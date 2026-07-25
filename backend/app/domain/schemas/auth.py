@@ -15,7 +15,7 @@ class LoginRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.-]+$")
+    username: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@-]+$")
     email: str | None = Field(default=None, max_length=320)
     display_name: str = Field(min_length=1, max_length=160)
     password: str = Field(min_length=12, max_length=1024)
@@ -86,7 +86,7 @@ class AuthSessionView(ORMModel):
 
 
 class UserCreateRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.-]+$")
+    username: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@-]+$")
     email: str | None = Field(default=None, max_length=320)
     display_name: str = Field(min_length=1, max_length=160)
     password: str = Field(min_length=12, max_length=1024)

@@ -34,6 +34,17 @@ LOCAL_TENANT_ID = "local-tenant"
 logger = logging.getLogger(__name__)
 
 
+def format_bootstrap_credentials(username: str, password: str) -> str:
+    return (
+        "\n=========\n"
+        "ONE-TIME LearnGraph bootstrap credentials\n"
+        f"username={username}\n"
+        f"password={password}\n"
+        "Password change is required after login.\n"
+        "========"
+    )
+
+
 def ensure_auth_identities(db: Session) -> None:
     settings = get_settings()
     tenant = db.get(Tenant, LOCAL_TENANT_ID)
@@ -84,11 +95,7 @@ def ensure_auth_identities(db: Session) -> None:
                 admin_name,
             )
         else:
-            logger.warning(
-                "ONE-TIME LearnGraph bootstrap credentials: username=%s password=%s (change required)",
-                admin_name,
-                bootstrap_password,
-            )
+            logger.warning(format_bootstrap_credentials(admin_name, bootstrap_password))
 
     demo = db.get(User, "demo-user")
     if settings.demo_seed_enabled and demo is None:

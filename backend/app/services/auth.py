@@ -54,7 +54,9 @@ def validate_new_password(password: str, *, username: str = "") -> None:
     normalized = password.casefold()
     if normalized in {"password1234", "adminadmin123", "learn-graph-local"}:
         raise AppError(422, "weak_password", "This password is reserved or commonly guessed")
-    if username and normalize_identity(username) in normalized:
+    # Email addresses are valid login identities. Do not reject a long,
+    # sufficiently varied password merely because it matches that identity.
+    if username and "@" not in username and normalize_identity(username) in normalized:
         raise AppError(422, "weak_password", "Password must not contain the username")
     if len(set(password)) < 6 or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
         raise AppError(
