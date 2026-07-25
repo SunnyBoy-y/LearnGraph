@@ -822,6 +822,7 @@ class GoalService:
             self.graphs.query().where(Graph.goal_id == goal.id, Graph.status == "candidate")
         )
         if existing is not None:
+            self._normalize_candidate_roots(existing)
             return existing
         concepts = [item.strip() for item in payload.seed_concepts if item.strip()]
         draft = None
@@ -865,6 +866,16 @@ class GoalService:
         )
         created_nodes: list[GraphNode] = []
         node_specs = draft.nodes if draft else None
+        canonical_root_index = 0
+        if node_specs:
+            canonical_root_index = next(
+                (
+                    index
+                    for index, node_spec in enumerate(node_specs)
+                    if node_spec.node_type == "root"
+                ),
+                0,
+            )
         for index, concept in enumerate(node_specs or dict.fromkeys(concepts)):
             label = concept.label if node_specs else concept
             teaching_strategy = (
@@ -882,7 +893,20 @@ class GoalService:
                         graph_id=graph.id,
                         label=label[:200],
                         description=concept.description if node_specs else "本地规则生成的候选节点，发布前必须审核。",
-                        node_type=concept.node_type if node_specs else ("root" if index == 0 else "concept"),
+                        # Model output is advisory. A target graph must always
+                        # have exactly one root, so promote the first node when
+                        # none was supplied and demote any additional roots.
+                        node_type=(
+                            "root"
+                            if index == canonical_root_index
+                            else (
+                                "concept"
+                                if node_specs and concept.node_type == "root"
+                                else concept.node_type
+                            )
+                            if node_specs
+                            else "concept"
+                        ),
                         target_weight=concept.target_weight if node_specs else 50,
                         teaching_strategy=teaching_strategy[:4_000],
                     )
@@ -932,6 +956,82 @@ class GoalService:
         self.db.commit()
         self.db.refresh(graph)
         return graph
+
+    def _normalize_candidate_roots(self, graph: Graph) -> bool:
+        """Repair model-created candidate graphs that do not have one root.
+
+        Older candidates may already contain multiple roots because structured
+        model output used to be persisted verbatim. Prefer the root that is not
+        contained by another node, then the one with the broadest containment
+        subtree. The repair is revisioned so an open reviewer is forced to
+        reload instead of publishing a structure it has not seen.
+        """
+
+        if graph.status != "candidate":
+            return False
+        nodes = list(
+            self.db.scalars(
+                self.nodes.query().where(GraphNode.graph_id == graph.id)
+            ).all()
+        )
+        if not nodes:
+            return False
+        roots = [node for node in nodes if node.node_type == "root"]
+        if len(roots) == 1:
+            return False
+        edges = list(
+            self.db.scalars(
+                self.edges.query().where(
+                    GraphEdge.graph_id == graph.id,
+                    GraphEdge.relation == "contains",
+                )
+            ).all()
+        )
+        contained_ids = {edge.target_node_id for edge in edges}
+        outgoing_counts: dict[str, int] = {}
+        for edge in edges:
+            outgoing_counts[edge.source_node_id] = (
+                outgoing_counts.get(edge.source_node_id, 0) + 1
+            )
+        candidates = roots or nodes
+        canonical = min(
+            candidates,
+            key=lambda node: (
+                node.id in contained_ids,
+                -outgoing_counts.get(node.id, 0),
+                node.created_at,
+                node.id,
+            ),
+        )
+        changed_node_ids: list[str] = []
+        for node in nodes:
+            next_type = (
+                "root"
+                if node.id == canonical.id
+                else "concept"
+                if node.node_type == "root"
+                else node.node_type
+            )
+            if node.node_type != next_type:
+                node.node_type = next_type
+                changed_node_ids.append(node.id)
+        if not changed_node_ids:
+            return False
+        graph.revision += 1
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="graph.normalize_candidate_roots",
+            resource_type="graph",
+            resource_id=graph.id,
+            details={
+                "canonical_root_id": canonical.id,
+                "changed_node_ids": sorted(changed_node_ids),
+                "revision": graph.revision,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(graph)
+        return True
 
     @staticmethod
     def _graph_title_from_goal(goal_title: str, model_title: str | None) -> str:
@@ -1145,6 +1245,11 @@ class GoalService:
                 "graph_goal_mismatch",
                 "The reviewed graph does not belong to this Goal",
             )
+        # Repair legacy model output before validating the review revision.
+        # Because normalization increments the revision, a reviewer looking at
+        # the old two-root graph will receive the normal conflict response and
+        # must review the corrected graph once before publishing.
+        self._normalize_candidate_roots(graph)
         if graph.revision != payload.expected_revision:
             raise AppError(
                 409,
