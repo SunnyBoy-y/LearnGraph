@@ -1,0 +1,1190 @@
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip as ChartTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
+  Check,
+  Download,
+  ExternalLink,
+  FileText,
+  ImageIcon,
+  LoaderCircle,
+  Network,
+  Quote,
+  ShieldAlert,
+  Sparkles,
+} from "lucide-react";
+
+import { MessageResponse } from "@/components/ai-elements/message";
+import {
+  Reasoning,
+  ReasoningContent,
+  ReasoningTrigger,
+} from "@/components/ai-elements/reasoning";
+import {
+  Source,
+  Sources,
+  SourcesContent,
+  SourcesTrigger,
+} from "@/components/ai-elements/sources";
+import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolInput,
+  ToolOutput,
+} from "@/components/ai-elements/tool";
+import { MagicCardHost } from "@/components/chat/magic-card-host";
+import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
+import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
+import { downloadFile } from "@/api/files";
+import {
+  TrustedComponentRenderer,
+  type TrustedComponentAction,
+} from "@/components/chat/trusted-component-renderer";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useAuth } from "@/features/auth/auth-context-value";
+import {
+  documentHref,
+  isDocumentCitationHref,
+  isWebCitationHref,
+  parseDocumentCitationHref,
+  parseWebCitationHref,
+  rewriteAllCitations,
+} from "@/lib/document-citations";
+import { decodeUrlForDisplay } from "@/lib/url-display";
+import { cn } from "@/lib/utils";
+import type { MessagePart } from "@/types/sessions";
+
+type PartData = Record<string, unknown> | undefined;
+
+type SourceItem = {
+  title: string;
+  href: string;
+  fileId: string;
+  filename: string;
+  locator: string;
+  chunkId: string;
+  quote: string;
+  isDocument: boolean;
+  index?: number;
+};
+
+function graphLabels(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (typeof item === "string") return [item];
+    if (item && typeof item === "object" && "label" in item) {
+      const label = (item as { label?: unknown }).label;
+      return typeof label === "string" ? [label] : [];
+    }
+    return [];
+  });
+}
+
+function EmptyPart({ children }: { children: string }) {
+  return (
+    <div className="message-part-empty" role="status">
+      {children}
+    </div>
+  );
+}
+
+function GraphContextPart({ data }: { data: PartData }) {
+  const nodes = graphLabels(data?.nodes);
+  return (
+    <section className="message-graph-context" aria-label="图谱上下文">
+      <div>
+        <Network className="size-4" />
+        <strong>图谱上下文</strong>
+        <Badge className="ml-auto font-normal" variant="secondary">
+          {nodes.length} 个节点
+        </Badge>
+      </div>
+      {nodes.length ? (
+        <div className="message-graph-context__nodes">
+          {nodes.map((node) => (
+            <Badge className="font-normal" key={node} variant="outline">
+              {node}
+            </Badge>
+          ))}
+        </div>
+      ) : (
+        <p>本轮没有绑定图谱节点。</p>
+      )}
+    </section>
+  );
+}
+
+type QuizOption = { id: string; label: string };
+
+function quizOptions(value: unknown): QuizOption[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item, index) => {
+    if (typeof item === "string") return [{ id: String(index), label: item }];
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    if (typeof record.label !== "string") return [];
+    return [
+      {
+        id: typeof record.id === "string" ? record.id : String(index),
+        label: record.label,
+      },
+    ];
+  });
+}
+
+function QuizPart({
+  data,
+  onAction,
+  partId,
+}: {
+  data: PartData;
+  onAction?: (action: TrustedComponentAction) => void | Promise<void>;
+  partId: string;
+}) {
+  const options = useMemo(() => quizOptions(data?.options), [data?.options]);
+  const [answer, setAnswer] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  const prompt = typeof data?.prompt === "string" ? data.prompt.trim() : "";
+
+  if (!prompt || !options.length) {
+    return <EmptyPart>习题数据不完整，已停止渲染交互项。</EmptyPart>;
+  }
+
+  return (
+    <section className="message-quiz" aria-label="即时验收题">
+      <div className="message-quiz__heading">
+        <Sparkles className="size-4" />
+        <strong>即时验收题</strong>
+      </div>
+      <p>{prompt}</p>
+      <RadioGroup
+        className="message-quiz__options"
+        disabled={submitted}
+        onValueChange={setAnswer}
+        value={answer}
+      >
+        {options.map((option, index) => (
+          <Label
+            className={cn("message-quiz__option", answer === option.id && "is-selected")}
+            htmlFor={`quiz-${partId}-${option.id}`}
+            key={option.id}
+          >
+            <RadioGroupItem
+              id={`quiz-${partId}-${option.id}`}
+              value={option.id}
+            />
+            <span>{String.fromCharCode(65 + index)}. {option.label}</span>
+            {submitted && answer === option.id ? <Check className="size-3.5" /> : null}
+          </Label>
+        ))}
+      </RadioGroup>
+      <div className="message-quiz__actions">
+        <Button
+          disabled={!answer || submitted || !onAction}
+          onClick={() => {
+            const selected = options.find((option) => option.id === answer);
+            if (!selected) return;
+            setSubmitted(true);
+            void onAction?.({
+              componentId: partId,
+              componentType: "quiz",
+              event: "submit",
+              payload: { answer_id: answer, answer: selected.label },
+            });
+          }}
+          size="sm"
+        >
+          提交答案
+        </Button>
+        {submitted ? <span>答案已提交到当前会话。</span> : null}
+      </div>
+    </section>
+  );
+}
+
+function safeHref(value: unknown) {
+  if (typeof value !== "string") return "";
+  if (value.startsWith("data:image/")) return value;
+  if (value.startsWith("/")) return value;
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function collectSourceItems(data: PartData, workspaceId: string): SourceItem[] {
+  const rawItems = Array.isArray(data?.results)
+    ? data.results
+    : Array.isArray(data?.sources)
+      ? data.sources
+      : [];
+  return rawItems.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as Record<string, unknown>;
+    const fileId = typeof record.file_id === "string" ? record.file_id : "";
+    const filename =
+      typeof record.filename === "string"
+        ? record.filename
+        : typeof record.title === "string"
+          ? record.title.split(" · ")[0] || record.title
+          : "";
+    const locator = typeof record.locator === "string" ? record.locator : "";
+    const chunkId = typeof record.chunk_id === "string" ? record.chunk_id : "";
+    const quote = typeof record.quote === "string" ? record.quote : "";
+    const title =
+      typeof record.title === "string" && record.title.trim()
+        ? record.title
+        : filename
+          ? `${filename}${locator ? ` · ${locator}` : ""}`
+          : fileId
+            ? `文档 ${fileId.slice(0, 8)}`
+            : "";
+    const documentPath = fileId
+      ? documentHref(workspaceId, fileId, {
+          chunkId: chunkId || undefined,
+          locator: locator || undefined,
+        })
+      : "";
+    const href = documentPath || safeHref(record.url ?? record.href);
+    if (!title || !href) return [];
+    const index =
+      typeof record.index === "number" && Number.isFinite(record.index)
+        ? record.index
+        : undefined;
+    return [
+      {
+        title,
+        href,
+        fileId,
+        filename: filename || title,
+        locator,
+        chunkId,
+        quote,
+        isDocument: Boolean(fileId),
+        index,
+      },
+    ];
+  });
+}
+
+function SourceListPart({ data }: { data: PartData }) {
+  const { workspaceId } = useAuth();
+  const navigate = useNavigate();
+  const items = useMemo(
+    () => collectSourceItems(data, workspaceId),
+    [data, workspaceId],
+  );
+
+  if (!items.length) return <EmptyPart>服务端没有返回可访问的来源。</EmptyPart>;
+  return (
+    <Sources className="message-sources" defaultOpen={false}>
+      <SourcesTrigger count={items.length}>
+        <>
+          <p className="font-medium">引用了 {items.length} 个来源</p>
+        </>
+      </SourcesTrigger>
+      <SourcesContent>
+        {items.map((item) =>
+          item.isDocument ? (
+            <button
+              className="message-source-item"
+              key={`${item.href}-${item.locator}`}
+              onClick={() => navigate(item.href)}
+              type="button"
+            >
+              <FileText className="size-3.5 flex-none" />
+              <span className="min-w-0">
+                <strong className="block truncate font-medium">{item.filename}</strong>
+                {item.locator ? (
+                  <small className="block truncate text-[10px] text-muted-foreground">
+                    {item.locator}
+                  </small>
+                ) : null}
+                {item.quote ? (
+                  <small className="mt-0.5 line-clamp-2 block text-[11px] leading-4 text-muted-foreground">
+                    {item.quote}
+                  </small>
+                ) : null}
+              </span>
+              <ExternalLink className="ml-auto size-3.5 flex-none opacity-60" />
+            </button>
+          ) : (
+            <Source
+              href={item.href}
+              key={`${item.title}-${item.href}`}
+              title={item.title}
+            />
+          ),
+        )}
+      </SourcesContent>
+    </Sources>
+  );
+}
+
+type CitationLookup = {
+  byFileId: Map<string, SourceItem[]>;
+  byWebIndex: Map<number, SourceItem>;
+  webIndexes: Set<number>;
+};
+
+function buildCitationLookup(parts: MessagePart[] | undefined): CitationLookup {
+  const byFileId = new Map<string, SourceItem[]>();
+  const byWebIndex = new Map<number, SourceItem>();
+  const webIndexes = new Set<number>();
+  if (!parts) return { byFileId, byWebIndex, webIndexes };
+  let webOrdinal = 0;
+  for (const part of parts) {
+    if (part.type !== "source_list") continue;
+    // workspace id is not needed for grouping; collect with empty path fallback
+    const items = collectSourceItems(part.data, "");
+    for (const item of items) {
+      if (item.fileId) {
+        const list = byFileId.get(item.fileId) ?? [];
+        list.push(item);
+        byFileId.set(item.fileId, list);
+        continue;
+      }
+      if (!item.href) continue;
+      webOrdinal += 1;
+      const index =
+        typeof item.index === "number" && item.index >= 1 ? item.index : webOrdinal;
+      if (!byWebIndex.has(index)) {
+        byWebIndex.set(index, { ...item, index });
+        webIndexes.add(index);
+      }
+    }
+  }
+  return { byFileId, byWebIndex, webIndexes };
+}
+
+function CitationBadge({
+  fileId,
+  locators,
+  index,
+  lookup,
+}: {
+  fileId: string;
+  locators: string;
+  index: number;
+  lookup: CitationLookup;
+}) {
+  const { workspaceId } = useAuth();
+  const navigate = useNavigate();
+  const sources = lookup.byFileId.get(fileId) ?? [];
+  const preferred =
+    sources.find(
+      (item) =>
+        item.locator &&
+        locators &&
+        (locators.includes(item.locator) || item.locator.includes(locators.split(/[、,，]/)[0] ?? "")),
+    ) ?? sources[0];
+  const filename = preferred?.filename || preferred?.title || "引用文档";
+  const quote = preferred?.quote || "";
+  const href =
+    preferred?.fileId && workspaceId
+      ? documentHref(workspaceId, preferred.fileId, {
+          chunkId: preferred.chunkId || undefined,
+          locator: preferred.locator || locators || undefined,
+        })
+      : workspaceId
+        ? documentHref(workspaceId, fileId, { locator: locators || undefined })
+        : "";
+
+  return (
+    <TooltipProvider delayDuration={120}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            aria-label={`打开引用文件 ${filename}`}
+            className="message-citation-badge"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (href) navigate(href);
+            }}
+            type="button"
+          >
+            {index}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent
+          className="message-citation-tooltip max-w-72"
+          side="top"
+          sideOffset={6}
+        >
+          <div className="grid gap-1.5">
+            <div className="flex items-start gap-2">
+              <FileText className="mt-0.5 size-3.5 flex-none opacity-80" />
+              <div className="min-w-0">
+                <strong className="block truncate text-[12px] font-semibold">
+                  {filename}
+                </strong>
+                {locators ? (
+                  <span className="block font-mono text-[10px] opacity-80">
+                    {locators}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+            {quote ? (
+              <p className="line-clamp-4 text-[11px] leading-4 opacity-90">
+                {quote}
+              </p>
+            ) : (
+              <p className="text-[11px] opacity-80">点击打开该引用文件</p>
+            )}
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+function WebCitationBadge({
+  index,
+  lookup,
+}: {
+  index: number;
+  lookup: CitationLookup;
+}) {
+  const source = lookup.byWebIndex.get(index);
+  const title = source?.title || source?.filename || `来源 ${index}`;
+  const href = source?.href ? safeHref(source.href) : "";
+  const quote = source?.quote || "";
+
+  return (
+    <TooltipProvider delayDuration={120}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          {href ? (
+            <a
+              aria-label={`打开网页来源 ${index}: ${title}`}
+              className="message-citation-badge"
+              href={href}
+              onClick={(event) => event.stopPropagation()}
+              rel="noreferrer"
+              target="_blank"
+            >
+              {index}
+            </a>
+          ) : (
+            <button
+              aria-label={`网页来源 ${index}`}
+              className="message-citation-badge"
+              type="button"
+            >
+              {index}
+            </button>
+          )}
+        </TooltipTrigger>
+        <TooltipContent
+          className="message-citation-tooltip max-w-72"
+          side="top"
+          sideOffset={6}
+        >
+          <div className="grid gap-1.5">
+            <div className="flex items-start gap-2">
+              <ExternalLink className="mt-0.5 size-3.5 flex-none opacity-80" />
+              <div className="min-w-0">
+                <strong className="block truncate text-[12px] font-semibold">
+                  {title}
+                </strong>
+                {href ? (
+                  <span className="block truncate font-mono text-[10px] opacity-80">
+                    {decodeUrlForDisplay(href)}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+            {quote ? (
+              <p className="line-clamp-4 text-[11px] leading-4 opacity-90">
+                {quote}
+              </p>
+            ) : href ? (
+              <p className="text-[11px] opacity-80">点击跳转到该网页</p>
+            ) : (
+              <p className="text-[11px] opacity-80">来源详情不可用</p>
+            )}
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+function TextWithCitations({
+  content,
+  lookup,
+  className,
+}: {
+  content: string;
+  lookup: CitationLookup;
+  className?: string;
+}) {
+  const { markdown } = useMemo(
+    () => rewriteAllCitations(content, lookup.webIndexes),
+    [content, lookup.webIndexes],
+  );
+
+  const components = useMemo<ComponentProps<typeof MessageResponse>["components"]>(
+    () => ({
+      a: ({ href, children, ...props }) => {
+        if (isDocumentCitationHref(href)) {
+          const parsed = parseDocumentCitationHref(href ?? "");
+          if (parsed) {
+            return (
+              <CitationBadge
+                fileId={parsed.fileId}
+                index={parsed.index}
+                locators={parsed.locators}
+                lookup={lookup}
+              />
+            );
+          }
+        }
+        if (isWebCitationHref(href)) {
+          const parsed = parseWebCitationHref(href ?? "");
+          if (parsed) {
+            return <WebCitationBadge index={parsed.index} lookup={lookup} />;
+          }
+        }
+        const safe =
+          typeof href === "string" &&
+          (href.startsWith("http://") ||
+            href.startsWith("https://") ||
+            href.startsWith("/"))
+            ? href
+            : undefined;
+        // Decode percent-encoded link text (e.g. %E7%9F%A5… → 知识…) when the
+        // visible children are just the raw URL or still encoded.
+        const childText =
+          typeof children === "string"
+            ? children
+            : Array.isArray(children)
+              ? children.map((child) => (typeof child === "string" ? child : "")).join("")
+              : "";
+        const looksEncoded =
+          /%[0-9A-Fa-f]{2}/.test(childText) ||
+          (safe && childText === href) ||
+          (safe && childText === safe);
+        const label =
+          looksEncoded && childText
+            ? decodeUrlForDisplay(childText)
+            : children;
+        return (
+          <a
+            href={safe}
+            rel="noreferrer"
+            target={safe?.startsWith("http") ? "_blank" : undefined}
+            title={safe ? decodeUrlForDisplay(safe) : undefined}
+            {...props}
+          >
+            {label}
+          </a>
+        );
+      },
+    }),
+    [lookup],
+  );
+
+  return (
+    <div data-message-selectable-text>
+      <MessageResponse className={cn("min-w-0 text-[15px] leading-7", className)} components={components}>
+        {markdown}
+      </MessageResponse>
+    </div>
+  );
+}
+
+function ChartPart({ data }: { data: PartData }) {
+  const points = Array.isArray(data?.points)
+    ? data.points.filter(
+        (item): item is Record<string, number | string> =>
+          Boolean(item) && typeof item === "object" && !Array.isArray(item),
+      )
+    : [];
+  const xKey = typeof data?.x_key === "string" ? data.x_key : "";
+  const yKey = typeof data?.y_key === "string" ? data.y_key : "";
+  const valid =
+    points.length > 0 &&
+    xKey &&
+    yKey &&
+    points.every((point) => typeof point[yKey] === "number" && xKey in point);
+
+  if (!valid) return <EmptyPart>图表数据不完整，未生成虚构趋势。</EmptyPart>;
+  return (
+    <section className="message-chart" aria-label={typeof data?.title === "string" ? data.title : "数据图表"}>
+      <div className="message-chart__heading">
+        <strong>{typeof data?.title === "string" ? data.title : "数据图表"}</strong>
+        <span>{points.length} 个真实数据点</span>
+      </div>
+      <div className="message-chart__canvas">
+        <ResponsiveContainer height="100%" width="100%">
+          <AreaChart data={points}>
+            <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+            <XAxis axisLine={false} dataKey={xKey} fontSize={11} tickLine={false} />
+            <YAxis axisLine={false} fontSize={11} tickLine={false} width={32} />
+            <ChartTooltip
+              contentStyle={{
+                background: "var(--card)",
+                borderColor: "var(--border)",
+                borderRadius: 10,
+                fontSize: 12,
+              }}
+            />
+            <Area
+              dataKey={yKey}
+              fill="color-mix(in srgb, var(--primary) 18%, transparent)"
+              stroke="var(--primary)"
+              strokeWidth={2}
+              type="monotone"
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+    </section>
+  );
+}
+
+function ImagePart({ data, status }: { data: PartData; status: string }) {
+  const directSrc = safeHref(data?.src ?? data?.url);
+  const fileId = typeof data?.file_id === "string" ? data.file_id : "";
+  const [fileSrc, setFileSrc] = useState("");
+  useEffect(() => {
+    if (!fileId || directSrc) return;
+    let objectUrl = "";
+    let cancelled = false;
+    void downloadFile(fileId)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setFileSrc(objectUrl);
+      })
+      .catch(() => setFileSrc(""));
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [directSrc, fileId]);
+  const title = typeof data?.title === "string" ? data.title : "图片任务";
+  const alt = typeof data?.alt === "string" ? data.alt : title;
+  const src = directSrc || fileSrc;
+  return (
+    <figure className="message-image">
+      {src && status === "completed" ? (
+        <img alt={alt} src={src} />
+      ) : (
+        <div>
+          <ImageIcon className="size-6" />
+          <strong>{title}</strong>
+          <span>{status}</span>
+        </div>
+      )}
+    </figure>
+  );
+}
+
+function AttachmentPart({ data, status }: { data: PartData; status: string }) {
+  const [downloading, setDownloading] = useState(false);
+  const fileId = typeof data?.file_id === "string" ? data.file_id : "";
+  const href = safeHref(data?.url ?? data?.src);
+  const filename =
+    typeof data?.filename === "string"
+      ? data.filename
+      : typeof data?.original_name === "string"
+        ? data.original_name
+        : "学习资料";
+  const mime = typeof data?.mime_type === "string" ? data.mime_type : "";
+  const kind = data?.relation === "context_reference"
+    ? "回答引用的上下文"
+    : mime.includes("presentation") || /\.pptx?$/i.test(filename)
+    ? "演示文稿"
+    : mime.includes("word") || /\.docx?$/i.test(filename)
+      ? "文档"
+      : mime || "文件";
+
+  async function download() {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      const blob = fileId ? await downloadFile(fileId) : undefined;
+      const url = blob ? URL.createObjectURL(blob) : href;
+      if (!url) return;
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      if (blob) URL.revokeObjectURL(url);
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return (
+    <div className="message-attachment">
+      <span className="message-attachment__icon"><FileText className="size-4" /></span>
+      <span className="message-attachment__meta">
+        <strong title={filename}>{filename}</strong>
+        <small>{kind}{status !== "completed" ? ` · ${status}` : ""}</small>
+      </span>
+      <Button
+        aria-label={`下载 ${filename}`}
+        disabled={downloading || (!fileId && !href)}
+        onClick={() => void download()}
+        size="icon-sm"
+        variant="ghost"
+      >
+        {downloading ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+      </Button>
+    </div>
+  );
+}
+
+
+function DocumentSelectionPart({ content, data }: { content: string; data: PartData }) {
+  const filename = stringField(data, "filename") || "文档选区";
+  const locator =
+    stringField(data, "locator_label") ||
+    stringField(data, "locator") ||
+    "可验证原文定位";
+  const quote = stringField(data, "selected_text") || content;
+  return (
+    <section className="border-l-2 border-primary bg-muted/35 px-3 py-2 text-xs" aria-label="文档选区">
+      <div className="flex min-w-0 items-center gap-2">
+        <Quote className="size-3.5 flex-none" />
+        <strong className="truncate">{filename}</strong>
+        <span className="ml-auto truncate font-mono text-[10px] text-muted-foreground">{locator}</span>
+      </div>
+      <p className="mt-1 line-clamp-4 whitespace-pre-wrap leading-5 text-muted-foreground">{quote}</p>
+    </section>
+  );
+}
+
+function SelectionQuotePart({ content, data }: { content: string; data: PartData }) {
+  const sourceRole = stringField(data, "source_role");
+  const sourceLabel = sourceRole === "assistant" ? "引用模型回答" : "引用会话内容";
+  return (
+    <blockquote
+      aria-label={sourceLabel}
+      className="border-l-2 border-primary bg-muted/35 px-3 py-2 text-xs"
+    >
+      <div className="flex items-center gap-2 font-medium">
+        <Quote className="size-3.5 flex-none" />
+        <span>{sourceLabel}</span>
+      </div>
+      <p className="mt-1 line-clamp-4 whitespace-pre-wrap leading-5 text-muted-foreground">
+        {content}
+      </p>
+    </blockquote>
+  );
+}
+
+const TOOL_AUTO_CLOSE_DELAY = 1000;
+
+function stringField(data: PartData, field: string) {
+  const value = data?.[field];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function AgentStepPart({
+  content,
+  data,
+  status,
+  streaming,
+}: {
+  content: string;
+  data: PartData;
+  status: string;
+  streaming: boolean;
+}) {
+  const title = stringField(data, "title") || stringField(data, "label");
+  const summary = stringField(data, "summary");
+  // Prefer real model/tool narration; never invent fixed host status copy.
+  const detail = content.trim() || summary || title;
+  if (!detail) {
+    // Empty agent_step is a host bookkeeping shell — hide fixed boilerplate.
+    return null;
+  }
+  const completedLabel = title || detail;
+  const label =
+    status === "failed"
+      ? title || "智能体步骤失败"
+      : streaming
+        ? title || "正在执行智能体步骤"
+        : completedLabel;
+
+  return (
+    <Reasoning
+      className="chat-reasoning chat-agent-step"
+      defaultOpen={false}
+      isStreaming={streaming}
+    >
+      <ReasoningTrigger
+        aria-label="展开或收起智能体步骤"
+        getThinkingMessage={() => label}
+      />
+      <ReasoningContent>{detail}</ReasoningContent>
+    </Reasoning>
+  );
+}
+
+function toolDisplayTitle(
+  toolName: string | undefined,
+  data: PartData,
+  selectedNodeLabels: string[],
+) {
+  const explicit = stringField(data, "title");
+  if (explicit) return explicit;
+  if (toolName === "resolve_learning_context" && selectedNodeLabels.length) {
+    return `已读取学习节点 · ${selectedNodeLabels.join("、")}`;
+  }
+  if (toolName === "search_web" || (toolName && /search|检索|搜索/i.test(toolName))) {
+    const input =
+      data?.input && typeof data.input === "object" && !Array.isArray(data.input)
+        ? (data.input as Record<string, unknown>)
+        : null;
+    const query = typeof input?.query === "string" ? input.query.trim() : "";
+    return query ? `搜索 ${query}` : "联网搜索";
+  }
+  if (toolName === "sandbox_exec" || toolName === "sandbox_run") {
+    return "沙箱执行";
+  }
+  return toolName ?? "工具调用";
+}
+
+function isSearchLikeTool(toolName: string | undefined) {
+  if (!toolName) return false;
+  return (
+    toolName === "search_web" ||
+    /search|检索|搜索|web_search/i.test(toolName)
+  );
+}
+
+function ToolCallPart({
+  content,
+  part,
+  streaming,
+}: {
+  content: string;
+  part: MessagePart;
+  streaming: boolean;
+}) {
+  const isPending = part.status === "pending";
+  const isRunning = part.status === "streaming" || (isPending && streaming);
+  const isAwaitingResult = isRunning || isPending;
+  // ChatGPT-style: keep tool rows collapsed by default; user expands for I/O.
+  const [open, setOpen] = useState(false);
+  const hasStreamedRef = useRef(isRunning);
+
+  useEffect(() => {
+    if (isRunning) {
+      hasStreamedRef.current = true;
+      // Stay collapsed while running — the activity line already surfaces status.
+      return;
+    }
+    if (!hasStreamedRef.current) return;
+    const timer = window.setTimeout(() => setOpen(false), TOOL_AUTO_CLOSE_DELAY);
+    return () => window.clearTimeout(timer);
+  }, [isRunning]);
+
+  const toolName =
+    typeof part.data?.tool_name === "string" ? part.data.tool_name : undefined;
+  const selectedNodes = Array.isArray(part.data?.selected_nodes)
+    ? part.data.selected_nodes.filter(
+        (node): node is Record<string, unknown> =>
+          Boolean(node) && typeof node === "object",
+      )
+    : [];
+  const selectedNodeLabels = selectedNodes
+    .map((node) =>
+      typeof node.label === "string" && node.label.trim()
+        ? node.label.trim()
+        : typeof node.id === "string"
+          ? node.id
+          : "",
+    )
+    .filter(Boolean);
+  const title = toolDisplayTitle(toolName, part.data, selectedNodeLabels);
+  const searchLike = isSearchLikeTool(toolName);
+  const toolInput =
+    part.data?.input &&
+    typeof part.data.input === "object" &&
+    !Array.isArray(part.data.input)
+      ? part.data.input
+      : toolName === "resolve_learning_context"
+        ? {
+            node_ids: part.data?.node_ids ?? [],
+            selected_nodes: selectedNodes,
+            file_ids: part.data?.file_ids ?? [],
+            document_selection: part.data?.document_selection ?? null,
+            message_selection: part.data?.message_selection ?? null,
+          }
+        : (part.data ?? {});
+  const toolState =
+    part.status === "failed"
+      ? "output-error"
+      : isPending
+        ? "input-streaming"
+        : isRunning
+          ? "input-available"
+          : "output-available";
+
+  return (
+    <Tool
+      className={cn(
+        "chat-tool-call",
+        searchLike && "chat-tool-call--search",
+        isAwaitingResult && "is-running",
+        part.status === "failed" && "is-failed",
+      )}
+      onOpenChange={setOpen}
+      open={open}
+    >
+      <ToolHeader
+        className="chat-tool-call__header"
+        state={toolState}
+        title={title}
+        toolName={title}
+        type="dynamic-tool"
+      />
+      <ToolContent>
+        <ToolInput input={toolInput} />
+        {isAwaitingResult ? (
+          <p
+            aria-live="polite"
+            className="text-xs text-muted-foreground"
+            role="status"
+          >
+            正在等待工具结果…
+          </p>
+        ) : (
+          <ToolOutput
+            errorText={
+              part.status === "failed" ? content || "工具调用失败" : undefined
+            }
+            output={
+              part.status === "failed"
+                ? part.data?.output
+                : (part.data?.output ??
+                  (content || "未返回可展示的工具输出"))
+            }
+          />
+        )}
+      </ToolContent>
+    </Tool>
+  );
+}
+
+function AcknowledgementPart({
+  content,
+  streaming,
+}: {
+  content: string;
+  streaming: boolean;
+}) {
+  const text = content.trim();
+  if (!text) return null;
+  return (
+    <div
+      className={cn(
+        "chat-acknowledgement",
+        streaming && "chat-acknowledgement--streaming",
+      )}
+      data-message-selectable-text
+    >
+      <p>{text}</p>
+    </div>
+  );
+}
+
+export function MessagePartRenderer({
+  onAction,
+  part,
+  siblingParts,
+  streaming = false,
+}: {
+  onAction?: (action: TrustedComponentAction) => void | Promise<void>;
+  part: MessagePart;
+  /** Sibling parts of the same assistant message (used to resolve citation tooltips). */
+  siblingParts?: MessagePart[];
+  streaming?: boolean;
+}) {
+  const content = part.content ?? part.content_delta ?? "";
+  const citationLookup = useMemo(
+    () => buildCitationLookup(siblingParts),
+    [siblingParts],
+  );
+  switch (part.type) {
+    case "acknowledgement":
+      return (
+        <AcknowledgementPart content={content} streaming={streaming} />
+      );
+    case "text":
+      return content ? (
+        <TextWithCitations content={content} lookup={citationLookup} />
+      ) : null;
+    case "reasoning_summary":
+    case "reasoning_content": {
+      const isReasoningSummary = part.type === "reasoning_summary";
+      // These parts live inside the outer ThinkingChain fold. Render as a plain
+      // step (no nested collapsible) so expanding "正在思考" shows the text.
+      if (!content && !streaming) return null;
+      return (
+        <div
+          className="chat-reasoning-step"
+          data-reasoning-type={part.type}
+          role="status"
+        >
+          <div className="chat-reasoning-step__label">
+            {streaming
+              ? isReasoningSummary
+                ? "正在生成推理摘要…"
+                : "思考过程"
+              : isReasoningSummary
+                ? "推理摘要"
+                : "思考过程"}
+          </div>
+          {content ? (
+            <div className="chat-reasoning-step__body whitespace-pre-wrap">
+              {content}
+            </div>
+          ) : streaming ? (
+            <div className="chat-reasoning-step__body text-muted-foreground">…</div>
+          ) : null}
+        </div>
+      );
+    }
+    case "agent_step":
+      return (
+        <AgentStepPart
+          content={content}
+          data={part.data}
+          status={part.status}
+          streaming={streaming}
+        />
+      );
+    case "tool_call":
+      return <ToolCallPart content={content} part={part} streaming={streaming} />;
+    case "graph_context":
+      return <GraphContextPart data={part.data} />;
+    case "quiz":
+      return <QuizPart data={part.data} onAction={onAction} partId={part.id} />;
+    case "source_list":
+      return <SourceListPart data={part.data} />;
+    case "chart":
+      return <ChartPart data={part.data} />;
+    case "component":
+      return (
+        <TrustedComponentRenderer
+          data={part.data ?? {}}
+          fallbackId={part.id}
+          onAction={onAction}
+        />
+      );
+    case "magic_card":
+      return <MagicCardHost data={part.data ?? {}} />;
+    case "sandbox": {
+      const kind = part.data?.kind;
+      if (kind === "file" || typeof part.data?.file_id === "string") {
+        return <SandboxFileArtifact data={part.data ?? {}} />;
+      }
+      // Generative card previews prefer the dedicated host so failures stay local.
+      if (
+        part.data?.runtime === "react-sandbox-v1" ||
+        typeof part.data?.card_instance_id === "string"
+      ) {
+        return <MagicCardHost data={part.data ?? {}} />;
+      }
+      return <SandboxArtifact data={part.data ?? {}} />;
+    }
+    case "sandbox_artifact":
+      return <SandboxFileArtifact data={part.data ?? {}} />;
+    case "sandbox_status": {
+      const authRequired = part.data?.auth_required === true;
+      const paths = Array.isArray(part.data?.paths)
+        ? part.data.paths.filter((item): item is string => typeof item === "string")
+        : [];
+      return (
+        <div
+          className={
+            authRequired
+              ? "rounded-xl border border-amber-300 bg-amber-50/70 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
+              : "rounded-xl border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+          }
+        >
+          <strong className="text-foreground">
+            {authRequired ? "需要授权沙箱操作" : "沙箱执行"}
+          </strong>
+          <span className="ml-2">
+            {typeof part.data?.phase === "string" ? part.data.phase : part.status}
+            {typeof part.data?.latency_ms === "number" ? ` · ${part.data.latency_ms} ms` : ""}
+            {typeof part.data?.exit_code === "number" ? ` · exit ${part.data.exit_code}` : ""}
+          </span>
+          {typeof part.data?.message_zh === "string" && part.data.message_zh ? (
+            <p className="mt-1 leading-5">{part.data.message_zh}</p>
+          ) : null}
+          {authRequired && paths.length ? (
+            <ul className="mt-2 list-disc space-y-1 pl-5 font-mono text-[10px]">
+              {paths.map((path) => (
+                <li key={path}>{path}</li>
+              ))}
+            </ul>
+          ) : null}
+          {typeof part.data?.stdout_summary === "string" && part.data.stdout_summary ? (
+            <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px]">
+              {part.data.stdout_summary}
+            </pre>
+          ) : null}
+          {typeof part.data?.stderr_summary === "string" && part.data.stderr_summary ? (
+            <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-amber-800 dark:text-amber-200">
+              {part.data.stderr_summary}
+            </pre>
+          ) : null}
+        </div>
+      );
+    }
+    case "image":
+      return <ImagePart data={part.data} status={part.status} />;
+    case "attachment":
+      return <AttachmentPart data={part.data} status={part.status} />;
+    case "document_selection":
+      return <DocumentSelectionPart content={content} data={part.data} />;
+    case "selection_quote":
+      return <SelectionQuotePart content={content} data={part.data} />;
+    case "error":
+      return (
+        <p className="message-part-error" role="alert">
+          {content || "消息处理失败"}
+        </p>
+      );
+    default:
+      return (
+        <div className="message-part-unknown">
+          <p>
+            <ShieldAlert className="size-4" />未知 Message Part 已安全降级
+          </p>
+          <pre>{JSON.stringify(part, null, 2)}</pre>
+        </div>
+      );
+  }
+}

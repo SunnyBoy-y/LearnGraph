@@ -1,0 +1,2123 @@
+from __future__ import annotations
+
+"""Bounded tool runtime for a persisted LearnGraph Chat Agent.
+
+The model is a planner only.  Every tool below is dispatched through a
+workspace-scoped service, has a durable audit trail, and returns data instead
+of a host capability.  This module deliberately contains no model-provider
+fallbacks or arbitrary HTTP/shell execution.
+"""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import json
+from typing import Any, Callable
+from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# memory_tools is duck-typed (MemoryService) to avoid circular imports.
+
+from app.core.config import Settings
+from app.core.errors import AppError
+from app.providers.ports.image_generation import (
+    ImageGenerationProviderPort,
+    ImageGenerationRequest,
+)
+from app.providers.ports.search import SearchProviderPort
+from app.providers.remote.search import SearchProviderError, SearchProviderTimeout
+from app.repositories.audit import AuditRepository
+from app.services.image_generations import ImageGenerationService
+from app.services.mcp_skills import MCPAndSkillService
+from app.services.sandbox import SandboxAgentWorkspaceService
+from app.services.session_retrieval import SessionRetrievalService
+
+
+AGENT_TOOL_RESULT_MAX_BYTES = 128 * 1024
+MAX_PARALLEL_RESEARCH_CHILDREN = 4
+DEFAULT_CLOCK_TIMEZONE = "UTC"
+MAX_AGENT_IMAGE_PROMPT_CHARS = 2_000
+
+
+class AgentToolRuntime:
+    """Dispatch user-authorized Agent tools without exposing host internals."""
+
+    def __init__(
+        self,
+        *,
+        workspace_id: str,
+        actor_id: str,
+        search_provider: SearchProviderPort | None,
+        extensions: MCPAndSkillService,
+        sandbox: SandboxAgentWorkspaceService | None,
+        sandbox_authorized: bool,
+        memory_tools: Any | None = None,
+        session_retrieval: SessionRetrievalService | None = None,
+        image_provider: ImageGenerationProviderPort | None = None,
+        image_provider_resolver: (
+            Callable[[str | None, str | None], ImageGenerationProviderPort] | None
+        ) = None,
+        settings: Settings | None = None,
+        can_manage_providers: bool = False,
+    ) -> None:
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.search_provider = search_provider
+        self.extensions = extensions
+        self.sandbox = sandbox
+        self.sandbox_authorized = sandbox_authorized
+        self.memory_tools = memory_tools
+        self.session_retrieval = session_retrieval
+        self.image_provider = image_provider
+        self.image_provider_resolver = image_provider_resolver
+        self.settings = settings
+        self.can_manage_providers = bool(can_manage_providers)
+        self.audit = AuditRepository(extensions.db, workspace_id)
+
+    def definitions(
+        self,
+        *,
+        agent_mode_enabled: bool,
+        web_search_enabled: bool,
+    ) -> list[dict[str, Any]]:
+        if not agent_mode_enabled:
+            return []
+
+        # Clock is a host-local, side-effect-free fact. Always expose it in Agent
+        # mode so the model does not guess "today" from training data.
+        definitions = list(self._clock_tool_definitions())
+        definitions.extend(self._canvas_tool_definitions())
+        definitions.extend(self._provider_tool_definitions())
+        definitions.extend(self._learning_orchestration_tool_definitions())
+        definitions.extend(self.extensions.agent_tool_definitions())
+        if web_search_enabled and self._search_available:
+            definitions.extend(self._web_tool_definitions())
+        if self._image_available:
+            definitions.extend(self._image_tool_definitions())
+        if self.sandbox is not None and self.sandbox_authorized:
+            definitions.extend(self.sandbox.agent_tool_definitions())
+        if self.session_retrieval is not None:
+            definitions.extend(self._session_retrieval_tool_definitions())
+        if self.memory_tools is not None:
+            definitions.extend(self._memory_tool_definitions())
+        return definitions
+
+    @staticmethod
+    def _learning_orchestration_tool_definitions() -> list[dict[str, Any]]:
+        """First-party planning tools whose writes always remain reviewable.
+
+        Roadmap and schedule tools are supplied by ``MCPAndSkillService``.  A
+        graph proposal needs the current durable Message IDs, so it lives in
+        this session-aware runtime instead of the context-free extension
+        dispatcher.
+        """
+
+        node_schema = {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "pattern": r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                },
+                "change": {"type": "string", "enum": ["add", "update"]},
+                "node_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                "label": {"type": "string", "minLength": 1, "maxLength": 200},
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2_000,
+                },
+                "node_type": {
+                    "type": "string",
+                    "enum": ["root", "concept", "practice", "assessment"],
+                },
+                "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1_000,
+                },
+            },
+            "required": [
+                "ref",
+                "change",
+                "label",
+                "description",
+                "node_type",
+                "rationale",
+            ],
+            "additionalProperties": False,
+        }
+        edge_schema = {
+            "type": "object",
+            "properties": {
+                "source_ref": {"type": "string", "minLength": 1, "maxLength": 80},
+                "target_ref": {"type": "string", "minLength": 1, "maxLength": 80},
+                "relation": {
+                    "type": "string",
+                    "enum": [
+                        "contains",
+                        "prerequisite",
+                        "related",
+                        "contrast",
+                        "application",
+                    ],
+                },
+                "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1_000,
+                },
+            },
+            "required": ["source_ref", "target_ref", "relation", "rationale"],
+            "additionalProperties": False,
+        }
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_graph_propose_change",
+                    "description": (
+                        "Create a reviewable target-graph proposal for the Goal "
+                        "bound to this session, or update the Graph bound to this "
+                        "session. This tool never publishes or mutates the formal "
+                        "graph. For a new graph provide at least two added nodes "
+                        "and exactly one root; for an update use existing node IDs "
+                        "when change=update and do not add another root."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "graph_title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 80,
+                            },
+                            "summary": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2_000,
+                            },
+                            "nodes": {
+                                "type": "array",
+                                "items": node_schema,
+                                "minItems": 1,
+                                "maxItems": 16,
+                            },
+                            "edges": {
+                                "type": "array",
+                                "items": edge_schema,
+                                "maxItems": 32,
+                            },
+                        },
+                        "required": ["graph_title", "summary", "nodes", "edges"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    @property
+    def _image_available(self) -> bool:
+        provider = self.image_provider
+        return (
+            provider is not None
+            and self.settings is not None
+            and bool(getattr(provider, "available", True))
+            and bool(getattr(provider, "remote_capability", False))
+        )
+
+    @property
+    def _search_available(self) -> bool:
+        return self.search_provider is not None and bool(
+            getattr(self.search_provider, "available", True)
+        )
+
+    @staticmethod
+    def _memory_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_conversation_history",
+                    "description": (
+                        "Search prior completed messages by topic/keywords within the "
+                        "authorized workspace. Use when the user refers to past "
+                        "discussions, decisions, or when current memory conflicts. "
+                        "Do not call every turn."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "goal_id": {"type": "string"},
+                            "session_id": {"type": "string"},
+                            "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_conversation_segment",
+                    "description": (
+                        "Read a contiguous segment of messages from one session "
+                        "(optionally centered on a message_id)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {"type": "string"},
+                            "around_message_id": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 40},
+                        },
+                        "required": ["session_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_memory_evidence",
+                    "description": (
+                        "Load source evidence (message snippets / source refs) for one "
+                        "LearnGraph memory_id to verify or explain a recalled fact."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"memory_id": {"type": "string"}},
+                        "required": ["memory_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "propose_memory_draft",
+                    "description": (
+                        "Propose a MemoryDraft (CREATE/UPDATE/…); does not write active "
+                        "memory unless auto_commit is allowed by policy. Prefer drafts "
+                        "over direct long-term writes."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": [
+                                    "CREATE",
+                                    "UPDATE",
+                                    "MERGE",
+                                    "SUPERSEDE",
+                                    "RETRACT",
+                                    "PROMOTE",
+                                    "DEMOTE",
+                                    "ARCHIVE",
+                                ],
+                            },
+                            "memory_type": {"type": "string"},
+                            "title": {"type": "string"},
+                            "content": {"type": "string"},
+                            "goal_id": {"type": "string"},
+                            "node_id": {"type": "string"},
+                            "session_id": {"type": "string"},
+                            "target_memory_id": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "auto_commit": {"type": "boolean"},
+                        },
+                        "required": ["content"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    @staticmethod
+    def _session_retrieval_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_session_fragments",
+                    "description": (
+                        "Retrieve authorized prior conversation fragments by exact "
+                        "session IDs, sparse keywords, or both. Use this when the "
+                        "user refers to a previous plan, decision, explanation, "
+                        "assessment, or learning evidence. Generate concise keywords "
+                        "and phrases; never invent session IDs or SQL."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "maxLength": 500},
+                            "session_ids": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1, "maxLength": 36},
+                                "maxItems": 20,
+                            },
+                            "scope": {
+                                "type": "string",
+                                "enum": ["linked", "workspace", "all_authorized"],
+                            },
+                            "reason": {
+                                "type": "string",
+                                "enum": [
+                                    "resolve_reference",
+                                    "continue_task",
+                                    "recover_decision",
+                                    "verify_memory",
+                                    "find_learning_evidence",
+                                ],
+                            },
+                            "keywords": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1, "maxLength": 160},
+                                "maxItems": 20,
+                            },
+                            "phrases": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1, "maxLength": 240},
+                                "maxItems": 10,
+                            },
+                            "entities": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "value": {"type": "string", "minLength": 1, "maxLength": 160},
+                                    },
+                                    "required": ["type", "value"],
+                                    "additionalProperties": False,
+                                },
+                                "maxItems": 20,
+                            },
+                            "graph_node_ids": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1, "maxLength": 36},
+                                "maxItems": 20,
+                            },
+                            "time_range": {
+                                "type": "object",
+                                "properties": {
+                                    "from": {"type": "string", "format": "date-time"},
+                                    "to": {"type": "string", "format": "date-time"},
+                                },
+                                "additionalProperties": False,
+                            },
+                            "status": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "current",
+                                        "confirmed",
+                                        "possibly_current",
+                                        "superseded",
+                                    ],
+                                },
+                                "maxItems": 4,
+                            },
+                            "prefer_recent": {"type": "boolean"},
+                            "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                        },
+                        "additionalProperties": False,
+                        "anyOf": [
+                            {"required": ["query"]},
+                            {"required": ["session_ids"]},
+                            {"required": ["keywords"]},
+                            {"required": ["phrases"]},
+                            {"required": ["entities"]},
+                            {"required": ["graph_node_ids"]},
+                        ],
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def _canvas_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "canvas_get_render_contract",
+                    "description": (
+                        "Read the LearnGraph conversation canvas render contract: "
+                        "available pixel width, height limits, theme, locale, and "
+                        "whether declarative or React-sandbox cards are available. "
+                        "Call this before emitting a card."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "available_width": {
+                                "type": "integer",
+                                "minimum": 280,
+                                "maximum": 1600,
+                            },
+                            "theme": {"type": "string", "enum": ["light", "dark"]},
+                            "locale": {"type": "string"},
+                            "reduced_motion": {"type": "boolean"},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "canvas_emit_trusted_component",
+                    "description": (
+                        "Publish a channel-A declarative trusted component into the "
+                        "assistant message stream (weather_card, metric_card, "
+                        "option_group, single_choice, multiple_choice, fill_blank, "
+                        "short_answer_table, image_frame). Prefer this over free-form "
+                        "HTML/React for forms, metrics, and weather. "
+                        "CRITICAL: never pass JSON null for optional fields — omit them. "
+                        "Option cards need non-empty options[{id,label}]; "
+                        "single/multiple choice need title or prompt; "
+                        "fill_blank needs title/prompt (blank_ids default to [answer]); "
+                        "weather_card requires location, condition, temperature_c."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "component_type": {
+                                "type": "string",
+                                "enum": [
+                                    "weather_card",
+                                    "metric_card",
+                                    "option_group",
+                                    "single_choice",
+                                    "multiple_choice",
+                                    "fill_blank",
+                                    "short_answer_table",
+                                    "image_frame",
+                                ],
+                            },
+                            "props": {
+                                "type": "object",
+                                "description": (
+                                    "Component data. Examples: "
+                                    'single_choice → {title, options:[{id,label}]}; '
+                                    'fill_blank → {title, prompt, blank_ids:["answer"]}; '
+                                    'weather_card → {location, condition, temperature_c}. '
+                                    "Do not include null values."
+                                ),
+                            },
+                            "component_id": {"type": "string"},
+                            "allowed_events": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 10,
+                            },
+                            "schema_version": {"type": "string"},
+                        },
+                        "required": ["component_type", "props"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "canvas_emit_magic_card",
+                    "description": (
+                        "Publish a channel-B magic_card Message Part. Until the "
+                        "isolated browser sandbox is configured, this records a safe "
+                        "fallback card with optional dynamic preview_html (scripts run "
+                        "inside a sandboxed iframe, not host DOM). Prefer full HTML "
+                        "documents or fragments with <script> for animations/canvas. "
+                        "Do not use this for ordinary forms."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "fallback_text": {"type": "string"},
+                            "card_id": {"type": "string"},
+                            "version": {"type": "integer", "minimum": 1, "maximum": 10_000},
+                            "preferred_height": {
+                                "type": "integer",
+                                "minimum": 120,
+                                "maximum": 900,
+                            },
+                            "preview_html": {"type": "string"},
+                            "goal_id": {"type": "string"},
+                            "node_id": {"type": "string"},
+                        },
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    @staticmethod
+    def _clock_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": (
+                        "Return the authoritative current date and time from the "
+                        "LearnGraph host clock. Use this whenever the user asks about "
+                        "today, now, weekdays, deadlines, or any time-sensitive fact "
+                        "instead of guessing from training data. Optional IANA timezone "
+                        f"(default {DEFAULT_CLOCK_TIMEZONE})."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "timezone": {
+                                "type": "string",
+                                "description": (
+                                    "IANA timezone name such as Asia/Shanghai or UTC"
+                                ),
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def _provider_tool_definitions(self) -> list[dict[str, Any]]:
+        """D-084: discover model/provider capabilities; manage when authorized."""
+
+        definitions: list[dict[str, Any]] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_providers",
+                    "description": (
+                        "List Providers configured in this workspace (model, search, "
+                        "fetch, transcription, image, etc.). Never returns API keys — "
+                        "only masked metadata, health, and declared capabilities."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "description": (
+                                    "Optional filter: model | image_generation | vision | "
+                                    "search | fetch | deep_research | memory | transcription"
+                                ),
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_provider_models",
+                    "description": (
+                        "Discover or list models for one Provider. Non-model roles "
+                        "return a clear error. Use before choosing thinking/search/vision."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "provider_id": {"type": "string"},
+                        },
+                        "required": ["provider_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_model_capabilities",
+                    "description": (
+                        "Read the saved capability snapshot for a model "
+                        "(reasoning efforts, search route, image input, etc.)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "provider_id": {"type": "string"},
+                            "model_id": {"type": "string"},
+                        },
+                        "required": ["provider_id", "model_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_secret_store_status",
+                    "description": (
+                        "Read Secret Store availability and active key version. "
+                        "Never returns secrets."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+        if not self.can_manage_providers:
+            return definitions
+        definitions.extend(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "create_provider",
+                        "description": (
+                            "Create a Provider configuration in this workspace. "
+                            "Requires workspace.manage. Optional api_key is stored only "
+                            "in the server Secret Store; the tool result never echoes it."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "display_name": {"type": "string"},
+                                "provider_type": {"type": "string"},
+                                "base_url": {"type": "string"},
+                                "api_key": {"type": "string"},
+                                "capabilities": {"type": "object"},
+                            },
+                            "required": ["display_name", "provider_type"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "update_provider",
+                        "description": (
+                            "Update enablement, base_url, default models, or headers. "
+                            "Requires workspace.manage."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                                "enabled": {"type": "boolean"},
+                                "base_url": {"type": "string"},
+                                "default_model": {"type": "string"},
+                                "default_image_generation_model_id": {"type": "string"},
+                                "default_transcription_model_id": {"type": "string"},
+                                "default_vision_model_id": {"type": "string"},
+                            },
+                            "required": ["provider_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "rotate_provider_secret",
+                        "description": (
+                            "Replace the encrypted API key for a Provider. "
+                            "Requires workspace.manage. The new key is never returned."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                                "api_key": {"type": "string"},
+                            },
+                            "required": ["provider_id", "api_key"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "delete_provider",
+                        "description": (
+                            "Permanently delete a Provider and its encrypted secret. "
+                            "Requires workspace.manage. Confirm with the user first."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                            },
+                            "required": ["provider_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "put_model_capabilities",
+                        "description": (
+                            "Create or replace a model capability snapshot "
+                            "(thinking, search, image input). Requires workspace.manage."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                                "model_id": {"type": "string"},
+                                "reasoning_efforts": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ["low", "medium", "high", "xhigh"],
+                                    },
+                                },
+                                "default_thinking_mode": {
+                                    "type": "string",
+                                    "enum": ["off", "low", "medium", "high", "xhigh"],
+                                },
+                                "hosted_web_search": {"type": "boolean"},
+                                "supports_image_input": {"type": "boolean"},
+                                "image_input_mode": {
+                                    "type": "string",
+                                    "enum": ["native", "external_vision", "auto"],
+                                },
+                                "default_search_route": {
+                                    "type": "string",
+                                    "enum": [
+                                        "disabled",
+                                        "model_native",
+                                        "external",
+                                        "local",
+                                        "auto",
+                                    ],
+                                },
+                            },
+                            "required": ["provider_id", "model_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+            ]
+        )
+        return definitions
+
+    def _image_tool_definitions(self) -> list[dict[str, Any]]:
+        default_provider_id = (
+            getattr(self.image_provider, "provider_id", None) or "workspace default"
+        )
+        default_model_id = (
+            getattr(self.image_provider, "model_id", None) or "workspace default"
+        )
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "generate_image",
+                    "description": (
+                        "Generate an image from a natural-language prompt using the "
+                        "workspace image generation Provider. Use only when the user "
+                        "explicitly asks for a picture, diagram, illustration, or "
+                        "visual. By default OMIT provider_id and model_id: the tool "
+                        f"will use the configured default image model "
+                        f"{default_provider_id}/{default_model_id}. Specify them only "
+                        "when deliberately choosing another configured, enabled image "
+                        "model after inspecting Provider models. Returns a durable "
+                        "file_id the chat UI can render."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_AGENT_IMAGE_PROMPT_CHARS,
+                                "description": (
+                                    "Detailed image description in the user's language."
+                                ),
+                            },
+                            "title": {
+                                "type": "string",
+                                "maxLength": 120,
+                                "description": "Optional short display title for the image.",
+                            },
+                            "provider_id": {
+                                "type": "string",
+                                "description": (
+                                    "Optional configured image Provider ID. Omit to use "
+                                    "the workspace default image Provider."
+                                ),
+                            },
+                            "model_id": {
+                                "type": "string",
+                                "description": (
+                                    "Optional configured and enabled image-generation "
+                                    "model ID. Omit to use the default image model."
+                                ),
+                            },
+                        },
+                        "required": ["prompt"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    @staticmethod
+    def _web_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_web",
+                    "description": (
+                        "Search the web through the user-authorized LearnGraph "
+                        "SearchProvider. Use this only when current information or "
+                        "external sources are needed."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "A concise web search query.",
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "parallel_web_research",
+                    "description": (
+                        "Run 2 to 4 independent web-research child tasks in parallel "
+                        "through the authorized SearchProvider, then return their "
+                        "separate source sets to the parent Agent. Use for genuinely "
+                        "independent research angles; do not use it for one query."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "tasks": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "minItems": 2,
+                                "maxItems": MAX_PARALLEL_RESEARCH_CHILDREN,
+                                "description": "Independent concise search queries.",
+                            }
+                        },
+                        "required": ["tasks"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def execute(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        allowed_domains: list[str],
+        chat_session_id: str,
+        assistant_message_id: str | None = None,
+        assistant_version_id: str | None = None,
+        source_message_id: str | None = None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return self._failure("invalid_tool_call", "Tool call is malformed")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            return self._failure("invalid_tool_call", "Tool call has no function name")
+        try:
+            arguments = self._parse_arguments(function.get("arguments"))
+            if name == "search_session_fragments":
+                if self.session_retrieval is None:
+                    return self._failure(
+                        "session_search_unavailable",
+                        "Session retrieval is unavailable",
+                    )
+                from app.domain.schemas.chat import SessionFragmentSearchRequest
+
+                try:
+                    payload = SessionFragmentSearchRequest.model_validate(arguments)
+                except Exception as exc:
+                    raise AppError(
+                        422,
+                        "invalid_tool_arguments",
+                        "search_session_fragments arguments are invalid",
+                        {"validation_error": str(exc)},
+                    ) from exc
+                response = self.session_retrieval.search(
+                    current_session_id=chat_session_id,
+                    payload=payload,
+                )
+                result = response.model_dump(mode="json", by_alias=True)
+                return self._success(
+                    result,
+                    {
+                        "hit_count": len(response.hits),
+                        "retrieval_strategy": response.retrieval_strategy,
+                    },
+                    [],
+                )
+            if name in {
+                "search_conversation_history",
+                "read_conversation_segment",
+                "get_memory_evidence",
+                "propose_memory_draft",
+            }:
+                return self._execute_memory_tool(name, arguments, chat_session_id=chat_session_id)
+            if name == "get_current_time":
+                result = self._get_current_time(arguments)
+                return self._success(
+                    result,
+                    {
+                        "timezone": result["timezone"],
+                        "utc_offset": result["utc_offset"],
+                    },
+                    [],
+                )
+            if name in {
+                "canvas_get_render_contract",
+                "canvas_emit_trusted_component",
+                "canvas_emit_magic_card",
+            }:
+                return self._execute_canvas_tool(name, arguments, chat_session_id=chat_session_id)
+            if name == "lg_graph_propose_change":
+                return self._execute_graph_proposal_tool(
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    source_message_id=source_message_id,
+                )
+            if name in {
+                "list_providers",
+                "list_provider_models",
+                "get_model_capabilities",
+                "get_secret_store_status",
+                "create_provider",
+                "update_provider",
+                "rotate_provider_secret",
+                "delete_provider",
+                "put_model_capabilities",
+            }:
+                return self._execute_provider_tool(name, arguments)
+            if name == "search_web":
+                result, sources = self._search(arguments, allowed_domains)
+                return self._success(
+                    result,
+                    {"query": result["query"], "result_count": len(sources)},
+                    sources,
+                )
+            if name == "generate_image":
+                return self._execute_generate_image(
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    assistant_version_id=assistant_version_id,
+                    source_message_id=source_message_id,
+                )
+            if name == "parallel_web_research":
+                result, sources = self._parallel_web_research(arguments, allowed_domains)
+                return self._success(result, {"child_runs": result["child_runs"]}, sources)
+            if name.startswith("sandbox_"):
+                if self.sandbox is None:
+                    return self._failure("sandbox_agent_unavailable", "Sandbox Agent tools are unavailable")
+                result = self.sandbox.execute_agent_tool(
+                    name,
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    agent_authorized=self.sandbox_authorized,
+                )
+                status = str(result.get("status") or "completed")
+                if status not in {"completed", "ready"} and name == "sandbox_exec":
+                    return self._failure(
+                        str(result.get("error_class") or "sandbox_execution_failed"),
+                        str(result.get("stderr") or result.get("error_class") or "Sandbox command failed"),
+                        data=result,
+                    )
+                meta: dict[str, Any] = {
+                    "sandbox": True,
+                    "sandbox_session_id": result.get("sandbox_session_id"),
+                }
+                if isinstance(result.get("artifact"), dict):
+                    meta["artifact"] = result["artifact"]
+                if isinstance(result.get("part"), dict):
+                    meta["artifact"] = result["part"]
+                if isinstance(result.get("summary"), dict):
+                    meta["summary"] = result["summary"]
+                if result.get("file_id"):
+                    meta["file_id"] = result.get("file_id")
+                return self._success(result, meta, [])
+            result = self.extensions.invoke_agent_function(name, arguments)
+            return self._success(
+                result,
+                {
+                    "extension_invocation_id": result.get("invocation_id"),
+                    "target_type": result.get("target_type"),
+                },
+                [],
+            )
+        except AppError as exc:
+            return self._failure(exc.code, exc.message, data=exc.details or {})
+        except Exception:
+            # Do not leak transport, provider, SQL, or sandbox implementation
+            # details into an Agent transcript.  The authoritative traceback
+            # remains in server logs; the persisted audit record identifies the
+            # target tool and safe failure class.
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="agent.tool.unexpected_failure",
+                resource_type="agent_tool",
+                resource_id=name,
+                outcome="failure",
+            )
+            self.extensions.db.commit()
+            return self._failure("agent_tool_failed", "The authorized tool failed")
+
+    def _execute_graph_proposal_tool(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        assistant_message_id: str | None,
+        source_message_id: str | None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Persist an inert graph change set from the current Agent turn."""
+
+        if not assistant_message_id or not source_message_id:
+            raise AppError(
+                409,
+                "graph_proposal_message_context_missing",
+                "A graph proposal requires the current persisted user and assistant messages",
+            )
+
+        from sqlalchemy import select
+
+        from app.domain.models import ChatSession, Goal, Graph, Message
+        from app.domain.schemas.graphs import (
+            GraphChangeSetView,
+            ModelConversationGraphProposal,
+        )
+        from app.services.graph_changes import GraphChangeSetService
+
+        db = self.extensions.db
+        session = db.scalar(
+            select(ChatSession).where(
+                ChatSession.workspace_id == self.workspace_id,
+                ChatSession.id == chat_session_id,
+            )
+        )
+        if session is None:
+            raise AppError(404, "session_not_found", "Session was not found")
+        if session.goal_id is None:
+            raise AppError(
+                409,
+                "goal_required_for_graph",
+                "Bind a confirmed Goal to this session before proposing a graph",
+            )
+        goal = db.scalar(
+            select(Goal).where(
+                Goal.workspace_id == self.workspace_id,
+                Goal.id == session.goal_id,
+            )
+        )
+        if goal is None:
+            raise AppError(404, "goal_not_found", "The session Goal was not found")
+        if goal.status not in {"confirmed", "candidate_ready", "approved"}:
+            raise AppError(
+                409,
+                "goal_not_confirmed_for_graph",
+                "Confirm the Goal before proposing a graph",
+            )
+
+        graph = None
+        mode = "create"
+        base_revision = 0
+        if session.graph_id:
+            graph = db.scalar(
+                select(Graph).where(
+                    Graph.workspace_id == self.workspace_id,
+                    Graph.id == session.graph_id,
+                    Graph.goal_id == goal.id,
+                )
+            )
+            if graph is None:
+                raise AppError(
+                    404,
+                    "graph_not_found",
+                    "The Graph bound to this session was not found",
+                )
+            mode = "update"
+            base_revision = graph.revision
+
+        source_user_message = db.scalar(
+            select(Message).where(
+                Message.workspace_id == self.workspace_id,
+                Message.id == source_message_id,
+                Message.session_id == session.id,
+                Message.role == "user",
+            )
+        )
+        source_assistant_message = db.scalar(
+            select(Message).where(
+                Message.workspace_id == self.workspace_id,
+                Message.id == assistant_message_id,
+                Message.session_id == session.id,
+                Message.role == "assistant",
+            )
+        )
+        if source_user_message is None or source_assistant_message is None:
+            raise AppError(
+                409,
+                "graph_proposal_message_context_invalid",
+                "Graph proposal messages do not belong to the current session",
+            )
+
+        try:
+            proposal = ModelConversationGraphProposal.model_validate(arguments)
+        except Exception as exc:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "Graph proposal arguments are invalid",
+                {"validation_error": str(exc)},
+            ) from exc
+
+        service = GraphChangeSetService(db, self.workspace_id, self.actor_id)
+        service.ensure_can_propose(session.id)
+        item = service.create_proposal(
+            session=session,
+            goal=goal,
+            graph=graph,
+            source_user_message=source_user_message,
+            source_assistant_message=source_assistant_message,
+            mode=mode,
+            base_revision=base_revision,
+            proposal=proposal,
+            provider_trace={
+                "origin": "agent_tool",
+                "tool_name": "lg_graph_propose_change",
+                "source_assistant_message_id": assistant_message_id,
+            },
+        )
+        db.flush()
+        view = GraphChangeSetView.model_validate(item).model_dump(mode="json")
+        component = service.component_data(item)
+        return self._success(
+            {
+                "proposal_id": item.id,
+                "mode": mode,
+                "goal_id": goal.id,
+                "graph_id": graph.id if graph else None,
+                "base_revision": base_revision,
+                "status": item.status,
+                "review_required": True,
+                "proposal": view["proposal"],
+            },
+            {
+                "graph_change_set_id": item.id,
+                "review_required": True,
+                "artifact": {
+                    "type": "component",
+                    "status": "completed",
+                    "data": component,
+                },
+            },
+            [],
+        )
+
+    def _provider_service(self):
+        from app.core.config import get_settings
+        from app.services.management import ProviderService
+
+        settings = self.settings or get_settings()
+        return ProviderService(
+            self.extensions.db,
+            self.workspace_id,
+            self.actor_id,
+            settings,
+        )
+
+    @staticmethod
+    def _provider_public_view(provider: Any, secret_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        meta = secret_meta or {}
+        capabilities = dict(getattr(provider, "capabilities", None) or {})
+        # Never surface secret material or fingerprints to the model.
+        return {
+            "id": provider.id,
+            "display_name": provider.display_name,
+            "provider_type": provider.provider_type,
+            "base_url": provider.base_url,
+            "api_key_masked": provider.api_key_masked,
+            "enabled": bool(provider.enabled),
+            "remote_capability": bool(provider.remote_capability),
+            "status": provider.status,
+            "capabilities": {
+                key: value
+                for key, value in capabilities.items()
+                if key
+                not in {
+                    "secret",
+                    "api_key",
+                    "authorization",
+                    "secret_fingerprint",
+                }
+            },
+            "secret_status": meta.get("secret_status"),
+            "secret_version": meta.get("secret_version"),
+            "secret_key_provider": meta.get("secret_key_provider"),
+            "secret_key_version": meta.get("secret_key_version"),
+        }
+
+    def _require_provider_manage(self) -> None:
+        if not self.can_manage_providers:
+            raise AppError(
+                403,
+                "permission_denied",
+                "Permission 'workspace.manage' is required for Provider write tools",
+            )
+
+    def _execute_provider_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from app.domain.schemas.management import (
+            ProviderCreateRequest,
+            ProviderModelCapabilityUpdateRequest,
+            ProviderSecretRotateRequest,
+            ProviderUpdateRequest,
+        )
+        from app.providers.catalog import provider_type_spec
+        from pydantic import SecretStr
+
+        service = self._provider_service()
+        if name == "list_providers":
+            role_filter = arguments.get("role")
+            secret_meta = service.secret_metadata()
+            items = []
+            for provider in service.list():
+                capabilities = dict(provider.capabilities or {})
+                role = capabilities.get("provider_role")
+                if not role:
+                    spec = provider_type_spec(provider.provider_type)
+                    role = spec.role if spec is not None else None
+                if isinstance(role_filter, str) and role_filter.strip():
+                    if role != role_filter.strip():
+                        continue
+                items.append(
+                    self._provider_public_view(
+                        provider,
+                        secret_meta.get(provider.id),
+                    )
+                    | {"role": role}
+                )
+            return self._success(
+                {"providers": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+        if name == "list_provider_models":
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(422, "invalid_tool_arguments", "provider_id is required")
+            result = service.models(provider_id)
+            return self._success(result, {"tool": name, "provider_id": provider_id}, [])
+        if name == "get_model_capabilities":
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            model_id = str(arguments.get("model_id") or "").strip()
+            if not provider_id or not model_id:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and model_id are required",
+                )
+            result = service.model_capabilities(provider_id, model_id)
+            return self._success(
+                result,
+                {"tool": name, "provider_id": provider_id, "model_id": model_id},
+                [],
+            )
+        if name == "get_secret_store_status":
+            result = service.secret_store_status()
+            return self._success(result, {"tool": name}, [])
+        if name == "create_provider":
+            self._require_provider_manage()
+            payload = ProviderCreateRequest(
+                display_name=str(arguments.get("display_name") or "").strip(),
+                provider_type=str(arguments.get("provider_type") or "").strip(),
+                base_url=(
+                    str(arguments["base_url"]).strip()
+                    if isinstance(arguments.get("base_url"), str)
+                    else None
+                ),
+                api_key=(
+                    SecretStr(str(arguments["api_key"]))
+                    if arguments.get("api_key")
+                    else None
+                ),
+                capabilities=(
+                    arguments.get("capabilities")
+                    if isinstance(arguments.get("capabilities"), dict)
+                    else {}
+                ),
+            )
+            provider = service.create(payload)
+            secret_meta = service.secret_metadata().get(provider.id)
+            return self._success(
+                self._provider_public_view(provider, secret_meta),
+                {"tool": name, "provider_id": provider.id, "mutated": True},
+                [],
+            )
+        if name == "update_provider":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(422, "invalid_tool_arguments", "provider_id is required")
+            update_fields = {
+                key: arguments[key]
+                for key in (
+                    "enabled",
+                    "base_url",
+                    "default_model",
+                    "default_image_generation_model_id",
+                    "default_transcription_model_id",
+                    "default_vision_model_id",
+                )
+                if key in arguments and arguments[key] is not None
+            }
+            payload = ProviderUpdateRequest(**update_fields)
+            provider = service.update(provider_id, payload)
+            secret_meta = service.secret_metadata().get(provider.id)
+            return self._success(
+                self._provider_public_view(provider, secret_meta),
+                {"tool": name, "provider_id": provider.id, "mutated": True},
+                [],
+            )
+        if name == "rotate_provider_secret":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            api_key = arguments.get("api_key")
+            if not provider_id or not isinstance(api_key, str) or not api_key.strip():
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and api_key are required",
+                )
+            result = service.rotate_secret(
+                provider_id,
+                ProviderSecretRotateRequest(api_key=SecretStr(api_key)),
+            )
+            # rotate_secret returns lifecycle metadata without plaintext.
+            safe = {
+                key: result.get(key)
+                for key in (
+                    "provider_id",
+                    "api_key_masked",
+                    "status",
+                    "secret_version",
+                    "key_version",
+                    "rotated_at",
+                    "revoked_at",
+                )
+            }
+            return self._success(
+                safe,
+                {"tool": name, "provider_id": provider_id, "mutated": True},
+                [],
+            )
+        if name == "delete_provider":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(422, "invalid_tool_arguments", "provider_id is required")
+            result = service.delete(provider_id)
+            return self._success(
+                result,
+                {"tool": name, "provider_id": provider_id, "mutated": True},
+                [],
+            )
+        if name == "put_model_capabilities":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            model_id = str(arguments.get("model_id") or "").strip()
+            if not provider_id or not model_id:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and model_id are required",
+                )
+            capability_fields = {
+                key: arguments[key]
+                for key in (
+                    "reasoning_efforts",
+                    "default_thinking_mode",
+                    "hosted_web_search",
+                    "supports_image_input",
+                    "image_input_mode",
+                    "default_search_route",
+                )
+                if key in arguments and arguments[key] is not None
+            }
+            payload = ProviderModelCapabilityUpdateRequest(**capability_fields)
+            result = service.update_model_capabilities(provider_id, model_id, payload)
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "mutated": True,
+                },
+                [],
+            )
+        raise AppError(404, "unknown_provider_tool", f"Unknown provider tool: {name}")
+
+    def _execute_canvas_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from app.services.canvas_cards import (
+            build_magic_card_part,
+            build_trusted_component_part,
+            get_render_contract,
+        )
+
+        if name == "canvas_get_render_contract":
+            contract = get_render_contract(arguments if isinstance(arguments, dict) else None)
+            return self._success(
+                contract,
+                {
+                    "canvas": True,
+                    "tool": name,
+                    "slot": contract.get("slot"),
+                    "available_width": contract.get("available_width"),
+                },
+                [],
+            )
+        if name == "canvas_emit_trusted_component":
+            component_type = arguments.get("component_type")
+            props = arguments.get("props")
+            if not isinstance(component_type, str) or not component_type:
+                raise AppError(422, "invalid_tool_arguments", "component_type is required")
+            if not isinstance(props, dict):
+                raise AppError(422, "invalid_tool_arguments", "props must be an object")
+            allowed_events = arguments.get("allowed_events")
+            if allowed_events is not None and not isinstance(allowed_events, list):
+                raise AppError(422, "invalid_tool_arguments", "allowed_events must be an array")
+            part = build_trusted_component_part(
+                component_type=component_type,
+                props=props,
+                component_id=arguments.get("component_id")
+                if isinstance(arguments.get("component_id"), str)
+                else None,
+                allowed_events=[str(item) for item in allowed_events]
+                if isinstance(allowed_events, list)
+                else None,
+                schema_version=arguments.get("schema_version")
+                if isinstance(arguments.get("schema_version"), str)
+                else "1.0",
+            )
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="canvas.emit_trusted_component",
+                resource_type="chat_session",
+                resource_id=chat_session_id,
+                details={
+                    "component_type": component_type,
+                    "component_id": (part.get("data") or {}).get("component_id"),
+                },
+            )
+            self.extensions.db.commit()
+            return self._success(
+                {
+                    "published": True,
+                    "channel": "declarative",
+                    "component_type": component_type,
+                    "part_type": "component",
+                    "component_id": (part.get("data") or {}).get("component_id"),
+                },
+                {
+                    "canvas": True,
+                    "tool": name,
+                    "artifact": part,
+                },
+                [],
+            )
+        if name == "canvas_emit_magic_card":
+            title = arguments.get("title")
+            if not isinstance(title, str) or not title.strip():
+                raise AppError(422, "invalid_tool_arguments", "title is required")
+            scope: dict[str, Any] = {}
+            if isinstance(arguments.get("goal_id"), str):
+                scope["goal_id"] = arguments["goal_id"]
+            if isinstance(arguments.get("node_id"), str):
+                scope["node_id"] = arguments["node_id"]
+            part = build_magic_card_part(
+                title=title.strip(),
+                fallback_text=arguments.get("fallback_text")
+                if isinstance(arguments.get("fallback_text"), str)
+                else None,
+                card_id=arguments.get("card_id")
+                if isinstance(arguments.get("card_id"), str)
+                else None,
+                version=int(arguments.get("version") or 1),
+                preferred_height=int(arguments["preferred_height"])
+                if isinstance(arguments.get("preferred_height"), int)
+                else None,
+                preview_html=arguments.get("preview_html")
+                if isinstance(arguments.get("preview_html"), str)
+                else None,
+                scope=scope or None,
+            )
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="canvas.emit_magic_card",
+                resource_type="chat_session",
+                resource_id=chat_session_id,
+                details={
+                    "card_id": (part.get("data") or {}).get("card_id"),
+                    "card_instance_id": (part.get("data") or {}).get("card_instance_id"),
+                    "status": (part.get("data") or {}).get("status"),
+                },
+            )
+            self.extensions.db.commit()
+            return self._success(
+                {
+                    "published": True,
+                    "channel": "react_sandbox",
+                    "runtime_available": bool((part.get("data") or {}).get("origin_verified")),
+                    "part_type": "magic_card",
+                    "card_instance_id": (part.get("data") or {}).get("card_instance_id"),
+                    "status": (part.get("data") or {}).get("status"),
+                    "reason": (part.get("data") or {}).get("reason"),
+                },
+                {
+                    "canvas": True,
+                    "tool": name,
+                    "artifact": part,
+                },
+                [],
+            )
+        return self._failure("unknown_canvas_tool", f"Unknown canvas tool {name}")
+
+    def _execute_memory_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        if self.memory_tools is None:
+            return self._failure("memory_tools_unavailable", "Memory tools are unavailable")
+        if name == "search_conversation_history":
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                raise AppError(422, "invalid_tool_arguments", "query is required")
+            top_k = arguments.get("top_k", 8)
+            if not isinstance(top_k, int):
+                top_k = 8
+            result = self.memory_tools.search_conversation_history(
+                query=query.strip(),
+                goal_id=arguments.get("goal_id") if isinstance(arguments.get("goal_id"), str) else None,
+                session_id=(
+                    arguments.get("session_id")
+                    if isinstance(arguments.get("session_id"), str)
+                    else chat_session_id
+                ),
+                top_k=min(20, max(1, top_k)),
+            )
+            return self._success(result, {"hit_count": len(result.get("hits") or [])}, [])
+        if name == "read_conversation_segment":
+            session_id = arguments.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise AppError(422, "invalid_tool_arguments", "session_id is required")
+            limit = arguments.get("limit", 12)
+            if not isinstance(limit, int):
+                limit = 12
+            result = self.memory_tools.read_conversation_segment(
+                session_id=session_id,
+                around_message_id=(
+                    arguments.get("around_message_id")
+                    if isinstance(arguments.get("around_message_id"), str)
+                    else None
+                ),
+                limit=min(40, max(1, limit)),
+            )
+            return self._success(result, {"message_count": len(result.get("messages") or [])}, [])
+        if name == "get_memory_evidence":
+            memory_id = arguments.get("memory_id")
+            if not isinstance(memory_id, str) or not memory_id:
+                raise AppError(422, "invalid_tool_arguments", "memory_id is required")
+            result = self.memory_tools.get_memory_evidence(memory_id)
+            return self._success(result, {"memory_id": memory_id}, [])
+        if name == "propose_memory_draft":
+            from app.domain.schemas.management import MemoryDraftCreateRequest
+
+            content = arguments.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise AppError(422, "invalid_tool_arguments", "content is required")
+            payload = MemoryDraftCreateRequest(
+                operation=arguments.get("operation") or "CREATE",
+                memory_type=arguments.get("memory_type") or "ai_observation",
+                title=arguments.get("title") or "",
+                content=content.strip(),
+                goal_id=arguments.get("goal_id") if isinstance(arguments.get("goal_id"), str) else None,
+                node_id=arguments.get("node_id") if isinstance(arguments.get("node_id"), str) else None,
+                session_id=arguments.get("session_id")
+                if isinstance(arguments.get("session_id"), str)
+                else chat_session_id,
+                target_memory_id=arguments.get("target_memory_id")
+                if isinstance(arguments.get("target_memory_id"), str)
+                else None,
+                confidence=float(arguments.get("confidence") or 0.55),
+                auto_commit=bool(arguments.get("auto_commit") or False),
+                created_by="learning_agent",
+            )
+            draft = self.memory_tools.create_draft(payload)
+            data = draft.model_dump(mode="json") if hasattr(draft, "model_dump") else dict(draft)
+            return self._success(data, {"draft_id": data.get("id"), "status": data.get("status")}, [])
+        return self._failure("unknown_memory_tool", f"Unknown memory tool {name}")
+
+    @staticmethod
+    def _parse_arguments(raw_arguments: Any) -> dict[str, Any]:
+        if not isinstance(raw_arguments, str):
+            raise AppError(422, "invalid_tool_arguments", "Tool arguments must be a JSON object")
+        try:
+            value = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise AppError(422, "invalid_tool_arguments", "Tool arguments are not valid JSON") from exc
+        if not isinstance(value, dict):
+            raise AppError(422, "invalid_tool_arguments", "Tool arguments must be a JSON object")
+        return value
+
+    @staticmethod
+    def _get_current_time(arguments: dict[str, Any]) -> dict[str, Any]:
+        """Return a host-clock snapshot for the requested IANA timezone."""
+
+        unknown = set(arguments) - {"timezone"}
+        if unknown:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "get_current_time only accepts an optional timezone",
+            )
+        raw_timezone = arguments.get("timezone", DEFAULT_CLOCK_TIMEZONE)
+        if raw_timezone is None or raw_timezone == "":
+            raw_timezone = DEFAULT_CLOCK_TIMEZONE
+        if not isinstance(raw_timezone, str) or not (1 <= len(raw_timezone.strip()) <= 80):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "timezone must be an IANA name such as Asia/Shanghai or UTC",
+            )
+        timezone_name = raw_timezone.strip()
+        if timezone_name.casefold() in {"utc", "z", "gmt"}:
+            timezone_name = "UTC"
+            zone = timezone.utc
+        else:
+            try:
+                zone = ZoneInfo(timezone_name)
+            except ZoneInfoNotFoundError as exc:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    f"Unknown IANA timezone '{timezone_name}'",
+                ) from exc
+        now_local = datetime.now(zone)
+        now_utc = now_local.astimezone(timezone.utc)
+        offset = now_local.utcoffset()
+        if offset is None:
+            utc_offset = "+00:00"
+        else:
+            total_minutes = int(offset.total_seconds() // 60)
+            sign = "+" if total_minutes >= 0 else "-"
+            absolute = abs(total_minutes)
+            utc_offset = f"{sign}{absolute // 60:02d}:{absolute % 60:02d}"
+        return {
+            "timezone": timezone_name,
+            "utc_offset": utc_offset,
+            "iso_local": now_local.isoformat(timespec="seconds"),
+            "iso_utc": now_utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "unix_timestamp": int(now_local.timestamp()),
+            "date": now_local.date().isoformat(),
+            "time": now_local.time().replace(microsecond=0).isoformat(),
+            "weekday": now_local.strftime("%A"),
+            "weekday_zh": (
+                "星期一",
+                "星期二",
+                "星期三",
+                "星期四",
+                "星期五",
+                "星期六",
+                "星期日",
+            )[now_local.weekday()],
+            "source": "learngraph_host_clock",
+        }
+
+    def _search(
+        self,
+        arguments: dict[str, Any],
+        allowed_domains: list[str],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        query = arguments.get("query")
+        if set(arguments) != {"query"} or not isinstance(query, str) or not (1 <= len(query.strip()) <= 500):
+            raise AppError(422, "invalid_tool_arguments", "search_web requires one query from 1 to 500 characters")
+        if not self._search_available:
+            raise AppError(503, "search_provider_unavailable", "SearchProvider is unavailable")
+        domains = {item.strip().casefold() for item in allowed_domains if item.strip()}
+        try:
+            results = self.search_provider.search(query.strip(), 5, allowed_domains=domains or None)
+        except SearchProviderTimeout as exc:
+            raise AppError(504, "search_provider_timeout", "SearchProvider timed out") from exc
+        except SearchProviderError as exc:
+            raise AppError(502, "search_provider_failed", "SearchProvider failed") from exc
+        sources = [item.model_dump(mode="json") for item in results]
+        return (
+            {
+                "query": query.strip(),
+                "results": [
+                    {"title": item["title"], "url": item["url"], "snippet": item["snippet"]}
+                    for item in sources
+                ],
+            },
+            sources,
+        )
+
+    def _parallel_web_research(
+        self,
+        arguments: dict[str, Any],
+        allowed_domains: list[str],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        tasks = arguments.get("tasks")
+        if (
+            set(arguments) != {"tasks"}
+            or not isinstance(tasks, list)
+            or not 2 <= len(tasks) <= MAX_PARALLEL_RESEARCH_CHILDREN
+            or not all(isinstance(task, str) and 1 <= len(task.strip()) <= 500 for task in tasks)
+        ):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "parallel_web_research requires 2 to 4 bounded query strings",
+            )
+        if len({task.strip().casefold() for task in tasks}) != len(tasks):
+            raise AppError(422, "invalid_tool_arguments", "Parallel research tasks must be distinct")
+        parent_run_id = str(uuid4())
+        children: list[dict[str, Any]] = []
+        sources: list[dict[str, Any]] = []
+
+        def run_child(index: int, query: str) -> tuple[int, str, dict[str, Any], list[dict[str, Any]]]:
+            result, child_sources = self._search({"query": query}, allowed_domains)
+            return index, query, result, child_sources
+
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_RESEARCH_CHILDREN, len(tasks))) as executor:
+            futures = {
+                executor.submit(run_child, index, task.strip()): (index, task.strip())
+                for index, task in enumerate(tasks, start=1)
+            }
+            for future in as_completed(futures):
+                index, query = futures[future]
+                child_id = str(uuid4())
+                try:
+                    _, _, result, child_sources = future.result()
+                    children.append(
+                        {
+                            "child_run_id": child_id,
+                            "index": index,
+                            "query": query,
+                            "status": "completed",
+                            "result_count": len(child_sources),
+                            "results": result["results"],
+                        }
+                    )
+                    sources.extend(child_sources)
+                except AppError as exc:
+                    children.append(
+                        {
+                            "child_run_id": child_id,
+                            "index": index,
+                            "query": query,
+                            "status": "failed",
+                            "error_code": exc.code,
+                        }
+                    )
+                except Exception:
+                    # A single provider/runtime fault must not discard the
+                    # completed siblings or expose an internal traceback to
+                    # the model.  The parent remains an auditable aggregate.
+                    children.append(
+                        {
+                            "child_run_id": child_id,
+                            "index": index,
+                            "query": query,
+                            "status": "failed",
+                            "error_code": "search_child_failed",
+                        }
+                    )
+        children.sort(key=lambda item: int(item["index"]))
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="agent.parallel_web_research",
+            resource_type="agent_parent_run",
+            resource_id=parent_run_id,
+            outcome="success" if any(item["status"] == "completed" for item in children) else "failure",
+            details={
+                "child_count": len(children),
+                "completed_children": sum(item["status"] == "completed" for item in children),
+            },
+        )
+        self.extensions.db.commit()
+        return {"parent_run_id": parent_run_id, "child_runs": children}, sources
+
+    def _execute_generate_image(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        assistant_message_id: str | None,
+        assistant_version_id: str | None,
+        source_message_id: str | None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        if not self._image_available or self.image_provider is None or self.settings is None:
+            return self._failure(
+                "image_provider_unavailable",
+                "No usable image generation Provider is configured for this workspace",
+            )
+        if not assistant_message_id or not assistant_version_id:
+            return self._failure(
+                "agent_image_context_missing",
+                "Image generation requires the active assistant message context",
+            )
+        prompt_raw = arguments.get("prompt")
+        if not isinstance(prompt_raw, str) or not prompt_raw.strip():
+            raise AppError(422, "invalid_tool_arguments", "prompt is required")
+        prompt = " ".join(prompt_raw.split())
+        if len(prompt) > MAX_AGENT_IMAGE_PROMPT_CHARS:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                f"prompt must be at most {MAX_AGENT_IMAGE_PROMPT_CHARS} characters",
+            )
+        title_raw = arguments.get("title")
+        title = (
+            " ".join(title_raw.split())[:120]
+            if isinstance(title_raw, str) and title_raw.strip()
+            else prompt[:80]
+        )
+        provider_id_raw = arguments.get("provider_id")
+        model_id_raw = arguments.get("model_id")
+        provider_id = (
+            provider_id_raw.strip()
+            if isinstance(provider_id_raw, str) and provider_id_raw.strip()
+            else None
+        )
+        model_id = (
+            model_id_raw.strip()
+            if isinstance(model_id_raw, str) and model_id_raw.strip()
+            else None
+        )
+        image_provider = self.image_provider
+        if provider_id is not None or model_id is not None:
+            if self.image_provider_resolver is None:
+                return self._failure(
+                    "image_model_selection_unavailable",
+                    "This Agent runtime cannot resolve a selected image model",
+                )
+            image_provider = self.image_provider_resolver(provider_id, model_id)
+        if (
+            image_provider is None
+            or not bool(getattr(image_provider, "available", True))
+            or not bool(getattr(image_provider, "remote_capability", False))
+        ):
+            return self._failure(
+                "image_model_unavailable",
+                "The selected image generation model is not configured and enabled",
+            )
+
+        images = ImageGenerationService(
+            self.extensions.db,
+            self.workspace_id,
+            self.actor_id,
+            self.settings,
+        )
+        task = images.create(
+            session_id=chat_session_id,
+            message_id=assistant_message_id,
+            message_version_id=assistant_version_id,
+            source_message_id=source_message_id or assistant_message_id,
+            provider_id=image_provider.provider_id,
+            model_id=image_provider.model_id,
+            prompt=prompt,
+            commit=False,
+        )
+        images.mark_running(task)
+        final_event = None
+        usage: dict[str, Any] = {}
+        try:
+            for event in image_provider.stream_generate(
+                ImageGenerationRequest(prompt=prompt, partial_images=0)
+            ):
+                if event.type == "completed":
+                    final_event = event
+                    usage = dict(event.usage or {})
+                    break
+            if final_event is None:
+                raise AppError(
+                    502,
+                    "image_generation_incomplete",
+                    "The image Provider stream ended without a final image",
+                )
+            file = images.store_image(
+                task,
+                final_event.image_bytes,
+                final_event.mime_type,
+                partial_index=None,
+                completed=True,
+                provider_trace={
+                    "remote_request_id": getattr(
+                        image_provider, "last_request_id", None
+                    ),
+                    "agent_tool": "generate_image",
+                },
+            )
+        except AppError as exc:
+            images.fail(task, exc.code, exc.message)
+            return self._failure(exc.code, exc.message, data=exc.details or {})
+        except Exception as exc:
+            images.fail(
+                task,
+                "image_generation_failed",
+                str(exc)[:500] or "Image generation failed",
+            )
+            return self._failure(
+                "image_generation_failed",
+                "The authorized image generation Provider failed",
+            )
+
+        part = {
+            "type": "image",
+            "status": "completed",
+            "content": title,
+            "data": {
+                "generation_id": task.id,
+                "provider_id": image_provider.provider_id,
+                "model_id": image_provider.model_id,
+                "file_id": file.id,
+                "mime_type": file.mime_type,
+                "title": title,
+                "alt": prompt[:240],
+                "prompt": prompt,
+                "progress_mode": "completed",
+                "preview_revision": 1,
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+            },
+        }
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="agent.generate_image",
+            resource_type="image_generation_task",
+            resource_id=task.id,
+            details={
+                "chat_session_id": chat_session_id,
+                "message_id": assistant_message_id,
+                "file_id": file.id,
+                "provider_id": image_provider.provider_id,
+                "model_id": image_provider.model_id,
+            },
+        )
+        self.extensions.db.commit()
+        return self._success(
+            {
+                "generated": True,
+                "generation_id": task.id,
+                "file_id": file.id,
+                "mime_type": file.mime_type,
+                "title": title,
+                "prompt": prompt,
+            },
+            {
+                "image": True,
+                "tool": "generate_image",
+                "file_id": file.id,
+                "generation_id": task.id,
+                "artifact": part,
+            },
+            [],
+        )
+
+    def _success(
+        self,
+        data: dict[str, Any],
+        meta: dict[str, Any],
+        sources: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        content, truncated = self._bounded_content(data)
+        return content, {"status": "completed", **meta, "result_truncated": truncated}, sources
+
+    def _failure(
+        self,
+        code: str,
+        message: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        details = data or {}
+        content, truncated = self._bounded_content(
+            {"error": code, "message": message, "details": details}
+        )
+        meta: dict[str, Any] = {
+            "status": "failed",
+            "reason": code,
+            "error_code": code,
+            "error_message": message,
+            "details": details,
+            "result_truncated": truncated,
+        }
+        # Surface structured sandbox authorization challenges to the Chat SSE
+        # assembler so the client can open an explicit grant dialog.
+        if code == "sandbox_auth_required":
+            meta["sandbox_auth_required"] = {
+                "action": details.get("action") or "delete_path",
+                "paths": details.get("paths") or [],
+                "chat_session_id": details.get("chat_session_id"),
+                "affects_host_files": bool(details.get("affects_host_files", False)),
+                "message_zh": details.get("message_zh")
+                or "智能体请求删除会话工作区内的文件；不影响你电脑上的真实文件。",
+            }
+        return content, meta, []
+
+    @staticmethod
+    def _bounded_content(value: dict[str, Any]) -> tuple[str, bool]:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        raw = encoded.encode("utf-8")
+        if len(raw) <= AGENT_TOOL_RESULT_MAX_BYTES:
+            return encoded, False
+        prefix = raw[: AGENT_TOOL_RESULT_MAX_BYTES - 256].decode("utf-8", errors="ignore")
+        return (
+            json.dumps(
+                {
+                    "truncated": True,
+                    "message": "Tool result exceeded the Agent transcript limit",
+                    "preview": prefix,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            True,
+        )

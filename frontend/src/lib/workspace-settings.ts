@@ -1,0 +1,46 @@
+import type { WorkspaceSetting } from "@/types/settings";
+
+export const CHAT_SUGGESTED_PROMPTS_SETTING_KEY = "chat.suggested_prompts";
+export const CHAT_AUTO_TITLE_MODEL_SETTING_KEY = "chat.auto_title_model";
+export const CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY =
+  "chat.suggested_prompts_model";
+export { CHAT_RESPONSE_STYLE_SETTING_KEY } from "@/lib/response-style";
+
+export type ChatFeatureModelSetting = {
+  provider_id: string | null;
+  model_id: string | null;
+};
+
+export function areChatSuggestedPromptsEnabled(
+  settings: WorkspaceSetting[] | undefined,
+): boolean {
+  const value = settings?.find(
+    (setting) => setting.key === CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
+  )?.value;
+
+  if (!value || typeof value !== "object" || !("enabled" in value)) return true;
+  return value.enabled !== false;
+}
+
+export function readChatFeatureModelSetting(
+  settings: WorkspaceSetting[] | undefined,
+  key: string,
+): ChatFeatureModelSetting {
+  const value = settings?.find((setting) => setting.key === key)?.value;
+  if (!value || typeof value !== "object") {
+    return { provider_id: null, model_id: null };
+  }
+  const record = value as Record<string, unknown>;
+  const providerId =
+    typeof record.provider_id === "string" && record.provider_id.trim()
+      ? record.provider_id.trim()
+      : null;
+  const modelId =
+    typeof record.model_id === "string" && record.model_id.trim()
+      ? record.model_id.trim()
+      : null;
+  if (!providerId || !modelId) {
+    return { provider_id: null, model_id: null };
+  }
+  return { provider_id: providerId, model_id: modelId };
+}

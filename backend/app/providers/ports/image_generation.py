@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class ImageGenerationRequest:
+    prompt: str
+    partial_images: int = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ImageGenerationEvent:
+    type: Literal["partial_image", "completed"]
+    image_bytes: bytes
+    mime_type: str
+    partial_index: int | None = None
+    usage: dict[str, int | float] | None = None
+
+
+class ImageGenerationProviderPort(Protocol):
+    provider_id: str
+    provider_type: str
+    model_id: str
+    available: bool
+    remote_capability: bool
+
+    def stream_generate(
+        self, request: ImageGenerationRequest
+    ) -> Iterable[ImageGenerationEvent]: ...

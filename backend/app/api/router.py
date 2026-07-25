@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from app.api.routers import (
+    audit_settings,
+    auth,
+    chat,
+    components,
+    dashboard,
+    document_learning,
+    evidence,
+    exercises,
+    files,
+    goals,
+    graphs,
+    health,
+    image_generations,
+    memory,
+    mcp_skills,
+    migrations,
+    plugins,
+    providers,
+    research,
+    sources,
+    usage,
+    workflow,
+    sandbox,
+)
+
+
+api_router = APIRouter(prefix="/api/v1")
+
+for router in (
+    health.router,
+    auth.router,
+    dashboard.router,
+    goals.router,
+    graphs.router,
+    chat.router,
+    image_generations.router,
+    files.router,
+    document_learning.router,
+    research.router,
+    sources.router,
+    evidence.router,
+    exercises.router,
+    memory.router,
+    mcp_skills.router,
+    providers.router,
+    usage.router,
+    plugins.router,
+    components.router,
+    migrations.router,
+    audit_settings.router,
+    workflow.router,
+    sandbox.router,
+):
+    api_router.include_router(router)

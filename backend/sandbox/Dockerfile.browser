@@ -1,0 +1,19 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont \
+    && npm install --global --omit=dev playwright-core@1.62.0 \
+    && npm cache clean --force
+
+COPY --chown=65532:65532 browser-smoke.js /opt/learngraph/browser-smoke.js
+RUN chmod 0555 /opt/learngraph/browser-smoke.js
+
+ENV NODE_PATH=/usr/local/lib/node_modules \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+USER 65532:65532
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

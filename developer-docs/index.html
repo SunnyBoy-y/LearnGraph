@@ -1,0 +1,930 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="LearnGraph 开发者文档：架构、API 网关、Agent、Tools、Skills、MCP、沙箱、记忆与系统提示词策略。"
+    />
+    <title>LearnGraph Developer Docs</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23171a18'/%3E%3Cpath d='M8 10.5 16 6l8 4.5v9L16 24l-8-4.5zm0 0 8 4.5 8-4.5M16 15v9' fill='none' stroke='white' stroke-width='1.6'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到正文</a>
+
+    <header class="topbar">
+      <a class="brand" href="#overview" aria-label="LearnGraph 开发者文档首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="img">
+            <path d="M8 10.5 16 6l8 4.5v9L16 24l-8-4.5z" />
+            <path d="m8 10.5 8 4.5 8-4.5M16 15v9" />
+          </svg>
+        </span>
+        <span class="brand-name">LearnGraph</span>
+        <span class="brand-divider"></span>
+        <span class="brand-context">开发者文档</span>
+      </a>
+
+      <div class="topbar-actions">
+        <button class="search-trigger" type="button" data-open-search>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"></circle>
+            <path d="m20 20-3.4-3.4"></path>
+          </svg>
+          <span>搜索文档</span>
+          <kbd>⌘ K</kbd>
+        </button>
+        <span class="version-chip">MVP · 当前代码</span>
+        <button class="icon-button menu-button" type="button" data-menu-toggle aria-label="打开章节目录">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="docs-shell">
+      <aside class="sidebar" data-sidebar>
+        <div class="sidebar-scroll">
+          <p class="sidebar-kicker">文档导航</p>
+          <nav class="primary-nav" aria-label="开发者文档章节">
+            <div class="nav-group">
+              <p>开始</p>
+              <a href="#overview" class="is-active">概览</a>
+              <a href="#status-language">实现状态与阅读约定</a>
+              <a href="#quickstart">本地启动</a>
+            </div>
+            <div class="nav-group">
+              <p>核心架构</p>
+              <a href="#architecture">系统架构</a>
+              <a href="#gateway">API 网关与请求边界</a>
+              <a href="#persistence">持久化与事实源</a>
+              <a href="#providers">Provider 层</a>
+            </div>
+            <div class="nav-group">
+              <p>Agent Runtime</p>
+              <a href="#agent">Agent 执行循环</a>
+              <a href="#prompt-strategy">系统提示词策略</a>
+              <a href="#tools">Tool 注册与调用</a>
+              <a href="#skills">Skills</a>
+              <a href="#mcp">MCP</a>
+            </div>
+            <div class="nav-group">
+              <p>运行与数据</p>
+              <a href="#sandbox">沙箱</a>
+              <a href="#memory">记忆系统</a>
+              <a href="#streaming">消息与 SSE</a>
+              <a href="#security">安全与授权</a>
+            </div>
+            <div class="nav-group">
+              <p>开发参考</p>
+              <a href="#repo-map">代码地图</a>
+              <a href="#extension-guide">扩展指南</a>
+              <a href="#verification">验证与完成定义</a>
+            </div>
+          </nav>
+          <div class="sidebar-footer">
+            <span class="live-dot"></span>
+            <span>基于仓库代码与设计共识</span>
+          </div>
+        </div>
+      </aside>
+
+      <main id="main-content" class="content">
+        <section id="overview" class="doc-section hero-section" data-title="概览">
+          <div class="eyebrow"><span></span> Developer platform</div>
+          <h1>理解 LearnGraph<br />从一条真实调用链开始</h1>
+          <p class="hero-lead">
+            LearnGraph 是一个目标驱动、证据驱动的学习图谱智能体。本页描述当前仓库中可验证的架构边界，
+            以及 Agent、Tools、Skills、MCP、沙箱、记忆和系统提示词如何协同工作。
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#architecture">阅读架构</a>
+            <a class="button button-secondary" href="#agent">进入 Agent Runtime</a>
+          </div>
+
+          <div class="loop-visual" aria-label="G-R-E-M-A 学习闭环">
+            <div class="loop-line"></div>
+            <div class="loop-node is-current">
+              <span>G</span>
+              <strong>Goal</strong>
+              <small>结构化目标</small>
+            </div>
+            <div class="loop-node">
+              <span>R</span>
+              <strong>Representation</strong>
+              <small>可审核图谱</small>
+            </div>
+            <div class="loop-node">
+              <span>E</span>
+              <strong>Evidence</strong>
+              <small>可追溯证据</small>
+            </div>
+            <div class="loop-node">
+              <span>M</span>
+              <strong>Mastery</strong>
+              <small>掌握度判断</small>
+            </div>
+            <div class="loop-node">
+              <span>A</span>
+              <strong>Action</strong>
+              <small>下一步行动</small>
+            </div>
+          </div>
+
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>本文档的事实边界</strong>
+              <p>
+                “已注册接口”不等于“外部服务已连通”，“支持 Provider”不等于“当前部署已配置”。
+                文中始终把代码能力、运行配置和真实远程验收分开描述。
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section id="status-language" class="doc-section" data-title="实现状态与阅读约定">
+          <div class="section-heading">
+            <span class="section-index">01</span>
+            <div>
+              <p class="overline">Reading guide</p>
+              <h2>实现状态与阅读约定</h2>
+            </div>
+          </div>
+          <p>
+            LearnGraph 仍处于早期开发阶段。开发者文档采用三种状态词，防止将未来设计或配置入口误解为已完成能力。
+          </p>
+          <div class="definition-list">
+            <div>
+              <span class="status status-current">当前实现</span>
+              <p>可在路由、服务、仓库或 Provider 适配器中追踪到完整调用链，并有持久化模型支撑。</p>
+            </div>
+            <div>
+              <span class="status status-conditional">条件可用</span>
+              <p>代码已接入，但依赖部署配置、外部凭据、Docker 或远程服务；缺失时应显式返回 unavailable。</p>
+            </div>
+            <div>
+              <span class="status status-planned">设计目标</span>
+              <p>仅存在于总体架构或设计 TODO 中，不应作为当前 API 行为或验收结论。</p>
+            </div>
+          </div>
+          <div class="source-strip">
+            <span>事实优先级</span>
+            <code>设计共识</code><i>→</i><code>设计 TODO</code><i>→</i><code>总体架构</code><i>→</i><code>实现 TODO</code><i>→</i><code>OpenAPI / 模型 / 代码</code>
+          </div>
+        </section>
+
+        <section id="quickstart" class="doc-section" data-title="本地启动">
+          <div class="section-heading">
+            <span class="section-index">02</span>
+            <div>
+              <p class="overline">Quick start</p>
+              <h2>本地启动</h2>
+            </div>
+          </div>
+          <p>根目录脚本负责编排 React/Vite 前端与 FastAPI 后端。默认数据库和对象存储均为本地实现。</p>
+          <div class="code-block">
+            <div class="code-header">
+              <span>PowerShell</span>
+              <button type="button" data-copy-code>复制</button>
+            </div>
+            <pre><code><span class="code-comment"># 安装依赖并启动（首次运行）</span>
+npm.cmd run dev:install
+
+<span class="code-comment"># 后续联合启动</span>
+npm.cmd run dev
+
+<span class="code-comment"># 静态检查、现有测试与生产构建</span>
+npm.cmd run check</code></pre>
+          </div>
+          <div class="endpoint-list">
+            <div><span>Web</span><code>http://127.0.0.1:5173</code></div>
+            <div><span>API</span><code>http://127.0.0.1:8000</code></div>
+            <div><span>OpenAPI</span><code>http://127.0.0.1:8000/docs</code></div>
+            <div><span>Health</span><code>/api/v1/health</code></div>
+          </div>
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
+            <div>
+              <strong>默认没有模型回退</strong>
+              <p>
+                未配置模型 Provider 或远程调用失败时，服务必须明确报错。
+                确定性的本地演示 Provider 仅在 <code>LEARNGRAPH_ENABLE_LOCAL_DEMO_PROVIDER=true</code> 时启用，
+                不能作为真实验收证据。
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section id="architecture" class="doc-section" data-title="系统架构">
+          <div class="section-heading">
+            <span class="section-index">03</span>
+            <div>
+              <p class="overline">Architecture</p>
+              <h2>系统架构</h2>
+            </div>
+          </div>
+          <p>
+            当前实现是前后端分离的模块化单体。浏览器只调用 LearnGraph 后端；外部模型、搜索、抓取、研究、Memory、
+            MCP 和存储都由后端经 Port/Adapter 边界访问。
+          </p>
+
+          <div class="architecture-map">
+            <div class="arch-layer arch-client">
+              <div class="arch-label">Client</div>
+              <div class="arch-main">
+                <strong>React 19 · TypeScript · Vite</strong>
+                <span>Router · TanStack Query · React Flow · Streamdown</span>
+              </div>
+            </div>
+            <div class="arch-connector"><span>JSON / SSE</span></div>
+            <div class="arch-layer arch-api">
+              <div class="arch-label">Gateway</div>
+              <div class="arch-main">
+                <strong>FastAPI · <code>/api/v1</code></strong>
+                <span>Bearer Session · Workspace Scope · RBAC / ACL · Error Envelope</span>
+              </div>
+            </div>
+            <div class="arch-connector"><span>typed use cases</span></div>
+            <div class="arch-split">
+              <div class="arch-layer">
+                <div class="arch-label">Domain</div>
+                <div class="arch-main">
+                  <strong>Services + Repositories</strong>
+                  <span>Goal · Graph · Chat · Evidence · Mastery · Memory</span>
+                </div>
+              </div>
+              <div class="arch-layer">
+                <div class="arch-label">Runtime</div>
+                <div class="arch-main">
+                  <strong>Agent + Tool Registry</strong>
+                  <span>Skills · MCP · Sandbox · Provider Gateway</span>
+                </div>
+              </div>
+            </div>
+            <div class="arch-connector"><span>ports</span></div>
+            <div class="arch-split arch-bottom">
+              <div class="arch-layer">
+                <div class="arch-label">Facts</div>
+                <div class="arch-main">
+                  <strong>SQLAlchemy 2 · SQLite</strong>
+                  <span>规范业务事实源</span>
+                </div>
+              </div>
+              <div class="arch-layer">
+                <div class="arch-label">Adapters</div>
+                <div class="arch-main">
+                  <strong>Local + Remote Providers</strong>
+                  <span>Filesystem · HTTP APIs · Docker</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <h3>后端依赖方向</h3>
+          <div class="flow-row" aria-label="后端依赖方向">
+            <span>api / routers</span><i>→</i><span>services</span><i>→</i><span>repositories / domain</span>
+            <b>或</b><span>provider ports</span><i>←</i><span>local / remote adapters</span>
+          </div>
+          <p class="muted">
+            业务服务不直接依赖厂商 SDK。新增外部能力应先定义或复用 Port，再提供适配器、能力探测和明确失败状态。
+          </p>
+          <div class="source-ref">来源：<code>backend/app/main.py</code> · <code>backend/app/api/router.py</code> · <code>backend/app/providers/ports/</code></div>
+        </section>
+
+        <section id="gateway" class="doc-section" data-title="API 网关与请求边界">
+          <div class="section-heading">
+            <span class="section-index">04</span>
+            <div>
+              <p class="overline">Request gateway</p>
+              <h2>API 网关与请求边界</h2>
+            </div>
+          </div>
+          <p>
+            当前仓库没有独立的网关微服务。FastAPI 的统一 <code>/api/v1</code> 路由层就是应用网关：
+            它终止认证、解析工作区作用域、校验权限、稳定错误结构，并把请求交给领域服务。
+          </p>
+
+          <div class="sequence">
+            <div class="sequence-step">
+              <span>01</span>
+              <div><strong>ApiClient</strong><small>添加 Bearer、X-Workspace-ID 与请求 ID</small></div>
+            </div>
+            <div class="sequence-step">
+              <span>02</span>
+              <div><strong>Router / Schema</strong><small>类型化输入、错误边界、HTTP/SSE 契约</small></div>
+            </div>
+            <div class="sequence-step">
+              <span>03</span>
+              <div><strong>Authorization</strong><small>重新校验 Membership、Permission 与资源 ACL</small></div>
+            </div>
+            <div class="sequence-step">
+              <span>04</span>
+              <div><strong>Service</strong><small>编排事务、Provider、审计与幂等策略</small></div>
+            </div>
+            <div class="sequence-step">
+              <span>05</span>
+              <div><strong>Repository / Port</strong><small>持久化事实或显式调用外部能力</small></div>
+            </div>
+          </div>
+
+          <h3>网关职责</h3>
+          <div class="plain-grid">
+            <div><strong>身份</strong><p>正式登录接口签发不透明 Bearer Session；浏览器不持有 Provider Secret。</p></div>
+            <div><strong>作用域</strong><p><code>X-Workspace-ID</code> 只是请求提示，不能替代服务端授权。</p></div>
+            <div><strong>契约</strong><p>普通资源使用 JSON；Chat 使用可恢复 SSE，但消息与事件仍落库。</p></div>
+            <div><strong>失败</strong><p>Provider unavailable、权限拒绝与输入错误必须保持可区分，禁止伪造成功。</p></div>
+          </div>
+
+          <h3>路由域</h3>
+          <div class="route-cloud" aria-label="FastAPI 路由域">
+            <code>auth</code><code>dashboard</code><code>goals</code><code>graphs</code><code>sessions</code>
+            <code>files</code><code>research</code><code>sources</code><code>evidence</code><code>exercises</code>
+            <code>memory</code><code>mcp-skills</code><code>providers</code><code>usage</code><code>plugins</code>
+            <code>components</code><code>migrations</code><code>audit</code><code>workflow</code><code>sandbox</code>
+          </div>
+        </section>
+
+        <section id="persistence" class="doc-section" data-title="持久化与事实源">
+          <div class="section-heading">
+            <span class="section-index">05</span>
+            <div>
+              <p class="overline">Durable facts</p>
+              <h2>持久化与事实源</h2>
+            </div>
+          </div>
+          <p>
+            SQLite 是 MVP 的规范业务事实源。本地文件系统承载默认对象存储和 Markdown Memory 投影，
+            但文件路径、外部 UUID 或 SSE 事件都不能替代数据库中的稳定业务身份。
+          </p>
+          <table>
+            <thead><tr><th>层</th><th>保存内容</th><th>关键边界</th></tr></thead>
+            <tbody>
+              <tr><td>SQLAlchemy / SQLite</td><td>账号、RBAC、Goal、Graph、Session、Evidence、Provider、授权、审计</td><td>当前规范事实源</td></tr>
+              <tr><td>Message timeline</td><td>Message、MessageVersion、MessagePart、SSE 事件、Provider Trace</td><td>SSE 只负责传输</td></tr>
+              <tr><td>Object Storage</td><td>上传文件、生成产物、内容寻址 Blob</td><td>默认本地，可经迁移边界切换</td></tr>
+              <tr><td>Memory projection</td><td>Workspace 隔离的 Markdown 文件树或 Mem0 记录</td><td>Canonical ID/Revision 仍在 SQLite</td></tr>
+            </tbody>
+          </table>
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>迁移不是双写</strong>
+              <p>数据库、对象存储和 Memory Provider 切换需要维护锁、预检、校验、切换点与回滚；不能静默双写或降级。</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="providers" class="doc-section" data-title="Provider 层">
+          <div class="section-heading">
+            <span class="section-index">06</span>
+            <div>
+              <p class="overline">Capability adapters</p>
+              <h2>Provider 层</h2>
+            </div>
+          </div>
+          <p>
+            Provider 是外部能力网关，不是业务事实源。业务层依赖 Protocol 定义的 Port；
+            适配器负责协议差异、探测、超时、限额和 Provider Trace。
+          </p>
+          <div class="capability-rows">
+            <div><span>Model</span><strong>OpenAI Responses · OpenAI-compatible Chat · Anthropic Messages · DeepSeek</strong><small>统一为 ProviderChatMessage / ProviderStreamEvent</small></div>
+            <div><span>Search</span><strong>SearXNG · Cloud / AnySearch</strong><small>搜索不可用时显式失败，不生成来源</small></div>
+            <div><span>Fetch</span><strong>Crawl4AI HTTP · Firecrawl</strong><small>URL 安全校验、超时和响应结构限制</small></div>
+            <div><span>Research</span><strong>Deep Research HTTP</strong><small>独立 Provider，不与普通搜索混淆</small></div>
+            <div><span>Memory</span><strong>Local Markdown · Mem0 Platform</strong><small>Provider Binding 可重建，Stable ID 不变</small></div>
+            <div><span>Storage</span><strong>Local filesystem · MinIO</strong><small>通过迁移流程切换</small></div>
+            <div><span>Sandbox</span><strong>Docker backend</strong><small>无 Docker 时明确 unavailable，不落回宿主执行</small></div>
+          </div>
+          <h3>模型消息抽象</h3>
+          <p>
+            <code>ProviderChatMessage</code> 保留 <code>system/user/assistant/tool</code> 角色、tool calls、reasoning summary
+            与协议原生 response items。原生 continuation state 作为不透明数据保存，不能被业务层臆造或跨协议消费。
+          </p>
+          <div class="source-ref">来源：<code>backend/app/providers/ports/model.py</code> · <code>backend/app/providers/remote/</code></div>
+        </section>
+
+        <section id="agent" class="doc-section" data-title="Agent 执行循环">
+          <div class="section-heading">
+            <span class="section-index">07</span>
+            <div>
+              <p class="overline">Agent runtime</p>
+              <h2>Agent 执行循环</h2>
+            </div>
+          </div>
+          <p>
+            Agent 模式是在持久化 Chat Session 上运行的受控工具循环。模型决定是否发起工具调用，
+            但工具可见性、授权、执行、结果裁剪、审计和持久化均由 LearnGraph 控制。
+          </p>
+
+          <div class="agent-loop">
+            <div class="agent-center"><span>Agent</span><small>model turn</small></div>
+            <div class="orbit orbit-1"><span>1</span><strong>编译上下文</strong><small>system + scope + history</small></div>
+            <div class="orbit orbit-2"><span>2</span><strong>注册工具</strong><small>capability + grant</small></div>
+            <div class="orbit orbit-3"><span>3</span><strong>流式推理</strong><small>text / reasoning summary</small></div>
+            <div class="orbit orbit-4"><span>4</span><strong>执行调用</strong><small>validate + audit</small></div>
+            <div class="orbit orbit-5"><span>5</span><strong>回填结果</strong><small>tool role message</small></div>
+            <div class="orbit orbit-6"><span>6</span><strong>完成回答</strong><small>persist + SSE</small></div>
+          </div>
+
+          <h3>一次 Agent Turn</h3>
+          <ol class="steps">
+            <li><span>01</span><div><strong>持久化用户输入</strong><p>用户消息、附件引用、所选节点与 Session 绑定先成为可追踪事实。</p></div></li>
+            <li><span>02</span><div><strong>构建授权上下文</strong><p>只加入本次允许访问的节点、文件、选区、Memory 和 Skill 指令；文档片段被标记为不可信参考数据。</p></div></li>
+            <li><span>03</span><div><strong>计算工具注册表</strong><p>内置工具按角色开放；声明式 Skill 与 MCP 还必须具有 enabled 状态和持久 <code>always</code> Grant。</p></div></li>
+            <li><span>04</span><div><strong>调用模型 Provider</strong><p>适配器把结构化消息与 JSON Schema 工具定义发送给已配置远程模型。</p></div></li>
+            <li><span>05</span><div><strong>受控执行 Tool Call</strong><p>服务端解析参数、重新校验作用域与授权、执行领域服务或 Provider，并保存 Invocation / Audit。</p></div></li>
+            <li><span>06</span><div><strong>继续或结束</strong><p>工具结果作为 <code>tool</code> 消息回填；模型可继续调用工具，最终文本和所有 MessagePart 一并持久化。</p></div></li>
+          </ol>
+
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
+            <div>
+              <strong>Agent 不能直接修改正式目标图谱</strong>
+              <p>
+                <code>lg_graph_propose_change</code> 只创建可审核的 GraphChangeSet 与组件，
+                不改变已发布图谱；Evidence 由 Agent 写入时保持 <code>pending</code>，不会直接授予 mastery。
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section id="prompt-strategy" class="doc-section" data-title="系统提示词策略">
+          <div class="section-heading">
+            <span class="section-index">08</span>
+            <div>
+              <p class="overline">Prompt compiler</p>
+              <h2>系统提示词策略</h2>
+            </div>
+          </div>
+          <p>
+            提示词由多个 system message 分层编译，而不是把所有内容拼成无法审计的单块文本。
+            核心规则稳定，工作区风格和本次授权上下文动态注入。
+          </p>
+
+          <div class="prompt-stack">
+            <div class="prompt-layer is-core">
+              <span>优先级 1</span>
+              <div><strong>Core Instructions</strong><p>身份、真实性、安全、隐私、指令优先级与通用回答行为。</p></div>
+            </div>
+            <div class="prompt-layer">
+              <span>优先级 2</span>
+              <div><strong>Response Style</strong><p>基础风格 + 温和、热情、标题、Emoji、详细度五个离散特征。</p></div>
+            </div>
+            <div class="prompt-layer">
+              <span>优先级 3</span>
+              <div><strong>Mode & Tool Policy</strong><p>普通 Chat 禁止工具；Agent 模式允许使用本次注册的函数。</p></div>
+            </div>
+            <div class="prompt-layer">
+              <span>优先级 4</span>
+              <div><strong>Agent Stream Guidance</strong><p>工具前给简短可见说明，工具后可更新进展，结束时给完整答案。</p></div>
+            </div>
+            <div class="prompt-layer">
+              <span>优先级 5</span>
+              <div><strong>Authorized Context</strong><p>选中节点、附件、文档选区、Memory 与最多 8 个已授权 Skill 包。</p></div>
+            </div>
+            <div class="prompt-layer">
+              <span>优先级 6</span>
+              <div><strong>Durable History + User Turn</strong><p>协议有效的历史消息、必要的上下文压缩，以及当前用户输入。</p></div>
+            </div>
+          </div>
+
+          <h3>风格策略</h3>
+          <p>
+            工作区可选择 <code>default</code>、<code>professional</code>、<code>friendly</code>、<code>candid</code>、
+            <code>efficient</code>、<code>exploratory</code>、<code>quirky</code> 或 <code>cynical</code>。
+            五个附加特征均使用 <code>-2…2</code>。风格只控制表达方式，不得改变事实、工具权限或用户当前明确格式。
+          </p>
+
+          <h3>提示词注入防线</h3>
+          <div class="plain-grid">
+            <div><strong>参考数据降权</strong><p>文档与网页摘录明确视为不可信参考，不作为系统指令。</p></div>
+            <div><strong>授权上下文</strong><p>只注入当前用户和工作区有权读取、且与本轮相关的内容。</p></div>
+            <div><strong>Skill 限额</strong><p>单包最多 8,000 字符、每轮最多 8 个；脚本不会因提示词自动执行。</p></div>
+            <div><strong>上下文压缩</strong><p>接近窗口阈值时保留协议有效的最近后缀，旧事务用持久摘要表达。</p></div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/prompts/fragments.py</code> · <code>backend/app/prompts/compiler.py</code> · <code>backend/app/services/chat.py</code></div>
+        </section>
+
+        <section id="tools" class="doc-section" data-title="Tool 注册与调用">
+          <div class="section-heading">
+            <span class="section-index">09</span>
+            <div>
+              <p class="overline">Tool registry</p>
+              <h2>Tool 注册与调用</h2>
+            </div>
+          </div>
+          <p>
+            Tool 是给模型看的 JSON Schema 函数定义与服务端执行器的配对。注册本身无副作用；
+            只有模型输出 tool call 后才进入参数校验、权限检查和执行。
+          </p>
+          <table>
+            <thead><tr><th>工具族</th><th>代表能力</th><th>写入边界</th></tr></thead>
+            <tbody>
+              <tr><td>会话与时间</td><td>检索 Session 片段、读取历史区段、读取当前时区时间</td><td>只读</td></tr>
+              <tr><td>图谱</td><td>读取目标/能力图谱、候选节点更新、提出图谱变更</td><td>正式图谱须用户审核</td></tr>
+              <tr><td>学习闭环</td><td>路线读取/重规划、行动计划、Mastery 读取、Evidence 草稿</td><td>Evidence 只写 pending</td></tr>
+              <tr><td>记忆</td><td>检索会话证据、读取记忆证据、提出 Memory Draft</td><td>草稿与正式记忆分离</td></tr>
+              <tr><td>Provider</td><td>列 Provider/模型、能力查询、配置与 Secret 轮换</td><td>管理写入要求 workspace.manage</td></tr>
+              <tr><td>Web</td><td><code>search_web</code>、<code>parallel_web_research</code></td><td>仅在 SearchProvider 可用时注册</td></tr>
+              <tr><td>内容产物</td><td>图片生成、可信组件、Magic Card、沙箱文件 Artifact</td><td>不允许任意代码进入宿主 DOM</td></tr>
+              <tr><td>扩展</td><td>声明式 Skill、已授权 MCP 工具</td><td>沿用各自 Grant 与 Invocation 边界</td></tr>
+            </tbody>
+          </table>
+
+          <h3>调用结果</h3>
+          <p>
+            执行器返回规范化的成功或失败对象，并可附带来源、Artifact、Extension Invocation ID、Sandbox Session ID
+            等安全元数据。意外异常不会把 SQL、HTTP、Provider 或沙箱实现细节泄露给模型；权威堆栈保留在服务端日志。
+          </p>
+          <div class="code-block">
+            <div class="code-header"><span>Normalized tool result</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "status": "completed",
+  "data": { "…": "domain result" },
+  "meta": {
+    "extension_invocation_id": "…",
+    "source_count": 3
+  }
+}</code></pre>
+          </div>
+        </section>
+
+        <section id="skills" class="doc-section" data-title="Skills">
+          <div class="section-heading">
+            <span class="section-index">10</span>
+            <div>
+              <p class="overline">Instruction & workflow extensions</p>
+              <h2>Skills</h2>
+            </div>
+          </div>
+          <p>
+            LearnGraph 区分两类 Skill。它们的安装、授权和运行语义不同，不能把文件包中的脚本当作自动 Tool。
+          </p>
+          <div class="compare">
+            <div>
+              <span class="compare-label">Agent Skill Package</span>
+              <h3>指令型文件包</h3>
+              <ul>
+                <li>至少包含 <code>SKILL.md</code></li>
+                <li>启用且具有 <code>always</code> Grant 后按需注入 system context</li>
+                <li><code>scripts/*</code> 不注册为函数工具</li>
+                <li>脚本仅可通过 Docker 无网 <code>sandbox-run</code> 显式试运行</li>
+                <li>文件按 ContentBlob 内容寻址保存，禁止绝对路径与 <code>..</code></li>
+              </ul>
+            </div>
+            <div>
+              <span class="compare-label">Declarative Skill</span>
+              <h3>声明式工作流</h3>
+              <ul>
+                <li>Manifest 类型为 <code>declarative_review</code> 或 <code>declarative_workflow</code></li>
+                <li>精确声明受审计的内置领域工具与最小权限</li>
+                <li>启用且持久授权后可注册为 Agent function tool</li>
+                <li>不允许 Shell、Python、JavaScript 或用户可执行代码进入宿主进程</li>
+                <li>图谱写入只产生候选修订；Evidence 保持 pending</li>
+              </ul>
+            </div>
+          </div>
+
+          <h3>生命周期</h3>
+          <div class="state-machine">
+            <code>authorization_required</code><i>→</i><code>ready_once / enabled</code><i>→</i><code>authorization_required</code>
+            <small>来源、版本、Manifest、权限或内容哈希变化会废止旧 Grant</small>
+          </div>
+          <p>
+            Skill Market 只提供系统级预缓存卡片；安装后才复制进工作区授权边界。本机 Skill 探测默认关闭，
+            只适用于前后端同机环境。翻译是按 content hash、locale 与 model 缓存的查看层，不修改源文件。
+          </p>
+          <div class="source-ref">来源：<code>backend/docs/mcp-skills.md</code> · <code>backend/app/services/mcp_skills.py</code> · <code>backend/app/services/skill_package.py</code></div>
+        </section>
+
+        <section id="mcp" class="doc-section" data-title="MCP">
+          <div class="section-heading">
+            <span class="section-index">11</span>
+            <div>
+              <p class="overline">Model Context Protocol</p>
+              <h2>MCP</h2>
+            </div>
+          </div>
+          <p>
+            MCP Server 是工作区级外部工具目录。运行时不会信任注册表中的旧描述：
+            每次调用前重新发现能力并保存不可变 CapabilitySnapshot。
+          </p>
+          <div class="mcp-pipeline">
+            <div><span>01</span><strong>Register</strong><small>端点、来源、认证引用</small></div>
+            <i>→</i>
+            <div><span>02</span><strong>Discover</strong><small>initialize + tools/list</small></div>
+            <i>→</i>
+            <div><span>03</span><strong>Authorize</strong><small>身份 + 快照 + 权限指纹</small></div>
+            <i>→</i>
+            <div><span>04</span><strong>Invoke</strong><small>tools/call + audit</small></div>
+          </div>
+
+          <h3>Transport 与网络边界</h3>
+          <div class="definition-list compact">
+            <div><code>streamable_http</code><p>真实执行 JSON-RPC 初始化、工具发现与调用；公网只允许 HTTPS，本机 HTTP 仅限 loopback。</p></div>
+            <div><code>stdio</code><p>当前没有隔离命令运行器，明确返回 <code>available=false</code>；不会在宿主启动任意命令。</p></div>
+            <div><code>Bearer</code><p>静态 Token 只保存为加密 Secret 引用，API 响应只返回掩码。</p></div>
+            <div><code>OAuth</code><p>授权码、动态客户端注册与刷新令牌流程尚未实现，不能宣称可用。</p></div>
+          </div>
+
+          <h3>重授权规则</h3>
+          <p>
+            服务身份、工具、资源、Prompt、Schema 或注解变化会改变快照哈希；来源、版本、端点、认证指纹、
+            Manifest、权限或运行边界变化会改变授权哈希。任一变化都使旧 Grant 失效。
+            <code>allow_once</code> 在调用前消费，即使远程执行失败也不会恢复。
+          </p>
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>Agent 可见性比“注册过”更严格</strong>
+              <p>只有当前快照 enabled 且具有明确持久 <code>always</code> Grant 的 MCP 工具才进入 Agent Tool Registry。</p>
+            </div>
+          </div>
+        </section>
+
+        <section id="sandbox" class="doc-section" data-title="沙箱">
+          <div class="section-heading">
+            <span class="section-index">12</span>
+            <div>
+              <p class="overline">Isolated execution</p>
+              <h2>沙箱</h2>
+            </div>
+          </div>
+          <p>
+            沙箱是 Docker 后端提供的会话级隔离工作区。宿主机不是 fallback：
+            Docker 支持、镜像或配置缺失时返回明确 unavailable。
+          </p>
+
+          <div class="sandbox-diagram">
+            <div class="sandbox-host">
+              <span class="diagram-label">LearnGraph host</span>
+              <div class="host-service">SandboxAgentWorkspaceService<small>授权 · 配额 · 审计 · Artifact</small></div>
+              <div class="sandbox-boundary">
+                <span class="diagram-label">Docker boundary</span>
+                <div class="container-box">
+                  <strong>固定 Python / Node Runner</strong>
+                  <span>无任意宿主 subprocess</span>
+                </div>
+                <div class="workspace-box">
+                  <strong>Session Workspace</strong>
+                  <span>用户 / 会话隔离挂载</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <h3>默认资源护栏</h3>
+          <div class="metric-row">
+            <div><strong>180s</strong><span>Wall time</span></div>
+            <div><strong>2 CPU</strong><span>CPU 配额</span></div>
+            <div><strong>2 GiB</strong><span>Memory</span></div>
+            <div><strong>256</strong><span>PIDs max</span></div>
+            <div><strong>256 MiB</strong><span>Workspace disk</span></div>
+            <div><strong>5 MiB</strong><span>Output</span></div>
+          </div>
+          <p class="muted">以上为 <code>backend/app/core/config.py</code> 当前默认值，可由部署配置覆盖；实际能力以 probe 为准。</p>
+
+          <h3>Agent 沙箱工具</h3>
+          <p>
+            Agent 可以在授权后创建/复用沙箱 Session、写入 UTF-8 文件、读取和列举工作区文件、执行固定 runner，
+            并把结果导出为可持久化 Artifact。路径、参数数、单文件字节数、输出量、空闲/绝对 TTL、
+            单用户并发和宿主容量均受限。
+          </p>
+          <div class="callout callout-danger">
+            <span class="callout-icon">×</span>
+            <div>
+              <strong>破坏性路径需要额外授权</strong>
+              <p>删除等高风险命令由 SandboxAuthorizationService 识别并要求会话级 Grant；阻断和授权挑战都会进入审计与 SSE。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/sandbox.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/providers/remote/sandbox.py</code></div>
+        </section>
+
+        <section id="memory" class="doc-section" data-title="记忆系统">
+          <div class="section-heading">
+            <span class="section-index">13</span>
+            <div>
+              <p class="overline">Durable memory</p>
+              <h2>记忆系统</h2>
+            </div>
+          </div>
+          <p>
+            Memory 采用“Canonical 事实 + Provider 投影”的设计。每条记忆由 LearnGraph 生成稳定
+            <code>lgm_&lt;uuid&gt;</code>；Provider 路径或 Mem0 UUID 只是可重建 Binding。
+          </p>
+
+          <div class="memory-layout">
+            <div class="memory-canonical">
+              <span>Canonical</span>
+              <strong>SQLite</strong>
+              <small>ID · Revision · Hash · Journal · Policy</small>
+            </div>
+            <div class="memory-arrow">verified projection →</div>
+            <div class="memory-provider">
+              <span>Active Provider</span>
+              <strong>Markdown 或 Mem0</strong>
+              <small>Binding · provider_epoch · read-back hash</small>
+            </div>
+          </div>
+
+          <h3>作用域与注入</h3>
+          <div class="plain-grid">
+            <div><strong>Workspace Memory</strong><p>工作区共同记忆；只有 Workspace 与当前 Session 开关都开启时才注入。</p></div>
+            <div><strong>Session Memory</strong><p>只能绑定同一工作区内的真实 Session，也只能注入所属 Session。</p></div>
+            <div><strong>Zones</strong><p><code>hot</code>、<code>recent</code>、<code>topics</code>、<code>archive</code> 四区组织投影。</p></div>
+            <div><strong>CAS</strong><p>更新推荐携带 <code>expected_revision</code>；冲突返回 409 并修复 Provider 投影到胜出版本。</p></div>
+          </div>
+
+          <h3>写入与删除语义</h3>
+          <ol class="steps">
+            <li><span>01</span><div><strong>Canonical mutation</strong><p>创建新 Revision、Provider-neutral Journal 与内容 Hash。</p></div></li>
+            <li><span>02</span><div><strong>Provider projection</strong><p>写入 Active Provider，并按稳定 ID + Revision 精确回读校验。</p></div></li>
+            <li><span>03</span><div><strong>Commit binding</strong><p>只有回读 Hash 一致才提交 Binding 与业务事务。</p></div></li>
+            <li><span>04</span><div><strong>Recoverable delete</strong><p>删除后正文使用每记忆独立密钥加密保留 30 分钟；普通 Revision 正文立即清空。</p></div></li>
+            <li><span>05</span><div><strong>Cryptographic destruction</strong><p>窗口到期销毁内容密钥与恢复密文；删除 Journal 元数据最长保留 7 天。</p></div></li>
+          </ol>
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
+            <div>
+              <strong>切换 Provider 必须迁移</strong>
+              <p>记录属于另一 Provider 时，Mutation 返回 <code>409 memory_provider_migration_required</code>；不会静默双写到新 Provider。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/docs/memory.md</code> · <code>backend/app/providers/ports/memory.py</code> · <code>backend/app/providers/local/memory.py</code></div>
+        </section>
+
+        <section id="streaming" class="doc-section" data-title="消息与 SSE">
+          <div class="section-heading">
+            <span class="section-index">14</span>
+            <div>
+              <p class="overline">Streaming contract</p>
+              <h2>消息与 SSE</h2>
+            </div>
+          </div>
+          <p>
+            SSE 是传输层，不是事实源。Session、Message、MessageVersion、MessagePart 与流事件均持久化，
+            从而支持刷新读取、断点续传、分支、版本比较和 Provider 协议续接。
+          </p>
+          <div class="event-lane">
+            <div><span>user_message</span><small>持久化输入</small></div>
+            <i></i>
+            <div><span>reasoning_delta</span><small>仅 Provider 暴露的 summary</small></div>
+            <i></i>
+            <div><span>tool_call</span><small>参数与调用状态</small></div>
+            <i></i>
+            <div><span>tool_result</span><small>规范化结果 / Artifact</small></div>
+            <i></i>
+            <div><span>text_delta</span><small>可见回答</small></div>
+            <i></i>
+            <div><span>completed</span><small>最终版本与用量</small></div>
+          </div>
+          <p>
+            前端以 Message Part 渲染文本、来源、推理摘要、工具状态、可信组件和沙箱 Artifact。
+            未知组件安全降级为数据预览，不注入任意 HTML、脚本或 React 代码。
+          </p>
+        </section>
+
+        <section id="security" class="doc-section" data-title="安全与授权">
+          <div class="section-heading">
+            <span class="section-index">15</span>
+            <div>
+              <p class="overline">Security model</p>
+              <h2>安全与授权</h2>
+            </div>
+          </div>
+          <p>安全边界贯穿路由、服务、扩展授权、Provider Secret、沙箱和输出渲染，而不是单独依赖前端隐藏按钮。</p>
+          <div class="security-rules">
+            <div><span>01</span><strong>Workspace scope</strong><p>所有资源查询由后端重新校验 Membership、Permission 与 ACL；跨工作区 ID 返回不可枚举错误。</p></div>
+            <div><span>02</span><strong>Secret isolation</strong><p>Provider Key 由后端加密保存，不进入浏览器、日志、SSE、审计或导出。</p></div>
+            <div><span>03</span><strong>Exact grants</strong><p>MCP/Skill 的权限集合必须与服务端推导的最小集合完全一致，少一项或多一项都拒绝。</p></div>
+            <div><span>04</span><strong>Human review</strong><p>正式目标图谱的重要变更、删除影响与高风险执行保留用户确认。</p></div>
+            <div><span>05</span><strong>No silent fallback</strong><p>远程 Provider、Docker 或 Transport 失败时保持失败事实，不落回 mock、宿主执行或硬编码结果。</p></div>
+            <div><span>06</span><strong>Audit trail</strong><p>授权、拒绝、撤销、失败、超时、大小阻断和成功调用均记录工作区审计。</p></div>
+          </div>
+        </section>
+
+        <section id="repo-map" class="doc-section" data-title="代码地图">
+          <div class="section-heading">
+            <span class="section-index">16</span>
+            <div>
+              <p class="overline">Repository map</p>
+              <h2>代码地图</h2>
+            </div>
+          </div>
+          <div class="file-tree">
+            <div><code>frontend/src/main.tsx</code><span>React 入口</span></div>
+            <div><code>frontend/src/App.tsx</code><span>页面路由总表</span></div>
+            <div><code>frontend/src/api/client.ts</code><span>认证、工作区头、JSON/SSE 客户端</span></div>
+            <div><code>frontend/src/features/</code><span>按业务领域组织页面与交互</span></div>
+            <div><code>backend/app/main.py</code><span>FastAPI 生命周期与调度器</span></div>
+            <div><code>backend/app/api/routers/</code><span>HTTP/SSE 契约与依赖边界</span></div>
+            <div><code>backend/app/services/chat.py</code><span>Chat、上下文、Agent 循环与持久化</span></div>
+            <div><code>backend/app/services/agent_runtime.py</code><span>工具定义、注册与执行分派</span></div>
+            <div><code>backend/app/services/mcp_skills.py</code><span>MCP/Skill 生命周期、Grant 与 Invocation</span></div>
+            <div><code>backend/app/services/sandbox.py</code><span>沙箱任务与 Agent Workspace</span></div>
+            <div><code>backend/app/prompts/</code><span>系统提示词片段与风格编译器</span></div>
+            <div><code>backend/app/repositories/</code><span>工作区作用域数据访问</span></div>
+            <div><code>backend/app/providers/ports/</code><span>外部能力契约</span></div>
+            <div><code>backend/app/providers/local|remote/</code><span>适配器实现</span></div>
+            <div><code>backend/app/domain/models.py</code><span>核心持久化模型</span></div>
+            <div><code>backend/app/domain/schemas/</code><span>API 输入输出 Schema</span></div>
+          </div>
+        </section>
+
+        <section id="extension-guide" class="doc-section" data-title="扩展指南">
+          <div class="section-heading">
+            <span class="section-index">17</span>
+            <div>
+              <p class="overline">Extension guide</p>
+              <h2>扩展指南</h2>
+            </div>
+          </div>
+          <h3>新增 Provider</h3>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>定义 Port</strong><p>优先复用现有 Protocol；不要让业务 Service 依赖厂商 SDK。</p></div></li>
+            <li><span>02</span><div><strong>实现 Adapter</strong><p>显式建模可用性、超时、响应校验、远程能力和安全诊断。</p></div></li>
+            <li><span>03</span><div><strong>接入 Catalog / Probe</strong><p>配置保存后执行真实探测，失败保持 disabled。</p></div></li>
+            <li><span>04</span><div><strong>记录 Trace / Usage</strong><p>保存 Provider ID、请求标识、用量与安全错误分类。</p></div></li>
+            <li><span>05</span><div><strong>真实验收</strong><p>用部署方明确配置的远程服务验证，缺凭据时标记未完成。</p></div></li>
+          </ol>
+
+          <h3>新增 Agent Tool</h3>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>从领域用例开始</strong><p>Tool 只调用现有 Service 或受控 Port，不直接访问数据库句柄。</p></div></li>
+            <li><span>02</span><div><strong>声明严格 Schema</strong><p>限制字段、长度、枚举与 additionalProperties。</p></div></li>
+            <li><span>03</span><div><strong>确定授权与副作用</strong><p>按用户角色、工作区、资源范围与是否需二次确认注册。</p></div></li>
+            <li><span>04</span><div><strong>规范化结果</strong><p>裁剪大小、脱敏错误、记录 Invocation / Audit，并返回可追踪来源。</p></div></li>
+            <li><span>05</span><div><strong>验证完整循环</strong><p>真实模型发起调用、真实服务执行、刷新后仍可读取结果。</p></div></li>
+          </ol>
+        </section>
+
+        <section id="verification" class="doc-section final-section" data-title="验证与完成定义">
+          <div class="section-heading">
+            <span class="section-index">18</span>
+            <div>
+              <p class="overline">Verification</p>
+              <h2>验证与完成定义</h2>
+            </div>
+          </div>
+          <p>
+            “现有测试通过”不等于业务闭环已完成。重要变更需要同时验证可见结果、后端事实和一个高风险失败/恢复边界。
+          </p>
+          <div class="checklist">
+            <label><input type="checkbox" disabled checked /><span>前端 lint、类型检查与 production build</span></label>
+            <label><input type="checkbox" disabled checked /><span>真实 SQLite、SQLAlchemy 事务与本地文件存储</span></label>
+            <label><input type="checkbox" disabled checked /><span>运行中的 FastAPI HTTP / SSE 与持久化断言</span></label>
+            <label><input type="checkbox" disabled checked /><span>权限、跨工作区、幂等、并发或删除恢复边界</span></label>
+            <label><input type="checkbox" disabled checked /><span>Playwright / Computer Use 真实页面操作与刷新</span></label>
+            <label><input type="checkbox" disabled checked /><span>涉及外部能力时核对真实 Provider ID、Trace、Usage 与 remote_capability</span></label>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>Verification commands</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code><span class="code-comment"># 常规检查（不自动包含 E2E 与真实远程 Provider）</span>
+npm.cmd run check
+
+<span class="code-comment"># 真实浏览器 E2E</span>
+npm.cmd --prefix frontend run test:e2e
+
+<span class="code-comment"># 已配置真实远程模型后</span>
+.\scripts\verify-real-provider.ps1</code></pre>
+          </div>
+          <div class="closing">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 32 32"><path d="M8 10.5 16 6l8 4.5v9L16 24l-8-4.5z" /><path d="m8 10.5 8 4.5 8-4.5M16 15v9" /></svg>
+            </span>
+            <div><strong>从真实目标到可追溯成长</strong><p>保持来源、权限、事务、审计和用户审核边界一致。</p></div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="toc" aria-label="本页目录">
+        <div class="toc-inner">
+          <p>本页内容</p>
+          <nav data-toc></nav>
+          <a class="toc-top" href="#overview">返回顶部 ↑</a>
+        </div>
+      </aside>
+    </div>
+
+    <div class="search-dialog" data-search-dialog aria-hidden="true">
+      <button class="search-backdrop" type="button" data-close-search aria-label="关闭搜索"></button>
+      <section class="search-panel" role="dialog" aria-modal="true" aria-labelledby="search-title">
+        <div class="search-field">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.4-3.4"></path></svg>
+          <input id="search-title" type="search" placeholder="搜索架构、Agent、MCP、Memory…" autocomplete="off" data-search-input />
+          <kbd>Esc</kbd>
+        </div>
+        <div class="search-results" data-search-results>
+          <p class="search-hint">输入关键词以搜索本文档章节</p>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast" role="status" aria-live="polite" data-toast>已复制到剪贴板</div>
+  </body>
+</html>

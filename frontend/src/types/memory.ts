@@ -1,0 +1,253 @@
+import type { IsoDateTime } from './common'
+
+export type MemoryNamespace = 'workspace' | 'session'
+export type MemoryScopeType = 'workspace' | 'goal' | 'node' | 'session'
+export type MemoryZone = 'hot' | 'recent' | 'topics' | 'archive'
+export type MemoryState = 'active' | 'deleted' | 'destroyed'
+export type MemoryDraftStatus = 'PENDING' | 'COMMITTED' | 'REJECTED' | 'CANCELLED'
+export type MemoryDraftOperation =
+  | 'CREATE'
+  | 'UPDATE'
+  | 'MERGE'
+  | 'SUPERSEDE'
+  | 'RETRACT'
+  | 'PROMOTE'
+  | 'DEMOTE'
+  | 'ARCHIVE'
+export type MemoryResolutionStatus =
+  | 'none'
+  | 'active_misconception'
+  | 'improving'
+  | 'resolved'
+  | 'recurring'
+
+export interface MemoryCreateRequest {
+  title: string
+  content: string
+  namespace?: MemoryNamespace
+  session_id?: string
+  scope_type?: MemoryScopeType
+  scope_id?: string
+  goal_id?: string
+  node_id?: string
+  zone?: MemoryZone
+  record_kind?: string
+  structured_payload?: Record<string, unknown>
+  confidence?: number
+  importance?: number
+  resolution_status?: MemoryResolutionStatus
+  source?: string
+  source_ids?: string[]
+}
+
+export interface MemoryUpdateRequest {
+  expected_revision?: number
+  title?: string
+  content?: string
+  zone?: MemoryZone
+  source_ids?: string[]
+  structured_payload?: Record<string, unknown>
+  confidence?: number
+  importance?: number
+  resolution_status?: MemoryResolutionStatus
+  goal_id?: string
+  node_id?: string
+  scope_type?: MemoryScopeType
+  scope_id?: string
+  reason?: string
+}
+
+export interface MemoryEntry {
+  id: string
+  lg_memory_id: string
+  workspace_id: string
+  namespace: MemoryNamespace
+  session_id: string | null
+  scope_type?: MemoryScopeType
+  scope_id?: string | null
+  goal_id?: string | null
+  node_id?: string | null
+  record_kind: string
+  merge_strategy?: string
+  zone: MemoryZone
+  state: MemoryState
+  title: string
+  content_hash: string
+  relative_path: string
+  revision: number
+  source: string
+  source_ids: string[]
+  structured_payload?: Record<string, unknown>
+  confidence?: number
+  importance?: number
+  strength?: number
+  access_count?: number
+  confirmation_count?: number
+  successful_use_count?: number
+  last_accessed_at?: IsoDateTime | null
+  resolution_status?: MemoryResolutionStatus
+  decay_policy?: string
+  supersedes_id?: string | null
+  provider_id: string
+  provider_binding_id: string | null
+  deleted_at: IsoDateTime | null
+  recoverable_until: IsoDateTime | null
+  content_destroyed_at: IsoDateTime | null
+  restore_available: boolean
+  created_at: IsoDateTime
+  updated_at: IsoDateTime
+  content: string | null
+  retrieval_score?: number | null
+}
+
+export interface MemoryRevision {
+  id: string
+  memory_id: string
+  revision: number
+  base_revision: number | null
+  operation: string
+  title: string
+  content: string | null
+  content_hash: string
+  namespace: MemoryNamespace
+  session_id: string | null
+  record_kind: string
+  zone: MemoryZone
+  source: string
+  source_ids: string[]
+  actor_id: string
+  reason: string
+  is_active: boolean
+  created_at: IsoDateTime
+}
+
+export interface MemoryJournalEntry {
+  id: string
+  memory_id: string
+  revision: number
+  operation: string
+  provider_id: string
+  provider_epoch: number
+  provider_record_id: string | null
+  content_hash: string
+  payload: Record<string, unknown>
+  tombstone: boolean
+  recoverable_until: IsoDateTime | null
+  audit_retention_until: IsoDateTime | null
+  content_scrubbed_at: IsoDateTime | null
+  created_at: IsoDateTime
+}
+
+export interface MemoryBinding {
+  id: string
+  provider_instance_id: string
+  memory_id: string
+  revision: number
+  provider_record_id: string
+  provider_entity_kind: string
+  provider_entity_value: string
+  source_content_hash: string
+  target_readback_hash: string
+  import_event_id: string | null
+  binding_status: string
+  verified_at: IsoDateTime | null
+  last_error: string
+}
+
+export interface MemoryPurgeResult {
+  content_keys_destroyed: number
+  journal_entries_removed: number
+}
+
+export interface MemoryPolicy {
+  workspace_id: string
+  workspace_enabled: boolean
+  session_id: string | null
+  session_enabled: boolean | null
+  effective_enabled: boolean
+}
+
+export interface MemoryPolicyUpdateRequest {
+  workspace_enabled?: boolean
+  session_id?: string
+  session_enabled?: boolean
+}
+
+export interface MemoryProviderStatus {
+  provider_id: string
+  provider_type: string
+  display_name: string
+  available: boolean
+  remote_capability: boolean
+  status: string
+  provider_epoch: number
+  details: Record<string, unknown>
+}
+
+export interface MemoryDraft {
+  id: string
+  workspace_id: string
+  operation: MemoryDraftOperation
+  status: MemoryDraftStatus
+  memory_type: string
+  target_memory_id: string | null
+  proposed_scope_type: MemoryScopeType
+  proposed_scope_id: string | null
+  goal_id: string | null
+  node_id: string | null
+  session_id: string | null
+  branch_session_id: string | null
+  title: string
+  content: string
+  structured_payload: Record<string, unknown>
+  source_refs: Array<Record<string, unknown>>
+  confidence: number
+  importance: number
+  suggested_decay_policy: string
+  conflicts_with: string[]
+  created_by: string
+  reviewed_by: string | null
+  reviewed_at: IsoDateTime | null
+  rejection_reason: string
+  result_memory_id: string | null
+  result_revision: number | null
+  created_at: IsoDateTime
+  updated_at: IsoDateTime
+}
+
+export interface MemoryDraftCreateRequest {
+  operation?: MemoryDraftOperation
+  memory_type?: string
+  target_memory_id?: string
+  proposed_scope_type?: MemoryScopeType
+  proposed_scope_id?: string
+  goal_id?: string
+  node_id?: string
+  session_id?: string
+  branch_session_id?: string
+  title?: string
+  content?: string
+  structured_payload?: Record<string, unknown>
+  source_refs?: Array<Record<string, unknown>>
+  confidence?: number
+  importance?: number
+  suggested_decay_policy?: string
+  conflicts_with?: string[]
+  created_by?: string
+  auto_commit?: boolean
+}
+
+export interface MemoryDraftDecisionRequest {
+  decision: 'commit' | 'reject'
+  reason?: string
+}
+
+export interface MemoryTypeDefinition {
+  memory_type: string
+  default_scope: MemoryScopeType
+  merge_strategy: string
+  decay_policy: string
+  requires_confirmation: boolean
+  description: string
+  payload_schema: Record<string, string>
+}

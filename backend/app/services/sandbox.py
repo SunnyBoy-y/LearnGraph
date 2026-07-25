@@ -1,0 +1,1854 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import shutil
+import threading
+from pathlib import Path
+from datetime import timedelta, timezone
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+from pydantic import ValidationError
+
+from app.core.config import Settings
+from app.core.errors import AppError
+from app.core.file_lock import InterProcessFileLock
+from app.core.security import Principal
+from app.domain.models import (
+    ChatSession,
+    FileRecord,
+    SandboxAgentCommand,
+    SandboxExecution,
+    SandboxSession,
+    SandboxTask,
+    Workspace,
+    new_id,
+    utc_now,
+)
+from app.services.sandbox_authz import SandboxAuthorizationService
+from app.services.session_workspace import SessionWorkspaceService
+from app.domain.schemas.sandbox import (
+    SandboxAgentCommandRequest,
+    SandboxAgentFileListRequest,
+    SandboxAgentFileReadRequest,
+    SandboxAgentFileWriteRequest,
+    SandboxAgentSessionCreateRequest,
+    SandboxTaskCreateRequest,
+)
+from app.providers.ports.sandbox import SandboxCreateSpec, SandboxSessionHandle
+from app.providers.remote.sandbox import (
+    SandboxBackendError,
+    SandboxBackendUnavailable,
+    SandboxCapabilityMismatch,
+    SandboxDestructiveAuthorizationRequired,
+    SandboxWorkspaceQuotaExceeded,
+    image_ref_is_pinned,
+    validate_agent_argv,
+    validate_agent_cwd,
+    validate_agent_workspace_path,
+)
+from app.providers.storage_factory import object_storage_provider
+from app.repositories.audit import AuditRepository
+from app.services.authorization import AuthorizationService
+from app.services.sandbox_bootstrap import backend_for_settings, get_bootstrap_service
+from app.services.sandbox_runtime import (
+    resolve_sandbox_image,
+    resolve_sandbox_image_for_runtime,
+)
+
+_sandbox_capacity_lock = threading.RLock()
+logger = logging.getLogger(__name__)
+
+def _sandbox_workspace_root(settings: Settings) -> Path:
+    root = settings.resolved_sandbox_workspace_root
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _sandbox_capacity_file_lock(settings: Settings) -> InterProcessFileLock:
+    return InterProcessFileLock(_sandbox_workspace_root(settings) / ".runtime-capacity.lock")
+
+
+def _sandbox_workspace_path(settings: Settings, relative_path: str) -> Path:
+    root = _sandbox_workspace_root(settings)
+    candidate = (root / relative_path).resolve()
+    if candidate == root or root not in candidate.parents:
+        raise SandboxBackendError(
+            f"Sandbox workspace path escaped the managed root (relative={relative_path!r})"
+        )
+    return candidate
+
+
+def _initialize_workspace(
+    settings: Settings, owner_user_id: str, sandbox_session_id: str
+) -> str:
+    relative = f"{owner_user_id}/{sandbox_session_id}"
+    target = _sandbox_workspace_path(settings, relative)
+    for directory in ("inputs", "work", "outputs"):
+        (target / directory).mkdir(parents=True, exist_ok=True)
+    return relative
+
+
+def _session_expirations(settings: Settings, now):
+    workspace_idle = now + timedelta(
+        seconds=settings.sandbox_workspace_idle_ttl_seconds
+    )
+    absolute = now + timedelta(
+        seconds=settings.sandbox_workspace_absolute_ttl_seconds
+    )
+    return workspace_idle, absolute
+
+
+def _enforce_sandbox_capacity(
+    db: Session,
+    settings: Settings,
+    actor_id: str,
+    session: SandboxSession,
+    backend,
+) -> None:
+    active_states = ("STARTING", "RUNNING", "WARM_IDLE")
+    user_active = db.scalar(
+        select(func.count(SandboxSession.id)).where(
+            SandboxSession.owner_user_id == actor_id,
+            SandboxSession.lifecycle_state.in_(active_states),
+            SandboxSession.id != session.id,
+        )
+    ) or 0
+    if user_active >= settings.sandbox_active_per_user:
+        raise AppError(
+            429,
+            "sandbox_user_concurrency_limit",
+            "The active sandbox limit for this user has been reached",
+        )
+    host_active = db.scalar(
+        select(func.count(SandboxSession.id)).where(
+            SandboxSession.lifecycle_state.in_(active_states),
+            SandboxSession.id != session.id,
+        )
+    ) or 0
+    if host_active >= settings.sandbox_host_max_active:
+        raise AppError(
+            503,
+            "sandbox_host_capacity_exhausted",
+            "The deployment-wide active sandbox limit has been reached",
+        )
+    host_cpus, host_memory = backend.host_capacity()
+    requested_count = host_active + 1
+    if (
+        host_memory > 0
+        and requested_count * settings.sandbox_memory_bytes
+        > host_memory * settings.sandbox_host_max_allocated_memory_ratio
+    ):
+        raise AppError(
+            503,
+            "sandbox_host_memory_budget",
+            "The deployment-wide sandbox memory allocation budget has been reached",
+        )
+    if (
+        host_cpus > 0
+        and requested_count * settings.sandbox_cpu_count
+        > host_cpus * settings.sandbox_host_max_allocated_cpu_ratio
+    ):
+        raise AppError(
+            503,
+            "sandbox_host_cpu_budget",
+            "The deployment-wide sandbox CPU allocation budget has been reached",
+        )
+    free = shutil.disk_usage(_sandbox_workspace_root(settings)).free
+    if free < settings.sandbox_host_minimum_free_disk_bytes:
+        raise AppError(
+            503,
+            "sandbox_host_disk_reserve",
+            "The sandbox host free-disk reserve would be violated",
+        )
+
+
+def _enforce_retained_workspace_capacity(
+    db: Session, settings: Settings, actor_id: str
+) -> None:
+    retained = db.scalar(
+        select(func.count(SandboxSession.id)).where(
+            SandboxSession.owner_user_id == actor_id,
+            SandboxSession.cleanup_status != "cleaned",
+            SandboxSession.lifecycle_state != "EXPIRED",
+        )
+    ) or 0
+    if retained >= settings.sandbox_retained_workspaces_per_user:
+        raise AppError(
+            429,
+            "sandbox_workspace_quota_exceeded",
+            "Retained sandbox workspace quota exceeded; clean an older session first",
+        )
+
+
+def agent_sandbox_readiness(settings: Settings, *, authorized: bool) -> dict[str, Any]:
+    """Return the single readiness contract used by Agent UI and execution."""
+
+    backend = backend_for_settings(settings)
+    if not authorized:
+        return {
+            "available": False,
+            "code": "sandbox_permission_required",
+            "message": "当前账号缺少智能体沙箱执行权限（需要 workspace.manage）。",
+            "authorized": False,
+            "sandbox_enabled": settings.sandbox_enabled,
+            "agent_enabled": settings.sandbox_agent_enabled,
+            "backend_id": backend.backend_id,
+            "platform": backend.platform,
+            "capabilities": [],
+            "remediation_steps": ["请由工作区管理员授予管理权限后重试。"],
+        }
+    if not settings.sandbox_agent_enabled:
+        return {
+            "available": False,
+            "code": "sandbox_agent_disabled",
+            "message": "部署配置已关闭智能体沙箱执行。",
+            "authorized": True,
+            "sandbox_enabled": settings.sandbox_enabled,
+            "agent_enabled": False,
+            "backend_id": backend.backend_id,
+            "platform": backend.platform,
+            "capabilities": [],
+            "remediation_steps": [
+                "启用 LEARNGRAPH_SANDBOX_AGENT_ENABLED 后重启后端服务。"
+            ],
+        }
+    capability = backend.probe()
+    if not capability.available:
+        bootstrap = get_bootstrap_service().status(settings)
+        return {
+            "available": False,
+            "code": "sandbox_backend_unavailable",
+            "message": capability.reason or "智能体沙箱运行时不可用。",
+            "authorized": True,
+            "sandbox_enabled": settings.sandbox_enabled,
+            "agent_enabled": True,
+            "backend_id": capability.backend_id,
+            "platform": capability.platform,
+            "capabilities": list(capability.capabilities),
+            "remediation_steps": list(bootstrap.get("remediation_steps") or []),
+        }
+    return {
+        "available": True,
+        "code": None,
+        "message": "智能体沙箱运行时已就绪。",
+        "authorized": True,
+        "sandbox_enabled": settings.sandbox_enabled,
+        "agent_enabled": True,
+        "backend_id": capability.backend_id,
+        "platform": capability.platform,
+        "capabilities": list(capability.capabilities),
+        "remediation_steps": [],
+    }
+
+
+class SandboxTaskService:
+    def __init__(
+        self,
+        db: Session,
+        workspace_id: str,
+        actor_id: str,
+        settings: Settings,
+        *,
+        workspace: Workspace | None = None,
+        principal: Principal | None = None,
+    ) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.settings = settings
+        self.workspace = workspace
+        self.principal = principal
+        self.audit = AuditRepository(db, workspace_id)
+        self.storage = object_storage_provider(db, workspace_id, settings)
+        self.backend = backend_for_settings(settings)
+
+    def profile(self, runtime_kind: str = "python-node") -> dict:
+        backend = backend_for_settings(self.settings, runtime_kind)
+        capability = backend.probe()
+        resolved = (
+            resolve_sandbox_image_for_runtime(self.settings, runtime_kind) or ""
+        )
+        return {
+            "backend_id": f"{capability.backend_id}:{runtime_kind}",
+            "runtime_kind": runtime_kind,
+            "platform": capability.platform,
+            "available": capability.available,
+            "capabilities": list(capability.capabilities),
+            "reason": capability.reason,
+            "image_pinned": image_ref_is_pinned(resolved),
+        }
+
+    def list_sessions(self, chat_session_id: str | None = None) -> list[SandboxSession]:
+        query = select(SandboxSession).where(
+            SandboxSession.workspace_id == self.workspace_id,
+            SandboxSession.owner_user_id == self.actor_id,
+        )
+        if chat_session_id:
+            self._require_chat_session(chat_session_id)
+            query = query.where(SandboxSession.chat_session_id == chat_session_id)
+        return list(self.db.scalars(query.order_by(SandboxSession.created_at.desc())).all())
+
+    def get_session(self, session_id: str) -> SandboxSession:
+        session = self.db.scalar(
+            select(SandboxSession).where(
+                SandboxSession.id == session_id,
+                SandboxSession.workspace_id == self.workspace_id,
+                SandboxSession.owner_user_id == self.actor_id,
+            )
+        )
+        if session is None:
+            raise AppError(404, "sandbox_session_not_found", "Sandbox session was not found")
+        return session
+
+    def get_task(self, task_id: str) -> SandboxTask:
+        task = self.db.scalar(
+            select(SandboxTask).where(
+                SandboxTask.id == task_id,
+                SandboxTask.workspace_id == self.workspace_id,
+                SandboxTask.owner_user_id == self.actor_id,
+            )
+        )
+        if task is None:
+            raise AppError(404, "sandbox_task_not_found", "Sandbox task was not found")
+        return task
+
+    def list_tasks(self, chat_session_id: str | None = None) -> list[SandboxTask]:
+        """Return the caller's persisted sandbox task history for this workspace."""
+        query = select(SandboxTask).where(
+            SandboxTask.workspace_id == self.workspace_id,
+            SandboxTask.owner_user_id == self.actor_id,
+        )
+        if chat_session_id:
+            self._require_chat_session(chat_session_id)
+            query = query.where(SandboxTask.chat_session_id == chat_session_id)
+        return list(self.db.scalars(query.order_by(SandboxTask.created_at.desc())).all())
+
+    def executions(self, task_id: str) -> list[SandboxExecution]:
+        self.get_task(task_id)
+        return list(
+            self.db.scalars(
+                select(SandboxExecution).where(
+                    SandboxExecution.workspace_id == self.workspace_id,
+                    SandboxExecution.task_id == task_id,
+                ).order_by(SandboxExecution.attempt_no)
+            ).all()
+        )
+
+    def _require_chat_session(self, session_id: str) -> ChatSession:
+        record = self.db.scalar(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.workspace_id == self.workspace_id,
+            )
+        )
+        if record is None:
+            raise AppError(404, "session_not_found", "Chat session was not found in this workspace")
+        if self.workspace is not None and self.principal is not None:
+            if self.workspace.id != self.workspace_id or not AuthorizationService(
+                self.db, self.principal
+            ).can_access_resource(self.workspace, "session", session_id, "write"):
+                raise AppError(404, "session_not_found", "Chat session was not found in this workspace")
+        return record
+
+    def _require_file(self, file_id: str) -> FileRecord:
+        record = self.db.scalar(
+            select(FileRecord).where(
+                FileRecord.id == file_id,
+                FileRecord.workspace_id == self.workspace_id,
+            )
+        )
+        if record is None:
+            raise AppError(404, "file_not_found", "File was not found in this workspace")
+        return record
+
+    def _new_session(self, chat_session_id: str, file: FileRecord) -> SandboxSession:
+        with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
+            _enforce_retained_workspace_capacity(
+                self.db, self.settings, self.actor_id
+            )
+            return self._new_session_locked(chat_session_id, file)
+
+    def _new_session_locked(
+        self, chat_session_id: str, file: FileRecord
+    ) -> SandboxSession:
+        manifest_hash = hashlib.sha256(
+            f"sandbox-policy-v1:{self.workspace_id}:{chat_session_id}:{file.id}:{file.sha256}".encode()
+        ).hexdigest()
+        now = utc_now()
+        workspace_expires_at, absolute_expires_at = _session_expirations(
+            self.settings, now
+        )
+        session = SandboxSession(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            chat_session_id=chat_session_id,
+            backend_id=self.backend.backend_id,
+            manifest_hash=manifest_hash,
+            runtime_kind="python-node",
+            lifecycle_state="CREATED",
+            status="created",
+            resource_limits={
+                "wall_time_seconds": self.settings.sandbox_wall_time_seconds,
+                "memory_bytes": self.settings.sandbox_memory_bytes,
+                "pids_max": self.settings.sandbox_pids_max,
+                "disk_bytes": self.settings.sandbox_disk_bytes,
+                "output_bytes": self.settings.sandbox_output_bytes,
+            },
+            network_policy={"mode": "none", "allowed_hosts": []},
+            last_used_at=now,
+            expires_at=workspace_expires_at,
+            workspace_expires_at=workspace_expires_at,
+            absolute_expires_at=absolute_expires_at,
+        )
+        self.db.add(session)
+        self.db.flush()
+        session.workspace_relative_path = _initialize_workspace(
+            self.settings, self.actor_id, session.id
+        )
+        session.lifecycle_state = "COLD"
+        # Publish the durable workspace identity before cross-process runtime
+        # reservation refreshes this row.
+        self.db.commit()
+        self.db.refresh(session)
+        return session
+
+    def _resolve_session(
+        self,
+        requested_id: str | None,
+        chat_session_id: str,
+        file: FileRecord,
+    ) -> SandboxSession:
+        if requested_id is None:
+            return self._new_session(chat_session_id, file)
+        session = self.get_session(requested_id)
+        if session.chat_session_id != chat_session_id:
+            raise AppError(
+                409,
+                "sandbox_session_scope_mismatch",
+                "A sandbox session cannot be reused by a different chat session",
+            )
+        if session.status != "ready" or not session.backend_session_ref:
+            raise AppError(409, "sandbox_session_not_ready", "Sandbox session is not reusable")
+        expires_at = session.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= utc_now():
+            raise AppError(409, "sandbox_session_expired", "Sandbox session has expired")
+        return session
+
+    def create_task(
+        self,
+        payload: SandboxTaskCreateRequest,
+        *,
+        idempotency_key: str | None,
+    ) -> SandboxTask:
+        self._require_chat_session(payload.chat_session_id)
+        file = self._require_file(payload.file_id)
+        key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
+        if key_hash:
+            existing = self.db.scalar(
+                select(SandboxTask).where(
+                    SandboxTask.workspace_id == self.workspace_id,
+                    SandboxTask.owner_user_id == self.actor_id,
+                    SandboxTask.idempotency_key_hash == key_hash,
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.chat_session_id != payload.chat_session_id
+                    or existing.file_id != payload.file_id
+                    or existing.task_type != payload.task_type
+                ):
+                    raise AppError(
+                        409,
+                        "idempotency_key_conflict",
+                        "The sandbox idempotency key was already used for a different task",
+                    )
+                return existing
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id, file)
+        task = SandboxTask(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            sandbox_session_id=session.id,
+            chat_session_id=payload.chat_session_id,
+            file_id=file.id,
+            task_type=payload.task_type,
+            output_format=payload.output_format,
+            idempotency_key_hash=key_hash,
+            status="created",
+        )
+        self.db.add(task)
+        self.db.flush()
+        argv = (
+            "python",
+            "/opt/learngraph/runner.py",
+            "--task",
+            payload.task_type,
+            "--input",
+            f"input/{file.id}.bin",
+            "--output",
+            f"output/{task.id}.json",
+        )
+        execution = SandboxExecution(
+            workspace_id=self.workspace_id,
+            sandbox_session_id=session.id,
+            task_id=task.id,
+            attempt_no=1,
+            argv_digest=hashlib.sha256("\0".join(argv).encode()).hexdigest(),
+            argv_redacted=["python", "/opt/learngraph/runner.py", "--task", payload.task_type],
+            cwd_relative=".",
+            status="created",
+        )
+        self.db.add(execution)
+        self.db.commit()
+        capability = self.backend.probe()
+        if not capability.available:
+            return self._fail_task(
+                task,
+                session,
+                execution,
+                "sandbox_backend_unavailable",
+                capability.reason or "Sandbox backend is unavailable",
+            )
+        handle: SandboxSessionHandle | None = None
+        try:
+            if session.backend_session_ref:
+                handle = self.backend.resume(session.id, session.backend_session_ref)
+            else:
+                with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
+                    self.db.refresh(session)
+                    if session.backend_session_ref:
+                        handle = self.backend.resume(
+                            session.id, session.backend_session_ref
+                        )
+                    else:
+                        _enforce_sandbox_capacity(
+                            self.db,
+                            self.settings,
+                            self.actor_id,
+                            session,
+                            self.backend,
+                        )
+                        session.lifecycle_state = "STARTING"
+                        session.runtime_started_at = utc_now()
+                        session.runtime_last_used_at = session.runtime_started_at
+                        self.db.commit()
+                        try:
+                            handle = self.backend.create(
+                                SandboxCreateSpec(
+                                session_id=session.id,
+                                image_ref=resolve_sandbox_image(self.settings) or "",
+                                memory_bytes=self.settings.sandbox_memory_bytes,
+                                memory_swap_bytes=self.settings.sandbox_memory_swap_bytes,
+                                cpu_count=self.settings.sandbox_cpu_count,
+                                pids_max=self.settings.sandbox_pids_max,
+                                disk_bytes=self.settings.sandbox_disk_bytes,
+                                workspace_path=str(
+                                    _sandbox_workspace_path(
+                                        self.settings, session.workspace_relative_path
+                                    )
+                                ),
+                                runtime_kind=session.runtime_kind,
+                                )
+                            )
+                            session.backend_session_ref = handle.backend_ref
+                            self.db.commit()
+                        except Exception:
+                            session.lifecycle_state = "COLD"
+                            session.backend_session_ref = None
+                            self.db.commit()
+                            raise
+            session.status = "running"
+            session.lifecycle_state = "RUNNING"
+            task.status = "running"
+            execution.status = "running"
+            self.db.commit()
+            raw = self.storage.read_bytes(file.object_key, limit_bytes=self.settings.max_document_parse_bytes)
+            self.backend.write(handle, f"input/{file.id}.bin", raw)
+            result = self.backend.exec_fixed(
+                handle,
+                argv,
+                timeout_seconds=self.settings.sandbox_wall_time_seconds,
+                output_limit=self.settings.sandbox_output_bytes,
+            )
+            execution.exit_code = result.exit_code
+            execution.timed_out = result.timed_out
+            execution.latency_ms = result.latency_ms
+            execution.truncated = result.truncated
+            execution.stdout_summary = result.stdout.decode("utf-8", errors="replace")[:2_000]
+            execution.stderr_summary = result.stderr.decode("utf-8", errors="replace")[:2_000]
+            if result.timed_out:
+                return self._fail_task(task, session, execution, "sandbox_timeout", "Sandbox task timed out")
+            if result.exit_code != 0:
+                return self._fail_task(task, session, execution, "sandbox_runner_failed", "Sandbox runner failed")
+            artifact_bytes = self.backend.read(
+                handle,
+                f"output/{task.id}.json",
+                self.settings.sandbox_output_bytes,
+            )
+            artifact = json.loads(artifact_bytes)
+            if not isinstance(artifact, dict) or artifact.get("schema_version") != "1.0":
+                raise SandboxBackendError("Sandbox output failed schema validation")
+            if artifact.get("sha256") != file.sha256:
+                raise SandboxBackendError("Sandbox output does not match the authorized input hash")
+            task.artifact_json = artifact
+            task.status = "completed"
+            execution.status = "completed"
+            session.status = "ready"
+            session.last_used_at = utc_now()
+            session.runtime_last_used_at = session.last_used_at
+            session.lifecycle_state = "WARM_IDLE"
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="sandbox.task.completed",
+                resource_type="sandbox_task",
+                resource_id=task.id,
+                details={
+                    "sandbox_session_id": session.id,
+                    "chat_session_id": session.chat_session_id,
+                    "file_id": file.id,
+                    "task_type": task.task_type,
+                    "network_mode": "none",
+                },
+            )
+            self.db.commit()
+            self.db.refresh(task)
+            return task
+        except (SandboxBackendUnavailable, SandboxBackendError, ValueError, json.JSONDecodeError) as exc:
+            return self._fail_task(
+                task,
+                session,
+                execution,
+                "sandbox_execution_failed",
+                "Sandbox execution failed; inspect the execution record for the error class",
+                type(exc).__name__,
+            )
+
+    def _fail_task(
+        self,
+        task: SandboxTask,
+        session: SandboxSession,
+        execution: SandboxExecution,
+        error_class: str,
+        message: str,
+        internal_class: str | None = None,
+    ) -> SandboxTask:
+        task.status = "failed"
+        task.error_class = error_class
+        task.error_message = message
+        execution.status = "failed"
+        execution.error_class = internal_class or error_class
+        session.status = "failed"
+        session.runtime_last_used_at = utc_now()
+        if error_class == "sandbox_timeout":
+            if session.backend_session_ref:
+                try:
+                    self.backend.delete(
+                        SandboxSessionHandle(
+                            session.id, session.backend_session_ref
+                        )
+                    )
+                    session.backend_session_ref = None
+                except SandboxBackendError:
+                    logger.exception("Failed to remove timed-out fixed-task container")
+            session.lifecycle_state = "COLD"
+        else:
+            session.lifecycle_state = (
+                "WARM_IDLE" if session.backend_session_ref else "COLD"
+            )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.task.failed",
+            resource_type="sandbox_task",
+            resource_id=task.id,
+            outcome="failed",
+            details={"error_class": error_class, "sandbox_session_id": session.id},
+        )
+        self.db.commit()
+        self.db.refresh(task)
+        return task
+
+    def cancel(self, task_id: str) -> SandboxTask:
+        task = self.get_task(task_id)
+        if task.status in {"completed", "failed", "cancelled"}:
+            return task
+        session = self.get_session(task.sandbox_session_id)
+        if session.backend_session_ref:
+            try:
+                self.backend.stop(SandboxSessionHandle(session.id, session.backend_session_ref))
+            except SandboxBackendError as exc:
+                raise AppError(502, "sandbox_cancel_failed", "Sandbox cancellation failed") from exc
+        task.status = "cancelled"
+        session.status = "stopped"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.task.cancelled",
+            resource_type="sandbox_task",
+            resource_id=task.id,
+        )
+        self.db.commit()
+        self.db.refresh(task)
+        return task
+
+    def cleanup(self, session_id: str) -> SandboxSession:
+        session = self.get_session(session_id)
+        if session.cleanup_status == "cleaned":
+            return session
+        session.cleanup_status = "running"
+        self.db.commit()
+        if session.backend_session_ref:
+            try:
+                backend_for_settings(self.settings, session.runtime_kind).delete(
+                    SandboxSessionHandle(session.id, session.backend_session_ref)
+                )
+            except SandboxBackendError as exc:
+                session.cleanup_status = "cleanup_blocked"
+                session.cleanup_error_class = type(exc).__name__
+                self.db.commit()
+                raise AppError(502, "sandbox_cleanup_failed", "Sandbox cleanup failed and is pending retry") from exc
+        if session.workspace_relative_path:
+            workspace_path = _sandbox_workspace_path(
+                self.settings, session.workspace_relative_path
+            )
+            if workspace_path.exists():
+                shutil.rmtree(workspace_path)
+        session.status = "deleted"
+        session.lifecycle_state = "EXPIRED"
+        session.cleanup_status = "cleaned"
+        session.backend_session_ref = None
+        session.cleanup_error_class = None
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.session.cleaned",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+        )
+        self.db.commit()
+        self.db.refresh(session)
+        return session
+
+
+AGENT_SANDBOX_POLICY_REVISION = "sandbox-agent-v1"
+_AGENT_SECRET_OUTPUT = re.compile(
+    r"(?i)(?:\b(?:as_sk|sk)_[a-z0-9_-]{8,}\b|"
+    r"\b(?:authorization|api[_-]?key|token|password)\s*[:=]\s*[^\s,;]+)"
+)
+_AGENT_SECRET_ARGUMENT_FLAGS = frozenset(
+    {
+        "--api-key",
+        "--apikey",
+        "--token",
+        "--password",
+        "--secret",
+        "-p",
+    }
+)
+
+
+def _redact_agent_text(value: str, *, limit: int = 2_000) -> str:
+    """Keep useful command diagnostics without persisting likely credentials."""
+
+    clipped = value[:limit]
+    return _AGENT_SECRET_OUTPUT.sub("[REDACTED]", clipped)
+
+
+def _redacted_agent_argv(argv: tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    redact_next = False
+    for item in argv:
+        if redact_next:
+            result.append("[REDACTED]")
+            redact_next = False
+            continue
+        lowered = item.casefold()
+        if lowered in _AGENT_SECRET_ARGUMENT_FLAGS:
+            result.append(item)
+            redact_next = True
+            continue
+        if any(marker in lowered for marker in ("api_key=", "apikey=", "token=", "password=")):
+            result.append("[REDACTED]")
+            continue
+        result.append(_redact_agent_text(item, limit=512))
+    return result
+
+
+class SandboxAgentWorkspaceService:
+    """Persisted, shell-free Agent workspace operations over a hardened backend.
+
+    The service deliberately owns only the execution boundary.  Agent planning
+    and business-domain tools stay in Chat/MCP services.  A caller must make a
+    separate authorization decision before using ``execute_agent_tool``; HTTP
+    routes enforce ``workspace.manage`` directly.
+    """
+
+    def __init__(
+        self,
+        db: Session,
+        workspace_id: str,
+        actor_id: str,
+        settings: Settings,
+        *,
+        workspace: Workspace | None = None,
+        principal: Principal | None = None,
+    ) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.settings = settings
+        self.workspace = workspace
+        self.principal = principal
+        self.audit = AuditRepository(db, workspace_id)
+        self.backend = backend_for_settings(settings)
+        self.workspace_files = SessionWorkspaceService(db, workspace_id, actor_id, settings)
+        self.authz = SandboxAuthorizationService(db, workspace_id, actor_id)
+
+    def _require_chat_session(self, session_id: str) -> ChatSession:
+        record = self.db.scalar(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.workspace_id == self.workspace_id,
+            )
+        )
+        if record is None:
+            raise AppError(404, "session_not_found", "Chat session was not found in this workspace")
+        if self.workspace is not None and self.principal is not None:
+            if self.workspace.id != self.workspace_id or not AuthorizationService(
+                self.db, self.principal
+            ).can_access_resource(self.workspace, "session", session_id, "write"):
+                raise AppError(404, "session_not_found", "Chat session was not found in this workspace")
+        return record
+
+    def _get_session(self, sandbox_session_id: str) -> SandboxSession:
+        session = self.db.scalar(
+            select(SandboxSession).where(
+                SandboxSession.id == sandbox_session_id,
+                SandboxSession.workspace_id == self.workspace_id,
+                SandboxSession.owner_user_id == self.actor_id,
+            )
+        )
+        if session is None:
+            raise AppError(404, "sandbox_session_not_found", "Sandbox session was not found")
+        if session.policy_revision != AGENT_SANDBOX_POLICY_REVISION:
+            raise AppError(
+                409,
+                "sandbox_agent_session_required",
+                "The selected sandbox session is not an Agent workspace session",
+            )
+        return session
+
+    def get_command(self, command_id: str) -> SandboxAgentCommand:
+        command = self.db.scalar(
+            select(SandboxAgentCommand).where(
+                SandboxAgentCommand.id == command_id,
+                SandboxAgentCommand.workspace_id == self.workspace_id,
+                SandboxAgentCommand.owner_user_id == self.actor_id,
+            )
+        )
+        if command is None:
+            raise AppError(404, "sandbox_agent_command_not_found", "Sandbox Agent command was not found")
+        return command
+
+    def list_commands(self, chat_session_id: str | None = None) -> list[SandboxAgentCommand]:
+        statement = select(SandboxAgentCommand).where(
+            SandboxAgentCommand.workspace_id == self.workspace_id,
+            SandboxAgentCommand.owner_user_id == self.actor_id,
+        )
+        if chat_session_id is not None:
+            self._require_chat_session(chat_session_id)
+            statement = statement.where(SandboxAgentCommand.chat_session_id == chat_session_id)
+        return list(self.db.scalars(statement.order_by(SandboxAgentCommand.created_at.desc())).all())
+
+    def _new_session(
+        self, chat_session_id: str, runtime_kind: str = "python-node"
+    ) -> SandboxSession:
+        with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
+            _enforce_retained_workspace_capacity(
+                self.db, self.settings, self.actor_id
+            )
+            return self._new_session_locked(chat_session_id, runtime_kind)
+
+    def _new_session_locked(
+        self, chat_session_id: str, runtime_kind: str
+    ) -> SandboxSession:
+        now = utc_now()
+        workspace_expires_at, absolute_expires_at = _session_expirations(
+            self.settings, now
+        )
+        manifest_hash = hashlib.sha256(
+            f"{AGENT_SANDBOX_POLICY_REVISION}:{self.workspace_id}:{chat_session_id}:{self.actor_id}".encode()
+        ).hexdigest()
+        session = SandboxSession(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            chat_session_id=chat_session_id,
+            backend_id=self.backend.backend_id,
+            manifest_hash=manifest_hash,
+            policy_revision=AGENT_SANDBOX_POLICY_REVISION,
+            runtime_kind=runtime_kind,
+            lifecycle_state="CREATED",
+            status="created",
+            resource_limits={
+                "wall_time_seconds": self.settings.sandbox_wall_time_seconds,
+                "memory_bytes": self.settings.sandbox_memory_bytes,
+                "pids_max": self.settings.sandbox_pids_max,
+                "disk_bytes": self.settings.sandbox_disk_bytes,
+                "output_bytes": self.settings.sandbox_output_bytes,
+                "agent_file_bytes": self.settings.sandbox_agent_file_bytes,
+            },
+            network_policy={"mode": "none", "allowed_hosts": []},
+            last_used_at=now,
+            expires_at=workspace_expires_at,
+            workspace_expires_at=workspace_expires_at,
+            absolute_expires_at=absolute_expires_at,
+        )
+        self.db.add(session)
+        self.db.flush()
+        session.workspace_relative_path = _initialize_workspace(
+            self.settings, self.actor_id, session.id
+        )
+        session.lifecycle_state = "COLD"
+        # Publish the workspace identity before the runtime reservation path
+        # refreshes this row under the deployment lock.
+        self.db.commit()
+        self.db.refresh(session)
+        return session
+
+    @staticmethod
+    def _not_expired(session: SandboxSession) -> bool:
+        expires_at = session.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return expires_at > utc_now()
+
+    def _resolve_session(
+        self,
+        sandbox_session_id: str | None,
+        chat_session_id: str,
+        runtime_kind: str = "python-node",
+    ) -> SandboxSession:
+        self._require_chat_session(chat_session_id)
+        if sandbox_session_id is not None:
+            session = self._get_session(sandbox_session_id)
+            if session.chat_session_id != chat_session_id:
+                raise AppError(
+                    409,
+                    "sandbox_session_scope_mismatch",
+                    "A sandbox session cannot be reused by a different chat session",
+                )
+            if not self._not_expired(session):
+                raise AppError(409, "sandbox_session_expired", "Sandbox session has expired")
+            if session.cleanup_status == "cleaned" or session.status in {"deleted", "stopped"}:
+                raise AppError(409, "sandbox_session_not_ready", "Sandbox session is not reusable")
+            return session
+
+        existing = self.db.scalar(
+            select(SandboxSession)
+            .where(
+                SandboxSession.workspace_id == self.workspace_id,
+                SandboxSession.owner_user_id == self.actor_id,
+                SandboxSession.chat_session_id == chat_session_id,
+                SandboxSession.policy_revision == AGENT_SANDBOX_POLICY_REVISION,
+                SandboxSession.runtime_kind == runtime_kind,
+                SandboxSession.status == "ready",
+                SandboxSession.cleanup_status != "cleaned",
+            )
+            .order_by(SandboxSession.last_used_at.desc())
+        )
+        if existing is not None and self._not_expired(existing):
+            return existing
+        return self._new_session(chat_session_id, runtime_kind)
+
+    def _runtime_backend(self, session: SandboxSession):
+        return backend_for_settings(self.settings, session.runtime_kind)
+
+    def _ensure_runtime_capacity(self, session: SandboxSession) -> None:
+        _enforce_sandbox_capacity(
+            self.db,
+            self.settings,
+            self.actor_id,
+            session,
+            self._runtime_backend(session),
+        )
+
+    def _touch_session(self, session: SandboxSession) -> None:
+        now = utc_now()
+        absolute_expires_at = session.absolute_expires_at
+        if absolute_expires_at.tzinfo is None:
+            absolute_expires_at = absolute_expires_at.replace(tzinfo=timezone.utc)
+        session.last_used_at = now
+        session.runtime_last_used_at = now
+        session.workspace_expires_at = min(
+            now
+            + timedelta(seconds=self.settings.sandbox_workspace_idle_ttl_seconds),
+            absolute_expires_at,
+        )
+        session.expires_at = session.workspace_expires_at
+
+    def _ensure_backend_session(self, session: SandboxSession) -> SandboxSessionHandle:
+        if not self.settings.sandbox_agent_enabled:
+            raise SandboxBackendUnavailable("Agent sandbox execution is disabled by deployment configuration")
+        backend = self._runtime_backend(session)
+        if session.backend_session_ref:
+            try:
+                return backend.resume(session.id, session.backend_session_ref)
+            except SandboxBackendError:
+                session.backend_session_ref = None
+                session.lifecycle_state = "COLD"
+        with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
+            # This ORM object may have been loaded before another worker
+            # completed the same cold start. Refresh under the process lock.
+            self.db.refresh(session)
+            if session.backend_session_ref:
+                return backend.resume(session.id, session.backend_session_ref)
+            self._ensure_runtime_capacity(session)
+            capability = backend.probe()
+            if not capability.available:
+                raise SandboxBackendUnavailable(
+                    capability.reason or "Sandbox backend is unavailable"
+                )
+            image_ref = resolve_sandbox_image_for_runtime(
+                self.settings, session.runtime_kind
+            )
+            # Persist STARTING before the slow Docker call. Other requests and
+            # workers count the reservation instead of oversubscribing the host.
+            session.lifecycle_state = "STARTING"
+            session.runtime_started_at = utc_now()
+            session.runtime_last_used_at = session.runtime_started_at
+            self.db.commit()
+            try:
+                handle = backend.create(
+                    SandboxCreateSpec(
+                        session_id=session.id,
+                        image_ref=image_ref or "",
+                        memory_bytes=self.settings.sandbox_memory_bytes,
+                        memory_swap_bytes=self.settings.sandbox_memory_swap_bytes,
+                        cpu_count=self.settings.sandbox_cpu_count,
+                        pids_max=self.settings.sandbox_pids_max,
+                        disk_bytes=self.settings.sandbox_disk_bytes,
+                        workspace_path=str(
+                            _sandbox_workspace_path(
+                                self.settings, session.workspace_relative_path
+                            )
+                        ),
+                        runtime_kind=session.runtime_kind,
+                    )
+                )
+                session.backend_session_ref = handle.backend_ref
+                session.status = "ready"
+                self.db.commit()
+            except Exception:
+                session.lifecycle_state = "COLD"
+                session.backend_session_ref = None
+                self.db.commit()
+                raise
+        return handle
+
+    def _mark_session_failed(self, session: SandboxSession) -> None:
+        session.status = "failed"
+        session.runtime_last_used_at = utc_now()
+        session.lifecycle_state = (
+            "WARM_IDLE" if session.backend_session_ref else "COLD"
+        )
+
+    def _discard_killed_runtime(self, session: SandboxSession) -> None:
+        if session.backend_session_ref:
+            try:
+                self._runtime_backend(session).delete(
+                    SandboxSessionHandle(session.id, session.backend_session_ref)
+                )
+                session.backend_session_ref = None
+            except SandboxBackendError:
+                logger.exception("Failed to remove killed Agent sandbox container")
+        session.lifecycle_state = "COLD"
+
+    def _record_policy_block(
+        self,
+        *,
+        action: str,
+        reason: str,
+        argv: tuple[str, ...] | None = None,
+        path: str | None = None,
+    ) -> None:
+        details: dict[str, Any] = {"reason": reason}
+        if argv:
+            details["argv_digest"] = hashlib.sha256("\0".join(argv).encode()).hexdigest()
+        if path is not None:
+            details["path_digest"] = hashlib.sha256(path.encode()).hexdigest()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action=action,
+            resource_type="sandbox_agent_policy",
+            resource_id=new_id(),
+            outcome="blocked",
+            details=details,
+        )
+        self.db.commit()
+
+    def _validate_command(self, payload: SandboxAgentCommandRequest) -> tuple[str, ...]:
+        raw = tuple(payload.argv)
+        try:
+            argv = validate_agent_argv(
+                raw,
+                max_args=self.settings.sandbox_agent_command_args_max,
+            )
+            validate_agent_cwd(payload.cwd)
+        except SandboxCapabilityMismatch as exc:
+            self._record_policy_block(
+                action="sandbox.agent.command.blocked",
+                reason=str(exc),
+                argv=raw,
+            )
+            raise AppError(422, "sandbox_command_blocked", str(exc)) from exc
+        # Destructive argv is shape-validated above; authorization is separate.
+        self.authz.authorize_or_raise(chat_session_id=payload.chat_session_id, argv=argv)
+        return argv
+
+    def create_session(self, payload: SandboxAgentSessionCreateRequest) -> SandboxSession:
+        session = self._resolve_session(
+            payload.sandbox_session_id,
+            payload.chat_session_id,
+            payload.runtime,
+        )
+        try:
+            self._ensure_backend_session(session)
+            self._touch_session(session)
+            session.lifecycle_state = "WARM_IDLE"
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="sandbox.agent.session.ready",
+                resource_type="sandbox_session",
+                resource_id=session.id,
+                details={"chat_session_id": session.chat_session_id, "backend_id": session.backend_id},
+            )
+            self.db.commit()
+            self.db.refresh(session)
+            return session
+        except SandboxBackendUnavailable as exc:
+            self._mark_session_failed(session)
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="sandbox.agent.session.unavailable",
+                resource_type="sandbox_session",
+                resource_id=session.id,
+                outcome="failed",
+                details={"error_class": "sandbox_backend_unavailable"},
+            )
+            self.db.commit()
+            raise AppError(503, "sandbox_backend_unavailable", str(exc)) from exc
+        except SandboxBackendError as exc:
+            logger.exception("Sandbox session startup failed")
+            self._mark_session_failed(session)
+            self.db.commit()
+            raise AppError(502, "sandbox_execution_failed", "Sandbox session startup failed") from exc
+
+    def execute_command(
+        self,
+        payload: SandboxAgentCommandRequest,
+        *,
+        idempotency_key: str | None,
+    ) -> SandboxAgentCommand:
+        argv = self._validate_command(payload)
+        argv_digest = hashlib.sha256("\0".join(argv).encode()).hexdigest()
+        key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
+        if key_hash:
+            existing = self.db.scalar(
+                select(SandboxAgentCommand).where(
+                    SandboxAgentCommand.workspace_id == self.workspace_id,
+                    SandboxAgentCommand.owner_user_id == self.actor_id,
+                    SandboxAgentCommand.idempotency_key_hash == key_hash,
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.chat_session_id != payload.chat_session_id
+                    or existing.argv_digest != argv_digest
+                    or existing.cwd_relative != payload.cwd
+                ):
+                    raise AppError(
+                        409,
+                        "idempotency_key_conflict",
+                        "The sandbox idempotency key was already used for a different command",
+                    )
+                return existing
+        session = self._resolve_session(
+            payload.sandbox_session_id,
+            payload.chat_session_id,
+            payload.runtime,
+        )
+        command = SandboxAgentCommand(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            sandbox_session_id=session.id,
+            chat_session_id=payload.chat_session_id,
+            idempotency_key_hash=key_hash,
+            argv_digest=argv_digest,
+            argv_redacted=_redacted_agent_argv(argv),
+            cwd_relative=payload.cwd,
+            status="created",
+        )
+        self.db.add(command)
+        self.db.commit()
+        try:
+            handle = self._ensure_backend_session(session)
+            session.status = "running"
+            session.lifecycle_state = "RUNNING"
+            command.status = "running"
+            self.db.commit()
+            result = self._runtime_backend(session).exec_agent(
+                handle,
+                argv,
+                cwd_relative=payload.cwd,
+                timeout_seconds=self.settings.sandbox_wall_time_seconds,
+                output_limit=self.settings.sandbox_output_bytes,
+                destructive_path_prefixes=self.authz.active_delete_prefixes(
+                    chat_session_id=payload.chat_session_id,
+                    sandbox_session_id=session.id,
+                ),
+            )
+            command.exit_code = result.exit_code
+            command.timed_out = result.timed_out
+            command.latency_ms = result.latency_ms
+            command.truncated = result.truncated
+            command.resource_usage = {
+                "output_bytes": len(result.stdout) + len(result.stderr),
+                "network_mode": "none",
+            }
+            command.stdout_summary = _redact_agent_text(
+                result.stdout.decode("utf-8", errors="replace")
+            )
+            command.stderr_summary = _redact_agent_text(
+                result.stderr.decode("utf-8", errors="replace")
+            )
+            if result.timed_out:
+                command.status = "failed"
+                command.error_class = "sandbox_timeout"
+                command.error_message = "Sandbox Agent command timed out"
+                self._mark_session_failed(session)
+            elif result.exit_code != 0:
+                command.status = "failed"
+                command.error_class = "sandbox_command_failed"
+                command.error_message = "Sandbox Agent command exited with a non-zero status"
+                session.status = "ready"
+            else:
+                command.status = "completed"
+                session.status = "ready"
+            self._touch_session(session)
+            if result.timed_out:
+                self._discard_killed_runtime(session)
+            else:
+                session.lifecycle_state = "WARM_IDLE"
+            self.audit.record(
+                actor_id=self.actor_id,
+                action=(
+                    "sandbox.agent.command.completed"
+                    if command.status == "completed"
+                    else "sandbox.agent.command.failed"
+                ),
+                resource_type="sandbox_agent_command",
+                resource_id=command.id,
+                outcome="success" if command.status == "completed" else "failed",
+                details={
+                    "sandbox_session_id": session.id,
+                    "argv_digest": argv_digest,
+                    "exit_code": command.exit_code,
+                    "timed_out": command.timed_out,
+                },
+            )
+            self.db.commit()
+            self.db.refresh(command)
+            return command
+        except SandboxBackendUnavailable as exc:
+            return self._fail_command(
+                command,
+                session,
+                "sandbox_backend_unavailable",
+                "Sandbox backend is unavailable",
+                type(exc).__name__,
+            )
+        except SandboxCapabilityMismatch as exc:
+            return self._fail_command(
+                command,
+                session,
+                "sandbox_command_blocked",
+                "Sandbox command was blocked by policy",
+                type(exc).__name__,
+            )
+        except SandboxWorkspaceQuotaExceeded as exc:
+            return self._fail_command(
+                command,
+                session,
+                "sandbox_workspace_quota_exceeded",
+                "Sandbox workspace aggregate disk quota was exceeded",
+                type(exc).__name__,
+            )
+        except SandboxDestructiveAuthorizationRequired as exc:
+            return self._fail_command(
+                command,
+                session,
+                "sandbox_auth_required",
+                "Sandbox code attempted a workspace deletion that requires authorization",
+                type(exc).__name__,
+            )
+        except SandboxBackendError as exc:
+            return self._fail_command(
+                command,
+                session,
+                "sandbox_execution_failed",
+                "Sandbox Agent command execution failed",
+                type(exc).__name__,
+            )
+
+    def _fail_command(
+        self,
+        command: SandboxAgentCommand,
+        session: SandboxSession,
+        error_class: str,
+        message: str,
+        internal_class: str,
+    ) -> SandboxAgentCommand:
+        command.status = "failed"
+        command.error_class = error_class
+        command.error_message = message
+        self._mark_session_failed(session)
+        if error_class in {
+            "sandbox_timeout",
+            "sandbox_workspace_quota_exceeded",
+        }:
+            self._discard_killed_runtime(session)
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.command.failed",
+            resource_type="sandbox_agent_command",
+            resource_id=command.id,
+            outcome="failed",
+            details={
+                "sandbox_session_id": session.id,
+                "error_class": error_class,
+                "internal_class": internal_class,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(command)
+        return command
+
+    def _resolve_file_session(self, sandbox_session_id: str | None, chat_session_id: str) -> tuple[SandboxSession, SandboxSessionHandle]:
+        session = self._resolve_session(sandbox_session_id, chat_session_id)
+        try:
+            handle = self._ensure_backend_session(session)
+            return session, handle
+        except SandboxBackendUnavailable as exc:
+            self._mark_session_failed(session)
+            self.db.commit()
+            raise AppError(503, "sandbox_backend_unavailable", str(exc)) from exc
+        except SandboxBackendError as exc:
+            self._mark_session_failed(session)
+            self.db.commit()
+            raise AppError(502, "sandbox_execution_failed", "Sandbox workspace is unavailable") from exc
+
+    def write_file(self, payload: SandboxAgentFileWriteRequest) -> dict[str, Any]:
+        try:
+            path = validate_agent_workspace_path(payload.path)
+        except SandboxCapabilityMismatch as exc:
+            self._record_policy_block(
+                action="sandbox.agent.file_write.blocked",
+                reason=str(exc),
+                path=payload.path,
+            )
+            raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
+        data = payload.content.encode("utf-8")
+        if len(data) > self.settings.sandbox_agent_file_bytes:
+            self._record_policy_block(
+                action="sandbox.agent.file_write.blocked",
+                reason="Sandbox Agent file exceeds the configured byte limit",
+                path=payload.path,
+            )
+            raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
+        session, handle = self._resolve_file_session(payload.sandbox_session_id, payload.chat_session_id)
+        try:
+            self._runtime_backend(session).write_agent_file(handle, path, data)
+        except SandboxWorkspaceQuotaExceeded as exc:
+            self.db.commit()
+            raise AppError(
+                413,
+                "sandbox_workspace_quota_exceeded",
+                "Sandbox workspace aggregate disk quota was exceeded",
+            ) from exc
+        except SandboxBackendError as exc:
+            self._mark_session_failed(session)
+            self.db.commit()
+            raise AppError(502, "sandbox_execution_failed", "Sandbox file write failed") from exc
+        # Dual-write into the content-addressed session workspace (two-layer store).
+        role = "output" if path.startswith("outputs/") else "work"
+        workspace_view = self.workspace_files.put_bytes(
+            chat_session_id=payload.chat_session_id,
+            path=path,
+            data=data,
+            role=role,
+            sandbox_session_id=session.id,
+            source="agent_write",
+            publish_file=path.startswith("outputs/"),
+        )
+        session.status = "ready"
+        self._touch_session(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.file_written",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={
+                "path": path,
+                "size_bytes": len(data),
+                "blob_sha256": workspace_view.get("blob_sha256"),
+                "file_id": workspace_view.get("file_id"),
+            },
+        )
+        self.db.commit()
+        result = {
+            "sandbox_session_id": session.id,
+            "path": path,
+            "size_bytes": len(data),
+            "blob_sha256": workspace_view.get("blob_sha256"),
+            "file_id": workspace_view.get("file_id"),
+            "role": workspace_view.get("role"),
+        }
+        if workspace_view.get("file_id"):
+            result["artifact"] = {
+                "type": "sandbox_artifact",
+                "status": "completed",
+                "data": {
+                    "kind": "file",
+                    "title": path.rsplit("/", 1)[-1],
+                    "path": path,
+                    "file_id": workspace_view.get("file_id"),
+                    "size_bytes": len(data),
+                    "sha256": workspace_view.get("blob_sha256"),
+                    "mime_type": workspace_view.get("mime_type"),
+                    "sandbox_session_id": session.id,
+                    "chat_session_id": payload.chat_session_id,
+                },
+            }
+        return result
+
+    def read_file(self, payload: SandboxAgentFileReadRequest) -> dict[str, Any]:
+        try:
+            path = validate_agent_workspace_path(payload.path)
+        except SandboxCapabilityMismatch as exc:
+            self._record_policy_block(
+                action="sandbox.agent.file_read.blocked",
+                reason=str(exc),
+                path=payload.path,
+            )
+            raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        data: bytes | None = None
+        # Prefer the content-addressed session workspace so chat-seeded inputs/
+        # remain readable even when Docker is unavailable or not yet synced.
+        try:
+            data = self.workspace_files.materialize_bytes(payload.chat_session_id, path)
+        except AppError:
+            data = None
+        if data is None:
+            try:
+                handle = self._ensure_backend_session(session)
+                data = self._runtime_backend(session).read(
+                    handle, path, self.settings.sandbox_agent_file_bytes
+                )
+            except SandboxBackendUnavailable as exc:
+                self._mark_session_failed(session)
+                self.db.commit()
+                raise AppError(503, "sandbox_backend_unavailable", str(exc)) from exc
+            except SandboxBackendError as exc:
+                raise AppError(422, "sandbox_file_unavailable", "Sandbox Agent file cannot be read") from exc
+        try:
+            content = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise AppError(422, "sandbox_file_not_text", "Sandbox Agent file is not UTF-8 text") from exc
+        if len(data) > self.settings.sandbox_agent_file_bytes:
+            raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
+        self._touch_session(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.file_read",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={"path": path, "size_bytes": len(data)},
+        )
+        self.db.commit()
+        return {
+            "sandbox_session_id": session.id,
+            "path": path,
+            "size_bytes": len(data),
+            "content": content,
+        }
+
+    def list_files(self, payload: SandboxAgentFileListRequest) -> dict[str, Any]:
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        # Always surface the durable session workspace tree (chat attachments,
+        # agent writes, published outputs). Docker listing is best-effort.
+        logical = self.workspace_files.list_entries(payload.chat_session_id)
+        by_path: dict[str, dict[str, Any]] = {
+            entry.path: {
+                "path": entry.path,
+                "size_bytes": int(entry.size_bytes or 0),
+                "role": entry.role,
+                "file_id": entry.file_id,
+                "source": entry.source,
+            }
+            for entry in logical
+        }
+        try:
+            handle = self._ensure_backend_session(session)
+            for item in self._runtime_backend(session).list_files(
+                handle, limit_entries=200
+            ):
+                existing = by_path.get(item.path)
+                if existing is None:
+                    by_path[item.path] = {
+                        "path": item.path,
+                        "size_bytes": item.size_bytes,
+                        "role": "work",
+                        "file_id": None,
+                        "source": "container",
+                    }
+                else:
+                    existing["size_bytes"] = item.size_bytes or existing["size_bytes"]
+        except (SandboxBackendUnavailable, SandboxBackendError):
+            # Logical workspace alone is enough for list; agent can still read
+            # materializable inputs without a live Docker handle.
+            pass
+        files = sorted(by_path.values(), key=lambda item: item["path"])[:200]
+        self._touch_session(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.files_listed",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={"file_count": len(files)},
+        )
+        self.db.commit()
+        return {
+            "sandbox_session_id": session.id,
+            "path": ".",
+            "size_bytes": 0,
+            "files": files,
+        }
+
+    def seed_chat_attachments(
+        self,
+        *,
+        chat_session_id: str,
+        files: list[FileRecord],
+    ) -> list[dict[str, Any]]:
+        """Materialize chat attachments into session workspace inputs/.
+
+        Does not require Docker for the durable logical tree. When a backend
+        session can be opened, also best-effort write read-only input files
+        into the container so list/read tools see them immediately.
+        """
+
+        self._require_chat_session(chat_session_id)
+        seeded: list[dict[str, Any]] = []
+        handle = None
+        session = None
+        for file in files:
+            if file.storage_status != "stored":
+                continue
+            if self._is_image_like(file):
+                # Multimodal images stay on the structured chat path; do not
+                # force them into the code workspace unless the user asks.
+                continue
+            view = self.workspace_files.link_file_record(
+                chat_session_id=chat_session_id,
+                file=file,
+                role="input",
+                source="chat_attachment",
+            )
+            seeded.append(view)
+            # Best-effort Docker dual-write of input bytes.
+            try:
+                if handle is None:
+                    session = self._resolve_session(None, chat_session_id)
+                    handle = self._ensure_backend_session(session)
+                data = self.workspace_files.materialize_bytes(
+                    chat_session_id, str(view["path"])
+                )
+                # backend.write uses mode 0o444 — appropriate for inputs/.
+                self._runtime_backend(session).write(
+                    handle, str(view["path"]), data
+                )
+                if session is not None:
+                    view_path = str(view["path"])
+                    # Keep entry sandbox_session_id current when container is live.
+                    entry = self.workspace_files.get_entry(chat_session_id, view_path)
+                    entry.sandbox_session_id = session.id
+                    entry.updated_at = utc_now()
+            except (SandboxBackendUnavailable, SandboxBackendError, AppError, KeyError):
+                pass
+        if session is not None:
+            self._touch_session(session)
+        return seeded
+
+    @staticmethod
+    def _is_image_like(file: FileRecord) -> bool:
+        return file.mime_type.casefold().split(";", 1)[0].strip().startswith("image/")
+
+    @staticmethod
+    def agent_tool_definitions() -> list[dict[str, Any]]:
+        """OpenAI-compatible function schemas for the Chat agent dispatcher.
+
+        ``chat_session_id`` is server supplied by ``execute_agent_tool`` and
+        cannot be selected by the model.  Tool callers should persist and pass
+        back the returned ``sandbox_session_id`` to maintain one workspace.
+        """
+
+        session_property = {
+            "type": "string",
+            "description": "Optional previously returned sandbox session ID for this chat.",
+        }
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_write_file",
+                    "description": "Write UTF-8 source or data into the isolated Agent workspace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative workspace path."},
+                            "content": {"type": "string", "description": "UTF-8 file content."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_read_file",
+                    "description": "Read a UTF-8 file from the isolated Agent workspace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "sandbox_session_id": session_property},
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_list_files",
+                    "description": "List regular files in the isolated Agent workspace.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sandbox_session_id": session_property},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_exec",
+                    "description": (
+                        "Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file in the isolated sandbox. "
+                        "argv is never evaluated by a shell. Host-path deletes are blocked; "
+                        "session work/ deletes require prior user authorization."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "argv": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": 'For example: ["python", "main.py"] or ["node", "main.js"].',
+                            },
+                            "cwd": {"type": "string", "enum": ["."], "default": "."},
+                            "runtime": {
+                                "type": "string",
+                                "enum": ["python-node", "python-node-browser"],
+                                "default": "python-node",
+                                "description": (
+                                    "Use python-node-browser only for Playwright/Chromium work."
+                                ),
+                            },
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["argv"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_publish_file",
+                    "description": (
+                        "Promote a UTF-8 workspace file into session outputs/, register it in the "
+                        "unified file zone, and return a downloadable sandbox_artifact for the chat UI."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative workspace path to publish (copied under outputs/).",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Optional UTF-8 content; when omitted the path must already exist in the session workspace store.",
+                            },
+                            "title": {"type": "string"},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def execute_agent_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        agent_authorized: bool,
+    ) -> dict[str, Any]:
+        """Execute one allow-listed tool for a caller-authorized Chat Agent.
+
+        This method is intentionally synchronous like the existing Agent tool
+        dispatcher.  It raises ``AppError`` for malformed/denied calls so the
+        dispatcher can serialize the same stable error shape it uses for other
+        LearnGraph tools.
+        """
+
+        if not agent_authorized:
+            self._record_policy_block(
+                action="sandbox.agent.tool.denied",
+                reason="workspace.manage permission is required for Agent sandbox tools",
+            )
+            raise AppError(
+                403,
+                "sandbox_agent_permission_denied",
+                "Workspace management permission is required for Agent sandbox tools",
+            )
+        if not self.settings.sandbox_agent_enabled:
+            raise AppError(
+                503,
+                "sandbox_agent_disabled",
+                "Agent sandbox execution is disabled by deployment configuration",
+            )
+        if not isinstance(arguments, dict):
+            raise AppError(422, "invalid_tool_arguments", "Sandbox Agent tool arguments must be an object")
+        payload = {**arguments, "chat_session_id": chat_session_id}
+        try:
+            if name == "sandbox_write_file":
+                return self.write_file(SandboxAgentFileWriteRequest.model_validate(payload))
+            if name == "sandbox_read_file":
+                return self.read_file(SandboxAgentFileReadRequest.model_validate(payload))
+            if name == "sandbox_list_files":
+                return self.list_files(SandboxAgentFileListRequest.model_validate(payload))
+            if name == "sandbox_exec":
+                command = self.execute_command(
+                    SandboxAgentCommandRequest.model_validate(payload),
+                    idempotency_key=None,
+                )
+                return {
+                    "id": command.id,
+                    "sandbox_session_id": command.sandbox_session_id,
+                    "status": command.status,
+                    "exit_code": command.exit_code,
+                    "error_class": command.error_class,
+                    "stdout": command.stdout_summary,
+                    "stderr": command.stderr_summary,
+                    "timed_out": command.timed_out,
+                    "truncated": command.truncated,
+                    "summary": {
+                        "type": "sandbox_status",
+                        "status": command.status,
+                        "data": {
+                            "phase": "completed" if command.status == "completed" else "failed",
+                            "argv_redacted": command.argv_redacted,
+                            "exit_code": command.exit_code,
+                            "latency_ms": command.latency_ms,
+                            "stdout_summary": (command.stdout_summary or "")[:400],
+                            "stderr_summary": (command.stderr_summary or "")[:400],
+                            "sandbox_session_id": command.sandbox_session_id,
+                            "chat_session_id": command.chat_session_id,
+                        },
+                    },
+                }
+            if name == "sandbox_publish_file":
+                return self.publish_workspace_file(
+                    chat_session_id=chat_session_id,
+                    path=str(payload.get("path") or ""),
+                    content=payload.get("content") if isinstance(payload.get("content"), str) else None,
+                    title=payload.get("title") if isinstance(payload.get("title"), str) else None,
+                    sandbox_session_id=payload.get("sandbox_session_id")
+                    if isinstance(payload.get("sandbox_session_id"), str)
+                    else None,
+                )
+        except ValidationError as exc:
+            raise AppError(422, "invalid_tool_arguments", "Sandbox Agent tool arguments are invalid") from exc
+        raise AppError(404, "sandbox_agent_tool_not_found", "Sandbox Agent tool is not registered")
+
+    def publish_workspace_file(
+        self,
+        *,
+        chat_session_id: str,
+        path: str,
+        content: str | None,
+        title: str | None,
+        sandbox_session_id: str | None,
+    ) -> dict[str, Any]:
+        self._require_chat_session(chat_session_id)
+        session = self._resolve_session(sandbox_session_id, chat_session_id)
+        if content is not None:
+            data = content.encode("utf-8")
+            if len(data) > self.settings.sandbox_agent_file_bytes:
+                raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
+            # Best-effort container dual-write; unified file zone does not require Docker.
+            try:
+                handle = self._ensure_backend_session(session)
+                self._runtime_backend(session).write_agent_file(handle, path, data)
+            except (SandboxBackendUnavailable, SandboxBackendError):
+                pass
+        else:
+            try:
+                data = self.workspace_files.materialize_bytes(chat_session_id, path)
+            except AppError:
+                try:
+                    handle = self._ensure_backend_session(session)
+                    data = self._runtime_backend(session).read(
+                        handle, path, self.settings.sandbox_agent_file_bytes
+                    )
+                except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+                    raise AppError(422, "sandbox_file_unavailable", "Sandbox Agent file cannot be read") from exc
+        published = self.workspace_files.publish_path(
+            chat_session_id=chat_session_id,
+            path=path if path.startswith("outputs/") else f"outputs/{path.rsplit('/', 1)[-1]}",
+            data=data,
+            sandbox_session_id=session.id,
+            title=title,
+        )
+        session.status = "ready"
+        self._touch_session(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.db.commit()
+        return published
+
+    def list_workspace_entries(self, chat_session_id: str) -> list[dict[str, Any]]:
+        self._require_chat_session(chat_session_id)
+        return self.workspace_files.list_views(chat_session_id)

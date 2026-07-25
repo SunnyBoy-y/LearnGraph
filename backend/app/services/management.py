@@ -1,0 +1,1879 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from pydantic import ValidationError
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from app.core.config import Settings
+from app.core.errors import AppError
+from app.core.secret_store import SecretStoreUnavailable, secret_store_from_settings
+from app.core.security import SecretCipher, mask_secret
+from app.domain.models import (
+    AuditEvent,
+    MigrationJob,
+    PluginRecord,
+    ProviderConfig,
+    ProviderSecret,
+    UsageEvent,
+    Workspace,
+    WorkspaceSetting,
+    utc_now,
+)
+from app.domain.settings import (
+    CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
+    CHAT_RESPONSE_STYLE_SETTING_KEY,
+    CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
+    CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
+)
+from app.domain.schemas.management import (
+    ChatFeatureModelSettingValue,
+    ChatResponseStyleSettingValue,
+    ChatSuggestedPromptsSettingValue,
+    MigrationPreflightRequest,
+    PluginToggleRequest,
+    ProviderCreateRequest,
+    ProviderSecretRotateRequest,
+    ProviderUpdateRequest,
+    ProviderModelCapabilityUpdateRequest,
+    SettingUpdateRequest,
+    UsageSummary,
+)
+from app.repositories.audit import AuditRepository
+from app.repositories.domain import (
+    MigrationRepository,
+    PluginRepository,
+    ProviderRepository,
+    SettingRepository,
+    UsageRepository,
+)
+from app.providers.catalog import (
+    DEEP_RESEARCH_PROVIDER_TYPES,
+    FETCH_PROVIDER_TYPES,
+    IMAGE_GENERATION_PROVIDER_TYPES,
+    MEMORY_PROVIDER_TYPES,
+    MODEL_PROVIDER_TYPES,
+    SEARCH_PROVIDER_TYPES,
+    TRANSCRIPTION_PROVIDER_TYPES,
+    VISION_PROVIDER_TYPES,
+    provider_catalog,
+    provider_type_spec,
+)
+from app.providers.remote.fetch import (
+    Crawl4AIHTTPFetchProvider,
+    FetchProviderError,
+    FetchProviderTimeout,
+    FirecrawlFetchProvider,
+)
+from app.providers.remote.openai import (
+    ProviderHTTPError,
+    ProviderResponseError,
+    ProviderTimeoutError,
+    discover_remote_models,
+)
+from app.providers.remote.deepseek import (
+    DeepSeekBalanceError,
+    fetch_deepseek_balance,
+    is_deepseek_chat_configuration,
+    is_official_deepseek_api_base_url,
+)
+from app.providers.remote.memory import Mem0PlatformAdapter, mem0_entity_id
+from app.providers.remote.anysearch import AnySearchSearchProvider
+from app.providers.remote.research import (
+    DeepResearchProviderError,
+    DeepResearchProviderTimeout,
+    HTTPDeepResearchProvider,
+)
+from app.providers.remote.search import (
+    CloudSearchProvider,
+    SearchProviderError,
+    SearchProviderResponseError,
+    SearchProviderTimeout,
+    SearXNGSearchProvider,
+)
+from app.providers.model_options import (
+    ModelCapabilityError,
+    model_capabilities_for_model,
+    validate_model_capability_update,
+)
+from app.services.provider_secrets import (
+    PROVIDER_SECRET_ALGORITHM,
+    ProviderSecretUnavailable,
+    decrypt_provider_secret,
+    encrypt_provider_secret,
+)
+
+
+class ProviderService:
+    def __init__(self, db: Session, workspace_id: str, actor_id: str, settings: Settings) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.settings = settings
+        self.providers = ProviderRepository(db, workspace_id)
+        self.audit = AuditRepository(db, workspace_id)
+
+    def list(self) -> list[ProviderConfig]:
+        return list(self.providers.list())
+
+    def catalog(self) -> list[dict[str, object]]:
+        return provider_catalog()
+
+    def secret_metadata(self) -> dict[str, dict]:
+        records = self.db.scalars(
+            select(ProviderSecret).where(
+                ProviderSecret.workspace_id == self.workspace_id
+            )
+        )
+        return {
+            record.provider_id: {
+                "secret_status": (
+                    "revoked"
+                    if record.revoked_at is not None or not record.ciphertext
+                    else "active"
+                ),
+                "secret_version": record.secret_version,
+                "secret_key_provider": record.key_provider,
+                "secret_key_version": record.key_version,
+            }
+            for record in records
+        }
+
+    def create(self, payload: ProviderCreateRequest) -> ProviderConfig:
+        spec = provider_type_spec(payload.provider_type)
+        if spec is None or not spec.create_allowed:
+            raise AppError(
+                422,
+                "unsupported_provider_type",
+                "This Provider type cannot be created by the current backend",
+                {"provider_type": payload.provider_type},
+            )
+        existing = self.db.scalar(
+            self.providers.query().where(ProviderConfig.display_name == payload.display_name)
+        )
+        if existing is not None:
+            raise AppError(409, "provider_name_conflict", "Provider display name already exists")
+        secret = payload.api_key.get_secret_value() if payload.api_key else None
+        encrypted = None
+        if secret:
+            try:
+                encrypted = encrypt_provider_secret(self.settings, secret)
+            except (SecretStoreUnavailable, ValueError) as exc:
+                raise AppError(
+                    503,
+                    "secret_store_unavailable",
+                    "Provider secrets are rejected because the configured secret store is unavailable",
+                ) from exc
+        masked: str | None = None
+        fingerprint: str | None = None
+        if secret:
+            masked, fingerprint = mask_secret(secret)
+        deepseek_defaults: dict[str, object] = {}
+        if payload.provider_type == "deepseek_chat" or (
+            payload.provider_type == "openai_compatible_chat"
+            and (
+                (payload.capabilities or {}).get("model_family") == "deepseek"
+                or (payload.capabilities or {}).get("brand_id") == "deepseek"
+            )
+        ):
+            deepseek_defaults = {
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "thinking_mapping": {
+                    "off": None,
+                    "low": "high",
+                    "medium": "high",
+                    "high": "high",
+                    "xhigh": "max",
+                },
+                "default_thinking_mode": "off",
+                "reasoning_parameter": "reasoning_effort",
+                "hosted_web_search": False,
+                "default_search_route": "disabled",
+                "capability_source": "official_catalog",
+                "supports_agent_tools": True,
+                "model_family": "deepseek",
+                "brand_id": "deepseek",
+            }
+        anthropic_defaults: dict[str, object] = {}
+        if payload.provider_type == "anthropic_messages":
+            anthropic_defaults = {
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "thinking_mapping": {
+                    "off": None,
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                    "xhigh": "high",
+                },
+                "default_thinking_mode": "off",
+                "reasoning_parameter": "reasoning_effort",
+                "hosted_web_search": False,
+                "default_search_route": "disabled",
+                "capability_source": "official_catalog",
+                "supports_agent_tools": True,
+                "model_family": "anthropic",
+                "brand_id": "anthropic",
+            }
+        # Sanitize optional custom headers used by proxy / relay stations.
+        incoming_capabilities = dict(payload.capabilities or {})
+        if "extra_headers" in incoming_capabilities:
+            incoming_capabilities["extra_headers"] = self._sanitize_extra_headers(
+                incoming_capabilities.get("extra_headers")
+            )
+        capabilities = {
+            **deepseek_defaults,
+            **anthropic_defaults,
+            **incoming_capabilities,
+            "provider_role": spec.role,
+            "declaration_status": "unverified_user_input",
+            "remote_calls_enabled": False,
+        }
+        provider = self.providers.add(
+            ProviderConfig(
+                workspace_id=self.workspace_id,
+                display_name=payload.display_name,
+                provider_type=payload.provider_type,
+                base_url=payload.base_url,
+                api_key_masked=masked,
+                secret_fingerprint=fingerprint,
+                enabled=False,
+                remote_capability=False,
+                capabilities=capabilities,
+                status="configured_disabled" if secret else "unconfigured",
+            )
+        )
+        self.db.flush()
+        if secret and encrypted is not None:
+            self.db.add(
+                ProviderSecret(
+                    workspace_id=self.workspace_id,
+                    provider_id=provider.id,
+                    ciphertext=encrypted.ciphertext,
+                    algorithm=encrypted.algorithm,
+                    key_provider=encrypted.key_provider,
+                    key_version=encrypted.key_version,
+                    secret_version=1,
+                )
+            )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.create_metadata",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_type": provider.provider_type,
+                "secret_received": bool(secret),
+                "secret_persisted_encrypted": bool(secret),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        if (
+            secret
+            and spec.supports_probe
+            and provider.provider_type in MODEL_PROVIDER_TYPES
+        ):
+            self._probe_after_configuration(provider.id)
+            provider = self.providers.require(provider.id, "provider")
+            self.db.refresh(provider)
+        return provider
+
+    def secret_store_status(self) -> dict:
+        store = secret_store_from_settings(self.settings)
+        try:
+            current = store.status()
+            return {
+                "provider": current.provider,
+                "available": current.available,
+                "secure_backend": current.secure_backend,
+                "backend_name": current.backend_name,
+                "active_key_version": current.active_key_version,
+            }
+        except SecretStoreUnavailable:
+            return {
+                "provider": self.settings.secret_provider,
+                "available": False,
+                "secure_backend": False,
+                "backend_name": "unavailable",
+                "active_key_version": None,
+            }
+
+    def rotate_secret(
+        self, provider_id: str, payload: ProviderSecretRotateRequest
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        plaintext = payload.api_key.get_secret_value()
+        try:
+            encrypted = encrypt_provider_secret(self.settings, plaintext)
+        except (SecretStoreUnavailable, ValueError) as exc:
+            raise AppError(
+                503,
+                "secret_store_unavailable",
+                "The Provider secret cannot be rotated because the configured secret store is unavailable",
+            ) from exc
+        masked, fingerprint = mask_secret(plaintext)
+        record = self._secret_record(provider.id)
+        now = utc_now()
+        if record is None:
+            record = ProviderSecret(
+                workspace_id=self.workspace_id,
+                provider_id=provider.id,
+                ciphertext=encrypted.ciphertext,
+                algorithm=encrypted.algorithm,
+                key_provider=encrypted.key_provider,
+                key_version=encrypted.key_version,
+                secret_version=1,
+                rotated_at=now,
+            )
+            self.db.add(record)
+        else:
+            record.ciphertext = encrypted.ciphertext
+            record.algorithm = encrypted.algorithm
+            record.key_provider = encrypted.key_provider
+            record.key_version = encrypted.key_version
+            record.secret_version += 1
+            record.rotated_at = now
+            record.revoked_at = None
+            record.revoked_by = None
+        provider.api_key_masked = masked
+        provider.secret_fingerprint = fingerprint
+        if provider.enabled:
+            provider.status = "enabled_unverified"
+        else:
+            provider.status = "configured_disabled"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.secret.rotate",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "secret_version": record.secret_version,
+                "key_version": record.key_version,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(record)
+        spec = provider_type_spec(provider.provider_type)
+        if (
+            spec is not None
+            and spec.supports_probe
+            and provider.provider_type in MODEL_PROVIDER_TYPES
+        ):
+            self._probe_after_configuration(provider.id)
+        return self._secret_lifecycle(provider, record)
+
+    def rotate_master_key(self) -> dict:
+        store = secret_store_from_settings(self.settings)
+        if self.settings.secret_provider != "keyring":
+            raise AppError(
+                409,
+                "master_key_rotation_unsupported",
+                "In-application master-key rotation requires the keyring secret provider",
+            )
+        try:
+            previous, current = store.rotate_key()
+            records = list(
+                self.db.scalars(
+                    select(ProviderSecret).where(
+                        ProviderSecret.workspace_id == self.workspace_id,
+                        ProviderSecret.revoked_at.is_(None),
+                    )
+                )
+            )
+            replacements: list[tuple[ProviderSecret, str]] = []
+            for record in records:
+                plaintext = decrypt_provider_secret(self.settings, record)
+                replacements.append(
+                    (record, SecretCipher(current.secret).encrypt(plaintext))
+                )
+        except (SecretStoreUnavailable, ProviderSecretUnavailable, ValueError) as exc:
+            self.db.rollback()
+            raise AppError(
+                503,
+                "master_key_rotation_failed",
+                "The workspace Provider secrets could not be re-encrypted with a new master key",
+            ) from exc
+        now = utc_now()
+        for record, ciphertext in replacements:
+            record.ciphertext = ciphertext
+            record.algorithm = PROVIDER_SECRET_ALGORITHM
+            record.key_provider = self.settings.secret_provider
+            record.key_version = current.version
+            record.rotated_at = now
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.master_key.rotate",
+            resource_type="secret_store",
+            resource_id=self.workspace_id,
+            details={
+                "previous_key_version": previous.version,
+                "active_key_version": current.version,
+                "reencrypted_secrets": len(replacements),
+            },
+        )
+        self.db.commit()
+        return {
+            "provider": self.settings.secret_provider,
+            "previous_key_version": previous.version,
+            "active_key_version": current.version,
+            "reencrypted_secrets": len(replacements),
+        }
+
+    def update(self, provider_id: str, payload: ProviderUpdateRequest) -> ProviderConfig:
+        provider = self.providers.require(provider_id, "provider")
+        was_enabled = provider.enabled
+        capabilities = dict(provider.capabilities or {})
+        fields_set = payload.model_fields_set
+        if "base_url" in fields_set:
+            updated_base_url = (
+                payload.base_url.strip().rstrip("/")
+                if isinstance(payload.base_url, str) and payload.base_url.strip()
+                else None
+            )
+            spec = provider_type_spec(provider.provider_type)
+            if spec is not None and spec.requires_base_url and not updated_base_url:
+                raise AppError(
+                    422,
+                    "provider_base_url_required",
+                    "This Provider requires a base URL",
+                )
+            provider.base_url = updated_base_url
+        if "extra_headers" in fields_set:
+            capabilities["extra_headers"] = self._sanitize_extra_headers(
+                payload.extra_headers
+            )
+        if payload.default_model is not None:
+            capabilities["default_model"] = payload.default_model
+        if payload.default_image_generation_model_id is not None:
+            capabilities["default_image_generation_model_id"] = (
+                payload.default_image_generation_model_id
+            )
+        if payload.default_transcription_model_id is not None:
+            capabilities["default_transcription_model_id"] = (
+                payload.default_transcription_model_id
+            )
+        if payload.default_vision_model_id is not None:
+            capabilities["default_vision_model_id"] = payload.default_vision_model_id
+            # Vision companions also expose default_model so discovery UIs and
+            # model_provider-shaped adapters can share the same field.
+            capabilities.setdefault("default_model", payload.default_vision_model_id)
+        if "enabled" not in fields_set:
+            provider.capabilities = capabilities
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="provider.configuration.update",
+                resource_type="provider",
+                resource_id=provider.id,
+                details={
+                    "base_url_changed": "base_url" in fields_set,
+                    "extra_headers_changed": "extra_headers" in fields_set,
+                    "default_model": capabilities.get("default_model"),
+                    "default_image_generation_model_id": capabilities.get(
+                        "default_image_generation_model_id"
+                    ),
+                    "default_transcription_model_id": capabilities.get(
+                        "default_transcription_model_id"
+                    ),
+                    "default_vision_model_id": capabilities.get(
+                        "default_vision_model_id"
+                    ),
+                },
+            )
+            self.db.commit()
+            self.db.refresh(provider)
+            return provider
+        enabled = payload.enabled
+        assert isinstance(enabled, bool)
+        if enabled and provider.provider_type in MODEL_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(409, "provider_not_configured", "Provider requires a base URL and encrypted secret")
+            if not str(capabilities.get("default_model") or "").strip():
+                raise AppError(409, "provider_model_required", "A default model is required before enabling")
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            provider.status = "enabled_unverified"
+        elif (
+            enabled
+            and provider.provider_type in IMAGE_GENERATION_PROVIDER_TYPES
+        ):
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "Image generation Provider requires a base URL and encrypted secret",
+                )
+            if not str(
+                capabilities.get("default_image_generation_model_id") or ""
+            ).strip():
+                raise AppError(
+                    409,
+                    "provider_image_model_required",
+                    "A default image generation model is required before enabling",
+                )
+            for current in self.providers.list():
+                if (
+                    current.id != provider.id
+                    and current.provider_type in IMAGE_GENERATION_PROVIDER_TYPES
+                ):
+                    current.enabled = False
+                    current.remote_capability = False
+                    current_capabilities = dict(current.capabilities or {})
+                    current_capabilities["remote_calls_enabled"] = False
+                    current.capabilities = current_capabilities
+                    current.status = "disabled"
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "image_generation"
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in VISION_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "Vision Provider requires a base URL and encrypted secret",
+                )
+            default_vision = str(
+                capabilities.get("default_vision_model_id")
+                or capabilities.get("default_model")
+                or ""
+            ).strip()
+            if not default_vision:
+                raise AppError(
+                    409,
+                    "provider_vision_model_required",
+                    "A default vision model is required before enabling",
+                )
+            capabilities["default_vision_model_id"] = default_vision
+            capabilities.setdefault("default_model", default_vision)
+            for current in self.providers.list():
+                if (
+                    current.id != provider.id
+                    and current.provider_type in VISION_PROVIDER_TYPES
+                ):
+                    current.enabled = False
+                    current.remote_capability = False
+                    current_capabilities = dict(current.capabilities or {})
+                    current_capabilities["remote_calls_enabled"] = False
+                    current.capabilities = current_capabilities
+                    current.status = "disabled"
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "vision"
+            capabilities["supports_image_input"] = True
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in {
+            *SEARCH_PROVIDER_TYPES,
+            *FETCH_PROVIDER_TYPES,
+        }:
+            if not provider.base_url:
+                raise AppError(409, "provider_not_configured", "This provider requires a base URL before enabling")
+            if provider.provider_type in SEARCH_PROVIDER_TYPES - {"searxng"}:
+                if self._active_secret_record(provider.id) is None:
+                    raise AppError(
+                        409,
+                        "provider_not_configured",
+                        "This cloud SearchProvider requires an encrypted secret before enabling",
+                    )
+            if provider.provider_type == "firecrawl_fetch" and self._active_secret_record(provider.id) is None:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "Firecrawl FetchProvider requires an encrypted secret before enabling",
+                )
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities.setdefault(
+                "provider_role",
+                "search" if provider.provider_type in SEARCH_PROVIDER_TYPES else "fetch",
+            )
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "Deep research requires a base URL and encrypted secret before enabling",
+                )
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities.setdefault("provider_role", "deep_research")
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in MEMORY_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "Mem0 Platform requires a base URL and encrypted secret before enabling",
+                )
+            for current in self.providers.list():
+                if current.id != provider.id and current.provider_type in MEMORY_PROVIDER_TYPES:
+                    current.enabled = False
+                    current.remote_capability = False
+                    current.status = "disabled"
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "memory"
+            capabilities["api_family"] = "mem0_platform_v3"
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in TRANSCRIPTION_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "ASR Provider requires a base URL and encrypted secret before enabling",
+                )
+            if not str(capabilities.get("default_transcription_model_id") or "").strip():
+                raise AppError(
+                    409,
+                    "provider_transcription_model_required",
+                    "A default transcription model is required before enabling",
+                )
+            for current in self.providers.list():
+                if (
+                    current.id != provider.id
+                    and current.provider_type in TRANSCRIPTION_PROVIDER_TYPES
+                ):
+                    current.enabled = False
+                    current.remote_capability = False
+                    current.status = "disabled"
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "transcription"
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type == "local_mock":
+            provider.remote_capability = False
+            capabilities["remote_calls_enabled"] = False
+            provider.status = "healthy_local"
+        elif enabled:
+            raise AppError(
+                422,
+                "unsupported_provider_type",
+                "This provider type cannot be enabled by the current backend",
+                {"provider_type": provider.provider_type},
+            )
+        else:
+            provider.remote_capability = False
+            capabilities["remote_calls_enabled"] = False
+            provider.status = "disabled"
+        provider.enabled = enabled
+        provider.capabilities = capabilities
+        if provider.provider_type in MEMORY_PROVIDER_TYPES and was_enabled != enabled:
+            self._bump_memory_provider_epoch()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.enable" if enabled else "provider.disable",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "base_url_changed": "base_url" in fields_set,
+                "default_model": capabilities.get("default_model"),
+                "default_image_generation_model_id": capabilities.get(
+                    "default_image_generation_model_id"
+                ),
+                "default_transcription_model_id": capabilities.get(
+                    "default_transcription_model_id"
+                ),
+                "default_vision_model_id": capabilities.get(
+                    "default_vision_model_id"
+                ),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        return provider
+
+    def update_model_capabilities(
+        self,
+        provider_id: str,
+        model_id: str,
+        payload: ProviderModelCapabilityUpdateRequest,
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Model capabilities can only be configured on a model Provider",
+            )
+        try:
+            validated = validate_model_capability_update(payload.model_dump())
+        except ModelCapabilityError as exc:
+            raise AppError(422, "invalid_model_capabilities", str(exc)) from exc
+        capabilities = dict(provider.capabilities or {})
+        models = dict(capabilities.get("models") or {})
+        models[model_id] = validated
+        capabilities["models"] = models
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.model_capabilities.update",
+            resource_type="provider_model",
+            resource_id=f"{provider.id}:{model_id}",
+            details={
+                "provider_id": provider.id,
+                "model_id": model_id,
+                "reasoning_efforts": validated["reasoning_efforts"],
+                "hosted_web_search": validated["hosted_web_search"],
+                "supports_image_input": validated["supports_image_input"],
+                "image_input_mode": validated.get("image_input_mode", "auto"),
+                "capability_source": validated["capability_source"],
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "model_id": model_id,
+            "capabilities": validated,
+        }
+
+    def update_model_group_capabilities(
+        self,
+        provider_id: str,
+        payload: ProviderModelCapabilityUpdateRequest,
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Model capabilities can only be configured on a model Provider",
+            )
+        try:
+            validated = validate_model_capability_update(payload.model_dump())
+        except ModelCapabilityError as exc:
+            raise AppError(422, "invalid_model_capabilities", str(exc)) from exc
+        capabilities = dict(provider.capabilities or {})
+        capabilities["model_defaults"] = validated
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.model_defaults.update",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_id": provider.id,
+                "context_window_tokens": validated["context_window_tokens"],
+                "context_limit_tokens": validated["context_limit_tokens"],
+                "capability_source": validated["capability_source"],
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "model_id": "*",
+            "capabilities": validated,
+        }
+
+    def update_model_state(
+        self, provider_id: str, model_id: str, enabled: bool
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Model state can only be configured on a model Provider",
+            )
+        normalized_model_id = model_id.strip()
+        capabilities = dict(provider.capabilities or {})
+        discovered = [
+            str(item).strip()
+            for item in capabilities.get("discovered_model_ids") or []
+            if str(item).strip()
+        ]
+        configured_default = str(capabilities.get("default_model") or "").strip()
+        if normalized_model_id not in discovered and normalized_model_id != configured_default:
+            raise AppError(
+                404,
+                "provider_model_not_found",
+                "The model is not present in the latest Provider discovery snapshot",
+            )
+        states = {
+            str(key): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+        }
+        states[normalized_model_id] = enabled
+        capabilities["model_states"] = states
+        if enabled and not configured_default:
+            capabilities["default_model"] = normalized_model_id
+            configured_default = normalized_model_id
+        elif not enabled and configured_default == normalized_model_id:
+            capabilities["default_model"] = next(
+                (item for item in discovered if states.get(item, True)), ""
+            )
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.model.enable" if enabled else "provider.model.disable",
+            resource_type="provider_model",
+            resource_id=f"{provider.id}:{normalized_model_id}",
+            details={
+                "provider_id": provider.id,
+                "model_id": normalized_model_id,
+                "enabled": enabled,
+                "default_model": capabilities.get("default_model") or None,
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "model_id": normalized_model_id,
+            "enabled": enabled,
+            "is_default": capabilities.get("default_model") == normalized_model_id,
+        }
+
+    def update_model_states(
+        self, provider_id: str, requested_states: dict[str, bool]
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Model state can only be configured on a model Provider",
+            )
+        capabilities = dict(provider.capabilities or {})
+        discovered = [
+            str(item).strip()
+            for item in capabilities.get("discovered_model_ids") or []
+            if str(item).strip()
+        ]
+        unknown = sorted(set(requested_states) - set(discovered))
+        if unknown:
+            raise AppError(
+                404,
+                "provider_model_not_found",
+                "One or more models are not present in the latest discovery snapshot",
+                {"model_ids": unknown},
+            )
+        states = {
+            model_id: bool(requested_states.get(model_id, False))
+            for model_id in discovered
+        }
+        capabilities["model_states"] = states
+        configured_default = str(capabilities.get("default_model") or "").strip()
+        if not configured_default or not states.get(configured_default, False):
+            capabilities["default_model"] = next(
+                (model_id for model_id in discovered if states[model_id]), ""
+            )
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.model_states.bulk_update",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_id": provider.id,
+                "enabled_model_ids": [
+                    model_id for model_id, enabled in states.items() if enabled
+                ],
+                "default_model": capabilities.get("default_model") or None,
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "states": states,
+            "default_model": capabilities.get("default_model") or None,
+        }
+
+    def model_capabilities(self, provider_id: str, model_id: str) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Model capabilities can only be read from a model Provider",
+            )
+        capabilities = dict(provider.capabilities or {})
+        models = dict(capabilities.get("models") or {})
+        configured = models.get(model_id)
+        if not isinstance(configured, dict) and is_deepseek_chat_configuration(
+            provider.provider_type,
+            provider.base_url,
+        ):
+            configured = self._deepseek_capabilities(capabilities)
+        effective = model_capabilities_for_model(capabilities, model_id)
+        if isinstance(configured, dict):
+            effective.update(configured)
+        return {
+            "provider_id": provider.id,
+            "model_id": model_id,
+            "capabilities": effective,
+        }
+
+    def balance(self, provider_id: str) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        capabilities = dict(provider.capabilities or {})
+        default_model = str(capabilities.get("default_model") or "")
+        is_deepseek_family = (
+            provider.provider_type == "deepseek_chat"
+            or capabilities.get("model_family") == "deepseek"
+            or capabilities.get("brand_id") == "deepseek"
+            or default_model.casefold().startswith("deepseek")
+            or "deepseek" in default_model.casefold().split("/")[-1]
+            or is_deepseek_chat_configuration(provider.provider_type, provider.base_url)
+        )
+        # Balance is only safe against the official DeepSeek origin so a custom
+        # gateway never receives a balance request with the saved key.
+        if not is_deepseek_family or not is_official_deepseek_api_base_url(provider.base_url):
+            raise AppError(
+                409,
+                "provider_balance_unsupported",
+                "This Provider does not expose an account-balance endpoint",
+            )
+        if not provider.base_url:
+            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        api_key = self._decrypt_secret(provider.id)
+        try:
+            is_available, balance_infos = fetch_deepseek_balance(
+                base_url=provider.base_url,
+                api_key=api_key,
+                extra_headers=self._sanitize_extra_headers(
+                    capabilities.get("extra_headers")
+                ),
+            )
+        except DeepSeekBalanceError as exc:
+            raise AppError(
+                502,
+                "provider_balance_unavailable",
+                "DeepSeek balance could not be retrieved",
+                {"provider_id": provider.id},
+            ) from exc
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.balance.read",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={"provider_type": provider.provider_type, "is_available": is_available},
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "is_available": is_available,
+            "balance_infos": [
+                {
+                    "currency": item.currency,
+                    "total_balance": item.total_balance,
+                    "granted_balance": item.granted_balance,
+                    "topped_up_balance": item.topped_up_balance,
+                }
+                for item in balance_infos
+            ],
+            "queried_at": utc_now(),
+        }
+
+    def delete(self, provider_id: str) -> dict[str, str]:
+        provider = self.providers.require(provider_id, "provider")
+        self.db.execute(
+            delete(ProviderSecret).where(
+                ProviderSecret.workspace_id == self.workspace_id,
+                ProviderSecret.provider_id == provider.id,
+            )
+        )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.delete",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={"display_name": provider.display_name, "provider_type": provider.provider_type},
+        )
+        self.db.delete(provider)
+        self.db.commit()
+        return {"status": "deleted", "resource_id": provider_id}
+
+    def models(self, provider_id: str) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type == "local_mock":
+            return {
+                "provider_id": provider.id,
+                "status": "local_demo",
+                "models": [
+                    {
+                        "id": "deterministic-demo",
+                        "roles": ["llm_demo"],
+                        "streaming": True,
+                        "remote": False,
+                    }
+                ],
+            }
+        if provider.provider_type not in {
+            *MODEL_PROVIDER_TYPES,
+            *IMAGE_GENERATION_PROVIDER_TYPES,
+            *VISION_PROVIDER_TYPES,
+        }:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "This provider does not expose a model discovery endpoint",
+            )
+        model_ids = self._discover(provider)
+        configured_models = dict((provider.capabilities or {}).get("models") or {})
+        capabilities = dict(provider.capabilities or {})
+        is_deepseek = is_deepseek_chat_configuration(
+            provider.provider_type,
+            provider.base_url,
+        ) or (
+            capabilities.get("model_family") == "deepseek"
+            or capabilities.get("brand_id") == "deepseek"
+            or provider.provider_type == "deepseek_chat"
+        )
+        return {
+            "provider_id": provider.id,
+            "status": "discovered",
+            "models": [
+                {
+                    "id": model_id,
+                    "roles": (
+                        ["image_generation"]
+                        if provider.provider_type in IMAGE_GENERATION_PROVIDER_TYPES
+                        else ["vision"]
+                        if provider.provider_type in VISION_PROVIDER_TYPES
+                        else ["llm"]
+                    ),
+                    "streaming": True,
+                    "remote": True,
+                    "enabled": dict(
+                        (provider.capabilities or {}).get("model_states") or {}
+                    ).get(model_id, True)
+                    is not False,
+                    "capabilities": model_capabilities_for_model(
+                        {
+                            **capabilities,
+                            "model_defaults": (
+                                self._deepseek_capabilities(capabilities)
+                                if (
+                                    is_deepseek
+                                    or model_id.casefold().startswith("deepseek")
+                                    or "deepseek"
+                                    in model_id.casefold().split("/")[-1]
+                                )
+                                and not isinstance(
+                                    capabilities.get("model_defaults"), dict
+                                )
+                                else capabilities.get("model_defaults", {})
+                            ),
+                        },
+                        model_id,
+                    ),
+                }
+                for model_id in model_ids
+            ],
+        }
+
+    @staticmethod
+    def _deepseek_capabilities(capabilities: dict) -> dict:
+        return {
+            "reasoning_efforts": list(
+                capabilities.get("reasoning_efforts")
+                or ["low", "medium", "high", "xhigh"]
+            ),
+            "thinking_mapping": dict(
+                capabilities.get("thinking_mapping")
+                or {
+                    "off": None,
+                    "low": "high",
+                    "medium": "high",
+                    "high": "high",
+                    "xhigh": "max",
+                }
+            ),
+            "default_thinking_mode": capabilities.get("default_thinking_mode", "off"),
+            "reasoning_parameter": capabilities.get(
+                "reasoning_parameter", "reasoning_effort"
+            ),
+            "hosted_web_search": False,
+            "supports_image_input": capabilities.get("supports_image_input") is True,
+            "default_search_route": capabilities.get("default_search_route", "disabled"),
+            "capability_source": capabilities.get("capability_source", "official_catalog"),
+        }
+
+    def probe(self, provider_id: str) -> ProviderConfig:
+        provider = self.providers.require(provider_id, "provider")
+        details: dict[str, object]
+        discovered_model_ids: list[str] = []
+        if provider.provider_type == "local_mock":
+            provider.status = "healthy_local"
+            details = {"capability": "development_demo", "remote": False}
+        elif provider.provider_type in {
+            *MODEL_PROVIDER_TYPES,
+            *IMAGE_GENERATION_PROVIDER_TYPES,
+            *VISION_PROVIDER_TYPES,
+        }:
+            model_ids = self._discover(provider)
+            discovered_model_ids = model_ids
+            details = {
+                "capability": "model_discovery",
+                "discovered_model_count": len(model_ids),
+            }
+            provider.status = "healthy"
+        elif provider.provider_type in SEARCH_PROVIDER_TYPES:
+            details = self._probe_search(provider)
+            provider.status = "healthy"
+        elif provider.provider_type in FETCH_PROVIDER_TYPES:
+            details = self._probe_fetch(provider)
+            provider.status = "healthy"
+        elif provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
+            details = self._probe_deep_research(provider)
+            provider.status = "healthy"
+        elif provider.provider_type in MEMORY_PROVIDER_TYPES:
+            health = self._mem0_adapter(provider).health()
+            details = dict(health.details)
+            details["capability"] = "memory"
+            provider.remote_capability = True
+            provider.status = "healthy"
+        else:
+            raise AppError(
+                409,
+                "provider_probe_not_supported",
+                "The provider requires a task-specific probe and cannot be marked healthy by model discovery",
+            )
+        if provider.provider_type != "local_mock":
+            provider.remote_capability = True
+        capabilities = dict(provider.capabilities or {})
+        if provider.provider_type in {
+            *MODEL_PROVIDER_TYPES,
+            *IMAGE_GENERATION_PROVIDER_TYPES,
+            *VISION_PROVIDER_TYPES,
+        }:
+            capabilities["discovered_model_count"] = details["discovered_model_count"]
+            capabilities["discovered_model_ids"] = discovered_model_ids
+        if provider.provider_type in MODEL_PROVIDER_TYPES:
+            states = {
+                str(key): value is not False
+                for key, value in dict(capabilities.get("model_states") or {}).items()
+            }
+            for model_id in discovered_model_ids:
+                states.setdefault(model_id, True)
+            capabilities["model_states"] = states
+            configured_default = str(capabilities.get("default_model") or "").strip()
+            if not configured_default or states.get(configured_default, True) is False:
+                capabilities["default_model"] = next(
+                    (
+                        model_id
+                        for model_id in discovered_model_ids
+                        if states.get(model_id, True)
+                    ),
+                    "",
+                )
+        capabilities["last_probe_result"] = "healthy"
+        capabilities["last_probe_details"] = details
+        capabilities["remote_calls_enabled"] = provider.provider_type != "local_mock"
+        if provider.provider_type in MEMORY_PROVIDER_TYPES:
+            capabilities["api_family"] = "mem0_platform_v3"
+        provider.capabilities = capabilities
+        was_enabled = provider.enabled
+        provider.enabled = True
+        if provider.provider_type != "local_mock":
+            provider.remote_capability = True
+        if provider.provider_type in {
+            *IMAGE_GENERATION_PROVIDER_TYPES,
+            *VISION_PROVIDER_TYPES,
+            *MEMORY_PROVIDER_TYPES,
+            *TRANSCRIPTION_PROVIDER_TYPES,
+        }:
+            peer_types = (
+                IMAGE_GENERATION_PROVIDER_TYPES
+                if provider.provider_type in IMAGE_GENERATION_PROVIDER_TYPES
+                else VISION_PROVIDER_TYPES
+                if provider.provider_type in VISION_PROVIDER_TYPES
+                else MEMORY_PROVIDER_TYPES
+                if provider.provider_type in MEMORY_PROVIDER_TYPES
+                else TRANSCRIPTION_PROVIDER_TYPES
+            )
+            for current in self.providers.list():
+                if current.id == provider.id or current.provider_type not in peer_types:
+                    continue
+                current.enabled = False
+                current.remote_capability = False
+                current_capabilities = dict(current.capabilities or {})
+                current_capabilities["remote_calls_enabled"] = False
+                current.capabilities = current_capabilities
+                current.status = "disabled"
+        if provider.provider_type in MEMORY_PROVIDER_TYPES and not was_enabled:
+            self._bump_memory_provider_epoch()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.probe",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={"status": provider.status, "probe": details},
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        return provider
+
+    def _probe_after_configuration(self, provider_id: str) -> None:
+        """Probe a newly stored credential and auto-enable only on real health."""
+
+        try:
+            self.probe(provider_id)
+        except AppError as exc:
+            self.db.rollback()
+            provider = self.providers.require(provider_id, "provider")
+            capabilities = dict(provider.capabilities or {})
+            capabilities["last_probe_result"] = "failed"
+            capabilities["last_probe_details"] = {
+                "error_code": exc.code,
+                "status_code": exc.status_code,
+            }
+            capabilities["remote_calls_enabled"] = False
+            provider.capabilities = capabilities
+            provider.enabled = False
+            provider.remote_capability = False
+            provider.status = "probe_failed"
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="provider.probe.failed",
+                resource_type="provider",
+                resource_id=provider.id,
+                details={
+                    "error_code": exc.code,
+                    "status_code": exc.status_code,
+                    "auto_probe": True,
+                },
+            )
+            self.db.commit()
+
+    def _probe_search(self, provider: ProviderConfig) -> dict[str, object]:
+        if not provider.base_url:
+            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        try:
+            if provider.provider_type == "searxng":
+                adapter = SearXNGSearchProvider(
+                    provider_id=provider.id,
+                    base_url=provider.base_url,
+                    api_key=self._optional_secret(provider.id),
+                )
+            elif provider.provider_type == "anysearch":
+                adapter = AnySearchSearchProvider(
+                    provider_id=provider.id,
+                    base_url=provider.base_url,
+                    api_key=self._decrypt_secret(provider.id),
+                )
+            else:
+                adapter = CloudSearchProvider(
+                    provider_id=provider.id,
+                    provider_type=provider.provider_type,
+                    base_url=provider.base_url,
+                    api_key=self._decrypt_secret(provider.id),
+                )
+            return adapter.probe()
+        except ValueError as exc:
+            raise AppError(409, "provider_not_configured", str(exc)) from exc
+        except SearchProviderTimeout as exc:
+            raise AppError(504, "provider_probe_timeout", "Search Provider probe timed out") from exc
+        except SearchProviderResponseError as exc:
+            raise AppError(
+                502, "provider_probe_invalid_response", "Search Provider probe returned an invalid response"
+            ) from exc
+        except SearchProviderError as exc:
+            raise AppError(502, "provider_probe_failed", str(exc)) from exc
+
+    def _probe_fetch(self, provider: ProviderConfig) -> dict[str, object]:
+        if not provider.base_url:
+            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        try:
+            if provider.provider_type == "crawl4ai_http":
+                adapter = Crawl4AIHTTPFetchProvider(
+                    provider_id=provider.id,
+                    base_url=provider.base_url,
+                    api_key=self._optional_secret(provider.id),
+                )
+            else:
+                adapter = FirecrawlFetchProvider(
+                    provider_id=provider.id,
+                    base_url=provider.base_url,
+                    api_key=self._decrypt_secret(provider.id),
+                )
+            return adapter.probe()
+        except FetchProviderTimeout as exc:
+            raise AppError(504, "provider_probe_timeout", "Fetch Provider probe timed out") from exc
+        except FetchProviderError as exc:
+            raise AppError(502, "provider_probe_failed", str(exc)) from exc
+
+    def _probe_deep_research(self, provider: ProviderConfig) -> dict[str, object]:
+        if not provider.base_url:
+            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        try:
+            adapter = HTTPDeepResearchProvider(
+                provider_id=provider.id,
+                base_url=provider.base_url,
+                api_key=self._decrypt_secret(provider.id),
+                declared_capabilities=provider.capabilities,
+            )
+            return adapter.probe()
+        except DeepResearchProviderTimeout as exc:
+            raise AppError(
+                504, "provider_probe_timeout", "Deep Research Provider probe timed out"
+            ) from exc
+        except DeepResearchProviderError as exc:
+            raise AppError(502, "provider_probe_failed", str(exc)) from exc
+
+    def _discover(self, provider: ProviderConfig) -> list[str]:
+        if not provider.base_url:
+            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        api_key = self._decrypt_secret(provider.id)
+        extra_headers = self._sanitize_extra_headers(
+            (provider.capabilities or {}).get("extra_headers")
+        )
+        try:
+            if provider.provider_type == "anthropic_messages":
+                from app.providers.remote.anthropic import discover_anthropic_models
+
+                return discover_anthropic_models(
+                    base_url=provider.base_url,
+                    api_key=api_key,
+                    extra_headers=extra_headers,
+                )
+            return discover_remote_models(
+                base_url=provider.base_url,
+                api_key=api_key,
+                extra_headers=extra_headers,
+            )
+        except ProviderTimeoutError as exc:
+            raise AppError(504, "provider_timeout", "Provider model discovery timed out") from exc
+        except ProviderResponseError as exc:
+            raise AppError(502, "provider_invalid_response", str(exc)) from exc
+        except ProviderHTTPError as exc:
+            raise AppError(502, "provider_http_error", str(exc)) from exc
+
+    @staticmethod
+    def _sanitize_extra_headers(raw: object) -> dict[str, str]:
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise AppError(
+                422,
+                "invalid_extra_headers",
+                "extra_headers must be an object of string header names to string values",
+            )
+        headers: dict[str, str] = {}
+        for key, value in raw.items():
+            name = str(key).strip()
+            text = str(value).strip() if value is not None else ""
+            if not name:
+                continue
+            if len(name) > 128 or len(text) > 2_048:
+                raise AppError(
+                    422,
+                    "invalid_extra_headers",
+                    "extra_headers names/values exceed the allowed length",
+                )
+            if name.casefold() in {
+                "authorization",
+                "x-api-key",
+                "api-key",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "host",
+                "content-length",
+            }:
+                # Credentials and hop-by-hop headers always come from the Secret
+                # Store / transport layer, never from user-supplied custom headers.
+                continue
+            if not text:
+                continue
+            headers[name] = text
+        if len(headers) > 32:
+            raise AppError(
+                422,
+                "invalid_extra_headers",
+                "At most 32 custom request headers are allowed",
+            )
+        return headers
+
+    def _mem0_adapter(self, provider: ProviderConfig) -> Mem0PlatformAdapter:
+        if not provider.base_url:
+            raise AppError(
+                409,
+                "provider_not_configured",
+                "Mem0 Platform base URL is missing",
+            )
+        workspace = self.db.get(Workspace, self.workspace_id)
+        if workspace is None:
+            raise AppError(404, "workspace_not_found", "Workspace does not exist")
+        api_key = self._decrypt_secret(provider.id)
+        try:
+            identity_key = secret_store_from_settings(self.settings).identity_key(create=True)
+        except SecretStoreUnavailable as exc:
+            raise AppError(
+                503, "secret_store_unavailable", "The secret store identity key is unavailable"
+            ) from exc
+        return Mem0PlatformAdapter(
+            provider_id=provider.id,
+            base_url=provider.base_url,
+            api_key=api_key,
+            workspace_entity=mem0_entity_id(
+                tenant_id=workspace.tenant_id,
+                user_id=self.actor_id,
+                workspace_id=workspace.id,
+                secret=identity_key,
+            ),
+        )
+
+    def _secret_record(self, provider_id: str) -> ProviderSecret | None:
+        return self.db.scalar(
+            select(ProviderSecret).where(
+                ProviderSecret.workspace_id == self.workspace_id,
+                ProviderSecret.provider_id == provider_id,
+            )
+        )
+
+    def _active_secret_record(self, provider_id: str) -> ProviderSecret | None:
+        record = self._secret_record(provider_id)
+        if record is None or record.revoked_at is not None or not record.ciphertext:
+            return None
+        return record
+
+    def _decrypt_secret(self, provider_id: str) -> str:
+        record = self._active_secret_record(provider_id)
+        if record is None:
+            raise AppError(
+                409,
+                "provider_secret_unavailable",
+                "Provider encrypted secret is missing or revoked",
+            )
+        try:
+            return decrypt_provider_secret(self.settings, record)
+        except ProviderSecretUnavailable as exc:
+            raise AppError(
+                503,
+                "provider_secret_unavailable",
+                "Provider encrypted secret cannot be opened by the configured secret store",
+            ) from exc
+
+    def _optional_secret(self, provider_id: str) -> str | None:
+        return (
+            self._decrypt_secret(provider_id)
+            if self._active_secret_record(provider_id) is not None
+            else None
+        )
+
+    @staticmethod
+    def _secret_lifecycle(provider: ProviderConfig, record: ProviderSecret) -> dict:
+        return {
+            "provider_id": provider.id,
+            "api_key_masked": provider.api_key_masked,
+            "status": provider.status,
+            "secret_version": record.secret_version,
+            "key_version": record.key_version,
+            "rotated_at": record.rotated_at,
+            "revoked_at": record.revoked_at,
+        }
+
+    def _bump_memory_provider_epoch(self) -> None:
+        setting = self.db.scalar(
+            select(WorkspaceSetting).where(
+                WorkspaceSetting.workspace_id == self.workspace_id,
+                WorkspaceSetting.key == "memory.provider_epoch",
+            )
+        )
+        try:
+            current = int(setting.value) if setting is not None else 1
+        except (TypeError, ValueError):
+            current = 1
+        if setting is None:
+            self.db.add(
+                WorkspaceSetting(
+                    workspace_id=self.workspace_id,
+                    key="memory.provider_epoch",
+                    value=current + 1,
+                )
+            )
+        else:
+            setting.value = current + 1
+
+
+class UsageService:
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.usage = UsageRepository(db, workspace_id)
+
+    def events(
+        self,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        feature: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> list[UsageEvent]:
+        statement = self._filtered_query(
+            provider_id=provider_id,
+            model_id=model_id,
+            feature=feature,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        return list(
+            self.db.scalars(statement.order_by(UsageEvent.created_at.desc())).all()
+        )
+
+    def summary(
+        self,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        feature: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> UsageSummary:
+        filtered = self._filtered_query(
+            provider_id=provider_id,
+            model_id=model_id,
+            feature=feature,
+            start_at=start_at,
+            end_at=end_at,
+        ).subquery()
+        values = self.db.execute(
+            select(
+                func.coalesce(func.sum(filtered.c.input_tokens), 0),
+                func.coalesce(func.sum(filtered.c.cached_input_tokens), 0),
+                func.coalesce(func.sum(filtered.c.output_tokens), 0),
+                func.coalesce(func.sum(filtered.c.reasoning_tokens), 0),
+                func.coalesce(func.sum(filtered.c.total_tokens), 0),
+                func.count(filtered.c.id),
+                func.coalesce(func.sum(filtered.c.cost_usd), 0.0),
+                func.coalesce(func.sum(filtered.c.cost_cny), 0.0),
+            )
+        ).one()
+        remote_count = self.db.scalar(
+            select(func.count()).select_from(filtered).where(
+                filtered.c.provider_id != "local_mock",
+                filtered.c.cost_status != "non_billable",
+            )
+        ) or 0
+        unpriced_count = self.db.scalar(
+            select(func.count()).select_from(filtered).where(
+                filtered.c.cost_status.in_(["unpriced", "estimated_usage_missing"])
+            )
+        ) or 0
+        return UsageSummary(
+            workspace_id=self.workspace_id,
+            input_tokens=int(values[0]),
+            cached_input_tokens=int(values[1]),
+            output_tokens=int(values[2]),
+            reasoning_tokens=int(values[3]),
+            total_tokens=int(values[4]),
+            attempts=int(values[5]),
+            cost_usd=float(values[6]),
+            cost_cny=float(values[7]),
+            unpriced_events=int(unpriced_count),
+            remote_usage_recorded=bool(remote_count),
+        )
+
+    def clear_events(self, *, actor_id: str) -> dict[str, int]:
+        """Delete every UsageEvent in the current workspace.
+
+        Price versions, exchange rates, and budget policies remain so the
+        workspace can keep billing configuration while resetting the ledger.
+        """
+
+        count = int(
+            self.db.scalar(
+                select(func.count())
+                .select_from(UsageEvent)
+                .where(UsageEvent.workspace_id == self.workspace_id)
+            )
+            or 0
+        )
+        self.db.execute(
+            delete(UsageEvent).where(UsageEvent.workspace_id == self.workspace_id)
+        )
+        AuditRepository(self.db, self.workspace_id).record(
+            actor_id=actor_id,
+            action="usage.events.cleared",
+            resource_type="usage_event",
+            resource_id=self.workspace_id,
+            details={"deleted_count": count},
+        )
+        self.db.commit()
+        return {"deleted_count": count}
+
+    def _filtered_query(
+        self,
+        *,
+        provider_id: str | None,
+        model_id: str | None,
+        feature: str | None,
+        start_at: datetime | None,
+        end_at: datetime | None,
+    ):
+        statement = self.usage.query()
+        if provider_id:
+            statement = statement.where(UsageEvent.provider_id == provider_id)
+        if model_id:
+            statement = statement.where(UsageEvent.model_id == model_id)
+        if feature:
+            statement = statement.where(UsageEvent.feature == feature)
+        if start_at:
+            statement = statement.where(UsageEvent.created_at >= start_at)
+        if end_at:
+            statement = statement.where(UsageEvent.created_at < end_at)
+        return statement
+
+
+class PluginService:
+    def __init__(self, db: Session, workspace_id: str, actor_id: str) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.plugins = PluginRepository(db, workspace_id)
+        self.audit = AuditRepository(db, workspace_id)
+
+    def list(self) -> list[PluginRecord]:
+        return list(self.plugins.list())
+
+    def toggle(self, plugin_id: str, payload: PluginToggleRequest) -> PluginRecord:
+        plugin = self.plugins.require(plugin_id, "plugin")
+        next_status = "enabled" if payload.enabled else "disabled"
+        if payload.enabled and plugin.plugin_type == "trusted_component":
+            # Imported components must retain an authorization matching the exact
+            # immutable manifest and permission fingerprint. The local import
+            # keeps the generic plugin registry independent of component schemas.
+            from app.services.components import ComponentService
+
+            next_status = ComponentService(
+                self.db,
+                self.workspace_id,
+                self.actor_id,
+            ).assert_can_enable(plugin)
+        plugin.enabled = payload.enabled
+        plugin.status = next_status
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="plugin.enable" if payload.enabled else "plugin.disable",
+            resource_type="plugin",
+            resource_id=plugin.id,
+            details={"permissions": plugin.permissions, "status": plugin.status},
+        )
+        self.db.commit()
+        self.db.refresh(plugin)
+        return plugin
+
+
+class MigrationService:
+    def __init__(self, db: Session, workspace_id: str, actor_id: str) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.jobs = MigrationRepository(db, workspace_id)
+        self.audit = AuditRepository(db, workspace_id)
+
+    def list(self) -> list[MigrationJob]:
+        return list(self.jobs.list())
+
+    def preflight(self, payload: MigrationPreflightRequest) -> MigrationJob:
+        checks = [
+            {"key": "source_readable", "status": "passed" if payload.source_kind == "sqlite" else "not_checked"},
+            {"key": "target_adapter", "status": "missing" if payload.target_kind != "sqlite" else "passed"},
+            {"key": "maintenance_window", "status": "required"},
+            {"key": "dual_write", "status": "forbidden"},
+        ]
+        ready = all(item["status"] == "passed" for item in checks)
+        job = self.jobs.add(
+            MigrationJob(
+                workspace_id=self.workspace_id,
+                source_kind=payload.source_kind,
+                target_kind=payload.target_kind,
+                status="cutover_ready" if ready else "preflight_blocked",
+                report={"checks": checks, "ready": ready, "data_copied": False},
+            )
+        )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="migration.preflight",
+            resource_type="migration_job",
+            resource_id=job.id,
+            outcome="success" if ready else "blocked",
+        )
+        self.db.commit()
+        self.db.refresh(job)
+        return job
+
+    def start(self, job_id: str) -> None:
+        job = self.jobs.require(job_id, "migration job")
+        if job.status != "cutover_ready":
+            raise AppError(409, "migration_not_ready", "Preflight is not ready; no data was copied")
+        raise AppError(
+            501,
+            "migration_executor_not_configured",
+            "This MVP exposes truthful preflight state but has no target migration executor",
+        )
+
+
+class AuditService:
+    def __init__(self, db: Session, workspace_id: str, actor_id: str | None = None) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id or "system"
+        self.audit = AuditRepository(db, workspace_id)
+
+    def list(self, action: str | None = None) -> list[AuditEvent]:
+        statement = select(AuditEvent).where(AuditEvent.workspace_id == self.workspace_id)
+        if action:
+            statement = statement.where(AuditEvent.action == action)
+        return list(self.db.scalars(statement.order_by(AuditEvent.created_at.desc()).limit(200)).all())
+
+    def delete(self, event_id: str) -> dict[str, str | None]:
+        event = self.db.scalar(
+            select(AuditEvent).where(
+                AuditEvent.workspace_id == self.workspace_id,
+                AuditEvent.id == event_id,
+            )
+        )
+        if event is None:
+            raise AppError(404, "not_found", "Audit event not found in this workspace")
+        # Snapshot metadata before delete so the purge event stays useful without
+        # re-storing the original details payload.
+        snapshot = {
+            "id": event.id,
+            "action": event.action,
+            "resource_type": event.resource_type,
+            "resource_id": event.resource_id,
+            "outcome": event.outcome,
+            "deleted_created_at": event.created_at.isoformat() if event.created_at else None,
+        }
+        self.db.delete(event)
+        self.db.flush()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="audit.event_deleted",
+            resource_type="audit_event",
+            resource_id=event_id,
+            details={
+                "deleted_action": snapshot["action"],
+                "deleted_resource_type": snapshot["resource_type"],
+                "deleted_resource_id": snapshot["resource_id"],
+                "deleted_outcome": snapshot["outcome"],
+                "deleted_created_at": snapshot["deleted_created_at"],
+            },
+        )
+        self.db.commit()
+        return snapshot
+
+    def delete_many(self, event_ids: list[str]) -> dict[str, int | list[str]]:
+        unique_ids = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not unique_ids:
+            raise AppError(422, "invalid_request", "At least one audit event id is required")
+        if len(unique_ids) > 100:
+            raise AppError(422, "invalid_request", "Cannot delete more than 100 audit events at once")
+        events = list(
+            self.db.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.workspace_id == self.workspace_id,
+                    AuditEvent.id.in_(unique_ids),
+                )
+            ).all()
+        )
+        found_ids = {event.id for event in events}
+        missing = [event_id for event_id in unique_ids if event_id not in found_ids]
+        if missing:
+            raise AppError(
+                404,
+                "not_found",
+                "One or more audit events were not found in this workspace",
+                {"missing_ids": missing},
+            )
+        deleted_summaries = [
+            {
+                "id": event.id,
+                "action": event.action,
+                "resource_type": event.resource_type,
+                "resource_id": event.resource_id,
+                "outcome": event.outcome,
+            }
+            for event in events
+        ]
+        for event in events:
+            self.db.delete(event)
+        self.db.flush()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="audit.events_deleted",
+            resource_type="audit_event",
+            resource_id=self.workspace_id,
+            details={
+                "count": len(deleted_summaries),
+                "deleted_ids": [item["id"] for item in deleted_summaries],
+                "actions": sorted({item["action"] for item in deleted_summaries}),
+            },
+        )
+        self.db.commit()
+        return {"deleted": len(deleted_summaries), "ids": [item["id"] for item in deleted_summaries]}
+
+
+class SettingsService:
+    def __init__(self, db: Session, workspace_id: str, actor_id: str) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.settings = SettingRepository(db, workspace_id)
+        self.audit = AuditRepository(db, workspace_id)
+
+    def list(self) -> list[WorkspaceSetting]:
+        return list(self.settings.list())
+
+    def update(self, key: str, payload: SettingUpdateRequest) -> WorkspaceSetting:
+        value = payload.value
+        if key == CHAT_SUGGESTED_PROMPTS_SETTING_KEY:
+            try:
+                value = ChatSuggestedPromptsSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "chat.suggested_prompts must contain only an enabled boolean",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key in {
+            CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
+            CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
+        }:
+            try:
+                value = ChatFeatureModelSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    (
+                        f"{key} must contain provider_id and model_id together, "
+                        "or both null to use the chat default model"
+                    ),
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key == CHAT_RESPONSE_STYLE_SETTING_KEY:
+            try:
+                value = ChatResponseStyleSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    (
+                        "chat.response_style must contain base_style and integer "
+                        "levels in [-2, 2] for warmth, enthusiasm, "
+                        "headings_and_lists, emoji, and verbosity"
+                    ),
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        setting = self.db.scalar(self.settings.query().where(WorkspaceSetting.key == key))
+        if setting is None:
+            setting = self.settings.add(
+                WorkspaceSetting(workspace_id=self.workspace_id, key=key, value=value)
+            )
+        else:
+            setting.value = value
+        self.audit.record(actor_id=self.actor_id, action="settings.update", resource_type="setting", resource_id=key)
+        self.db.commit()
+        self.db.refresh(setting)
+        return setting

@@ -1,0 +1,36 @@
+import { apiClient } from './client'
+import type { ActionItem, CompositeDraft, DeleteImpact, Project, ProjectCreate, Roadmap, RoadmapItemRescheduleRequest, RoadmapRejectRequest, RoadmapVersion, SourceLink, SourceRecord, SourceTargetType } from '@/types/workflow'
+import type { ActionResponse } from '@/types/common'
+import type { Session } from '@/types/sessions'
+
+export const listProjects = (includeArchived = false) => apiClient.get<Project[]>('/projects', { query: { include_archived: includeArchived } })
+export const createProject = (payload: ProjectCreate) => apiClient.post<Project, ProjectCreate>('/projects', payload)
+export const updateProject = (id: string, payload: Partial<ProjectCreate & { position: number }>) => apiClient.patch<Project, typeof payload>(`/projects/${encodeURIComponent(id)}`, payload)
+export const archiveProject = (id: string) => apiClient.post<Project>(`/projects/${encodeURIComponent(id)}/archive`)
+export const restoreProject = (id: string) => apiClient.post<Project>(`/projects/${encodeURIComponent(id)}/restore`)
+export const getProjectDeleteImpact = (id: string) => apiClient.get<DeleteImpact>(`/projects/${encodeURIComponent(id)}/delete-impact`)
+export const deleteProject = (id: string, confirmation_text: string) => apiClient.post(`/projects/${encodeURIComponent(id)}/delete`, { confirmation_text })
+export const assignSessionProject = (sessionId: string, projectId: string | null) => apiClient.put(`/sessions/${encodeURIComponent(sessionId)}/project`, { project_id: projectId })
+export const archiveSession = (id: string) => apiClient.post<Session>(`/sessions/${encodeURIComponent(id)}/archive`)
+export const restoreSession = (id: string) => apiClient.post<Session>(`/sessions/${encodeURIComponent(id)}/restore`)
+export const getSessionDeleteImpact = (id: string) => apiClient.get<DeleteImpact>(`/sessions/${encodeURIComponent(id)}/delete-impact`)
+export const deleteSession = (id: string, confirmation_text: string) => apiClient.post(`/sessions/${encodeURIComponent(id)}/delete`, { confirmation_text })
+export const fetchSource = (url: string) => { const host = new URL(url).hostname; return apiClient.post<SourceRecord, { url: string; authorized_domains: string[] }>('/sources/fetch', { url, authorized_domains: [host] }) }
+export const listSourceRecords = () => apiClient.get<SourceRecord[]>('/sources')
+export const getSourceRecord = (sourceId: string) => apiClient.get<SourceRecord>(`/sources/${encodeURIComponent(sourceId)}`)
+export const listSourceLinks = (sourceId: string) => apiClient.get<SourceLink[]>(`/sources/${encodeURIComponent(sourceId)}/links`)
+export const getSourceDeleteImpact = (sourceId: string) => apiClient.get<DeleteImpact>(`/sources/${encodeURIComponent(sourceId)}/delete-impact`)
+export const deleteSourceConfirmed = (sourceId: string, confirmationText: string) => apiClient.post<ActionResponse, { confirmation_text: string }>(`/sources/${encodeURIComponent(sourceId)}/delete`, { confirmation_text: confirmationText })
+export const createSourceLink = (sourceId: string, target_type: SourceTargetType, target_id: string) => apiClient.post<SourceLink, { target_type: SourceTargetType; target_id: string; relation: string }>(`/sources/${encodeURIComponent(sourceId)}/links`, { target_type, target_id, relation: 'reference' })
+export const listActions = () => apiClient.get<ActionItem[]>('/actions')
+export const createAction = (title: string) => apiClient.post<ActionItem, { title: string }>('/actions', { title })
+export const updateAction = (id: string, payload: Partial<Pick<ActionItem, 'title' | 'description' | 'status' | 'due_at' | 'priority' | 'position'>>) => apiClient.patch<ActionItem, typeof payload>(`/actions/${encodeURIComponent(id)}`, payload)
+export const createCompositeDraft = (target_message_id: string, source_version_ids: string[]) => apiClient.post<CompositeDraft, { target_message_id: string; source_version_ids: string[] }>('/message-composites', { target_message_id, source_version_ids })
+export const confirmCompositeDraft = (id: string) => apiClient.post<CompositeDraft>(`/message-composites/${encodeURIComponent(id)}/confirm`)
+export const getRoadmap = (goalId: string) => apiClient.get<Roadmap>(`/goals/${encodeURIComponent(goalId)}/roadmap`)
+export const listRoadmaps = (goalId: string) => apiClient.get<RoadmapVersion[]>(`/goals/${encodeURIComponent(goalId)}/roadmaps`)
+export const getRoadmapVersion = (id: string) => apiClient.get<Roadmap>(`/roadmaps/${encodeURIComponent(id)}`)
+export const replanRoadmap = (goalId: string) => apiClient.post<Roadmap>(`/goals/${encodeURIComponent(goalId)}/roadmap/replan`)
+export const publishRoadmap = (id: string) => apiClient.post<Roadmap>(`/roadmaps/${encodeURIComponent(id)}/publish`)
+export const rescheduleRoadmapItem = (roadmapId: string, actionId: string, payload: RoadmapItemRescheduleRequest) => apiClient.post<Roadmap, RoadmapItemRescheduleRequest>(`/roadmaps/${encodeURIComponent(roadmapId)}/items/${encodeURIComponent(actionId)}/reschedule`, payload)
+export const rejectRoadmap = (id: string, payload: RoadmapRejectRequest) => apiClient.post<Roadmap, RoadmapRejectRequest>(`/roadmaps/${encodeURIComponent(id)}/reject`, payload)
