@@ -67,7 +67,6 @@
 开发者文档详细说明当前项目的系统架构、API 网关、Agent Runtime、系统提示词策略、Tools、Skills、MCP、Docker 沙箱、记忆系统、安全边界与真实验收规范。
 
 - [在线阅读开发者文档](https://sunnyboy-y.github.io/LearnGraph/)
-- [查看仓库中的 HTML 文档](./developer-docs/index.html)
 
 文档站由 GitHub Pages 自动发布。仓库内的 `docs/` 与 `backend/docs/` 仍是仅供本地开发使用的内部资料，不会进入 Git 或 Pages 部署产物。
 
