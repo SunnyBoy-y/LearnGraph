@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "developer-docs/**"
+      - "docs/**"
       - ".github/workflows/deploy-developer-docs.yml"
   workflow_dispatch:
 
@@ -36,7 +36,7 @@ jobs:
       - name: Upload developer docs
         uses: actions/upload-pages-artifact@v4
         with:
-          path: developer-docs
+          path: docs
 
       - name: Deploy to GitHub Pages
         id: deployment

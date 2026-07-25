@@ -23,7 +23,7 @@
 在仓库根目录运行：
 
 ```powershell
-python -m http.server 4173 --directory developer-docs
+python -m http.server 4173 --directory docs
 ```
 
 然后打开 `http://127.0.0.1:4173/`。
@@ -31,7 +31,7 @@ python -m http.server 4173 --directory developer-docs
 ## GitHub Pages
 
 `.github/workflows/deploy-developer-docs.yml` 会在 `main` 分支中的
-`developer-docs/` 发生变化时，把该目录作为独立 GitHub Pages Artifact 发布。
+`docs/` 发生变化时，把该目录作为独立 GitHub Pages Artifact 发布。
 
 仓库首次启用时，需要在 GitHub 的 **Settings → Pages → Build and deployment**
 中将 Source 设为 **GitHub Actions**。之后可以通过推送触发部署，也可以在
