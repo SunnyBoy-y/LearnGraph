@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     mastery_job_max_attempts: int = 3
     memory_retention_scheduler_enabled: bool = True
     memory_retention_interval_seconds: int = 60
+    # Background memory extraction ("dreaming"): reviews quiet sessions and
+    # proposes MemoryDrafts through the per-workspace enhancement settings.
+    memory_extraction_scheduler_enabled: bool = True
+    memory_extraction_interval_seconds: int = 120
+    memory_extraction_idle_seconds: int = 180
+    memory_extraction_sessions_per_sweep: int = 3
     # Docker is the cross-platform hardened baseline: Docker Engine on Linux,
     # Docker Desktop/WSL2 on Windows, and Docker Desktop on macOS.  Enabling
     # the feature by default does not make an unpinned/missing runner image
@@ -71,7 +77,14 @@ class Settings(BaseSettings):
     sandbox_cpu_count: float = 2.0
     sandbox_memory_bytes: int = 2 * 1024 * 1024 * 1024
     sandbox_memory_swap_bytes: int = 2 * 1024 * 1024 * 1024
-    sandbox_pids_max: int = 256
+    # pids_limit counts threads; the unified image runs Chromium, which needs
+    # headroom beyond a plain interpreter workload.
+    sandbox_pids_max: int = 512
+    # Optional build-time mirrors for the Bootstrap image build (useful on
+    # constrained networks); empty means the public defaults baked into the
+    # Dockerfile ARGs.
+    sandbox_build_pip_index_url: str | None = None
+    sandbox_build_npm_registry: str | None = None
     sandbox_disk_bytes: int = 256 * 1024 * 1024
     sandbox_output_bytes: int = 5 * 1024 * 1024
     sandbox_active_per_user: int = 2
@@ -86,6 +99,37 @@ class Settings(BaseSettings):
     sandbox_agent_command_args_max: int = 32
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60
+    # --- Skills & extension marketplace -------------------------------------
+    # Same-host local skill discovery. Empty string keeps the legacy behavior
+    # (also honours the raw LEARNGRAPH_SKILL_LOCAL_PROBE env var); explicit
+    # values: "on"/"local" force-allow, "off"/"remote" force-deny.
+    skill_local_probe_mode: str = ""
+    # Whether /skills/market may refresh its cache from GitHub raw content.
+    skill_market_refresh_enabled: bool = True
+    # Optional GitHub token used for market fetches (raises rate limits).
+    skill_market_github_token: str | None = None
+    # External skill catalogs (search-only aggregation; installs still resolve
+    # to GitHub or manual import so content stays pinned and reviewable).
+    clawhub_enabled: bool = True
+    clawhub_api_url: str = "https://clawhub.ai/api/v1"
+    # skills.sh has a documented API but authenticated via Vercel OIDC; keep
+    # disabled by default until a deployment provides credentials.
+    skills_sh_enabled: bool = False
+    skills_sh_api_url: str = "https://skills.sh/api/v1"
+    # Official MCP Registry (frozen v0.1 API; anonymous reads).
+    mcp_registry_enabled: bool = True
+    mcp_registry_url: str = "https://registry.modelcontextprotocol.io"
+    external_catalog_timeout_seconds: float = 12.0
+    # Progressive disclosure for Agent Skill prompt injection: bodies within
+    # these budgets are injected inline; the rest become one-line catalog
+    # entries the model expands on demand via the lg_skill_read tool.
+    skill_prompt_inline_char_limit: int = 4_000
+    skill_prompt_total_char_budget: int = 16_000
+    skill_prompt_catalog_max_entries: int = 24
+    # Agent self-service extension management (lg_skill_install / lg_mcp_register
+    # etc.). Installs stay commit-pinned and audited; disable to make skills and
+    # MCP servers user-click-only.
+    agent_extension_self_service_enabled: bool = True
 
     @property
     def resolved_sandbox_workspace_root(self) -> Path:

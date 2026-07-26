@@ -1,51 +1,48 @@
 import { type FormEvent, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useNavigate } from 'react-router-dom'
 import {
   Archive,
-  Check,
+  ArrowUp,
   Clock3,
   Download,
   Eye,
   FileClock,
   FileText,
   History,
-  Inbox,
   Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
-  ShieldCheck,
+  Settings2,
+  Sparkles,
   Trash2,
-  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import {
   createMemory,
-  createMemoryDraft,
-  decideMemoryDraft,
   deleteMemory,
   exportMemoryMarkdown,
+  extractSessionMemories,
   getCurrentUser,
+  getEffectiveMemoryPackage,
   getGraph,
   getMemory,
-  getMemoryPolicy,
-  getMemoryProviderStatus,
   listGoals,
   listGraphs,
   listMemoryBindings,
-  listMemoryDrafts,
   listMemories,
   listMemoryRevisions,
   listMemoryTypes,
   listSessions,
-  probeMemoryProvider,
   purgeExpiredMemoryContent,
   restoreDeletedMemory,
   restoreMemoryRevision,
+  summarizeSessionContext,
   updateMemory,
-  updateMemoryPolicy,
 } from '@/api'
+import { MessageResponse } from '@/components/ai-elements/message'
 import {
   EmptyState,
   ErrorState,
@@ -57,6 +54,7 @@ import {
   StatePill,
   Surface,
 } from '@/components/shared/page-elements'
+import { SessionCombobox } from '@/components/shared/session-combobox'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -89,13 +87,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import type {
   MemoryCreateRequest,
-  MemoryDraft,
-  MemoryDraftCreateRequest,
   MemoryEntry,
   MemoryNamespace,
   MemoryRevision,
@@ -118,6 +113,8 @@ const zoneDefinitions: Array<{
   { zone: 'archive', title: '冷区归档', description: '已闭环事件与完整来源', icon: Archive },
 ]
 
+const zoneRank: Record<MemoryZone, number> = { hot: 0, recent: 1, topics: 2, archive: 3 }
+
 function memoryBody(markdown: string | null): string {
   if (!markdown) return ''
   const lines = markdown.split('\n')
@@ -128,6 +125,30 @@ function memoryBody(markdown: string | null): string {
 
 function formatTime(value: string | null): string {
   return value ? new Date(value).toLocaleString() : '—'
+}
+
+function deriveQuickTitle(text: string): string {
+  const firstLine = text.split('\n').map((line) => line.trim()).find(Boolean) ?? ''
+  const cleaned = firstLine.replace(/^[#>\-*\s]+/, '').replace(/[。．.!！?？]+$/, '')
+  if (!cleaned) return '用户补充记忆'
+  return cleaned.length > 24 ? `${cleaned.slice(0, 24)}…` : cleaned
+}
+
+function summaryUpdatedHint(items: MemoryEntry[]): string | null {
+  let latest: string | null = null
+  for (const item of items) {
+    if (!latest || item.updated_at > latest) latest = item.updated_at
+  }
+  if (!latest) return null
+  const elapsedMinutes = Math.max(
+    0,
+    Math.floor((Date.now() - new Date(latest).getTime()) / 60_000),
+  )
+  if (elapsedMinutes < 5) return '刚刚更新'
+  if (elapsedMinutes < 60) return `${elapsedMinutes} 分钟前更新`
+  const hours = Math.floor(elapsedMinutes / 60)
+  if (hours < 24) return `${hours} 小时前更新`
+  return `${new Date(latest).toLocaleDateString()} 更新`
 }
 
 function downloadBlob(blob: Blob): void {
@@ -143,12 +164,11 @@ function downloadBlob(blob: Blob): void {
 
 export function MemoryPage() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [selectedSessionId, setSelectedSessionId] = useState('')
-  const memories = useQuery({ queryKey: ['memory', 'active'], queryFn: () => listMemories() })
-  const drafts = useQuery({
-    queryKey: ['memory', 'drafts', 'PENDING'],
-    queryFn: () => listMemoryDrafts({ status: 'PENDING' }),
+  const memories = useQuery({
+    queryKey: ['memory', 'active'],
+    queryFn: () => listMemories({ include_content: true }),
   })
   const memoryTypes = useQuery({ queryKey: ['memory', 'types'], queryFn: listMemoryTypes })
   const goals = useQuery({ queryKey: ['goals'], queryFn: listGoals })
@@ -160,19 +180,8 @@ export function MemoryPage() {
       ...(await listMemories({ state: 'destroyed' })),
     ],
   })
-  const provider = useQuery({ queryKey: ['memory-provider'], queryFn: getMemoryProviderStatus })
-  const policy = useQuery({ queryKey: ['memory-policy'], queryFn: () => getMemoryPolicy() })
   const sessions = useQuery({ queryKey: ['sessions'], queryFn: listSessions })
   const operator = useQuery({ queryKey: ['current-user'], queryFn: getCurrentUser })
-  const sessionPolicy = useQuery({
-    queryKey: ['memory-policy', selectedSessionId],
-    queryFn: () => getMemoryPolicy(selectedSessionId),
-    enabled: Boolean(selectedSessionId),
-  })
-
-  useEffect(() => {
-    if (!selectedSessionId && sessions.data?.[0]) setSelectedSessionId(sessions.data[0].id)
-  }, [selectedSessionId, sessions.data])
 
   const refreshMemory = async () => {
     await queryClient.invalidateQueries({ queryKey: ['memory'] })
@@ -182,36 +191,6 @@ export function MemoryPage() {
     onSuccess: async (item) => {
       toast.success(`已创建 ${item.lg_memory_id} · revision ${item.revision}`)
       await refreshMemory()
-    },
-    onError: (error) => toast.error(error.message),
-  })
-  const createDraft = useMutation({
-    mutationFn: createMemoryDraft,
-    onSuccess: async (item) => {
-      toast.success(
-        item.status === 'COMMITTED'
-          ? `草稿已自动提交 · ${item.result_memory_id ?? item.id}`
-          : `草稿待审核 · ${item.id}`,
-      )
-      await refreshMemory()
-      await queryClient.invalidateQueries({ queryKey: ['memory', 'drafts'] })
-    },
-    onError: (error) => toast.error(error.message),
-  })
-  const decideDraft = useMutation({
-    mutationFn: ({
-      id,
-      decision,
-      reason,
-    }: {
-      id: string
-      decision: 'commit' | 'reject'
-      reason?: string
-    }) => decideMemoryDraft(id, { decision, reason }),
-    onSuccess: async (item) => {
-      toast.success(item.status === 'COMMITTED' ? '草稿已提交为正式记忆' : '草稿已拒绝')
-      await refreshMemory()
-      await queryClient.invalidateQueries({ queryKey: ['memory', 'drafts'] })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -253,23 +232,6 @@ export function MemoryPage() {
     },
     onError: (error) => toast.error(error.message),
   })
-  const savePolicy = useMutation({
-    mutationFn: updateMemoryPolicy,
-    onSuccess: async () => {
-      toast.success('共同记忆策略已持久化')
-      await queryClient.invalidateQueries({ queryKey: ['memory-policy'] })
-      await queryClient.invalidateQueries({ queryKey: ['sessions'] })
-    },
-    onError: (error) => toast.error(error.message),
-  })
-  const probe = useMutation({
-    mutationFn: probeMemoryProvider,
-    onSuccess: async (result) => {
-      toast.success(`Provider 探测：${result.status}`)
-      await queryClient.invalidateQueries({ queryKey: ['memory-provider'] })
-    },
-    onError: (error) => toast.error(error.message),
-  })
   const exportArchive = useMutation({
     mutationFn: exportMemoryMarkdown,
     onSuccess: (blob) => {
@@ -278,39 +240,15 @@ export function MemoryPage() {
     },
     onError: (error) => toast.error(error.message),
   })
-  const purge = useMutation({
-    mutationFn: purgeExpiredMemoryContent,
-    onSuccess: async (result) => {
-      toast.success(
-        `维护完成：销毁 ${result.content_keys_destroyed} 个到期内容密钥，清理 ${result.journal_entries_removed} 条 Journal`,
-      )
-      await refreshMemory()
-      await queryClient.invalidateQueries({ queryKey: ['memory-detail'] })
-      await queryClient.invalidateQueries({ queryKey: ['memory-bindings'] })
-    },
-    onError: (error) => toast.error(error.message),
-  })
 
-  if (
-    memories.isPending ||
-    deleted.isPending ||
-    provider.isPending ||
-    policy.isPending ||
-    sessions.isPending ||
-    drafts.isPending
-  ) {
+  if (memories.isPending || deleted.isPending || sessions.isPending) {
     return <PageFrame><LoadingState /></PageFrame>
   }
-  const firstError =
-    memories.error ?? deleted.error ?? provider.error ?? policy.error ?? sessions.error ?? drafts.error
+  const firstError = memories.error ?? deleted.error ?? sessions.error
   if (firstError) return <PageFrame><ErrorState message={firstError.message} /></PageFrame>
-  if (!provider.data || !policy.data) {
-    return <PageFrame><ErrorState message="服务端未返回记忆 Provider 或策略状态" /></PageFrame>
-  }
 
   const activeMemories = memories.data ?? []
   const deletedMemories = deleted.data ?? []
-  const pendingDrafts = drafts.data ?? []
   const sessionList = sessions.data ?? []
   const goalList = goals.data ?? []
   const graphList = graphs.data ?? []
@@ -321,12 +259,31 @@ export function MemoryPage() {
 
   const recoverableCount = deletedMemories.filter((item) => item.restore_available).length
   const zoneBusy = remove.isPending || update.isPending || restoreRevision.isPending
+  const quickAdd = (content: string) =>
+    create
+      .mutateAsync({
+        title: deriveQuickTitle(content),
+        content,
+        zone: 'topics',
+        namespace: 'workspace',
+        scope_type: 'workspace',
+        record_kind: 'semantic_memory',
+        source: 'user_confirmed',
+      })
+      .then(() => undefined)
 
   return (
     <PageFrame>
       <PageIntro
         actions={
           <div className="flex flex-wrap gap-2">
+            <Button
+              onClick={() => navigate('../settings/workspace')}
+              size="sm"
+              variant="outline"
+            >
+              <Settings2 className="size-4" />配置
+            </Button>
             <Button
               disabled={exportArchive.isPending || !activeMemories.length}
               onClick={() => exportArchive.mutate()}
@@ -335,14 +292,6 @@ export function MemoryPage() {
             >
               <Download className="size-4" />导出 Markdown
             </Button>
-            <CreateDraftDialog
-              busy={createDraft.isPending}
-              goals={goalList}
-              graphs={graphList}
-              onCreate={(payload) => createDraft.mutateAsync(payload).then(() => undefined)}
-              sessions={sessionList}
-              types={typeList}
-            />
             <CreateMemoryDialog
               busy={create.isPending}
               goals={goalList}
@@ -353,7 +302,7 @@ export function MemoryPage() {
             />
           </div>
         }
-        description="记忆 ID、Revision、来源和删除恢复状态都由服务端持久化；草稿需审核后才进入 Active Memory。"
+        description="记忆摘要基于服务端 Active Memory 实时汇总；记忆 ID、Revision、来源与删除恢复状态都由服务端持久化。"
         eyebrow="Workspace memory"
         title="工作区记忆中心"
       />
@@ -367,10 +316,15 @@ export function MemoryPage() {
             tone: activeMemories.length ? 'positive' : 'default',
           },
           {
-            label: '待审核草稿',
-            value: pendingDrafts.length,
-            hint: '提交后进入 Active',
-            tone: pendingDrafts.length ? 'warning' : 'default',
+            label: '热区记忆',
+            value: grouped.hot.length + grouped.recent.length,
+            hint: '热摘要与近期事件',
+            tone: grouped.hot.length + grouped.recent.length ? 'info' : 'default',
+          },
+          {
+            label: '主题与归档',
+            value: grouped.topics.length + grouped.archive.length,
+            hint: '稳定事实与冷区记录',
           },
           {
             label: '可恢复删除',
@@ -378,339 +332,436 @@ export function MemoryPage() {
             hint: '30 分钟恢复窗口',
             tone: recoverableCount ? 'warning' : 'default',
           },
-          {
-            label: 'Provider',
-            value: provider.data.remote_capability ? '远程' : '本地',
-            hint: provider.data.display_name,
-            tone: provider.data.status.includes('healthy') ? 'positive' : 'info',
-          },
         ]}
       />
 
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_300px]">
-        <div className="min-w-0">
-          <Tabs className="gap-4" defaultValue="zones">
-            <TabsList className="h-9 w-full justify-start sm:w-auto">
-              <TabsTrigger className="px-3" value="zones">
-                冷热分层
-                <span className="ml-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
-                  {activeMemories.length}
-                </span>
-              </TabsTrigger>
-              <TabsTrigger className="px-3" value="drafts">
-                待审核草稿
-                {pendingDrafts.length ? (
-                  <span className="ml-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
-                    {pendingDrafts.length}
-                  </span>
-                ) : null}
-              </TabsTrigger>
-              <TabsTrigger className="px-3" value="deleted">
-                删除恢复
-                {deletedMemories.length ? (
-                  <span className="ml-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
-                    {deletedMemories.length}
-                  </span>
-                ) : null}
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent className="mt-0 outline-none" value="zones">
-              {!activeMemories.length ? (
-                <Surface className="p-2">
-                  <EmptyState
-                    description="新增确认记忆或审核草稿后，会按所选层级写入真实 Provider。"
-                    title="当前工作区还没有 Active 记忆"
-                  />
-                </Surface>
-              ) : (
-                <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-4">
-                  {zoneDefinitions.map(({ zone, title, description, icon: Icon }) => {
-                    const items = grouped[zone]
-                    return (
-                      <Surface className="flex min-h-0 flex-col overflow-hidden p-0" key={zone}>
-                        <div className="flex items-start gap-3 border-b bg-muted/25 px-4 py-3.5">
-                          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-                            <Icon className="size-4" />
-                          </span>
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-2">
-                              <h2 className="truncate text-sm font-semibold">{title}</h2>
-                              <Badge className="font-mono text-[10px]" variant="outline">
-                                {items.length}
-                              </Badge>
-                            </div>
-                            <p className="mt-0.5 truncate text-xs text-muted-foreground">{description}</p>
-                          </div>
-                        </div>
-                        <div className="flex flex-1 flex-col gap-2 p-3">
-                          {items.map((item) => (
-                            <MemoryRow
-                              busy={zoneBusy}
-                              item={item}
-                              key={item.id}
-                              onDelete={() => remove.mutate(item.id)}
-                              onOpen={() => setSelectedId(item.id)}
-                              onRestoreRevision={(revision) => restoreRevision.mutate({ item, revision })}
-                              onUpdate={(payload) =>
-                                update.mutateAsync({ id: item.id, payload }).then(() => undefined)
-                              }
-                            />
-                          ))}
-                          {!items.length ? (
-                            <div className="grid flex-1 place-items-center rounded-xl border border-dashed px-3 py-10 text-center text-xs text-muted-foreground">
-                              此层暂无真实记忆
-                            </div>
-                          ) : null}
-                        </div>
-                      </Surface>
-                    )
-                  })}
-                </div>
-              )}
-            </TabsContent>
-
-            <TabsContent className="mt-0 outline-none" value="drafts">
-              <Surface className="overflow-hidden">
-                <div className="flex flex-wrap items-start justify-between gap-3 border-b px-5 py-4">
-                  <SectionHeading
-                    description="Agent / 子会话提出的变更缓冲层；提交后才写入正式记忆与 Journal"
-                    title={`待审核草稿 · ${pendingDrafts.length}`}
-                  />
-                  <Button
-                    disabled={drafts.isFetching}
-                    onClick={() => void queryClient.invalidateQueries({ queryKey: ['memory', 'drafts'] })}
-                    size="sm"
-                    variant="outline"
-                  >
-                    <RefreshCw className={drafts.isFetching ? 'size-4 animate-spin' : 'size-4'} />
-                    刷新草稿
-                  </Button>
-                </div>
-                {pendingDrafts.length ? (
-                  <div className="divide-y">
-                    {pendingDrafts.map((draft) => (
-                      <DraftReviewRow
-                        busy={decideDraft.isPending}
-                        draft={draft}
-                        key={draft.id}
-                        onCommit={() =>
-                          decideDraft.mutate({
-                            id: draft.id,
-                            decision: 'commit',
-                            reason: 'user_review_commit',
-                          })
-                        }
-                        onReject={() =>
-                          decideDraft.mutate({
-                            id: draft.id,
-                            decision: 'reject',
-                            reason: 'user_review_reject',
-                          })
-                        }
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <EmptyState
-                    description="Agent 或「提出草稿」会把候选变更放在这里，提交后才进入 Active Memory。"
-                    title="当前没有待审核草稿"
-                  />
-                )}
-              </Surface>
-            </TabsContent>
-
-            <TabsContent className="mt-0 outline-none" value="deleted">
-              <Surface className="overflow-hidden">
-                <div className="border-b px-5 py-4">
-                  <SectionHeading
-                    description="30 分钟内可恢复；过窗后正文与内容密钥不可逆销毁"
-                    title="删除恢复窗口"
-                  />
-                </div>
-                {deletedMemories.length ? (
-                  <div className="divide-y">
-                    {deletedMemories.map((item) => (
-                      <div
-                        className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center"
-                        key={item.id}
-                      >
-                        <FileClock className="size-4 shrink-0 text-amber-600" />
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <p className="text-sm font-semibold">{item.title}</p>
-                            <Badge variant="secondary">{item.state}</Badge>
-                          </div>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {item.restore_available
-                              ? `可恢复至 ${formatTime(item.recoverable_until)}`
-                              : `正文已于 ${formatTime(item.content_destroyed_at)} 销毁`}
-                          </p>
-                        </div>
-                        <Button
-                          disabled={!item.restore_available || restore.isPending}
-                          onClick={() => restore.mutate(item.id)}
-                          size="sm"
-                          variant="outline"
-                        >
-                          <RotateCcw className="size-4" />恢复
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <EmptyState
-                    description="软删除的记忆会短暂出现在这里，过窗后仅保留无正文审计元数据。"
-                    title="当前没有删除记录"
-                  />
-                )}
-              </Surface>
-            </TabsContent>
-          </Tabs>
-        </div>
-
-        <aside className="flex min-w-0 flex-col gap-4 xl:sticky xl:top-5 xl:self-start">
-          <Surface className="p-4">
-            <div className="flex items-start justify-between gap-3">
-              <SectionHeading
-                description={`Epoch ${provider.data.provider_epoch} · ${provider.data.provider_type}`}
-                title="Provider 状态"
-              />
-              <StatePill status={provider.data.status} />
-            </div>
-            <div className="mt-4 space-y-2 border-t pt-4">
-              <p className="text-sm font-semibold">{provider.data.display_name}</p>
-              <p className="break-all font-mono text-[10px] text-muted-foreground">
-                {provider.data.provider_id}
-              </p>
-              <p className="text-xs leading-5 text-muted-foreground">
-                {provider.data.remote_capability
-                  ? '远程 Provider；不可用时操作会显式失败，不回退本地伪装成功。'
-                  : '本地 Markdown Provider；SQLite Journal 保持业务身份与历史权威。'}
-              </p>
-            </div>
-            <Button
-              className="mt-4 w-full"
-              disabled={probe.isPending}
-              onClick={() => probe.mutate()}
-              size="sm"
-              variant="outline"
-            >
-              <RefreshCw className={probe.isPending ? 'size-4 animate-spin' : 'size-4'} />
-              健康探测
-            </Button>
-          </Surface>
-
-          <Surface className="p-4">
-            <SectionHeading
-              description="工作区总开关与 Session 开关必须同时启用"
-              title="共同记忆策略"
-            />
-            <div className="mt-4 flex items-start justify-between gap-3 border-t pt-4">
-              <div className="min-w-0">
-                <Label htmlFor="workspace-memory">工作区共同记忆</Label>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  关闭后任何 Session 都不能跨会话注入。
-                </p>
-              </div>
-              <Switch
-                checked={policy.data.workspace_enabled}
-                disabled={savePolicy.isPending}
-                id="workspace-memory"
-                onCheckedChange={(workspace_enabled) => savePolicy.mutate({ workspace_enabled })}
-              />
-            </div>
-            <div className="mt-4 space-y-3 border-t pt-4">
-              <div className="space-y-2">
-                <Label htmlFor="memory-session">Session 策略</Label>
-                <Select
-                  onValueChange={(value) => setSelectedSessionId(value ?? '')}
-                  value={selectedSessionId}
-                >
-                  <SelectTrigger id="memory-session">
-                    <SelectValue placeholder="选择 Session" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {sessionList.map((session) => (
-                      <SelectItem key={session.id} value={session.id}>
-                        {session.title}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs text-muted-foreground">
-                  {sessionPolicy.data?.effective_enabled ? '当前有效' : '当前隔离'}
-                </span>
-                <Switch
-                  checked={sessionPolicy.data?.session_enabled ?? false}
-                  disabled={!selectedSessionId || sessionPolicy.isPending || savePolicy.isPending}
-                  onCheckedChange={(session_enabled) =>
-                    savePolicy.mutate({ session_id: selectedSessionId, session_enabled })
-                  }
-                />
-              </div>
-              {!sessionList.length ? (
-                <p className="text-xs text-muted-foreground">
-                  当前没有 Session；创建会话后可设置独立策略。
-                </p>
-              ) : sessionPolicy.isError ? (
-                <p className="text-xs text-destructive">
-                  Session 策略读取失败：{sessionPolicy.error.message}
-                </p>
-              ) : null}
-            </div>
-          </Surface>
-
-          {operator.data?.is_system_admin ? (
-            <Surface className="border-amber-200 bg-amber-50/35 p-4 dark:border-amber-900 dark:bg-amber-950/15">
-              <SectionHeading
-                description="仅系统管理员可见；服务端会重校验 Bearer 与工作区作用域。"
-                title="保留期维护"
-              />
-              <p className="mt-3 text-xs leading-5 text-muted-foreground">
-                销毁超过恢复窗口的内容密钥与恢复密文，并清理到期 Journal 元数据。不会恢复或伪造正文。
-              </p>
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button className="mt-4 w-full" disabled={purge.isPending} size="sm" variant="outline">
-                    <RefreshCw className={purge.isPending ? 'size-4 animate-spin' : 'size-4'} />
-                    运行到期清理
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogMedia className="bg-amber-500/10 text-amber-700">
-                      <FileClock />
-                    </AlertDialogMedia>
-                    <AlertDialogTitle>运行记忆保留期清理？</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      系统会仅销毁已经超过恢复窗口的内容密钥和到期审计元数据。未到期的删除记录不会受影响。
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>取消</AlertDialogCancel>
-                    <AlertDialogAction disabled={purge.isPending} onClick={() => purge.mutate()}>
-                      {purge.isPending ? '清理中…' : '确认运行清理'}
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </Surface>
-          ) : null}
-
-          <div className="flex items-start gap-2.5 rounded-xl border bg-muted/25 px-3.5 py-3 text-xs leading-5 text-muted-foreground">
-            <ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" />
-            <span>
-              Mem0 UUID 仅作可重建 Binding；lg_memory_id、Revision、Hash、来源与 Journal 始终是权威。
+      <Tabs className="gap-4" defaultValue="summary">
+        <TabsList className="h-9 w-full justify-start sm:w-auto">
+          <TabsTrigger className="px-3" value="summary">
+            记忆摘要
+          </TabsTrigger>
+          <TabsTrigger className="px-3" value="zones">
+            冷热分层
+            <span className="ml-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+              {activeMemories.length}
             </span>
-          </div>
-        </aside>
-      </div>
+          </TabsTrigger>
+          <TabsTrigger className="px-3" value="preview">
+            AI 眼中的我
+          </TabsTrigger>
+          <TabsTrigger className="px-3" value="deleted">
+            删除恢复
+            {deletedMemories.length ? (
+              <span className="ml-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+                {deletedMemories.length}
+              </span>
+            ) : null}
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent className="mt-0 outline-none" value="summary">
+          <MemorySummaryCard
+            busy={create.isPending}
+            memories={activeMemories}
+            onOpen={setSelectedId}
+            onQuickAdd={quickAdd}
+          />
+        </TabsContent>
+
+        <TabsContent className="mt-0 outline-none" value="zones">
+          {!activeMemories.length ? (
+            <Surface className="p-2">
+              <EmptyState
+                description="新增确认记忆后，会按所选层级写入真实 Provider。"
+                title="当前工作区还没有 Active 记忆"
+              />
+            </Surface>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {zoneDefinitions.map(({ zone, title, description, icon: Icon }) => {
+                const items = grouped[zone]
+                return (
+                  <Surface className="flex min-h-0 flex-col overflow-hidden p-0" key={zone}>
+                    <div className="flex items-start gap-3 border-b bg-muted/25 px-4 py-3.5">
+                      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
+                        <Icon className="size-4" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <h2 className="truncate text-sm font-semibold">{title}</h2>
+                          <Badge className="font-mono text-[10px]" variant="outline">
+                            {items.length}
+                          </Badge>
+                        </div>
+                        <p className="mt-0.5 truncate text-xs text-muted-foreground">{description}</p>
+                      </div>
+                    </div>
+                    <div className="flex flex-1 flex-col gap-2 p-3">
+                      {items.map((item) => (
+                        <MemoryRow
+                          busy={zoneBusy}
+                          item={item}
+                          key={item.id}
+                          onDelete={() => remove.mutate(item.id)}
+                          onOpen={() => setSelectedId(item.id)}
+                          onRestoreRevision={(revision) => restoreRevision.mutate({ item, revision })}
+                          onUpdate={(payload) =>
+                            update.mutateAsync({ id: item.id, payload }).then(() => undefined)
+                          }
+                        />
+                      ))}
+                      {!items.length ? (
+                        <div className="grid flex-1 place-items-center rounded-xl border border-dashed px-3 py-10 text-center text-xs text-muted-foreground">
+                          此层暂无真实记忆
+                        </div>
+                      ) : null}
+                    </div>
+                  </Surface>
+                )
+              })}
+            </div>
+          )}
+        </TabsContent>
+
+        <TabsContent className="mt-0 outline-none" value="preview">
+          <MemoryInjectionPreviewTab sessions={sessionList} />
+        </TabsContent>
+
+        <TabsContent className="mt-0 outline-none" value="deleted">
+          <Surface className="overflow-hidden">
+            <div className="border-b px-5 py-4">
+              <SectionHeading
+                description="30 分钟内可恢复；过窗后正文与内容密钥不可逆销毁"
+                title="删除恢复窗口"
+              />
+            </div>
+            {deletedMemories.length ? (
+              <div className="divide-y">
+                {deletedMemories.map((item) => (
+                  <div
+                    className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center"
+                    key={item.id}
+                  >
+                    <FileClock className="size-4 shrink-0 text-amber-600" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-semibold">{item.title}</p>
+                        <Badge variant="secondary">{item.state}</Badge>
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {item.restore_available
+                          ? `可恢复至 ${formatTime(item.recoverable_until)}`
+                          : `正文已于 ${formatTime(item.content_destroyed_at)} 销毁`}
+                      </p>
+                    </div>
+                    <Button
+                      disabled={!item.restore_available || restore.isPending}
+                      onClick={() => restore.mutate(item.id)}
+                      size="sm"
+                      variant="outline"
+                    >
+                      <RotateCcw className="size-4" />恢复
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <EmptyState
+                description="软删除的记忆会短暂出现在这里，过窗后仅保留无正文审计元数据。"
+                title="当前没有删除记录"
+              />
+            )}
+          </Surface>
+          {operator.data?.is_system_admin ? <RetentionMaintenanceCard /> : null}
+        </TabsContent>
+      </Tabs>
 
       <MemoryDetailDialog memoryId={selectedId} onClose={() => setSelectedId(null)} />
     </PageFrame>
+  )
+}
+
+function MemorySummaryCard({
+  memories,
+  busy,
+  onOpen,
+  onQuickAdd,
+}: {
+  memories: MemoryEntry[]
+  busy: boolean
+  onOpen: (id: string) => void
+  onQuickAdd: (content: string) => Promise<void>
+}) {
+  const [draft, setDraft] = useState('')
+  const sections = [...memories].sort((a, b) => zoneRank[a.zone] - zoneRank[b.zone])
+  const hint = summaryUpdatedHint(memories)
+
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    const content = draft.trim()
+    if (!content || busy) return
+    try {
+      await onQuickAdd(content)
+    } catch {
+      return
+    }
+    setDraft('')
+  }
+
+  return (
+    <Surface className="flex flex-col overflow-hidden p-0">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-6 pt-5">
+        <h2 className="text-lg font-semibold tracking-tight">记忆摘要</h2>
+        {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
+      </div>
+      {sections.length ? (
+        <div className="space-y-1 px-3 py-4">
+          {sections.map((item) => {
+            const body = memoryBody(item.content)
+            return (
+              <article
+                className="cursor-pointer rounded-xl px-3 py-3 transition-colors hover:bg-muted/40"
+                key={item.id}
+                onClick={() => onOpen(item.id)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && event.target === event.currentTarget) onOpen(item.id)
+                }}
+                role="button"
+                tabIndex={0}
+              >
+                <h3 className="text-base font-semibold tracking-tight">{item.title}</h3>
+                {body ? (
+                  <MessageResponse className="mt-1.5 text-sm leading-6 text-foreground/90">
+                    {body}
+                  </MessageResponse>
+                ) : (
+                  <p className="mt-1.5 text-sm text-muted-foreground">正文不可用。</p>
+                )}
+              </article>
+            )
+          })}
+        </div>
+      ) : (
+        <div className="px-6 py-5">
+          <EmptyState
+            description="在下方输入关于你的事实或偏好，确认后会像个人档案一样汇总在这里。"
+            title="当前工作区还没有 Active 记忆"
+          />
+        </div>
+      )}
+      <form className="border-t bg-muted/20 px-4 py-3.5" onSubmit={(event) => void submit(event)}>
+        <div className="flex items-center gap-2 rounded-full border bg-background py-1.5 pl-5 pr-1.5 shadow-sm transition-colors focus-within:border-primary/40">
+          <input
+            aria-label="添加或更新记忆"
+            className="h-9 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+            maxLength={2000}
+            onChange={(event) => setDraft(event.target.value)}
+            placeholder="添加或更新"
+            value={draft}
+          />
+          <Button
+            aria-label="提交记忆"
+            className="size-9 rounded-full"
+            disabled={busy || !draft.trim()}
+            size="icon"
+            type="submit"
+          >
+            <ArrowUp className="size-4" />
+          </Button>
+        </div>
+      </form>
+    </Surface>
+  )
+}
+
+function MemoryInjectionPreviewTab({ sessions }: { sessions: Session[] }) {
+  const queryClient = useQueryClient()
+  const [sessionId, setSessionId] = useState(sessions[0]?.id ?? '')
+  const preview = useQuery({
+    queryKey: ['memory-package', sessionId],
+    queryFn: () => getEffectiveMemoryPackage({ session_id: sessionId }),
+    enabled: Boolean(sessionId),
+  })
+  const extractNow = useMutation({
+    mutationFn: () => extractSessionMemories(sessionId),
+    onSuccess: async (result) => {
+      if (result.status === 'no_new_messages') {
+        toast.info('该会话没有新的可抽取内容')
+      } else {
+        toast.success(
+          `抽取完成：提炼 ${result.drafts_created} 条（自动写入 ${result.auto_committed ?? 0} 条）`,
+        )
+      }
+      await queryClient.invalidateQueries({ queryKey: ['memory'] })
+      await queryClient.invalidateQueries({ queryKey: ['memory-package'] })
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const summarizeNow = useMutation({
+    mutationFn: () => summarizeSessionContext(sessionId),
+    onSuccess: (result) => {
+      if (result.status === 'ok') {
+        toast.success(
+          `摘要已生成 v${result.version}：覆盖 ${result.covered_messages} 条消息（本次新增 ${result.newly_summarized} 条）`,
+        )
+      } else if (result.status === 'too_short') {
+        toast.info('该会话消息太少，暂不需要摘要')
+      } else if (result.status === 'fresh') {
+        toast.info('摘要已是最新，无需重新生成')
+      } else {
+        toast.info(`未生成摘要：${result.status}`)
+      }
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
+  if (!sessions.length) {
+    return (
+      <Surface className="p-2">
+        <EmptyState
+          description="创建会话后可以在这里查看下一轮对话实际注入的记忆。"
+          title="当前没有 Session"
+        />
+      </Surface>
+    )
+  }
+
+  return (
+    <Surface className="p-5">
+      <SectionHeading
+        description="透明化：查看所选 Session 下一轮对话实际会注入哪些记忆"
+        title="AI 眼中的我"
+      />
+      <div className="mt-4 flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center">
+        <SessionCombobox
+          className="sm:max-w-sm"
+          onChange={setSessionId}
+          sessions={sessions}
+          value={sessionId}
+        />
+        <div className="flex flex-wrap gap-2">
+          <Button
+            disabled={!sessionId || preview.isFetching}
+            onClick={() => void preview.refetch()}
+            size="sm"
+            variant="outline"
+          >
+            <RefreshCw className={preview.isFetching ? 'size-4 animate-spin' : 'size-4'} />
+            刷新
+          </Button>
+          <Button
+            disabled={!sessionId || extractNow.isPending}
+            onClick={() => extractNow.mutate()}
+            size="sm"
+            variant="outline"
+          >
+            <Sparkles className={extractNow.isPending ? 'size-4 animate-pulse' : 'size-4'} />
+            立即抽取记忆
+          </Button>
+          <Button
+            disabled={!sessionId || summarizeNow.isPending}
+            onClick={() => summarizeNow.mutate()}
+            size="sm"
+            variant="outline"
+          >
+            <FileText className={summarizeNow.isPending ? 'size-4 animate-pulse' : 'size-4'} />
+            立即生成摘要
+          </Button>
+        </div>
+      </div>
+      {preview.isLoading ? (
+        <p className="mt-4 text-xs text-muted-foreground">加载中…</p>
+      ) : preview.isError ? (
+        <p className="mt-4 text-xs text-destructive">{preview.error.message}</p>
+      ) : preview.data ? (
+        <div className="mt-4 space-y-3 border-t pt-4">
+          <p className="text-xs text-muted-foreground">
+            命中 {preview.data.effective_memories.length} 条 · 估算{' '}
+            {preview.data.token_estimate} tokens
+            {preview.data.conflicts.length
+              ? ` · ${preview.data.conflicts.length} 处作用域覆盖`
+              : ''}
+          </p>
+          {preview.data.effective_memories.length ? (
+            <ul className="grid gap-2 lg:grid-cols-2">
+              {preview.data.effective_memories.map((item) => (
+                <li className="rounded-lg border bg-muted/20 px-3 py-2" key={item.id}>
+                  <p className="text-xs font-semibold">{item.title}</p>
+                  <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+                    {item.record_kind} · {item.scope_type} · {item.zone}
+                    {typeof item.retrieval_score === 'number'
+                      ? ` · score ${item.retrieval_score.toFixed(2)}`
+                      : ''}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              当前策略下不会注入任何记忆（检查工作区/Session 开关，或还没有活跃记忆）。
+            </p>
+          )}
+          {preview.data.prompt_block ? (
+            <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/25 p-3 text-[10px] leading-4 text-muted-foreground">
+              {preview.data.prompt_block}
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+    </Surface>
+  )
+}
+
+function RetentionMaintenanceCard() {
+  const queryClient = useQueryClient()
+  const purge = useMutation({
+    mutationFn: purgeExpiredMemoryContent,
+    onSuccess: async (result) => {
+      toast.success(
+        `维护完成：销毁 ${result.content_keys_destroyed} 个到期内容密钥，清理 ${result.journal_entries_removed} 条 Journal`,
+      )
+      await queryClient.invalidateQueries({ queryKey: ['memory'] })
+      await queryClient.invalidateQueries({ queryKey: ['memory-detail'] })
+      await queryClient.invalidateQueries({ queryKey: ['memory-bindings'] })
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
+  return (
+    <Surface className="mt-4 border-amber-200 bg-amber-50/35 p-4 dark:border-amber-900 dark:bg-amber-950/15">
+      <SectionHeading
+        description="仅系统管理员可见；服务端会重校验 Bearer 与工作区作用域。"
+        title="保留期维护"
+      />
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        销毁超过恢复窗口的内容密钥与恢复密文，并清理到期 Journal 元数据。不会恢复或伪造正文。
+      </p>
+      <AlertDialog>
+        <AlertDialogTrigger asChild>
+          <Button className="mt-4" disabled={purge.isPending} size="sm" variant="outline">
+            <RefreshCw className={purge.isPending ? 'size-4 animate-spin' : 'size-4'} />
+            运行到期清理
+          </Button>
+        </AlertDialogTrigger>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogMedia className="bg-amber-500/10 text-amber-700">
+              <FileClock />
+            </AlertDialogMedia>
+            <AlertDialogTitle>运行记忆保留期清理？</AlertDialogTitle>
+            <AlertDialogDescription>
+              系统会仅销毁已经超过恢复窗口的内容密钥和到期审计元数据。未到期的删除记录不会受影响。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction disabled={purge.isPending} onClick={() => purge.mutate()}>
+              {purge.isPending ? '清理中…' : '确认运行清理'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </Surface>
   )
 }
 
@@ -769,50 +820,6 @@ function MemoryRow({
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
-      </div>
-    </div>
-  )
-}
-
-function DraftReviewRow({
-  draft,
-  busy,
-  onCommit,
-  onReject,
-}: {
-  draft: MemoryDraft
-  busy: boolean
-  onCommit: () => void
-  onReject: () => void
-}) {
-  return (
-    <div className="flex flex-col gap-3 px-5 py-4 lg:flex-row lg:items-start">
-      <div className="min-w-0 flex-1 space-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="text-sm font-semibold">{draft.title || '未命名草稿'}</p>
-          <Badge>{draft.operation}</Badge>
-          <Badge variant="outline">{draft.memory_type}</Badge>
-          <Badge variant="secondary">{draft.proposed_scope_type}</Badge>
-          <Badge variant="outline">conf {draft.confidence.toFixed(2)}</Badge>
-        </div>
-        <p className="whitespace-pre-wrap text-xs leading-5 text-muted-foreground">
-          {draft.content || '（无正文）'}
-        </p>
-        <p className="font-mono text-[10px] text-muted-foreground">
-          {draft.id}
-          {draft.goal_id ? ` · goal ${draft.goal_id}` : ''}
-          {draft.node_id ? ` · node ${draft.node_id}` : ''}
-          {draft.created_by ? ` · by ${draft.created_by}` : ''}
-          {` · ${formatTime(draft.created_at)}`}
-        </p>
-      </div>
-      <div className="flex shrink-0 flex-wrap gap-2">
-        <Button disabled={busy} onClick={onCommit} size="sm">
-          <Check className="size-4" />提交
-        </Button>
-        <Button disabled={busy} onClick={onReject} size="sm" variant="outline">
-          <X className="size-4" />拒绝
-        </Button>
       </div>
     </div>
   )
@@ -1034,148 +1041,6 @@ function CreateMemoryDialog({
               type="submit"
             >
               {busy ? '保存中…' : '保存 Revision 1'}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function CreateDraftDialog({
-  sessions,
-  goals,
-  graphs,
-  types,
-  busy,
-  onCreate,
-}: {
-  sessions: Session[]
-  goals: Goal[]
-  graphs: GraphSummary[]
-  types: Array<{ memory_type: string; description: string }>
-  busy: boolean
-  onCreate: (payload: MemoryDraftCreateRequest) => Promise<void>
-}) {
-  const [open, setOpen] = useState(false)
-  const [title, setTitle] = useState('')
-  const [content, setContent] = useState('')
-  const [memoryType, setMemoryType] = useState('ai_observation')
-  const [scopeType, setScopeType] = useState<MemoryScopeType>('workspace')
-  const [goalId, setGoalId] = useState('')
-  const [nodeId, setNodeId] = useState('')
-  const [sessionId, setSessionId] = useState('')
-  const [confidence, setConfidence] = useState('0.7')
-
-  async function submit(event: FormEvent) {
-    event.preventDefault()
-    try {
-      await onCreate({
-        operation: 'CREATE',
-        title: title.trim(),
-        content: content.trim(),
-        memory_type: memoryType,
-        proposed_scope_type: scopeType,
-        proposed_scope_id:
-          scopeType === 'goal' ? goalId || undefined : scopeType === 'node' ? nodeId || undefined : undefined,
-        goal_id: scopeType === 'goal' || scopeType === 'node' ? goalId || undefined : undefined,
-        node_id: scopeType === 'node' ? nodeId || undefined : undefined,
-        session_id: scopeType === 'session' ? sessionId || undefined : undefined,
-        confidence: Number(confidence) || 0.7,
-        importance: 0.55,
-        auto_commit: false,
-        created_by: 'user_review_ui',
-      })
-    } catch {
-      return
-    }
-    setOpen(false)
-    setTitle('')
-    setContent('')
-  }
-
-  return (
-    <Dialog onOpenChange={setOpen} open={open}>
-      <DialogTrigger asChild>
-        <Button size="sm" variant="outline"><Inbox className="size-4" />提出草稿</Button>
-      </DialogTrigger>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
-        <form onSubmit={(event) => void submit(event)}>
-          <DialogHeader>
-            <DialogTitle>提出记忆草稿</DialogTitle>
-            <DialogDescription>
-              草稿不会立即成为 Active Memory；需在上方列表中提交或拒绝。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-5">
-            <div className="space-y-2">
-              <Label>标题</Label>
-              <Input maxLength={240} onChange={(event) => setTitle(event.target.value)} value={title} />
-            </div>
-            <div className="space-y-2">
-              <Label>内容</Label>
-              <Textarea className="min-h-32" maxLength={50_000} onChange={(event) => setContent(event.target.value)} value={content} />
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label>类型</Label>
-                <Select onValueChange={(value) => setMemoryType(value ?? 'ai_observation')} value={memoryType}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {(types.length ? types : [{ memory_type: 'ai_observation', description: '' }]).map((item) => (
-                      <SelectItem key={item.memory_type} value={item.memory_type}>{item.memory_type}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label>置信度</Label>
-                <Input
-                  max={1}
-                  min={0}
-                  onChange={(event) => setConfidence(event.target.value)}
-                  step="0.05"
-                  type="number"
-                  value={confidence}
-                />
-              </div>
-            </div>
-            <ScopeFields
-              goalId={goalId}
-              goals={goals}
-              graphs={graphs}
-              nodeId={nodeId}
-              onGoalIdChange={setGoalId}
-              onNodeIdChange={setNodeId}
-              onScopeTypeChange={setScopeType}
-              scopeType={scopeType}
-            />
-            {scopeType === 'session' ? (
-              <div className="space-y-2">
-                <Label>Session</Label>
-                <Select onValueChange={(value) => setSessionId(value ?? '')} value={sessionId}>
-                  <SelectTrigger><SelectValue placeholder="选择 Session" /></SelectTrigger>
-                  <SelectContent>
-                    {sessions.map((session) => (
-                      <SelectItem key={session.id} value={session.id}>{session.title}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : null}
-          </div>
-          <DialogFooter>
-            <Button
-              disabled={
-                busy
-                || !content.trim()
-                || (scopeType === 'goal' && !goalId)
-                || (scopeType === 'node' && (!goalId || !nodeId))
-                || (scopeType === 'session' && !sessionId)
-              }
-              type="submit"
-            >
-              {busy ? '提交中…' : '创建待审草稿'}
             </Button>
           </DialogFooter>
         </form>

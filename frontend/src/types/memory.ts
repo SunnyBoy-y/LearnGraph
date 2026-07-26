@@ -4,16 +4,6 @@ export type MemoryNamespace = 'workspace' | 'session'
 export type MemoryScopeType = 'workspace' | 'goal' | 'node' | 'session'
 export type MemoryZone = 'hot' | 'recent' | 'topics' | 'archive'
 export type MemoryState = 'active' | 'deleted' | 'destroyed'
-export type MemoryDraftStatus = 'PENDING' | 'COMMITTED' | 'REJECTED' | 'CANCELLED'
-export type MemoryDraftOperation =
-  | 'CREATE'
-  | 'UPDATE'
-  | 'MERGE'
-  | 'SUPERSEDE'
-  | 'RETRACT'
-  | 'PROMOTE'
-  | 'DEMOTE'
-  | 'ARCHIVE'
 export type MemoryResolutionStatus =
   | 'none'
   | 'active_misconception'
@@ -181,65 +171,14 @@ export interface MemoryProviderStatus {
   remote_capability: boolean
   status: string
   provider_epoch: number
+  frozen_memories: number
   details: Record<string, unknown>
 }
 
-export interface MemoryDraft {
-  id: string
-  workspace_id: string
-  operation: MemoryDraftOperation
-  status: MemoryDraftStatus
-  memory_type: string
-  target_memory_id: string | null
-  proposed_scope_type: MemoryScopeType
-  proposed_scope_id: string | null
-  goal_id: string | null
-  node_id: string | null
-  session_id: string | null
-  branch_session_id: string | null
-  title: string
-  content: string
-  structured_payload: Record<string, unknown>
-  source_refs: Array<Record<string, unknown>>
-  confidence: number
-  importance: number
-  suggested_decay_policy: string
-  conflicts_with: string[]
-  created_by: string
-  reviewed_by: string | null
-  reviewed_at: IsoDateTime | null
-  rejection_reason: string
-  result_memory_id: string | null
-  result_revision: number | null
-  created_at: IsoDateTime
-  updated_at: IsoDateTime
-}
-
-export interface MemoryDraftCreateRequest {
-  operation?: MemoryDraftOperation
-  memory_type?: string
-  target_memory_id?: string
-  proposed_scope_type?: MemoryScopeType
-  proposed_scope_id?: string
-  goal_id?: string
-  node_id?: string
-  session_id?: string
-  branch_session_id?: string
-  title?: string
-  content?: string
-  structured_payload?: Record<string, unknown>
-  source_refs?: Array<Record<string, unknown>>
-  confidence?: number
-  importance?: number
-  suggested_decay_policy?: string
-  conflicts_with?: string[]
-  created_by?: string
-  auto_commit?: boolean
-}
-
-export interface MemoryDraftDecisionRequest {
-  decision: 'commit' | 'reject'
-  reason?: string
+export interface MemoryProviderMigrationResult {
+  migrated: number
+  failed: number
+  remaining: number
 }
 
 export interface MemoryTypeDefinition {
@@ -250,4 +189,73 @@ export interface MemoryTypeDefinition {
   requires_confirmation: boolean
   description: string
   payload_schema: Record<string, string>
+}
+
+export interface MemoryExtractionSettings {
+  enabled: boolean
+  provider_id: string
+  model_id: string
+  auto_commit: boolean
+}
+
+export interface MemoryEmbeddingSettings {
+  enabled: boolean
+  provider_id: string
+  model_id: string
+  semantic_weight: number
+}
+
+export interface MemorySummarizationSettings {
+  enabled: boolean
+  provider_id: string
+  model_id: string
+}
+
+export interface MemoryEnhancement {
+  workspace_id: string
+  extraction: MemoryExtractionSettings
+  embedding: MemoryEmbeddingSettings
+  summarization: MemorySummarizationSettings
+  active_memories: number
+  indexed_memories: number
+}
+
+export interface MemoryEnhancementUpdateRequest {
+  extraction?: Partial<MemoryExtractionSettings>
+  embedding?: Partial<MemoryEmbeddingSettings>
+  summarization?: Partial<MemorySummarizationSettings>
+}
+
+export interface MemoryEmbeddingReindexResult {
+  model_key: string
+  total_active: number
+  embedded: number
+  already_indexed: number
+}
+
+export interface MemoryExtractionRunResult {
+  status: string
+  session_id?: string
+  messages_reviewed?: number
+  drafts_created: number
+  auto_committed?: number
+  skipped?: number
+}
+
+export interface ContextSummarizationRunResult {
+  status: string
+  session_id?: string
+  version?: number
+  covered_messages?: number
+  newly_summarized?: number
+}
+
+export interface EffectiveMemoryPackage {
+  session_id: string | null
+  goal_id: string | null
+  node_ids: string[]
+  effective_memories: MemoryEntry[]
+  conflicts: Array<Record<string, unknown>>
+  prompt_block: string
+  token_estimate: number
 }

@@ -5,15 +5,17 @@ import {
   useState,
   type FormEvent,
 } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowUp,
+  ChevronDown,
   ExternalLink,
   FileText,
   LoaderCircle,
   MessageSquareText,
   Plus,
+  Search,
   Square,
   X,
   Image as ImageIcon,
@@ -31,10 +33,41 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
+import { ThinkingChain } from "@/components/chat/thinking-chain";
+import {
+  groupPartsForDisplay,
+  thinkingDurationSeconds,
+} from "@/features/chat/chat-message-parts";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import { listProviders } from "@/api/providers";
+import { discoverProviderModels, listProviders } from "@/api/providers";
+import {
+  capabilityThinkingModes,
+  fuzzyModelMatch,
+  modelChoiceValue,
+  modelProtocolLabel,
+  parseModelChoiceValue,
+  providerModelOptions,
+  thinkingLabels,
+} from "@/lib/model-choices";
+import {
+  setSessionComposerPrefs,
+  getSessionComposerPrefs,
+  type ThinkingMode,
+} from "@/lib/session-composer-prefs";
+import { isDeepSeekProvider, isModelProviderType } from "@/types/providers";
 import {
   cancelSessionMessage,
   createSession,
@@ -189,6 +222,14 @@ export function DocumentChatPanel({
   const submittedSeedRef = useRef("");
   const sendRef = useRef<(content: string) => Promise<void>>(async () => undefined);
   const [previewImage, setPreviewImage] = useState<(typeof embeddedImages)[number] | null>(null);
+  const [selectedProviderId, setSelectedProviderId] = useState(
+    () => getSessionComposerPrefs(sessionId).providerId ?? "",
+  );
+  const [selectedModelId, setSelectedModelId] = useState(
+    () => getSessionComposerPrefs(sessionId).modelId ?? "",
+  );
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("off");
+  const [modelSearch, setModelSearch] = useState("");
 
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
   const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
@@ -197,23 +238,134 @@ export function DocumentChatPanel({
     queryFn: () => listSessionMessages(sessionId),
     enabled: Boolean(sessionId),
   });
-  const activeProvider = useMemo(
+  const modelProviders = useMemo(
     () =>
-      providers.data?.find(
+      (providers.data ?? []).filter(
         (provider) =>
           provider.enabled &&
           provider.remote_capability &&
-          ["openai_responses", "openai_compatible_chat", "deepseek_chat"].includes(
-            provider.provider_type,
-          ),
+          isModelProviderType(provider.provider_type),
       ),
     [providers.data],
   );
+  const providerModelQueries = useQueries({
+    queries: modelProviders.map((provider) => ({
+      queryKey: ["provider-models", provider.id],
+      queryFn: () => discoverProviderModels(provider.id),
+      retry: false,
+    })),
+  });
+  const activeProvider =
+    modelProviders.find((provider) => provider.id === selectedProviderId) ??
+    modelProviders[0];
+  const activeProviderIndex = modelProviders.findIndex(
+    (provider) => provider.id === activeProvider?.id,
+  );
+  const discoveredModels =
+    activeProviderIndex >= 0
+      ? providerModelQueries[activeProviderIndex]
+      : undefined;
+  const modelOptions = useMemo(
+    () => providerModelOptions(activeProvider, discoveredModels?.data?.models),
+    [activeProvider, discoveredModels?.data?.models],
+  );
+  const selectedModel =
+    modelOptions.find((model) => model.id === selectedModelId) ?? modelOptions[0];
+  const availableModelChoices = useMemo(
+    () =>
+      modelProviders.flatMap((provider, index) =>
+        providerModelOptions(
+          provider,
+          providerModelQueries[index]?.data?.models,
+        ).map((model) => ({ provider, model })),
+      ),
+    [modelProviders, providerModelQueries],
+  );
+  const filteredModelChoices = useMemo(
+    () =>
+      availableModelChoices.filter(({ provider, model }) =>
+        fuzzyModelMatch(
+          `${model.id} ${provider.display_name} ${modelProtocolLabel(provider.provider_type)}`,
+          modelSearch,
+        ),
+      ),
+    [availableModelChoices, modelSearch],
+  );
+  const thinkingModes = useMemo(
+    () =>
+      capabilityThinkingModes(
+        selectedModel?.capabilities?.reasoning_efforts ??
+          activeProvider?.capabilities.reasoning_efforts ??
+          (activeProvider && isDeepSeekProvider(activeProvider)
+            ? ["low", "medium", "high", "xhigh"]
+            : undefined),
+      ),
+    [activeProvider, selectedModel?.capabilities?.reasoning_efforts],
+  );
+  const thinkingRequired =
+    selectedModel?.capabilities?.thinking_required === true;
   const activeSession = sessions.data?.find((item) => item.id === sessionId);
   const messages = useMemo(
     () => [...(history.data ?? []), ...localMessages],
     [history.data, localMessages],
   );
+
+  // Adopt the session's persisted composer prefs so panel and full chat page agree.
+  useEffect(() => {
+    if (!sessionId) return;
+    const stored = getSessionComposerPrefs(sessionId);
+    if (!stored.providerId && !stored.modelId) return;
+    if (stored.providerId) setSelectedProviderId(stored.providerId);
+    if (stored.modelId) setSelectedModelId(stored.modelId);
+    setThinkingMode(stored.responseMode === "fast" ? "off" : stored.thinkingMode);
+  }, [sessionId]);
+
+  useEffect(() => {
+    setSelectedProviderId((current) =>
+      modelProviders.some((provider) => provider.id === current)
+        ? current
+        : (modelProviders[0]?.id ?? ""),
+    );
+  }, [modelProviders]);
+
+  useEffect(() => {
+    setSelectedModelId((current) =>
+      modelOptions.some((model) => model.id === current)
+        ? current
+        : (modelOptions[0]?.id ?? ""),
+    );
+  }, [modelOptions]);
+
+  useEffect(() => {
+    setThinkingMode((current) => {
+      if (current === "off") {
+        return thinkingRequired && thinkingModes.length
+          ? (thinkingModes.includes("medium") ? "medium" : thinkingModes[0])
+          : current;
+      }
+      return thinkingModes.includes(current)
+        ? current
+        : (thinkingModes[0] ?? "off");
+    });
+  }, [thinkingModes, thinkingRequired]);
+
+  function persistComposerPrefs(
+    targetSessionId: string,
+    overrides: {
+      providerId?: string;
+      modelId?: string;
+      thinkingMode?: ThinkingMode;
+    } = {},
+  ) {
+    if (!targetSessionId) return;
+    const nextThinking = overrides.thinkingMode ?? thinkingMode;
+    setSessionComposerPrefs(targetSessionId, {
+      providerId: overrides.providerId ?? activeProvider?.id,
+      modelId: overrides.modelId ?? selectedModel?.id,
+      responseMode: nextThinking === "off" ? "fast" : "thinking",
+      thinkingMode: nextThinking,
+    });
+  }
 
   useEffect(() => {
     if (!selection) return;
@@ -297,6 +449,7 @@ export function DocumentChatPanel({
         ...(current ?? []).filter((item) => item.id !== created.id),
       ]);
     }
+    persistComposerPrefs(targetSessionId);
 
     // Upload / reuse embedded images so the server can route native or vision.
     const imageFileIds: string[] = [];
@@ -400,9 +553,12 @@ export function DocumentChatPanel({
       file_ids: fileIds,
       provider_id: activeProvider.id,
       model_id:
-        typeof activeProvider.capabilities.default_model === "string"
+        selectedModel?.id ??
+        (typeof activeProvider.capabilities.default_model === "string"
           ? activeProvider.capabilities.default_model
-          : undefined,
+          : undefined),
+      // Only send an explicit intensity when the model declares reasoning support.
+      thinking_mode: thinkingModes.length ? thinkingMode : undefined,
       document_selection: documentSelection,
     };
     const idempotencyKey = `document-chat-${crypto.randomUUID()}`;
@@ -534,10 +690,30 @@ export function DocumentChatPanel({
     setStatus("ready");
   }
 
+  async function expandToFullChat() {
+    let targetSessionId = sessionId;
+    if (!targetSessionId) {
+      const created = await createSession({
+        title: `阅读 ${file.original_name}`,
+        memory_enabled: false,
+      });
+      targetSessionId = created.id;
+      createdSessionRef.current = created.id;
+      onSessionChange(created.id);
+      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+        created,
+        ...(current ?? []).filter((item) => item.id !== created.id),
+      ]);
+    }
+    persistComposerPrefs(targetSessionId);
+    navigate(`/w/${workspaceId}/chat/${targetSessionId}`);
+  }
+
   const unavailableSession = Boolean(
     sessionId && sessions.isSuccess && !activeSession,
   );
   const sessionClosed = activeSession?.status === "closed";
+  const busy = status === "submitted" || status === "streaming";
 
   return (
     <section className="flex h-full min-h-[36rem] flex-col bg-background" aria-label="文档学习对话">
@@ -549,19 +725,117 @@ export function DocumentChatPanel({
             {activeProvider ? `${activeProvider.display_name} · 持久会话` : "真实模型未配置"}
           </p>
         </div>
-        {sessionId ? (
-          <Button
-            aria-label="在完整会话画布中打开"
-            onClick={() => navigate(`/w/${workspaceId}/chat/${sessionId}`)}
-            size="icon-xs"
-            variant="ghost"
-          >
-            <ExternalLink className="size-3.5" />
-          </Button>
-        ) : null}
+        <DropdownMenu onOpenChange={(open) => { if (!open) setModelSearch(""); }}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              aria-label="选择模型与思考力度"
+              className="max-w-36 gap-1 px-2"
+              disabled={!modelProviders.length || busy}
+              size="xs"
+              variant="outline"
+            >
+              <span className="truncate font-mono text-[10px]">
+                {selectedModel?.id ?? "选择模型"}
+              </span>
+              <ChevronDown className="size-3 flex-none" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-64" collisionPadding={12}>
+            <DropdownMenuLabel>思考力度</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              onValueChange={(value) => {
+                const mode = value as ThinkingMode;
+                setThinkingMode(mode);
+                if (sessionId) persistComposerPrefs(sessionId, { thinkingMode: mode });
+              }}
+              value={thinkingModes.length ? thinkingMode : "off"}
+            >
+              <DropdownMenuRadioItem disabled={thinkingRequired} value="off">
+                关闭{thinkingRequired ? "（该模型仅支持思考）" : ""}
+              </DropdownMenuRadioItem>
+              {thinkingModes.map((mode) => (
+                <DropdownMenuRadioItem key={mode} value={mode}>
+                  {thinkingLabels[mode]}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+            {!thinkingModes.length ? (
+              <p className="px-2 pb-1 text-[10px] text-muted-foreground">
+                当前模型未声明推理能力，按服务商默认执行。
+              </p>
+            ) : null}
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>模型</DropdownMenuLabel>
+            <div className="relative px-1 pb-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                aria-label="搜索模型"
+                className="h-8 pl-8 font-mono text-xs"
+                onChange={(event) => setModelSearch(event.target.value)}
+                onKeyDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                placeholder="搜索模型名称或 Provider…"
+                value={modelSearch}
+              />
+            </div>
+            <div className="max-h-[min(50vh,20rem)] overflow-y-auto">
+              {filteredModelChoices.length ? (
+                <DropdownMenuRadioGroup
+                  onValueChange={(value) => {
+                    const choice = parseModelChoiceValue(value);
+                    if (!choice) return;
+                    setSelectedProviderId(choice.providerId);
+                    setSelectedModelId(choice.modelId);
+                    if (sessionId) {
+                      persistComposerPrefs(sessionId, {
+                        providerId: choice.providerId,
+                        modelId: choice.modelId,
+                      });
+                    }
+                  }}
+                  value={
+                    activeProvider && selectedModel
+                      ? modelChoiceValue(activeProvider.id, selectedModel.id)
+                      : ""
+                  }
+                >
+                  {filteredModelChoices.map(({ provider, model }) => (
+                    <DropdownMenuRadioItem
+                      key={`${provider.id}:${model.id}`}
+                      value={modelChoiceValue(provider.id, model.id)}
+                    >
+                      <span className="flex min-w-0 flex-col">
+                        <span className="truncate font-mono">{model.id}</span>
+                        <span className="text-[10px] text-muted-foreground">
+                          {provider.display_name} ·{" "}
+                          {modelProtocolLabel(provider.provider_type)}
+                        </span>
+                      </span>
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              ) : (
+                <DropdownMenuItem disabled>
+                  {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
+                </DropdownMenuItem>
+              )}
+            </div>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <Button
+          aria-label="在完整会话画布中打开"
+          disabled={busy}
+          onClick={() =>
+            void expandToFullChat().catch((error: Error) => toast.error(error.message))
+          }
+          size="icon-xs"
+          variant="ghost"
+        >
+          <ExternalLink className="size-3.5" />
+        </Button>
         <Button
           aria-label="新建文档学习对话"
-          disabled={status === "submitted" || status === "streaming"}
+          disabled={busy}
           onClick={() => onSessionChange("")}
           size="icon-xs"
           variant="ghost"
@@ -612,20 +886,51 @@ export function DocumentChatPanel({
               title="围绕原文件继续学习"
             />
           ) : null}
-          {messages.map((message) => (
-            <AiMessage from={message.role === "user" ? "user" : "assistant"} key={message.id}>
-              <MessageContent className={message.role === "assistant" ? "w-full gap-2" : undefined}>
-                {messageParts(message).map((part) => (
-                  <MessagePartRenderer
-                    key={part.id}
-                    part={part}
-                    siblingParts={messageParts(message)}
-                    streaming={message.status === "streaming"}
-                  />
-                ))}
-              </MessageContent>
-            </AiMessage>
-          ))}
+          {messages.map((message) => {
+            const parts = messageParts(message);
+            const streaming = message.status === "streaming";
+            const renderPart = (part: MessagePart) => (
+              <MessagePartRenderer
+                key={part.id}
+                part={part}
+                siblingParts={parts}
+                streaming={streaming}
+              />
+            );
+            return (
+              <AiMessage from={message.role === "user" ? "user" : "assistant"} key={message.id}>
+                <MessageContent className={message.role === "assistant" ? "w-full gap-2" : undefined}>
+                  {groupPartsForDisplay(parts).map((segment, index) =>
+                    segment.kind === "chain" ? (
+                      <ThinkingChain
+                        chainParts={segment.parts}
+                        completedDurationSec={thinkingDurationSeconds(
+                          message.provider_trace,
+                        )}
+                        key={`chain-${message.id}-${index}`}
+                        messageStatus={message.status}
+                        startedAt={
+                          typeof message.provider_trace.generation_started_at ===
+                          "string"
+                            ? message.provider_trace.generation_started_at
+                            : message.created_at
+                        }
+                      >
+                        {segment.parts.map(renderPart)}
+                      </ThinkingChain>
+                    ) : (
+                      <div
+                        className="message-answer-segment"
+                        key={`parts-${message.id}-${index}`}
+                      >
+                        {segment.parts.map(renderPart)}
+                      </div>
+                    ),
+                  )}
+                </MessageContent>
+              </AiMessage>
+            );
+          })}
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>

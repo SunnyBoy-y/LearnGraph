@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -53,7 +54,10 @@ def discover_anthropic_models(
     except httpx.TimeoutException as exc:
         raise ProviderTimeoutError("Anthropic model discovery timed out") from exc
     if not response.is_success:
-        raise ProviderHTTPError(f"Provider returned HTTP {response.status_code}")
+        raise ProviderHTTPError(
+            f"Provider returned HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
@@ -98,6 +102,34 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
             return f"{root}/messages"
         return f"{root}/v1/messages"
 
+    _MODEL_VERSION_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d+))?")
+
+    @classmethod
+    def _thinking_capabilities(cls, model_id: str) -> tuple[bool, bool]:
+        """Return ``(adaptive_thinking, supports_xhigh_effort)`` for a model id.
+
+        Claude Opus 4.7+/Opus 5, Sonnet 5, and Fable/Mythos 5 reject the legacy
+        ``{"type": "enabled", "budget_tokens": N}`` config with HTTP 400 and use
+        adaptive thinking with ``output_config.effort`` instead. Opus/Sonnet 4.6
+        accept adaptive but not the ``xhigh`` effort tier (introduced with Opus
+        4.7). Everything older keeps the enabled+budget form.
+        """
+
+        match = cls._MODEL_VERSION_RE.search((model_id or "").strip().lower())
+        if not match:
+            return False, False
+        family = match.group(1)
+        major = int(match.group(2))
+        minor = int(match.group(3) or 0)
+        if family in {"fable", "mythos"}:
+            return True, True
+        if family in {"opus", "sonnet"}:
+            if major >= 5 or (major == 4 and minor >= 7):
+                return True, True
+            if major == 4 and minor == 6:
+                return True, False
+        return False, False
+
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
         del responses
         options = self.call_options
@@ -106,14 +138,25 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
         actual = options.actual_reasoning_effort
         thinking_mode = options.thinking_mode
         if thinking_mode and thinking_mode != "off":
-            # Adaptive thinking: enable and budget tokens by effort tier.
-            budget = {
-                "low": 4_000,
-                "medium": 10_000,
-                "high": 20_000,
-                "xhigh": 32_000,
-            }.get(str(actual or thinking_mode), 10_000)
-            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            tier = str(actual or thinking_mode)
+            if tier not in {"low", "medium", "high", "xhigh"}:
+                tier = str(thinking_mode)
+            adaptive, supports_xhigh = self._thinking_capabilities(self.model_id)
+            if adaptive:
+                payload["thinking"] = {"type": "adaptive"}
+                effort = tier
+                if effort == "xhigh" and not supports_xhigh:
+                    effort = "high"
+                if effort in {"low", "medium", "high", "xhigh"}:
+                    payload["output_config"] = {"effort": effort}
+            else:
+                budget = {
+                    "low": 4_000,
+                    "medium": 10_000,
+                    "high": 20_000,
+                    "xhigh": 32_000,
+                }.get(tier, 10_000)
+                payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
         return payload
 
     @staticmethod

@@ -15,7 +15,17 @@ from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
 
 
 class ProviderHTTPError(RuntimeError):
-    pass
+    """Provider call failure.
+
+    ``status_code`` carries the upstream HTTP status when the failure came
+    from an HTTP response, so callers can tell transient gateway errors
+    (502/503/529) from permanent request errors. Transport-level failures
+    leave it ``None``.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ProviderTimeoutError(ProviderHTTPError):
@@ -114,7 +124,10 @@ def discover_remote_models(
     except httpx.TimeoutException as exc:
         raise ProviderTimeoutError("Provider model discovery timed out") from exc
     if not response.is_success:
-        raise ProviderHTTPError(f"Provider returned HTTP {response.status_code}")
+        raise ProviderHTTPError(
+            f"Provider returned HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
@@ -175,6 +188,9 @@ class _StreamingHTTPProvider:
         self.supports_image_input = supports_image_input
         self.image_input_mode = image_input_mode or "auto"
         self.capabilities = dict(capabilities or {})
+        self.supports_video_input = (
+            self.capabilities.get("supports_video_input") is True
+        )
         self.extra_headers = dict(extra_headers or {})
         self.authorization_scheme = authorization_scheme
 
@@ -229,11 +245,16 @@ class _StreamingHTTPProvider:
         if options is None:
             return payload
         actual = options.actual_reasoning_effort
-        if actual is not None:
+        if actual is not None and options.reasoning_parameter in {
+            "reasoning_effort",
+            "reasoning.effort",
+        }:
             if responses or options.reasoning_parameter == "reasoning.effort":
                 payload["reasoning"] = {"effort": actual}
             else:
                 payload["reasoning_effort"] = actual
+        if not responses:
+            payload.update(options.provider_options)
         if responses and options.native_web_search:
             raw_tools = payload.get("tools")
             tools = list(raw_tools) if isinstance(raw_tools, list) else []
@@ -334,10 +355,17 @@ class _StreamingHTTPProvider:
     def _raise_for_status(response: httpx.Response) -> None:
         if response.is_success:
             return
-        request_id = response.headers.get("x-request-id")
-        detail = response.text[:500]
+        request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
+        try:
+            # Streaming responses (``client.stream``) have an unread body here;
+            # accessing ``.text`` without ``read()`` raises httpx.ResponseNotRead.
+            response.read()
+            detail = response.text[:500]
+        except (httpx.HTTPError, httpx.StreamError):
+            detail = "<error body unavailable>"
         raise ProviderHTTPError(
-            f"Provider returned HTTP {response.status_code}; request_id={request_id}; body={detail}"
+            f"Provider returned HTTP {response.status_code}; request_id={request_id}; body={detail}",
+            status_code=response.status_code,
         )
 
     @staticmethod
@@ -599,9 +627,12 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
             call_id = raw_item.get("call_id")
             name = raw_item.get("name")
             arguments = raw_item.get("arguments")
-            if isinstance(call_id, str):
+            # A relay that echoes the identity keys as blanks must not erase
+            # what the opening item already established; an empty call id is
+            # discarded downstream and would lose the call silently.
+            if isinstance(call_id, str) and call_id:
                 aggregate["id"] = call_id
-            if isinstance(name, str):
+            if isinstance(name, str) and name:
                 aggregate["function"]["name"] = name
             if isinstance(arguments, str):
                 aggregate["function"]["arguments"] = arguments
@@ -621,9 +652,9 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
         )
         call_id = event.get("call_id")
         name = event.get("name")
-        if isinstance(call_id, str):
+        if isinstance(call_id, str) and call_id:
             aggregate["id"] = call_id
-        if isinstance(name, str):
+        if isinstance(name, str) and name:
             aggregate["function"]["name"] = name
         if event_type == "response.function_call_arguments.delta":
             delta = event.get("delta")
@@ -873,6 +904,12 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
 class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
     """Chat Completions compatible adapter for DeepSeek and similar providers."""
 
+    # Function calling is part of the Chat Completions contract implemented by
+    # ``stream_chat`` below.  Keep this explicit so generic compatible
+    # providers receive the same Agent capability declaration as native
+    # OpenAI, Anthropic, and DeepSeek adapters.
+    supports_agent_tools = True
+
     def __init__(
         self,
         *,
@@ -972,18 +1009,49 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             index,
             {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
         )
-        if isinstance(raw.get("id"), str):
+        # Identity fields are announced once and then repeated as blanks by some
+        # gateways.  OpenAI and DeepSeek omit ``id``/``name`` on continuation
+        # fragments, but DashScope echoes ``"id": ""`` and ``"name": ""`` on
+        # every argument chunk.  Overwriting with those blanks erases the call
+        # identity and the completed tool call is dropped by the filter below,
+        # which silently disables Agent mode on that gateway.
+        if isinstance(raw.get("id"), str) and raw["id"]:
             item["id"] = raw["id"]
-        if isinstance(raw.get("type"), str):
+        if isinstance(raw.get("type"), str) and raw["type"]:
             item["type"] = raw["type"]
         function = raw.get("function")
         if not isinstance(function, dict):
             return
         target = item["function"]
-        if isinstance(function.get("name"), str):
+        if isinstance(function.get("name"), str) and function["name"]:
             target["name"] += function["name"]
         if isinstance(function.get("arguments"), str):
             target["arguments"] += function["arguments"]
+
+    @staticmethod
+    def _completed_chat_tool_calls(
+        aggregates: dict[int, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return the tool calls a compatible gateway finished streaming.
+
+        A function name is the only field the caller cannot substitute, so it
+        stays required.  ``id`` is synthesized when a gateway never sends one:
+        it is only correlation state that LearnGraph echoes back as
+        ``tool_call_id``, and the same object is replayed on both the assistant
+        turn and its tool result, so a local identifier round-trips correctly.
+        """
+
+        tool_calls: list[dict[str, Any]] = []
+        for index, item in sorted(aggregates.items()):
+            function = item.get("function")
+            if not isinstance(function, dict) or not function.get("name"):
+                continue
+            if not item.get("id"):
+                item["id"] = f"call_{index}"
+            if not item.get("type"):
+                item["type"] = "function"
+            tool_calls.append(item)
+        return tool_calls
 
     @staticmethod
     def _chat_stream_error_message(error: object) -> str:
@@ -996,6 +1064,67 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         if isinstance(error, str) and error.strip():
             return error.strip()[:300]
         return "Compatible Chat stream returned an error event"
+
+    def _capture_chat_sources(self, event: dict[str, Any]) -> None:
+        candidates: list[object] = [
+            event.get("search_info"),
+            event.get("web_search"),
+        ]
+        choices = event.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice = choices[0]
+            candidates.extend(
+                [
+                    choice.get("search_info"),
+                    choice.get("web_search"),
+                ]
+            )
+            for container_key in ("delta", "message"):
+                container = choice.get(container_key)
+                if isinstance(container, dict):
+                    candidates.extend(
+                        [
+                            container.get("search_info"),
+                            container.get("web_search"),
+                        ]
+                    )
+        sources = list(self.last_sources)
+        seen = {
+            item.get("url")
+            for item in sources
+            if isinstance(item, dict) and isinstance(item.get("url"), str)
+        }
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            raw_results = (
+                candidate.get("search_results")
+                or candidate.get("results")
+                or candidate.get("sources")
+            )
+            if not isinstance(raw_results, list):
+                continue
+            for raw in raw_results:
+                if not isinstance(raw, dict):
+                    continue
+                url = raw.get("url") or raw.get("link")
+                if (
+                    not isinstance(url, str)
+                    or not url.startswith(("http://", "https://"))
+                    or url in seen
+                ):
+                    continue
+                seen.add(url)
+                sources.append(
+                    {
+                        "index": len(sources) + 1,
+                        "url": url,
+                        "title": str(
+                            raw.get("title") or raw.get("site_name") or url
+                        )[:1_000],
+                    }
+                )
+        self.last_sources = sources
 
     def stream_chat(
         self,
@@ -1011,6 +1140,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         """
 
         self.last_usage = {}
+        self.last_sources = []
         self.last_request_id = None
         payload: dict[str, Any] = {
             "model": self.model_id,
@@ -1058,6 +1188,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                             raise ProviderHTTPError(
                                 self._chat_stream_error_message(event.get("error"))
                             )
+                        self._capture_chat_sources(event)
                         usage = self._usage_from_chat_chunk(event.get("usage"))
                         if usage is not None:
                             self.last_usage = usage
@@ -1081,6 +1212,15 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                             saw_model_output = True
                             for text_delta in self._text_deltas(content):
                                 yield ProviderStreamEvent("text_delta", content=text_delta)
+                        reasoning_content = delta.get("reasoning_content")
+                        if isinstance(reasoning_content, str) and reasoning_content:
+                            saw_model_output = True
+                            for reasoning_delta in self._text_deltas(reasoning_content):
+                                yield ProviderStreamEvent(
+                                    "reasoning_delta",
+                                    content=reasoning_delta,
+                                    reasoning_kind="summary",
+                                )
                         raw_tool_calls = delta.get("tool_calls")
                         if isinstance(raw_tool_calls, list):
                             for fallback_index, raw_tool_call in enumerate(raw_tool_calls):
@@ -1106,13 +1246,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                     "Compatible Chat stream ended before completion "
                     f"(finish_reason={finish_reason!r}, output={saw_model_output})"
                 )
-        tool_calls = [
-            item
-            for _, item in sorted(tool_aggregates.items())
-            if item.get("id")
-            and isinstance(item.get("function"), dict)
-            and item["function"].get("name")
-        ]
+        tool_calls = self._completed_chat_tool_calls(tool_aggregates)
         if tool_calls:
             yield ProviderStreamEvent("tool_calls", tool_calls=tool_calls)
         yield ProviderStreamEvent("completed", finish_reason=finish_reason)
@@ -1165,3 +1299,94 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
         }
         return self._validate_structured_result(result, schema)
+
+
+class QwenChatProvider(OpenAICompatibleChatProvider):
+    """DashScope OpenAI-compatible Chat adapter.
+
+    Qwen thinking controls are extra body fields rather than OpenAI's standard
+    reasoning shape. Streaming reasoning arrives as ``reasoning_content`` and
+    is normalized by the parent adapter.
+    """
+
+    def __init__(self, *args: Any, preserve_thinking: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.preserve_thinking = preserve_thinking
+
+    def _apply_call_options(
+        self,
+        payload: dict[str, Any],
+        *,
+        responses: bool,
+    ) -> dict[str, Any]:
+        payload = super()._apply_call_options(payload, responses=responses)
+        # DashScope enables thinking by default for several Qwen generations.
+        # Older LearnGraph provider rows may still carry a generic
+        # ``reasoning_effort`` capability snapshot, so relying only on
+        # provider_options would omit the disable switch in fast mode.
+        # Make the product-level "off" choice authoritative at the wire.
+        if (
+            not responses
+            and self.call_options is not None
+            and self.call_options.thinking_mode == "off"
+        ):
+            payload["enable_thinking"] = False
+        # DashScope's built-in search is a whole-turn alternative to function
+        # calling, not an additional tool: compatible mode rejects the request
+        # when ``enable_search`` accompanies ``tools``.  An Agent turn always
+        # carries function tools and reaches the web through its own search
+        # lane, so the hosted switch yields to them instead of failing the turn.
+        if (
+            not responses
+            and not payload.get("tools")
+            and self.call_options is not None
+            and self.call_options.native_web_search
+        ):
+            payload["enable_search"] = True
+            strategy = self.capabilities.get("chat_search_strategy")
+            if strategy not in {"turbo", "max", "agent", "agent_max"}:
+                strategy = "turbo"
+            payload.setdefault(
+                "search_options",
+                {"search_strategy": strategy, "enable_source": True},
+            )
+        # ``preserve_thinking`` only controls how reasoning state is carried
+        # across turns.  Sending it during a fast call is contradictory to the
+        # explicit ``enable_thinking=false`` override and can make DashScope
+        # continue a previous thinking turn.  Keep fast mode unambiguous.
+        if (
+            not responses
+            and self.preserve_thinking
+            and self.call_options is not None
+            and self.call_options.thinking_mode != "off"
+        ):
+            payload["preserve_thinking"] = True
+        return payload
+
+    def generate_json(
+        self,
+        prompt: str,
+        schema_name: str,
+        schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Qwen Chat JSON mode rejects enable_thinking=true. Structured output
+        # is therefore an explicit fast sub-call even when the chat preference
+        # uses thinking.
+        if self.capabilities.get("thinking_required") is True:
+            raise ProviderResponseError(
+                "This Qwen-hosted model cannot disable thinking for JSON mode"
+            )
+        original_options = self.call_options
+        if original_options is not None:
+            self.call_options = ModelCallOptions(
+                thinking_mode="off",
+                actual_reasoning_effort=None,
+                reasoning_parameter=original_options.reasoning_parameter,
+                search_route="disabled",
+                native_web_search=False,
+                provider_options={"enable_thinking": False},
+            )
+        try:
+            return super().generate_json(prompt, schema_name, schema)
+        finally:
+            self.call_options = original_options

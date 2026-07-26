@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 import uuid
@@ -14,8 +15,8 @@ from app.core.config import Settings
 from app.core.file_lock import InterProcessFileLock
 from app.providers.remote.sandbox import (
     DockerSandboxBackend,
-    chromium_seccomp_security_options,
     image_ref_is_pinned,
+    sandbox_seccomp_security_options,
 )
 from app.services.sandbox_runtime import (
     load_runtime_config,
@@ -26,7 +27,6 @@ from app.services.sandbox_runtime import (
 )
 
 DEFAULT_TAG = "learngraph-sandbox:local"
-DEFAULT_BROWSER_TAG = "learngraph-sandbox-browser:local"
 SMOKE_CONTAINER_PREFIX = "learngraph-sandbox-smoke-"
 
 
@@ -81,6 +81,7 @@ class SandboxBootstrapService:
 
     def status(self, settings: Settings) -> dict[str, Any]:
         docker_reachable, docker_detail = self._probe_docker()
+        docker_installed = docker_reachable or shutil.which("docker") is not None
         image = resolve_sandbox_image(settings)
         image_ready = False
         browser_image_ready = False
@@ -149,7 +150,7 @@ class SandboxBootstrapService:
                 remediation.append(image_detail)
 
         return {
-            "docker_installed": docker_reachable or docker_detail is not None,
+            "docker_installed": docker_installed,
             "docker_reachable": docker_reachable,
             "docker_detail": docker_detail,
             "sandbox_enabled": settings.sandbox_enabled,
@@ -297,12 +298,23 @@ class SandboxBootstrapService:
                 )
                 return
 
-            self._set_phase(job, "build_runner", 40, "正在构建沙箱 Runner 镜像（可能需要几分钟）…")
+            self._set_phase(
+                job,
+                "build_runner",
+                40,
+                "正在构建统一沙箱 Runner 镜像（含 Chromium/ffmpeg/前端工具链，可能需要几分钟）…",
+            )
+            buildargs: dict[str, str] = {}
+            if (settings.sandbox_build_pip_index_url or "").strip():
+                buildargs["PIP_INDEX_URL"] = settings.sandbox_build_pip_index_url.strip()
+            if (settings.sandbox_build_npm_registry or "").strip():
+                buildargs["NPM_REGISTRY"] = settings.sandbox_build_npm_registry.strip()
             client = self._docker_client()
             try:
                 image, build_log = client.images.build(
                     path=str(sandbox_root),
                     tag=DEFAULT_TAG,
+                    buildargs=buildargs or None,
                     rm=True,
                     forcerm=True,
                 )
@@ -324,65 +336,22 @@ class SandboxBootstrapService:
                 except Exception:
                     pass
 
-            self._set_phase(job, "pin_digest", 65, "正在固定镜像 digest…")
+            self._set_phase(job, "pin_digest", 70, "正在固定镜像 digest…")
             digest = self._image_digest(DEFAULT_TAG)
             if not digest:
                 self._fail(job, "digest_missing", "Docker did not return an immutable image id")
                 return
             job.image_digest = digest
 
-            browser_dockerfile = sandbox_root / "Dockerfile.browser"
-            if not browser_dockerfile.is_file():
-                self._fail(
-                    job,
-                    "browser_dockerfile_missing",
-                    f"Sandbox browser Dockerfile was not found at {browser_dockerfile}",
-                )
-                return
-            self._set_phase(job, "build_browser_runner", 72, "正在构建浏览器 Runner 镜像…")
-            client = self._docker_client()
-            try:
-                _, build_log = client.images.build(
-                    path=str(sandbox_root),
-                    dockerfile="Dockerfile.browser",
-                    tag=DEFAULT_BROWSER_TAG,
-                    buildargs={"BASE_IMAGE": digest},
-                    rm=True,
-                    forcerm=True,
-                )
-                for chunk in build_log:
-                    if isinstance(chunk, dict):
-                        stream = chunk.get("stream")
-                        if isinstance(stream, str) and stream.strip():
-                            job.append_log(stream.strip())
-                        err = chunk.get("error")
-                        if isinstance(err, str) and err.strip():
-                            self._fail(job, "browser_build_failed", err.strip())
-                            return
-            except Exception as exc:
-                self._fail(job, "browser_build_failed", f"Docker browser build failed: {exc}")
-                return
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-            browser_digest = self._image_digest(DEFAULT_BROWSER_TAG)
-            if not browser_digest:
-                self._fail(job, "browser_digest_missing", "Docker did not return a browser image id")
-                return
-            job.browser_image_digest = browser_digest
-
-            self._set_phase(job, "smoke_test", 88, "正在做 Python / Node / Browser 冒烟检查…")
-            smoke_error = self._smoke_test(digest)
+            self._set_phase(
+                job, "smoke_test", 85, "正在做 Python / Node / ffmpeg / Browser 冒烟检查…"
+            )
+            smoke_error = self._smoke_test(digest, settings)
             if smoke_error:
                 self._fail(job, "smoke_failed", smoke_error)
                 return
-            browser_smoke_error = self._browser_smoke_test(browser_digest)
-            if browser_smoke_error:
-                self._fail(job, "browser_smoke_failed", browser_smoke_error)
-                return
-            # Publish both digests atomically only after both images pass smoke.
+            # Publish the digest only after smoke passes.  browser_image_digest
+            # mirrors the unified digest for configuration compatibility.
             self._set_phase(job, "persist_runtime", 97, "正在保存运行时配置…")
             try:
                 save_runtime_config(
@@ -391,13 +360,13 @@ class SandboxBootstrapService:
                     source="bootstrap_build",
                     builder_user_id=job.actor_id,
                     tag=DEFAULT_TAG,
-                    browser_image_digest=browser_digest,
+                    browser_image_digest=digest,
                 )
             except Exception as exc:
                 self._fail(job, "persist_failed", f"Failed to persist runtime config: {exc}")
                 return
 
-            self._succeed(job, digest, browser_digest)
+            self._succeed(job, digest, digest)
         except Exception as exc:  # pragma: no cover - defensive
             self._fail(job, "bootstrap_internal_error", str(exc)[:300])
 
@@ -439,32 +408,68 @@ class SandboxBootstrapService:
         finally:
             client.close()
 
-    def _smoke_test(self, image_digest: str) -> str | None:
+    def _smoke_test(self, image_digest: str, settings: Settings) -> str | None:
+        """Exercise the unified image under the exact production hardening.
+
+        The container options mirror ``DockerSandboxBackend.create`` (seccomp
+        allowlist, noexec /tmp, shm 1g, production memory/pids limits) so a
+        passing smoke actually predicts a working session runtime.
+        """
+
         client = self._docker_client()
         name = f"{SMOKE_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
         container = None
         try:
             container = client.containers.create(
                 image_digest,
-                command=["sleep", "30"],
+                command=["sleep", "120"],
                 name=name,
                 network_mode="none",
                 read_only=True,
                 user="65532:65532",
                 cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                mem_limit="128m",
-                pids_limit=32,
+                security_opt=sandbox_seccomp_security_options(),
+                mem_limit=settings.sandbox_memory_bytes,
+                memswap_limit=settings.sandbox_memory_swap_bytes,
+                pids_limit=settings.sandbox_pids_max,
+                shm_size="1g",
+                tmpfs={"/tmp": "rw,noexec,nosuid,nodev,size=67108864,mode=1777"},
                 labels={"com.learngraph.sandbox": "smoke"},
             )
             container.start()
-            for argv, label in (
+            # playwright-core is a global CJS module (NODE_PATH); the vite
+            # toolchain is ESM and must resolve via /node_modules from cwd.
+            toolchain_check = (
+                "require('playwright-core'); "
+                "Promise.all(['vite','vue','react','react-dom',"
+                "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']"
+                ".map((m) => import(m)))"
+                ".then(() => process.exit(0))"
+                ".catch((e) => { console.error(e); process.exit(1); })"
+            )
+            checks: tuple[tuple[list[str], str], ...] = (
                 (["python", "--version"], "python"),
                 (["node", "--version"], "node"),
-            ):
-                result = container.exec_run(argv, user="65532:65532")
+                (["ffmpeg", "-version"], "ffmpeg"),
+                (
+                    [
+                        "python",
+                        "-c",
+                        "import mammoth, pypdf, openpyxl, PIL, pydub, learngraph_tasks",
+                    ],
+                    "python-task-libs",
+                ),
+                (["node", "-e", toolchain_check], "node-toolchain"),
+                (["node", "/opt/learngraph/browser-smoke.js"], "browser"),
+            )
+            for argv, label in checks:
+                result = container.exec_run(
+                    argv,
+                    user="65532:65532",
+                    environment={"HOME": "/tmp"},
+                )
                 if int(result.exit_code) != 0:
-                    out = (result.output or b"").decode("utf-8", errors="replace")[:200]
+                    out = (result.output or b"").decode("utf-8", errors="replace")[:500]
                     return f"Smoke check failed for {label}: {out or 'non-zero exit'}"
             return None
         except Exception as exc:
@@ -479,44 +484,6 @@ class SandboxBootstrapService:
                 client.close()
             except Exception:
                 pass
-
-    def _browser_smoke_test(self, image_digest: str) -> str | None:
-        client = self._docker_client()
-        container = None
-        try:
-            container = client.containers.create(
-                image_digest,
-                command=["sleep", "30"],
-                network_mode="none",
-                read_only=True,
-                user="65532:65532",
-                cap_drop=["ALL"],
-                security_opt=chromium_seccomp_security_options(),
-                mem_limit="512m",
-                pids_limit=128,
-                shm_size="256m",
-                tmpfs={"/tmp": "rw,nosuid,nodev,size=134217728,mode=1777"},
-                labels={"com.learngraph.sandbox": "browser-smoke"},
-            )
-            container.start()
-            result = container.exec_run(
-                ["node", "/opt/learngraph/browser-smoke.js"],
-                user="65532:65532",
-                environment={"HOME": "/tmp", "NODE_PATH": "/usr/local/lib/node_modules"},
-            )
-            if int(result.exit_code) != 0:
-                out = (result.output or b"").decode("utf-8", errors="replace")[:500]
-                return f"Browser smoke check failed: {out or 'non-zero exit'}"
-            return None
-        except Exception as exc:
-            return f"Browser smoke test could not run: {exc}"
-        finally:
-            if container is not None:
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
-            client.close()
 
 
 _bootstrap_service: SandboxBootstrapService | None = None

@@ -4,6 +4,9 @@ from fastapi import APIRouter, status
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.domain.schemas.management import (
+    CodexDeviceLoginPollRequest,
+    CodexDeviceLoginPollView,
+    CodexDeviceLoginStartView,
     MasterKeyRotationView,
     ProviderCreateRequest,
     ProviderTypeCatalogView,
@@ -13,10 +16,18 @@ from app.domain.schemas.management import (
     ProviderView,
     ProviderModelCapabilityUpdateRequest,
     ProviderModelCapabilityView,
+    ProviderModelCatalogSyncRequest,
+    ProviderModelCatalogSyncView,
     ProviderModelStateUpdateRequest,
     ProviderModelStateView,
     ProviderModelStatesUpdateRequest,
     ProviderModelStatesView,
+    ProviderBalanceQueryConfigUpdateRequest,
+    ProviderBalanceQueryConfigView,
+    ProviderBalanceQueryExecuteRequest,
+    ProviderBalanceQueryExecuteView,
+    ProviderBalanceQueryResultRequest,
+    ProviderBalanceQueryResultView,
     ProviderBalanceView,
     SecretStoreStatusView,
 )
@@ -73,6 +84,20 @@ def secret_store_status(
     )
 
 
+@router.get("/model-defaults/{model_id:path}")
+def model_defaults(
+    model_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    provider_type: str | None = None,
+) -> dict:
+    return service(db, context, settings).default_model_capabilities(
+        model_id,
+        provider_type=provider_type,
+    )
+
+
 @router.post("/secret-store/rotate-master-key", response_model=MasterKeyRotationView)
 def rotate_master_key(
     db: DB, context: CurrentWorkspace, settings: AppSettings
@@ -100,6 +125,44 @@ def discover_models(provider_id: str, db: DB, context: CurrentWorkspace, setting
     return service(db, context, settings).models(provider_id)
 
 
+@router.post("/codex/device-login", response_model=CodexDeviceLoginStartView)
+def start_codex_device_login(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> CodexDeviceLoginStartView:
+    if "workspace.manage" not in context.permissions:
+        raise AppError(
+            403,
+            "permission_denied",
+            "Permission 'workspace.manage' is required to sign in to Codex",
+        )
+    return CodexDeviceLoginStartView.model_validate(
+        service(db, context, settings).codex_device_login_start()
+    )
+
+
+@router.post("/codex/device-login/poll", response_model=CodexDeviceLoginPollView)
+def poll_codex_device_login(
+    payload: CodexDeviceLoginPollRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> CodexDeviceLoginPollView:
+    if "workspace.manage" not in context.permissions:
+        raise AppError(
+            403,
+            "permission_denied",
+            "Permission 'workspace.manage' is required to sign in to Codex",
+        )
+    return CodexDeviceLoginPollView.model_validate(
+        service(db, context, settings).codex_device_login_poll(
+            device_auth_id=payload.device_auth_id,
+            user_code=payload.user_code,
+        )
+    )
+
+
 @router.get("/{provider_id}/balance", response_model=ProviderBalanceView)
 def get_provider_balance(
     provider_id: str,
@@ -115,6 +178,123 @@ def get_provider_balance(
         )
     return ProviderBalanceView.model_validate(
         service(db, context, settings).balance(provider_id)
+    )
+
+
+def _require_balance_permission(context: CurrentWorkspace) -> None:
+    if "workspace.manage" not in context.permissions:
+        raise AppError(
+            403,
+            "permission_denied",
+            "Permission 'workspace.manage' is required to query an account balance",
+        )
+
+
+@router.get(
+    "/{provider_id}/balance-query",
+    response_model=ProviderBalanceQueryConfigView,
+)
+def get_provider_balance_query_config(
+    provider_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderBalanceQueryConfigView:
+    _require_balance_permission(context)
+    return ProviderBalanceQueryConfigView.model_validate(
+        service(db, context, settings).balance_query_config(provider_id)
+    )
+
+
+@router.put(
+    "/{provider_id}/balance-query",
+    response_model=ProviderBalanceQueryConfigView,
+)
+def update_provider_balance_query_config(
+    provider_id: str,
+    payload: ProviderBalanceQueryConfigUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderBalanceQueryConfigView:
+    _require_balance_permission(context)
+    return ProviderBalanceQueryConfigView.model_validate(
+        service(db, context, settings).update_balance_query_config(
+            provider_id, payload.config
+        )
+    )
+
+
+@router.post(
+    "/{provider_id}/balance-query/execute",
+    response_model=ProviderBalanceQueryExecuteView,
+)
+def execute_provider_balance_query(
+    provider_id: str,
+    payload: ProviderBalanceQueryExecuteRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderBalanceQueryExecuteView:
+    _require_balance_permission(context)
+    return ProviderBalanceQueryExecuteView.model_validate(
+        service(db, context, settings).execute_balance_query(provider_id, payload)
+    )
+
+
+@router.put(
+    "/{provider_id}/balance-query/result",
+    response_model=ProviderBalanceQueryResultView,
+)
+def save_provider_balance_query_result(
+    provider_id: str,
+    payload: ProviderBalanceQueryResultRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderBalanceQueryResultView:
+    _require_balance_permission(context)
+    return ProviderBalanceQueryResultView.model_validate(
+        service(db, context, settings).save_balance_query_result(
+            provider_id, payload
+        )
+    )
+
+
+@router.get(
+    "/{provider_id}/model-capabilities",
+    response_model=ProviderModelCapabilityView,
+)
+def get_model_capabilities_by_query(
+    provider_id: str,
+    model_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderModelCapabilityView:
+    """Read capabilities without placing slash-bearing model IDs in the URL path."""
+    return ProviderModelCapabilityView.model_validate(
+        service(db, context, settings).model_capabilities(provider_id, model_id)
+    )
+
+
+@router.put(
+    "/{provider_id}/model-capabilities",
+    response_model=ProviderModelCapabilityView,
+)
+def update_model_capabilities_by_query(
+    provider_id: str,
+    model_id: str,
+    payload: ProviderModelCapabilityUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderModelCapabilityView:
+    """Update capabilities without placing slash-bearing model IDs in the URL path."""
+    return ProviderModelCapabilityView.model_validate(
+        service(db, context, settings).update_model_capabilities(
+            provider_id, model_id, payload
+        )
     )
 
 
@@ -167,6 +347,24 @@ def update_model_group_capabilities(
     return ProviderModelCapabilityView.model_validate(
         service(db, context, settings).update_model_group_capabilities(
             provider_id, payload
+        )
+    )
+
+
+@router.post(
+    "/{provider_id}/models/sync-catalog-defaults",
+    response_model=ProviderModelCatalogSyncView,
+)
+def sync_model_catalog_defaults(
+    provider_id: str,
+    payload: ProviderModelCatalogSyncRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderModelCatalogSyncView:
+    return ProviderModelCatalogSyncView.model_validate(
+        service(db, context, settings).sync_model_catalog_defaults(
+            provider_id, payload.model_ids
         )
     )
 

@@ -2,28 +2,36 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Query, Response, status
 
 from app.api.deps import CurrentWorkspace, DB
 from app.domain.schemas.management import (
+    AlertEmailConfigUpdateRequest,
+    AlertEmailConfigView,
+    AlertEmailTestResult,
     BudgetAlertView,
     BudgetPolicyCreateRequest,
     BudgetPolicyUpdateRequest,
     BudgetPolicyView,
     BudgetStatusView,
-    ExchangeRateCreateRequest,
-    ExchangeRateVersionView,
-    PriceVersionCreateRequest,
-    PriceCatalogApplyRequest,
+    ExchangeRateInfo,
+    ExchangeRateSetRequest,
+    ManualPriceUpsertRequest,
+    ManualPriceView,
+    ModelsDevSnapshotStatus,
     PriceCatalogItem,
-    PriceVersionView,
     UsageEventView,
     UsageSummary,
-    VersionRetireRequest,
 )
+from app.providers.models_dev import (
+    pricing_entries,
+    refresh_snapshot,
+    snapshot_status,
+)
+from app.services import alert_email
 from app.services.billing import BillingService
 from app.services.management import UsageService
-from app.services.pricing_catalog import PRICING_CATALOG, get_catalog_entry
+from app.services.pricing_catalog import PRICING_CATALOG
 from app.core.errors import AppError
 
 
@@ -89,156 +97,129 @@ def clear_usage_events(
     )
 
 
-@router.get("/prices", response_model=list[PriceVersionView])
-def list_prices(db: DB, context: CurrentWorkspace) -> list[PriceVersionView]:
-    return [
-        PriceVersionView.model_validate(item)
-        for item in billing_service(db, context).list_prices()
-    ]
-
-
 @router.get("/price-catalog", response_model=list[PriceCatalogItem])
 def list_price_catalog(db: DB, context: CurrentWorkspace) -> list[PriceCatalogItem]:
     del db, context
-    return [PriceCatalogItem.model_validate(item) for item in PRICING_CATALOG]
-
-
-@router.post("/price-catalog/apply", response_model=PriceVersionView, status_code=status.HTTP_201_CREATED)
-def apply_price_catalog(payload: PriceCatalogApplyRequest, db: DB, context: CurrentWorkspace) -> PriceVersionView:
-    item = get_catalog_entry(payload.catalog_id)
-    if item is None:
-        raise AppError(404, "price_catalog_item_not_found", "Price catalog item not found")
-    service = billing_service(db, context)
-    provider_id = payload.provider_id
-    if provider_id is None:
-        matching_provider_ids = service.provider_ids_for_catalog_key(
-            str(item["provider_key"])
-        )
-        if len(matching_provider_ids) != 1:
-            raise AppError(
-                409,
-                "provider_instance_required",
-                "Select exactly one configured Provider instance before importing this catalog price",
-                {
-                    "provider_key": item["provider_key"],
-                    "matching_provider_ids": matching_provider_ids,
-                },
-            )
-        provider_id = matching_provider_ids[0]
-
-    def selected(name: str) -> float | None:
-        override = getattr(payload, name)
-        return override if override is not None else item[name]
-    currency = str(item["currency"])
-    price = service.create_price(
-        provider_id=provider_id,
-        model_id=item["model_id"],
-        feature=payload.feature,
-        input_usd_per_million=selected("input_usd_per_million") or 0,
-        cached_input_usd_per_million=selected("cached_input_usd_per_million"),
-        cache_write_usd_per_million=selected("cache_write_usd_per_million"),
-        output_usd_per_million=selected("output_usd_per_million") or 0,
-        fixed_usd_per_call=0,
-        effective_at=None,
-        source=f"official_catalog:{item['source_url']}",
-        conditions=item["conditions"],
-        currency=currency,
-        input_cny_per_million=(
-            float(item["native_input_per_million"])
-            if currency == "CNY"
-            else None
-        ),
-        cached_input_cny_per_million=(
-            float(item["native_cached_input_per_million"])
-            if currency == "CNY" and item["native_cached_input_per_million"] is not None
-            else None
-        ),
-        cache_write_cny_per_million=(
-            float(item["native_cache_write_per_million"])
-            if currency == "CNY" and item["native_cache_write_per_million"] is not None
-            else None
-        ),
-        output_cny_per_million=(
-            float(item["native_output_per_million"])
-            if currency == "CNY"
-            else None
-        ),
-    )
-    return PriceVersionView.model_validate(price)
-
-
-@router.post(
-    "/prices",
-    response_model=PriceVersionView,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_price(
-    payload: PriceVersionCreateRequest,
-    db: DB,
-    context: CurrentWorkspace,
-) -> PriceVersionView:
-    return PriceVersionView.model_validate(
-        billing_service(db, context).create_price(**payload.model_dump())
-    )
-
-
-@router.post("/prices/{price_id}/retire", response_model=PriceVersionView)
-def retire_price(
-    price_id: str,
-    payload: VersionRetireRequest,
-    db: DB,
-    context: CurrentWorkspace,
-) -> PriceVersionView:
-    return PriceVersionView.model_validate(
-        billing_service(db, context).retire_price(
-            price_id,
-            retired_at=payload.retired_at,
-        )
-    )
-
-
-@router.get("/exchange-rates", response_model=list[ExchangeRateVersionView])
-def list_exchange_rates(
-    db: DB,
-    context: CurrentWorkspace,
-) -> list[ExchangeRateVersionView]:
     return [
-        ExchangeRateVersionView.model_validate(item)
-        for item in billing_service(db, context).list_exchange_rates()
+        PriceCatalogItem.model_validate({**item, "source": "builtin"})
+        for item in PRICING_CATALOG
+    ] + [PriceCatalogItem.model_validate(item) for item in pricing_entries()]
+
+
+@router.get("/models-dev", response_model=ModelsDevSnapshotStatus)
+def models_dev_status(db: DB, context: CurrentWorkspace) -> ModelsDevSnapshotStatus:
+    del db, context
+    return ModelsDevSnapshotStatus.model_validate(snapshot_status())
+
+
+@router.post("/models-dev/refresh", response_model=ModelsDevSnapshotStatus)
+def models_dev_refresh(db: DB, context: CurrentWorkspace) -> ModelsDevSnapshotStatus:
+    del db, context
+    try:
+        return ModelsDevSnapshotStatus.model_validate(refresh_snapshot())
+    except Exception as exc:  # noqa: BLE001 - network and payload faults alike
+        raise AppError(
+            502,
+            "models_dev_refresh_failed",
+            f"Refreshing tariffs from models.dev failed: {exc}",
+        ) from exc
+
+
+@router.get("/manual-prices", response_model=list[ManualPriceView])
+def list_manual_prices(db: DB, context: CurrentWorkspace) -> list[ManualPriceView]:
+    return [
+        ManualPriceView.model_validate(item)
+        for item in billing_service(db, context).list_manual_prices()
     ]
 
 
-@router.post(
-    "/exchange-rates",
-    response_model=ExchangeRateVersionView,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_exchange_rate(
-    payload: ExchangeRateCreateRequest,
+@router.put("/manual-prices", response_model=ManualPriceView)
+def upsert_manual_price(
+    payload: ManualPriceUpsertRequest,
     db: DB,
     context: CurrentWorkspace,
-) -> ExchangeRateVersionView:
-    return ExchangeRateVersionView.model_validate(
-        billing_service(db, context).create_exchange_rate(**payload.model_dump())
+) -> ManualPriceView:
+    return ManualPriceView.model_validate(
+        billing_service(db, context).upsert_manual_price(**payload.model_dump())
     )
 
 
-@router.post(
-    "/exchange-rates/{rate_id}/retire",
-    response_model=ExchangeRateVersionView,
-)
-def retire_exchange_rate(
-    rate_id: str,
-    payload: VersionRetireRequest,
+@router.delete("/manual-prices")
+def remove_manual_price(
     db: DB,
     context: CurrentWorkspace,
-) -> ExchangeRateVersionView:
-    return ExchangeRateVersionView.model_validate(
-        billing_service(db, context).retire_exchange_rate(
-            rate_id,
-            retired_at=payload.retired_at,
+    model_id: str = Query(min_length=1, max_length=160),
+) -> dict[str, int]:
+    return {
+        "removed_count": billing_service(db, context).remove_manual_price(model_id)
+    }
+
+
+@router.get("/exchange-rate", response_model=ExchangeRateInfo)
+def current_exchange_rate(db: DB, context: CurrentWorkspace) -> ExchangeRateInfo:
+    return ExchangeRateInfo.model_validate(
+        billing_service(db, context).current_exchange_rate(),
+        from_attributes=True,
+    )
+
+
+@router.put("/exchange-rate", response_model=ExchangeRateInfo)
+def set_exchange_rate(
+    payload: ExchangeRateSetRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ExchangeRateInfo:
+    return ExchangeRateInfo.model_validate(
+        billing_service(db, context).set_exchange_rate(payload.rate),
+        from_attributes=True,
+    )
+
+
+@router.post("/exchange-rate/refresh", response_model=ExchangeRateInfo)
+def refresh_exchange_rate(db: DB, context: CurrentWorkspace) -> ExchangeRateInfo:
+    return ExchangeRateInfo.model_validate(
+        billing_service(db, context).refresh_exchange_rate_from_network(),
+        from_attributes=True,
+    )
+
+
+@router.get("/alert-email", response_model=AlertEmailConfigView)
+def get_alert_email_config(db: DB, context: CurrentWorkspace) -> AlertEmailConfigView:
+    return AlertEmailConfigView.model_validate(
+        alert_email.load_config(db, context.workspace_id).view()
+    )
+
+
+@router.put("/alert-email", response_model=AlertEmailConfigView)
+def update_alert_email_config(
+    payload: AlertEmailConfigUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> AlertEmailConfigView:
+    return AlertEmailConfigView.model_validate(
+        alert_email.save_config(
+            db,
+            context.workspace_id,
+            context.principal.user_id,
+            **payload.model_dump(),
+        ).view()
+    )
+
+
+@router.post("/alert-email/test", response_model=AlertEmailTestResult)
+def send_test_alert_email(db: DB, context: CurrentWorkspace) -> AlertEmailTestResult:
+    config = alert_email.load_config(db, context.workspace_id)
+    try:
+        alert_email.send_mail(
+            config,
+            "[LearnGraph] 预算告警测试邮件",
+            "这是一封来自 LearnGraph 用量预算模块的测试邮件；收到即表示 SMTP 配置可用。",
         )
-    )
+    except AppError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report SMTP faults verbatim
+        return AlertEmailTestResult(ok=False, detail=str(exc))
+    return AlertEmailTestResult(ok=True, detail="测试邮件已发送")
 
 
 @router.get("/budget-policies", response_model=list[BudgetPolicyView])

@@ -215,6 +215,7 @@ def _ensure_sqlite_skill_package_columns() -> None:
         "origin_hash": "VARCHAR(64) DEFAULT ''",
         "has_scripts": "BOOLEAN DEFAULT 0",
         "locale_source": "VARCHAR(32) DEFAULT ''",
+        "is_official": "BOOLEAN DEFAULT 0",
     }
     with engine.begin() as connection:
         existing = {
@@ -319,6 +320,9 @@ def _apply_sqlite_additive_migrations() -> None:
         },
         "mastery_message_activities": {
             "activity_version": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "context_summaries": {
+            "kind": "VARCHAR(24) NOT NULL DEFAULT 'mechanical'",
         },
         "memory_records": {
             "session_id": "VARCHAR(36)",

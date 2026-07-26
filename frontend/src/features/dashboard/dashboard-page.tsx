@@ -2,12 +2,10 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRight,
-  CalendarDays,
   Check,
   ClipboardCheck,
   Clock3,
   ListTodo,
-  MessageSquareText,
   Network,
   Plus,
   Sparkles,
@@ -24,6 +22,7 @@ import {
   updateAction,
 } from "@/api";
 import { MessageResponse } from "@/components/ai-elements/message";
+import { ActivityHeatmap } from "@/components/shared/activity-heatmap";
 import {
   ErrorState,
   LoadingState,
@@ -35,6 +34,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { cn } from "@/lib/utils";
 
 const SUMMARY_CHARACTER_LIMIT = 100;
 
@@ -217,8 +217,36 @@ export function DashboardPage() {
         title="继续你的学习计划"
       />
 
+      <Surface aria-label="工作区概览" className="grid overflow-hidden sm:grid-cols-3">
+        {overview.map((item, index) => {
+          const Icon = item.icon;
+          return (
+            <div
+              className={cn(
+                "flex items-center gap-3 px-5 py-4",
+                index > 0 && "border-t sm:border-l sm:border-t-0",
+              )}
+              key={item.key}
+            >
+              <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted">
+                <Icon className={`size-4 ${item.iconClass}`} />
+              </span>
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-muted-foreground">{item.label}</p>
+                <p className="mt-0.5 text-xl font-semibold tabular-nums">
+                  {item.value}
+                  <span className="ml-2 text-xs font-normal text-muted-foreground">
+                    {item.hint}
+                  </span>
+                </p>
+              </div>
+            </div>
+          );
+        })}
+      </Surface>
+
       <div className="grid items-stretch gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(280px,.55fr)]">
-        <Surface className="flex min-h-64 flex-col p-5 sm:p-6">
+        <Surface className="flex flex-col p-5 sm:p-6">
           <SectionHeading
             description="来自已发布路线和手工待办"
             title="下一步行动"
@@ -274,7 +302,7 @@ export function DashboardPage() {
               ) : null}
             </div>
           ) : (
-            <div className="grid flex-1 place-items-center py-8 text-center">
+            <div className="grid flex-1 place-items-center py-6 text-center">
               <div>
                 <Check className="mx-auto size-6 text-muted-foreground" />
                 <p className="mt-2 text-sm font-medium">当前没有待处理行动</p>
@@ -309,16 +337,8 @@ export function DashboardPage() {
           </form>
         </Surface>
 
-        <Surface className="p-5">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <CalendarDays className="size-4 text-primary" />
-              <div>
-                <h2 className="text-base font-semibold">今日活动</h2>
-                <p className="text-xs text-muted-foreground">{todayLabel}</p>
-              </div>
-            </div>
-          </div>
+        <Surface className="flex flex-col p-5 sm:p-6">
+          <SectionHeading description={todayLabel} title="今日活动" />
           {todayActivities.length ? (
             <ul className="mt-4 divide-y">
               {todayActivities.map((activity) => (
@@ -336,41 +356,22 @@ export function DashboardPage() {
         </Surface>
       </div>
 
-      <section aria-label="工作区概览" className="grid gap-3 sm:grid-cols-3">
-        {overview.map((item) => {
-          const Icon = item.icon;
-          return (
-            <div className="rounded-lg border bg-card p-4" key={item.key}>
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-xs font-medium text-muted-foreground">{item.label}</p>
-                  <p className="mt-1 text-2xl font-semibold tabular-nums">{item.value}</p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">{item.hint}</p>
-                </div>
-                <span className="grid size-9 place-items-center rounded-lg bg-muted">
-                  <Icon className={`size-4 ${item.iconClass}`} />
-                </span>
-              </div>
-            </div>
-          );
-        })}
-      </section>
+      <Surface aria-label="学习活动热力图" className="p-5 sm:p-6">
+        <ActivityHeatmap variant="panel" />
+      </Surface>
 
       <Surface className="p-5 sm:p-6">
-        <div className="flex items-start gap-3">
-          <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-muted text-foreground">
-            <MessageSquareText className="size-5" />
-          </span>
-          <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
             <p className="text-xs font-medium text-muted-foreground">
-              学习助手正在延续你的上下文
+              最近会话 · 学习助手正在延续你的上下文
             </p>
             <h2 className="mt-1 truncate text-base font-semibold">
               {recentSession?.title ?? "还没有学习会话"}
             </h2>
           </div>
           {recentSession ? (
-            <Button asChild size="sm" variant="ghost">
+            <Button asChild className="shrink-0" size="sm" variant="outline">
               <Link to={`${base}/chat/${recentSession.id}`}>
                 打开会话
                 <ArrowRight className="size-4" />

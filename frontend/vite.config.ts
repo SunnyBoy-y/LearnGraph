@@ -3,9 +3,24 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 
+// The dev server proxies /api to the backend so the browser always issues
+// same-origin requests, no matter which port Vite ends up binding (5173,
+// 5174, ...). CORS therefore never applies during development.
+const backendOrigin = process.env.LEARNGRAPH_BACKEND_ORIGIN?.trim() || 'http://127.0.0.1:8000'
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    proxy: {
+      '/api': {
+        target: backendOrigin,
+        changeOrigin: true,
+        // Realtime dictation runs over a same-origin WebSocket.
+        ws: true,
+      },
+    },
+  },
   build: {
     // The remaining >500 kB files are isolated Shiki language/WASM payloads
     // loaded on demand. Application entry and route chunks stay well below

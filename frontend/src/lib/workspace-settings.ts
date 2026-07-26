@@ -4,6 +4,10 @@ export const CHAT_SUGGESTED_PROMPTS_SETTING_KEY = "chat.suggested_prompts";
 export const CHAT_AUTO_TITLE_MODEL_SETTING_KEY = "chat.auto_title_model";
 export const CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY =
   "chat.suggested_prompts_model";
+export const CHAT_DICTATION_CLEANUP_SETTING_KEY = "chat.dictation_cleanup";
+export const CHAT_CONTEXT_USAGE_SETTING_KEY = "chat.context_usage";
+export const CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY =
+  "chat.dictation_cleanup_model";
 export { CHAT_RESPONSE_STYLE_SETTING_KEY } from "@/lib/response-style";
 
 export type ChatFeatureModelSetting = {
@@ -20,6 +24,29 @@ export function areChatSuggestedPromptsEnabled(
 
   if (!value || typeof value !== "object" || !("enabled" in value)) return true;
   return value.enabled !== false;
+}
+
+export function isChatContextUsageEnabled(
+  settings: WorkspaceSetting[] | undefined,
+): boolean {
+  const value = settings?.find(
+    (setting) => setting.key === CHAT_CONTEXT_USAGE_SETTING_KEY,
+  )?.value;
+
+  if (!value || typeof value !== "object" || !("enabled" in value)) return true;
+  return value.enabled !== false;
+}
+
+export function isChatDictationCleanupEnabled(
+  settings: WorkspaceSetting[] | undefined,
+): boolean {
+  const value = settings?.find(
+    (setting) => setting.key === CHAT_DICTATION_CLEANUP_SETTING_KEY,
+  )?.value;
+
+  // 每个语音片段都会产生一次计费调用,未配置时默认关闭。
+  if (!value || typeof value !== "object" || !("enabled" in value)) return false;
+  return value.enabled === true;
 }
 
 export function readChatFeatureModelSetting(

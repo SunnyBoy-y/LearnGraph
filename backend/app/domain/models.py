@@ -497,6 +497,10 @@ class ContextSummary(Base, TimestampMixin, WorkspaceScopedMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
     version: Mapped[int] = mapped_column(Integer)
+    # 'mechanical'      — truncated concatenation written inline by chat compaction
+    # 'model'           — background LLM rolling summary (memory_enhancement)
+    # 'model_composite' — chat compaction that reused a model summary prefix
+    kind: Mapped[str] = mapped_column(String(24), default="mechanical", index=True)
     source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     source_hash: Mapped[str] = mapped_column(String(64))
     summary: Mapped[str] = mapped_column(Text)
@@ -1287,6 +1291,49 @@ class MemoryDeletionRecovery(Base, TimestampMixin, WorkspaceScopedMixin):
     destroyed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class MemoryEmbedding(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Cached embedding vector for one memory under one embedding model.
+
+    A projection, not a fact source: rows are rebuilt lazily whenever the
+    memory content hash or the configured embedding model changes. Recall
+    works without any row here (heuristic scoring only).
+    """
+
+    __tablename__ = "memory_embeddings"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "memory_id", "model_key", name="uq_memory_embedding_model"
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    memory_id: Mapped[str] = mapped_column(String(64), index=True)
+    model_key: Mapped[str] = mapped_column(String(200), index=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    dim: Mapped[int] = mapped_column(Integer, default=0)
+    vector: Mapped[list[float]] = mapped_column(JSON, default=list)
+
+
+class MemoryExtractionState(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Per-session cursor for background memory extraction sweeps."""
+
+    __tablename__ = "memory_extraction_states"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "session_id", name="uq_memory_extraction_session"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    last_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_status: Mapped[str] = mapped_column(String(40), default="never_run")
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    extracted_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ProviderConfig(Base, TimestampMixin, WorkspaceScopedMixin):

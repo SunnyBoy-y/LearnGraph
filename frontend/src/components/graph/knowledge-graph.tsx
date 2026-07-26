@@ -51,7 +51,6 @@ import {
   type TreeNodeKind,
 } from "./knowledge-graph-layout";
 import { NodeExploreChip, RecommendDots } from "./node-explore";
-import { importanceStars } from "./node-metrics";
 
 export type KnowledgeNodeData = {
   label: string;
@@ -105,6 +104,7 @@ export interface KnowledgeGraphProps {
     nodes: Array<KnowledgeNodeData & { id: string }>,
   ) => void;
   onStudy?: (node: KnowledgeNodeData & { id: string }) => void;
+  onOpenExplore?: (node: KnowledgeNodeData & { id: string }) => void;
   studyOnSelect?: boolean;
   selectedId?: string;
   selectedIds?: string[];
@@ -127,7 +127,7 @@ const knowledgeStateLabels: Record<string, string> = {
   due_soon: "即将复习",
   due: "待复习",
   relearning: "重新学习",
-  unverified: "未验证",
+  unverified: "未学习",
   none: "暂无证据",
   single: "单条证据",
   multi: "多条证据",
@@ -137,6 +137,19 @@ const knowledgeStateLabels: Record<string, string> = {
   interest_only: "仅兴趣记录",
   mastered: "已掌握",
 };
+
+/**
+ * The green stars are the learner-facing progression, independent of the
+ * review scheduler's internal retrieval state. A first learning interaction
+ * earns the first star; only a full five-star progression is stable mastery.
+ */
+function masteryProgressLabel(stars: number | undefined, state?: string) {
+  if (state === "relearning" || state === "due" || state === "due_soon") {
+    return knowledgeStateLabel(state, "unverified");
+  }
+  const level = Math.max(0, Math.min(5, Math.round(Number(stars) || 0)));
+  return ["未学习", "已学习", "初步理解", "能够应用", "熟练掌握", "掌握稳定"][level];
+}
 
 function knowledgeStateLabel(value: string | undefined, fallback: string) {
   const state = value ?? fallback;
@@ -175,12 +188,7 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
       : kind === "branch-left"
         ? Position.Right
         : Position.Left;
-  const sourcePosition =
-    kind === "root" || kind === "main"
-      ? Position.Top
-      : kind === "branch-left"
-        ? Position.Left
-        : Position.Right;
+  const masteredByProgress = Math.max(0, Number(data.stars) || 0) >= 5;
 
   const handleCollapse = (event: ReactMouseEvent) => {
     event.stopPropagation();
@@ -197,7 +205,7 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
         isRoot && "is-root",
         data.rootEmphasis && "is-root-emphasis",
         Boolean(data.focused) && "is-focused",
-        Boolean(data.mastered) && "is-mastered",
+        masteredByProgress && "is-mastered",
         tree && "is-tree-card",
         tree && kind === "main" && "is-tree-main",
         tree && kind === "branch-left" && "is-tree-branch-left",
@@ -254,20 +262,13 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
             className={cn(
               "knowledge-node__status-chip",
               data.state?.includes("due") && "is-due",
-              data.mastered && "is-mastered",
+              masteredByProgress && "is-mastered",
             )}
           >
-            {data.mastered
-              ? "已掌握"
-              : knowledgeStateLabel(data.state, "fresh")}
+            {masteryProgressLabel(data.stars, data.state)}
           </span>
           {typeof data.targetWeight === "number" ? (
             <span className="knowledge-node__importance">
-              <StarRating
-                max={3}
-                tone="importance"
-                value={importanceStars(data.targetWeight)}
-              />
               <RecommendDots weight={data.targetWeight} />
             </span>
           ) : null}
@@ -283,16 +284,19 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
               count={Number(data.exploreCount ?? 0)}
               onOpen={() => data.onOpenExplore?.(id)}
             />
-            {typeof data.stars === "number" && data.stars > 0 ? (
+            {typeof data.stars === "number" ? (
               <span className="knowledge-node__stars-inline">
-                <StarRating value={data.stars} />
+                <StarRating
+                  label={`${masteryProgressLabel(data.stars, data.state)}：${Math.max(0, Math.min(5, Math.round(data.stars)))}/5 成长星`}
+                  value={data.stars}
+                />
               </span>
             ) : null}
           </div>
         ) : (
           <small>
             {data.focused ? "重点关注 · " : ""}
-            {knowledgeStateLabel(data.state, "fresh")} ·{" "}
+            {masteryProgressLabel(data.stars, data.state)} ·{" "}
             {knowledgeStateLabel(data.evidence, "unverified")}
           </small>
         )
@@ -321,7 +325,8 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
       ) : null}
       <Handle
         className="!size-1 !border-0 !bg-transparent opacity-0"
-        position={sourcePosition}
+        position={Position.Top}
+        style={{ left: "50%", top: "50%", transform: "translate(-50%, -50%)" }}
         type="source"
       />
     </div>
@@ -396,6 +401,7 @@ export function KnowledgeGraph({
   onSelect,
   onSelectionChange,
   onStudy,
+  onOpenExplore,
   studyOnSelect = false,
   selectedId,
   selectedIds,
@@ -678,6 +684,11 @@ export function KnowledgeGraph({
             hasChildren,
             hiddenCount,
             onToggleCollapse: toggleCollapse,
+            onOpenExplore: (nodeId: string) => {
+              const selected = { ...node.data, id: nodeId };
+              if (onOpenExplore) onOpenExplore(selected);
+              else node.data.onOpenExplore?.(nodeId);
+            },
           },
           className: "graph-node-enter",
           selected: internalSelectedIds.includes(node.id),
@@ -711,6 +722,7 @@ export function KnowledgeGraph({
       structuredTree.depths,
       structuredTree.positions,
       toggleCollapse,
+      onOpenExplore,
       view,
       visibleCount,
       visibleSourceNodes,
@@ -755,29 +767,11 @@ export function KnowledgeGraph({
         ),
         animated: false,
       }));
-    const representedPairs = new Set(
-      treeEdges.map((edge) => `${edge.source}->${edge.target}`),
-    );
-    const semanticOverlays = edges
-      .filter(
-        (edge) =>
-          visibleIds.has(edge.source) &&
-          visibleIds.has(edge.target) &&
-          !representedPairs.has(`${edge.source}->${edge.target}`),
-      )
-      .map((edge) => ({
-        ...edge,
-        type: "knowledgeTree" as const,
-        data: {
-          ...edge.data,
-          spine: false,
-          active: focusId === edge.source || focusId === edge.target,
-        },
-        className: "knowledge-tree-edge is-semantic-overlay",
-        animated: false,
-      }));
-    return [...treeEdges, ...semanticOverlays];
-  }, [edges, focusId, structuredTree.edges, view, visibleIds]);
+    // The tree already communicates the learnable containment hierarchy.
+    // Rendering every additional semantic relation here made the canvas noisy
+    // and produced long, dashed lines with no clear action for the learner.
+    return treeEdges;
+  }, [structuredTree.edges, view, visibleIds]);
 
   // Initial / structure fit — skip while the user is mid-focus or collapsing.
   useEffect(() => {

@@ -74,7 +74,8 @@ WHITELIST_DOCUMENT_EXTENSIONS = BUILT_IN_DOCUMENT_EXTENSIONS | {".ppt", ".doc", 
 
 OPTIONAL_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff"}
 
-AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".webm", ".ogg", ".flac", ".aac", ".mp4"}
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".wmv"}
 
 # Explicitly never allowed in fast/thinking (even if somehow indexed).
 SPECIAL_BINARY_EXTENSIONS = {
@@ -115,6 +116,13 @@ def is_audio_attachment(file: FileRecord) -> bool:
     return file_extension(file.original_name) in AUDIO_EXTENSIONS
 
 
+def is_video_attachment(file: FileRecord) -> bool:
+    mime = (file.mime_type or "").casefold().split(";", 1)[0].strip()
+    if mime.startswith("video/"):
+        return True
+    return file_extension(file.original_name) in VIDEO_EXTENSIONS
+
+
 def is_special_binary_attachment(file: FileRecord) -> bool:
     return file_extension(file.original_name) in SPECIAL_BINARY_EXTENSIONS
 
@@ -122,7 +130,7 @@ def is_special_binary_attachment(file: FileRecord) -> bool:
 def is_fast_thinking_whitelist_document(file: FileRecord) -> bool:
     """True when the file is a common parseable document/text (not audio/image)."""
 
-    if is_image_attachment(file) or is_audio_attachment(file):
+    if is_image_attachment(file) or is_audio_attachment(file) or is_video_attachment(file):
         return False
     if is_special_binary_attachment(file):
         return False
@@ -146,6 +154,7 @@ def classify_non_agent_attachment(
 
     Classes:
     - image
+    - video
     - audio_ok / audio_needs_asr
     - document_ready / document_not_ready
     - unsupported
@@ -155,6 +164,8 @@ def classify_non_agent_attachment(
         return "unsupported"
     if is_image_attachment(file):
         return "image"
+    if is_video_attachment(file):
+        return "video"
     if is_audio_attachment(file):
         return "audio_ok" if asr_available else "audio_needs_asr"
     if not is_fast_thinking_whitelist_document(file):

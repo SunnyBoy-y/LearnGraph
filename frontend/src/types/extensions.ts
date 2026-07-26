@@ -132,6 +132,7 @@ export interface Skill {
   origin_hash?: string;
   has_scripts?: boolean;
   locale_source?: string;
+  is_official?: boolean;
   manifest_json: UnknownRecord;
   manifest_hash: string;
   instructions_markdown: string;
@@ -196,32 +197,6 @@ export interface SkillValidateResult {
   frontmatter: UnknownRecord;
 }
 
-export interface SkillSandboxRunRequest {
-  script_path: string;
-  chat_session_id?: string | null;
-  argv_extra?: string[];
-}
-
-export interface SkillSandboxRunResult {
-  status: string;
-  available: boolean;
-  skill_id: string;
-  script_path: string;
-  content_hash: string;
-  chat_session_id: string | null;
-  sandbox_session_id: string | null;
-  command_id: string | null;
-  argv_redacted: string[];
-  exit_code: number | null;
-  timed_out: boolean;
-  latency_ms: number;
-  stdout_summary: string;
-  stderr_summary: string;
-  error_code: string | null;
-  error_message: string | null;
-  invocation_id: string | null;
-}
-
 export interface SkillMarketCard {
   market_id: string;
   slug: string;
@@ -239,6 +214,7 @@ export interface SkillMarketCard {
   rank: number;
   file_count: number;
   has_scripts: boolean;
+  official?: boolean;
 }
 
 export interface SkillMarketList {
@@ -263,6 +239,21 @@ export interface SkillManualImport {
   source?: string;
   version?: string;
   files: SkillManualImportFile[];
+}
+
+export interface SkillNpxSkippedItem {
+  target: string;
+  reason: string;
+}
+
+export interface SkillNpxImportResult {
+  reference: string;
+  owner: string;
+  repo: string;
+  commit: string;
+  requested_skills: string[];
+  installed: Skill[];
+  skipped: SkillNpxSkippedItem[];
 }
 
 export interface SkillLocalProbePolicy {
@@ -307,6 +298,128 @@ export interface SkillTranslateResult {
   cached: boolean;
   translated_text: string;
   usage_event_id: string | null;
+}
+
+export interface ExternalCatalogSource {
+  id: string;
+  label: string;
+  kind: "skill" | "mcp";
+  enabled: boolean;
+  base_url: string;
+  auth_required: boolean;
+  notes: string;
+}
+
+export interface ExternalSkillSearchItem {
+  catalog: string;
+  external_id: string;
+  name: string;
+  description: string;
+  version: string;
+  owner: string;
+  homepage_url: string;
+  install_hint: string;
+  trust: UnknownRecord;
+}
+
+export interface ExternalSkillSearchResult {
+  catalog: string;
+  query: string;
+  items: ExternalSkillSearchItem[];
+}
+
+export interface McpRegistrySearchItem {
+  name: string;
+  title: string;
+  description: string;
+  version: string;
+  status: string;
+  repository_url: string;
+  website_url: string;
+  endpoint_url: string | null;
+  transport: string | null;
+  packages: string[];
+  env_hints: string[];
+  supported: boolean;
+  unsupported_reason: string;
+}
+
+export interface McpRegistrySearchResult {
+  registry_url: string;
+  query: string;
+  items: McpRegistrySearchItem[];
+  next_cursor: string | null;
+}
+
+export interface SkillGitHubCandidate {
+  path: string;
+  name: string;
+  description: string;
+  license: string;
+  allowed_tools: string;
+  file_count: number;
+  total_size_bytes: number;
+  has_scripts: boolean;
+  skipped_file_count: number;
+  required_permissions: string[];
+  scan_risk: string;
+  scan_finding_count: number;
+}
+
+export interface SkillSecurityFinding {
+  severity: string;
+  category: string;
+  path: string;
+  pattern: string;
+  explanation: string;
+  excerpt: string;
+}
+
+export interface SkillSecurityScanResult {
+  skill_id: string;
+  risk_level: string;
+  finding_count: number;
+  counts: Record<string, number>;
+  findings: SkillSecurityFinding[];
+  scanned_files: number;
+  content_hash: string;
+}
+
+export interface SkillSemanticReviewResult {
+  skill_id: string;
+  cached: boolean;
+  content_hash: string;
+  verdict: string;
+  risk_score: number;
+  reasons: string[];
+  summary: string;
+  model_id: string;
+}
+
+export interface SkillGitHubPreview {
+  owner: string;
+  repo: string;
+  ref: string;
+  commit: string;
+  tree_truncated: boolean;
+  candidates: SkillGitHubCandidate[];
+}
+
+export interface SkillGitHubInstallPayload {
+  reference: string;
+  path?: string;
+  commit?: string;
+  skill_key?: string;
+}
+
+export interface SkillUpdateCheck {
+  skill_id: string;
+  supported: boolean;
+  current_commit: string;
+  latest_commit: string;
+  update_available: boolean;
+  checked_ref: string;
+  message: string;
 }
 
 export interface ExtensionInvocation {

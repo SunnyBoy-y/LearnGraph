@@ -7,6 +7,9 @@ from app.domain.schemas.extensions import (
     BuiltinToolView,
     ExtensionInvocationView,
     ExtensionRevokeRequest,
+    ExternalCatalogSourceView,
+    ExternalSkillSearchResponse,
+    McpRegistrySearchResponse,
     MCPCapabilitySnapshotView,
     MCPInvokeRequest,
     MCPRefreshResponse,
@@ -20,30 +23,47 @@ from app.domain.schemas.extensions import (
     SkillFileTreeView,
     SkillFileWriteRequest,
     SkillFileWriteResponse,
+    SkillGitHubInstallRequest,
+    SkillGitHubPreviewRequest,
+    SkillGitHubPreviewResponse,
     SkillInvokeRequest,
     SkillLocalImportRequest,
     SkillLocalProbePolicyUpdate,
     SkillLocalProbePolicyView,
     SkillLocalProbeScanResponse,
+    SkillArchiveImportRequest,
     SkillManualImportRequest,
     SkillMarketInstallRequest,
     SkillMarketListResponse,
     SkillMkdirRequest,
+    SkillNpxImportRequest,
+    SkillNpxImportResponse,
     SkillPackageCreateRequest,
     SkillSandboxRunRequest,
     SkillSandboxRunResponse,
+    SkillSecurityScanResponse,
+    SkillSemanticReviewRequest,
+    SkillSemanticReviewResponse,
     SkillTranslateRequest,
     SkillTranslateResponse,
+    SkillUpdateCheckResponse,
     SkillUpdateRequest,
     SkillValidateResponse,
     SkillView,
     TransportCapabilityView,
 )
 from app.services.mcp_skills import MCPAndSkillService
+from app.services.skill_archive_import import SkillArchiveImportService
+from app.services.skill_catalog_sources import ExternalCatalogService
+from app.services.skill_github_import import SkillGitHubImportService
 from app.services.skill_local_probe import SkillLocalProbeService
 from app.services.skill_market import SkillMarketService
-from app.services.skill_package import SkillPackageService
+from app.services.skill_package import (
+    SkillPackageService,
+    ensure_official_skill_packages,
+)
 from app.services.skill_sandbox_run import SkillSandboxRunService
+from app.services.skill_semantic_review import SkillSemanticReviewService
 from app.services.skill_translation import SkillTranslationService
 
 
@@ -222,13 +242,39 @@ def revoke_mcp_server(
     return server_view(manager.revoke_server(server_id, payload.reason), manager)
 
 
+@router.delete(
+    "/mcp/servers/{server_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+def delete_mcp_server(
+    server_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    reason: str = Query(default="workspace_user_deleted", max_length=1000),
+) -> None:
+    """彻底删除 MCP Server（含凭据、能力快照与授权记录）；撤销仅停用。"""
+    context.require_permission("workspace.write")
+    service(db, context, settings).delete_server(server_id, reason)
+
+
 @router.get("/skills", response_model=list[SkillView])
 def list_skills(
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> list[SkillView]:
-    """列出工作区 Skill。输出 Skill 元数据、版本和当前授权状态。"""
+    """列出工作区 Skill。输出 Skill 元数据、版本和当前授权状态。
+
+    官方（第一方）工作流 Skill 会在此惰性安装/刷新，保证非 demo 部署的
+    新工作区也能看到完整的官方能力。
+    """
+    try:
+        ensure_official_skill_packages(db, context.workspace_id, settings=settings)
+        db.commit()
+    except Exception:
+        db.rollback()
     return [
         SkillView.model_validate(item)
         for item in service(db, context, settings).list_skills()
@@ -311,6 +357,62 @@ def install_skill_from_market(
     return manager.skill_view(manager.install(payload))
 
 
+@router.get("/skills/market/catalogs", response_model=list[ExternalCatalogSourceView])
+def list_skill_catalog_sources(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> list[ExternalCatalogSourceView]:
+    """列出已配置的外部 Skill/MCP 发现目录（聚合索引来源，只读）。"""
+    return ExternalCatalogService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).catalog_sources()
+
+
+@router.get("/skills/market/external-search", response_model=ExternalSkillSearchResponse)
+def search_external_skill_catalog(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    catalog: str = Query(default="clawhub", max_length=32),
+    q: str = Query(min_length=2, max_length=120),
+    limit: int = Query(default=10, ge=1, le=20),
+) -> ExternalSkillSearchResponse:
+    """搜索外部 Skill 目录（ClawHub / skills.sh）。只做发现，不直接安装。"""
+    return ExternalCatalogService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).search_skills(catalog, q, limit=limit)
+
+
+@router.get("/mcp/registry/search", response_model=McpRegistrySearchResponse)
+def search_mcp_registry(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    q: str = Query(min_length=2, max_length=120),
+    limit: int = Query(default=10, ge=1, le=20),
+) -> McpRegistrySearchResponse:
+    """搜索官方 MCP Registry；返回可用于预填登记表单的服务器信息。"""
+    return ExternalCatalogService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).search_mcp_registry(q, limit=limit)
+
+
+@router.get("/mcp/registry/browse", response_model=McpRegistrySearchResponse)
+def browse_mcp_registry(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    q: str = Query(default="", max_length=120),
+    cursor: str | None = Query(default=None, max_length=300),
+    limit: int = Query(default=12, ge=1, le=20),
+) -> McpRegistrySearchResponse:
+    """浏览官方 MCP Registry 市场（游标分页；支持一键预填可用的远程服务器）。"""
+    return ExternalCatalogService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).browse_mcp_registry(query=q, cursor=cursor, limit=limit)
+
+
 @router.post(
     "/skills/import",
     response_model=SkillView,
@@ -328,6 +430,105 @@ def import_skill_manual(
         db, context.workspace_id, context.principal.user_id, settings
     )
     return manager.skill_view(manager.import_manual(payload))
+
+
+@router.post(
+    "/skills/import-archive",
+    response_model=SkillView,
+    status_code=status.HTTP_201_CREATED,
+)
+def import_skill_archive(
+    payload: SkillArchiveImportRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillView:
+    """从 zip 压缩包导入 Skill（仅文本文件；内容不在宿主执行）。"""
+    context.require_permission("workspace.write")
+    manager = SkillArchiveImportService(
+        db, context.workspace_id, context.principal.user_id, settings
+    )
+    return manager.skill_view(manager.import_archive(payload))
+
+
+@router.post(
+    "/skills/npx-import",
+    response_model=SkillNpxImportResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def import_skill_npx(
+    payload: SkillNpxImportRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillNpxImportResponse:
+    """解析 `npx skills add …` 命令并等价安装（服务端解析，不执行 npx）。"""
+    context.require_permission("workspace.write")
+    return SkillGitHubImportService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).install_from_command(payload)
+
+
+def github_service(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillGitHubImportService:
+    return SkillGitHubImportService(
+        db, context.workspace_id, context.principal.user_id, settings
+    )
+
+
+@router.post("/skills/github/preview", response_model=SkillGitHubPreviewResponse)
+def preview_skill_github(
+    payload: SkillGitHubPreviewRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillGitHubPreviewResponse:
+    """解析 GitHub 引用并列出可安装的 Skill 目录（含安装前权限预览）。"""
+    return github_service(db, context, settings).preview(payload)
+
+
+@router.post(
+    "/skills/github/install",
+    response_model=SkillView,
+    status_code=status.HTTP_201_CREATED,
+)
+def install_skill_github(
+    payload: SkillGitHubInstallRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillView:
+    """按固定 commit 从 GitHub 安装 Skill 全量文件；安装后仍需授权。"""
+    context.require_permission("workspace.write")
+    manager = github_service(db, context, settings)
+    return manager.skill_view(manager.install(payload))
+
+
+@router.post("/skills/{skill_id}/check-update", response_model=SkillUpdateCheckResponse)
+def check_skill_update(
+    skill_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillUpdateCheckResponse:
+    """对 GitHub 固定导入的 Skill 比较上游 commit，报告是否有更新。"""
+    return github_service(db, context, settings).check_update(skill_id)
+
+
+@router.post("/skills/{skill_id}/upgrade", response_model=SkillView)
+def upgrade_skill_from_upstream(
+    skill_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillView:
+    """把 GitHub 固定导入的 Skill 升级到上游最新 commit；内容变化会失效授权。"""
+    context.require_permission("workspace.write")
+    manager = github_service(db, context, settings)
+    return manager.skill_view(manager.upgrade(skill_id))
 
 
 @router.get("/skills/local-probe/policy", response_model=SkillLocalProbePolicyView)
@@ -476,6 +677,37 @@ def run_skill_script(
         principal=context.principal,
     )
     return manager.run(skill_id, payload)
+
+
+@router.post("/skills/{skill_id}/security-scan", response_model=SkillSecurityScanResponse)
+def scan_skill_security(
+    skill_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillSecurityScanResponse:
+    """静态安全扫描（审核第二层）：危险命令、注入诱饵、隐藏字符。结果为建议性。"""
+    return SkillSecurityScanResponse.model_validate(
+        package_service(db, context, settings).security_scan(skill_id)
+    )
+
+
+@router.post(
+    "/skills/{skill_id}/semantic-review",
+    response_model=SkillSemanticReviewResponse,
+)
+def review_skill_semantics(
+    skill_id: str,
+    payload: SkillSemanticReviewRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillSemanticReviewResponse:
+    """模型语义审核（审核第三层）：描述与行为一致性、检索诱饵、越权与隐瞒指令。"""
+    manager = SkillSemanticReviewService(
+        db, context.workspace_id, context.principal.user_id, settings
+    )
+    return manager.review(skill_id, force=payload.force)
 
 
 @router.post("/skills/{skill_id}/translate", response_model=SkillTranslateResponse)

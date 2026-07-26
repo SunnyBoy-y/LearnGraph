@@ -6,9 +6,21 @@ from typing import Literal, Protocol
 
 
 @dataclass(frozen=True, slots=True)
+class ImageSourceInput:
+    """Validated source image bytes for an edit/reference generation."""
+
+    image_bytes: bytes
+    mime_type: str
+    name: str = "source.png"
+
+
+@dataclass(frozen=True, slots=True)
 class ImageGenerationRequest:
     prompt: str
     partial_images: int = 2
+    # When non-empty, the provider must condition the generation on these
+    # source images (image edit) instead of a pure text-to-image call.
+    source_images: tuple[ImageSourceInput, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

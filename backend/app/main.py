@@ -11,7 +11,12 @@ from app.core.config import get_settings
 from app.core.database import init_database
 from app.core.errors import install_error_handlers
 from app.core.seed import ensure_demo_data
-from app.core.scheduler import mastery_scheduler, memory_retention_scheduler, sandbox_cleanup_scheduler
+from app.core.scheduler import (
+    mastery_scheduler,
+    memory_extraction_scheduler,
+    memory_retention_scheduler,
+    sandbox_cleanup_scheduler,
+)
 from app.services.document_learning import mark_interrupted_document_jobs
 from app.services.chat import mark_interrupted_message_streams
 
@@ -29,6 +34,8 @@ async def lifespan(_: FastAPI):
     scheduler_task: asyncio.Task[None] | None = None
     retention_stop: asyncio.Event | None = None
     retention_task: asyncio.Task[None] | None = None
+    extraction_stop: asyncio.Event | None = None
+    extraction_task: asyncio.Task[None] | None = None
     sandbox_stop: asyncio.Event | None = None
     sandbox_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
@@ -37,6 +44,9 @@ async def lifespan(_: FastAPI):
     if settings.memory_retention_scheduler_enabled:
         retention_stop = asyncio.Event()
         retention_task = asyncio.create_task(memory_retention_scheduler(retention_stop))
+    if settings.memory_extraction_scheduler_enabled:
+        extraction_stop = asyncio.Event()
+        extraction_task = asyncio.create_task(memory_extraction_scheduler(extraction_stop))
     if settings.sandbox_cleanup_scheduler_enabled:
         sandbox_stop = asyncio.Event()
         sandbox_task = asyncio.create_task(sandbox_cleanup_scheduler(sandbox_stop))
@@ -49,6 +59,9 @@ async def lifespan(_: FastAPI):
         if retention_stop is not None and retention_task is not None:
             retention_stop.set()
             await retention_task
+        if extraction_stop is not None and extraction_task is not None:
+            extraction_stop.set()
+            await extraction_task
         if sandbox_stop is not None and sandbox_task is not None:
             sandbox_stop.set()
             await sandbox_task

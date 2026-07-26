@@ -19,6 +19,7 @@ from app.domain.models import (
     UsageEvent,
     utc_now,
 )
+from app.providers.models_dev import price_entry_for_model
 from app.services.pricing_catalog import PRICING_CATALOG
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import (
@@ -31,6 +32,42 @@ from app.repositories.domain import (
 
 
 DEFAULT_USD_CNY_RATE = Decimal("6.7704")
+
+MANUAL_PRICE_SOURCE = "workspace_manual"
+
+# Keyless public reference-rate endpoints, tried in order.
+_LIVE_RATE_ENDPOINTS: tuple[tuple[str, str], ...] = (
+    ("https://open.er-api.com/v6/latest/USD", "live:open.er-api.com"),
+    ("https://api.frankfurter.dev/v1/latest?base=USD&symbols=CNY", "live:frankfurter.dev"),
+)
+
+
+def fetch_live_usd_cny_rate(timeout_seconds: float = 15.0) -> tuple[float, str]:
+    """Fetch the current USD/CNY reference rate from a public endpoint."""
+
+    import httpx
+
+    last_error: Exception | None = None
+    for url, source in _LIVE_RATE_ENDPOINTS:
+        try:
+            response = httpx.get(
+                url,
+                timeout=timeout_seconds,
+                follow_redirects=True,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            value = (payload.get("rates") or {}).get("CNY")
+            if value is not None and float(value) > 0:
+                return float(value), source
+        except Exception as exc:  # noqa: BLE001 - fall through to the next source
+            last_error = exc
+    raise AppError(
+        502,
+        "exchange_rate_refresh_failed",
+        f"Fetching the live USD/CNY rate failed: {last_error}",
+    )
 
 
 @dataclass(frozen=True)
@@ -103,16 +140,6 @@ class BillingService:
         self.alerts = BudgetAlertRepository(db, workspace_id)
         self.usage = UsageRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
-
-    def list_prices(self) -> list[PriceVersion]:
-        return list(
-            self.db.scalars(
-                self.prices.query().order_by(
-                    PriceVersion.effective_at.desc(),
-                    PriceVersion.version.desc(),
-                )
-            ).all()
-        )
 
     def create_price(
         self,
@@ -225,29 +252,157 @@ class BillingService:
         self.db.refresh(price)
         return price
 
-    def retire_price(self, price_id: str, *, retired_at: datetime | None = None) -> PriceVersion:
-        price = self.prices.require(price_id, "price version")
-        if price.retired_at is None:
-            price.retired_at = self._as_utc(retired_at or utc_now())
-            self.audit.record(
-                actor_id=self.actor_id,
-                action="usage.price_version.retired",
-                resource_type="price_version",
-                resource_id=price.id,
-            )
-            self.db.commit()
-            self.db.refresh(price)
-        return price
+    def list_manual_prices(self) -> list[dict[str, Any]]:
+        """Active workspace-manual list prices, newest per model+provider."""
 
-    def list_exchange_rates(self) -> list[ExchangeRateVersion]:
-        return list(
+        items = list(
             self.db.scalars(
-                self.rates.query().order_by(
-                    ExchangeRateVersion.effective_at.desc(),
-                    ExchangeRateVersion.version.desc(),
+                self.prices.query()
+                .where(PriceVersion.source == MANUAL_PRICE_SOURCE)
+                .order_by(
+                    PriceVersion.effective_at.desc(),
+                    PriceVersion.version.desc(),
                 )
             ).all()
         )
+        latest: dict[tuple[str, str], PriceVersion] = {}
+        for item in items:
+            if item.retired_at is not None:
+                continue
+            key = (item.model_id, item.provider_id)
+            if key not in latest:
+                latest[key] = item
+        return [self._manual_price_view(item) for item in latest.values()]
+
+    def upsert_manual_price(
+        self,
+        *,
+        model_id: str,
+        provider_id: str = "*",
+        currency: str,
+        input_per_million: float,
+        cached_input_per_million: float | None,
+        output_per_million: float,
+        fixed_per_call: float = 0,
+    ) -> dict[str, Any]:
+        model = model_id.strip()
+        if not model or model == "*":
+            raise AppError(
+                422,
+                "manual_price_model_required",
+                "A concrete model id is required for manual pricing",
+            )
+        now = utc_now()
+        # Retire every currently active price for the model so the manual
+        # list price becomes the only quote source; future calls no longer
+        # re-seed catalog defaults while this override stays active.
+        actives = self.db.scalars(
+            self.prices.query().where(PriceVersion.model_id == model)
+        ).all()
+        for item in actives:
+            if item.retired_at is None:
+                item.retired_at = now
+        normalized_currency = currency.strip().upper()
+        if normalized_currency == "CNY":
+            price = self.create_price(
+                provider_id=provider_id,
+                model_id=model,
+                feature="*",
+                input_usd_per_million=0,
+                output_usd_per_million=0,
+                fixed_usd_per_call=0,
+                effective_at=now,
+                source=MANUAL_PRICE_SOURCE,
+                currency="CNY",
+                input_cny_per_million=input_per_million,
+                cached_input_cny_per_million=cached_input_per_million,
+                output_cny_per_million=output_per_million,
+                fixed_cny_per_call=fixed_per_call,
+            )
+        else:
+            price = self.create_price(
+                provider_id=provider_id,
+                model_id=model,
+                feature="*",
+                input_usd_per_million=input_per_million,
+                cached_input_usd_per_million=cached_input_per_million,
+                output_usd_per_million=output_per_million,
+                fixed_usd_per_call=fixed_per_call,
+                effective_at=now,
+                source=MANUAL_PRICE_SOURCE,
+                currency="USD",
+            )
+        return self._manual_price_view(price)
+
+    def remove_manual_price(self, model_id: str) -> int:
+        """Retire manual overrides so catalog defaults apply again."""
+
+        model = model_id.strip()
+        now = utc_now()
+        items = self.db.scalars(
+            self.prices.query().where(
+                PriceVersion.model_id == model,
+                PriceVersion.source == MANUAL_PRICE_SOURCE,
+            )
+        ).all()
+        removed = 0
+        for item in items:
+            if item.retired_at is None:
+                item.retired_at = now
+                removed += 1
+        if removed:
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="usage.manual_price.removed",
+                resource_type="price_version",
+                resource_id=model,
+                details={"model_id": model, "removed_count": removed},
+            )
+            self.db.commit()
+        return removed
+
+    @staticmethod
+    def _manual_price_view(price: PriceVersion) -> dict[str, Any]:
+        conditions = dict(price.conditions or {})
+        currency = str(conditions.get("pricing_currency") or "USD").upper()
+        if currency == "CNY":
+            cached = conditions.get("cached_input_cny_per_million")
+            return {
+                "id": price.id,
+                "model_id": price.model_id,
+                "provider_id": price.provider_id,
+                "currency": "CNY",
+                "input_per_million": float(conditions.get("input_cny_per_million") or 0),
+                "cached_input_per_million": float(cached) if cached is not None else None,
+                "output_per_million": float(conditions.get("output_cny_per_million") or 0),
+                "fixed_per_call": float(conditions.get("fixed_cny_per_call") or 0),
+                "effective_at": price.effective_at,
+            }
+        return {
+            "id": price.id,
+            "model_id": price.model_id,
+            "provider_id": price.provider_id,
+            "currency": "USD",
+            "input_per_million": price.input_usd_per_million,
+            "cached_input_per_million": price.cached_input_usd_per_million,
+            "output_per_million": price.output_usd_per_million,
+            "fixed_per_call": price.fixed_usd_per_call,
+            "effective_at": price.effective_at,
+        }
+
+    def current_exchange_rate(self) -> ExchangeRateVersion:
+        rate = self._active_exchange_rate(self._as_utc(utc_now()))
+        # _active_exchange_rate may create the fallback row inside the
+        # session; persist it so repeated reads stay stable.
+        self.db.commit()
+        return rate
+
+    def set_exchange_rate(self, rate: float, *, source: str = "workspace_manual") -> ExchangeRateVersion:
+        return self.create_exchange_rate(rate=rate, effective_at=None, source=source)
+
+    def refresh_exchange_rate_from_network(self) -> ExchangeRateVersion:
+        value, source = fetch_live_usd_cny_rate()
+        return self.create_exchange_rate(rate=value, effective_at=None, source=source)
 
     def create_exchange_rate(
         self,
@@ -290,25 +445,6 @@ class BillingService:
         )
         self.db.commit()
         self.db.refresh(item)
-        return item
-
-    def retire_exchange_rate(
-        self,
-        rate_id: str,
-        *,
-        retired_at: datetime | None = None,
-    ) -> ExchangeRateVersion:
-        item = self.rates.require(rate_id, "exchange rate version")
-        if item.retired_at is None:
-            item.retired_at = self._as_utc(retired_at or utc_now())
-            self.audit.record(
-                actor_id=self.actor_id,
-                action="usage.exchange_rate.retired",
-                resource_type="exchange_rate_version",
-                resource_id=item.id,
-            )
-            self.db.commit()
-            self.db.refresh(item)
         return item
 
     def list_budget_policies(self) -> list[BudgetPolicy]:
@@ -765,6 +901,8 @@ class BillingService:
             return "openai"
         if provider.provider_type == "deepseek_chat":
             return "deepseek"
+        if provider.provider_type == "qwen":
+            return "qwen"
         try:
             hostname = (urlparse(provider.base_url or "").hostname or "").casefold()
         except ValueError:
@@ -826,24 +964,33 @@ class BillingService:
         if provider is None:
             return None
         provider_key = self._provider_catalog_key(provider)
-        if provider_key is None:
-            return None
         matches = [
             item
             for item in PRICING_CATALOG
-            if item.get("provider_key") == provider_key
+            if provider_key is not None
+            and item.get("provider_key") == provider_key
             and item.get("model_id") == model_id
             and self._conditions_match(
                 dict(item.get("conditions") or {}),
                 input_tokens,
             )
         ]
-        if not matches:
-            return None
         # The catalog can contain context tiers. The last matching entry is
         # deterministic and catalog ordering deliberately keeps a more
         # specific later row after a generic one.
-        item = matches[-1]
+        builtin = matches[-1] if matches else None
+        # models.dev is the network-refreshable tariff source and matches by
+        # model name regardless of provider. CNY-native rows stay
+        # authoritative because models.dev only carries USD list prices.
+        models_dev_item = price_entry_for_model(model_id, input_tokens)
+        if builtin is not None and str(builtin.get("currency") or "").upper() == "CNY":
+            item = builtin
+        elif models_dev_item is not None:
+            item = models_dev_item
+        elif builtin is not None:
+            item = builtin
+        else:
+            return None
         scope = self._normalized_scope(provider_id, model_id, feature)
         version = (
             self.db.scalar(
@@ -862,7 +1009,8 @@ class BillingService:
             {
                 "pricing_currency": currency,
                 "catalog_id": item.get("catalog_id"),
-                "catalog_provider_key": provider_key,
+                "catalog_provider_key": provider_key or item.get("provider_key"),
+                "catalog_source": item.get("source") or "builtin",
                 "catalog_as_of": item.get("as_of"),
                 "catalog_source_url": item.get("source_url"),
             }
@@ -902,7 +1050,11 @@ class BillingService:
                 output_usd_per_million=float(item.get("output_usd_per_million") or 0),
                 fixed_usd_per_call=0,
                 effective_at=now,
-                source=f"official_catalog:{item.get('source_url') or 'unknown'}",
+                source=(
+                    f"models_dev:{item.get('source_url') or 'unknown'}"
+                    if item.get("source") == "models_dev"
+                    else f"official_catalog:{item.get('source_url') or 'unknown'}"
+                ),
                 conditions=conditions,
             )
         )
@@ -1158,6 +1310,7 @@ class BillingService:
                 BudgetAlert.period_start == start,
             )
         )
+        notify = False
         if alert is None:
             alert = self.alerts.add(
                 BudgetAlert(
@@ -1176,12 +1329,29 @@ class BillingService:
                 )
             )
             self.db.flush()
+            notify = True
         else:
+            # Mail again only when a previously acknowledged alert re-opens,
+            # so an exhausted budget does not flood the inbox on every call.
+            notify = alert.status == "acknowledged"
             alert.status = "open"
             alert.acknowledged_at = None
             alert.spent_cny = spent
             alert.projected_cost_cny = projected
             alert.limit_cny = limit
+        if notify:
+            from app.services.alert_email import notify_budget_alert
+
+            notify_budget_alert(
+                self.db,
+                self.workspace_id,
+                policy_name=policy.name,
+                level=level,
+                scope=f"{provider_id} / {model_id} / {feature}",
+                spent_cny=spent,
+                projected_cny=projected,
+                limit_cny=limit,
+            )
         self.audit.record(
             actor_id=self.actor_id,
             action=f"usage.budget.{level}",

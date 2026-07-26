@@ -41,19 +41,34 @@ class ProviderChatMessage:
             if self.content:
                 parts.append({"type": "text", "text": self.content})
             for part in self.content_parts:
-                if part.get("type") != "input_image":
-                    continue
-                image_url = part.get("image_url")
-                if not isinstance(image_url, str) or not image_url.startswith("data:image/"):
-                    continue
-                detail = part.get("detail")
-                payload_part: dict[str, Any] = {
-                    "type": "image_url",
-                    "image_url": {"url": image_url},
-                }
-                if detail in {"low", "high", "auto"}:
-                    payload_part["image_url"]["detail"] = detail
-                parts.append(payload_part)
+                if part.get("type") == "input_image":
+                    image_url = part.get("image_url")
+                    if not isinstance(image_url, str) or not image_url.startswith(
+                        "data:image/"
+                    ):
+                        continue
+                    detail = part.get("detail")
+                    payload_part: dict[str, Any] = {
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    }
+                    if detail in {"low", "high", "auto"}:
+                        payload_part["image_url"]["detail"] = detail
+                    parts.append(payload_part)
+                elif part.get("type") == "input_video":
+                    video_url = part.get("video_url")
+                    if not isinstance(video_url, str) or not video_url.startswith(
+                        "data:video/"
+                    ):
+                        continue
+                    payload_part = {
+                        "type": "video_url",
+                        "video_url": {"url": video_url},
+                    }
+                    fps = part.get("fps")
+                    if isinstance(fps, (int, float)) and not isinstance(fps, bool):
+                        payload_part["fps"] = max(0.1, min(float(fps), 10.0))
+                    parts.append(payload_part)
             payload["content"] = parts
         elif self.content is not None:
             # Chat Completions / DeepSeek: assistant turns that only emit tool

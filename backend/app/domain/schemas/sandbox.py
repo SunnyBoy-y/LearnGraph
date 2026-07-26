@@ -175,6 +175,18 @@ class SandboxAgentFileListRequest(BaseModel):
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
+class SandboxAgentTranscribeRequest(BaseModel):
+    """Host-side bridge: transcribe a workspace audio file with the user's ASR
+    Provider.  Credentials and network access stay on the host; the sandbox
+    remains offline."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    path: str = Field(min_length=1, max_length=255)
+    output_path: str | None = Field(default=None, min_length=1, max_length=255)
+    language: str | None = Field(default=None, min_length=2, max_length=16)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
 class SandboxAgentWorkspaceFileView(BaseModel):
     path: str
     size_bytes: int

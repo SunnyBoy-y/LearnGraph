@@ -7,10 +7,13 @@ const { chromium } = require("playwright-core");
     chromiumSandbox: true,
   });
   const page = await browser.newPage();
-  await page.setContent("<main data-smoke='ok'>LearnGraph</main>");
+  await page.setContent("<main data-smoke='ok'>LearnGraph 沙箱</main>");
   const value = await page.getAttribute("main", "data-smoke");
+  // Rasterization must work too (screenshot/PDF path uses the viz process);
+  // a DOM-only check once hid a missing-SwiftShader defect.
+  const shot = await page.screenshot({ type: "png" });
   await browser.close();
-  if (value !== "ok") process.exit(2);
+  if (value !== "ok" || !shot || shot.length < 1000) process.exit(2);
 })().catch((error) => {
   process.stderr.write(String(error));
   process.exit(1);

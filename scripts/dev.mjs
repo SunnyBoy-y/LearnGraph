@@ -11,6 +11,8 @@ import { initializeEnvFiles } from './init-env.mjs'
 const MINIMUM_NODE_MAJOR = 20
 const HEALTH_TIMEOUT_MS = 45_000
 const HEALTH_INTERVAL_MS = 500
+const HEALTH_MONITOR_INTERVAL_MS = 2_000
+const HEALTH_MONITOR_FAILURE_LIMIT = 5
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000
 const BACKEND_RESTART_DELAY_MS = 1_000
 
@@ -189,31 +191,69 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
+async function checkHealth(url) {
+  const controller = new AbortController()
+  const requestTimeout = setTimeout(() => controller.abort(), 2_000)
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    if (!response.ok) return { healthy: false, problem: `HTTP ${response.status}` }
+    const payload = await response.json()
+    if (payload?.status === 'ok') return { healthy: true }
+    return {
+      healthy: false,
+      problem: `HTTP ${response.status} returned status ${JSON.stringify(payload?.status)}`,
+    }
+  } catch (error) {
+    return { healthy: false, problem: error instanceof Error ? error.message : String(error) }
+  } finally {
+    clearTimeout(requestTimeout)
+  }
+}
+
 async function pollHealth(url) {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS
   let lastProblem = 'no response'
 
   while (Date.now() < deadline) {
-    const controller = new AbortController()
-    const requestTimeout = setTimeout(() => controller.abort(), 2_000)
-    try {
-      const response = await fetch(url, { signal: controller.signal })
-      if (response.ok) {
-        const payload = await response.json()
-        if (payload?.status === 'ok') return
-        lastProblem = `HTTP ${response.status} returned status ${JSON.stringify(payload?.status)}`
-      } else {
-        lastProblem = `HTTP ${response.status}`
-      }
-    } catch (error) {
-      lastProblem = error instanceof Error ? error.message : String(error)
-    } finally {
-      clearTimeout(requestTimeout)
-    }
+    const check = await checkHealth(url)
+    if (check.healthy) return
+    lastProblem = check.problem
     await wait(HEALTH_INTERVAL_MS)
   }
 
   throw new Error(`Backend did not become healthy within 45 seconds (${lastProblem}): ${url}`)
+}
+
+// The uvicorn --reload supervisor stays alive when its worker crashes, so the
+// backend process exiting is not a reliable "backend is down" signal. Keep
+// polling the health endpoint and report when it stops answering.
+function watchHealth(url) {
+  let stopped = false
+  const unhealthy = (async () => {
+    let failures = 0
+    let lastProblem = 'no response'
+    while (!stopped) {
+      await wait(HEALTH_MONITOR_INTERVAL_MS)
+      if (stopped) break
+      const check = await checkHealth(url)
+      if (check.healthy) {
+        failures = 0
+        continue
+      }
+      failures += 1
+      lastProblem = check.problem
+      if (failures >= HEALTH_MONITOR_FAILURE_LIMIT) {
+        return `Backend stopped responding (${lastProblem}): ${url}.`
+      }
+    }
+    return null
+  })()
+  return {
+    unhealthy,
+    stop: () => {
+      stopped = true
+    },
+  }
 }
 
 function waitForExit(child, timeoutMs) {
@@ -308,7 +348,10 @@ async function main() {
 
   const backendOrigin = `http://127.0.0.1:${options.backendPort}`
   const frontendOrigin = `http://127.0.0.1:${frontendPort}`
-  const apiOrigin = process.env.VITE_API_BASE_URL?.trim() || backendOrigin
+  // Default to same-origin '/' so the browser calls the Vite dev proxy and
+  // CORS never applies, whichever port the frontend lands on. An explicit
+  // VITE_API_BASE_URL still opts into calling the backend directly.
+  const apiBaseUrl = process.env.VITE_API_BASE_URL?.trim() || '/'
   const corsOrigins =
     process.env.LEARNGRAPH_CORS_ORIGINS?.trim() ||
     JSON.stringify([
@@ -369,7 +412,8 @@ async function main() {
       detached: true,
       env: {
         ...process.env,
-        VITE_API_BASE_URL: apiOrigin,
+        VITE_API_BASE_URL: apiBaseUrl,
+        LEARNGRAPH_BACKEND_ORIGIN: backendOrigin,
       },
     },
   )
@@ -422,16 +466,22 @@ async function main() {
       console.log(`\nBackend recovered and is healthy: ${healthUrl}`)
     }
 
+    const monitor = watchHealth(healthUrl)
     const outcome = await Promise.race([
+      monitor.unhealthy.then((problem) => ({ type: 'backend-unhealthy', problem })),
       backend.exited.then((result) => ({ type: 'backend-exit', result })),
       frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
       signalReceived.then((signal) => ({ type: 'signal', signal })),
     ])
+    monitor.stop()
     if (outcome.type === 'signal') return
     if (outcome.type === 'frontend-exit') {
       throw new Error(describeExit(outcome.result))
     }
-    console.error(`\n${describeExit(outcome.result)} Restarting backend in 1 second...`)
+    const problem =
+      outcome.type === 'backend-exit' ? describeExit(outcome.result) : outcome.problem
+    console.error(`\n${problem} Restarting backend in 1 second...`)
+    if (outcome.type === 'backend-unhealthy') await stopChild(backend)
     const pause = await Promise.race([
       wait(BACKEND_RESTART_DELAY_MS).then(() => ({ type: 'retry' })),
       frontend.exited.then((result) => ({ type: 'frontend-exit', result })),

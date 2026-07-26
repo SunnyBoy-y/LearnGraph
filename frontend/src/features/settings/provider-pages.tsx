@@ -2,30 +2,24 @@ import {
   Children,
   isValidElement,
   useEffect,
+  useRef,
   useState,
+  type Dispatch,
   type FormEvent,
   type ReactNode,
+  type SetStateAction,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 import {
   Activity,
   AlertTriangle,
   Bot,
-  CircleDollarSign,
-  Download,
+  LockKeyhole,
   Pencil,
   Plus,
   RefreshCcw,
   Search,
+  Settings2,
   SlidersHorizontal,
   Trash2,
   WalletCards,
@@ -36,45 +30,29 @@ import { AnimatePresence, motion } from "motion/react";
 import deepseekMark from "@/assets/deepseek.svg";
 import openAiMark from "@/assets/openai.svg";
 import {
-  acknowledgeBudgetAlert,
-  clearUsageEvents,
-  createBudgetPolicy,
-  createExchangeRate,
-  createPriceVersion,
   createProvider,
-  deleteBudgetPolicy,
   deleteProvider,
   discoverProviderModels,
   getProviderBalance,
   getProviderModelCapabilities,
+  getProviderModelDefaults,
   getSecretStoreStatus,
-  getUsageSummary,
-  listBudgetAlerts,
-  listBudgetPolicies,
-  listBudgetStatuses,
-  listExchangeRates,
-  listPriceVersions,
-  listPriceCatalog,
   listProviderCatalog,
   listProviders,
-  listSettings,
-  listUsageEvents,
+  pollCodexDeviceLogin,
   probeProvider,
-  retireExchangeRate,
-  retirePriceVersion,
   rotateProviderSecret,
-  updateBudgetPolicy,
+  startCodexDeviceLogin,
+  syncProviderModelCatalogDefaults,
   updateProviderModelCapabilities,
   updateProviderModelGroupCapabilities,
   updateProviderModelStates,
   updateProvider,
-  updateSetting,
 } from "@/api";
 import { ApiError } from "@/api";
 import {
   ErrorState,
   LoadingState,
-  MetricStrip,
   PageFrame,
   PageIntro,
   SectionHeading,
@@ -93,7 +71,6 @@ import {
   AlertDialogHeader,
   AlertDialogMedia,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import {
   Dialog,
@@ -118,7 +95,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -130,9 +106,23 @@ import { Switch } from "@/components/ui/switch";
 import {
   isAnthropicProvider,
   isDeepSeekProvider,
+  providerBalanceQueryConfig,
+  providerBalanceQueryLastResult,
+  providerSupportsBalance,
   providerExtraHeaders,
 } from "@/types/providers";
+import {
+  formatBalanceQuerySummary,
+  persistCustomBalanceResult,
+  relativeTimeLabel,
+  runCustomBalanceQuery,
+} from "@/lib/balance-query";
+import {
+  BalanceQueryConfigDialog,
+  CustomBalanceDialog,
+} from "./balance-query";
 import type {
+  CodexDeviceLoginStart,
   Provider,
   ProviderBalance,
   ProviderModelCapabilities,
@@ -145,12 +135,6 @@ import type {
   ThinkingMode,
 } from "@/types/providers";
 import { Textarea } from "@/components/ui/textarea";
-import type {
-  BudgetPolicy,
-  BudgetPolicyCreate,
-  BudgetPolicyUpdate,
-  PriceVersionCreate,
-} from "@/types/usage";
 
 function persistedProviderModels(
   provider: Provider,
@@ -204,18 +188,27 @@ function SearchableModelSelect({
 }) {
   const [open, setOpen] = useState(false);
   const models = (() => {
-    const values: string[] = [];
+    const values = new Map<string, boolean>();
     const visit = (nodes: ReactNode) => {
       Children.forEach(nodes, (node) => {
         if (!isValidElement(node)) return;
-        const props = node.props as { children?: ReactNode; value?: unknown };
+        const props = node.props as {
+          children?: ReactNode;
+          disabled?: boolean;
+          value?: unknown;
+        };
         const itemValue = props.value;
-        if (typeof itemValue === "string") values.push(itemValue);
+        if (typeof itemValue === "string") {
+          values.set(
+            itemValue,
+            (values.get(itemValue) ?? false) || props.disabled === true,
+          );
+        }
         visit(props.children);
       });
     };
     visit(children);
-    return [...new Set(values)];
+    return [...values].map(([id, disabled]) => ({ disabled, id }));
   })();
   const selectedLabel = value || "选择已发现的模型";
 
@@ -242,17 +235,33 @@ function SearchableModelSelect({
           <CommandInput placeholder="搜索模型名称…" />
           <CommandList className="max-h-64">
             <CommandEmpty>没有匹配的模型</CommandEmpty>
-            {models.map((modelId) => (
+            {models.map(({ disabled, id: modelId }) => (
               <CommandItem
+                disabled={disabled}
                 key={modelId}
                 onSelect={() => {
+                  if (disabled) return;
                   onValueChange(modelId);
                   setOpen(false);
                 }}
+                title={disabled ? "该模型已在供应商配置中停用" : undefined}
                 value={modelId}
               >
-                <span className="truncate font-mono text-xs">{modelId}</span>
-                {modelId === value ? <span className="ml-auto text-xs">✓</span> : null}
+                <span
+                  className={`truncate font-mono text-xs ${
+                    disabled ? "text-muted-foreground" : ""
+                  }`}
+                >
+                  {modelId}
+                </span>
+                {disabled ? (
+                  <span className="ml-auto flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+                    <LockKeyhole className="size-3" />
+                    已停用
+                  </span>
+                ) : modelId === value ? (
+                  <span className="ml-auto text-xs">✓</span>
+                ) : null}
               </CommandItem>
             ))}
           </CommandList>
@@ -285,6 +294,10 @@ export function ProvidersPage() {
   const [headersValue, setHeadersValue] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null);
   const [balanceTarget, setBalanceTarget] = useState<Provider | null>(null);
+  const [customBalanceTarget, setCustomBalanceTarget] =
+    useState<Provider | null>(null);
+  const [balanceQueryTarget, setBalanceQueryTarget] =
+    useState<Provider | null>(null);
   const [models, setModels] = useState<Record<string, ProviderModelsResponse>>(
     {},
   );
@@ -307,6 +320,58 @@ export function ProvidersPage() {
     mutationFn: getProviderBalance,
     onError: (error) => toast.error(error.message),
   });
+  const customBalance = useMutation({
+    mutationFn: async (provider: Provider) => {
+      const config = providerBalanceQueryConfig(provider);
+      if (!config?.enabled) throw new Error("尚未启用自定义余额查询");
+      const outcome = await runCustomBalanceQuery(provider.id, config);
+      try {
+        await persistCustomBalanceResult(outcome);
+        void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      } catch {
+        // 缓存写入失败不影响本次查询结果展示。
+      }
+      return outcome;
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  // cc-switch 风格的自动查询：仅在页面打开期间，按每个 Provider 配置的
+  // 间隔静默刷新缓存余额（0 表示关闭）。
+  const autoQueryInFlight = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const data = providers.data;
+    if (!data) return;
+    const tick = () => {
+      for (const provider of data) {
+        const config = providerBalanceQueryConfig(provider);
+        if (!config?.enabled || config.auto_query_interval_minutes <= 0) {
+          continue;
+        }
+        const last = providerBalanceQueryLastResult(provider);
+        const staleMs = config.auto_query_interval_minutes * 60_000;
+        if (
+          last &&
+          Date.now() - new Date(last.queried_at).getTime() < staleMs
+        ) {
+          continue;
+        }
+        if (autoQueryInFlight.current.has(provider.id)) continue;
+        autoQueryInFlight.current.add(provider.id);
+        runCustomBalanceQuery(provider.id, config)
+          .then((outcome) => persistCustomBalanceResult(outcome))
+          .then(() =>
+            queryClient.invalidateQueries({ queryKey: ["providers"] }),
+          )
+          .catch(() => {
+            // 静默轮询失败不打扰用户；手动查询会显示具体错误。
+          })
+          .finally(() => autoQueryInFlight.current.delete(provider.id));
+      }
+    };
+    tick();
+    const timer = window.setInterval(tick, 60_000);
+    return () => window.clearInterval(timer);
+  }, [providers.data, queryClient]);
   const discover = useMutation({
     mutationFn: discoverProviderModels,
     onSuccess: (result) => {
@@ -320,10 +385,12 @@ export function ProvidersPage() {
       const configuredModel =
         configuredProviderRole === "image_generation"
           ? configuredProvider?.capabilities.default_image_generation_model_id
-          : configuredProviderRole === "vision"
-            ? configuredProvider?.capabilities.default_vision_model_id
-              ?? configuredProvider?.capabilities.default_model
-            : configuredProvider?.capabilities.default_model;
+          : configuredProviderRole === "transcription"
+            ? configuredProvider?.capabilities.default_transcription_model_id
+            : configuredProviderRole === "vision"
+              ? configuredProvider?.capabilities.default_vision_model_id
+                ?? configuredProvider?.capabilities.default_model
+              : configuredProvider?.capabilities.default_model;
       setDefaultModels((current) =>
         current[result.provider_id] ||
         (typeof configuredModel === "string" && configuredModel.trim()) ||
@@ -454,6 +521,7 @@ export function ProvidersPage() {
     "fetch",
     "deep_research",
     "transcription",
+    "embedding",
     "memory",
   ];
   const availableRoles = (
@@ -488,6 +556,7 @@ export function ProvidersPage() {
                 providerCatalog.isError ? providerCatalog.error.message : undefined
               }
               catalogPending={providerCatalog.isPending}
+              initialRole={roleFilter === "all" ? undefined : roleFilter}
               onCreate={(payload) => create.mutate(payload)}
               secretStoreAvailable={
                 !secretStore.isPending && Boolean(secretStore.data?.available)
@@ -556,9 +625,14 @@ export function ProvidersPage() {
                 const supportsModelDiscovery =
                   providerSpec?.supports_model_discovery === true;
                 const supportsProbe = providerSpec?.supports_probe === true;
-                // Balance is available for DeepSeek family (including openai-compatible
-                // rows that declare model_family/brand_id deepseek or point at official host).
-                const supportsBalance = isDeepSeek;
+                // Balance covers DeepSeek plus every origin with a verified
+                // key-based balance endpoint and one-api style relay stations.
+                const supportsBalance = providerSupportsBalance(provider);
+                const customBalanceEnabled =
+                  providerBalanceQueryConfig(provider)?.enabled ?? false;
+                const customBalanceLast = customBalanceEnabled
+                  ? providerBalanceQueryLastResult(provider)
+                  : null;
                 const hasProbeConfiguration =
                   (!providerSpec?.requires_base_url || Boolean(provider.base_url)) &&
                   (!providerSpec?.requires_secret || provider.secret_status === "active");
@@ -605,7 +679,8 @@ export function ProvidersPage() {
                               className="size-5 object-contain"
                               src={providerQuickBrand(provider)!.iconUrl}
                             />
-                          ) : providerSpec?.brand_id === "openai" ? (
+                          ) : providerSpec?.brand_id === "openai" ||
+                            providerSpec?.brand_id === "openai_compatible" ? (
                             <img
                               alt=""
                               aria-hidden="true"
@@ -657,9 +732,6 @@ export function ProvidersPage() {
                               </span>
                             ) : null}
                           </div>
-                          <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-                            {provider.id}
-                          </p>
                         </div>
                       </div>
                     </td>
@@ -668,21 +740,16 @@ export function ProvidersPage() {
                         {isOfficialOpenAi
                           ? providerSpec?.label ?? provider.provider_type
                           : isDeepSeek
-                          ? "OpenAI-compatible · DeepSeek"
+                          ? "OpenAI-compatible Chat"
                           : isAnthropic
                             ? "Anthropic Messages"
                           : providerSpec?.label ?? provider.provider_type}
                       </p>
-                      <p className="mt-1 text-[10px] text-muted-foreground">
-                        {providerSpec
-                          ? providerRoleLabel(providerSpec.role)
-                          : provider.provider_type === "local_mock"
-                            ? "仅开发演示"
-                            : "后端未声明的类型"}
-                        {customHeaderCount > 0
-                          ? ` · ${customHeaderCount} 个自定义请求头`
-                          : ""}
-                      </p>
+                      {customHeaderCount > 0 ? (
+                        <p className="mt-1 text-[10px] text-muted-foreground">
+                          {customHeaderCount} 个自定义请求头
+                        </p>
+                      ) : null}
                     </td>
                     <td className="px-5 py-4">
                       <div className="flex flex-col items-start gap-1">
@@ -707,25 +774,39 @@ export function ProvidersPage() {
                               : "接口当前停用"}
                           </p>
                         ) : null}
+                        {customBalanceLast ? (
+                          <p
+                            className={`text-[10px] ${
+                              customBalanceLast.is_valid === false
+                                ? "text-destructive"
+                                : "text-muted-foreground"
+                            }`}
+                            title="自定义余额查询的缓存结果"
+                          >
+                            {formatBalanceQuerySummary(customBalanceLast)} ·{" "}
+                            {relativeTimeLabel(customBalanceLast.queried_at)}
+                          </p>
+                        ) : null}
                       </div>
                     </td>
                     <td className="px-5 py-4 font-mono text-xs text-muted-foreground">
                       <p>{provider.api_key_masked ?? "未保存"}</p>
-                      <p className="mt-1 text-[10px]">
-                        {provider.secret_status === "active"
-                          ? `Secret v${provider.secret_version} · ${provider.secret_key_provider ?? "key"} v${provider.secret_key_version}`
-                          : provider.secret_status === "revoked"
-                            ? `已吊销 · Secret v${provider.secret_version}`
-                            : "无 Secret"}
-                      </p>
                     </td>
                     <td className="px-5 py-4">
                       {hasConfigurableDefaultModel &&
                       (providerModels?.models.length ?? 0) > 0 ? (
                         <SearchableModelSelect
-                          onValueChange={(value) =>
-                            setDefaultModels((current) => ({ ...current, [provider.id]: value }))
-                          }
+                          onValueChange={(value) => {
+                            setDefaultModels((current) => ({ ...current, [provider.id]: value }));
+                            update.mutate({
+                              id: provider.id,
+                              enabled: provider.enabled,
+                              default_model: isModelProvider ? value : undefined,
+                              default_image_generation_model_id: isImageGenerationProvider ? value : undefined,
+                              default_transcription_model_id: isTranscriptionProvider ? value : undefined,
+                              default_vision_model_id: isVisionProvider ? value : undefined,
+                            });
+                          }}
                           value={modelValue}
                         >
                           <SelectTrigger
@@ -736,7 +817,12 @@ export function ProvidersPage() {
                           </SelectTrigger>
                           <SelectContent className="max-h-72 overflow-y-auto">
                             {(providerModels?.models ?? []).map((model) => (
-                              <SelectItem className="font-mono text-xs" key={model.id} value={model.id}>
+                              <SelectItem
+                                className="font-mono text-xs"
+                                disabled={model.enabled === false}
+                                key={model.id}
+                                value={model.id}
+                              >
                                 {model.id}
                               </SelectItem>
                             ))}
@@ -792,27 +878,52 @@ export function ProvidersPage() {
                         ) : null}
                         {supportsBalance ? (
                           <Button
-                            disabled={balance.isPending || !hasProbeConfiguration}
+                            disabled={
+                              customBalanceEnabled
+                                ? customBalance.isPending
+                                : balance.isPending || !hasProbeConfiguration
+                            }
                             onClick={() => {
+                              if (customBalanceEnabled) {
+                                customBalance.reset();
+                                setCustomBalanceTarget(provider);
+                                customBalance.mutate(provider);
+                                return;
+                              }
                               balance.reset();
                               setBalanceTarget(provider);
                               balance.mutate(provider.id);
                             }}
                             size="xs"
                             title={
-                              hasProbeConfiguration
-                                ? "按需读取 DeepSeek 当前账户余额"
-                                : configurationNotice
+                              customBalanceEnabled
+                                ? "使用自定义脚本查询余额"
+                                : hasProbeConfiguration
+                                  ? "按需读取当前账户余额 / 用量"
+                                  : configurationNotice
                             }
                             variant="outline"
                           >
                             <WalletCards className="size-3" />
-                            查询余额
+                            {!customBalanceEnabled &&
+                            provider.provider_type === "codex_chatgpt"
+                              ? "查询用量"
+                              : "查询余额"}
+                          </Button>
+                        ) : null}
+                        {!isModelProvider && provider.provider_type !== "local_mock" ? (
+                          <Button
+                            onClick={() => setBalanceQueryTarget(provider)}
+                            size="xs"
+                            title="配置余额查询方式：官方内置或自定义脚本"
+                            variant="outline"
+                          >
+                            <Settings2 className="size-3" />
+                            余额配置
                           </Button>
                         ) : null}
                         {isModelProvider ? (
                           <Button
-                            disabled={!capabilityModelValue}
                             onClick={() =>
                               setCapabilityTarget({
                                 provider,
@@ -820,18 +931,14 @@ export function ProvidersPage() {
                               })
                             }
                             size="xs"
-                            title={
-                              capabilityModelValue
-                                ? "读取或编辑此模型的能力快照"
-                                : "请先发现或填写模型 ID"
-                            }
+                            title="全局模板、模型开关、连接与余额查询统一在这里配置"
                             variant="outline"
                           >
                             <SlidersHorizontal className="size-3" />
-                            能力快照
+                            供应商配置
                           </Button>
                         ) : null}
-                        {providerSpec?.requires_base_url ? (
+                        {!isModelProvider && providerSpec?.requires_base_url ? (
                           <Button
                             disabled={updateEndpoint.isPending}
                             onClick={() => {
@@ -845,7 +952,7 @@ export function ProvidersPage() {
                             URL
                           </Button>
                         ) : null}
-                        {provider.provider_type !== "local_mock" ? (
+                        {!isModelProvider && provider.provider_type !== "local_mock" ? (
                           <Button
                             disabled={updateHeaders.isPending}
                             onClick={() => {
@@ -893,7 +1000,7 @@ export function ProvidersPage() {
                         >
                           {provider.enabled ? "停用" : "启用"}
                         </Button>
-                        {provider.provider_type !== "local_mock" ? (
+                        {!isModelProvider && provider.provider_type !== "local_mock" ? (
                           <Button
                             disabled={rotateSecret.isPending}
                             onClick={() => {
@@ -1204,6 +1311,29 @@ export function ProvidersPage() {
         result={balance.data}
         target={balanceTarget}
       />
+      <CustomBalanceDialog
+        error={customBalance.error}
+        isPending={customBalance.isPending}
+        onClose={() => {
+          setCustomBalanceTarget(null);
+          customBalance.reset();
+        }}
+        onRetry={() => {
+          if (!customBalanceTarget) return;
+          const fresh =
+            providers.data?.find(
+              (item) => item.id === customBalanceTarget.id,
+            ) ?? customBalanceTarget;
+          customBalance.reset();
+          customBalance.mutate(fresh);
+        }}
+        result={customBalance.data}
+        target={customBalanceTarget}
+      />
+      <BalanceQueryConfigDialog
+        onClose={() => setBalanceQueryTarget(null)}
+        target={balanceQueryTarget}
+      />
       <AlertDialog
         onOpenChange={(open) => {
           if (!open && !remove.isPending) setDeleteTarget(null);
@@ -1251,18 +1381,23 @@ export function ProvidersPage() {
             persistedProviderModels(capabilityTarget.provider) ?? {
               provider_id: capabilityTarget.provider.id,
               status: "manual",
-              models: [
-                {
-                  id: capabilityTarget.modelId,
-                  roles: ["llm"],
-                  streaming: true,
-                  remote: true,
-                  enabled: true,
-                },
-              ],
+              models: capabilityTarget.modelId
+                ? [
+                    {
+                      id: capabilityTarget.modelId,
+                      roles: ["llm"],
+                      streaming: true,
+                      remote: true,
+                      enabled: true,
+                    },
+                  ]
+                : [],
             }
           }
           onClose={() => setCapabilityTarget(null)}
+          onConfigureBalance={() =>
+            setBalanceQueryTarget(capabilityTarget.provider)
+          }
           onSaved={(snapshot) => {
             setModels((current) => {
               const discovered = current[snapshot.provider_id];
@@ -1281,6 +1416,13 @@ export function ProvidersPage() {
             });
             void queryClient.invalidateQueries({ queryKey: ["providers"] });
           }}
+          onSetDefault={(nextModelId) =>
+            update.mutate({
+              id: capabilityTarget.provider.id,
+              enabled: capabilityTarget.provider.enabled,
+              default_model: nextModelId,
+            })
+          }
           provider={capabilityTarget.provider}
         />
       ) : null}
@@ -1306,6 +1448,8 @@ function providerRoleLabel(role: ProviderRole) {
       return "共同记忆";
     case "transcription":
       return "语音转写";
+    case "embedding":
+      return "Embedding";
   }
 }
 
@@ -1331,16 +1475,20 @@ function ProviderBalanceDialog({
     <Dialog onOpenChange={(open) => !open && onClose()} open={Boolean(target)}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>DeepSeek 账户余额</DialogTitle>
+          <DialogTitle>
+            {visibleResult?.vendor_label
+              ? `${visibleResult.vendor_label} 账户余额`
+              : "账户余额"}
+          </DialogTitle>
           <DialogDescription>
-            {target?.display_name ?? "DeepSeek"}。余额仅在你主动查询时从已配置的
-            DeepSeek 账户读取。
+            {target?.display_name ?? "Provider"}
+            。余额仅在你主动查询时从已配置的账户读取。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-1">
           {loading ? (
             <div className="py-3">
-              <LoadingState label="正在读取 DeepSeek 账户余额…" />
+              <LoadingState label="正在读取账户余额…" />
             </div>
           ) : error ? (
             <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4" role="alert">
@@ -1360,6 +1508,41 @@ function ProviderBalanceDialog({
                   查询于 {formatProviderBalanceTimestamp(visibleResult.queried_at)}
                 </p>
               </div>
+              {visibleResult.usage_windows?.length ? (
+                <div className="overflow-hidden rounded-xl border">
+                  {visibleResult.usage_windows.map((usageWindow) => (
+                    <section
+                      className="border-b p-4 last:border-b-0"
+                      key={usageWindow.label}
+                    >
+                      <div className="flex items-baseline justify-between gap-3">
+                        <p className="text-sm font-medium">{usageWindow.label}</p>
+                        <p className="font-mono text-sm font-semibold">
+                          已用 {usageWindow.used_percent.toFixed(0)}%
+                        </p>
+                      </div>
+                      <div className="mt-2 h-2 overflow-hidden rounded-full bg-muted">
+                        <div
+                          className={`h-full rounded-full ${
+                            usageWindow.used_percent >= 90
+                              ? "bg-destructive"
+                              : "bg-primary"
+                          }`}
+                          style={{
+                            width: `${Math.min(100, Math.max(0, usageWindow.used_percent))}%`,
+                          }}
+                        />
+                      </div>
+                      {usageWindow.resets_at ? (
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          将于 {formatProviderBalanceTimestamp(usageWindow.resets_at)}{" "}
+                          重置
+                        </p>
+                      ) : null}
+                    </section>
+                  ))}
+                </div>
+              ) : null}
               {visibleResult.balance_infos.length ? (
                 <div className="overflow-hidden rounded-xl border">
                   {visibleResult.balance_infos.map((balanceInfo) => (
@@ -1376,34 +1559,46 @@ function ProviderBalanceDialog({
                           )}
                         </p>
                       </div>
-                      <dl className="mt-3 grid grid-cols-2 gap-x-5 gap-y-2 text-xs">
-                        <div>
-                          <dt className="text-muted-foreground">赠送余额</dt>
-                          <dd className="mt-1 font-mono">
-                            {formatProviderBalanceAmount(
-                              balanceInfo.granted_balance,
-                              balanceInfo.currency,
-                            )}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-muted-foreground">充值余额</dt>
-                          <dd className="mt-1 font-mono">
-                            {formatProviderBalanceAmount(
-                              balanceInfo.topped_up_balance,
-                              balanceInfo.currency,
-                            )}
-                          </dd>
-                        </div>
-                      </dl>
+                      {balanceInfo.granted_balance !== null ||
+                      balanceInfo.topped_up_balance !== null ? (
+                        <dl className="mt-3 grid grid-cols-2 gap-x-5 gap-y-2 text-xs">
+                          {balanceInfo.granted_balance !== null ? (
+                            <div>
+                              <dt className="text-muted-foreground">赠送余额</dt>
+                              <dd className="mt-1 font-mono">
+                                {formatProviderBalanceAmount(
+                                  balanceInfo.granted_balance,
+                                  balanceInfo.currency,
+                                )}
+                              </dd>
+                            </div>
+                          ) : null}
+                          {balanceInfo.topped_up_balance !== null ? (
+                            <div>
+                              <dt className="text-muted-foreground">充值余额</dt>
+                              <dd className="mt-1 font-mono">
+                                {formatProviderBalanceAmount(
+                                  balanceInfo.topped_up_balance,
+                                  balanceInfo.currency,
+                                )}
+                              </dd>
+                            </div>
+                          ) : null}
+                        </dl>
+                      ) : null}
                     </section>
                   ))}
                 </div>
-              ) : (
+              ) : !visibleResult.usage_windows?.length ? (
                 <p className="rounded-xl border border-dashed p-4 text-sm text-muted-foreground">
-                  DeepSeek 未返回可展示的币种余额。
+                  未返回可展示的币种余额。
                 </p>
-              )}
+              ) : null}
+              {visibleResult.notice ? (
+                <p className="rounded-xl border bg-muted/35 p-3 text-xs leading-5 text-muted-foreground">
+                  {visibleResult.notice}
+                </p>
+              ) : null}
               <p className="text-xs leading-5 text-muted-foreground">
                 结果不会写入 Provider 配置；关闭后如需更新，请再次主动查询。
               </p>
@@ -1502,17 +1697,214 @@ type QuickProvider = {
   brandId: string;
   iconUrl: string;
   protocol: "openai" | "anthropic";
+  keyUrl?: string;
 };
 
 const QUICK_PROVIDERS: QuickProvider[] = [
-  { id: "openai", name: "OpenAI", description: "官方 Responses API", baseUrl: "https://api.openai.com/v1", brandId: "openai", iconUrl: openAiMark, protocol: "openai" },
-  { id: "deepseek", name: "DeepSeek", description: "OpenAI 兼容接口", baseUrl: "https://api.deepseek.com", brandId: "deepseek", iconUrl: "https://cdn.simpleicons.org/deepseek/4D6BFE", protocol: "openai" },
-  { id: "qwen", name: "通义千问", description: "阿里云 Model Studio", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", brandId: "qwen", iconUrl: "https://cdn.simpleicons.org/qwen", protocol: "openai" },
-  { id: "gemini", name: "Google Gemini", description: "OpenAI 兼容接口", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", brandId: "gemini", iconUrl: "https://cdn.simpleicons.org/googlegemini", protocol: "openai" },
-  { id: "mimo", name: "Xiaomi MiMo", description: "OpenAI 兼容接口", baseUrl: "https://api.xiaomimimo.com/v1", brandId: "mimo", iconUrl: "https://cdn.simpleicons.org/xiaomi", protocol: "openai" },
-  { id: "anthropic", name: "Anthropic", description: "Claude Messages API", baseUrl: "https://api.anthropic.com", brandId: "anthropic", iconUrl: "https://cdn.simpleicons.org/anthropic", protocol: "anthropic" },
-  { id: "minimax", name: "MiniMax", description: "OpenAI 兼容接口", baseUrl: "https://api.minimaxi.com/v1", brandId: "minimax", iconUrl: "https://cdn.simpleicons.org/minimax", protocol: "openai" },
+  { id: "openai", name: "OpenAI", description: "官方 Responses API", baseUrl: "https://api.openai.com/v1", brandId: "openai", iconUrl: openAiMark, protocol: "openai", keyUrl: "https://platform.openai.com/api-keys" },
+  { id: "deepseek", name: "DeepSeek", description: "OpenAI 兼容接口", baseUrl: "https://api.deepseek.com", brandId: "deepseek", iconUrl: "https://cdn.simpleicons.org/deepseek/4D6BFE", protocol: "openai", keyUrl: "https://platform.deepseek.com/api_keys" },
+  { id: "qwen", name: "通义千问", description: "阿里云 Model Studio", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", brandId: "qwen", iconUrl: "https://cdn.simpleicons.org/qwen", protocol: "openai", keyUrl: "https://bailian.console.aliyun.com/?tab=model#/api-key" },
+  { id: "gemini", name: "Google Gemini", description: "OpenAI 兼容接口", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", brandId: "gemini", iconUrl: "https://cdn.simpleicons.org/googlegemini", protocol: "openai", keyUrl: "https://aistudio.google.com/apikey" },
+  { id: "mimo", name: "Xiaomi MiMo", description: "OpenAI 兼容接口", baseUrl: "https://api.xiaomimimo.com/v1", brandId: "mimo", iconUrl: "https://cdn.simpleicons.org/xiaomi", protocol: "openai", keyUrl: "https://platform.xiaomimimo.com/#/console/api-keys" },
+  { id: "anthropic", name: "Anthropic", description: "Claude Messages API", baseUrl: "https://api.anthropic.com", brandId: "anthropic", iconUrl: "https://cdn.simpleicons.org/anthropic", protocol: "anthropic", keyUrl: "https://platform.claude.com/settings/keys" },
+  { id: "minimax", name: "MiniMax", description: "OpenAI 兼容接口", baseUrl: "https://api.minimaxi.com/v1", brandId: "minimax", iconUrl: "https://cdn.simpleicons.org/minimax", protocol: "openai", keyUrl: "https://platform.minimaxi.com/user-center/basic-information/interface-key" },
 ];
+
+type RoleQuickProvider = {
+  id: string;
+  name: string;
+  description: string;
+  baseUrl: string;
+  brandId?: string;
+  iconUrl?: string;
+  keyUrl?: string;
+  providerType: string;
+  isCustom?: boolean;
+};
+
+function roleQuickProviders(
+  role: ProviderRole,
+  catalog: ProviderTypeCatalogItem[],
+): RoleQuickProvider[] {
+  const findType = (providerType: string) =>
+    catalog.find(
+      (item) => item.create_allowed && item.provider_type === providerType,
+    );
+  const compatibleChat = findType("openai_compatible_chat");
+  const qwenChat = findType("qwen");
+  const openAi = findType("openai_responses");
+  const openAiVision = findType("openai_responses_vision");
+  const compatibleVision = findType("openai_compatible_vision");
+  const openAiImages = findType("openai_images");
+
+  if (role === "model") {
+    return QUICK_PROVIDERS.flatMap((preset) => {
+      const providerType =
+        preset.id === "openai"
+          ? openAi?.provider_type
+          : preset.id === "qwen"
+            ? (qwenChat ?? compatibleChat)?.provider_type
+            : preset.protocol === "anthropic"
+              ? findType("anthropic_messages")?.provider_type
+              : compatibleChat?.provider_type;
+      return providerType ? [{ ...preset, providerType }] : [];
+    });
+  }
+
+  if (role === "vision") {
+    return QUICK_PROVIDERS.flatMap((preset) => {
+      // DeepSeek does not currently expose a supported vision preset.
+      if (preset.id === "deepseek" || preset.protocol === "anthropic") return [];
+      const providerType =
+        preset.id === "openai"
+          ? openAiVision?.provider_type
+          : compatibleVision?.provider_type;
+      return providerType ? [{ ...preset, providerType }] : [];
+    });
+  }
+
+  if (role === "image_generation" && openAiImages) {
+    const imageBrands = new Set(["openai", "gemini", "qwen"]);
+    return QUICK_PROVIDERS.filter((preset) => imageBrands.has(preset.id)).map(
+      (preset) => ({ ...preset, providerType: openAiImages.provider_type }),
+    );
+  }
+
+  return catalog
+    .filter((item) => item.create_allowed && item.role === role)
+    .map((item) => ({
+      id: item.provider_type,
+      name: item.label,
+      description: item.description,
+      baseUrl: item.default_base_url ?? "",
+      brandId: item.brand_id ?? undefined,
+      iconUrl:
+        item.brand_id === "openai" || item.brand_id === "openai_compatible"
+          ? openAiMark
+          : (item.brand_icon_url ?? undefined),
+      keyUrl: item.key_management_url ?? undefined,
+      providerType: item.provider_type,
+    }));
+}
+
+function CodexDeviceLoginPanel({
+  hasCredential,
+  onAuthorized,
+}: {
+  hasCredential: boolean;
+  onAuthorized: (secret: string, planType: string | null) => void;
+}) {
+  const [login, setLogin] = useState<CodexDeviceLoginStart | null>(null);
+  const [error, setError] = useState<string>();
+  const [waiting, setWaiting] = useState(false);
+
+  const start = useMutation({
+    mutationFn: startCodexDeviceLogin,
+    onSuccess: (data) => {
+      setError(undefined);
+      setLogin(data);
+      setWaiting(true);
+      window.open(data.verification_url, "_blank", "noopener,noreferrer");
+    },
+    onError: (mutationError: Error) => setError(mutationError.message),
+  });
+
+  useEffect(() => {
+    if (!login || !waiting) return;
+    let cancelled = false;
+    // The device code expires after 15 minutes upstream; stop polling then so
+    // a forgotten dialog cannot keep calling the login endpoint forever.
+    const deadline = Date.now() + 15 * 60 * 1000;
+    const timer = window.setInterval(async () => {
+      if (cancelled) return;
+      if (Date.now() > deadline) {
+        setWaiting(false);
+        setError("设备码已过期，请重新发起直登。");
+        return;
+      }
+      try {
+        const result = await pollCodexDeviceLogin({
+          device_auth_id: login.device_auth_id,
+          user_code: login.user_code,
+        });
+        if (cancelled || result.status !== "authorized" || !result.api_key) return;
+        setWaiting(false);
+        onAuthorized(result.api_key, result.plan_type);
+        toast.success("Codex 直登成功，凭据已填入");
+      } catch (pollError) {
+        if (cancelled) return;
+        setWaiting(false);
+        setError(
+          pollError instanceof Error ? pollError.message : "Codex 直登轮询失败",
+        );
+      }
+    }, Math.max(1, login.interval_seconds) * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [login, waiting, onAuthorized]);
+
+  return (
+    <div className="space-y-2 rounded-xl border bg-muted/25 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-medium">
+          使用 ChatGPT 账号直登（设备码授权）
+        </p>
+        <Button
+          disabled={start.isPending || waiting}
+          onClick={() => start.mutate()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          <LockKeyhole className="size-3" />
+          {waiting ? "等待授权…" : hasCredential ? "重新直登" : "开始直登"}
+        </Button>
+      </div>
+      {login ? (
+        <div className="space-y-1.5">
+          <p className="text-xs text-muted-foreground">
+            在打开的页面输入配对码后完成授权；本页会自动收取凭据。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="rounded-md border bg-background px-2 py-1 font-mono text-sm tracking-widest">
+              {login.user_code}
+            </code>
+            <a
+              className="text-xs text-primary underline-offset-4 hover:underline"
+              href={login.verification_url}
+              rel="noreferrer"
+              target="_blank"
+            >
+              重新打开授权页 ↗
+            </a>
+          </div>
+        </div>
+      ) : null}
+      {error ? (
+        <p className="text-xs text-destructive" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function QuickBrandIcon({ iconUrl, name }: { iconUrl?: string; name: string }) {
+  const [failedUrl, setFailedUrl] = useState<string>();
+  if (!iconUrl || failedUrl === iconUrl) {
+    return <Bot className="size-4 text-foreground" />;
+  }
+  return (
+    <img
+      alt={`${name} 图标`}
+      className="size-6 object-contain"
+      onError={() => setFailedUrl(iconUrl)}
+      src={iconUrl}
+    />
+  );
+}
 
 function providerQuickBrand(provider: Provider): QuickProvider | undefined {
   const brandId = String(provider.capabilities.brand_id ?? "").toLowerCase();
@@ -1533,6 +1925,7 @@ function ProviderDialog({
   catalog,
   catalogError,
   catalogPending,
+  initialRole,
   onCreate,
   secretStoreAvailable,
 }: {
@@ -1540,6 +1933,7 @@ function ProviderDialog({
   catalog: ProviderTypeCatalogItem[];
   catalogError?: string;
   catalogPending: boolean;
+  initialRole?: ProviderRole;
   onCreate: (payload: {
     display_name: string;
     provider_type: string;
@@ -1558,6 +1952,7 @@ function ProviderDialog({
     "fetch",
     "deep_research",
     "transcription",
+    "embedding",
     "memory",
   ];
   const roles = (
@@ -1574,10 +1969,6 @@ function ProviderDialog({
   const openAiPreset = catalog.find(
     (item) => item.create_allowed && item.provider_type === "openai_responses",
   );
-  const anthropicPreset = catalog.find(
-    (item) => item.create_allowed && item.provider_type === "anthropic_messages",
-  );
-
   const [name, setName] = useState("DeepSeek");
   const [role, setRole] = useState<ProviderRole>("model");
   const [type, setType] = useState("openai_compatible_chat");
@@ -1590,6 +1981,7 @@ function ProviderDialog({
 
   const selected = catalog.find((item) => item.provider_type === type);
   const roleTypes = creatable.filter((item) => item.role === role);
+  const quickProviders = roleQuickProviders(role, catalog);
 
   useEffect(() => {
     if (!catalog.length) return;
@@ -1618,6 +2010,16 @@ function ProviderDialog({
     setType(next.provider_type);
     setRole(next.role);
     setDeepSeekPresetActive(false);
+    // A stale quick preset would keep stamping its brand_id and key link onto
+    // a protocol the user picked manually. Non-model roles list the same
+    // provider types as quick cards, so keep those in sync instead.
+    setQuickPreset(
+      roleQuickProviders(next.role, catalog).some(
+        (item) => item.id === next.provider_type,
+      )
+        ? next.provider_type
+        : "",
+    );
     setBaseUrl(next.default_base_url ?? "");
     if (next.provider_type === "openai_responses") {
       setName("OpenAI");
@@ -1641,7 +2043,9 @@ function ProviderDialog({
   function selectRole(nextRole: ProviderRole) {
     setRole(nextRole);
     const first = creatable.find((item) => item.role === nextRole);
-    if (first) applyCatalogItem(first);
+    if (first) {
+      applyCatalogItem(first);
+    }
   }
 
   function selectType(nextType: string) {
@@ -1658,25 +2062,37 @@ function ProviderDialog({
 
   function selectQuickProvider(kind: string) {
     if (kind === "compatible") {
-      if (!compatiblePreset) return;
-      applyCatalogItem(compatiblePreset);
+      const compatible =
+        role === "vision"
+          ? catalog.find(
+              (item) =>
+                item.create_allowed &&
+                item.provider_type === "openai_compatible_vision",
+            )
+          : role === "model"
+            ? compatiblePreset
+            : roleTypes[0];
+      if (!compatible) return;
+      applyCatalogItem(compatible);
       setQuickPreset(kind);
       return;
     }
-    const preset = QUICK_PROVIDERS.find((item) => item.id === kind);
+    const preset = quickProviders.find((item) => item.id === kind);
     if (!preset) return;
-    if (preset.id === "deepseek") {
-      if (!compatiblePreset) return;
+    const next = catalog.find(
+      (item) =>
+        item.create_allowed && item.provider_type === preset.providerType,
+    );
+    if (!next) return;
+    if (role === "model" && preset.id === "deepseek") {
       setQuickPreset(preset.id);
-      setType(compatiblePreset.provider_type);
-      setRole(compatiblePreset.role);
+      setType(next.provider_type);
+      setRole(next.role);
       setBaseUrl(preset.baseUrl);
       setName(preset.name);
       setDeepSeekPresetActive(true);
       return;
     }
-    const next = preset.protocol === "anthropic" ? anthropicPreset : preset.id === "openai" ? openAiPreset : compatiblePreset;
-    if (!next) return;
     setType(next.provider_type);
     setRole(next.role);
     setDeepSeekPresetActive(false);
@@ -1684,6 +2100,28 @@ function ProviderDialog({
     setName(preset.name);
     setQuickPreset(preset.id);
   }
+
+  const activeQuickProvider = quickProviders.find(
+    (item) => item.id === quickPreset,
+  );
+  // For vendor-neutral "compatible" types the key console only matches while
+  // the Base URL still points at the prefilled official endpoint.
+  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+  const quickKeyUrl =
+    activeQuickProvider?.keyUrl &&
+    (activeQuickProvider.brandId !== "openai_compatible" ||
+      normalizedBaseUrl === activeQuickProvider.baseUrl.replace(/\/+$/, ""))
+      ? activeQuickProvider.keyUrl
+      : undefined;
+  const specKeyUrl =
+    selected?.key_management_url &&
+    (selected.brand_id !== "openai_compatible" ||
+      normalizedBaseUrl ===
+        (selected.default_base_url ?? "").replace(/\/+$/, ""))
+      ? selected.key_management_url
+      : undefined;
+  const apiKeyUrl = quickKeyUrl ?? specKeyUrl;
+  const isCodex = type === "codex_chatgpt";
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -1702,11 +2140,8 @@ function ProviderDialog({
     if (deepSeekPresetActive) {
       capabilities.model_family = "deepseek";
     }
-    const selectedQuickProvider = QUICK_PROVIDERS.find(
-      (item) => item.id === quickPreset,
-    );
-    if (selectedQuickProvider) {
-      capabilities.brand_id = selectedQuickProvider.brandId;
+    if (activeQuickProvider?.brandId) {
+      capabilities.brand_id = activeQuickProvider.brandId;
     }
     onCreate({
       display_name: name.trim(),
@@ -1720,7 +2155,17 @@ function ProviderDialog({
   const isDeepSeekQuick = deepSeekPresetActive && quickPreset === "deepseek";
 
   return (
-    <Dialog>
+    <Dialog
+      onOpenChange={(open) => {
+        if (
+          open &&
+          initialRole &&
+          creatable.some((item) => item.role === initialRole)
+        ) {
+          selectRole(initialRole);
+        }
+      }}
+    >
       <DialogTrigger asChild>
         <Button disabled={catalogPending || Boolean(catalogError)} size="sm">
           <Plus className="size-4" />
@@ -1745,57 +2190,6 @@ function ProviderDialog({
               </p>
             ) : null}
             <div className="space-y-2">
-              <Label>快捷接入</Label>
-              <div className="grid max-h-56 grid-cols-2 gap-2 overflow-y-auto pr-1 sm:grid-cols-3">
-                {QUICK_PROVIDERS.map((preset) => (
-                  <button
-                    aria-pressed={quickPreset === preset.id}
-                    className={`flex min-h-16 items-center gap-2 rounded-lg border p-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${quickPreset === preset.id ? "border-primary bg-primary/5" : "border-border bg-background hover:border-primary/45 hover:bg-muted/35"}`}
-                    disabled={catalogPending || (preset.protocol === "anthropic" ? !anthropicPreset : preset.id === "openai" ? !openAiPreset : !compatiblePreset)}
-                    key={preset.id}
-                    onClick={() => selectQuickProvider(preset.id)}
-                    type="button"
-                  >
-                    <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-white p-1 shadow-sm ring-1 ring-black/5">
-                      <img alt={`${preset.name} 图标`} className="size-6 object-contain" src={preset.iconUrl} />
-                    </span>
-                    <span className="min-w-0"><span className="block truncate text-xs font-medium">{preset.name}</span><span className="mt-0.5 block truncate text-[10px] text-muted-foreground">{preset.description}</span></span>
-                  </button>
-                ))}
-                <button
-                  aria-pressed={
-                    quickPreset === "compatible"
-                  }
-                  className={`flex min-h-20 items-center gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                    quickPreset === "compatible"
-                      ? "border-primary bg-primary/5"
-                      : "border-border bg-background hover:border-primary/45 hover:bg-muted/35"
-                  }`}
-                  disabled={catalogPending || !compatiblePreset}
-                  onClick={() => selectQuickProvider("compatible")}
-                  type="button"
-                >
-                  <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted">
-                    <Bot className="size-4" />
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block text-sm font-medium">自定义兼容</span>
-                    <span className="mt-0.5 block text-xs text-muted-foreground">
-                      OpenAI-compatible / 中转站
-                    </span>
-                  </span>
-                </button>
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="provider-name">显示名称</Label>
-              <Input
-                id="provider-name"
-                onChange={(event) => setName(event.target.value)}
-                value={name}
-              />
-            </div>
-            <div className="space-y-2">
               <Label>服务能力</Label>
               <div
                 className="flex flex-wrap gap-2"
@@ -1819,6 +2213,57 @@ function ProviderDialog({
                   </button>
                 ))}
               </div>
+            </div>
+            <div className="space-y-2">
+              <Label>快捷接入</Label>
+              <div className="grid max-h-56 grid-cols-2 gap-2 overflow-y-auto pr-1 sm:grid-cols-3">
+                {quickProviders.map((preset) => (
+                  <button
+                    aria-pressed={quickPreset === preset.id}
+                    className={`flex min-h-16 items-center gap-2 rounded-lg border p-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${quickPreset === preset.id ? "border-primary bg-primary/5" : "border-border bg-background hover:border-primary/45 hover:bg-muted/35"}`}
+                    disabled={catalogPending}
+                    key={preset.id}
+                    onClick={() => selectQuickProvider(preset.id)}
+                    type="button"
+                  >
+                    <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-white p-1 shadow-sm ring-1 ring-black/5">
+                      <QuickBrandIcon iconUrl={preset.iconUrl} name={preset.name} />
+                    </span>
+                    <span className="min-w-0"><span className="block truncate text-xs font-medium">{preset.name}</span><span className="mt-0.5 block truncate text-[10px] text-muted-foreground">{preset.description}</span></span>
+                  </button>
+                ))}
+                <button
+                  aria-pressed={
+                    quickPreset === "compatible"
+                  }
+                  className={`flex min-h-20 items-center gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                    quickPreset === "compatible"
+                      ? "border-primary bg-primary/5"
+                      : "border-border bg-background hover:border-primary/45 hover:bg-muted/35"
+                  }`}
+                  disabled={catalogPending || !compatiblePreset}
+                  onClick={() => selectQuickProvider("compatible")}
+                  type="button"
+                >
+                  <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted">
+                    <Bot className="size-4" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium">自定义兼容</span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      自定义地址与鉴权
+                    </span>
+                  </span>
+                </button>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="provider-name">显示名称</Label>
+              <Input
+                id="provider-name"
+                onChange={(event) => setName(event.target.value)}
+                value={name}
+              />
             </div>
             <div className="space-y-2">
               <Label>协议类型</Label>
@@ -1854,7 +2299,7 @@ function ProviderDialog({
               </div>
               {selected ? (
                 <div className="space-y-1.5">
-                  {selected.documentation_url || selected.key_management_url ? (
+                  {selected.documentation_url || isDeepSeekQuick ? (
                     <div className="flex flex-wrap gap-3 text-xs">
                       {selected.documentation_url ? (
                         <a
@@ -1864,16 +2309,6 @@ function ProviderDialog({
                           target="_blank"
                         >
                           官方文档
-                        </a>
-                      ) : null}
-                      {selected.key_management_url ? (
-                        <a
-                          className="text-primary underline-offset-4 hover:underline"
-                          href={selected.key_management_url}
-                          rel="noreferrer"
-                          target="_blank"
-                        >
-                          获取 API Key
                         </a>
                       ) : null}
                       {isDeepSeekQuick ? (
@@ -1914,17 +2349,51 @@ function ProviderDialog({
               </p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="provider-key">
-                API Key{selected?.requires_secret ? "（启用必填）" : "（可选）"}
-              </Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="provider-key">
+                  {isCodex ? "Codex 凭据" : "API Key"}
+                  {selected?.requires_secret ? "（启用必填）" : "（可选）"}
+                </Label>
+                {apiKeyUrl && !isCodex ? (
+                  <a
+                    className="text-xs text-primary underline-offset-4 hover:underline"
+                    href={apiKeyUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    获取 API Key ↗
+                  </a>
+                ) : null}
+              </div>
+              {isCodex ? (
+                <CodexDeviceLoginPanel
+                  hasCredential={Boolean(key)}
+                  onAuthorized={(secret, planType) => {
+                    setKey(secret);
+                    setName(
+                      planType ? `Codex（${planType}）` : "Codex 官方直登",
+                    );
+                  }}
+                />
+              ) : null}
               <Input
                 autoComplete="off"
                 id="provider-key"
                 onChange={(event) => setKey(event.target.value)}
-                placeholder="仅提交一次"
+                placeholder={
+                  isCodex
+                    ? "直登后自动填入，也可粘贴 ~/.codex/auth.json 内容"
+                    : "仅提交一次"
+                }
                 type="password"
                 value={key}
               />
+              {isCodex ? (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  凭据为 ChatGPT OAuth 令牌，按订阅计划计费而非 API 额度。令牌会自动续期，
+                  续期后的新令牌将加密保存。
+                </p>
+              ) : null}
             </div>
             <div className="space-y-2">
               <Label htmlFor="provider-create-headers">
@@ -1976,23 +2445,38 @@ const reasoningModes: Exclude<ThinkingMode, "off">[] = [
   "xhigh",
 ];
 const searchRoutes: SearchRoute[] = [
-  "disabled",
+  "auto",
   "model_native",
   "external",
-  "local",
-  "auto",
 ];
+
+function normalizeDefaultSearchRoute(route: SearchRoute | undefined): SearchRoute {
+  if (route === "model_native" || route === "external" || route === "auto") {
+    return route;
+  }
+  // Legacy "disabled" and "local" values are no longer exposed by this
+  // default-routing control.
+  return route === "local" ? "external" : "auto";
+}
 
 function emptyModelCapabilities(): ProviderModelCapabilities {
   return {
-    reasoning_efforts: [],
-    thinking_mapping: {},
-    default_thinking_mode: "off",
+    // New LLM connections default to reasoning on; unsupported models can be
+    // narrowed in their individual override.
+    reasoning_efforts: ["low", "medium", "high", "xhigh"],
+    thinking_mapping: { low: "low", medium: "medium", high: "high", xhigh: "xhigh" },
+    default_thinking_mode: "medium",
     reasoning_parameter: "reasoning_effort",
+    thinking_required: false,
     hosted_web_search: false,
+    hosted_web_fetch: false,
+    hosted_image_search: false,
     supports_image_input: false,
+    supports_video_input: false,
+    supports_structured_output: false,
+    supports_agent_tools: true,
     image_input_mode: "auto",
-    default_search_route: "disabled",
+    default_search_route: "auto",
     capability_source: "user_declared",
     context_window_tokens: 256_000,
     context_limit_tokens: 256_000,
@@ -2000,18 +2484,35 @@ function emptyModelCapabilities(): ProviderModelCapabilities {
   };
 }
 
+function parseThinkingMappingValue(
+  value: string,
+  parameter: ReasoningParameter,
+): string | number | boolean | null {
+  const normalized = value.trim();
+  if (!normalized) return null;
+  if (parameter === "enable_thinking") {
+    return normalized.toLowerCase() === "true";
+  }
+  if (parameter === "thinking_budget") {
+    const parsed = Number.parseInt(normalized, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return normalized;
+}
+
 function searchRouteLabel(route: SearchRoute) {
   switch (route) {
-    case "disabled":
-      return "禁用联网";
     case "model_native":
-      return "模型原生联网";
+      return "仅原生";
     case "external":
-      return "外部 Search Provider";
-    case "local":
-      return "本地 Search Provider";
+      return "仅外挂";
     case "auto":
-      return "按已授权链路自动选择";
+      return "自动（有原生则原生，否则外挂搜索）";
+    // Retain labels for legacy values that can still arrive from saved data.
+    case "disabled":
+      return "自动（有原生则原生，否则外挂搜索）";
+    case "local":
+      return "仅外挂";
   }
 }
 
@@ -2033,83 +2534,409 @@ function providerStatusLabel(status: string, enabled: boolean): string {
 }
 
 function ModelCapabilitiesDialog({
-  modelId,
   models,
   onClose,
+  onConfigureBalance,
   onSaved,
+  onSetDefault,
   provider,
 }: {
   modelId: string;
   models: ProviderModelsResponse;
   onClose: () => void;
+  onConfigureBalance: () => void;
   onSaved: (snapshot: ProviderModelCapabilityView) => void;
+  onSetDefault: (modelId: string) => void;
   provider: Provider;
 }) {
   const queryClient = useQueryClient();
-  const [selectedModelId, setSelectedModelId] = useState(modelId);
-  const [editScope, setEditScope] = useState<"group" | "model">("group");
+  // "none" keeps the dialog lightweight: the template form only appears after
+  // an explicit edit action. Per-model parameters open in a nested dialog.
+  const [editScope, setEditScope] = useState<"none" | "group">("none");
+  const [editModelId, setEditModelId] = useState<string | null>(null);
+  const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
+  const [headers, setHeaders] = useState(() => stringifyExtraHeaders(providerExtraHeaders(provider)));
+  const [secret, setSecret] = useState("");
   const [modelStates, setModelStates] = useState<Record<string, boolean>>(
     Object.fromEntries(models.models.map((model) => [model.id, model.enabled !== false])),
   );
-  const capabilitiesQuery = useQuery({
-    queryKey: ["provider-model-capabilities", provider.id, selectedModelId],
-    queryFn: () => getProviderModelCapabilities(provider.id, selectedModelId),
-    retry: false,
-    enabled: editScope === "model",
-  });
-  const snapshotMissing =
-    capabilitiesQuery.error instanceof ApiError &&
-    capabilitiesQuery.error.code === "model_capabilities_not_found";
   const [capabilities, setCapabilities] =
     useState<ProviderModelCapabilities>(emptyModelCapabilities);
 
+  const templateRaw = provider.capabilities.model_defaults;
+  const templateConfigured = Boolean(
+    templateRaw &&
+      typeof templateRaw === "object" &&
+      !Array.isArray(templateRaw) &&
+      Object.keys(templateRaw as Record<string, unknown>).length > 0,
+  );
+  // Absent flag = on for providers that already carry a template (legacy data).
+  const [templateOn, setTemplateOn] = useState(() =>
+    typeof provider.capabilities.model_defaults_enabled === "boolean"
+      ? provider.capabilities.model_defaults_enabled
+      : templateConfigured,
+  );
+
   useEffect(() => {
-    if (editScope === "group") {
-      const defaults = provider.capabilities.model_defaults;
-      setCapabilities({
-        ...emptyModelCapabilities(),
-        ...(defaults && typeof defaults === "object" && !Array.isArray(defaults)
-          ? defaults
-          : {}),
-      } as ProviderModelCapabilities);
-    } else if (capabilitiesQuery.data) {
-      const next = capabilitiesQuery.data.capabilities;
-      setCapabilities({
-        ...emptyModelCapabilities(),
-        ...next,
-        image_input_mode: next.image_input_mode ?? "auto",
-      });
-    } else if (snapshotMissing) {
-      setCapabilities(emptyModelCapabilities());
-    }
-  }, [capabilitiesQuery.data, editScope, provider.capabilities.model_defaults, snapshotMissing]);
+    if (editScope !== "group") return;
+    const defaults = provider.capabilities.model_defaults;
+    const merged = {
+      ...emptyModelCapabilities(),
+      ...(defaults && typeof defaults === "object" && !Array.isArray(defaults)
+        ? defaults
+        : {}),
+    } as ProviderModelCapabilities;
+    setCapabilities({
+      ...merged,
+      default_search_route: normalizeDefaultSearchRoute(merged.default_search_route),
+    });
+  }, [editScope, provider.capabilities.model_defaults]);
 
   const save = useMutation({
     mutationFn: (payload: ProviderModelCapabilities) =>
-      editScope === "group"
-        ? updateProviderModelGroupCapabilities(provider.id, payload)
-        : updateProviderModelCapabilities(provider.id, selectedModelId, payload),
+      updateProviderModelGroupCapabilities(provider.id, payload),
     onSuccess: (snapshot) => {
-      queryClient.setQueryData(
-        ["provider-model-capabilities", provider.id, selectedModelId],
-        snapshot,
-      );
       onSaved(snapshot);
-      toast.success("模型能力快照已保存");
+      toast.success("全局模板已保存");
       onClose();
     },
     onError: (error) => toast.error(error.message),
   });
-  const updateModelState = useMutation({
-    mutationFn: () => updateProviderModelStates(provider.id, modelStates),
-    onSuccess: (result) => {
-      setModelStates(result.states);
+  const toggleTemplate = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateProvider(provider.id, { model_defaults_enabled: enabled }),
+    onSuccess: (_, enabled) => {
+      toast.success(
+        enabled
+          ? "全局覆盖已开启，全部模型将遵从全局模板"
+          : "全局覆盖已关闭，各模型使用自身默认配置",
+      );
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      toast.success("模型列表已更新");
+    },
+    onError: (error, enabled) => {
+      setTemplateOn(!enabled);
+      toast.error(error.message);
+    },
+  });
+  const syncCatalogDefaults = useMutation({
+    mutationFn: () =>
+      syncProviderModelCatalogDefaults(
+        provider.id,
+        models.models.map((model) => model.id),
+      ),
+    onSuccess: (result) => {
+      for (const snapshot of result.models) {
+        queryClient.setQueryData(
+          ["provider-model-capabilities", provider.id, snapshot.model_id],
+          snapshot,
+        );
+        onSaved(snapshot);
+      }
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      toast.success(`已为 ${result.models.length} 个模型同步官方默认参数`);
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const updateConnection = useMutation({
+    mutationFn: () => updateProvider(provider.id, {
+      base_url: baseUrl.trim() || null,
+      extra_headers: parseExtraHeadersInput(headers),
+    }),
+    onSuccess: () => {
+      toast.success("连接配置已保存");
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const rotateSecretHere = useMutation({
+    mutationFn: () => rotateProviderSecret(provider.id, secret),
+    onSuccess: () => {
+      setSecret("");
+      toast.success("Secret 已更新");
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
     onError: (error) => toast.error(error.message),
   });
 
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    if (editScope === "none") {
+      // Nothing is being edited — the footer action only commits the model
+      // on/off switches.
+      updateProviderModelStates(provider.id, modelStates)
+        .then(() => {
+          toast.success("模型开关已保存");
+          void queryClient.invalidateQueries({ queryKey: ["providers"] });
+          onClose();
+        })
+        .catch((error: Error) => toast.error(error.message));
+      return;
+    }
+    if (
+      capabilities.default_thinking_mode !== "off" &&
+      !capabilities.reasoning_efforts.includes(capabilities.default_thinking_mode)
+    ) {
+      toast.error("默认思考模式必须已列入支持的推理强度");
+      return;
+    }
+    if (
+      capabilities.default_search_route === "model_native" &&
+      !capabilities.hosted_web_search
+    ) {
+      toast.error("模型原生联网需要先确认托管网页搜索能力");
+      return;
+    }
+    // Model switches are part of this supplier configuration and commit with
+    // the footer action, rather than requiring a second "apply" step.
+    updateProviderModelStates(provider.id, modelStates)
+      .then(() => save.mutate(capabilities))
+      .catch((error: Error) => toast.error(error.message));
+  }
+
+  const overridesRaw = provider.capabilities.models;
+  const overrideModelIds =
+    overridesRaw &&
+    typeof overridesRaw === "object" &&
+    !Array.isArray(overridesRaw)
+      ? Object.keys(overridesRaw as Record<string, unknown>)
+      : [];
+  const balanceConfig = providerBalanceQueryConfig(provider);
+  const balanceLast = balanceConfig?.enabled
+    ? providerBalanceQueryLastResult(provider)
+    : null;
+  return (
+    <Dialog onOpenChange={(open) => !open && !save.isPending && onClose()} open>
+      <DialogContent className="h-[min(88dvh,860px)] overflow-hidden p-0 sm:max-w-3xl">
+        <form className="flex min-h-0 flex-1 flex-col" onSubmit={submit}>
+          <DialogHeader className="shrink-0 border-b px-5 py-5 pr-14">
+            <DialogTitle>供应商配置</DialogTitle>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5">
+            <div className="space-y-5 py-5">
+              <section className="space-y-3 rounded-xl border p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold">全局模板</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      开启后模板覆盖该供应商全部模型；关闭后各模型使用自身默认配置。
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      disabled={
+                        models.models.length === 0 || syncCatalogDefaults.isPending
+                      }
+                      onClick={() => syncCatalogDefaults.mutate()}
+                      size="xs"
+                      title={
+                        models.models.length > 0
+                          ? "为模型列表中的全部模型写入官方目录默认参数"
+                          : "请先发现模型"
+                      }
+                      type="button"
+                      variant="outline"
+                    >
+                      {syncCatalogDefaults.isPending
+                        ? "同步中…"
+                        : "一键同步官方默认参数"}
+                    </Button>
+                    <Button
+                      onClick={() =>
+                        setEditScope(editScope === "group" ? "none" : "group")
+                      }
+                      size="xs"
+                      type="button"
+                      variant={editScope === "group" ? "default" : "outline"}
+                    >
+                      {editScope === "group" ? "收起编辑" : "编辑全局模板"}
+                    </Button>
+                    <label className="flex items-center gap-2 rounded-lg border px-2.5 py-1 text-xs font-medium">
+                      全局覆盖
+                      <Switch
+                        checked={templateOn}
+                        disabled={toggleTemplate.isPending}
+                        onCheckedChange={(checked) => {
+                          setTemplateOn(checked);
+                          toggleTemplate.mutate(checked);
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1.5 text-[11px]">
+                  <span
+                    className={`rounded-md border px-1.5 py-0.5 font-medium ${
+                      templateConfigured && templateOn
+                        ? "border-primary/30 bg-primary/10 text-primary"
+                        : "bg-muted/50 text-muted-foreground"
+                    }`}
+                  >
+                    {templateConfigured
+                      ? templateOn
+                        ? "全局覆盖已开启 · 模板对全部模型生效"
+                        : "模板已保存 · 全局覆盖已关闭"
+                      : "未配置模板参数"}
+                  </span>
+                  <span className="rounded-md border bg-muted/50 px-1.5 py-0.5 text-muted-foreground">
+                    {overrideModelIds.length > 0
+                      ? `${overrideModelIds.length} 个模型有单独配置`
+                      : "无单模型配置"}
+                  </span>
+                </div>
+                {templateOn && !templateConfigured ? (
+                  <p className="rounded-lg bg-muted px-3 py-2 text-xs">
+                    全局覆盖已开启，但尚未保存模板参数；请点击「编辑全局模板」完成配置。
+                  </p>
+                ) : editScope === "none" ? (
+                  <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                    模板参数表单在点击「编辑全局模板」后展开；单个模型的参数请在模型行「编辑」弹出的窗口中调整。
+                  </p>
+                ) : null}
+              </section>
+              <section className="space-y-3 rounded-xl border p-4">
+                <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => setModelStates(Object.fromEntries(models.models.map((model) => [model.id, true])))} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => setModelStates(Object.fromEntries(models.models.map((model) => [model.id, false])))} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="max-h-48 divide-y overflow-y-auto rounded-lg border">
+                  {models.models.length === 0 ? (
+                    <p className="px-3 py-4 text-xs text-muted-foreground">
+                      尚未发现模型。可先在列表中「发现模型」，或直接编辑全局模板。
+                    </p>
+                  ) : null}
+                  {models.models.map((model) => (
+                    <div
+                      className="flex items-center gap-3 px-3 py-2 text-xs"
+                      key={model.id}
+                    >
+                      <span className="min-w-0 flex-1 truncate font-mono">{model.id}</span>
+                      {overrideModelIds.includes(model.id) ? (
+                        <span
+                          className="rounded border px-1 py-0.5 text-[10px] text-muted-foreground"
+                          title="该模型有单独配置；全局覆盖开启时以全局模板为准"
+                        >
+                          单独配置
+                        </span>
+                      ) : null}
+                      {provider.capabilities.default_model === model.id ? null : (
+                        <Button onClick={() => onSetDefault(model.id)} size="xs" type="button" variant="ghost">设为默认</Button>
+                      )}
+                      <Button onClick={() => setEditModelId(model.id)} size="xs" type="button" variant="ghost"><Pencil className="size-3" />编辑</Button>
+                      <Switch
+                        checked={modelStates[model.id] === true}
+                        onCheckedChange={(checked) =>
+                          setModelStates((current) => ({
+                            ...current,
+                            [model.id]: checked,
+                          }))
+                        }
+                      />
+                      {provider.capabilities.default_model === model.id ? (
+                        <span className="text-muted-foreground">默认</span>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </section>
+              {editScope === "group" ? (
+                <CapabilityFormFields
+                  capabilities={capabilities}
+                  idPrefix={`group-${provider.id}`}
+                  providerType={provider.provider_type}
+                  setCapabilities={setCapabilities}
+                />
+              ) : null}
+              <section className="space-y-3 rounded-xl border p-4">
+                <div>
+                  <p className="text-sm font-semibold">连接配置</p>
+                  <p className="mt-1 text-xs text-muted-foreground">URL、请求头和 Secret 统一在这里维护。</p>
+                </div>
+                <Label>Base URL<Input className="mt-2" onChange={(event) => setBaseUrl(event.target.value)} value={baseUrl} /></Label>
+                <Label>请求头（JSON 对象）<Textarea className="mt-2 min-h-20 font-mono text-xs" onChange={(event) => setHeaders(event.target.value)} value={headers} /></Label>
+                <div className="flex flex-wrap items-end gap-2">
+                  <Label className="min-w-52 flex-1">替换 Secret<Input className="mt-2" onChange={(event) => setSecret(event.target.value)} placeholder="输入新 Secret" type="password" value={secret} /></Label>
+                  <Button disabled={updateConnection.isPending} onClick={() => updateConnection.mutate()} type="button" variant="outline">保存连接</Button>
+                  <Button disabled={!secret.trim() || rotateSecretHere.isPending} onClick={() => rotateSecretHere.mutate()} type="button" variant="outline">更新 Secret</Button>
+                </div>
+              </section>
+              <section className="space-y-3 rounded-xl border p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold">余额查询</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {balanceConfig?.enabled
+                        ? `自定义脚本已启用${
+                            balanceConfig.auto_query_interval_minutes > 0
+                              ? ` · 每 ${balanceConfig.auto_query_interval_minutes} 分钟自动查询`
+                              : ""
+                          }`
+                        : "当前使用官方内置方式；可切换为自定义脚本（兼容 cc-switch）。"}
+                    </p>
+                    {balanceLast ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {formatBalanceQuerySummary(balanceLast)} ·{" "}
+                        {relativeTimeLabel(balanceLast.queried_at)}
+                      </p>
+                    ) : null}
+                  </div>
+                  <Button
+                    onClick={onConfigureBalance}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    <Settings2 className="size-3" />
+                    配置余额查询
+                  </Button>
+                </div>
+              </section>
+              {save.isError ? (
+                <p className="text-sm text-destructive" role="alert">
+                  {save.error.message}
+                </p>
+              ) : null}
+            </div>
+          </div>
+          <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none rounded-b-2xl px-5 py-4">
+            <Button
+              disabled={save.isPending}
+              onClick={onClose}
+              type="button"
+              variant="outline"
+            >
+              取消
+            </Button>
+            <Button disabled={save.isPending} type="submit">
+              {save.isPending
+                ? "保存中…"
+                : editScope === "none"
+                  ? "保存模型开关"
+                  : "保存全局模板"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+      {editModelId ? (
+        <ModelOverrideDialog
+          globalOverrideOn={templateOn && templateConfigured}
+          modelId={editModelId}
+          onClose={() => setEditModelId(null)}
+          onSaved={onSaved}
+          provider={provider}
+        />
+      ) : null}
+    </Dialog>
+  );
+}
+
+function CapabilityFormFields({
+  capabilities,
+  idPrefix,
+  providerType,
+  setCapabilities,
+}: {
+  capabilities: ProviderModelCapabilities;
+  idPrefix: string;
+  providerType: string;
+  setCapabilities: Dispatch<SetStateAction<ProviderModelCapabilities>>;
+}) {
   function toggleReasoningEffort(
     effort: Exclude<ThinkingMode, "off">,
     checked: boolean,
@@ -2129,6 +2956,432 @@ function ModelCapabilitiesDialog({
     });
   }
 
+  return (
+    <>
+      <section className="space-y-3 rounded-xl border p-4">
+        <div>
+          <p className="text-sm font-semibold">上下文上限</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            未知模型默认 256K。智能体达到有效上限的 1/3 时压缩；极速/思考达到 80% 时压缩。
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Label>
+            模型总上下文
+            <Input
+              className="mt-2"
+              min={8000}
+              onChange={(event) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  context_window_tokens: Number(event.target.value),
+                  context_limit_tokens: Math.min(
+                    current.context_limit_tokens,
+                    Number(event.target.value),
+                  ),
+                }))
+              }
+              type="number"
+              value={capabilities.context_window_tokens}
+            />
+          </Label>
+          <Label>
+            使用上限
+            <Input
+              className="mt-2"
+              max={capabilities.context_window_tokens}
+              min={8000}
+              onChange={(event) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  context_limit_tokens: Number(event.target.value),
+                }))
+              }
+              type="number"
+              value={capabilities.context_limit_tokens}
+            />
+          </Label>
+          <Label>
+            最大输出
+            <Input
+              className="mt-2"
+              min={1}
+              onChange={(event) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  max_output_tokens: Number(event.target.value),
+                }))
+              }
+              type="number"
+              value={capabilities.max_output_tokens}
+            />
+          </Label>
+        </div>
+      </section>
+      <section className="space-y-3 rounded-xl border p-4">
+        <div>
+          <p className="text-sm font-semibold">推理强度与映射</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            选择 LearnGraph 可以请求的级别，并映射为该 Provider 实际接受的参数值。
+          </p>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {reasoningModes.map((effort) => {
+            const inputId = `${idPrefix}-${effort}`;
+            const enabled = capabilities.reasoning_efforts.includes(effort);
+            return (
+              <div className="rounded-lg border p-3" key={effort}>
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    checked={enabled}
+                    id={inputId}
+                    onCheckedChange={(checked) =>
+                      toggleReasoningEffort(effort, checked === true)
+                    }
+                  />
+                  <Label htmlFor={inputId}>支持 {effort}</Label>
+                </div>
+                <Input
+                  className="mt-3 h-8 font-mono text-xs"
+                  disabled={!enabled}
+                  onChange={(event) =>
+                    setCapabilities((current) => ({
+                      ...current,
+                      thinking_mapping: {
+                        ...current.thinking_mapping,
+                        [effort]: parseThinkingMappingValue(
+                          event.target.value,
+                          current.reasoning_parameter,
+                        ),
+                      },
+                    }))
+                  }
+                  placeholder={`实际参数值，默认 ${effort}`}
+                  value={String(capabilities.thinking_mapping[effort] ?? "")}
+                />
+              </div>
+            );
+          })}
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label>实际参数形状</Label>
+            <Select
+              onValueChange={(value) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  reasoning_parameter: value as ReasoningParameter,
+                }))
+              }
+              value={capabilities.reasoning_parameter}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="reasoning_effort">
+                  reasoning_effort
+                </SelectItem>
+                <SelectItem value="reasoning.effort">
+                  reasoning.effort
+                </SelectItem>
+                <SelectItem value="enable_thinking">
+                  enable_thinking（布尔开关）
+                </SelectItem>
+                <SelectItem value="thinking_budget">
+                  thinking_budget（Token 预算）
+                </SelectItem>
+                <SelectItem value="thinking">
+                  thinking（adaptive / disabled）
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <Label htmlFor={`${idPrefix}-thinking-required`}>仅支持思考模式</Label>
+            <Switch
+              checked={capabilities.thinking_required === true}
+              id={`${idPrefix}-thinking-required`}
+              onCheckedChange={(checked) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  thinking_required: checked,
+                  default_thinking_mode:
+                    checked && current.default_thinking_mode === "off"
+                      ? current.reasoning_efforts.includes("medium")
+                        ? "medium"
+                        : current.reasoning_efforts[0] ?? "medium"
+                      : current.default_thinking_mode,
+                }))
+              }
+            />
+          </div>
+        </div>
+      </section>
+      <section className="space-y-4 rounded-xl border p-4">
+        <div>
+          <p className="text-sm font-semibold">联网能力</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            设置模型是否可使用原生网页搜索，以及默认的联网方式。
+          </p>
+        </div>
+        <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+          <Label htmlFor={`${idPrefix}-hosted-web-search`}>支持托管网页搜索</Label>
+          <Switch
+            checked={capabilities.hosted_web_search}
+            id={`${idPrefix}-hosted-web-search`}
+            onCheckedChange={(checked) =>
+              setCapabilities((current) => ({
+                ...current,
+                hosted_web_search: checked,
+                default_search_route:
+                  !checked && current.default_search_route === "model_native"
+                    ? "auto"
+                    : current.default_search_route,
+              }))
+            }
+          />
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <Label htmlFor={`${idPrefix}-hosted-web-fetch`}>原生网页抓取</Label>
+            <Switch
+              checked={capabilities.hosted_web_fetch === true}
+              id={`${idPrefix}-hosted-web-fetch`}
+              onCheckedChange={(checked) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  hosted_web_fetch: checked,
+                }))
+              }
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+            <Label htmlFor={`${idPrefix}-hosted-image-search`}>原生图片搜索</Label>
+            <Switch
+              checked={capabilities.hosted_image_search === true}
+              id={`${idPrefix}-hosted-image-search`}
+              onCheckedChange={(checked) =>
+                setCapabilities((current) => ({
+                  ...current,
+                  hosted_image_search: checked,
+                }))
+              }
+            />
+          </div>
+        </div>
+        {providerType === "qwen" &&
+        (capabilities.hosted_web_search ||
+          capabilities.hosted_web_fetch ||
+          capabilities.hosted_image_search) ? (
+          <p className="rounded-lg border border-primary/25 bg-primary/5 px-3 py-2 text-xs leading-5">
+            组合调度：该 Qwen 模型可作为其他主模型的联网搜索、网页抓取或图片搜索工具。
+            图片搜索与精细抓取使用 Responses 内置工具，模型 Token 与工具调用会分别计费。
+            当前目录参考价：Agent 搜索 ¥4/千次、文字搜图 ¥24/千次、反向搜图
+            ¥48/千次；最终以千问控制台账单为准。
+          </p>
+        ) : null}
+        <div className="space-y-2">
+          <Label>默认联网路由</Label>
+          <Select
+            onValueChange={(value) =>
+              setCapabilities((current) => ({
+                ...current,
+                default_search_route: value as SearchRoute,
+              }))
+            }
+            value={capabilities.default_search_route}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {searchRoutes.map((route) => (
+                <SelectItem
+                  disabled={
+                    route === "model_native" && !capabilities.hosted_web_search
+                  }
+                  key={route}
+                  value={route}
+                >
+                  {searchRouteLabel(route)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </section>
+      <section className="space-y-3 rounded-xl border p-4">
+        <div>
+          <p className="text-sm font-semibold">多模态输入</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            开启「支持图片输入」后，图片会从受授权对象存储直接传给本次模型调用。
+            未开启时默认走工作区「识图 / 视觉」Provider（外挂描述后再由本模型回答）。
+            图片不会写入消息正文。
+          </p>
+        </div>
+        <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+          <Label htmlFor={`${idPrefix}-supports-image-input`}>支持图片输入</Label>
+          <Switch
+            checked={capabilities.supports_image_input}
+            id={`${idPrefix}-supports-image-input`}
+            onCheckedChange={(checked) =>
+              setCapabilities((current) => ({
+                ...current,
+                supports_image_input: checked,
+                // Native mode is only valid when image input is confirmed.
+                image_input_mode:
+                  checked
+                    ? current.image_input_mode === "external_vision"
+                      ? "external_vision"
+                      : current.image_input_mode ?? "auto"
+                    : current.image_input_mode === "native"
+                      ? "auto"
+                      : current.image_input_mode ?? "auto",
+              }))
+            }
+          />
+        </div>
+        <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+          <Label htmlFor={`${idPrefix}-supports-video-input`}>支持视频理解</Label>
+          <Switch
+            checked={capabilities.supports_video_input === true}
+            id={`${idPrefix}-supports-video-input`}
+            onCheckedChange={(checked) =>
+              setCapabilities((current) => ({
+                ...current,
+                supports_video_input: checked,
+              }))
+            }
+          />
+        </div>
+        {providerType === "qwen" &&
+        (capabilities.supports_image_input ||
+          capabilities.supports_video_input) ? (
+          <p className="rounded-lg border border-primary/25 bg-primary/5 px-3 py-2 text-xs leading-5">
+            可将此模型作为其他文本模型的视觉伴随模型。视频理解会按采样帧计入输入 Token；
+            使用前请确认文件大小、时长与当前快照限制。
+          </p>
+        ) : null}
+        <div className="space-y-2">
+          <Label>图片输入路径</Label>
+          <Select
+            onValueChange={(value) =>
+              setCapabilities((current) => ({
+                ...current,
+                image_input_mode: value as
+                  | "native"
+                  | "external_vision"
+                  | "auto",
+                supports_image_input:
+                  value === "native"
+                    ? true
+                    : current.supports_image_input,
+              }))
+            }
+            value={capabilities.image_input_mode ?? "auto"}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">
+                自动（有原生用原生，否则外挂视觉）
+              </SelectItem>
+              <SelectItem
+                disabled={!capabilities.supports_image_input}
+                value="native"
+              >
+                原生多模态
+              </SelectItem>
+              <SelectItem value="external_vision">
+                外挂识图 Provider
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function ModelOverrideDialog({
+  globalOverrideOn,
+  modelId,
+  onClose,
+  onSaved,
+  provider,
+}: {
+  globalOverrideOn: boolean;
+  modelId: string;
+  onClose: () => void;
+  onSaved: (snapshot: ProviderModelCapabilityView) => void;
+  provider: Provider;
+}) {
+  const queryClient = useQueryClient();
+  const capabilitiesQuery = useQuery({
+    queryKey: ["provider-model-capabilities", provider.id, modelId],
+    queryFn: () => getProviderModelCapabilities(provider.id, modelId),
+    retry: false,
+  });
+  const snapshotMissing =
+    capabilitiesQuery.error instanceof ApiError &&
+    capabilitiesQuery.error.code === "model_capabilities_not_found";
+  const [capabilities, setCapabilities] =
+    useState<ProviderModelCapabilities>(emptyModelCapabilities);
+
+  useEffect(() => {
+    if (capabilitiesQuery.data) {
+      const next = capabilitiesQuery.data.capabilities;
+      setCapabilities({
+        ...emptyModelCapabilities(),
+        ...next,
+        image_input_mode: next.image_input_mode ?? "auto",
+        default_search_route: normalizeDefaultSearchRoute(next.default_search_route),
+      });
+    } else if (snapshotMissing) {
+      setCapabilities(emptyModelCapabilities());
+    }
+  }, [capabilitiesQuery.data, snapshotMissing]);
+
+  const loadCatalogDefaults = useMutation({
+    mutationFn: () => getProviderModelDefaults(modelId, provider.provider_type),
+    onSuccess: (view) => {
+      const merged = {
+        ...emptyModelCapabilities(),
+        ...view.capabilities,
+      } as ProviderModelCapabilities;
+      setCapabilities({
+        ...merged,
+        // The catalog may report internal source labels the save schema
+        // rejects; a user-triggered fill is always an official-catalog value.
+        capability_source: "official_catalog",
+        default_search_route: normalizeDefaultSearchRoute(
+          merged.default_search_route,
+        ),
+      });
+      toast.success("已填入官方默认参数，确认后请保存");
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const save = useMutation({
+    mutationFn: () =>
+      updateProviderModelCapabilities(provider.id, modelId, capabilities),
+    onSuccess: (snapshot) => {
+      queryClient.setQueryData(
+        ["provider-model-capabilities", provider.id, modelId],
+        snapshot,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      onSaved(snapshot);
+      toast.success("模型配置已保存");
+      onClose();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+
+  const terminalError = capabilitiesQuery.isError && !snapshotMissing;
+
   function submit(event: FormEvent) {
     event.preventDefault();
     if (
@@ -2145,397 +3398,66 @@ function ModelCapabilitiesDialog({
       toast.error("模型原生联网需要先确认托管网页搜索能力");
       return;
     }
-    save.mutate(capabilities);
+    save.mutate();
   }
 
-  const terminalError =
-    editScope === "model" && capabilitiesQuery.isError && !snapshotMissing;
   return (
     <Dialog onOpenChange={(open) => !open && !save.isPending && onClose()} open>
-      <DialogContent className="max-h-[min(88vh,860px)] overflow-y-auto sm:max-w-3xl">
-        <form onSubmit={submit}>
-          <DialogHeader>
-            <DialogTitle>模型能力快照</DialogTitle>
+      <DialogContent className="h-[min(84dvh,780px)] overflow-hidden p-0 sm:max-w-2xl">
+        <form className="flex min-h-0 flex-1 flex-col" onSubmit={submit}>
+          <DialogHeader className="shrink-0 border-b px-5 py-5 pr-14">
+            <DialogTitle className="font-mono text-base">{modelId}</DialogTitle>
+            <DialogDescription>
+              单模型参数配置，保存后仅对该模型生效。
+            </DialogDescription>
           </DialogHeader>
-          {editScope === "model" && capabilitiesQuery.isPending ? (
-            <div className="py-10">
-              <LoadingState label="正在读取已保存的能力快照…" />
-            </div>
-          ) : terminalError ? (
-            <div className="py-5">
-              <ErrorState message={capabilitiesQuery.error.message} />
-            </div>
-          ) : (
-            <div className="space-y-5 py-5">
-              <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-semibold">模型列表开关</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      仅启用选中的模型；可以一键全选或全部禁用。
-                    </p>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button
-                      onClick={() =>
-                        setModelStates(
-                          Object.fromEntries(models.models.map((model) => [model.id, true])),
-                        )
-                      }
-                      size="xs"
-                      type="button"
-                      variant="outline"
-                    >
-                      全选
-                    </Button>
-                    <Button
-                      onClick={() =>
-                        setModelStates(
-                          Object.fromEntries(models.models.map((model) => [model.id, false])),
-                        )
-                      }
-                      size="xs"
-                      type="button"
-                      variant="outline"
-                    >
-                      全部禁用
-                    </Button>
-                    <Button
-                      disabled={updateModelState.isPending}
-                      onClick={() => updateModelState.mutate()}
-                      size="xs"
-                      type="button"
-                    >
-                      应用开关
-                    </Button>
-                  </div>
-                </div>
-                <div className="max-h-48 divide-y overflow-y-auto rounded-lg border">
-                  {models.models.map((model) => (
-                    <label
-                      className="flex cursor-pointer items-center gap-3 px-3 py-2 text-xs"
-                      key={model.id}
-                    >
-                      <Checkbox
-                        checked={modelStates[model.id] === true}
-                        onCheckedChange={(checked) =>
-                          setModelStates((current) => ({
-                            ...current,
-                            [model.id]: checked === true,
-                          }))
-                        }
-                      />
-                      <span className="min-w-0 flex-1 truncate font-mono">{model.id}</span>
-                      {provider.capabilities.default_model === model.id ? (
-                        <span className="text-muted-foreground">默认</span>
-                      ) : null}
-                    </label>
-                  ))}
-                </div>
-                {updateModelState.isError ? (
-                  <p className="text-sm text-destructive" role="alert">
-                    {updateModelState.error.message}
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5">
+            {capabilitiesQuery.isPending ? (
+              <div className="py-10">
+                <LoadingState label="正在读取已保存的能力快照…" />
+              </div>
+            ) : terminalError ? (
+              <div className="py-5">
+                <ErrorState message={capabilitiesQuery.error.message} />
+              </div>
+            ) : (
+              <div className="space-y-5 py-5">
+                {globalOverrideOn ? (
+                  <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
+                    全局覆盖开启中：此单模型配置会保存，但需在供应商配置中关闭「全局覆盖」后才生效。
                   </p>
                 ) : null}
-              </section>
-              <section className="space-y-3 rounded-xl border p-4">
-                <div>
-                  <p className="text-sm font-semibold">配置作用范围</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    群体配置作用于该 Provider 的全部模型；单模型配置覆盖群体配置。
+                {snapshotMissing ? (
+                  <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                    尚未保存过该模型的单独配置，以下为当前生效的默认参数。
                   </p>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <Select
-                    onValueChange={(value) => setEditScope(value as "group" | "model")}
-                    value={editScope}
-                  >
-                    <SelectTrigger aria-label="配置作用范围">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="group">全部模型（群体配置）</SelectItem>
-                      <SelectItem value="model">单个模型（覆盖群体）</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select
-                    disabled={editScope !== "model"}
-                    onValueChange={setSelectedModelId}
-                    value={selectedModelId}
-                  >
-                    <SelectTrigger aria-label="选择单独配置的模型">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="max-h-72">
-                      {models.models.map((model) => (
-                        <SelectItem key={model.id} value={model.id}>
-                          {model.id}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </section>
-              <section className="space-y-3 rounded-xl border p-4">
-                <div>
-                  <p className="text-sm font-semibold">上下文上限</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    未知模型默认 256K。智能体达到有效上限的 1/3 时压缩；极速/思考达到 80% 时压缩。
+                ) : null}
+                <CapabilityFormFields
+                  capabilities={capabilities}
+                  idPrefix={`model-${provider.id}-${modelId}`}
+                  providerType={provider.provider_type}
+                  setCapabilities={setCapabilities}
+                />
+                {save.isError ? (
+                  <p className="text-sm text-destructive" role="alert">
+                    {save.error.message}
                   </p>
-                </div>
-                <div className="grid gap-4 sm:grid-cols-3">
-                  <Label>
-                    模型总上下文
-                    <Input
-                      className="mt-2"
-                      min={8000}
-                      onChange={(event) =>
-                        setCapabilities((current) => ({
-                          ...current,
-                          context_window_tokens: Number(event.target.value),
-                          context_limit_tokens: Math.min(
-                            current.context_limit_tokens,
-                            Number(event.target.value),
-                          ),
-                        }))
-                      }
-                      type="number"
-                      value={capabilities.context_window_tokens}
-                    />
-                  </Label>
-                  <Label>
-                    使用上限
-                    <Input
-                      className="mt-2"
-                      max={capabilities.context_window_tokens}
-                      min={8000}
-                      onChange={(event) =>
-                        setCapabilities((current) => ({
-                          ...current,
-                          context_limit_tokens: Number(event.target.value),
-                        }))
-                      }
-                      type="number"
-                      value={capabilities.context_limit_tokens}
-                    />
-                  </Label>
-                  <Label>
-                    最大输出
-                    <Input
-                      className="mt-2"
-                      min={1}
-                      onChange={(event) =>
-                        setCapabilities((current) => ({
-                          ...current,
-                          max_output_tokens: Number(event.target.value),
-                        }))
-                      }
-                      type="number"
-                      value={capabilities.max_output_tokens}
-                    />
-                  </Label>
-                </div>
-              </section>
-              <section className="space-y-3 rounded-xl border p-4">
-                <div>
-                  <p className="text-sm font-semibold">推理强度与映射</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    选择 LearnGraph 可以请求的级别，并映射为该 Provider 实际接受的参数值。
-                  </p>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {reasoningModes.map((effort) => {
-                    const inputId = `capability-${provider.id}-${selectedModelId}-${effort}`;
-                    const enabled = capabilities.reasoning_efforts.includes(effort);
-                    return (
-                      <div className="rounded-lg border p-3" key={effort}>
-                        <div className="flex items-center gap-2">
-                          <Checkbox
-                            checked={enabled}
-                            id={inputId}
-                            onCheckedChange={(checked) =>
-                              toggleReasoningEffort(effort, checked === true)
-                            }
-                          />
-                          <Label htmlFor={inputId}>支持 {effort}</Label>
-                        </div>
-                        <Input
-                          className="mt-3 h-8 font-mono text-xs"
-                          disabled={!enabled}
-                          onChange={(event) =>
-                            setCapabilities((current) => ({
-                              ...current,
-                              thinking_mapping: {
-                                ...current.thinking_mapping,
-                                [effort]: event.target.value || null,
-                              },
-                            }))
-                          }
-                          placeholder={`实际参数值，默认 ${effort}`}
-                          value={capabilities.thinking_mapping[effort] ?? ""}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label>实际参数形状</Label>
-                    <Select
-                      onValueChange={(value) =>
-                        setCapabilities((current) => ({
-                          ...current,
-                          reasoning_parameter: value as ReasoningParameter,
-                        }))
-                      }
-                      value={capabilities.reasoning_parameter}
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="reasoning_effort">
-                          reasoning_effort
-                        </SelectItem>
-                        <SelectItem value="reasoning.effort">
-                          reasoning.effort
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-              </section>
-              <section className="space-y-4 rounded-xl border p-4">
-                <div>
-                  <p className="text-sm font-semibold">联网能力</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    设置模型是否可使用原生网页搜索，以及默认的联网方式。
-                  </p>
-                </div>
-                <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
-                  <Label htmlFor="hosted-web-search">支持托管网页搜索</Label>
-                  <Switch
-                    checked={capabilities.hosted_web_search}
-                    id="hosted-web-search"
-                    onCheckedChange={(checked) =>
-                      setCapabilities((current) => ({
-                        ...current,
-                        hosted_web_search: checked,
-                        default_search_route:
-                          !checked && current.default_search_route === "model_native"
-                            ? "disabled"
-                            : current.default_search_route,
-                      }))
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>默认联网路由</Label>
-                  <Select
-                    onValueChange={(value) =>
-                      setCapabilities((current) => ({
-                        ...current,
-                        default_search_route: value as SearchRoute,
-                      }))
-                    }
-                    value={capabilities.default_search_route}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {searchRoutes.map((route) => (
-                        <SelectItem
-                          disabled={
-                            route === "model_native" && !capabilities.hosted_web_search
-                          }
-                          key={route}
-                          value={route}
-                        >
-                          {searchRouteLabel(route)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </section>
-              <section className="space-y-3 rounded-xl border p-4">
-                <div>
-                  <p className="text-sm font-semibold">多模态输入</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    开启「支持图片输入」后，图片会从受授权对象存储直接传给本次模型调用。
-                    未开启时默认走工作区「识图 / 视觉」Provider（外挂描述后再由本模型回答）。
-                    图片不会写入消息正文。
-                  </p>
-                </div>
-                <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
-                  <Label htmlFor="supports-image-input">支持图片输入</Label>
-                  <Switch
-                    checked={capabilities.supports_image_input}
-                    id="supports-image-input"
-                    onCheckedChange={(checked) =>
-                      setCapabilities((current) => ({
-                        ...current,
-                        supports_image_input: checked,
-                        // Native mode is only valid when image input is confirmed.
-                        image_input_mode:
-                          checked
-                            ? current.image_input_mode === "external_vision"
-                              ? "external_vision"
-                              : current.image_input_mode ?? "auto"
-                            : current.image_input_mode === "native"
-                              ? "auto"
-                              : current.image_input_mode ?? "auto",
-                      }))
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>图片输入路径</Label>
-                  <Select
-                    onValueChange={(value) =>
-                      setCapabilities((current) => ({
-                        ...current,
-                        image_input_mode: value as
-                          | "native"
-                          | "external_vision"
-                          | "auto",
-                        supports_image_input:
-                          value === "native"
-                            ? true
-                            : current.supports_image_input,
-                      }))
-                    }
-                    value={capabilities.image_input_mode ?? "auto"}
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="auto">
-                        自动（有原生用原生，否则外挂视觉）
-                      </SelectItem>
-                      <SelectItem
-                        disabled={!capabilities.supports_image_input}
-                        value="native"
-                      >
-                        原生多模态
-                      </SelectItem>
-                      <SelectItem value="external_vision">
-                        外挂识图 Provider
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </section>
-              {save.isError ? (
-                <p className="text-sm text-destructive" role="alert">
-                  {save.error.message}
-                </p>
-              ) : null}
-            </div>
-          )}
-          <DialogFooter>
+                ) : null}
+              </div>
+            )}
+          </div>
+          <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none rounded-b-2xl px-5 py-4">
+            <Button
+              className="mr-auto"
+              disabled={
+                loadCatalogDefaults.isPending || capabilitiesQuery.isPending
+              }
+              onClick={() => loadCatalogDefaults.mutate()}
+              type="button"
+              variant="outline"
+            >
+              {loadCatalogDefaults.isPending ? "读取中…" : "填入官方默认参数"}
+            </Button>
             <Button
               disabled={save.isPending}
               onClick={onClose}
@@ -2546,1235 +3468,15 @@ function ModelCapabilitiesDialog({
             </Button>
             <Button
               disabled={
-                (editScope === "model" && capabilitiesQuery.isPending) ||
-                terminalError ||
-                save.isPending
+                capabilitiesQuery.isPending || terminalError || save.isPending
               }
               type="submit"
             >
-              {save.isPending
-                ? "保存中…"
-                : editScope === "group"
-                  ? "保存群体配置"
-                  : "保存单模型覆盖"}
+              {save.isPending ? "保存中…" : "保存该模型配置"}
             </Button>
           </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function BillingConfigDialog({
-  busy,
-  onBudget,
-  onExchangeRate,
-  onPrice,
-}: {
-  busy: boolean;
-  onBudget: (payload: BudgetPolicyCreate) => void;
-  onExchangeRate: (rate: number) => void;
-  onPrice: (payload: PriceVersionCreate) => void;
-}) {
-  const [providerId, setProviderId] = useState("*");
-  const [modelId, setModelId] = useState("*");
-  const [feature, setFeature] = useState("*");
-  const [priceCurrency, setPriceCurrency] = useState<"USD" | "CNY">("USD");
-  const [inputPrice, setInputPrice] = useState("0");
-  const [cachedInputPrice, setCachedInputPrice] = useState("");
-  const [outputPrice, setOutputPrice] = useState("0");
-  const [exchangeRate, setExchangeRate] = useState("6.7704");
-  const [budgetName, setBudgetName] = useState("工作区月度预算");
-  const [softLimit, setSoftLimit] = useState("");
-  const [hardLimit, setHardLimit] = useState("");
-  return (
-    <Dialog>
-      <DialogTrigger asChild>
-        <Button size="sm">
-          <CircleDollarSign className="size-4" />
-          配置计费
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>价格、汇率与预算</DialogTitle>
-          <DialogDescription>
-            每次保存都会写入服务端版本或策略；历史 UsageEvent 仍保留原快照。
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-5 py-3 md:grid-cols-2">
-          <section className="space-y-3 rounded-xl border p-4">
-            <p className="text-sm font-semibold">模型价格版本</p>
-            <Label htmlFor="billing-provider">Provider ID</Label>
-            <Input
-              id="billing-provider"
-              onChange={(event) => setProviderId(event.currentTarget.value)}
-              value={providerId}
-            />
-            <Label htmlFor="billing-model">Model ID</Label>
-            <Input
-              id="billing-model"
-              onChange={(event) => setModelId(event.currentTarget.value)}
-              value={modelId}
-            />
-            <Label htmlFor="billing-feature">Feature</Label>
-            <Input
-              id="billing-feature"
-              onChange={(event) => setFeature(event.currentTarget.value)}
-              value={feature}
-            />
-            <div className="space-y-2">
-              <Label>定价币种</Label>
-              <Select
-                onValueChange={(value) => setPriceCurrency(value as "USD" | "CNY")}
-                value={priceCurrency}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="USD">USD（美元原生定价）</SelectItem>
-                  <SelectItem value="CNY">CNY（人民币原生定价）</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              <div>
-                <Label htmlFor="billing-input">输入 {priceCurrency}/1M</Label>
-                <Input
-                  id="billing-input"
-                  min="0"
-                  onChange={(event) => setInputPrice(event.currentTarget.value)}
-                  type="number"
-                  value={inputPrice}
-                />
-              </div>
-              <div>
-                <Label htmlFor="billing-cached-input">缓存输入 {priceCurrency}/1M</Label>
-                <Input
-                  id="billing-cached-input"
-                  min="0"
-                  onChange={(event) => setCachedInputPrice(event.currentTarget.value)}
-                  placeholder="同普通输入"
-                  type="number"
-                  value={cachedInputPrice}
-                />
-              </div>
-              <div>
-                <Label htmlFor="billing-output">输出 {priceCurrency}/1M</Label>
-                <Input
-                  id="billing-output"
-                  min="0"
-                  onChange={(event) =>
-                    setOutputPrice(event.currentTarget.value)
-                  }
-                  type="number"
-                  value={outputPrice}
-                />
-              </div>
-            </div>
-            <Button
-              disabled={
-                busy || !providerId.trim() || !modelId.trim() || !feature.trim()
-              }
-              onClick={() =>
-                onPrice({
-                  provider_id: providerId.trim(),
-                  model_id: modelId.trim(),
-                  feature: feature.trim(),
-                  currency: priceCurrency,
-                  ...(priceCurrency === "CNY"
-                    ? {
-                        input_cny_per_million: Number(inputPrice) || 0,
-                        cached_input_cny_per_million:
-                          cachedInputPrice === "" ? null : Number(cachedInputPrice),
-                        output_cny_per_million: Number(outputPrice) || 0,
-                      }
-                    : {
-                        input_usd_per_million: Number(inputPrice) || 0,
-                        cached_input_usd_per_million:
-                          cachedInputPrice === "" ? null : Number(cachedInputPrice),
-                        output_usd_per_million: Number(outputPrice) || 0,
-                      }),
-                  source: "workspace_manual",
-                })
-              }
-              size="sm"
-              variant="outline"
-            >
-              保存价格版本
-            </Button>
-          </section>
-          <section className="space-y-3 rounded-xl border p-4">
-            <p className="text-sm font-semibold">USD/CNY 汇率版本</p>
-            <Label htmlFor="billing-rate">1 USD = CNY</Label>
-            <Input
-              id="billing-rate"
-              min="0.0001"
-              onChange={(event) => setExchangeRate(event.currentTarget.value)}
-              step="0.0001"
-              type="number"
-              value={exchangeRate}
-            />
-            <Button
-              disabled={busy || Number(exchangeRate) <= 0}
-              onClick={() => onExchangeRate(Number(exchangeRate))}
-              size="sm"
-              variant="outline"
-            >
-              保存汇率版本
-            </Button>
-            <div className="border-t pt-3">
-              <p className="text-sm font-semibold">预算策略</p>
-            </div>
-            <Label htmlFor="budget-name">名称</Label>
-            <Input
-              id="budget-name"
-              onChange={(event) => setBudgetName(event.currentTarget.value)}
-              value={budgetName}
-            />
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <Label htmlFor="budget-soft">软告警 CNY</Label>
-                <Input
-                  id="budget-soft"
-                  min="0"
-                  onChange={(event) => setSoftLimit(event.currentTarget.value)}
-                  type="number"
-                  value={softLimit}
-                />
-              </div>
-              <div>
-                <Label htmlFor="budget-hard">硬阻断 CNY</Label>
-                <Input
-                  id="budget-hard"
-                  min="0"
-                  onChange={(event) => setHardLimit(event.currentTarget.value)}
-                  type="number"
-                  value={hardLimit}
-                />
-              </div>
-            </div>
-            <Button
-              disabled={
-                busy ||
-                !budgetName.trim() ||
-                (!softLimit && !hardLimit) ||
-                (Boolean(softLimit) &&
-                  Boolean(hardLimit) &&
-                  Number(softLimit) > Number(hardLimit))
-              }
-              onClick={() =>
-                onBudget({
-                  name: budgetName.trim(),
-                  soft_limit_cny: softLimit ? Number(softLimit) : null,
-                  hard_limit_cny: hardLimit ? Number(hardLimit) : null,
-                  period: "calendar_month_utc",
-                })
-              }
-              size="sm"
-            >
-              保存预算策略
-            </Button>
-          </section>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function RetireVersionButton({
-  actionLabel,
-  busy,
-  description,
-  onRetire,
-}: {
-  actionLabel: string;
-  busy: boolean;
-  description: string;
-  onRetire: () => void;
-}) {
-  return (
-    <AlertDialog>
-      <AlertDialogTrigger asChild>
-        <Button disabled={busy} size="xs" variant="outline">
-          {actionLabel}
-        </Button>
-      </AlertDialogTrigger>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogMedia className="bg-amber-500/10 text-amber-700">
-            <AlertTriangle />
-          </AlertDialogMedia>
-          <AlertDialogTitle>{actionLabel}？</AlertDialogTitle>
-          <AlertDialogDescription>
-            {description} 历史 UsageEvent 会继续引用当前版本的价格或汇率快照；此操作不会删除历史账本。
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>取消</AlertDialogCancel>
-          <AlertDialogAction disabled={busy} onClick={onRetire}>
-            {busy ? "提交中…" : "确认退役"}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  );
-}
-
-function parseOptionalLimit(value: string): number | null | undefined {
-  if (!value.trim()) return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
-}
-
-function EditBudgetPolicyDialog({
-  busy,
-  onUpdate,
-  policy,
-}: {
-  busy: boolean;
-  onUpdate: (payload: BudgetPolicyUpdate) => Promise<void>;
-  policy: BudgetPolicy;
-}) {
-  const [open, setOpen] = useState(false);
-  const [name, setName] = useState(policy.name);
-  const [softLimit, setSoftLimit] = useState(
-    policy.soft_limit_cny === null ? "" : String(policy.soft_limit_cny),
-  );
-  const [hardLimit, setHardLimit] = useState(
-    policy.hard_limit_cny === null ? "" : String(policy.hard_limit_cny),
-  );
-  const [enabled, setEnabled] = useState(policy.enabled);
-  const soft = parseOptionalLimit(softLimit);
-  const hard = parseOptionalLimit(hardLimit);
-  const limitsValid =
-    soft !== undefined &&
-    hard !== undefined &&
-    (soft !== null || hard !== null) &&
-    !(soft !== null && hard !== null && soft > hard);
-
-  function resetFromPolicy() {
-    setName(policy.name);
-    setSoftLimit(policy.soft_limit_cny === null ? "" : String(policy.soft_limit_cny));
-    setHardLimit(policy.hard_limit_cny === null ? "" : String(policy.hard_limit_cny));
-    setEnabled(policy.enabled);
-  }
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (!limitsValid || soft === undefined || hard === undefined) return;
-    try {
-      await onUpdate({
-        name: name.trim(),
-        soft_limit_cny: soft,
-        hard_limit_cny: hard,
-        enabled,
-      });
-      setOpen(false);
-    } catch {
-      // The page-level mutation presents the server error without closing the form.
-    }
-  }
-
-  return (
-    <Dialog
-      onOpenChange={(nextOpen) => {
-        setOpen(nextOpen);
-        if (nextOpen) resetFromPolicy();
-      }}
-      open={open}
-    >
-      <DialogTrigger asChild>
-        <Button disabled={busy} size="xs" variant="outline">
-          <Pencil className="size-3" />编辑
-        </Button>
-      </DialogTrigger>
-      <DialogContent>
-        <form onSubmit={submit}>
-          <DialogHeader>
-            <DialogTitle>编辑预算策略</DialogTitle>
-            <DialogDescription>
-              范围和周期保持不可变；若要改变匹配范围，请删除后显式创建新策略。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-5">
-            <div className="rounded-xl border bg-muted/25 p-3 text-xs text-muted-foreground">
-              {policy.provider_id} / {policy.model_id} / {policy.feature} · {policy.period}
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor={`budget-policy-name-${policy.id}`}>名称</Label>
-              <Input
-                id={`budget-policy-name-${policy.id}`}
-                maxLength={160}
-                onChange={(event) => setName(event.currentTarget.value)}
-                value={name}
-              />
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor={`budget-policy-soft-${policy.id}`}>软告警 CNY</Label>
-                <Input
-                  id={`budget-policy-soft-${policy.id}`}
-                  min="0"
-                  onChange={(event) => setSoftLimit(event.currentTarget.value)}
-                  type="number"
-                  value={softLimit}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor={`budget-policy-hard-${policy.id}`}>硬阻断 CNY</Label>
-                <Input
-                  id={`budget-policy-hard-${policy.id}`}
-                  min="0"
-                  onChange={(event) => setHardLimit(event.currentTarget.value)}
-                  type="number"
-                  value={hardLimit}
-                />
-              </div>
-            </div>
-            <div className="flex items-center justify-between rounded-xl border p-3">
-              <div>
-                <Label htmlFor={`budget-policy-enabled-${policy.id}`}>启用策略</Label>
-                <p className="mt-1 text-xs text-muted-foreground">关闭后保留历史策略与告警，但不再参与后续预算匹配。</p>
-              </div>
-              <Switch
-                checked={enabled}
-                id={`budget-policy-enabled-${policy.id}`}
-                onCheckedChange={setEnabled}
-              />
-            </div>
-            {!limitsValid ? <p className="text-xs text-destructive">至少填写一个非负门槛，且软告警不能高于硬阻断。</p> : null}
-          </div>
-          <DialogFooter>
-            <Button disabled={busy || !name.trim() || !limitsValid} type="submit">
-              {busy ? "保存中…" : "保存策略"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function DeleteBudgetPolicyButton({
-  busy,
-  onDelete,
-  policy,
-}: {
-  busy: boolean;
-  onDelete: () => void;
-  policy: BudgetPolicy;
-}) {
-  return (
-    <AlertDialog>
-      <AlertDialogTrigger asChild>
-        <Button aria-label={`删除预算策略 ${policy.name}`} disabled={busy} size="icon-xs" variant="ghost">
-          <Trash2 className="size-3.5 text-destructive" />
-        </Button>
-      </AlertDialogTrigger>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogMedia className="bg-destructive/10 text-destructive"><Trash2 /></AlertDialogMedia>
-          <AlertDialogTitle>删除“{policy.name}”？</AlertDialogTitle>
-          <AlertDialogDescription>
-            该策略及其预算告警将被删除，之后新的调用不会再匹配这组范围。UsageEvent、价格版本和汇率版本不会被删除。
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>取消</AlertDialogCancel>
-          <AlertDialogAction disabled={busy} onClick={onDelete} variant="destructive">确认删除策略</AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  );
-}
-
-export function UsagePage() {
-  const queryClient = useQueryClient();
-  const usageDisplaySetting = useQuery({
-    queryKey: ["settings"],
-    queryFn: listSettings,
-  });
-  const summary = useQuery({
-    queryKey: ["usage-summary"],
-    queryFn: getUsageSummary,
-  });
-  const events = useQuery({
-    queryKey: ["usage-events"],
-    queryFn: listUsageEvents,
-  });
-  const prices = useQuery({
-    queryKey: ["usage-prices"],
-    queryFn: listPriceVersions,
-  });
-  const priceCatalog = useQuery({
-    queryKey: ["usage-price-catalog"],
-    queryFn: listPriceCatalog,
-  });
-  const exchangeRates = useQuery({
-    queryKey: ["usage-exchange-rates"],
-    queryFn: listExchangeRates,
-  });
-  const policies = useQuery({
-    queryKey: ["usage-budget-policies"],
-    queryFn: listBudgetPolicies,
-  });
-  const budgetStatuses = useQuery({
-    queryKey: ["usage-budget-status"],
-    queryFn: listBudgetStatuses,
-  });
-  const alerts = useQuery({
-    queryKey: ["usage-budget-alerts"],
-    queryFn: listBudgetAlerts,
-  });
-  const refreshBilling = () => {
-    void queryClient.invalidateQueries({ queryKey: ["usage-prices"] });
-    void queryClient.invalidateQueries({ queryKey: ["usage-exchange-rates"] });
-    void queryClient.invalidateQueries({ queryKey: ["usage-budget-policies"] });
-    void queryClient.invalidateQueries({ queryKey: ["usage-budget-status"] });
-    void queryClient.invalidateQueries({ queryKey: ["usage-budget-alerts"] });
-  };
-  const createPrice = useMutation({
-    mutationFn: createPriceVersion,
-    onSuccess: () => {
-      toast.success("价格版本已保存");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const createRate = useMutation({
-    mutationFn: createExchangeRate,
-    onSuccess: () => {
-      toast.success("汇率版本已保存");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const createBudget = useMutation({
-    mutationFn: createBudgetPolicy,
-    onSuccess: () => {
-      toast.success("预算策略已保存");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const retirePrice = useMutation({
-    mutationFn: retirePriceVersion,
-    onSuccess: () => {
-      toast.success("价格版本已退役；历史用量快照保持不变");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const retireRate = useMutation({
-    mutationFn: retireExchangeRate,
-    onSuccess: () => {
-      toast.success("汇率版本已退役；历史用量快照保持不变");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const updateBudget = useMutation({
-    mutationFn: ({
-      id,
-      payload,
-    }: {
-      id: string;
-      payload: BudgetPolicyUpdate;
-    }) => updateBudgetPolicy(id, payload),
-    onSuccess: () => {
-      toast.success("预算策略已更新");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const removeBudget = useMutation({
-    mutationFn: deleteBudgetPolicy,
-    onSuccess: () => {
-      toast.success("预算策略及其告警已删除");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const acknowledge = useMutation({
-    mutationFn: acknowledgeBudgetAlert,
-    onSuccess: () => {
-      toast.success("预算告警已确认");
-      refreshBilling();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const clearEvents = useMutation({
-    mutationFn: clearUsageEvents,
-    onSuccess: (result) => {
-      toast.success(
-        result.deleted_count
-          ? `已清空 ${result.deleted_count} 条用量事件`
-          : "当前没有可清空的用量事件",
-      );
-      void queryClient.invalidateQueries({ queryKey: ["usage-summary"] });
-      void queryClient.invalidateQueries({ queryKey: ["usage-events"] });
-      void queryClient.invalidateQueries({ queryKey: ["usage-budget-status"] });
-      void queryClient.invalidateQueries({ queryKey: ["usage-budget-alerts"] });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const updateUsageDisplayCurrency = useMutation({
-    mutationFn: (currency: "USD" | "CNY") =>
-      updateSetting("usage.display_currency", currency),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["settings"] });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const allQueries = [
-    summary,
-    events,
-    prices,
-    priceCatalog,
-    exchangeRates,
-    policies,
-    budgetStatuses,
-    alerts,
-    usageDisplaySetting,
-  ];
-  if (allQueries.some((query) => query.isPending))
-    return (
-      <PageFrame>
-        <LoadingState />
-      </PageFrame>
-    );
-  const queryError = allQueries.find((query) => query.isError)?.error;
-  if (queryError)
-    return (
-      <PageFrame>
-        <ErrorState message={queryError.message} />
-      </PageFrame>
-    );
-  const usageEvents = events.data ?? [];
-  const configuredDisplayCurrency = usageDisplaySetting.data?.find(
-    (setting) => setting.key === "usage.display_currency",
-  )?.value;
-  const displayCurrency: "USD" | "CNY" =
-    configuredDisplayCurrency === "USD" ? "USD" : "CNY";
-  const usageSummary = summary.data!;
-  const priceVersions = prices.data ?? [];
-  const catalogItems = priceCatalog.data ?? [];
-  const rateVersions = exchangeRates.data ?? [];
-  const policyItems = policies.data ?? [];
-  const statusItems = budgetStatuses.data ?? [];
-  const alertItems = alerts.data ?? [];
-  const billingBusy =
-    createPrice.isPending ||
-    createRate.isPending ||
-    createBudget.isPending ||
-    retirePrice.isPending ||
-    retireRate.isPending ||
-    updateBudget.isPending ||
-    removeBudget.isPending;
-  const chart = usageEvents.map((event) => ({
-    day: new Date(event.created_at).toLocaleString(),
-    cost: displayCurrency === "CNY" ? event.cost_cny : event.cost_usd,
-    tokens: event.input_tokens + event.output_tokens,
-  }));
-  const totalTokens = usageEvents.reduce(
-    (total, event) => total + event.input_tokens + event.output_tokens,
-    0,
-  );
-  const usageByFeature = Object.values(
-    usageEvents.reduce<
-      Record<string, { feature: string; tokens: number; cost: number }>
-    >((groups, event) => {
-      const current = groups[event.feature] ?? {
-        feature: event.feature,
-        tokens: 0,
-        cost: 0,
-      };
-      current.tokens += event.input_tokens + event.output_tokens;
-      current.cost += displayCurrency === "CNY" ? event.cost_cny : event.cost_usd;
-      groups[event.feature] = current;
-      return groups;
-    }, {}),
-  ).sort((left, right) => right.tokens - left.tokens);
-  function exportCsv() {
-    const escape = (value: string | number) =>
-      `"${String(value).replaceAll('"', '""')}"`;
-    const rows = [
-      [
-        "created_at",
-        "provider_id",
-        "model_id",
-        "feature",
-        "input_tokens",
-        "output_tokens",
-        "attempt",
-        "cost_usd",
-        "cost_cny",
-        "cost_status",
-        "price_version_id",
-        "exchange_rate_version_id",
-        "usd_cny_rate",
-        "latency_ms",
-      ],
-      ...usageEvents.map((event) => [
-        event.created_at,
-        event.provider_id,
-        event.model_id,
-        event.feature,
-        event.input_tokens,
-        event.output_tokens,
-        event.attempt,
-        event.cost_usd,
-        event.cost_cny,
-        event.cost_status,
-        event.price_version_id ?? "",
-        event.exchange_rate_version_id ?? "",
-        event.usd_cny_rate,
-        event.latency_ms,
-      ]),
-    ];
-    const blob = new Blob(
-      [`\uFEFF${rows.map((row) => row.map(escape).join(",")).join("\n")}`],
-      { type: "text/csv;charset=utf-8" },
-    );
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `learngraph-usage-${new Date().toISOString().slice(0, 10)}.csv`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }
-  return (
-    <PageFrame>
-      <PageIntro
-        actions={
-          <div className="flex gap-2">
-            <Select
-              disabled={updateUsageDisplayCurrency.isPending}
-              onValueChange={(value) =>
-                updateUsageDisplayCurrency.mutate(value as "USD" | "CNY")
-              }
-              value={displayCurrency}
-            >
-              <SelectTrigger aria-label="费用显示币种" className="h-9 w-28">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="CNY">显示 CNY</SelectItem>
-                <SelectItem value="USD">显示 USD</SelectItem>
-              </SelectContent>
-            </Select>
-            <BillingConfigDialog
-              busy={billingBusy}
-              onBudget={(payload) => createBudget.mutate(payload)}
-              onExchangeRate={(rate) => createRate.mutate(rate)}
-              onPrice={(payload) => createPrice.mutate(payload)}
-            />
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button
-                  disabled={!usageEvents.length || clearEvents.isPending}
-                  size="sm"
-                  variant="outline"
-                >
-                  <Trash2 className="size-4" />
-                  清空用量
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogMedia className="bg-destructive/10 text-destructive">
-                    <Trash2 />
-                  </AlertDialogMedia>
-                  <AlertDialogTitle>清空当前工作区的用量计费记录？</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    将永久删除当前工作区全部 {usageEvents.length} 条 UsageEvent。价格版本、汇率版本和预算策略会保留；此操作不可撤销。
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                {clearEvents.isError ? (
-                  <p className="text-sm text-destructive" role="alert">
-                    {clearEvents.error.message}
-                  </p>
-                ) : null}
-                <AlertDialogFooter>
-                  <AlertDialogCancel disabled={clearEvents.isPending}>取消</AlertDialogCancel>
-                  <AlertDialogAction
-                    disabled={clearEvents.isPending}
-                    onClick={(event) => {
-                      event.preventDefault();
-                      clearEvents.mutate();
-                    }}
-                    variant="destructive"
-                  >
-                    {clearEvents.isPending ? "正在清空…" : "确认清空"}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-            <Button
-              disabled={!usageEvents.length}
-              onClick={exportCsv}
-              size="sm"
-              variant="outline"
-            >
-              <Download className="size-4" />
-              导出 CSV
-            </Button>
-          </div>
-        }
-        description="每次实际 HTTP Attempt 追加一条用量事件，失败重试也单独计入；价格、汇率与预算均绑定持久化快照。"
-        eyebrow="Usage ledger"
-        title="用量计费与预算"
-      />
-      <MetricStrip
-        items={[
-          {
-            label: "输入 Token",
-            value: usageSummary.input_tokens.toLocaleString(),
-            hint: "当前工作区",
-          },
-          {
-            label: "输出 Token",
-            value: usageSummary.output_tokens.toLocaleString(),
-            hint: "当前工作区",
-            tone: "info",
-          },
-          {
-            label: "实际尝试",
-            value: usageSummary.attempts,
-            hint: `${usageSummary.unpriced_events} 条未定价`,
-            tone: "warning",
-          },
-          {
-            label: `费用 ${displayCurrency}`,
-            value:
-              displayCurrency === "CNY"
-                ? `¥${usageSummary.cost_cny.toFixed(4)}`
-                : `$${usageSummary.cost_usd.toFixed(4)}`,
-            hint: usageSummary.remote_usage_recorded
-              ? displayCurrency === "CNY"
-                ? `$${usageSummary.cost_usd.toFixed(4)} · 远程用量`
-                : `¥${usageSummary.cost_cny.toFixed(4)} · 远程用量`
-              : "暂无远程用量",
-            tone: "positive",
-          },
-        ]}
-      />
-      <div className="grid gap-5 lg:grid-cols-[1.1fr_.9fr]">
-        <Surface className="p-5">
-          <SectionHeading
-            description="仅展示当前工作区持久化的真实用量事件"
-            title="费用趋势"
-          />
-          {chart.length ? (
-            <div className="mt-4 h-80">
-              <ResponsiveContainer height="100%" width="100%">
-                <AreaChart data={chart}>
-                  <defs>
-                    <linearGradient id="usage-area" x1="0" x2="0" y1="0" y2="1">
-                      <stop
-                        offset="5%"
-                        stopColor="var(--primary)"
-                        stopOpacity={0.25}
-                      />
-                      <stop
-                        offset="95%"
-                        stopColor="var(--primary)"
-                        stopOpacity={0}
-                      />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid
-                    stroke="var(--border)"
-                    strokeDasharray="3 3"
-                    vertical={false}
-                  />
-                  <XAxis
-                    axisLine={false}
-                    dataKey="day"
-                    fontSize={11}
-                    tickLine={false}
-                  />
-                  <YAxis
-                    axisLine={false}
-                    fontSize={11}
-                    tickLine={false}
-                    width={38}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      background: "var(--card)",
-                      borderColor: "var(--border)",
-                      borderRadius: 10,
-                    }}
-                  />
-                  <Area
-                    dataKey="cost"
-                    fill="url(#usage-area)"
-                    stroke="var(--primary)"
-                    strokeWidth={2.5}
-                    type="monotone"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          ) : (
-            <p className="grid h-80 place-items-center text-sm text-muted-foreground">
-              暂无真实用量事件
-            </p>
-          )}
-        </Surface>
-        <Surface className="p-5">
-          <SectionHeading
-            description="按真实 token 聚合"
-            title="功能用量明细"
-          />
-          <div className="mt-5 space-y-5">
-            {usageByFeature.map((item) => {
-              const percent = totalTokens
-                ? Math.round((item.tokens / totalTokens) * 100)
-                : 0;
-              return (
-                <div key={item.feature}>
-                  <div className="flex justify-between text-sm">
-                    <span className="font-medium">{item.feature}</span>
-                    <span className="font-mono text-xs text-primary">
-                      {item.tokens.toLocaleString()} tokens · {displayCurrency === "CNY" ? "¥" : "$"}
-                      {item.cost.toFixed(4)}
-                    </span>
-                  </div>
-                  <div className="mt-2 flex items-center gap-2">
-                    <Progress value={percent} />
-                    <span className="w-8 text-right text-[10px] text-muted-foreground">
-                      {percent}%
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
-            {!usageByFeature.length ? (
-              <p className="py-10 text-center text-sm text-muted-foreground">
-                暂无可聚合事件
-              </p>
-            ) : null}
-          </div>
-          <div className="mt-6 rounded-xl border bg-muted/25 p-3 text-xs leading-5 text-muted-foreground">
-            <p className="flex items-center gap-2 font-semibold text-foreground">
-              <CircleDollarSign className="size-4 text-primary" />
-              预算状态
-            </p>
-            {statusItems.length ? (
-              <div className="mt-3 space-y-3">
-                {statusItems.map((status) => (
-                  <div
-                    className="rounded-lg border bg-background/80 p-3"
-                    key={status.policy_id}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-medium text-foreground">
-                        {status.name}
-                      </span>
-                      <StatePill
-                        label={
-                          status.hard_exceeded
-                            ? "已阻断"
-                            : status.soft_exceeded
-                              ? "已预警"
-                              : "正常"
-                        }
-                        status={
-                          status.hard_exceeded
-                            ? "failed"
-                            : status.soft_exceeded
-                              ? "warning"
-                              : "approved"
-                        }
-                      />
-                    </div>
-                    <p className="mt-1 font-mono">
-                      已用 ¥{status.spent_cny.toFixed(4)} · 软上限
-                      {status.soft_limit_cny === null
-                        ? "未设置"
-                        : ` ¥${status.soft_limit_cny.toFixed(2)}`}{" "}
-                      · 硬上限
-                      {status.hard_limit_cny === null
-                        ? "未设置"
-                        : ` ¥${status.hard_limit_cny.toFixed(2)}`}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="mt-1">
-                尚未配置预算策略；真实用量仍会记录，但不会执行预算阻断。
-              </p>
-            )}
-          </div>
-        </Surface>
-      </div>
-      <div className="grid gap-5 lg:grid-cols-2">
-        <Surface className="p-5">
-          <SectionHeading
-            description="事件创建时固化价格与汇率版本，后续调整不会改写历史账本。"
-            title="计费版本"
-          />
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            <div className="rounded-xl border p-4">
-              <p className="text-xs font-semibold text-muted-foreground">
-                价格版本
-              </p>
-              <p className="mt-2 text-2xl font-semibold">
-                {priceVersions.length}
-              </p>
-              <div className="mt-3 max-h-64 space-y-3 overflow-auto pr-1">
-                {priceVersions.map((price) => (
-                  <div className="rounded-lg border bg-muted/15 p-3 text-xs" key={price.id}>
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <p className="min-w-0 break-all font-medium">
-                        {price.provider_id} / {price.model_id} / {price.feature}
-                      </p>
-                      {price.retired_at ? (
-                        <StatePill label="已退役" status="archived" />
-                      ) : (
-                        <RetireVersionButton
-                          actionLabel={`退役价格 v${price.version}`}
-                          busy={retirePrice.isPending}
-                          description={`这会停止价格版本 v${price.version} 用于未来报价。`}
-                          onRetire={() => retirePrice.mutate(price.id)}
-                        />
-                      )}
-                    </div>
-                    {price.conditions.pricing_currency === "CNY" ? (
-                      <p className="mt-1 font-mono text-muted-foreground">
-                        in ¥{String(price.conditions.input_cny_per_million ?? 0)}/M · out ¥
-                        {String(price.conditions.output_cny_per_million ?? 0)}/M · 人民币原生定价
-                      </p>
-                    ) : (
-                      <p className="mt-1 font-mono text-muted-foreground">
-                        in ${price.input_usd_per_million}/M · out $
-                        {price.output_usd_per_million}/M · call $
-                        {price.fixed_usd_per_call}
-                      </p>
-                    )}
-                    <p className="mt-1 text-[10px] text-muted-foreground">
-                      v{price.version} · 生效 {new Date(price.effective_at).toLocaleString()}
-                      {price.retired_at ? ` · 退役 ${new Date(price.retired_at).toLocaleString()}` : ""}
-                    </p>
-                  </div>
-                ))}
-                {!priceVersions.length ? (
-                  <p className="text-xs text-muted-foreground">尚未配置</p>
-                ) : null}
-              </div>
-            </div>
-            <div className="rounded-xl border p-4">
-              <p className="text-xs font-semibold text-muted-foreground">
-                USD/CNY 汇率版本
-              </p>
-              <p className="mt-2 text-2xl font-semibold">
-                {rateVersions.length}
-              </p>
-              <div className="mt-3 max-h-64 space-y-3 overflow-auto pr-1">
-                {rateVersions.map((rate) => (
-                  <div className="rounded-lg border bg-muted/15 p-3 text-xs" key={rate.id}>
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <p className="font-mono font-medium">
-                        1 {rate.base_currency} = {rate.rate} {rate.quote_currency}
-                      </p>
-                      {rate.retired_at ? (
-                        <StatePill label="已退役" status="archived" />
-                      ) : (
-                        <RetireVersionButton
-                          actionLabel={`退役汇率 v${rate.version}`}
-                          busy={retireRate.isPending}
-                          description={`这会停止汇率版本 v${rate.version} 用于未来费用快照。`}
-                          onRetire={() => retireRate.mutate(rate.id)}
-                        />
-                      )}
-                    </div>
-                    <p className="mt-1 text-muted-foreground">
-                      v{rate.version} · {rate.source} · 生效 {new Date(rate.effective_at).toLocaleString()}
-                      {rate.retired_at ? ` · 退役 ${new Date(rate.retired_at).toLocaleString()}` : ""}
-                    </p>
-                  </div>
-                ))}
-                {!rateVersions.length ? (
-                  <p className="text-xs text-muted-foreground">尚未配置</p>
-                ) : null}
-              </div>
-            </div>
-          </div>
-        </Surface>
-        <Surface className="p-5">
-          <SectionHeading
-            description={`${policyItems.length} 条策略 · ${alertItems.filter((alert) => alert.status !== "acknowledged").length} 条待确认告警`}
-            title="预算策略与告警"
-          />
-          <div className="mt-4 space-y-5">
-            <section>
-              <p className="text-sm font-semibold">策略</p>
-              <div className="mt-3 space-y-3">
-                {policyItems.map((policy) => (
-                  <div className="flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center" key={policy.id}>
-                    <div className="min-w-0 flex-1 text-xs">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="font-medium">{policy.name}</p>
-                        <StatePill label={policy.enabled ? "已启用" : "已停用"} status={policy.enabled ? "approved" : "archived"} />
-                      </div>
-                      <p className="mt-1 break-all font-mono text-muted-foreground">
-                        {policy.provider_id} / {policy.model_id} / {policy.feature} · {policy.period}
-                      </p>
-                      <p className="mt-1 text-muted-foreground">
-                        软上限 {policy.soft_limit_cny === null ? "未设置" : `¥${policy.soft_limit_cny.toFixed(2)}`} · 硬上限 {policy.hard_limit_cny === null ? "未设置" : `¥${policy.hard_limit_cny.toFixed(2)}`}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      <EditBudgetPolicyDialog
-                        busy={updateBudget.isPending}
-                        onUpdate={(payload) =>
-                          updateBudget
-                            .mutateAsync({ id: policy.id, payload })
-                            .then(() => undefined)
-                        }
-                        policy={policy}
-                      />
-                      <DeleteBudgetPolicyButton
-                        busy={removeBudget.isPending}
-                        onDelete={() => removeBudget.mutate(policy.id)}
-                        policy={policy}
-                      />
-                    </div>
-                  </div>
-                ))}
-                {!policyItems.length ? (
-                  <p className="rounded-xl border border-dashed py-5 text-center text-sm text-muted-foreground">
-                    尚未配置预算策略；真实用量仍会记录，但不会执行预算阻断。
-                  </p>
-                ) : null}
-              </div>
-            </section>
-            <section className="border-t pt-5">
-              <p className="text-sm font-semibold">告警</p>
-              <div className="mt-3 space-y-3">
-                {alertItems.slice(0, 5).map((alert) => (
-                  <div
-                    className="flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center"
-                    key={alert.id}
-                  >
-                    <AlertTriangle className="size-4 shrink-0 text-amber-500" />
-                    <div className="min-w-0 flex-1 text-xs">
-                      <p className="font-medium">
-                        {alert.level} · {alert.feature || "全部功能"}
-                      </p>
-                      <p className="mt-1 font-mono text-muted-foreground">
-                        ¥{alert.projected_cost_cny.toFixed(4)} / ¥
-                        {alert.limit_cny.toFixed(4)}
-                      </p>
-                    </div>
-                    {alert.status === "acknowledged" ? (
-                      <StatePill label="已确认" status="approved" />
-                    ) : (
-                      <Button
-                        disabled={acknowledge.isPending}
-                        onClick={() => acknowledge.mutate(alert.id)}
-                        size="xs"
-                        variant="outline"
-                      >
-                        确认告警
-                      </Button>
-                    )}
-                  </div>
-                ))}
-                {!alertItems.length ? (
-                  <p className="rounded-xl border border-dashed py-5 text-center text-sm text-muted-foreground">
-                    当前没有预算告警
-                  </p>
-                ) : null}
-              </div>
-            </section>
-          </div>
-        </Surface>
-      </div>
-      <Surface className="p-5">
-        <SectionHeading
-          description="已知的 Provider 实例与模型在首次真实调用前会自动加载对应官方价格快照；可在“配置计费”中为实际 Provider ID 保存新的人工修正版本。人民币原生目录按人民币计算，不会先按参考汇率改写。"
-          title="模型价格映射目录"
-        />
-        <div className="mt-4 max-h-[34rem] overflow-auto rounded-xl border">
-          <table className="w-full min-w-[900px] text-left text-xs">
-            <thead className="sticky top-0 bg-muted text-muted-foreground">
-              <tr>
-                <th className="px-3 py-2">渠道 / 模型</th>
-                <th className="px-3 py-2">缓存输入</th>
-                <th className="px-3 py-2">普通输入</th>
-                <th className="px-3 py-2">输出</th>
-                <th className="px-3 py-2">条件</th>
-                <th className="px-3 py-2 text-right">操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {catalogItems.map((item) => (
-                <tr className="border-t" key={item.catalog_id}>
-                  <td className="px-3 py-2"><p className="font-medium">{item.provider_key}</p><p className="font-mono text-muted-foreground">{item.model_id}</p></td>
-                  <td className="px-3 py-2 font-mono">{item.native_cached_input_per_million === null ? "—" : `${item.currency === "USD" ? "$" : "¥"}${item.native_cached_input_per_million}`}</td>
-                  <td className="px-3 py-2 font-mono">{item.currency === "USD" ? "$" : "¥"}{item.native_input_per_million}</td>
-                  <td className="px-3 py-2 font-mono">{item.currency === "USD" ? "$" : "¥"}{item.native_output_per_million}</td>
-                  <td className="max-w-72 px-3 py-2 font-mono text-[10px] text-muted-foreground">{Object.keys(item.conditions).length ? JSON.stringify(item.conditions) : "默认"}</td>
-                  <td className="px-3 py-2 text-right text-muted-foreground">自动加载</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <p className="mt-3 text-xs text-muted-foreground">DeepSeek 目录包含 Asia/Shanghai 09:00–12:00、14:00–18:00 的 2 倍峰值规则；实际 UsageEvent 固化调用时倍率。促销和长上下文阶梯保存在条件字段中。</p>
-      </Surface>
-      <Surface className="overflow-hidden">
-        <div className="border-b p-5">
-          <SectionHeading title="用量事件" />
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[740px] text-left text-xs">
-            <thead className="bg-muted/35 text-muted-foreground">
-              <tr>
-                <th className="px-5 py-3">时间</th>
-                <th className="px-5 py-3">Provider / Model</th>
-                <th className="px-5 py-3">功能</th>
-                <th className="px-5 py-3">Token</th>
-                <th className="px-5 py-3">Attempt</th>
-                <th className="px-5 py-3">费用</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {usageEvents.map((event) => (
-                <tr key={event.id}>
-                  <td className="px-5 py-3 font-mono">
-                    {new Date(event.created_at).toLocaleString()}
-                  </td>
-                  <td className="px-5 py-3">
-                    {event.provider_id} / {event.model_id}
-                  </td>
-                  <td className="px-5 py-3">{event.feature}</td>
-                  <td className="px-5 py-3 font-mono">
-                    {event.input_tokens + event.output_tokens}
-                  </td>
-                  <td className="px-5 py-3">{event.attempt}</td>
-                  <td className="px-5 py-3 font-mono">
-                    <p>
-                      {displayCurrency === "CNY" ? "¥" : "$"}
-                      {(displayCurrency === "CNY" ? event.cost_cny : event.cost_usd).toFixed(4)}
-                    </p>
-                    <p className="mt-1 text-[10px] text-muted-foreground">
-                      {displayCurrency === "CNY" ? "$" : "¥"}
-                      {(displayCurrency === "CNY" ? event.cost_usd : event.cost_cny).toFixed(4)} · {event.cost_status}
-                    </p>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Surface>
-    </PageFrame>
   );
 }

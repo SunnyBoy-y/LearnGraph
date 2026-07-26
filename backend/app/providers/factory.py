@@ -32,6 +32,7 @@ from app.providers.model_options import (
     model_capabilities_for_model,
     resolve_model_call_options,
 )
+from app.providers.qwen_catalog import is_dashscope_api_base_url
 from app.providers.remote.deepseek import (
     DeepSeekChatProvider,
     is_deepseek_chat_configuration,
@@ -39,9 +40,17 @@ from app.providers.remote.deepseek import (
 from app.providers.remote.openai import (
     OpenAICompatibleChatProvider,
     OpenAIResponsesProvider,
+    QwenChatProvider,
     normalize_openai_api_base_url,
 )
 from app.providers.remote.anthropic import AnthropicMessagesProvider, normalize_anthropic_api_base_url
+from app.providers.remote.codex import (
+    CODEX_BASE_URL,
+    CodexAuthError,
+    ensure_fresh_codex_credentials,
+    parse_codex_credentials,
+)
+from app.providers.remote.codex_provider import CodexResponsesProvider
 from app.providers.remote.images import (
     OpenAIImagesProvider,
     UnavailableImageGenerationProvider,
@@ -50,11 +59,21 @@ from app.providers.remote.research import (
     HTTPDeepResearchProvider,
     UnavailableDeepResearchProvider,
 )
+from app.providers.remote.research_vendors import (
+    ExaDeepResearchProvider,
+    GeminiDeepResearchProvider,
+    JinaDeepSearchProvider,
+    OpenAIDeepResearchProvider,
+    PerplexityDeepResearchProvider,
+    QwenDeepResearchProvider,
+    TavilyDeepResearchProvider,
+)
 from app.providers.remote.fetch import (
     Crawl4AIHTTPFetchProvider,
     FirecrawlFetchProvider,
     UnavailableFetchProvider,
 )
+from app.providers.remote.qwen_tools import QwenResponsesToolProvider
 from app.providers.remote.search import SearXNGSearchProvider, UnavailableSearchProvider
 from app.providers.remote.memory import (
     Mem0PlatformAdapter,
@@ -119,13 +138,34 @@ def model_provider_for_workspace(
                 provider_id=provider.id,
                 model_id=resolved_model_id or "unavailable",
             )
+        # A model identifier is not a protocol declaration.  Compatible
+        # gateways (for example DashScope) can expose hosted DeepSeek models,
+        # but still require their own OpenAI-compatible request shape.  Routing
+        # those models through ``DeepSeekChatProvider`` adds DeepSeek-only
+        # fields such as ``thinking`` and breaks Agent tool calls at the
+        # gateway.  Use the native adapter only for the legacy explicit type or
+        # the official DeepSeek API origin.
         is_deepseek = (
-            is_deepseek_chat_configuration(
+            provider.provider_type == "deepseek_chat"
+            or is_deepseek_chat_configuration(
                 provider.provider_type,
                 provider.base_url,
             )
-            or provider.provider_type == "deepseek_chat"
-            or _model_family_is_deepseek(resolved_model_id, capabilities)
+        )
+        # Qwen was historically created through the generic
+        # ``openai_compatible_chat`` preset.  Keep those existing rows on the
+        # DashScope-aware adapter too; otherwise fast mode never gets Qwen's
+        # explicit ``enable_thinking=false`` request field.  The endpoint is the
+        # decisive signal: DashScope also hosts DeepSeek, GLM, Kimi and MiniMax
+        # weights, and those models still need DashScope's request shape — a
+        # model-name test alone leaves them on the generic adapter, where the
+        # hosted search switch silently does nothing.
+        brand_id = str(capabilities.get("brand_id") or "").strip().casefold()
+        is_qwen = (
+            provider.provider_type == "qwen"
+            or brand_id == "qwen"
+            or is_dashscope_api_base_url(provider.base_url)
+            or resolved_model_id.casefold().startswith(("qwen", "qwq"))
         )
         if is_deepseek:
             # Provider-level defaults are protocol facts, not a hard-coded
@@ -143,7 +183,7 @@ def model_provider_for_workspace(
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
                 "hosted_web_search": False,
-                "default_search_route": "disabled",
+                "default_search_route": "auto",
                 **capabilities,
             }
         if not provider.remote_capability:
@@ -177,7 +217,11 @@ def model_provider_for_workspace(
                 provider_id=provider.id,
                 model_id=resolved_model_id,
             )
-        if provider.provider_type == "openai_responses":
+        if provider.provider_type == "codex_chatgpt":
+            # The Codex backend is the only origin these OAuth tokens are
+            # accepted by, so the row's URL never redirects the credential.
+            effective_base_url = CODEX_BASE_URL
+        elif provider.provider_type == "openai_responses":
             effective_base_url = normalize_openai_api_base_url(provider.base_url)
         elif provider.provider_type == "anthropic_messages":
             effective_base_url = normalize_anthropic_api_base_url(provider.base_url)
@@ -225,7 +269,11 @@ def model_provider_for_workspace(
         # Expose a shallow capability snapshot so ChatService can re-resolve
         # image routing without another DB round-trip.
         common["capabilities"] = {
+            **effective_model_capabilities,
             "supports_image_input": common["supports_image_input"],
+            "supports_video_input": (
+                effective_model_capabilities.get("supports_video_input") is True
+            ),
             "image_input_mode": image_mode,
             "context_window_tokens": context_window_tokens,
             "context_limit_tokens": context_limit_tokens,
@@ -244,6 +292,18 @@ def model_provider_for_workspace(
                 provider_id=provider.id,
                 model_id=resolved_model_id,
             )
+        if provider.provider_type == "codex_chatgpt":
+            try:
+                credentials, _ = ensure_fresh_codex_credentials(
+                    parse_codex_credentials(api_key)
+                )
+            except CodexAuthError as exc:
+                return UnavailableModelProvider(
+                    str(exc),
+                    provider_id=provider.id,
+                    model_id=resolved_model_id,
+                )
+            return CodexResponsesProvider(**common, credentials=credentials)
         if provider.provider_type == "openai_responses":
             return OpenAIResponsesProvider(**common)
         if provider.provider_type == "anthropic_messages":
@@ -252,7 +312,7 @@ def model_provider_for_workspace(
             provider.provider_type == "openai_compatible_chat" and is_deepseek
         ):
             return DeepSeekChatProvider(**common)
-        if provider.provider_type == "openai_compatible_chat":
+        if provider.provider_type in {"openai_compatible_chat", "qwen"}:
             structured_output_mode = capabilities.get("structured_output_mode")
             if structured_output_mode not in {None, "json_object", "json_schema"}:
                 return UnavailableModelProvider(
@@ -260,10 +320,21 @@ def model_provider_for_workspace(
                     provider_id=provider.id,
                     model_id=resolved_model_id,
                 )
-            return OpenAICompatibleChatProvider(
+            adapter = (
+                QwenChatProvider
+                if is_qwen
+                else OpenAICompatibleChatProvider
+            )
+            qwen_options = {}
+            if is_qwen:
+                qwen_options["preserve_thinking"] = (
+                    effective_model_capabilities.get("preserve_thinking") is True
+                )
+            return adapter(
                 **common,
                 structured_output_mode=structured_output_mode,
                 supports_structured_chat=True,
+                **qwen_options,
             )
 
     local_provider = db.scalar(
@@ -307,22 +378,30 @@ def _extra_headers_from_capabilities(capabilities: dict) -> dict[str, str]:
     return headers
 
 
-def _model_family_is_deepseek(model_id: str | None, capabilities: dict) -> bool:
-    """Detect DeepSeek model family so balance/thinking features can activate.
+def _qwen_model_candidates(
+    capabilities: dict,
+    *preferred_model_ids: str | None,
+) -> list[str]:
+    """Return enabled Qwen model IDs in explicit-to-discovered priority order."""
 
-    DeepSeek no longer needs a separate protocol type: the OpenAI-compatible
-    Chat adapter is used, and DeepSeek-specific behaviour keys off the model
-    family (or an explicit capability flag) rather than a separate catalog row.
-    """
-
-    if capabilities.get("model_family") == "deepseek":
-        return True
-    if capabilities.get("brand_id") == "deepseek":
-        return True
-    if not model_id:
-        return False
-    lowered = model_id.strip().casefold()
-    return lowered.startswith("deepseek") or "deepseek" in lowered.split("/")[-1]
+    raw_states = capabilities.get("model_states")
+    states = raw_states if isinstance(raw_states, dict) else {}
+    raw_discovered = capabilities.get("discovered_model_ids")
+    discovered = raw_discovered if isinstance(raw_discovered, list) else []
+    raw_models = capabilities.get("models")
+    configured = raw_models.keys() if isinstance(raw_models, dict) else []
+    candidates = [
+        *preferred_model_ids,
+        str(capabilities.get("default_model") or ""),
+        *discovered,
+        *configured,
+    ]
+    return [
+        model_id
+        for value in candidates
+        if (model_id := str(value or "").strip())
+        and states.get(model_id, True) is not False
+    ]
 
 
 def image_provider_for_workspace(
@@ -456,6 +535,15 @@ def vision_provider_for_workspace(
     provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
     selected_model_id = model_id.strip() if model_id else ""
     if provider is None:
+        if provider_id is None:
+            qwen_vision = _qwen_vision_companion_for_workspace(
+                db,
+                workspace_id,
+                settings,
+                model_id=selected_model_id or None,
+            )
+            if qwen_vision is not None:
+                return qwen_vision
         return UnavailableModelProvider(
             (
                 "The selected vision provider is not enabled in this workspace"
@@ -519,7 +607,9 @@ def vision_provider_for_workspace(
         "supports_image_input": True,
         "image_input_mode": "native",
         "capabilities": {
+            **capabilities,
             "supports_image_input": True,
+            "supports_video_input": capabilities.get("supports_video_input") is True,
             "image_input_mode": "native",
         },
     }
@@ -559,14 +649,118 @@ def vision_provider_for_workspace(
     )
 
 
+def _qwen_vision_companion_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    *,
+    model_id: str | None = None,
+) -> ModelProviderPort | None:
+    providers = list(
+        db.scalars(
+            select(ProviderConfig)
+            .where(
+                ProviderConfig.workspace_id == workspace_id,
+                ProviderConfig.enabled.is_(True),
+                ProviderConfig.remote_capability.is_(True),
+                ProviderConfig.provider_type == "qwen",
+            )
+            .order_by(ProviderConfig.updated_at.desc())
+        ).all()
+    )
+    for provider in providers:
+        capabilities = dict(provider.capabilities or {})
+        if not provider.base_url:
+            continue
+        selected = next(
+            (
+                (candidate, effective)
+                for candidate in _qwen_model_candidates(
+                    capabilities,
+                    model_id,
+                    str(capabilities.get("vision_companion_model_id") or ""),
+                )
+                if (
+                    effective := model_capabilities_for_model(
+                        capabilities,
+                        candidate,
+                    )
+                ).get("supports_image_input")
+                is True
+            ),
+            None,
+        )
+        if selected is None:
+            continue
+        resolved_model_id, effective = selected
+        try:
+            api_key = _secret_for_provider(db, workspace_id, provider, settings)
+        except Exception:
+            continue
+        if not api_key:
+            continue
+        try:
+            call_options = resolve_model_call_options(
+                capabilities,
+                resolved_model_id,
+                thinking_mode=(
+                    "medium" if effective.get("thinking_required") is True else "off"
+                ),
+                search_route="disabled",
+            )
+        except ModelCapabilityError:
+            continue
+        return QwenChatProvider(
+            provider_id=provider.id,
+            provider_type="qwen",
+            model_id=resolved_model_id,
+            base_url=provider.base_url,
+            api_key=api_key,
+            context_window_tokens=int(
+                effective.get("context_limit_tokens")
+                or effective.get("context_window_tokens")
+                or 256_000
+            ),
+            max_output_tokens=min(
+                int(effective.get("max_output_tokens") or 4_096),
+                4_096,
+            ),
+            call_options=call_options,
+            supports_image_input=True,
+            image_input_mode="native",
+            capabilities=effective,
+            extra_headers=_extra_headers_from_capabilities(capabilities),
+            structured_output_mode="json_object",
+            supports_structured_chat=True,
+            preserve_thinking=effective.get("preserve_thinking") is True,
+        )
+    return None
+
+
 def search_provider_for_workspace(
     db: Session,
     workspace_id: str,
     settings: Settings,
     route: str | None = None,
 ) -> SearchProviderPort | None:
-    if route in {"disabled", "model_native"}:
+    if route == "disabled":
         return None
+    if route == "model_native":
+        # The model normally runs this search inside its own invocation, so no
+        # external SearchProvider is required.  DashScope is the exception: its
+        # hosted ``enable_search`` switch is a whole-turn alternative to
+        # function calling and is dropped whenever a request carries ``tools``
+        # (see QwenChatProvider._apply_call_options).  An Agent turn always
+        # carries tools, so offer the Qwen Responses companion as an explicit
+        # tool lane instead — otherwise Agent mode on a Qwen model would have no
+        # way to reach the web at all.  Callers on the hosted path ignore this
+        # provider by short-circuiting on the route before they use it.
+        return _qwen_companion_for_workspace(
+            db,
+            workspace_id,
+            settings,
+            capability="hosted_web_search",
+        )
     provider_types = SEARCH_PROVIDER_TYPES
     if route == "local":
         provider_types = {"searxng"}
@@ -604,6 +798,15 @@ def search_provider_for_workspace(
                     "route_unconfigured",
                     "Auto search crosses local/cloud boundaries and requires an explicit authorized chain",
                 )
+    if provider is None and route in {None, "external", "auto"}:
+        qwen_tool = _qwen_companion_for_workspace(
+            db,
+            workspace_id,
+            settings,
+            capability="hosted_web_search",
+        )
+        if qwen_tool is not None:
+            return qwen_tool
     if provider is None:
         return UnavailableSearchProvider(
             "unconfigured",
@@ -683,6 +886,53 @@ def transcription_provider_for_workspace(
     )
 
 
+def embedding_provider_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    *,
+    provider_id: str,
+    model_id: str,
+):
+    """Build the optional memory-embedding adapter from an explicit selection.
+
+    Embeddings ride on any enabled OpenAI-compatible provider row (OpenAI,
+    DashScope/Qwen, SiliconFlow, relays): the workspace picks the provider and
+    the embedding model id in the memory enhancement settings. Returns None
+    when the selection cannot produce a usable adapter — recall then stays on
+    the heuristic (no-embedding) pipeline by design.
+    """
+
+    from app.providers.remote.embedding import OpenAICompatibleEmbeddingProvider
+
+    resolved_model = (model_id or "").strip()
+    if not provider_id or not resolved_model:
+        return None
+    provider = db.scalar(
+        select(ProviderConfig).where(
+            ProviderConfig.workspace_id == workspace_id,
+            ProviderConfig.id == provider_id,
+            ProviderConfig.enabled.is_(True),
+        )
+    )
+    if provider is None or not provider.base_url:
+        return None
+    try:
+        api_key = _secret_for_provider(db, workspace_id, provider, settings)
+    except Exception:
+        return None
+    if not api_key:
+        return None
+    capabilities = dict(provider.capabilities or {})
+    return OpenAICompatibleEmbeddingProvider(
+        provider_id=provider.id,
+        model_id=resolved_model,
+        base_url=provider.base_url,
+        api_key=api_key,
+        extra_headers=_extra_headers_from_capabilities(capabilities),
+    )
+
+
 def deep_research_provider_for_workspace(
     db: Session,
     workspace_id: str,
@@ -708,6 +958,54 @@ def deep_research_provider_for_workspace(
         return UnavailableDeepResearchProvider(provider.id, "Configured research secret cannot be decrypted")
     if not api_key:
         return UnavailableDeepResearchProvider(provider.id, "Configured research provider has no encrypted secret")
+    capabilities = dict(provider.capabilities or {})
+    vendor_adapters = {
+        "gemini_deep_research": (
+            GeminiDeepResearchProvider,
+            GeminiDeepResearchProvider.DEFAULT_AGENT,
+        ),
+        "openai_deep_research": (
+            OpenAIDeepResearchProvider,
+            OpenAIDeepResearchProvider.DEFAULT_MODEL,
+        ),
+        "perplexity_deep_research": (
+            PerplexityDeepResearchProvider,
+            PerplexityDeepResearchProvider.DEFAULT_MODEL,
+        ),
+        "tavily_deep_research": (
+            TavilyDeepResearchProvider,
+            TavilyDeepResearchProvider.DEFAULT_MODEL,
+        ),
+        "exa_deep_research": (
+            ExaDeepResearchProvider,
+            ExaDeepResearchProvider.DEFAULT_MODEL,
+        ),
+        "qwen_deep_research": (
+            QwenDeepResearchProvider,
+            QwenDeepResearchProvider.DEFAULT_MODEL,
+        ),
+        "jina_deep_research": (
+            JinaDeepSearchProvider,
+            JinaDeepSearchProvider.DEFAULT_MODEL,
+        ),
+    }
+    selected = vendor_adapters.get(provider.provider_type)
+    if selected is not None:
+        adapter, default_model = selected
+        # The research model is a workspace choice; the adapter only supplies a
+        # documented default when the row has not declared one.
+        model = str(
+            capabilities.get("deep_research_model")
+            or capabilities.get("default_model")
+            or default_model
+        ).strip()
+        return adapter(
+            provider_id=provider.id,
+            base_url=provider.base_url,
+            api_key=api_key,
+            model=model or default_model,
+            declared_capabilities=capabilities,
+        )
     return HTTPDeepResearchProvider(
         provider_id=provider.id,
         base_url=provider.base_url,
@@ -732,7 +1030,12 @@ def fetch_provider_for_workspace(
         .order_by(ProviderConfig.updated_at.desc())
     )
     if provider is None:
-        return None
+        return _qwen_companion_for_workspace(
+            db,
+            workspace_id,
+            settings,
+            capability="hosted_web_fetch",
+        )
     if not provider.base_url:
         return UnavailableFetchProvider(provider.id, "Configured Crawl4AI provider has no base URL")
     try:
@@ -752,6 +1055,75 @@ def fetch_provider_for_workspace(
         base_url=provider.base_url,
         api_key=api_key,
     )
+
+
+def _qwen_companion_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    *,
+    capability: str,
+) -> QwenResponsesToolProvider | None:
+    """Resolve an explicitly enabled Qwen model as a mixed-model tool lane.
+
+    ``QwenResponsesToolProvider`` calls ``POST /responses``, so declaring the
+    capability is not sufficient: the model must also speak that protocol.
+    DashScope exposes hosted search on plain Chat Completions too (via
+    ``enable_search``) for families such as ``qwen-plus``, ``qwq-plus`` and the
+    hosted DeepSeek models, and those would fail against the Responses route.
+    """
+
+    candidates = list(
+        db.scalars(
+            select(ProviderConfig)
+            .where(
+                ProviderConfig.workspace_id == workspace_id,
+                ProviderConfig.enabled.is_(True),
+                ProviderConfig.remote_capability.is_(True),
+                ProviderConfig.provider_type == "qwen",
+            )
+            .order_by(ProviderConfig.updated_at.desc())
+        ).all()
+    )
+    for provider in candidates:
+        capabilities = dict(provider.capabilities or {})
+        if not provider.base_url:
+            continue
+        selected = next(
+            (
+                candidate
+                for candidate in _qwen_model_candidates(
+                    capabilities,
+                    str(capabilities.get(f"{capability}_model_id") or ""),
+                )
+                if (
+                    effective := model_capabilities_for_model(
+                        capabilities,
+                        candidate,
+                    )
+                ).get(capability)
+                is True
+                and effective.get("native_tool_protocol") == "responses"
+            ),
+            None,
+        )
+        if selected is None:
+            continue
+        model_id = selected
+        try:
+            api_key = _secret_for_provider(db, workspace_id, provider, settings)
+        except Exception:
+            continue
+        if not api_key:
+            continue
+        return QwenResponsesToolProvider(
+            provider_id=provider.id,
+            model_id=model_id,
+            base_url=provider.base_url,
+            api_key=api_key,
+            extra_headers=_extra_headers_from_capabilities(capabilities),
+        )
+    return None
 
 
 def memory_provider_for_workspace(

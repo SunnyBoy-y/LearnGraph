@@ -1,6 +1,8 @@
 import type {
   BranchSessionRequest,
   ConceptBranchCreateRequest,
+  DictationCleanupRequest,
+  DictationCleanupResult,
   GraphChangeSet,
   Message,
   MessageSnapshot,
@@ -9,6 +11,7 @@ import type {
   MessageRetryRequest,
   Session,
   SessionAutoTitleRequest,
+  SessionContextUsage,
   SessionCreateRequest,
   SessionUpdateRequest,
   SessionMessageStreamData,
@@ -37,6 +40,43 @@ export function autoTitleSession(
   return apiClient.post<Session, SessionAutoTitleRequest>(
     `/sessions/${encodeURIComponent(sessionId)}/auto-title`,
     payload,
+  )
+}
+
+export function cleanupDictation(
+  payload: DictationCleanupRequest,
+): Promise<DictationCleanupResult> {
+  return apiClient.post<DictationCleanupResult, DictationCleanupRequest>(
+    '/sessions/dictation/cleanup',
+    payload,
+  )
+}
+
+export interface DictationTranscriptionResult {
+  text: string
+  language: string | null
+  duration_seconds: number | null
+  request_id: string | null
+}
+
+/** Transcribe one live microphone segment via the workspace ASR Provider. */
+export function transcribeDictationSegment(
+  segment: Blob,
+  options: { provider_id?: string; model_id?: string; language?: string } = {},
+): Promise<DictationTranscriptionResult> {
+  const formData = new FormData()
+  const extension = segment.type.includes('mp4')
+    ? 'm4a'
+    : segment.type.includes('ogg')
+      ? 'ogg'
+      : 'webm'
+  formData.set('file', segment, `dictation-segment.${extension}`)
+  if (options.provider_id) formData.set('provider_id', options.provider_id)
+  if (options.model_id) formData.set('model_id', options.model_id)
+  if (options.language) formData.set('language', options.language)
+  return apiClient.upload<DictationTranscriptionResult>(
+    '/sessions/dictation/transcriptions',
+    formData,
   )
 }
 
@@ -80,6 +120,22 @@ export function deleteSessionsBatch(
 
 export function listSessionMessages(sessionId: string): Promise<Message[]> {
   return apiClient.get<Message[]>(`/sessions/${encodeURIComponent(sessionId)}/messages`)
+}
+
+export function getSessionContextUsage(
+  sessionId: string,
+  options: { provider_id?: string; model_id?: string; agent_mode?: boolean } = {},
+): Promise<SessionContextUsage> {
+  return apiClient.get<SessionContextUsage>(
+    `/sessions/${encodeURIComponent(sessionId)}/context-usage`,
+    {
+      query: {
+        provider_id: options.provider_id,
+        model_id: options.model_id,
+        agent_mode: options.agent_mode ? 'true' : undefined,
+      },
+    },
+  )
 }
 
 export function getSessionSuggestedPrompts(

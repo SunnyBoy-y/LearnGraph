@@ -1,9 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
-import { CircleAlert, ImageIcon, LoaderCircle } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  CircleAlert,
+  Download,
+  ImageIcon,
+  LoaderCircle,
+  Maximize2,
+  X,
+} from "lucide-react";
+import { toast } from "sonner";
 
 import { downloadFile } from "@/api/files";
 import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import type { MessagePart } from "@/types/sessions";
 
 function safeImageSource(value: unknown) {
@@ -25,6 +39,42 @@ function positiveNumber(value: unknown) {
     : undefined;
 }
 
+/**
+ * Simulated generation progress: image providers report no true percentage,
+ * so the bar advances with variable speed toward 99% and only reaches 100%
+ * when the final image is actually delivered.
+ */
+function useSimulatedImageProgress(active: boolean, done: boolean) {
+  const [progress, setProgress] = useState(0);
+  useEffect(() => {
+    if (done) {
+      setProgress(100);
+      return;
+    }
+    if (!active) {
+      setProgress(0);
+      return;
+    }
+    setProgress((current) => (current > 0 && current < 99 ? current : 2));
+    const timer = window.setInterval(() => {
+      setProgress((current) => {
+        if (current >= 99) return 99;
+        const remaining = 99 - current;
+        // Ease toward 99 with jitter and occasional bursts so the motion
+        // reads as "variable speed" rather than a fixed-rate fill.
+        const burst = Math.random() < 0.12 ? remaining * 0.08 : 0;
+        const step = Math.max(
+          0.15,
+          remaining * (0.012 + Math.random() * 0.045) + burst,
+        );
+        return Math.min(99, current + step);
+      });
+    }, 200);
+    return () => window.clearInterval(timer);
+  }, [active, done]);
+  return progress;
+}
+
 function ChatImagePart({ part }: { part: MessagePart }) {
   const data = part.data;
   const directSource = safeImageSource(
@@ -37,6 +87,7 @@ function ChatImagePart({ part }: { part: MessagePart }) {
   const [downloadedSource, setDownloadedSource] = useState("");
   const [loadingRevision, setLoadingRevision] = useState(Boolean(fileId));
   const [downloadFailed, setDownloadFailed] = useState(false);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
     if (!fileId) {
@@ -89,29 +140,111 @@ function ChatImagePart({ part }: { part: MessagePart }) {
       loadingRevision) &&
     !downloadFailed;
   const failed = part.status === "failed" || downloadFailed;
-  const stateLabel =
-    downloadFailed
-      ? "图片预览加载失败"
-      : part.status === "failed"
+  const done = part.status === "completed" && Boolean(source) && !loadingRevision;
+  const progress = useSimulatedImageProgress(isWorking && !failed, done);
+
+  // Keep the overlay briefly after completion so the bar visibly hits 100%.
+  const [showCompletion, setShowCompletion] = useState(false);
+  const wasWorkingRef = useRef(false);
+  useEffect(() => {
+    if (done && wasWorkingRef.current) {
+      setShowCompletion(true);
+      const timer = window.setTimeout(() => setShowCompletion(false), 900);
+      wasWorkingRef.current = false;
+      return () => window.clearTimeout(timer);
+    }
+    if (isWorking) wasWorkingRef.current = true;
+    return undefined;
+  }, [done, isWorking]);
+
+  const stateLabel = downloadFailed
+    ? "图片预览加载失败"
+    : part.status === "failed"
       ? "图片生成失败"
-      : source
-        ? "正在优化预览"
-        : "正在生成图片";
+      : done
+        ? "图片已生成"
+        : source
+          ? "正在优化预览"
+          : "正在生成图片";
   const imageKey = useMemo(
     () => `${fileId || directSource}-${revision}`,
     [directSource, fileId, revision],
   );
 
+  const mimeType = typeof data?.mime_type === "string" ? data.mime_type : "";
+  const downloadName = `learngraph-image-${fileId || "generated"}.${
+    mimeType.includes("jpeg") || mimeType.includes("jpg")
+      ? "jpg"
+      : mimeType.includes("webp")
+        ? "webp"
+        : "png"
+  }`;
+  const handleDownload = useCallback(async () => {
+    if (!source) return;
+    try {
+      let href = source;
+      let revoke = false;
+      if (!source.startsWith("blob:") && !source.startsWith("data:")) {
+        const response = await fetch(source);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        href = URL.createObjectURL(await response.blob());
+        revoke = true;
+      }
+      const anchor = document.createElement("a");
+      anchor.href = href;
+      anchor.download = downloadName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      if (revoke) window.setTimeout(() => URL.revokeObjectURL(href), 2_000);
+    } catch {
+      toast.error("图片下载失败");
+    }
+  }, [downloadName, source]);
+
+  const interactive = done && !failed;
+  const showOverlay = isWorking || !source || failed || showCompletion;
+  const showProgress = !failed && (isWorking || showCompletion || !source);
+
   return (
     <figure
       aria-busy={isWorking}
-      className="chat-generated-image"
+      className={`chat-generated-image${
+        source ? " chat-generated-image--has-preview" : ""
+      }`}
       style={{ aspectRatio }}
     >
       {source ? (
-        <img alt={alt} className="chat-generated-image__preview" key={imageKey} src={source} />
+        interactive ? (
+          <button
+            aria-label="放大查看图片"
+            className="chat-generated-image__zoom"
+            onClick={() => setLightboxOpen(true)}
+            type="button"
+          >
+            <img
+              alt={alt}
+              className="chat-generated-image__preview"
+              key={imageKey}
+              src={source}
+            />
+          </button>
+        ) : (
+          <img
+            alt={alt}
+            className="chat-generated-image__preview"
+            key={imageKey}
+            src={source}
+          />
+        )
       ) : null}
-      {isWorking || !source || failed ? (
+      {isWorking && !failed ? (
+        <div aria-hidden="true" className="chat-generated-image__shimmer">
+          <i className="chat-generated-image__shimmer-dots" />
+          <i className="chat-generated-image__shimmer-sweep" />
+        </div>
+      ) : null}
+      {showOverlay ? (
         <div
           className={`chat-generated-image__state${failed ? " is-failed" : ""}`}
           role={failed ? "alert" : "status"}
@@ -127,10 +260,73 @@ function ChatImagePart({ part }: { part: MessagePart }) {
           </span>
           <strong>{stateLabel}</strong>
           <span>{title}</span>
-          {part.status !== "failed" && !downloadFailed ? (
-            <i aria-hidden="true" className="chat-generated-image__progress" />
+          {showProgress ? (
+            <span className="chat-generated-image__progress-row">
+              <span
+                aria-valuemax={100}
+                aria-valuemin={0}
+                aria-valuenow={Math.round(progress)}
+                className="chat-generated-image__progressbar"
+                role="progressbar"
+              >
+                <i
+                  className="chat-generated-image__progressbar-fill"
+                  style={{ width: `${progress}%` }}
+                />
+              </span>
+              <span className="chat-generated-image__percent">
+                {Math.floor(progress)}%
+              </span>
+            </span>
           ) : null}
         </div>
+      ) : null}
+      {interactive ? (
+        <div className="chat-generated-image__actions">
+          <button
+            aria-label="放大查看"
+            onClick={() => setLightboxOpen(true)}
+            title="放大查看"
+            type="button"
+          >
+            <Maximize2 className="size-3.5" />
+          </button>
+          <button
+            aria-label="下载图片"
+            onClick={() => void handleDownload()}
+            title="下载图片"
+            type="button"
+          >
+            <Download className="size-3.5" />
+          </button>
+        </div>
+      ) : null}
+      {interactive ? (
+        <Dialog onOpenChange={setLightboxOpen} open={lightboxOpen}>
+          <DialogContent
+            aria-describedby={undefined}
+            className="chat-image-lightbox"
+            showCloseButton={false}
+          >
+            <DialogTitle className="sr-only">查看生成的图片</DialogTitle>
+            <img alt={alt} className="chat-image-lightbox__image" src={source} />
+            <div className="chat-image-lightbox__toolbar">
+              <button
+                onClick={() => void handleDownload()}
+                type="button"
+              >
+                <Download className="size-4" />
+                下载图片
+              </button>
+              <DialogClose asChild>
+                <button type="button">
+                  <X className="size-4" />
+                  关闭
+                </button>
+              </DialogClose>
+            </div>
+          </DialogContent>
+        </Dialog>
       ) : null}
     </figure>
   );

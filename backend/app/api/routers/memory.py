@@ -12,18 +12,31 @@ from app.domain.schemas.management import (
     MemoryDraftCreateRequest,
     MemoryDraftDecisionRequest,
     MemoryDraftView,
+    MemoryEmbeddingSettingsView,
+    MemoryEnhancementUpdateRequest,
+    MemoryEnhancementView,
+    MemoryExtractionSettingsView,
     MemoryJournalView,
     MemoryPolicyUpdateRequest,
     MemoryPolicyView,
     MemoryProviderStatusView,
     MemoryRevisionRestoreRequest,
     MemoryRevisionView,
+    MemorySummarizationSettingsView,
     MemoryTypeDefinitionView,
     MemoryUpdateRequest,
     MemoryView,
 )
 from app.providers.factory import memory_provider_for_workspace
 from app.services.memory import MemoryService
+from app.services.memory_enhancement import (
+    embedding_index_status,
+    extract_session_memories,
+    load_enhancement_config,
+    reindex_memory_embeddings,
+    save_enhancement_config,
+    summarize_session_context,
+)
 
 
 router = APIRouter(prefix="/memory", tags=["memory"])
@@ -62,12 +75,14 @@ def list_memories(
         Query(),
     ] = None,
     session_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    include_content: Annotated[bool, Query()] = False,
 ) -> list[MemoryView]:
     return service(db, context, settings).list(
         zone=zone,
         state=state,
         namespace=namespace,
         session_id=session_id,
+        include_content=include_content,
     )
 
 
@@ -137,6 +152,16 @@ def purge_expired_memory_content(
     return service(db, context, settings).purge_expired()
 
 
+@router.post("/maintenance/migrate-provider")
+def migrate_memory_provider_generation(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, int]:
+    return service(db, context, settings).migrate_provider_generation(limit=limit)
+
+
 @router.get("/package", response_model=EffectiveMemoryPackageView)
 def get_effective_memory_package(
     db: DB,
@@ -150,8 +175,87 @@ def get_effective_memory_package(
         session_id=session_id,
         goal_id=goal_id,
         node_ids=list(node_id or []),
-        require_provider_health=False,
         mark_access=False,
+    )
+
+
+def _enhancement_view(db: DB, workspace_id: str) -> MemoryEnhancementView:
+    config = load_enhancement_config(db, workspace_id)
+    stats = embedding_index_status(db, workspace_id)
+    return MemoryEnhancementView(
+        workspace_id=workspace_id,
+        extraction=MemoryExtractionSettingsView(**config["extraction"]),
+        embedding=MemoryEmbeddingSettingsView(**config["embedding"]),
+        summarization=MemorySummarizationSettingsView(**config["summarization"]),
+        active_memories=stats["active_memories"],
+        indexed_memories=stats["indexed_memories"],
+    )
+
+
+@router.get("/enhancement", response_model=MemoryEnhancementView)
+def get_memory_enhancement(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryEnhancementView:
+    return _enhancement_view(db, context.workspace_id)
+
+
+@router.put("/enhancement", response_model=MemoryEnhancementView)
+def update_memory_enhancement(
+    payload: MemoryEnhancementUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryEnhancementView:
+    save_enhancement_config(
+        db,
+        context.workspace_id,
+        payload.model_dump(exclude_none=True),
+    )
+    return _enhancement_view(db, context.workspace_id)
+
+
+@router.post("/enhancement/reindex")
+def reindex_memory_embedding_index(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    return reindex_memory_embeddings(db, context.workspace_id, settings)
+
+
+@router.post("/enhancement/extract/{session_id}")
+def extract_memories_now(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    return extract_session_memories(
+        db,
+        context.workspace,
+        session_id,
+        settings,
+        actor_id=context.principal.user_id,
+        force=True,
+    )
+
+
+@router.post("/enhancement/summarize/{session_id}")
+def summarize_session_now(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    return summarize_session_context(
+        db,
+        context.workspace,
+        session_id,
+        settings,
+        actor_id=context.principal.user_id,
+        force=True,
     )
 
 

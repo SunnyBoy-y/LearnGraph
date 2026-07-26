@@ -110,6 +110,9 @@ class SkillRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     origin_hash: Mapped[str] = mapped_column(String(64), default="")
     has_scripts: Mapped[bool] = mapped_column(Boolean, default=False)
     locale_source: Mapped[str] = mapped_column(String(32), default="")
+    # First-class flag for official (first-party) workflow skills. Official
+    # rows are system-managed: users cannot edit, revoke, or delete them.
+    is_official: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     manifest_hash: Mapped[str] = mapped_column(String(64), index=True)
     instructions_markdown: Mapped[str] = mapped_column(Text, default="")

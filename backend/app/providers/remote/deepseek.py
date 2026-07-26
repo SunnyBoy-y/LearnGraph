@@ -216,15 +216,17 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
             index,
             {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
         )
-        if isinstance(raw.get("id"), str):
+        # Identity fields are announced once. A blank repeat on a continuation
+        # fragment must never erase them; see the parent adapter's note.
+        if isinstance(raw.get("id"), str) and raw["id"]:
             item["id"] = raw["id"]
-        if isinstance(raw.get("type"), str):
+        if isinstance(raw.get("type"), str) and raw["type"]:
             item["type"] = raw["type"]
         function = raw.get("function")
         if not isinstance(function, dict):
             return
         target = item["function"]
-        if isinstance(function.get("name"), str):
+        if isinstance(function.get("name"), str) and function["name"]:
             target["name"] += function["name"]
         if isinstance(function.get("arguments"), str):
             target["arguments"] += function["arguments"]
@@ -362,13 +364,7 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
                     "DeepSeek stream ended before completion "
                     f"(finish_reason={finish_reason!r}, output={saw_model_output})"
                 )
-        tool_calls = [
-            item
-            for _, item in sorted(tool_aggregates.items())
-            if item.get("id")
-            and isinstance(item.get("function"), dict)
-            and item["function"].get("name")
-        ]
+        tool_calls = self._completed_chat_tool_calls(tool_aggregates)
         if tool_calls:
             yield ProviderStreamEvent("tool_calls", tool_calls=tool_calls)
         yield ProviderStreamEvent("completed", finish_reason=finish_reason)

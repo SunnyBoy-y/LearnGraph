@@ -1,11 +1,19 @@
 import type {
+  CodexDeviceLoginPoll,
+  CodexDeviceLoginStart,
   ProviderBalance,
+  ProviderBalanceQueryConfig,
+  ProviderBalanceQueryExecuteResponse,
+  ProviderBalanceQueryHttpRequest,
+  ProviderBalanceQueryLastResult,
   Provider,
   ProviderCreateRequest,
   ProviderUpdateRequest,
   ProviderModelsResponse,
   ProviderModelCapabilityUpdateRequest,
   ProviderModelCapabilityView,
+  ProviderModelCatalogSyncView,
+  ProviderModelDefaultsView,
   ProviderModelStateView,
   ProviderModelStatesView,
   ProviderSecretLifecycle,
@@ -44,12 +52,92 @@ export function getProviderBalance(providerId: string): Promise<ProviderBalance>
   );
 }
 
+export function getProviderBalanceQueryConfig(
+  providerId: string,
+): Promise<{ provider_id: string; config: ProviderBalanceQueryConfig | null }> {
+  return apiClient.get(
+    `/providers/${encodeURIComponent(providerId)}/balance-query`,
+  );
+}
+
+export function updateProviderBalanceQueryConfig(
+  providerId: string,
+  config: ProviderBalanceQueryConfig | null,
+): Promise<{ provider_id: string; config: ProviderBalanceQueryConfig | null }> {
+  return apiClient.put(
+    `/providers/${encodeURIComponent(providerId)}/balance-query`,
+    { config },
+  );
+}
+
+export function executeProviderBalanceQuery(
+  providerId: string,
+  payload: {
+    request: ProviderBalanceQueryHttpRequest;
+    timeout_seconds?: number | null;
+    variables?: Record<string, string> | null;
+  },
+): Promise<ProviderBalanceQueryExecuteResponse> {
+  return apiClient.post(
+    `/providers/${encodeURIComponent(providerId)}/balance-query/execute`,
+    payload,
+  );
+}
+
+export function saveProviderBalanceQueryResult(
+  providerId: string,
+  payload: {
+    is_valid?: boolean | null;
+    invalid_message?: string | null;
+    remaining?: number | null;
+    unit?: string | null;
+    plan_name?: string | null;
+    total?: number | null;
+    used?: number | null;
+    extra?: string | null;
+  },
+): Promise<ProviderBalanceQueryLastResult & { provider_id: string }> {
+  return apiClient.put(
+    `/providers/${encodeURIComponent(providerId)}/balance-query/result`,
+    payload,
+  );
+}
+
+export function startCodexDeviceLogin(): Promise<CodexDeviceLoginStart> {
+  return apiClient.post<CodexDeviceLoginStart, Record<string, never>>(
+    "/providers/codex/device-login",
+    {},
+  );
+}
+
+export function pollCodexDeviceLogin(payload: {
+  device_auth_id: string;
+  user_code: string;
+}): Promise<CodexDeviceLoginPoll> {
+  return apiClient.post<CodexDeviceLoginPoll, typeof payload>(
+    "/providers/codex/device-login/poll",
+    payload,
+  );
+}
+
 export function getProviderModelCapabilities(
   providerId: string,
   modelId: string,
 ): Promise<ProviderModelCapabilityView> {
   return apiClient.get<ProviderModelCapabilityView>(
-    `/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}/capabilities`,
+    `/providers/${encodeURIComponent(providerId)}/model-capabilities?model_id=${encodeURIComponent(modelId)}`,
+  );
+}
+
+export function getProviderModelDefaults(
+  modelId: string,
+  providerType?: string,
+): Promise<ProviderModelDefaultsView> {
+  const query = providerType
+    ? `?provider_type=${encodeURIComponent(providerType)}`
+    : "";
+  return apiClient.get<ProviderModelDefaultsView>(
+    `/providers/model-defaults/${encodeURIComponent(modelId)}${query}`,
   );
 }
 
@@ -62,7 +150,7 @@ export function updateProviderModelCapabilities(
     ProviderModelCapabilityView,
     ProviderModelCapabilityUpdateRequest
   >(
-    `/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}/capabilities`,
+    `/providers/${encodeURIComponent(providerId)}/model-capabilities?model_id=${encodeURIComponent(modelId)}`,
     payload,
   );
 }
@@ -75,6 +163,19 @@ export function updateProviderModelGroupCapabilities(
     ProviderModelCapabilityView,
     ProviderModelCapabilityUpdateRequest
   >(`/providers/${encodeURIComponent(providerId)}/models/capabilities`, payload);
+}
+
+export function syncProviderModelCatalogDefaults(
+  providerId: string,
+  modelIds: string[],
+): Promise<ProviderModelCatalogSyncView> {
+  return apiClient.post<
+    ProviderModelCatalogSyncView,
+    { model_ids: string[] }
+  >(
+    `/providers/${encodeURIComponent(providerId)}/models/sync-catalog-defaults`,
+    { model_ids: modelIds },
+  );
 }
 
 export function updateProviderModelStates(

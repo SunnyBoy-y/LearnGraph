@@ -102,9 +102,10 @@ for model, inp, out, cached, cond in [
     _add("minimax", model, "USD", inp, out, cached=cached, cache_write=.375 if "M2.7" in model else None, conditions=cond, source_url=MINIMAX)
 
 for model, inp, out, conditions in [
-    ("qwen3.7-max", 6, 18, {"promotion": "50_percent", "max_input_tokens": 1000000}),
+    ("qwen3.7-max", 12, 36, {"max_input_tokens": 1000000}),
     ("qwen3-max", 2.5, 10, {"max_input_tokens": 32000}), ("qwen3-max", 4, 16, {"min_input_tokens": 32001, "max_input_tokens": 128000}), ("qwen3-max", 7, 28, {"min_input_tokens": 128001, "max_input_tokens": 256000}),
-    ("qwen3.7-plus", 1.6, 6.4, {"max_input_tokens": 256000, "promotion": "80_percent"}), ("qwen3.7-plus", 4.8, 19.2, {"min_input_tokens": 256001, "max_input_tokens": 1000000, "promotion": "80_percent"}),
+    ("qwen3.7-plus", 2, 8, {"max_input_tokens": 256000}), ("qwen3.7-plus", 6, 24, {"min_input_tokens": 256001, "max_input_tokens": 1000000}),
+    ("qwen3.7-flash", .2, .8, {"max_input_tokens": 32000}), ("qwen3.7-flash", .6, 2.4, {"min_input_tokens": 32001, "max_input_tokens": 256000}), ("qwen3.7-flash", 1.2, 4.8, {"min_input_tokens": 256001, "max_input_tokens": 1000000}),
     ("qwen3.6-plus", 2, 12, {"max_input_tokens": 256000}), ("qwen3.6-plus", 8, 48, {"min_input_tokens": 256001}),
     ("qwen3.5-plus", .8, 4.8, {"max_input_tokens": 128000}), ("qwen3.5-plus", 2, 12, {"min_input_tokens": 128001, "max_input_tokens": 256000}), ("qwen3.5-plus", 4, 24, {"min_input_tokens": 256001}),
     ("qwen3.6-flash", 1.2, 7.2, {"max_input_tokens": 256000}), ("qwen3.6-flash", 4.8, 28.8, {"min_input_tokens": 256001}),
@@ -118,7 +119,72 @@ for model, inp, out, conditions in [
     ("qwen3-coder-flash", 1, 4, {"max_input_tokens": 32000}), ("qwen3-coder-flash", 1.5, 6, {"min_input_tokens": 32001, "max_input_tokens": 128000}), ("qwen3-coder-flash", 2.5, 10, {"min_input_tokens": 128001, "max_input_tokens": 256000}), ("qwen3-coder-flash", 5, 25, {"min_input_tokens": 256001}),
     ("qwen-math-plus", 4, 12, {}), ("qwen-math-turbo", 2, 6, {}), ("qwen-mt-plus", 1.8, 5.4, {}), ("qwen-mt-flash", .7, 1.95, {}), ("qwen-mt-turbo", .7, 1.95, {}), ("qwen-mt-lite", .6, 1.6, {}),
 ]:
-    _add("qwen", model, "CNY", inp, out, conditions=conditions, source_url=QWEN)
+    supports_explicit_cache = model.startswith(
+        (
+            "qwen3.7-",
+            "qwen3.6-",
+            "qwen3.5-",
+            "qwen3-max",
+            "qwen-plus",
+            "qwen-flash",
+            "qwen3-coder",
+            "qwen3-vl",
+        )
+    )
+    _add(
+        "qwen",
+        model,
+        "CNY",
+        inp,
+        out,
+        cached=round(inp * 0.2, 8),
+        cache_write=round(inp * 1.25, 8) if supports_explicit_cache else None,
+        conditions={
+            **conditions,
+            "implicit_cache_read_multiplier": 0.2,
+            **(
+                {
+                    "explicit_cache_read_multiplier": 0.1,
+                    "explicit_cache_write_multiplier": 1.25,
+                }
+                if supports_explicit_cache
+                else {}
+            ),
+        },
+        source_url=QWEN,
+    )
+
+# Versioned snapshots inherit the reviewed family tariff unless Qwen publishes
+# a snapshot-specific price. Keeping explicit aliases matters because billing
+# intentionally matches exact model IDs.
+for alias, family in {
+    "qwen3.7-max-2026-06-08": "qwen3.7-max",
+    "qwen3.7-max-2026-05-20": "qwen3.7-max",
+    "qwen3.7-max-preview": "qwen3.7-max",
+    "qwen3.7-max-2026-05-17": "qwen3.7-max",
+    "qwen3.7-plus-2026-05-26": "qwen3.7-plus",
+    "qwen3.7-flash-2026-07-15": "qwen3.7-flash",
+    "qwen3.6-plus-2026-04-02": "qwen3.6-plus",
+    "qwen3.6-flash-2026-04-16": "qwen3.6-flash",
+    "qwen3.5-plus-2026-02-15": "qwen3.5-plus",
+    "qwen3.5-flash-2026-02-23": "qwen3.5-flash",
+}.items():
+    for source in [
+        item
+        for item in tuple(PRICING_CATALOG)
+        if item["provider_key"] == "qwen" and item["model_id"] == family
+    ]:
+        _add(
+            "qwen",
+            alias,
+            source["currency"],
+            source["native_input_per_million"],
+            source["native_output_per_million"],
+            cached=source["native_cached_input_per_million"],
+            cache_write=source["native_cache_write_per_million"],
+            conditions=dict(source["conditions"]),
+            source_url=source["source_url"],
+        )
 
 for model, text_input, audio_input, text_output, audio_output in [
     ("qwen3.5-omni-plus", 7, 53, 40, 213),
@@ -127,6 +193,12 @@ for model, text_input, audio_input, text_output, audio_output in [
     _add("qwen", model, "CNY", text_input, text_output, conditions={"modality": "text_image_video"}, source_url=QWEN)
     _add("qwen", model, "CNY", audio_input, audio_output, conditions={"modality": "audio"}, source_url=QWEN)
 
-
-def get_catalog_entry(catalog_id: str) -> dict[str, Any] | None:
-    return next((item for item in PRICING_CATALOG if item["catalog_id"] == catalog_id), None)
+# DashScope 通用文本向量：embedding 调用只按输入 Token 计费，输出恒为 0。
+# models.dev 不收录这些型号，缺了这几行 memory_embedding 用量会一直停在 unpriced。
+for model, embed_input in [
+    ("text-embedding-v4", .5),
+    ("text-embedding-v3", .5),
+    ("text-embedding-v2", .7),
+    ("text-embedding-v1", .7),
+]:
+    _add("qwen", model, "CNY", embed_input, 0, source_url=QWEN)

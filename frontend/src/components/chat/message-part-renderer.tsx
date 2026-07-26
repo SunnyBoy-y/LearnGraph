@@ -609,7 +609,10 @@ function TextWithCitations({
 
   return (
     <div data-message-selectable-text>
-      <MessageResponse className={cn("min-w-0 text-[15px] leading-7", className)} components={components}>
+      <MessageResponse className={cn("min-w-0 text-[15px] leading-7", className)} components={components}></MessageResponse>
+      <MessageResponse 
+
+      >
         {markdown}
       </MessageResponse>
     </div>
@@ -1119,6 +1122,38 @@ export function MessagePartRenderer({
     }
     case "sandbox_artifact":
       return <SandboxFileArtifact data={part.data ?? {}} />;
+    case "skill_trigger": {
+      const skillName =
+        typeof part.data?.skill_name === "string" && part.data.skill_name
+          ? part.data.skill_name
+          : typeof part.data?.skill_key === "string"
+            ? part.data.skill_key
+            : "Skill";
+      const skillKey =
+        typeof part.data?.skill_key === "string" ? part.data.skill_key : "";
+      const origin =
+        typeof part.data?.origin === "string" ? part.data.origin : "";
+      const originLabel =
+        origin === "declarative_invoke"
+          ? "声明式调用"
+          : origin === "catalog_read"
+            ? "按需加载指令"
+            : "技能指令生效";
+      return (
+        <div className="chat-skill-trigger flex items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-1.5 text-xs">
+          <Sparkles className="size-3.5 shrink-0 text-primary" />
+          <span className="font-medium">触发了 Skill · {skillName}</span>
+          {skillKey && skillKey !== skillName ? (
+            <span className="truncate font-mono text-[10px] text-muted-foreground">
+              {skillKey}
+            </span>
+          ) : null}
+          <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+            {originLabel}
+          </span>
+        </div>
+      );
+    }
     case "sandbox_status": {
       const authRequired = part.data?.auth_required === true;
       const paths = Array.isArray(part.data?.paths)

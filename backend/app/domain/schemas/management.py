@@ -256,6 +256,63 @@ class MemoryPolicyView(BaseModel):
     effective_enabled: bool
 
 
+class MemoryExtractionSettingsView(BaseModel):
+    enabled: bool
+    provider_id: str
+    model_id: str
+    auto_commit: bool
+
+
+class MemoryEmbeddingSettingsView(BaseModel):
+    enabled: bool
+    provider_id: str
+    model_id: str
+    semantic_weight: float
+
+
+class MemorySummarizationSettingsView(BaseModel):
+    enabled: bool
+    provider_id: str
+    model_id: str
+
+
+class MemoryEnhancementView(BaseModel):
+    """Workspace-level optional pipelines: extraction, embedding, summaries."""
+
+    workspace_id: str
+    extraction: MemoryExtractionSettingsView
+    embedding: MemoryEmbeddingSettingsView
+    summarization: MemorySummarizationSettingsView
+    active_memories: int = 0
+    indexed_memories: int = 0
+
+
+class MemoryExtractionSettingsUpdate(BaseModel):
+    enabled: bool | None = None
+    provider_id: str | None = Field(default=None, max_length=64)
+    model_id: str | None = Field(default=None, max_length=200)
+    auto_commit: bool | None = None
+
+
+class MemoryEmbeddingSettingsUpdate(BaseModel):
+    enabled: bool | None = None
+    provider_id: str | None = Field(default=None, max_length=64)
+    model_id: str | None = Field(default=None, max_length=200)
+    semantic_weight: float | None = Field(default=None, ge=0.0, le=2.0)
+
+
+class MemorySummarizationSettingsUpdate(BaseModel):
+    enabled: bool | None = None
+    provider_id: str | None = Field(default=None, max_length=64)
+    model_id: str | None = Field(default=None, max_length=200)
+
+
+class MemoryEnhancementUpdateRequest(BaseModel):
+    extraction: MemoryExtractionSettingsUpdate | None = None
+    embedding: MemoryEmbeddingSettingsUpdate | None = None
+    summarization: MemorySummarizationSettingsUpdate | None = None
+
+
 class MemoryJournalView(ORMModel):
     id: str
     memory_id: str
@@ -297,6 +354,9 @@ class MemoryProviderStatusView(BaseModel):
     remote_capability: bool
     status: str
     provider_epoch: int
+    # Active memories still bound to a previous provider generation; they are
+    # adopted lazily on mutation or in bulk via /memory/maintenance/migrate-provider.
+    frozen_memories: int = 0
     details: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -311,7 +371,7 @@ class ProviderCreateRequest(BaseModel):
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[
-        "model", "image_generation", "vision", "search", "fetch", "deep_research", "memory", "transcription"
+        "model", "image_generation", "vision", "search", "fetch", "deep_research", "memory", "transcription", "embedding"
     ]
     label: str
     description: str
@@ -350,15 +410,150 @@ class ProviderView(ORMModel):
 class ProviderBalanceInfoView(BaseModel):
     currency: Literal["CNY", "USD"]
     total_balance: str
-    granted_balance: str
-    topped_up_balance: str
+    granted_balance: str | None = None
+    topped_up_balance: str | None = None
+
+
+class ProviderUsageWindowView(BaseModel):
+    """A rolling usage window (e.g. Codex 5h / weekly limits)."""
+
+    label: str
+    used_percent: float
+    window_minutes: int | None = None
+    resets_at: datetime | None = None
 
 
 class ProviderBalanceView(BaseModel):
     provider_id: str
+    vendor: str
+    vendor_label: str
     is_available: bool
     balance_infos: list[ProviderBalanceInfoView]
+    usage_windows: list[ProviderUsageWindowView] | None = None
+    notice: str | None = None
     queried_at: datetime
+
+
+class ProviderBalanceQueryConfig(BaseModel):
+    """cc-switch style custom balance query: a JS config expression evaluated
+    in a sandboxed frame on the client; the HTTP request itself runs on the
+    server so the plaintext key never reaches the browser."""
+
+    enabled: bool = False
+    template_id: str | None = Field(default=None, max_length=40)
+    script: str = Field(min_length=1, max_length=20_000)
+    timeout_seconds: float = Field(default=10.0, ge=1, le=60)
+    auto_query_interval_minutes: int = Field(default=0, ge=0, le=1_440)
+    # Extra template variables, e.g. the NewAPI preset's {{accessToken}} /
+    # {{userId}}. {{baseUrl}} / {{apiKey}} are reserved and filled server-side.
+    variables: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_variables(self) -> "ProviderBalanceQueryConfig":
+        if len(self.variables) > 16:
+            raise ValueError("At most 16 template variables are allowed")
+        for name, value in self.variables.items():
+            if not name.strip() or len(name) > 64 or len(str(value)) > 2_048:
+                raise ValueError("Template variable names/values exceed the allowed length")
+            if name in {"baseUrl", "apiKey"}:
+                raise ValueError("baseUrl and apiKey are reserved template variables")
+        return self
+
+
+class ProviderBalanceQueryConfigUpdateRequest(BaseModel):
+    # None clears the custom configuration and falls back to the built-in
+    # official balance flow.
+    config: ProviderBalanceQueryConfig | None = None
+
+
+class ProviderBalanceQueryConfigView(BaseModel):
+    provider_id: str
+    config: ProviderBalanceQueryConfig | None = None
+
+
+class ProviderBalanceQueryHttpRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=1_000)
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "GET"
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: str | None = Field(default=None, max_length=8_000)
+
+    @model_validator(mode="after")
+    def validate_headers(self) -> "ProviderBalanceQueryHttpRequest":
+        if len(self.headers) > 32:
+            raise ValueError("At most 32 request headers are allowed")
+        for name, value in self.headers.items():
+            if len(name) > 128 or len(str(value)) > 2_048:
+                raise ValueError("Header names/values exceed the allowed length")
+        return self
+
+
+class ProviderBalanceQueryExecuteRequest(BaseModel):
+    request: ProviderBalanceQueryHttpRequest
+    timeout_seconds: float | None = Field(default=None, ge=1, le=60)
+    # Unsaved-variable override used by the config dialog's 测试脚本 flow.
+    variables: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def validate_variables(self) -> "ProviderBalanceQueryExecuteRequest":
+        if self.variables is None:
+            return self
+        if len(self.variables) > 16:
+            raise ValueError("At most 16 template variables are allowed")
+        for name, value in self.variables.items():
+            if not name.strip() or len(name) > 64 or len(str(value)) > 2_048:
+                raise ValueError(
+                    "Template variable names/values exceed the allowed length"
+                )
+        return self
+
+
+class ProviderBalanceQueryExecuteView(BaseModel):
+    provider_id: str
+    status_code: int
+    ok: bool
+    payload: Any | None = None
+    # Raw body when the response was not valid JSON.
+    text: str | None = None
+    queried_at: datetime
+
+
+class ProviderBalanceQueryResultRequest(BaseModel):
+    """Extractor output cached for the provider list (cc-switch fields)."""
+
+    is_valid: bool | None = None
+    invalid_message: str | None = Field(default=None, max_length=500)
+    remaining: float | None = None
+    unit: str | None = Field(default=None, max_length=20)
+    plan_name: str | None = Field(default=None, max_length=120)
+    total: float | None = None
+    used: float | None = None
+    extra: str | None = Field(default=None, max_length=500)
+
+
+class ProviderBalanceQueryResultView(ProviderBalanceQueryResultRequest):
+    provider_id: str
+    queried_at: datetime
+
+
+class CodexDeviceLoginStartView(BaseModel):
+    device_auth_id: str
+    user_code: str
+    verification_url: str
+    interval_seconds: int
+
+
+class CodexDeviceLoginPollRequest(BaseModel):
+    device_auth_id: str = Field(min_length=1, max_length=200)
+    user_code: str = Field(min_length=1, max_length=64)
+
+
+class CodexDeviceLoginPollView(BaseModel):
+    status: Literal["pending", "authorized"]
+    # Returned once on success so the caller can save it through the normal
+    # Provider create / secret-rotate path.
+    api_key: str | None = None
+    account_id: str | None = None
+    plan_type: str | None = None
 
 
 class ProviderUpdateRequest(BaseModel):
@@ -375,6 +570,9 @@ class ProviderUpdateRequest(BaseModel):
         default=None, min_length=1, max_length=160
     )
     extra_headers: dict[str, str] | None = None
+    # Global template switch: on = the group template overrides every model,
+    # off = each model uses its own saved snapshot or catalog defaults.
+    model_defaults_enabled: bool | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> "ProviderUpdateRequest":
@@ -384,20 +582,36 @@ class ProviderUpdateRequest(BaseModel):
 
 
 class ProviderModelCapabilityUpdateRequest(BaseModel):
+    # Only meaningful for the group endpoint: removes per-model overrides so
+    # every discovered model inherits the group configuration again.
+    apply_to_all: bool = False
     reasoning_efforts: list[Literal["low", "medium", "high", "xhigh"]] = Field(
         default_factory=list
     )
     thinking_mapping: dict[
-        Literal["off", "low", "medium", "high", "xhigh"], str | None
+        Literal["off", "low", "medium", "high", "xhigh"],
+        str | int | bool | None,
     ] = Field(default_factory=dict)
     default_thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] = "off"
-    reasoning_parameter: Literal["reasoning_effort", "reasoning.effort"] = "reasoning_effort"
+    reasoning_parameter: Literal[
+        "reasoning_effort",
+        "reasoning.effort",
+        "enable_thinking",
+        "thinking_budget",
+        "thinking",
+    ] = "reasoning_effort"
+    thinking_required: bool = False
     hosted_web_search: bool = False
+    hosted_web_fetch: bool = False
+    hosted_image_search: bool = False
     supports_image_input: bool = False
+    supports_video_input: bool = False
+    supports_structured_output: bool = False
+    supports_agent_tools: bool = True
     image_input_mode: Literal["native", "external_vision", "auto"] = "auto"
     default_search_route: Literal[
         "disabled", "model_native", "external", "local", "auto"
-    ] = "disabled"
+    ] = "auto"
     capability_source: Literal[
         "user_declared", "provider_probe", "official_catalog", "runtime_observation"
     ] = "user_declared"
@@ -418,6 +632,15 @@ class ProviderModelCapabilityView(BaseModel):
     provider_id: str
     model_id: str
     capabilities: dict[str, Any]
+
+
+class ProviderModelCatalogSyncRequest(BaseModel):
+    model_ids: list[str] = Field(min_length=1, max_length=2_000)
+
+
+class ProviderModelCatalogSyncView(BaseModel):
+    provider_id: str
+    models: list[ProviderModelCapabilityView]
 
 
 class ProviderModelStateUpdateRequest(BaseModel):
@@ -511,56 +734,28 @@ class UsageEventView(ORMModel):
     created_at: datetime
 
 
-class PriceVersionCreateRequest(BaseModel):
+class ManualPriceUpsertRequest(BaseModel):
+    """Workspace-defined list price for a model, overriding catalog defaults."""
+
+    model_id: str = Field(min_length=1, max_length=160)
     provider_id: str = Field(default="*", min_length=1, max_length=80)
-    model_id: str = Field(default="*", min_length=1, max_length=160)
-    feature: str = Field(default="*", min_length=1, max_length=80)
-    input_usd_per_million: float = Field(default=0, ge=0)
-    cached_input_usd_per_million: float | None = Field(default=None, ge=0)
-    cache_write_usd_per_million: float | None = Field(default=None, ge=0)
-    output_usd_per_million: float = Field(default=0, ge=0)
-    fixed_usd_per_call: float = Field(default=0, ge=0)
     currency: Literal["USD", "CNY"] = "USD"
-    input_cny_per_million: float | None = Field(default=None, ge=0)
-    cached_input_cny_per_million: float | None = Field(default=None, ge=0)
-    cache_write_cny_per_million: float | None = Field(default=None, ge=0)
-    output_cny_per_million: float | None = Field(default=None, ge=0)
-    fixed_cny_per_call: float | None = Field(default=None, ge=0)
-    effective_at: datetime | None = None
-    source: str = Field(default="workspace_manual", min_length=1, max_length=160)
-    conditions: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_native_currency_rates(self) -> "PriceVersionCreateRequest":
-        if self.currency == "CNY" and (
-            self.input_cny_per_million is None
-            or self.output_cny_per_million is None
-        ):
-            raise ValueError("CNY pricing requires input_cny_per_million and output_cny_per_million")
-        return self
+    input_per_million: float = Field(ge=0)
+    cached_input_per_million: float | None = Field(default=None, ge=0)
+    output_per_million: float = Field(ge=0)
+    fixed_per_call: float = Field(default=0, ge=0)
 
 
-class VersionRetireRequest(BaseModel):
-    retired_at: datetime | None = None
-
-
-class PriceVersionView(ORMModel):
+class ManualPriceView(BaseModel):
     id: str
-    workspace_id: str
-    provider_id: str
     model_id: str
-    feature: str
-    version: int
-    input_usd_per_million: float
-    cached_input_usd_per_million: float | None
-    cache_write_usd_per_million: float | None
-    output_usd_per_million: float
-    fixed_usd_per_call: float
+    provider_id: str
+    currency: str
+    input_per_million: float
+    cached_input_per_million: float | None
+    output_per_million: float
+    fixed_per_call: float
     effective_at: datetime
-    retired_at: datetime | None
-    source: str
-    conditions: dict[str, Any]
-    created_at: datetime
 
 
 class PriceCatalogItem(BaseModel):
@@ -579,37 +774,56 @@ class PriceCatalogItem(BaseModel):
     conditions: dict[str, Any]
     source_url: str
     as_of: str
+    source: str = "builtin"
 
 
-class PriceCatalogApplyRequest(BaseModel):
-    catalog_id: str = Field(min_length=1, max_length=40)
-    provider_id: str | None = Field(default=None, min_length=1, max_length=80)
-    feature: str = Field(default="*", min_length=1, max_length=80)
-    input_usd_per_million: float | None = Field(default=None, ge=0)
-    cached_input_usd_per_million: float | None = Field(default=None, ge=0)
-    cache_write_usd_per_million: float | None = Field(default=None, ge=0)
-    output_usd_per_million: float | None = Field(default=None, ge=0)
-
-
-class ExchangeRateCreateRequest(BaseModel):
-    base_currency: Literal["USD"] = "USD"
-    quote_currency: Literal["CNY"] = "CNY"
-    rate: float = Field(gt=0)
-    effective_at: datetime | None = None
-    source: str = Field(default="workspace_manual", min_length=1, max_length=160)
-
-
-class ExchangeRateVersionView(ORMModel):
-    id: str
-    workspace_id: str
-    base_currency: str
-    quote_currency: str
-    version: int
-    rate: float
-    effective_at: datetime
-    retired_at: datetime | None
+class ModelsDevSnapshotStatus(BaseModel):
     source: str
-    created_at: datetime
+    origin: str
+    fetched_at: str | None
+    provider_count: int
+    model_count: int
+    priced_model_count: int
+
+
+class ExchangeRateInfo(BaseModel):
+    """The single currently-effective USD/CNY rate used for cost conversion."""
+
+    rate: float
+    source: str
+    effective_at: datetime
+
+
+class ExchangeRateSetRequest(BaseModel):
+    rate: float = Field(gt=0)
+
+
+class AlertEmailConfigView(BaseModel):
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = 465
+    smtp_security: Literal["ssl", "starttls", "none"] = "ssl"
+    smtp_username: str = ""
+    has_password: bool = False
+    from_address: str = ""
+    to_addresses: list[str] = Field(default_factory=list)
+
+
+class AlertEmailConfigUpdateRequest(BaseModel):
+    enabled: bool = False
+    smtp_host: str = Field(default="", max_length=255)
+    smtp_port: int = Field(default=465, ge=1, le=65535)
+    smtp_security: Literal["ssl", "starttls", "none"] = "ssl"
+    smtp_username: str = Field(default="", max_length=255)
+    # None keeps the previously stored password; empty string clears it.
+    smtp_password: str | None = Field(default=None, max_length=500)
+    from_address: str = Field(default="", max_length=255)
+    to_addresses: list[str] = Field(default_factory=list, max_length=20)
+
+
+class AlertEmailTestResult(BaseModel):
+    ok: bool
+    detail: str
 
 
 class BudgetPolicyCreateRequest(BaseModel):
@@ -740,6 +954,18 @@ class MigrationJobView(ORMModel):
 
 
 class ChatSuggestedPromptsSettingValue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(strict=True)
+
+
+class ChatDictationCleanupSettingValue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(strict=True)
+
+
+class ChatContextUsageSettingValue(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(strict=True)

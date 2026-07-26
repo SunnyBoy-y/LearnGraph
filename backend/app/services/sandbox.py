@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import mimetypes
+import os
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 from datetime import timedelta, timezone
 from typing import Any
@@ -37,8 +40,13 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileReadRequest,
     SandboxAgentFileWriteRequest,
     SandboxAgentSessionCreateRequest,
+    SandboxAgentTranscribeRequest,
     SandboxTaskCreateRequest,
 )
+from app.providers.factory import transcription_provider_for_workspace
+from app.providers.remote.transcription import TranscriptionProviderError
+from app.services.billing import BillingService
+from app.services.chat_attachment_policy import AUDIO_EXTENSIONS
 from app.providers.ports.sandbox import SandboxCreateSpec, SandboxSessionHandle
 from app.providers.remote.sandbox import (
     SandboxBackendError,
@@ -267,15 +275,20 @@ class SandboxTaskService:
         self.storage = object_storage_provider(db, workspace_id, settings)
         self.backend = backend_for_settings(settings)
 
-    def profile(self, runtime_kind: str = "python-node") -> dict:
-        backend = backend_for_settings(self.settings, runtime_kind)
+    def profile(self) -> dict:
+        """Single unified runtime profile.
+
+        One image serves every session (browser, ffmpeg and the frontend
+        toolchain always included), so the deployment exposes one honest
+        profile instead of the legacy python-node / python-node-browser pair.
+        """
+
+        backend = backend_for_settings(self.settings)
         capability = backend.probe()
-        resolved = (
-            resolve_sandbox_image_for_runtime(self.settings, runtime_kind) or ""
-        )
+        resolved = resolve_sandbox_image(self.settings) or ""
         return {
-            "backend_id": f"{capability.backend_id}:{runtime_kind}",
-            "runtime_kind": runtime_kind,
+            "backend_id": f"{capability.backend_id}:unified",
+            "runtime_kind": "unified",
             "platform": capability.platform,
             "available": capability.available,
             "capabilities": list(capability.capabilities),
@@ -1541,11 +1554,213 @@ class SandboxAgentWorkspaceService:
             "files": files,
         }
 
+    def transcribe_workspace_audio(
+        self, payload: SandboxAgentTranscribeRequest
+    ) -> dict[str, Any]:
+        """Host-side ASR bridge: the sandbox stays offline and secret-free.
+
+        The workspace bind mount doubles as the data channel — audio bytes are
+        read host-side (logical store first, then the bind mount), the user's
+        configured ASR Provider runs on the host with host credentials, and
+        the transcript is written back through the standard quota-checked
+        write path.  No network or secret ever enters the container.
+        """
+
+        try:
+            path = validate_agent_workspace_path(payload.path)
+        except SandboxCapabilityMismatch as exc:
+            self._record_policy_block(
+                action="sandbox.agent.transcribe.blocked",
+                reason=str(exc),
+                path=payload.path,
+            )
+            raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
+        if Path(path).suffix.casefold() not in AUDIO_EXTENSIONS:
+            raise AppError(
+                415,
+                "audio_required",
+                "Only audio workspace files can be transcribed; use "
+                "learngraph_tasks.audio_transcode in the sandbox first for other formats",
+            )
+        filename = path.rsplit("/", 1)[-1]
+        stem = filename.rsplit(".", 1)[0] or "transcript"
+        try:
+            output_path = validate_agent_workspace_path(
+                payload.output_path or f"work/transcripts/{stem}.txt"
+            )
+        except SandboxCapabilityMismatch as exc:
+            raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        data: bytes | None = None
+        try:
+            data = self.workspace_files.materialize_bytes(payload.chat_session_id, path)
+        except AppError:
+            data = None
+        if data is None:
+            data = self._read_workspace_bytes_from_host(session, path)
+        if data is None:
+            raise AppError(
+                404,
+                "sandbox_file_unavailable",
+                "Workspace audio file was not found in the session workspace",
+            )
+        if len(data) > self.settings.max_upload_bytes:
+            raise AppError(
+                413, "sandbox_file_too_large", "Workspace audio exceeds the upload limit"
+            )
+        provider = transcription_provider_for_workspace(
+            self.db, self.workspace_id, self.settings
+        )
+        if provider is None:
+            raise AppError(
+                503,
+                "transcription_provider_unavailable",
+                "No enabled remote ASR Provider is configured for this workspace",
+            )
+        billing = BillingService(self.db, self.workspace_id, self.actor_id)
+        quote = billing.preflight_model_call(
+            provider_id=provider.provider_id,
+            model_id=provider.model_id,
+            feature="audio_transcription",
+            estimated_input_tokens=0,
+            estimated_output_tokens=0,
+            remote_capability=True,
+        )
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.transcription.started",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={
+                "path": path,
+                "size_bytes": len(data),
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+            },
+        )
+        self.db.commit()
+        started = time.monotonic()
+        try:
+            result = provider.transcribe(
+                filename=filename,
+                mime_type=mime_type,
+                content=data,
+                language=payload.language,
+            )
+        except TranscriptionProviderError as exc:
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="sandbox.agent.transcription.failed",
+                resource_type="sandbox_session",
+                resource_id=session.id,
+                outcome="failed",
+                details={"path": path, "provider_id": provider.provider_id},
+            )
+            self.db.commit()
+            raise AppError(502, "transcription_provider_failed", str(exc)) from exc
+        latency_ms = int((time.monotonic() - started) * 1000)
+        billing.record_usage(
+            quote,
+            input_tokens=int(result.usage.get("input_tokens") or 0),
+            output_tokens=int(result.usage.get("output_tokens") or 0),
+            attempt=1,
+            latency_ms=latency_ms,
+            usage_reported=bool(result.usage),
+        )
+        self.db.commit()
+        transcript = result.text or ""
+        # The durable artifact goes through the standard agent write path and
+        # must respect its byte cap; truncation is rare and flagged.
+        limit_bytes = min(1_048_576, self.settings.sandbox_agent_file_bytes)
+        transcript_truncated = False
+        stored = transcript
+        while stored and len(stored.encode("utf-8")) > limit_bytes:
+            transcript_truncated = True
+            stored = stored[: max(1, len(stored) - max(1, len(stored) // 10))]
+        write_result = self.write_file(
+            SandboxAgentFileWriteRequest(
+                chat_session_id=payload.chat_session_id,
+                path=output_path,
+                content=stored,
+                sandbox_session_id=session.id,
+            )
+        )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.transcription.completed",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={
+                "path": path,
+                "output_path": output_path,
+                "provider_id": provider.provider_id,
+                "request_id": result.request_id,
+                "latency_ms": latency_ms,
+            },
+        )
+        self.db.commit()
+        inline_limit = 16_000
+        return {
+            "sandbox_session_id": session.id,
+            "path": path,
+            "output_path": output_path,
+            "language": result.language or payload.language,
+            "duration_seconds": result.duration_seconds,
+            "provider_id": provider.provider_id,
+            "model_id": provider.model_id,
+            "transcript_truncated": transcript_truncated,
+            "text": stored[:inline_limit],
+            "text_truncated_inline": len(stored) > inline_limit,
+            "artifact": write_result.get("artifact"),
+        }
+
+    def _read_workspace_bytes_from_host(
+        self, session: SandboxSession, path: str
+    ) -> bytes | None:
+        """Read bind-mount bytes host-side with symlink-escape containment.
+
+        This bypasses the container archive size limit for large media while
+        never following a sandbox-created symlink outside the managed
+        workspace root.
+        """
+
+        if not session.workspace_relative_path:
+            return None
+        try:
+            host_root = _sandbox_workspace_path(
+                self.settings, session.workspace_relative_path
+            )
+        except SandboxBackendError:
+            return None
+        root_real = Path(os.path.realpath(host_root))
+        candidate = Path(os.path.realpath(host_root / path))
+        if candidate == root_real or root_real not in candidate.parents:
+            self._record_policy_block(
+                action="sandbox.agent.transcribe.blocked",
+                reason="Workspace media path escaped the managed workspace root",
+                path=path,
+            )
+            return None
+        try:
+            if not candidate.is_file():
+                return None
+            if candidate.stat().st_size > self.settings.max_upload_bytes:
+                raise AppError(
+                    413,
+                    "sandbox_file_too_large",
+                    "Workspace audio exceeds the upload limit",
+                )
+            return candidate.read_bytes()
+        except OSError:
+            return None
+
     def seed_chat_attachments(
         self,
         *,
         chat_session_id: str,
         files: list[FileRecord],
+        include_images: bool = False,
     ) -> list[dict[str, Any]]:
         """Materialize chat attachments into session workspace inputs/.
 
@@ -1561,9 +1776,10 @@ class SandboxAgentWorkspaceService:
         for file in files:
             if file.storage_status != "stored":
                 continue
-            if self._is_image_like(file):
+            if not include_images and self._is_image_like(file):
                 # Multimodal images stay on the structured chat path; do not
-                # force them into the code workspace unless the user asks.
+                # force them into the code workspace unless explicitly
+                # requested (e.g. read_session_file target='workspace').
                 continue
             view = self.workspace_files.link_file_record(
                 chat_session_id=chat_session_id,
@@ -1611,7 +1827,12 @@ class SandboxAgentWorkspaceService:
 
         session_property = {
             "type": "string",
-            "description": "Optional previously returned sandbox session ID for this chat.",
+            "description": (
+                "OMIT this field on the first call: the workspace session is created or "
+                "reused automatically and every sandbox tool result returns its "
+                "sandbox_session_id. On later calls pass back exactly that returned ID. "
+                "Never send an empty string or an invented value such as 'new'."
+            ),
         }
         return [
             {
@@ -1662,8 +1883,17 @@ class SandboxAgentWorkspaceService:
                     "name": "sandbox_exec",
                     "description": (
                         "Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file in the isolated sandbox. "
-                        "argv is never evaluated by a shell. Host-path deletes are blocked; "
-                        "session work/ deletes require prior user authorization."
+                        "argv is never evaluated by a shell. The sandbox has NO network access (page.goto to "
+                        "the internet, pip install and npm install all fail by design). Pre-installed and "
+                        "offline-ready: Chromium + playwright-core (headless render/screenshot/PDF with CJK "
+                        "fonts), ffmpeg/ffprobe, Python libs mammoth/pypdf/openpyxl/Pillow/pydub, and "
+                        "learngraph_tasks (docx_to_pdf, html_to_pdf, html_to_png, audio_transcode, media_info, "
+                        "make_zip, extract_zip, pdf_merge). The frontend toolchain (vite, vue, react, "
+                        "react-dom, @vitejs plugins, vite-plugin-singlefile) resolves from the image's "
+                        "/node_modules — write app sources plus a driver script that imports {build} from "
+                        "'vite' (base:'./', singlefile for previewable output), then publish dist output via "
+                        "sandbox_publish_file. Host-path deletes are blocked; session work/ deletes require "
+                        "prior user authorization."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1679,12 +1909,46 @@ class SandboxAgentWorkspaceService:
                                 "enum": ["python-node", "python-node-browser"],
                                 "default": "python-node",
                                 "description": (
-                                    "Use python-node-browser only for Playwright/Chromium work."
+                                    "Deprecated: both values run the same unified image; "
+                                    "browser, ffmpeg and the toolchain are always available."
                                 ),
                             },
                             "sandbox_session_id": session_property,
                         },
                         "required": ["argv"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_transcribe_audio",
+                    "description": (
+                        "Transcribe a workspace audio file with the user's configured ASR "
+                        "Provider. The call runs on the host (the sandbox itself stays "
+                        "offline and never sees credentials); the transcript is written back "
+                        "into the workspace and returned. For exotic formats, first run "
+                        "learngraph_tasks.audio_transcode in the sandbox (e.g. to 16 kHz mono mp3)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative workspace audio path, e.g. inputs/lecture.mp3.",
+                            },
+                            "output_path": {
+                                "type": "string",
+                                "description": "Optional transcript path; defaults to work/transcripts/<name>.txt.",
+                            },
+                            "language": {
+                                "type": "string",
+                                "description": "Optional language hint such as zh or en.",
+                            },
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path"],
                         "additionalProperties": False,
                     },
                 },
@@ -1717,6 +1981,34 @@ class SandboxAgentWorkspaceService:
                 },
             },
         ]
+
+    _AGENT_SESSION_ID_PLACEHOLDERS = frozenset(
+        {"", "new", "auto", "none", "null", "default", "create", "latest", "current"}
+    )
+
+    def _normalize_agent_session_id(self, raw: Any, chat_session_id: str) -> str | None:
+        """Agent-path leniency: models often send "" or "new" instead of omitting
+        the field, or replay a stale/foreign session ID.  Anything that is not a
+        live session of this chat resolves to ``None`` so ``_resolve_session``
+        silently reuses or creates the chat workspace session instead of failing
+        the tool call."""
+
+        if not isinstance(raw, str):
+            return None
+        candidate = raw.strip()
+        if candidate.casefold() in self._AGENT_SESSION_ID_PLACEHOLDERS:
+            return None
+        try:
+            session = self._get_session(candidate)
+        except AppError:
+            return None
+        if session.chat_session_id != chat_session_id:
+            return None
+        if session.cleanup_status == "cleaned" or session.status in {"deleted", "stopped"}:
+            return None
+        if not self._not_expired(session):
+            return None
+        return candidate
 
     def execute_agent_tool(
         self,
@@ -1753,6 +2045,14 @@ class SandboxAgentWorkspaceService:
         if not isinstance(arguments, dict):
             raise AppError(422, "invalid_tool_arguments", "Sandbox Agent tool arguments must be an object")
         payload = {**arguments, "chat_session_id": chat_session_id}
+        if "sandbox_session_id" in payload:
+            normalized = self._normalize_agent_session_id(
+                payload.get("sandbox_session_id"), chat_session_id
+            )
+            if normalized is None:
+                payload.pop("sandbox_session_id")
+            else:
+                payload["sandbox_session_id"] = normalized
         try:
             if name == "sandbox_write_file":
                 return self.write_file(SandboxAgentFileWriteRequest.model_validate(payload))
@@ -1790,6 +2090,10 @@ class SandboxAgentWorkspaceService:
                         },
                     },
                 }
+            if name == "sandbox_transcribe_audio":
+                return self.transcribe_workspace_audio(
+                    SandboxAgentTranscribeRequest.model_validate(payload)
+                )
             if name == "sandbox_publish_file":
                 return self.publish_workspace_file(
                     chat_session_id=chat_session_id,
@@ -1801,7 +2105,29 @@ class SandboxAgentWorkspaceService:
                     else None,
                 )
         except ValidationError as exc:
-            raise AppError(422, "invalid_tool_arguments", "Sandbox Agent tool arguments are invalid") from exc
+            issues = [
+                {
+                    "field": ".".join(str(part) for part in error.get("loc", ())) or "arguments",
+                    "problem": str(error.get("msg") or "invalid value"),
+                }
+                for error in exc.errors()[:5]
+            ]
+            summary = "; ".join(f"{issue['field']}: {issue['problem']}" for issue in issues)
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                f"Sandbox Agent tool arguments are invalid — {summary}"[:500],
+                {
+                    "tool": name,
+                    "issues": issues,
+                    "hint": (
+                        "Use the exact argument names from the tool schema (English keys such as "
+                        "path, content, argv). Omit sandbox_session_id entirely to reuse or create "
+                        "this chat's workspace session automatically; when continuing, pass back "
+                        "the exact sandbox_session_id returned by the previous sandbox tool result."
+                    ),
+                },
+            ) from exc
         raise AppError(404, "sandbox_agent_tool_not_found", "Sandbox Agent tool is not registered")
 
     def publish_workspace_file(

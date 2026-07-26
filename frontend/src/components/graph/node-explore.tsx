@@ -63,16 +63,15 @@ export function NodeExploreChip({
         active ? "is-active" : "is-empty",
         className,
       )}
-      // Keep clickable when empty so the chip can surface the empty-state
-      // panel; only jump into the chain when rounds exist.
+      disabled={!active}
       onClick={(event) => {
         event.stopPropagation();
-        onOpen?.();
+        if (active) onOpen?.();
       }}
       title={
         active
           ? `已深入 ${count} 轮 · 点击查看每一轮`
-          : "未深入 · 围绕此节点提问后会自动更新"
+          : "尚无历史问话"
       }
       type="button"
     >

@@ -78,10 +78,9 @@ def list_profiles(
     db: DB, context: CurrentWorkspace, settings: AppSettings
 ) -> list[SandboxProfileView]:
     sandbox = service(db, context, settings)
-    return [
-        SandboxProfileView.model_validate(sandbox.profile(runtime_kind))
-        for runtime_kind in ("python-node", "python-node-browser")
-    ]
+    # The unified runner image serves every runtime kind, so the deployment
+    # exposes exactly one profile.
+    return [SandboxProfileView.model_validate(sandbox.profile())]
 
 
 @router.get("/bootstrap/status", response_model=SandboxBootstrapStatusView)

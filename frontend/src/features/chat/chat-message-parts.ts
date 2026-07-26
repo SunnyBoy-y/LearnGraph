@@ -12,6 +12,7 @@ export const CHAIN_PART_TYPES = new Set<MessagePart["type"]>([
   "tool_call",
   "graph_context",
   "sandbox_status",
+  "skill_trigger",
 ]);
 
 /** Reasoning-only subset (still chain parts; used for activity labels). */
@@ -164,7 +165,9 @@ function hasVisiblePartContent(part: MessagePart) {
     return true;
   }
   if (part.content?.trim() || part.content_delta?.trim()) return true;
-  return ["agent_step", "tool_call", "graph_context"].includes(part.type);
+  return ["agent_step", "tool_call", "graph_context", "skill_trigger"].includes(
+    part.type,
+  );
 }
 
 export function shouldShowThinkingPlaceholder(

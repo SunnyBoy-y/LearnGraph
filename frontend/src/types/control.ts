@@ -178,7 +178,8 @@ export interface ComponentRegistration {
 
 export interface SandboxProfile {
   backend_id: string;
-  runtime_kind: "python-node" | "python-node-browser";
+  /** Unified runner image; legacy deployments may still report python-node kinds. */
+  runtime_kind: "unified" | "python-node" | "python-node-browser";
   platform: string;
   available: boolean;
   capabilities: string[];

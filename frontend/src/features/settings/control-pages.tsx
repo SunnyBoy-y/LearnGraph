@@ -4,34 +4,28 @@ import {
   Boxes,
   CircleAlert,
   FileCog,
-  Network,
   PackageCheck,
   Play,
   RefreshCcw,
   ServerCog,
-  TerminalSquare,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import {
   addMembership,
   authorizeComponent,
-  cancelSandboxTask,
   cleanupSandboxSession,
   createManagedUser,
   createOrganization,
   createRole,
-  createSandboxTask,
   getCurrentUser,
   getMcpServer,
   getSandboxBootstrapStatus,
-  getSandboxTask,
   getSkill,
   listAuthSessions,
   listComponentAuthorizations,
   listComponentChecks,
   listComponentManifests,
-  listFiles,
   listMcpServers,
   listMcpSnapshots,
   listMcpTransportCapabilities,
@@ -41,11 +35,8 @@ import {
   listPermissions,
   listPlugins,
   listRoles,
-  listSandboxExecutions,
   listSandboxProfiles,
   listSandboxSessions,
-  listSandboxTasks,
-  listSessions,
   listSkills,
   prepareComponentArtifact,
   registerComponent,
@@ -75,7 +66,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import type { MCPServer, Skill } from "@/types/extensions";
 
@@ -503,56 +493,28 @@ function MembershipForm({ busy, onSubmit, roles, users }: { busy: boolean; onSub
   return <form className="mt-3 grid gap-2 sm:grid-cols-3" onSubmit={submit}><select className="h-9 rounded-lg border bg-transparent px-3 text-sm" name="user_id" required><option value="">选择用户</option>{users.map((user) => <option key={user.id} value={user.id}>{user.display_name} · {user.username}</option>)}</select><select className="h-9 rounded-lg border bg-transparent px-3 text-sm" name="role_id" required><option value="">选择角色</option>{roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}</select><Button disabled={busy || !users.length || !roles.length} size="sm" type="submit">添加</Button></form>;
 }
 
-/** Runtime controls embedded by the unified Extensions Hub (D-076). */
-export function RuntimeControlsBody({
-  defaultTab = "mcp",
-}: {
-  defaultTab?: "mcp" | "components" | "sandbox";
-}) {
-  return (
-    <Tabs defaultValue={defaultTab}>
-      <TabsList aria-label="运行时控制分类" className="w-full justify-start">
-        <TabsTrigger value="mcp">
-          <Network />
-          MCP 与 Skills 修订
-        </TabsTrigger>
-        <TabsTrigger value="components">
-          <PackageCheck />
-          可信组件
-        </TabsTrigger>
-        <TabsTrigger value="sandbox">
-          <TerminalSquare />
-          Sandbox
-        </TabsTrigger>
-      </TabsList>
-      <TabsContent className="mt-5" value="mcp">
-        <McpAdministration />
-      </TabsContent>
-      <TabsContent className="mt-5" value="components">
-        <ComponentAdministration />
-      </TabsContent>
-      <TabsContent className="mt-5" value="sandbox">
-        <SandboxAdministration />
-      </TabsContent>
-    </Tabs>
-  );
-}
-
-function McpAdministration() {
+/** Advanced MCP revision panel (transport capabilities, server details, snapshots), embedded in the hub's MCP tab (D-076). */
+export function McpRevisionPanel() {
   const queryClient = useQueryClient();
   const [serverChoice, setServerChoice] = useState("");
-  const [skillChoice, setSkillChoice] = useState("");
   const transports = useQuery({ queryKey: ["mcp-transport-capabilities"], queryFn: listMcpTransportCapabilities });
   const servers = useQuery({ queryKey: ["mcp-servers"], queryFn: listMcpServers });
-  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
   const selectedServerId = serverChoice || servers.data?.[0]?.id || "";
-  const selectedSkillId = skillChoice || skills.data?.[0]?.id || "";
   const server = useQuery({ queryKey: ["mcp-server", selectedServerId], queryFn: () => getMcpServer(selectedServerId), enabled: Boolean(selectedServerId) });
   const snapshots = useQuery({ queryKey: ["mcp-snapshots", selectedServerId], queryFn: () => listMcpSnapshots(selectedServerId), enabled: Boolean(selectedServerId) });
-  const skill = useQuery({ queryKey: ["skill", selectedSkillId], queryFn: () => getSkill(selectedSkillId), enabled: Boolean(selectedSkillId) });
   const updateServerMutation = useMutation({ mutationFn: ({ id, payload }: { id: string; payload: Parameters<typeof updateMcpServer>[1] }) => updateMcpServer(id, payload), onSuccess: () => { toast.success("MCP Server 已更新"); void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] }); void queryClient.invalidateQueries({ queryKey: ["mcp-server", selectedServerId] }); }, onError: (error) => toast.error(error.message) });
+  return <div className="space-y-5"><Surface className="p-5"><SectionHeading description="能力声明来自服务端实现，而不是前端的 transport 下拉框。" title="Transport 能力" />{transports.isError ? <QueryFailure message={transports.error.message} /> : null}<div className="mt-4 grid gap-3 sm:grid-cols-2">{transports.data?.map((item) => <div className="rounded-xl border p-4" key={item.transport}><div className="flex items-center justify-between gap-3"><p className="font-mono text-sm">{item.transport}</p><StatePill status={item.available ? "approved" : "failed"} label={item.available ? "可用" : "不可用"} /></div><p className="mt-2 text-xs text-muted-foreground">协议 {item.protocol_version ?? "—"} · 真实执行 {item.supports_real_execution ? "支持" : "未支持"}</p><p className="mt-1 text-xs text-muted-foreground">{item.reason}</p></div>)}</div></Surface><Surface className="p-5"><SectionHeading title="MCP Server 详情与快照" />{servers.isError ? <QueryFailure message={servers.error.message} /> : null}<ServerChooser onChange={setServerChoice} servers={servers.data ?? []} value={selectedServerId} />{server.data ? <McpServerEditor busy={updateServerMutation.isPending} onSubmit={(payload) => updateServerMutation.mutate({ id: server.data!.id, payload })} server={server.data} /> : server.isError ? <QueryFailure message={server.error.message} /> : null}{snapshots.data?.length ? <div className="mt-4 space-y-2"><p className="text-xs font-semibold">能力快照</p>{snapshots.data.map((snapshot) => <details className="rounded-lg border p-3" key={snapshot.id}><summary className="flex cursor-pointer list-none items-center gap-2 text-xs"><span className="min-w-0 flex-1 font-mono">#{snapshot.sequence} · {snapshot.snapshot_hash.slice(0, 12)}</span><StatePill status={snapshot.changed ? "pending" : "approved"} label={snapshot.changed ? "已变化" : "一致"} /></summary><pre className="mt-3 max-h-48 overflow-auto rounded bg-muted p-3 text-[10px]">{JSON.stringify({ capabilities: snapshot.capabilities, tools: snapshot.tools, resources: snapshot.resources, prompts: snapshot.prompts }, null, 2)}</pre></details>)}</div> : snapshots.isSuccess && selectedServerId ? <p className="mt-4 text-sm text-muted-foreground">尚无能力快照。请先在基础工具页刷新 Server。</p> : null}</Surface></div>;
+}
+
+/** Advanced Skill revision panel (version, source, manifest), embedded in the hub's Skills tab (D-076). */
+export function SkillRevisionPanel() {
+  const queryClient = useQueryClient();
+  const [skillChoice, setSkillChoice] = useState("");
+  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
+  const selectedSkillId = skillChoice || skills.data?.[0]?.id || "";
+  const skill = useQuery({ queryKey: ["skill", selectedSkillId], queryFn: () => getSkill(selectedSkillId), enabled: Boolean(selectedSkillId) });
   const updateSkillMutation = useMutation({ mutationFn: ({ id, payload }: { id: string; payload: Parameters<typeof updateSkill>[1] }) => updateSkill(id, payload), onSuccess: () => { toast.success("Skill 已更新"); void queryClient.invalidateQueries({ queryKey: ["skills"] }); void queryClient.invalidateQueries({ queryKey: ["skill", selectedSkillId] }); }, onError: (error) => toast.error(error.message) });
-  return <div className="space-y-5"><Surface className="p-5"><SectionHeading description="能力声明来自服务端实现，而不是前端的 transport 下拉框。" title="Transport 能力" />{transports.isError ? <QueryFailure message={transports.error.message} /> : null}<div className="mt-4 grid gap-3 sm:grid-cols-2">{transports.data?.map((item) => <div className="rounded-xl border p-4" key={item.transport}><div className="flex items-center justify-between gap-3"><p className="font-mono text-sm">{item.transport}</p><StatePill status={item.available ? "approved" : "failed"} label={item.available ? "可用" : "不可用"} /></div><p className="mt-2 text-xs text-muted-foreground">协议 {item.protocol_version ?? "—"} · 真实执行 {item.supports_real_execution ? "支持" : "未支持"}</p><p className="mt-1 text-xs text-muted-foreground">{item.reason}</p></div>)}</div></Surface><div className="grid gap-5 xl:grid-cols-2"><Surface className="p-5"><SectionHeading title="MCP Server 详情与快照" />{servers.isError ? <QueryFailure message={servers.error.message} /> : null}<ServerChooser onChange={setServerChoice} servers={servers.data ?? []} value={selectedServerId} />{server.data ? <McpServerEditor busy={updateServerMutation.isPending} onSubmit={(payload) => updateServerMutation.mutate({ id: server.data!.id, payload })} server={server.data} /> : server.isError ? <QueryFailure message={server.error.message} /> : null}{snapshots.data?.length ? <div className="mt-4 space-y-2"><p className="text-xs font-semibold">能力快照</p>{snapshots.data.map((snapshot) => <details className="rounded-lg border p-3" key={snapshot.id}><summary className="flex cursor-pointer list-none items-center gap-2 text-xs"><span className="min-w-0 flex-1 font-mono">#{snapshot.sequence} · {snapshot.snapshot_hash.slice(0, 12)}</span><StatePill status={snapshot.changed ? "pending" : "approved"} label={snapshot.changed ? "已变化" : "一致"} /></summary><pre className="mt-3 max-h-48 overflow-auto rounded bg-muted p-3 text-[10px]">{JSON.stringify({ capabilities: snapshot.capabilities, tools: snapshot.tools, resources: snapshot.resources, prompts: snapshot.prompts }, null, 2)}</pre></details>)}</div> : snapshots.isSuccess && selectedServerId ? <p className="mt-4 text-sm text-muted-foreground">尚无能力快照。请先在基础工具页刷新 Server。</p> : null}</Surface><Surface className="p-5"><SectionHeading title="Skill 详情与修订" />{skills.isError ? <QueryFailure message={skills.error.message} /> : null}<SkillChooser onChange={setSkillChoice} skills={skills.data ?? []} value={selectedSkillId} />{skill.data ? <SkillEditor busy={updateSkillMutation.isPending} onSubmit={(payload) => updateSkillMutation.mutate({ id: skill.data!.id, payload })} skill={skill.data} /> : skill.isError ? <QueryFailure message={skill.error.message} /> : null}</Surface></div></div>;
+  return <Surface className="p-5"><SectionHeading title="Skill 详情与修订" />{skills.isError ? <QueryFailure message={skills.error.message} /> : null}<SkillChooser onChange={setSkillChoice} skills={skills.data ?? []} value={selectedSkillId} />{skill.data ? <SkillEditor busy={updateSkillMutation.isPending} onSubmit={(payload) => updateSkillMutation.mutate({ id: skill.data!.id, payload })} skill={skill.data} /> : skill.isError ? <QueryFailure message={skill.error.message} /> : null}</Surface>;
 }
 
 function ServerChooser({ onChange, servers, value }: { onChange: (value: string) => void; servers: MCPServer[]; value: string }) { return <div className="mt-4"><Label htmlFor="runtime-mcp-server">Server</Label><select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" id="runtime-mcp-server" onChange={(event) => onChange(event.target.value)} value={value}>{servers.map((server) => <option key={server.id} value={server.id}>{server.display_name} · {server.transport}</option>)}</select>{!servers.length ? <p className="mt-3 text-sm text-muted-foreground">尚未注册 MCP Server。请先在基础工具页注册。</p> : null}</div>; }
@@ -563,7 +525,8 @@ function SkillChooser({ onChange, skills, value }: { onChange: (value: string) =
 
 function SkillEditor({ busy, onSubmit, skill }: { busy: boolean; onSubmit: (payload: Parameters<typeof updateSkill>[1]) => void; skill: Skill }) { function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); const manifest = parseObject(data.get("manifest"), "Skill Manifest"); if (!manifest) return; onSubmit({ name: String(data.get("name") ?? "").trim() || undefined, source: String(data.get("source") ?? "").trim(), version: String(data.get("version") ?? "").trim(), manifest }); } return <form className="mt-4 space-y-3" key={skill.id} onSubmit={submit}><div className="grid gap-3 sm:grid-cols-2"><Label>名称<Input defaultValue={skill.name} name="name" /></Label><Label>来源<Input defaultValue={skill.source} name="source" required /></Label><Label>版本<Input defaultValue={skill.version} name="version" required /></Label><div className="rounded-lg border p-2 text-xs">状态：<StatePill status={skill.status} /></div></div><Label>声明式 Manifest JSON<Textarea className="mt-2 font-mono text-xs" defaultValue={JSON.stringify(skill.manifest_json, null, 2)} name="manifest" rows={10} required /></Label><Button disabled={busy} size="sm" type="submit"><FileCog className="size-4" />保存 Skill 修订</Button></form>; }
 
-function ComponentAdministration() {
+/** Trusted-component administration, rendered as the hub's components tab (D-076). */
+export function ComponentAdministration() {
   const queryClient = useQueryClient();
   const [pluginChoice, setPluginChoice] = useState("");
   const [artifact, setArtifact] = useState<unknown>(null);
@@ -586,9 +549,9 @@ function ComponentRegistrationForm({ busy, onSubmit }: { busy: boolean; onSubmit
 
 function ComponentManifestCard({ artifactBusy, artifactResult, authorization, authorizeBusy, checkBusy, checks, eventBusy, eventResult, manifest, onAuthorize, onCheck, onPrepareArtifact, onRevoke, onValidateEvent, revokeBusy }: { artifactBusy: boolean; artifactResult: unknown; authorization: { status: string } | undefined; authorizeBusy: boolean; checkBusy: boolean; checks: Array<{ id: string; check_type: string; status: string; runtime_executed: boolean; checked_at: string; details: Record<string, unknown> }>; eventBusy: boolean; eventResult: unknown; manifest: { component_id: string; version: string; display_name: string; renderer: string; package_hash_status: string; signature_status: string; id: string; example_data: Record<string, unknown> }; onAuthorize: () => void; onCheck: (type: "health" | "render", data?: Record<string, unknown>) => void; onPrepareArtifact: (data: Record<string, unknown>) => void; onRevoke: (reason: string) => void; onValidateEvent: (event: Record<string, unknown>) => void; revokeBusy: boolean }) { function parsedAction(event: FormEvent<HTMLFormElement>, target: (value: Record<string, unknown>) => void, label: string) { event.preventDefault(); const data = new FormData(event.currentTarget); const parsed = parseObject(data.get("json"), label); if (parsed) target(parsed); } return <details className="rounded-xl border p-4"><summary className="flex cursor-pointer list-none items-center gap-3"><Boxes className="size-4 text-primary" /><span className="min-w-0 flex-1"><span className="block font-medium">{manifest.display_name}</span><span className="font-mono text-xs text-muted-foreground">{manifest.component_id} · v{manifest.version}</span></span><StatePill status={authorization ? authorization.status : "pending"} label={authorization ? authorization.status : "未授权"} /></summary><div className="mt-4 grid gap-3 md:grid-cols-2"><KeyValueGrid items={[{ label: "Renderer", value: manifest.renderer }, { label: "包哈希", value: manifest.package_hash_status }, { label: "签名", value: manifest.signature_status }, { label: "已记录检查", value: checks.length }]} /><div className="flex flex-wrap content-start gap-2"><Button disabled={authorizeBusy || Boolean(authorization)} onClick={onAuthorize} size="xs">授权此版本</Button><Button disabled={revokeBusy || !authorization} onClick={() => onRevoke("workspace_user_revoked")} size="xs" variant="outline">撤销授权</Button><Button disabled={checkBusy} onClick={() => onCheck("health")} size="xs" variant="outline">健康检查</Button><Button disabled={checkBusy} onClick={() => onCheck("render", manifest.example_data)} size="xs" variant="outline">渲染检查</Button></div></div><div className="mt-4 grid gap-3 lg:grid-cols-2"><form className="rounded-lg border p-3" onSubmit={(event) => parsedAction(event, onPrepareArtifact, "Artifact 数据")}><p className="text-xs font-semibold">生成受控 Artifact</p><Textarea className="mt-2 font-mono text-xs" defaultValue={JSON.stringify(manifest.example_data, null, 2)} name="json" rows={5} /><Button className="mt-2" disabled={artifactBusy || !authorization} size="xs" type="submit">准备 Artifact</Button></form><form className="rounded-lg border p-3" onSubmit={(event) => parsedAction(event, onValidateEvent, "组件事件")}><p className="text-xs font-semibold">验证组件事件</p><Textarea className="mt-2 font-mono text-xs" name="json" placeholder='{"action":"..."}' rows={5} /><Button className="mt-2" disabled={eventBusy || !authorization} size="xs" type="submit" variant="outline">验证事件</Button></form></div>{checks.length ? <div className="mt-3 space-y-2">{checks.map((check) => <details className="rounded-lg border p-3" key={check.id}><summary className="flex cursor-pointer list-none items-center gap-2 text-xs"><span className="min-w-0 flex-1">{check.check_type} · {formatDate(check.checked_at)}</span><StatePill status={check.status} /><Badge variant="outline">{check.runtime_executed ? "已执行" : "未执行 runtime"}</Badge></summary><pre className="mt-2 max-h-36 overflow-auto rounded bg-muted p-2 text-[10px]">{JSON.stringify(check.details, null, 2)}</pre></details>)}</div> : null}{artifactResult ? <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{JSON.stringify(artifactResult, null, 2)}</pre> : null}{eventResult ? <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{JSON.stringify(eventResult, null, 2)}</pre> : null}</details>; }
 
-function SandboxAdministration() {
+/** Sandbox administration (bootstrap, profile, session cleanup), rendered as the hub's sandbox tab (D-076). */
+export function SandboxAdministration() {
   const queryClient = useQueryClient();
-  const [selectedTaskChoice, setSelectedTaskChoice] = useState("");
   const bootstrap = useQuery({
     queryKey: ["sandbox-bootstrap-status"],
     queryFn: getSandboxBootstrapStatus,
@@ -599,14 +562,6 @@ function SandboxAdministration() {
   });
   const profiles = useQuery({ queryKey: ["sandbox-profiles"], queryFn: listSandboxProfiles });
   const sandboxSessions = useQuery({ queryKey: ["sandbox-sessions"], queryFn: () => listSandboxSessions() });
-  const tasks = useQuery({ queryKey: ["sandbox-tasks"], queryFn: () => listSandboxTasks() });
-  const chatSessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
-  const files = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
-  const selectedTaskId = selectedTaskChoice || tasks.data?.[0]?.id || "";
-  const task = useQuery({ queryKey: ["sandbox-task", selectedTaskId], queryFn: () => getSandboxTask(selectedTaskId), enabled: Boolean(selectedTaskId) });
-  const executions = useQuery({ queryKey: ["sandbox-executions", selectedTaskId], queryFn: () => listSandboxExecutions(selectedTaskId), enabled: Boolean(selectedTaskId) });
-  const create = useMutation({ mutationFn: createSandboxTask, onSuccess: (result) => { setSelectedTaskChoice(result.id); toast.success(result.status === "completed" ? "Sandbox 任务已完成" : `Sandbox 任务状态：${result.status}`); void queryClient.invalidateQueries({ queryKey: ["sandbox-tasks"] }); void queryClient.invalidateQueries({ queryKey: ["sandbox-sessions"] }); }, onError: (error) => toast.error(error.message) });
-  const cancel = useMutation({ mutationFn: cancelSandboxTask, onSuccess: () => { toast.success("Sandbox 任务已取消"); void queryClient.invalidateQueries({ queryKey: ["sandbox-tasks"] }); void queryClient.invalidateQueries({ queryKey: ["sandbox-task", selectedTaskId] }); }, onError: (error) => toast.error(error.message) });
   const cleanup = useMutation({ mutationFn: cleanupSandboxSession, onSuccess: () => { toast.success("Sandbox Session 清理已完成"); void queryClient.invalidateQueries({ queryKey: ["sandbox-sessions"] }); }, onError: (error) => toast.error(error.message) });
   const initBootstrap = useMutation({
     mutationFn: startSandboxBootstrap,
@@ -624,7 +579,6 @@ function SandboxAdministration() {
   const bootstrapStatus = bootstrap.data;
   const activeJob = bootstrapStatus?.active_job;
   const progress = activeJob?.progress_percent ?? bootstrapStatus?.progress_percent ?? 0;
-  return <div className="space-y-5"><Surface className="p-5"><SectionHeading description="在任意已安装 Docker 的设备上点击初始化即可构建 Runner（Python + Node）。digest 由后端自动保存，无需手改 .env。" title="沙箱一键初始化" />{bootstrap.isError ? <QueryFailure message={bootstrap.error.message} /> : null}{bootstrapStatus ? <div className="mt-4 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatePill status={bootstrapStatus.image_ready ? "approved" : activeJob ? "pending" : "failed"} label={bootstrapStatus.image_ready ? "已就绪" : activeJob ? "初始化中" : "未就绪"} /><p className="text-sm text-muted-foreground">{bootstrapStatus.message}</p></div><div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-all" style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} /></div><KeyValueGrid items={[{ label: "Docker", value: bootstrapStatus.docker_reachable ? "可达" : "不可达" }, { label: "镜像 digest", value: <span className="font-mono text-[10px]">{bootstrapStatus.image_digest ?? "—"}</span> }, { label: "配置来源", value: bootstrapStatus.image_source ?? "—" }, { label: "阶段", value: bootstrapStatus.phase }]} /><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{bootstrapStatus.remediation_steps.map((step) => <li key={step}>{step}</li>)}</ul>{activeJob?.log_tail?.length ? <pre className="max-h-40 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{activeJob.log_tail.join("\n")}</pre> : null}<div className="flex flex-wrap gap-2"><Button disabled={initBootstrap.isPending || Boolean(activeJob) || !bootstrapStatus.can_initialize} onClick={() => initBootstrap.mutate()} size="sm"><Play className="size-4" />{activeJob ? "初始化进行中…" : bootstrapStatus.image_ready ? "重新构建沙箱" : "初始化沙箱"}</Button><Button onClick={() => { void bootstrap.refetch(); void profiles.refetch(); }} size="sm" variant="outline"><RefreshCcw className="size-4" />刷新状态</Button></div>{bootstrapStatus.last_failed_job && !activeJob ? <p className="text-xs text-amber-800 dark:text-amber-200">上次失败：{bootstrapStatus.last_failed_job.error_code} · {bootstrapStatus.last_failed_job.error_message}</p> : null}</div> : bootstrap.isLoading ? <LoadingState label="正在读取沙箱初始化状态…" /> : null}</Surface><Surface className="p-5"><SectionHeading description="Profile 来自当前运行时探测；Docker 或镜像不可用时会明确标为 unavailable。" title="Sandbox Profile" />{profiles.isError ? <QueryFailure message={profiles.error.message} /> : null}<div className="mt-4 grid gap-3 sm:grid-cols-2">{profiles.data?.map((profile) => <div className="rounded-xl border p-4" key={profile.backend_id}><div className="flex items-center justify-between gap-3"><p className="font-medium">{profile.backend_id}</p><StatePill status={profile.available ? "approved" : "failed"} label={profile.available ? "可用" : "不可用"} /></div><p className="mt-2 text-xs text-muted-foreground">{profile.platform} · 固定镜像 {profile.image_pinned ? "是" : "否"}</p><p className="mt-1 text-xs text-muted-foreground">{profile.reason ?? profile.capabilities.join(" / ")}</p></div>)}</div></Surface><div className="grid gap-5 xl:grid-cols-[.85fr_1.15fr]"><Surface className="p-5"><SectionHeading description="文件和会话均从当前工作区真实记录选择；任务会使用隔离 Runner，而不是 API 进程直接执行。" title="创建 Sandbox 任务" /><SandboxTaskForm busy={create.isPending} chatSessions={chatSessions.data ?? []} files={files.data ?? []} onSubmit={(payload) => create.mutate(payload)} sandboxSessions={sandboxSessions.data ?? []} /></Surface><Surface className="p-5"><SectionHeading title="持久化任务与执行历史" />{tasks.isError ? <QueryFailure message={tasks.error.message} /> : null}<div className="mt-4"><Label htmlFor="sandbox-task-select">任务</Label><select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" id="sandbox-task-select" onChange={(event) => setSelectedTaskChoice(event.target.value)} value={selectedTaskId}>{tasks.data?.map((item) => <option key={item.id} value={item.id}>{item.task_type} · {item.status} · {formatDate(item.created_at)}</option>)}</select></div>{task.data ? <div className="mt-4 space-y-3"><KeyValueGrid items={[{ label: "任务状态", value: <StatePill status={task.data.status} /> }, { label: "Sandbox Session", value: <span className="font-mono text-xs">{task.data.sandbox_session_id}</span> }, { label: "文件", value: <span className="font-mono text-xs">{task.data.file_id}</span> }, { label: "错误", value: task.data.error_class ?? "无" }]} /><div className="flex flex-wrap gap-2"><Button disabled={cancel.isPending || ["completed", "failed", "cancelled"].includes(task.data.status)} onClick={() => cancel.mutate(task.data!.id)} size="xs" variant="outline">取消任务</Button><Button onClick={() => { void task.refetch(); void executions.refetch(); }} size="xs" variant="ghost"><RefreshCcw className="size-3" />刷新</Button></div><pre className="max-h-52 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{JSON.stringify(task.data.artifact_json, null, 2)}</pre>{executions.data?.map((execution) => <details className="rounded-lg border p-3" key={execution.id}><summary className="flex cursor-pointer list-none items-center gap-2 text-xs"><span className="min-w-0 flex-1">尝试 #{execution.attempt_no} · {execution.latency_ms} ms</span><StatePill status={execution.status} /></summary><pre className="mt-2 max-h-40 overflow-auto rounded bg-muted p-2 text-[10px]">{JSON.stringify(execution, null, 2)}</pre></details>)}</div> : tasks.isSuccess && !tasks.data.length ? <EmptyState description="创建任务后，这里会保留执行、错误与 Artifact 的可追溯历史。" title="尚无 Sandbox 任务" /> : task.isError ? <QueryFailure message={task.error.message} /> : null}</Surface></div><Surface className="p-5"><SectionHeading title="Sandbox Session 清理" />{sandboxSessions.isError ? <QueryFailure message={sandboxSessions.error.message} /> : null}<div className="mt-4 space-y-2">{sandboxSessions.data?.map((session) => <div className="flex flex-col gap-3 rounded-xl border p-3 sm:flex-row sm:items-center" key={session.id}><div className="min-w-0 flex-1"><p className="font-mono text-xs">{session.id}</p><p className="mt-1 text-xs text-muted-foreground">{session.backend_id} · 过期 {formatDate(session.expires_at)} · 清理 {session.cleanup_status}</p></div><StatePill status={session.status} /><Button disabled={cleanup.isPending || session.cleanup_status === "cleaned"} onClick={() => cleanup.mutate(session.id)} size="xs" variant="outline">清理</Button></div>)}{sandboxSessions.isSuccess && !sandboxSessions.data.length ? <p className="py-5 text-sm text-muted-foreground">当前身份还没有 Sandbox Session。</p> : null}</div></Surface></div>;
+  const visibleSandboxSessions = (sandboxSessions.data ?? []).filter((session) => session.cleanup_status !== "cleaned" && session.status !== "deleted");
+  return <div className="space-y-5"><Surface className="p-5"><SectionHeading description="在任意已安装 Docker 的设备上点击初始化即可构建统一 Runner 镜像（Python + Node + Chromium/Playwright + ffmpeg + 中文字体 + Vue/React 构建工具链）。" title="沙箱一键初始化" />{bootstrap.isError ? <QueryFailure message={bootstrap.error.message} /> : null}{bootstrapStatus ? <div className="mt-4 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatePill status={bootstrapStatus.image_ready ? "approved" : activeJob ? "pending" : "failed"} label={bootstrapStatus.image_ready ? "已就绪" : activeJob ? "初始化中" : "未就绪"} /><p className="text-sm text-muted-foreground">{bootstrapStatus.message}</p></div><div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-all" style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} /></div><KeyValueGrid items={[{ label: "Docker", value: bootstrapStatus.docker_reachable ? "可达" : "不可达" }, { label: "镜像 digest", value: <span className="font-mono text-[10px]">{bootstrapStatus.image_digest ?? "—"}</span> }, { label: "配置来源", value: bootstrapStatus.image_source ?? "—" }, { label: "阶段", value: bootstrapStatus.phase }]} /><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{bootstrapStatus.remediation_steps.map((step) => <li key={step}>{step}</li>)}</ul>{activeJob?.log_tail?.length ? <pre className="max-h-40 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{activeJob.log_tail.join("\n")}</pre> : null}<div className="flex flex-wrap gap-2"><Button disabled={initBootstrap.isPending || Boolean(activeJob) || !bootstrapStatus.can_initialize} onClick={() => initBootstrap.mutate()} size="sm"><Play className="size-4" />{activeJob ? "初始化进行中…" : bootstrapStatus.image_ready ? "重新构建沙箱" : "初始化沙箱"}</Button><Button onClick={() => { void bootstrap.refetch(); void profiles.refetch(); }} size="sm" variant="outline"><RefreshCcw className="size-4" />刷新状态</Button></div>{bootstrapStatus.last_failed_job && !activeJob ? <p className="text-xs text-amber-800 dark:text-amber-200">上次失败：{bootstrapStatus.last_failed_job.error_code} · {bootstrapStatus.last_failed_job.error_message}</p> : null}</div> : bootstrap.isLoading ? <LoadingState label="正在读取沙箱初始化状态…" /> : null}</Surface><Surface className="p-5"><SectionHeading description="统一运行时的实时探测结果：所有会话共享同一个加固镜像（断网、只读、seccomp 白名单），浏览器 / ffmpeg / 前端工具链能力始终可用。" title="Sandbox Profile" />{profiles.isError ? <QueryFailure message={profiles.error.message} /> : null}<div className="mt-4 space-y-3">{profiles.data?.map((profile) => <div className="rounded-xl border p-4" key={profile.backend_id}><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="font-medium">统一沙箱运行时</p><p className="font-mono text-[10px] text-muted-foreground">{profile.backend_id}</p></div><StatePill status={profile.available ? "approved" : "failed"} label={profile.available ? "可用" : "不可用"} /></div><p className="mt-2 text-xs text-muted-foreground">{profile.platform} · 固定镜像 {profile.image_pinned ? "是" : "否"}</p>{profile.reason ? <p className="mt-2 text-xs text-amber-800 dark:text-amber-200">{profile.reason}</p> : <div className="mt-2 flex flex-wrap gap-1">{profile.capabilities.map((capability) => <Badge key={capability} variant="outline">{capability}</Badge>)}</div>}</div>)}</div></Surface><Surface className="p-5"><SectionHeading description="已清理或已删除的 Session 不再显示。" title="Sandbox Session 清理" />{sandboxSessions.isError ? <QueryFailure message={sandboxSessions.error.message} /> : null}<div className="mt-4 space-y-2">{visibleSandboxSessions.map((session) => <div className="flex flex-col gap-3 rounded-xl border p-3 sm:flex-row sm:items-center" key={session.id}><div className="min-w-0 flex-1"><p className="font-mono text-xs">{session.id}</p><p className="mt-1 text-xs text-muted-foreground">{session.backend_id} · 过期 {formatDate(session.expires_at)} · 清理 {session.cleanup_status}</p></div><StatePill status={session.status} /><Button disabled={cleanup.isPending} onClick={() => cleanup.mutate(session.id)} size="xs" variant="outline">清理</Button></div>)}{sandboxSessions.isSuccess && !visibleSandboxSessions.length ? <p className="py-5 text-sm text-muted-foreground">当前没有待清理的 Sandbox Session。</p> : null}</div></Surface></div>;
 }
-
-function SandboxTaskForm({ busy, chatSessions, files, onSubmit, sandboxSessions }: { busy: boolean; chatSessions: Array<{ id: string; title: string }>; files: Array<{ id: string; original_name: string }>; onSubmit: (payload: { chat_session_id: string; file_id: string; task_type: "file_inspect" | "extract_inert_text"; output_format: "metadata_json" | "text_bundle"; sandbox_session_id?: string }) => void; sandboxSessions: Array<{ id: string; chat_session_id: string; status: string }> }) { function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); onSubmit({ chat_session_id: String(data.get("chat_session_id") ?? ""), file_id: String(data.get("file_id") ?? ""), task_type: String(data.get("task_type") ?? "file_inspect") as "file_inspect" | "extract_inert_text", output_format: String(data.get("output_format") ?? "metadata_json") as "metadata_json" | "text_bundle", sandbox_session_id: String(data.get("sandbox_session_id") ?? "") || undefined }); } return <form className="mt-4 space-y-3" onSubmit={submit}><Label>学习会话<select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" name="chat_session_id" required><option value="">选择会话</option>{chatSessions.map((session) => <option key={session.id} value={session.id}>{session.title}</option>)}</select></Label><Label>文件<select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" name="file_id" required><option value="">选择文件</option>{files.map((file) => <option key={file.id} value={file.id}>{file.original_name}</option>)}</select></Label><div className="grid gap-3 sm:grid-cols-2"><Label>任务类型<select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" name="task_type"><option value="file_inspect">文件安全检查</option><option value="extract_inert_text">提取惰性文本</option></select></Label><Label>输出<select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" name="output_format"><option value="metadata_json">元数据 JSON</option><option value="text_bundle">文本包</option></select></Label></div>{sandboxSessions.length ? <Label>复用已就绪 Session（可选）<select className="mt-2 h-9 w-full rounded-lg border bg-transparent px-3 text-sm" name="sandbox_session_id"><option value="">新建隔离 Session</option>{sandboxSessions.filter((session) => session.status === "ready").map((session) => <option key={session.id} value={session.id}>{session.id.slice(0, 12)} · {session.chat_session_id.slice(0, 8)}</option>)}</select></Label> : null}<Button disabled={busy || !chatSessions.length || !files.length} size="sm" type="submit"><Play className="size-4" />{busy ? "正在提交…" : "在 Sandbox 中执行"}</Button></form>; }

@@ -86,11 +86,19 @@ export const AUDIO_EXTENSIONS = new Set([
   ".mp3",
   ".m4a",
   ".wav",
-  ".webm",
   ".ogg",
   ".flac",
   ".aac",
+]);
+
+export const VIDEO_EXTENSIONS = new Set([
   ".mp4",
+  ".mov",
+  ".avi",
+  ".webm",
+  ".mkv",
+  ".flv",
+  ".wmv",
 ]);
 
 export const SPECIAL_BINARY_EXTENSIONS = new Set([
@@ -131,6 +139,12 @@ export function isAudioNameOrMime(name: string, mime?: string | null): boolean {
   return AUDIO_EXTENSIONS.has(fileExtension(name));
 }
 
+export function isVideoNameOrMime(name: string, mime?: string | null): boolean {
+  const type = (mime ?? "").toLowerCase().split(";", 1)[0].trim();
+  if (type.startsWith("video/")) return true;
+  return VIDEO_EXTENSIONS.has(fileExtension(name));
+}
+
 export function isSpecialBinaryName(name: string): boolean {
   return SPECIAL_BINARY_EXTENSIONS.has(fileExtension(name));
 }
@@ -140,7 +154,11 @@ export function isFastThinkingWhitelistDocument(
   mime?: string | null,
   parseCapability?: string | null,
 ): boolean {
-  if (isImageNameOrMime(name, mime) || isAudioNameOrMime(name, mime)) {
+  if (
+    isImageNameOrMime(name, mime) ||
+    isAudioNameOrMime(name, mime) ||
+    isVideoNameOrMime(name, mime)
+  ) {
     return false;
   }
   if (isSpecialBinaryName(name)) return false;
@@ -183,6 +201,9 @@ export function classifyNonAgentAttachment(options: {
   if (isImageNameOrMime(name, mime)) {
     return { ok: true, reason: null, message: "" };
   }
+  if (isVideoNameOrMime(name, mime)) {
+    return { ok: true, reason: null, message: "" };
+  }
   if (isAudioNameOrMime(name, mime)) {
     if (!asrAvailable) {
       return {
@@ -214,9 +235,11 @@ export function classifyNonAgentAttachment(options: {
 export function fastThinkingAcceptAttribute(asrAvailable: boolean): string {
   const parts = [
     "image/*",
+    "video/*",
     ...WHITELIST_DOCUMENT_EXTENSIONS,
     ...LOCAL_TEXT_EXTENSIONS,
     ...IMAGE_EXTENSIONS,
+    ...VIDEO_EXTENSIONS,
   ];
   if (asrAvailable) {
     parts.push("audio/*", ...AUDIO_EXTENSIONS);

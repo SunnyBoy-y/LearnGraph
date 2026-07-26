@@ -503,6 +503,9 @@ export function DocumentLearningPage() {
   const previewKind = resolveFilePreviewKind(file.original_name, file.mime_type);
   const isAudio = previewKind === "audio";
   const hasOriginalPreview = previewKind !== "unsupported";
+  // HTML 页面在沙箱 iframe 中整体预览，证据检索与图谱构建不适用。
+  const chatOnlyPanel = previewKind === "html";
+  const effectiveRightPanel = chatOnlyPanel ? "chat" : rightPanel;
   const confirmedGoals = (goals.data ?? []).filter((item) =>
     ["confirmed", "candidate_ready", "approved"].includes(item.status),
   );
@@ -874,19 +877,21 @@ export function DocumentLearningPage() {
                 : "h-[calc(100svh-8.25rem)] xl:h-[calc(100svh-4.25rem)]",
             )}
           >
-            <div className="grid h-10 flex-none grid-cols-3 border-b p-1">
-              <Button aria-pressed={rightPanel === "chat"} onClick={() => setRightPanel("chat")} size="sm" variant={rightPanel === "chat" ? "secondary" : "ghost"}>
-                <MessageSquareText className="size-3.5" />对话
-              </Button>
-              <Button aria-pressed={rightPanel === "evidence"} onClick={() => setRightPanel("evidence")} size="sm" variant={rightPanel === "evidence" ? "secondary" : "ghost"}>
-                <Search className="size-3.5" />证据
-              </Button>
-              <Button aria-pressed={rightPanel === "graph"} onClick={() => setRightPanel("graph")} size="sm" variant={rightPanel === "graph" ? "secondary" : "ghost"}>
-                <Network className="size-3.5" />图谱
-              </Button>
-            </div>
+            {!chatOnlyPanel ? (
+              <div className="grid h-10 flex-none grid-cols-3 border-b p-1">
+                <Button aria-pressed={effectiveRightPanel === "chat"} onClick={() => setRightPanel("chat")} size="sm" variant={effectiveRightPanel === "chat" ? "secondary" : "ghost"}>
+                  <MessageSquareText className="size-3.5" />对话
+                </Button>
+                <Button aria-pressed={effectiveRightPanel === "evidence"} onClick={() => setRightPanel("evidence")} size="sm" variant={effectiveRightPanel === "evidence" ? "secondary" : "ghost"}>
+                  <Search className="size-3.5" />证据
+                </Button>
+                <Button aria-pressed={effectiveRightPanel === "graph"} onClick={() => setRightPanel("graph")} size="sm" variant={effectiveRightPanel === "graph" ? "secondary" : "ghost"}>
+                  <Network className="size-3.5" />图谱
+                </Button>
+              </div>
+            ) : null}
 
-            {rightPanel === "chat" ? (
+            {effectiveRightPanel === "chat" ? (
               <div className="min-h-0 flex-1">
                 <DocumentChatPanel
                   embeddedImages={embeddedImages}
@@ -902,7 +907,7 @@ export function DocumentLearningPage() {
               </div>
             ) : null}
 
-            {rightPanel === "evidence" ? (
+            {effectiveRightPanel === "evidence" ? (
               <div className="min-h-0 flex-1 overflow-auto p-4">
                 <div className="flex items-center gap-2"><Focus className="size-4 text-primary" /><h2 className="text-sm font-semibold">证据检索</h2></div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">先查看真实 FTS5 命中，再决定是否发送给模型。</p>
@@ -971,7 +976,7 @@ export function DocumentLearningPage() {
               </div>
             ) : null}
 
-            {rightPanel === "graph" ? (
+            {effectiveRightPanel === "graph" ? (
               <div className="min-h-0 flex-1 overflow-auto p-4">
                 <div className="flex items-center gap-2"><Network className="size-4" /><h2 className="text-sm font-semibold">从文档构建图谱</h2></div>
                 <p className="mt-1 text-[11px] leading-5 text-muted-foreground">模型只生成带来源的候选变更；确认前不会发布图谱。</p>

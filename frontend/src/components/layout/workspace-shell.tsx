@@ -19,6 +19,7 @@ import {
 } from "react-router-dom";
 import {
   Activity,
+  ArrowUp,
   Archive,
   BadgeCheck,
   Bot,
@@ -70,6 +71,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { ActivityHeatmap } from "@/components/shared/activity-heatmap";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { Input } from "@/components/ui/input";
 import {
@@ -97,6 +99,7 @@ import {
   KnowledgeGraph,
   type KnowledgeNode,
 } from "@/components/graph/knowledge-graph";
+import { NodeExploreChain } from "@/components/graph/node-explore";
 import {
   archiveProject,
   archiveSession,
@@ -113,7 +116,6 @@ import {
   getSessionBatchDeleteImpact,
   listGraphs,
   listGoals,
-  listActions,
   listNodeQuestions,
   listProjects,
   listSessions,
@@ -368,15 +370,15 @@ function pickDefaultLearningNode(graph: Graph): GraphNode | undefined {
 }
 
 const settingsNav: NavItem[] = [
+  { label: "工作区设置", icon: SlidersHorizontal, path: "settings/workspace" },
   { label: "模型 Provider", icon: Bot, path: "settings/providers" },
   { label: "用量与预算", icon: CircleDollarSign, path: "settings/usage" },
+  { label: "个性化", icon: Palette, path: "settings/personalization" },
   { label: "扩展中心", icon: Sparkles, path: "settings/extensions" },
   { label: "搜索与研究", icon: Search, path: "settings/research" },
-  { label: "存储迁移", icon: Database, path: "settings/storage/migrations" },
-  { label: "权限审计", icon: ShieldCheck, path: "settings/audit" },
-  { label: "个性化", icon: Palette, path: "settings/personalization" },
-  { label: "工作区设置", icon: SlidersHorizontal, path: "settings/workspace" },
   { label: "账户与访问", icon: UsersRound, path: "settings/access" },
+  { label: "权限审计", icon: ShieldCheck, path: "settings/audit" },
+  { label: "存储迁移", icon: Database, path: "settings/storage/migrations" },
 ];
 
 const titleMatchers: Array<[string, string, string]> = [
@@ -401,7 +403,7 @@ const titleMatchers: Array<[string, string, string]> = [
     "预算、来源、状态和覆盖缺口可审核",
   ],
   ["/research/search", "联网搜索与网页获取", "普通搜索、正文抓取与引用分层"],
-  ["/memory", "本地工作区记忆中心", "热区、冷区和可审计写入"],
+  ["/memory", "工作区记忆中心", "记忆摘要、注入预览与删除恢复"],
   [
     "/settings/providers",
     "模型 Provider 管理",
@@ -411,7 +413,7 @@ const titleMatchers: Array<[string, string, string]> = [
   [
     "/settings/extensions",
     "扩展中心",
-    "Skills、MCP、可信组件、插件与运行审计的统一入口",
+    "Skills、MCP、插件、可信组件与沙箱的统一入口",
   ],
   [
     "/settings/research",
@@ -1327,7 +1329,14 @@ function SidebarNav({
                 onClick={onCollapse}
                 variant="ghost"
               >
-                <span className="sidebar-brand__mark grid size-8 place-items-center rounded-xl">
+                <span
+                  className={cn(
+                    "sidebar-brand__mark grid place-items-center",
+                    collapsed && !mobile
+                      ? "size-7 shrink-0 rounded-full!"
+                      : "size-8 rounded-xl",
+                  )}
+                >
                   <Network className="size-4" />
                 </span>
                 <span className="sidebar-text text-lg font-semibold">
@@ -1343,7 +1352,14 @@ function SidebarNav({
             onClick={onNavigate}
             to={`${base}/home`}
           >
-            <span className="sidebar-brand__mark grid size-8 place-items-center rounded-xl">
+            <span
+              className={cn(
+                "sidebar-brand__mark grid place-items-center",
+                collapsed && !mobile
+                  ? "size-7 shrink-0 rounded-full!"
+                  : "size-8 rounded-xl",
+              )}
+            >
               <Network className="size-4" />
             </span>
             <span className="sidebar-text text-lg font-semibold">
@@ -1386,6 +1402,7 @@ function SidebarNav({
           const active = isNavActive(pathname, item);
           const className = cn(
             "flex w-full items-center gap-3 rounded-xl px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+            collapsed && !mobile && "h-10 px-0",
             active &&
               "bg-sidebar-accent font-medium text-sidebar-accent-foreground",
           );
@@ -1401,7 +1418,10 @@ function SidebarNav({
                 type="button"
               >
                 <Icon
-                  className={cn("size-4.5", active && "text-primary")}
+                  className={cn(
+                    "size-4.5 shrink-0",
+                    active && "text-primary",
+                  )}
                   strokeWidth={2.25}
                 />
                 <span className="sidebar-text">
@@ -1419,7 +1439,10 @@ function SidebarNav({
               to={`${base}/${item.path}`}
             >
               <Icon
-                className={cn("size-4.5", active && "text-primary")}
+                className={cn(
+                  "size-4.5 shrink-0",
+                  active && "text-primary",
+                )}
                 strokeWidth={2.25}
               />
               <span className="sidebar-text">{item.label}</span>
@@ -2464,15 +2487,35 @@ function UserMenu({
 }) {
   const { logout, username, workspaceId, workspaceName } = useAuth();
   const navigate = useNavigate();
+  // Primer/GitHub-inspired muted accents: blue, green, purple, amber and teal.
+  // The stable hash means an account keeps the same friendly avatar colour.
+  const avatarTones = [
+    { backgroundColor: "#ddf4ff", color: "#0969da" },
+    { backgroundColor: "#dafbe1", color: "#1a7f37" },
+    { backgroundColor: "#fbefff", color: "#8250df" },
+    { backgroundColor: "#fff1e5", color: "#bc4c00" },
+    { backgroundColor: "#ddf7f4", color: "#0f766e" },
+  ];
+  const avatarTone = avatarTones[
+    [...username].reduce((total, character) => total + character.codePointAt(0)!, 0) % avatarTones.length
+  ];
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
-          className="sidebar-user-menu mt-3 h-auto w-full shrink-0 justify-start gap-3 overflow-hidden rounded-xl px-2 py-2"
+          className={cn(
+            "sidebar-user-menu mt-3 h-auto w-full shrink-0 justify-start gap-3 overflow-hidden rounded-xl px-2 py-2",
+            collapsed && !mobile && "px-0",
+          )}
           variant="ghost"
         >
-          <Avatar className="size-8 shrink-0">
-            <AvatarFallback className="sidebar-user-avatar text-xs font-semibold">
+          <Avatar
+            className={cn(
+              "shrink-0",
+              collapsed && !mobile ? "size-6" : "size-8",
+            )}
+          >
+            <AvatarFallback className="sidebar-user-avatar text-xs font-semibold" style={avatarTone}>
               {username.slice(0, 1).toUpperCase()}
             </AvatarFallback>
           </Avatar>
@@ -2551,7 +2594,15 @@ function statusIsHealthy(status: string) {
   return ["healthy", "healthy_local", "enabled"].includes(status);
 }
 
-function TopBar({ onOpenActivity }: { onOpenActivity: () => void }) {
+function TopBar({
+  graphOpen,
+  onOpenActivity,
+  onToggleGraph,
+}: {
+  graphOpen?: boolean;
+  onOpenActivity: () => void;
+  onToggleGraph?: () => void;
+}) {
   const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
   const auth = useAuth();
@@ -2636,6 +2687,24 @@ function TopBar({ onOpenActivity }: { onOpenActivity: () => void }) {
           {description}
         </p>
       </div>
+      {/* Pages portal their compact stats in here (e.g. the sources library). */}
+      <div className="topbar-stats-slot" id="topbar-stats-slot" />
+      {isChat ? (
+        // The chat page portals its model picker in here on phone widths.
+        <div className="topbar-model-slot" id="topbar-model-slot" />
+      ) : null}
+      {onToggleGraph ? (
+        <Button
+          aria-expanded={graphOpen}
+          aria-label={graphOpen ? "收起图谱面板" : "展开图谱面板"}
+          className="topbar-graph-toggle shrink-0"
+          onClick={onToggleGraph}
+          size="icon-sm"
+          variant="ghost"
+        >
+          <Network className="size-4" />
+        </Button>
+      ) : null}
       <div className="hidden items-center gap-2 md:flex">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -2805,6 +2874,49 @@ function TopBar({ onOpenActivity }: { onOpenActivity: () => void }) {
   );
 }
 
+type SelectionExplanation = {
+  sessionId: string;
+  sourceMessageId: string;
+  selectedText: string;
+};
+
+function SelectionExplanationRail({
+  explanation,
+  onClose,
+}: {
+  explanation: SelectionExplanation;
+  onClose: () => void;
+}) {
+  return (
+    <section aria-label="独立解释" className="selection-explanation-rail">
+      <header className="selection-explanation-rail__header">
+        <div>
+          <span>独立画布</span>
+          <strong>划词解释</strong>
+        </div>
+        <Button aria-label="关闭独立解释" onClick={onClose} size="icon-xs" variant="ghost">
+          <X className="size-3.5" />
+        </Button>
+      </header>
+      <div className="selection-explanation-rail__canvas">
+        <div className="selection-explanation-rail__quote">
+          <span>选中内容</span>
+          <p>{explanation.selectedText}</p>
+        </div>
+        <div className="selection-explanation-rail__empty">
+          <Sparkles className="size-4" />
+          <p>已创建独立解释上下文</p>
+          <span>这里会保持与主对话分离，便于围绕这段内容继续追问。</span>
+        </div>
+      </div>
+      <footer className="selection-explanation-rail__composer">
+        <span>针对这段内容继续提问…</span>
+        <ArrowUp className="size-3.5" />
+      </footer>
+    </section>
+  );
+}
+
 function ContextRail() {
   const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
@@ -2812,6 +2924,8 @@ function ContextRail() {
     project?: SidebarProject;
     sessionId?: string;
   }>();
+  const [selectionExplanation, setSelectionExplanation] =
+    useState<SelectionExplanation | null>(null);
   const railProjects = useQuery({
     queryKey: ["projects"],
     queryFn: () => listProjects(),
@@ -2906,13 +3020,29 @@ function ContextRail() {
     };
   }, [sessionId, workspaceId]);
 
+  useEffect(() => {
+    const openExplanation = (event: Event) => {
+      const detail = (event as CustomEvent<SelectionExplanation>).detail;
+      if (!detail || detail.sessionId !== sessionId || !detail.selectedText.trim()) return;
+      setSelectionExplanation(detail);
+    };
+    window.addEventListener("learngraph:selection-explanation", openExplanation);
+    return () =>
+      window.removeEventListener("learngraph:selection-explanation", openExplanation);
+  }, [sessionId]);
+
   const activeProject =
     projectContext && projectContext.sessionId === sessionId
       ? projectContext.project
       : undefined;
   return (
     <aside className="context-rail min-h-svh bg-card px-4 py-5">
-      {isGoalClarify || isGoalMode ? (
+      {selectionExplanation && isChat ? (
+        <SelectionExplanationRail
+          explanation={selectionExplanation}
+          onClose={() => setSelectionExplanation(null)}
+        />
+      ) : isGoalClarify || isGoalMode ? (
         <GoalGraphPreviewRail />
       ) : isGraph ? (
         <GraphWorkspaceRail />
@@ -2963,83 +3093,9 @@ function ContextRail() {
 }
 
 function ActivityRail() {
-  const now = new Date();
-  const [selectedDay, setSelectedDay] = useState(now.getDate());
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
-  const actions = useQuery({ queryKey: ["actions"], queryFn: listActions });
-  const weekdayLabels = ["一", "二", "三", "四", "五", "六", "日"];
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const leadingBlanks = (new Date(year, month, 1).getDay() + 6) % 7;
-  const dayActivity = useMemo(() => {
-    const result: Record<number, string[]> = {};
-    const add = (value: string, label: string) => {
-      const date = new Date(value);
-      if (date.getFullYear() !== year || date.getMonth() !== month) return;
-      result[date.getDate()] = [...(result[date.getDate()] ?? []), label];
-    };
-    sessions.data?.forEach((session) =>
-      add(session.created_at, `创建会话：${session.title}`),
-    );
-    actions.data?.forEach((action) => {
-      if (action.completed_at)
-        add(action.completed_at, `完成行动：${action.title}`);
-      else if (action.due_at) add(action.due_at, `计划行动：${action.title}`);
-    });
-    return result;
-  }, [actions.data, month, sessions.data, year]);
-  const activities = dayActivity[selectedDay] ?? ["当天没有记录的学习活动"];
   return (
     <section className="activity-rail" aria-label="学习活动日历">
-      <div className="activity-rail__title">
-        <div>
-          <p className="text-sm font-semibold">学习活动</p>
-          <p>
-            {year}年{month + 1}月
-          </p>
-        </div>
-        <CalendarDays className="size-4" />
-      </div>
-      <div className="activity-rail__weekdays">
-        {weekdayLabels.map((label) => (
-          <span key={label}>{label}</span>
-        ))}
-      </div>
-      <div className="activity-rail__calendar">
-        {Array.from({ length: leadingBlanks }).map((_, index) => (
-          <span aria-hidden="true" key={`blank-${index}`} />
-        ))}
-        {Array.from({ length: daysInMonth }).map((_, index) => {
-          const day = index + 1;
-          const intensity = Math.min(3, dayActivity[day]?.length ?? 0);
-          return (
-            <button
-              aria-label={`${month + 1}月${day}日`}
-              aria-pressed={selectedDay === day}
-              className={`activity-rail__day is-level-${intensity}`}
-              key={day}
-              onClick={() => setSelectedDay(day)}
-              type="button"
-            >
-              {day}
-            </button>
-          );
-        })}
-      </div>
-      <div className="activity-rail__details">
-        <p>
-          <strong>
-            {month + 1}月{selectedDay}日
-          </strong>{" "}
-          的活动
-        </p>
-        <ul>
-          {activities.map((activity, index) => (
-            <li key={`${activity}-${index}`}>{activity}</li>
-          ))}
-        </ul>
-      </div>
+      <ActivityHeatmap variant="rail" />
     </section>
   );
 }
@@ -3268,7 +3324,8 @@ function BoundGraphRail({
   });
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState({ label: "", description: "" });
+  const draftRef = useRef({ label: "", description: "" });
+  const [explorePanelOpen, setExplorePanelOpen] = useState(false);
   const [validation, setValidation] = useState<{
     errors: string[];
     suggestions: string[];
@@ -3277,6 +3334,7 @@ function BoundGraphRail({
   useEffect(() => {
     setSelectedNodeId(requestedNodeId);
     setEditing(false);
+    setExplorePanelOpen(false);
     setValidation(undefined);
   }, [graphId, requestedNodeId]);
 
@@ -3338,10 +3396,10 @@ function BoundGraphRail({
 
   useEffect(() => {
     if (!selectedNode) return;
-    setDraft({
+    draftRef.current = {
       label: selectedNode.label,
       description: selectedNode.description,
-    });
+    };
   }, [selectedNode]);
 
   const update = useMutation({
@@ -3428,11 +3486,17 @@ function BoundGraphRail({
     setValidation(undefined);
   }
 
+  function openExploreHistory(nodeId: string) {
+    setSelectedNodeId(nodeId);
+    setEditing(false);
+    setExplorePanelOpen(true);
+  }
+
   function assessDraft() {
     if (!selectedNode || !graph)
       return { errors: ["请选择一个节点。"], suggestions: [] };
-    const label = draft.label.trim();
-    const description = draft.description.trim();
+    const label = draftRef.current.label.trim();
+    const description = draftRef.current.description.trim();
     const errors: string[] = [];
     const suggestions: string[] = [];
     if (label.length < 2) errors.push("节点名称至少需要 2 个字符。");
@@ -3455,8 +3519,8 @@ function BoundGraphRail({
     setValidation(next);
     if (next.errors.length || (next.suggestions.length && !force)) return;
     const payload = {
-      label: draft.label.trim(),
-      description: draft.description.trim(),
+      label: draftRef.current.label.trim(),
+      description: draftRef.current.description.trim(),
     };
     update.mutate({ nodeId: selectedNode.id, ...payload });
   }
@@ -3633,9 +3697,11 @@ function BoundGraphRail({
         maximumZoom={2.4}
         minimumZoom={0.15}
         nodes={railGraph.nodes}
+        onOpenExplore={(node) => openExploreHistory(node.id)}
         onSelect={(node) => {
           setSelectedNodeId(node.id);
           setEditing(false);
+          setExplorePanelOpen(false);
           setValidation(undefined);
           rememberLastLearnedNode(graphId, node.id);
           publishLearningNodeContext({
@@ -3646,7 +3712,7 @@ function BoundGraphRail({
         }}
         selectedId={selectedNode?.id}
         showZoomControls
-        title={title || graph.title}
+        title={graph.title || title}
       />
       {selectedNode ? (
         <div className="bound-graph-rail__inspector">
@@ -3664,6 +3730,24 @@ function BoundGraphRail({
               <Badge variant="secondary">重点</Badge>
             ) : null}
           </div>
+          {explorePanelOpen && questions.length ? (
+            <NodeExploreChain
+              onClose={() => setExplorePanelOpen(false)}
+              onJump={(round) => {
+                const message = document.getElementById(
+                  `conversation-jump-${round.id}`,
+                );
+                if (!message) {
+                  toast.message("这条历史问话不在当前会话中。");
+                  return;
+                }
+                message.scrollIntoView({ behavior: "smooth", block: "center" });
+                setExplorePanelOpen(false);
+              }}
+              rounds={questions}
+              title={`${selectedNode.label} 的历史问话`}
+            />
+          ) : null}
           {editing ? (
             <div className="graph-rail-editor">
               <label>
@@ -3671,12 +3755,12 @@ function BoundGraphRail({
                 <Input
                   aria-label="节点名称"
                   onChange={(event) =>
-                    setDraft((current) => ({
-                      ...current,
+                    (draftRef.current = {
+                      ...draftRef.current,
                       label: event.currentTarget.value,
-                    }))
+                    })
                   }
-                  value={draft.label}
+                  defaultValue={draftRef.current.label}
                 />
               </label>
               <label>
@@ -3684,13 +3768,13 @@ function BoundGraphRail({
                 <textarea
                   aria-label="节点学习说明"
                   onChange={(event) =>
-                    setDraft((current) => ({
-                      ...current,
+                    (draftRef.current = {
+                      ...draftRef.current,
                       description: event.currentTarget.value,
-                    }))
+                    })
                   }
                   rows={3}
-                  value={draft.description}
+                  defaultValue={draftRef.current.description}
                 />
               </label>
               {validation ? (
@@ -4254,6 +4338,8 @@ export function WorkspaceShell() {
   );
   const [railWidth, setRailWidth] = useState(360);
   const [activityOpen, setActivityOpen] = useState(false);
+  // Narrow screens hide the context rail; this re-opens it as a right drawer.
+  const [graphDrawerOpen, setGraphDrawerOpen] = useState(false);
   const isChat = pathname.includes("/chat/");
   const isDocumentReader = pathname.includes("/documents/");
   const isGoalClarify =
@@ -4261,6 +4347,17 @@ export function WorkspaceShell() {
     (isChat && new URLSearchParams(search).get("mode") === "goal");
   const showContextRail = isChat || isGoalClarify;
   const hideInspector = !showContextRail;
+  useEffect(() => {
+    setGraphDrawerOpen(false);
+  }, [pathname]);
+  useEffect(() => {
+    if (!graphDrawerOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setGraphDrawerOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [graphDrawerOpen]);
   useEffect(() => {
     const value = settings.data?.find(
       (item) => item.key === "ui.preferences",
@@ -4284,7 +4381,7 @@ export function WorkspaceShell() {
     event.preventDefault();
     document.body.classList.add("is-resizing");
     const onMove = (moveEvent: PointerEvent) => {
-      const sidebarWidth = collapsed ? 72 : 216;
+      const sidebarWidth = collapsed ? 50 : 216;
       const maximum = Math.max(280, window.innerWidth - sidebarWidth - 360);
       setRailWidth(
         Math.min(maximum, Math.max(280, window.innerWidth - moveEvent.clientX)),
@@ -4299,7 +4396,7 @@ export function WorkspaceShell() {
     window.addEventListener("pointerup", onEnd);
   }
   const shellStyle = {
-    "--sidebar-width": collapsed ? "72px" : "216px",
+    "--sidebar-width": collapsed ? "50px" : "216px",
     "--rail-width": `${railWidth}px`,
   } as CSSProperties;
   return (
@@ -4308,6 +4405,7 @@ export function WorkspaceShell() {
         "workspace-shell",
         collapsed && "workspace-shell--collapsed",
         hideInspector && "workspace-shell--no-inspector",
+        showContextRail && graphDrawerOpen && "workspace-shell--graph-open",
       )}
       style={shellStyle}
     >
@@ -4329,7 +4427,15 @@ export function WorkspaceShell() {
             <span className="text-sm font-semibold">LearnGraph</span>
           </header>
         ) : (
-          <TopBar onOpenActivity={() => setActivityOpen(true)} />
+          <TopBar
+            graphOpen={graphDrawerOpen}
+            onOpenActivity={() => setActivityOpen(true)}
+            onToggleGraph={
+              showContextRail
+                ? () => setGraphDrawerOpen((current) => !current)
+                : undefined
+            }
+          />
         )}
         <Outlet />
       </main>
@@ -4342,7 +4448,25 @@ export function WorkspaceShell() {
             onPointerDown={beginRailResize}
             role="separator"
           />
+          {graphDrawerOpen ? (
+            <div
+              aria-hidden="true"
+              className="graph-drawer-backdrop"
+              onClick={() => setGraphDrawerOpen(false)}
+            />
+          ) : null}
           <ContextRail />
+          {graphDrawerOpen ? (
+            <Button
+              aria-label="收起图谱面板"
+              className="graph-drawer-close"
+              onClick={() => setGraphDrawerOpen(false)}
+              size="icon-sm"
+              variant="secondary"
+            >
+              <X className="size-4" />
+            </Button>
+          ) : null}
         </>
       ) : null}
       <Sheet onOpenChange={setActivityOpen} open={activityOpen}>

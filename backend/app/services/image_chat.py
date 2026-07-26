@@ -871,12 +871,21 @@ class ImageChatService:
                     return
                 attempt.status = "failed"
                 attempt.error_type = type(exc).__name__
+                error_detail = " ".join(str(exc).split()).strip()[:300]
+                error_message = (
+                    f"图片生成失败：{error_detail}"
+                    if error_detail
+                    else "图片生成失败，未写入伪造结果。"
+                )
                 self.images.fail(
                     task,
                     "image_generation_failed",
-                    "The image Provider failed before returning a final image",
+                    error_detail
+                    or "The image Provider failed before returning a final image",
                 )
+                image_data["title"] = error_detail or "图片生成失败"
                 image_record.status = "failed"
+                image_record.data = dict(image_data)
                 version.status = "failed"
                 assistant.status = "failed"
                 if submission is not None:
@@ -900,7 +909,7 @@ class ImageChatService:
                         "status": "failed",
                         "error": {
                             "code": "image_generation_failed",
-                            "message": "图片生成失败，未写入伪造结果。",
+                            "message": error_message,
                         },
                         "part": self._part(
                             image_record.id,
@@ -923,7 +932,7 @@ class ImageChatService:
                         "status": "failed",
                         "error": {
                             "code": "image_generation_failed",
-                            "message": "图片生成失败，未写入伪造结果。",
+                            "message": error_message,
                         },
                     },
                 )

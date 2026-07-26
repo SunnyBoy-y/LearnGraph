@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   useMutation,
   useQueries,
@@ -34,9 +35,11 @@ import {
   Pencil,
   RefreshCcw,
   Search,
+  Settings2,
   Sparkles,
   Square,
   Target,
+  TerminalSquare,
   X,
 } from "lucide-react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
@@ -49,6 +52,7 @@ import {
   autoTitleSession,
   branchSession,
   cancelSessionMessage,
+  cleanupDictation,
   closeSession,
   confirmCompositeDraft,
   confirmGraphChangeSet,
@@ -57,7 +61,9 @@ import {
   discoverProviderModels,
   generateSessionSuggestedPrompts,
   getAgentSandboxReadiness,
+  getSandboxBootstrapStatus,
   getMessageSnapshot,
+  getSessionContextUsage,
   getSessionSuggestedPrompts,
   listMessageVersions,
   listSessionMessageEvents,
@@ -72,13 +78,24 @@ import {
   parseFile,
   rejectGraphChangeSet,
   retrySessionMessage,
+  startSandboxBootstrap,
   streamSessionMessage,
   updateSession,
   uploadFile,
   listAudioTranscriptions,
   transcribeAudioFile,
+  transcribeDictationSegment,
 } from "@/api";
 import { hashFileSha256 } from "@/lib/file-hash";
+import {
+  providerDictationSupported,
+  startProviderDictation,
+} from "@/lib/provider-dictation";
+import type { ProviderDictationHandle } from "@/lib/provider-dictation";
+import {
+  realtimeDictationSupported,
+  startRealtimeDictation,
+} from "@/lib/realtime-dictation";
 import {
   classifyNonAgentAttachment,
   fastThinkingAcceptAttribute,
@@ -156,6 +173,16 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -177,8 +204,7 @@ import {
 import type { FileRecord } from "@/types/files";
 import {
   isDeepSeekProvider,
-  type Provider,
-  type ProviderModel,
+  isModelProviderType,
 } from "@/types/providers";
 import {
   clearDraftSessionId,
@@ -198,7 +224,18 @@ import {
   type SearchRoute,
   type ThinkingMode,
 } from "@/lib/session-composer-prefs";
-import { areChatSuggestedPromptsEnabled, readChatFeatureModelSetting, CHAT_AUTO_TITLE_MODEL_SETTING_KEY, CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY } from "@/lib/workspace-settings";
+import {
+  capabilityThinkingModes,
+  fuzzyModelMatch,
+  modelChoiceValue,
+  modelProtocolLabel,
+  parseModelChoiceValue,
+  providerCapabilityString,
+  providerModelOptions,
+  thinkingLabels,
+} from "@/lib/model-choices";
+import { areChatSuggestedPromptsEnabled, isChatContextUsageEnabled, isChatDictationCleanupEnabled, readChatFeatureModelSetting, CHAT_AUTO_TITLE_MODEL_SETTING_KEY, CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY, CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY } from "@/lib/workspace-settings";
+import { ContextUsageRing } from "@/components/chat/context-usage-ring";
 import { shouldShowSuggestedPromptError } from "@/lib/suggested-prompts";
 import { cn } from "@/lib/utils";
 import {
@@ -241,6 +278,248 @@ type TextSelectionMenu = MessageSelectionContext & {
   occurrenceIndex: number;
   top: number;
 };
+
+type ConversationJumpItem = {
+  id: string;
+  label: string;
+  branch: boolean;
+  active: boolean;
+};
+type ConversationBranchLink = { id: string; label: string; active: boolean };
+
+/** Matches the phone breakpoint used by the workspace CSS (index.css). */
+const PHONE_LAYOUT_QUERY = "(max-width: 780px)";
+
+function usePhoneLayout() {
+  const [isPhone, setIsPhone] = useState(
+    () => window.matchMedia(PHONE_LAYOUT_QUERY).matches,
+  );
+  useEffect(() => {
+    const query = window.matchMedia(PHONE_LAYOUT_QUERY);
+    const update = () => setIsPhone(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  return isPhone;
+}
+
+function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const readiness = useQuery({
+    queryKey: ["agent-sandbox-readiness"],
+    queryFn: getAgentSandboxReadiness,
+    refetchInterval: (query) =>
+      query.state.data?.available === false ? 5_000 : false,
+  });
+  const bootstrap = useQuery({
+    queryKey: ["sandbox-bootstrap-status"],
+    queryFn: getSandboxBootstrapStatus,
+    enabled: readiness.data?.code === "sandbox_backend_unavailable",
+    refetchInterval: (query) =>
+      query.state.data?.active_job ? 1_500 : false,
+  });
+  const initialize = useMutation({
+    mutationFn: startSandboxBootstrap,
+    onSuccess: (result) => {
+      setConfirmOpen(false);
+      if (!result.accepted && result.error_message) {
+        toast.error("沙箱初始化未启动", {
+          description: result.error_message,
+        });
+        return;
+      }
+      toast.success(
+        result.joined_existing
+          ? "已加入正在进行的沙箱初始化"
+          : "沙箱初始化已开始",
+      );
+      queryClient.setQueryData(["sandbox-bootstrap-status"], result.status);
+      void queryClient.invalidateQueries({
+        queryKey: ["sandbox-bootstrap-status"],
+      });
+    },
+    onError: (error) =>
+      toast.error("沙箱初始化失败", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      }),
+  });
+
+  useEffect(() => {
+    if (!bootstrap.data?.image_ready) return;
+    void queryClient.invalidateQueries({
+      queryKey: ["agent-sandbox-readiness"],
+    });
+  }, [bootstrap.data?.image_ready, queryClient]);
+
+  if (
+    dismissed ||
+    !readiness.data ||
+    readiness.data.available ||
+    readiness.data.code !== "sandbox_backend_unavailable"
+  )
+    return null;
+
+  const status = bootstrap.data;
+  const dockerMissing = status?.docker_installed === false;
+  const dockerStopped =
+    status?.docker_installed === true && status.docker_reachable === false;
+  const needsInitialization =
+    status?.docker_reachable === true && status.image_ready === false;
+  const activeJob = status?.active_job;
+  const title = dockerMissing
+    ? "智能体需要 Docker 环境"
+    : dockerStopped
+      ? "请先启动 Docker"
+      : needsInitialization
+        ? "智能体沙箱尚未初始化"
+        : "智能体沙箱暂不可用";
+  const description = dockerMissing
+    ? "当前设备未检测到 Docker。安装并启动 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）后，才能使用智能体的文件与代码能力。"
+    : dockerStopped
+      ? "已检测到 Docker，但引擎当前不可达。请启动 Docker 后刷新沙箱状态。"
+      : activeJob
+        ? `${activeJob.message}（${activeJob.progress_percent}%）`
+        : needsInitialization
+          ? "已检测到可用的 Docker。是否现在构建并初始化智能体沙箱？首次初始化可能需要几分钟。"
+          : readiness.data.message;
+
+  return (
+    <>
+      <div
+        className="mb-2 flex flex-col gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-950 shadow-sm dark:border-amber-800 dark:bg-amber-950/45 dark:text-amber-100 sm:flex-row sm:items-center"
+        role="alert"
+      >
+        <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-amber-200/70 dark:bg-amber-900">
+          <TerminalSquare className="size-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold">{title}</p>
+          <p className="mt-0.5 text-xs leading-5 opacity-85">{description}</p>
+          {activeJob ? (
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-amber-200 dark:bg-amber-900">
+              <div
+                className="h-full rounded-full bg-amber-600 transition-[width] dark:bg-amber-400"
+                style={{ width: `${activeJob.progress_percent}%` }}
+              />
+            </div>
+          ) : null}
+        </div>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          {needsInitialization && !activeJob ? (
+            <Button
+              disabled={initialize.isPending || !status?.can_initialize}
+              onClick={() => setConfirmOpen(true)}
+              size="xs"
+            >
+              <TerminalSquare className="size-3.5" />
+              立即初始化
+            </Button>
+          ) : null}
+          <Button
+            onClick={() =>
+              navigate(`/w/${workspaceId}/settings/extensions?tab=sandbox`)
+            }
+            size="xs"
+            variant="outline"
+          >
+            <Settings2 className="size-3.5" />
+            前往沙箱设置
+          </Button>
+          <Button
+            aria-label="关闭沙箱提醒"
+            onClick={() => setDismissed(true)}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <X className="size-3.5" />
+          </Button>
+        </div>
+      </div>
+      <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>初始化智能体沙箱？</AlertDialogTitle>
+            <AlertDialogDescription>
+              LearnGraph 将使用本机 Docker
+              构建并登记隔离运行镜像。首次构建需要下载基础镜像，可能需要几分钟。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>暂不初始化</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={initialize.isPending}
+              onClick={() => initialize.mutate()}
+            >
+              {initialize.isPending ? "正在启动…" : "同意并初始化"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+function ConversationJumpNav({
+  items,
+  branches = [],
+  onJump,
+  onBranchJump,
+}: {
+  items: ConversationJumpItem[];
+  branches?: ConversationBranchLink[];
+  onJump: (id: string) => void;
+  onBranchJump: (id: string) => void;
+}) {
+  if (!items.length && !branches.length) return null;
+  return (
+    <nav
+      aria-label="对话快速跳转"
+      className="conversation-jump-nav"
+    >
+      <div className="conversation-jump-nav__handle" aria-hidden="true">
+        {items.map((item) => (
+          <span className={item.active ? "is-active" : undefined} key={item.id} />
+        ))}
+      </div>
+      <div className="conversation-jump-nav__panel">
+        <p>本次问答</p>
+        <div className="conversation-jump-nav__list">
+          {items.map((item, index) => (
+            <button
+              aria-current={item.active ? "location" : undefined}
+              key={item.id}
+              onClick={() => onJump(item.id)}
+              type="button"
+            >
+              <span>{index + 1}</span>
+              <strong>{item.label}</strong>
+              {item.branch ? <GitBranch aria-label="分支问答" /> : null}
+            </button>
+          ))}
+        </div>
+        {branches.length ? (
+          <div className="conversation-jump-nav__branches">
+            {branches.map((branch) => (
+              <button
+                aria-current={branch.active ? "page" : undefined}
+                key={branch.id}
+                onClick={() => onBranchJump(branch.id)}
+                type="button"
+              >
+                <strong>{branch.label}</strong>
+                <GitBranch aria-label="分支会话" />
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </nav>
+  );
+}
 
 type ComposerCommandId =
   | "goal"
@@ -305,22 +584,6 @@ async function confirmedSessionMessages(
   return persisted;
 }
 
-const thinkingLabels: Record<ThinkingMode, string> = {
-  off: "关闭",
-  low: "低",
-  medium: "中",
-  high: "高",
-  xhigh: "极高",
-};
-
-function capabilityThinkingModes(value: unknown): ThinkingMode[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (item): item is ThinkingMode =>
-      typeof item === "string" && item in thinkingLabels,
-  );
-}
-
 type BrowserSpeechRecognitionResult = {
   0: { transcript: string };
   isFinal: boolean;
@@ -342,6 +605,35 @@ type BrowserSpeechRecognition = {
   onend: (() => void) | null;
 };
 type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+
+// 语音转写 LLM 整理:为避免打断讲话与中途资费,仅在本次听写结束
+// (用户停止,或识别无法恢复)后一次性整理;进行中在输入框上方显示
+// 「正在润色」标签,点击标签即跳过整理并保留原始转写。
+type DictationCleanupSession = {
+  prefix: string;
+  cleaned: string; // 已整理文本(不可变,只追加)
+  active: string; // 整理请求在途的片段
+  pending: string; // 已定稿、等待整理的原始转写
+  interim: string; // 浏览器临时识别结果(不发送)
+  cleanupEnabled: boolean;
+  degraded: boolean; // 用户跳过或连续失败后保留原始转写,停止继续消耗资费
+  failures: number;
+  inFlight: boolean;
+  recognitionEnded: boolean;
+  providerId?: string;
+  modelId?: string;
+  lastRendered: string | null; // 最近一次程序写入输入框的值
+};
+
+// 单次请求的片段上限(后端 schema 上限 2000,留余量);超长听写按序分段。
+const DICTATION_CLEANUP_MAX_CHUNK_CHARS = 1_800;
+// 只携带已整理文本的尾部作为只读语境,token 消耗随语音长度线性增长。
+const DICTATION_CLEANUP_CONTEXT_CHARS = 80;
+const DICTATION_CLEANUP_MAX_FAILURES = 2;
+
+function dictationCleanupActive(session: DictationCleanupSession): boolean {
+  return session.cleanupEnabled && !session.degraded;
+}
 
 function readLearningNodeContext(): LearningNodeContext | undefined {
   try {
@@ -441,95 +733,6 @@ function streamEventType(data: Record<string, unknown>): string {
       : "";
 }
 
-function providerCapabilityString(provider: Provider | undefined, key: string) {
-  const value = provider?.capabilities[key];
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function providerModelOptions(
-  provider: Provider | undefined,
-  discovered: ProviderModel[] | undefined,
-  defaultModelCapability = "default_model",
-) {
-  if (!provider) return [];
-  const persistedIds = Array.isArray(provider.capabilities.discovered_model_ids)
-    ? provider.capabilities.discovered_model_ids.filter(
-        (item): item is string => typeof item === "string" && Boolean(item.trim()),
-      )
-    : [];
-  const persistedCapabilities =
-    provider.capabilities.models &&
-    typeof provider.capabilities.models === "object" &&
-    !Array.isArray(provider.capabilities.models)
-      ? (provider.capabilities.models as Record<string, ProviderModel["capabilities"]>)
-      : {};
-  const persistedModels: ProviderModel[] = persistedIds.map((id) => ({
-    id,
-    roles: ["llm"],
-    streaming: true,
-    remote: true,
-    enabled: true,
-    capabilities: persistedCapabilities[id],
-  }));
-  const byId = new Map(
-    (discovered ?? persistedModels).map((model) => [model.id, model]),
-  );
-  const configured = providerCapabilityString(provider, defaultModelCapability);
-  if (configured && !byId.has(configured))
-    byId.set(configured, {
-      id: configured,
-      roles: ["llm"],
-      streaming: true,
-      remote: true,
-      enabled: true,
-    });
-  const rawStates = provider.capabilities.model_states;
-  const states =
-    rawStates && typeof rawStates === "object" && !Array.isArray(rawStates)
-      ? (rawStates as Record<string, unknown>)
-      : {};
-  return [...byId.values()].filter(
-    (model) => model.enabled !== false && states[model.id] !== false,
-  );
-}
-
-function fuzzyModelMatch(value: string, query: string): boolean {
-  const normalizedValue = value.toLocaleLowerCase();
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  if (!normalizedQuery) return true;
-  if (normalizedValue.includes(normalizedQuery)) return true;
-  let queryIndex = 0;
-  for (const character of normalizedValue) {
-    if (character === normalizedQuery[queryIndex]) queryIndex += 1;
-    if (queryIndex === normalizedQuery.length) return true;
-  }
-  return false;
-}
-
-function modelChoiceValue(providerId: string, modelId: string): string {
-  return `${encodeURIComponent(providerId)}|${encodeURIComponent(modelId)}`;
-}
-
-function parseModelChoiceValue(
-  value: string,
-): { providerId: string; modelId: string } | null {
-  const separator = value.indexOf("|");
-  if (separator < 1) return null;
-  try {
-    return {
-      providerId: decodeURIComponent(value.slice(0, separator)),
-      modelId: decodeURIComponent(value.slice(separator + 1)),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function modelProtocolLabel(providerType: string): string {
-  if (providerType === "openai_responses") return "Responses";
-  if (providerType === "anthropic_messages") return "Anthropic Messages";
-  return "Compatible Chat";
-}
 
 const STREAM_EVENTS_PER_FRAME = 3;
 const STREAM_DELTA_CHARS = 28;
@@ -916,7 +1119,12 @@ function UserMessage({
   };
 
   return (
-    <AiMessage className="relative" data-message-id={message.id} from="user">
+    <AiMessage
+      className="relative"
+      data-message-id={message.id}
+      from="user"
+      id={`conversation-jump-${message.id}`}
+    >
       <MessageContent
         className={editing ? "w-full sm:max-w-xl" : undefined}
         data-message-content
@@ -977,7 +1185,7 @@ function UserMessage({
         )}
       </MessageContent>
       {!editing ? (
-        <MessageActions className="min-h-8 justify-end opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+        <MessageActions className="chat-message-actions--user min-h-8 justify-end opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           <MessageAction
             label="复制消息"
             onClick={() => void copyMessage()}
@@ -1527,11 +1735,22 @@ export function ChatCanvasPage() {
   const goalMode = new URLSearchParams(location.search).get("mode") === "goal";
   const conversationResetKey = `${workspaceId}:${sessionId}`;
   const mentionMenuId = useId();
+  const isPhoneLayout = usePhoneLayout();
+  // On phones the model picker renders inside the top bar (slot owned by the
+  // workspace shell) instead of the cramped composer end addon.
+  const [topbarModelSlot, setTopbarModelSlot] = useState<HTMLElement | null>(
+    null,
+  );
+  useEffect(() => {
+    setTopbarModelSlot(document.getElementById("topbar-model-slot"));
+  }, []);
   const [localMessages, setLocalMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ChatStatus>("ready");
   const [streamConnectionNotice, setStreamConnectionNotice] =
     useState<StreamConnectionNotice | null>(null);
   const [selectionMenu, setSelectionMenu] = useState<TextSelectionMenu | null>(null);
+  const [activeConversationQuestionId, setActiveConversationQuestionId] =
+    useState<string | null>(null);
   const [longPaste, setLongPaste] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<FileRecord[]>([]);
   const [composerText, setComposerText] = useState("");
@@ -1596,6 +1815,13 @@ export function ChatCanvasPage() {
     useState<ThinkingMode>("medium");
   const [retryWebSearch, setRetryWebSearch] = useState(false);
   const [retryAllowedDomains, setRetryAllowedDomains] = useState("");
+  // Image answers retry by resending the original prompt with a freely
+  // chosen image model (the backend has no versioned retry for images).
+  const [imageRetryTarget, setImageRetryTarget] = useState<{
+    messageId: string;
+    prompt: string;
+  } | null>(null);
+  const [imageRetryChoice, setImageRetryChoice] = useState("");
   const [sandboxAuthRequest, setSandboxAuthRequest] = useState<SandboxAuthRequest | null>(null);
   const initialLearningNode = useRef<LearningNodeContext | undefined>(
     readLearningNodeContext(),
@@ -1625,6 +1851,16 @@ export function ChatCanvasPage() {
   } | null>(null);
   const preserveDraftForSessionRef = useRef<string | null>(null);
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const dictationStopRequestedRef = useRef(false);
+  const dictationCleanupSessionRef = useRef<DictationCleanupSession | null>(
+    null,
+  );
+  // 听写结束后的收尾阶段:云端 ASR 剩余段转写中,或 LLM 润色中。
+  // 两个阶段都在输入框上方显示可点击跳过的标签。
+  const [dictationFinalizing, setDictationFinalizing] = useState<
+    null | "transcribing" | "polishing"
+  >(null);
+  const providerDictationRef = useRef<ProviderDictationHandle | null>(null);
   const registerFileDialog = useCallback((openFileDialog: () => void) => {
     openFileDialogRef.current = openFileDialog;
   }, []);
@@ -1770,12 +2006,7 @@ export function ChatCanvasPage() {
         (provider) =>
           provider.enabled &&
           provider.remote_capability &&
-          [
-            "openai_responses",
-            "openai_compatible_chat",
-            "deepseek_chat",
-            "anthropic_messages",
-          ].includes(provider.provider_type),
+          isModelProviderType(provider.provider_type),
       ),
     [providers.data],
   );
@@ -1825,6 +2056,22 @@ export function ChatCanvasPage() {
       }),
     [providers.data],
   );
+  // realtime 系列 ASR 模型只提供 WebSocket 接口,听写须走实时长连接;
+  // 非 realtime 模型走 HTTP 分段上传。
+  const asrRealtimeConfigured = useMemo(() => {
+    const provider = (providers.data ?? []).find((item) => {
+      if (!item.enabled || !item.remote_capability) return false;
+      const role = providerCapabilityString(item, "provider_role");
+      return (
+        role === "transcription" ||
+        item.provider_type === "openai_compatible_transcription"
+      );
+    });
+    const model = provider
+      ? providerCapabilityString(provider, "default_transcription_model_id")
+      : null;
+    return Boolean(model && model.toLowerCase().includes("realtime"));
+  }, [providers.data]);
   const composerFileAccept = useMemo(() => {
     if (responseMode === "agentic") return undefined;
     return fastThinkingAcceptAttribute(asrAvailable);
@@ -1944,23 +2191,13 @@ export function ChatCanvasPage() {
   );
   const retrySupportsAgentMode = Boolean(
     retryProvider &&
-      [
-        "openai_responses",
-        "openai_compatible_chat",
-        "deepseek_chat",
-        "anthropic_messages",
-      ].includes(retryProvider.provider_type) &&
+      isModelProviderType(retryProvider.provider_type) &&
       retryProvider.capabilities.supports_agent_tools !== false &&
       retrySelectedModel?.remote,
   );
   const activeProviderSupportsStructuredAgent = Boolean(
     activeModelProvider &&
-      [
-        "openai_responses",
-        "openai_compatible_chat",
-        "deepseek_chat",
-        "anthropic_messages",
-      ].includes(activeModelProvider.provider_type) &&
+      isModelProviderType(activeModelProvider.provider_type) &&
       activeModelProvider.capabilities.supports_agent_tools !== false,
   );
   const activeProviderIsDeepSeek = Boolean(
@@ -1971,14 +2208,27 @@ export function ChatCanvasPage() {
       (provider) =>
         provider.enabled &&
         provider.remote_capability &&
-        [
-          "anysearch",
-          "searxng",
-          "tavily",
-          "exa",
-          "brave_search",
-          "firecrawl_search",
-        ].includes(provider.provider_type),
+        ([
+            "anysearch",
+            "searxng",
+            "tavily",
+            "exa",
+            "brave_search",
+            "firecrawl_search",
+          ].includes(provider.provider_type) ||
+          (provider.provider_type === "qwen" &&
+            Array.isArray(provider.capabilities.companion_capabilities) &&
+            provider.capabilities.companion_capabilities.includes("web_search"))),
+    ),
+  );
+  const hasQwenCompanionSearchProvider = Boolean(
+    providers.data?.some(
+      (provider) =>
+        provider.provider_type === "qwen" &&
+        provider.enabled &&
+        provider.remote_capability &&
+        Array.isArray(provider.capabilities.companion_capabilities) &&
+        provider.capabilities.companion_capabilities.includes("web_search"),
     ),
   );
   const thinkingModes = useMemo(
@@ -2070,6 +2320,8 @@ export function ChatCanvasPage() {
     );
   }, [retryDiscoveredModels.isPending, retryTarget, retryThinkingModes]);
   const supportsThinkingMode = thinkingModes.length > 0;
+  const thinkingRequired =
+    selectedModel?.capabilities?.thinking_required === true;
   const supportsAgentMode =
     activeProviderSupportsStructuredAgent &&
     Boolean(selectedModel?.remote);
@@ -2095,6 +2347,19 @@ export function ChatCanvasPage() {
     responseMode,
     supportsThinkingMode,
   ]);
+  useEffect(() => {
+    if (!thinkingRequired || !supportsThinkingMode || responseMode !== "fast") {
+      return;
+    }
+    setResponseMode("thinking");
+    setThinkingMode((current) =>
+      thinkingModes.includes(current)
+        ? current
+        : thinkingModes.includes("medium")
+          ? "medium"
+          : thinkingModes[0],
+    );
+  }, [responseMode, supportsThinkingMode, thinkingModes, thinkingRequired]);
   // External SearchProvider is authorized only when enabled + remote_capable.
   // Drop a stale "auto/external/local" preference if the user disables search
   // (or the SearchProvider itself) so agentic send cannot request web_search
@@ -2112,7 +2377,9 @@ export function ChatCanvasPage() {
     searchRoute,
   ]);
   const effectiveThinkingMode: ThinkingMode =
-    responseMode === "fast" || !supportsThinkingMode ? "off" : thinkingMode;
+    (responseMode === "fast" && !thinkingRequired) || !supportsThinkingMode
+      ? "off"
+      : thinkingMode;
   const responseModeLabel =
     responseMode === "fast" ? "极速" : responseMode === "agentic" ? "智能体" : "思考";
   const activeGenerationProvider =
@@ -2168,6 +2435,66 @@ export function ChatCanvasPage() {
       ...appended,
     ];
   }, [history.data, localMessages, sessionId]);
+  const conversationJumpItems = useMemo(() => {
+    const activeSession = (sessions.data ?? []).find(
+      (session) => session.id === sessionId,
+    );
+    const branchSourceIds = new Set(
+      (sessions.data ?? [])
+        .filter((session) => session.parent_session_id === sessionId)
+        .map((session) => session.source_message_id)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const firstLocalUserId = messages.find(
+      (message) => message.role === "user" && message.session_id === sessionId,
+    )?.id;
+    return messages
+      .filter(
+        (message) =>
+          message.role === "user" &&
+          !message.id.startsWith("temp") &&
+          message.id !== "welcome-local",
+      )
+      .map((message) => ({
+        id: message.id,
+        label: message.content.replace(/\s+/gu, " ").trim() || "未命名问题",
+        branch:
+          branchSourceIds.has(message.id) ||
+          (Boolean(activeSession?.parent_session_id) &&
+            message.id === firstLocalUserId),
+        active: message.id === activeConversationQuestionId,
+      }));
+  }, [activeConversationQuestionId, messages, sessionId, sessions.data]);
+  useEffect(() => {
+    if (!conversationJumpItems.length) {
+      setActiveConversationQuestionId(null);
+      return;
+    }
+    const updateActiveQuestion = () => {
+      const anchor = Math.min(window.innerHeight * 0.42, 320);
+      let closest = conversationJumpItems[0]!;
+      let closestDistance = Number.POSITIVE_INFINITY;
+      for (const item of conversationJumpItems) {
+        const element = document.getElementById(`conversation-jump-${item.id}`);
+        if (!element) continue;
+        const distance = Math.abs(element.getBoundingClientRect().top - anchor);
+        if (distance < closestDistance) {
+          closest = item;
+          closestDistance = distance;
+        }
+      }
+      setActiveConversationQuestionId((current) =>
+        current === closest.id ? current : closest.id,
+      );
+    };
+    updateActiveQuestion();
+    window.addEventListener("scroll", updateActiveQuestion, true);
+    window.addEventListener("resize", updateActiveQuestion);
+    return () => {
+      window.removeEventListener("scroll", updateActiveQuestion, true);
+      window.removeEventListener("resize", updateActiveQuestion);
+    };
+  }, [conversationJumpItems]);
 
   useEffect(() => {
     // Promote sandbox_auth_required status parts into an authorization dialog.
@@ -2477,6 +2804,15 @@ export function ChatCanvasPage() {
   const currentSession = sessions.data?.find(
     (session) => session.id === sessionId,
   );
+  const conversationBranchLinks = useMemo(() => {
+    if (!currentSession?.parent_session_id) return [];
+    const parent = (sessions.data ?? []).find(
+      (session) => session.id === currentSession.parent_session_id,
+    );
+    return parent
+      ? [{ id: parent.id, label: "原会话", active: false }]
+      : [];
+  }, [currentSession, sessionId, sessions.data]);
   const sessionIsClosed = currentSession?.status === "closed";
   const isEmptySession = messages.length === 0;
   const latestAssistantMessage = useMemo(() => {
@@ -2502,6 +2838,36 @@ export function ChatCanvasPage() {
     [messages],
   );
   const suggestedPromptsEnabled = areChatSuggestedPromptsEnabled(settings.data);
+  const contextUsageEnabled = isChatContextUsageEnabled(settings.data);
+  // 仅在持久化时间线变化时重取上下文估算，流式增量不触发请求。
+  const persistedTimelineStamp = useMemo(() => {
+    const persisted = history.data ?? [];
+    if (!persisted.length) return "0";
+    const last = persisted[persisted.length - 1];
+    return `${persisted.length}:${last.id}:${last.status}`;
+  }, [history.data]);
+  const contextUsage = useQuery({
+    queryKey: [
+      "context-usage",
+      sessionId,
+      activeModelProvider?.id ?? "",
+      selectedModel?.id ?? "",
+      responseMode === "agentic",
+      persistedTimelineStamp,
+    ],
+    queryFn: () =>
+      getSessionContextUsage(sessionId, {
+        provider_id: activeModelProvider?.id,
+        model_id: selectedModel?.id,
+        agent_mode: responseMode === "agentic",
+      }),
+    enabled:
+      contextUsageEnabled &&
+      sessionId !== "new" &&
+      generationMode === "text" &&
+      Boolean(activeModelProvider),
+    staleTime: 30_000,
+  });
   const autoTitleModel = useMemo(
     () =>
       readChatFeatureModelSetting(
@@ -2515,6 +2881,15 @@ export function ChatCanvasPage() {
       readChatFeatureModelSetting(
         settings.data,
         CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
+      ),
+    [settings.data],
+  );
+  const dictationCleanupEnabled = isChatDictationCleanupEnabled(settings.data);
+  const dictationCleanupModel = useMemo(
+    () =>
+      readChatFeatureModelSetting(
+        settings.data,
+        CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
       ),
     [settings.data],
   );
@@ -3068,6 +3443,8 @@ export function ChatCanvasPage() {
         fileIds?: string[];
         graphAction?: GraphAction;
         generationMode?: GenerationMode;
+        imageProviderId?: string;
+        imageModelId?: string;
         sandboxPreflighted?: boolean;
         selectionContext?: MessageSelectionContext | null;
       } = {},
@@ -3097,13 +3474,21 @@ export function ChatCanvasPage() {
       ) {
         if (!(await ensureAgentSandboxReady())) return;
       }
+      // Image retries can override the composer selection with an explicit
+      // provider/model so switching models does not race React state updates.
+      const overrideImageProvider =
+        requestedGenerationMode === "image" && options.imageProviderId
+          ? imageProviders.find(
+              (provider) => provider.id === options.imageProviderId,
+            )
+          : undefined;
       const requestProvider =
         requestedGenerationMode === "image"
-          ? activeImageProvider
+          ? overrideImageProvider ?? activeImageProvider
           : activeModelProvider;
       const requestModelId =
         requestedGenerationMode === "image"
-          ? selectedImageModel?.id ?? ""
+          ? options.imageModelId ?? selectedImageModel?.id ?? ""
           : selectedModel?.id ?? "";
       if (!requestProvider || !requestModelId) {
         toast.error(
@@ -3737,6 +4122,7 @@ export function ChatCanvasPage() {
       goalMode,
       hasAuthorizedAgentSearchProvider,
       history.isSuccess,
+      imageProviders,
       location.key,
       messages,
       selectedModel?.id,
@@ -4084,6 +4470,41 @@ export function ChatCanvasPage() {
         ? confirmGraphChangeSet(sessionId, proposalId)
         : rejectGraphChangeSet(sessionId, proposalId, reason),
     onSuccess: async (changeSet) => {
+      // The server persists the resolved component snapshot, but updating the
+      // active message cache first keeps the proposal controls from remaining
+      // actionable while the refetch is in flight.
+      queryClient.setQueryData<Message[]>(["messages", sessionId], (current) =>
+        current?.map((message) => ({
+          ...message,
+          parts: message.parts.map((part) => {
+            const component = part.data;
+            const props = component?.props as Record<string, unknown> | undefined;
+            if (
+              part.type !== "component" ||
+              component?.component_type !== "graph_update_proposal" ||
+              !props ||
+              props.proposal_id !== changeSet.id
+            ) {
+              return part;
+            }
+            return {
+              ...part,
+              data: {
+                ...component,
+                allowed_events: [],
+                props: {
+                  ...props,
+                  graph_id: changeSet.graph_id,
+                  status: changeSet.status,
+                  confirmed_revision: changeSet.confirmed_revision,
+                  confirmation_required: false,
+                  rejection_reason: changeSet.rejection_reason,
+                },
+              },
+            };
+          }),
+        })),
+      );
       if (changeSet.graph_id) {
         queryClient.setQueryData<Session[]>(["sessions"], (current) =>
           current?.map((item) =>
@@ -4334,11 +4755,242 @@ export function ChatCanvasPage() {
       );
   }, []);
 
-  useEffect(() => () => speechRecognitionRef.current?.abort(), []);
+  useEffect(
+    () => () => {
+      dictationStopRequestedRef.current = true;
+      const session = dictationCleanupSessionRef.current;
+      if (session) session.degraded = true;
+      speechRecognitionRef.current?.abort();
+      providerDictationRef.current?.abort();
+      providerDictationRef.current = null;
+    },
+    [],
+  );
+
+  const dictationEngine = useMemo(() => {
+    const apply = (session: DictationCleanupSession) => {
+      // 新一轮听写开始后,旧会话的迟到整理结果不再写入输入框。
+      if (dictationCleanupSessionRef.current !== session) return;
+      const transcript = (
+        session.cleaned +
+        session.active +
+        session.pending +
+        session.interim
+      ).trim();
+      const nextText = [session.prefix, transcript]
+        .filter(Boolean)
+        .join(session.prefix ? " " : "");
+      setComposerText((current) => {
+        // 停止监听后,如果用户已手动编辑输入框,迟到的整理结果不再覆盖。
+        if (session.recognitionEnded && current !== session.lastRendered)
+          return current;
+        session.lastRendered = nextText;
+        return nextText;
+      });
+    };
+
+    const finish = (session: DictationCleanupSession) => {
+      if (dictationCleanupSessionRef.current === session)
+        setDictationFinalizing(null);
+    };
+
+    async function flush(session: DictationCleanupSession): Promise<void> {
+      if (session.inFlight) return;
+      if (!dictationCleanupActive(session) || !session.pending.trim()) {
+        if (session.pending) {
+          session.cleaned += session.pending;
+          session.pending = "";
+          apply(session);
+        }
+        finish(session);
+        return;
+      }
+      const chunk = session.pending.slice(0, DICTATION_CLEANUP_MAX_CHUNK_CHARS);
+      session.pending = session.pending.slice(chunk.length);
+      session.active = chunk;
+      session.inFlight = true;
+      const contextTail = (
+        (session.prefix ? `${session.prefix} ` : "") + session.cleaned
+      ).slice(-DICTATION_CLEANUP_CONTEXT_CHARS);
+      try {
+        const result = await cleanupDictation({
+          text: chunk,
+          context: contextTail,
+          provider_id: session.providerId,
+          model_id: session.modelId,
+        });
+        session.failures = 0;
+        // 等待期间用户点击了跳过:废弃迟到的整理结果,保留原始转写。
+        // 整段均为语气词时,整理结果可以为空字符串。
+        session.cleaned += session.degraded ? chunk : result.text;
+      } catch {
+        // 失败时保留原始转写,内容永不丢失;连续失败则本次听写降级,
+        // 停止继续发起计费调用。
+        session.cleaned += chunk;
+        session.failures += 1;
+        if (
+          session.failures >= DICTATION_CLEANUP_MAX_FAILURES &&
+          !session.degraded
+        ) {
+          session.degraded = true;
+          toast.message("语音智能整理暂不可用", {
+            description: "本次听写将保留原始转写。",
+          });
+        }
+      } finally {
+        session.active = "";
+        session.inFlight = false;
+      }
+      apply(session);
+      if (session.pending) void flush(session);
+      else finish(session);
+    }
+
+    return {
+      apply,
+      // 仅在听写结束后调用:一次性整理全部原始转写(超长时按序分段)。
+      polish: (session: DictationCleanupSession) => void flush(session),
+    };
+  }, [setComposerText]);
+
+  // 听写结束后的共享收尾:有待整理文本且未跳过则进入润色阶段,否则直接
+  // 采用原始转写并收起标签。
+  const finishDictationSession = useCallback(
+    (session: DictationCleanupSession) => {
+      session.recognitionEnded = true;
+      // 实时听写可能残留未定稿的 partial 文本,并入待整理内容以免丢失。
+      if (session.interim) {
+        session.pending += session.interim;
+        session.interim = "";
+      }
+      if (dictationCleanupActive(session) && session.pending.trim()) {
+        setDictationFinalizing("polishing");
+        dictationEngine.polish(session);
+      } else {
+        if (session.pending) {
+          session.cleaned += session.pending;
+          session.pending = "";
+          dictationEngine.apply(session);
+        }
+        setDictationFinalizing(null);
+      }
+    },
+    [dictationEngine],
+  );
 
   const toggleDictation = useCallback(() => {
     if (isListening) {
+      dictationStopRequestedRef.current = true;
+      const providerDictation = providerDictationRef.current;
+      if (providerDictation) {
+        const session = dictationCleanupSessionRef.current;
+        setIsListening(false);
+        // 云端听写收尾:先等剩余语音段转写返回,再进入(可选的)润色。
+        setDictationFinalizing("transcribing");
+        void providerDictation.stop().then(() => {
+          if (providerDictationRef.current === providerDictation)
+            providerDictationRef.current = null;
+          const current = dictationCleanupSessionRef.current;
+          if (current && current === session) finishDictationSession(current);
+          else setDictationFinalizing(null);
+        });
+        return;
+      }
       speechRecognitionRef.current?.stop();
+      return;
+    }
+
+    // 已配置云端 ASR 时优先使用:麦克风持续采集(长会话,不因识别轮次
+    // 中断),保留 ASR 服务原生的标点推断。realtime 模型走 WebSocket
+    // 实时长连接(partial 逐字上屏);非 realtime 模型在自然停顿处切段上传。
+    if (asrAvailable && providerDictationSupported()) {
+      const session: DictationCleanupSession = {
+        prefix: composerText.trimEnd(),
+        cleaned: "",
+        active: "",
+        pending: "",
+        interim: "",
+        cleanupEnabled: dictationCleanupEnabled,
+        degraded: false,
+        failures: 0,
+        inFlight: false,
+        recognitionEnded: false,
+        providerId: dictationCleanupModel.provider_id ?? activeModelProvider?.id,
+        modelId: dictationCleanupModel.model_id ?? (selectedModelId || undefined),
+        lastRendered: null,
+      };
+      dictationStopRequestedRef.current = false;
+      setDictationFinalizing(null);
+      dictationCleanupSessionRef.current = session;
+      const appendFinalText = (text: string) => {
+        // 中英文混排:两侧都是字母数字时补一个空格再拼接。
+        const joiner =
+          session.pending &&
+          /[A-Za-z0-9]$/.test(session.pending) &&
+          /^[A-Za-z0-9]/.test(text)
+            ? " "
+            : "";
+        session.pending += joiner + text;
+      };
+      const handleFatal = (message: string) => {
+        toast.error(message);
+        providerDictationRef.current = null;
+        setIsListening(false);
+        if (dictationCleanupSessionRef.current === session)
+          finishDictationSession(session);
+      };
+      const beginSegmentedDictation = () =>
+        startProviderDictation({
+          transcribe: async (segment) =>
+            (await transcribeDictationSegment(segment)).text,
+          onSegmentText: (text) => {
+            if (dictationCleanupSessionRef.current !== session) return;
+            appendFinalText(text);
+            dictationEngine.apply(session);
+          },
+          onFatal: handleFatal,
+        })
+          .then((handle) => {
+            providerDictationRef.current = handle;
+            setIsListening(true);
+          })
+          .catch(() => {
+            if (dictationCleanupSessionRef.current === session)
+              dictationCleanupSessionRef.current = null;
+            toast.error("未获得麦克风权限");
+          });
+      if (asrRealtimeConfigured && realtimeDictationSupported()) {
+        startRealtimeDictation({
+          onPartial: (text) => {
+            if (dictationCleanupSessionRef.current !== session) return;
+            session.interim = text;
+            dictationEngine.apply(session);
+          },
+          onFinal: (text) => {
+            if (dictationCleanupSessionRef.current !== session) return;
+            session.interim = "";
+            appendFinalText(text);
+            dictationEngine.apply(session);
+          },
+          onFatal: handleFatal,
+        })
+          .then((handle) => {
+            providerDictationRef.current = handle;
+            setIsListening(true);
+          })
+          .catch((error: Error & { code?: string }) => {
+            // 后端判定当前模型并非 realtime 时,退回分段上传路径。
+            if (error.code === "realtime_model_required") {
+              void beginSegmentedDictation();
+              return;
+            }
+            if (dictationCleanupSessionRef.current === session)
+              dictationCleanupSessionRef.current = null;
+            toast.error(error.message || "无法启动实时语音转写");
+          });
+        return;
+      }
+      void beginSegmentedDictation();
       return;
     }
 
@@ -4356,55 +5008,130 @@ export function ChatCanvasPage() {
     }
 
     const recognition = new SpeechRecognition();
-    const prefix = composerText.trimEnd();
+    // 会话状态跨浏览器自动重启保留:静音超时结束一轮识别后 event.results
+    // 会清空,已定稿/已整理的文本都保存在这里。
+    const session: DictationCleanupSession = {
+      prefix: composerText.trimEnd(),
+      cleaned: "",
+      active: "",
+      pending: "",
+      interim: "",
+      cleanupEnabled: dictationCleanupEnabled,
+      degraded: false,
+      failures: 0,
+      inFlight: false,
+      recognitionEnded: false,
+      providerId: dictationCleanupModel.provider_id ?? activeModelProvider?.id,
+      modelId: dictationCleanupModel.model_id ?? (selectedModelId || undefined),
+      lastRendered: null,
+    };
     recognition.lang = navigator.language.startsWith("zh")
       ? "zh-CN"
       : navigator.language || "zh-CN";
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.onresult = (event) => {
-      let transcript = "";
+      let finalText = "";
+      let interimText = "";
       for (
         let index = event.resultIndex;
         index < event.results.length;
         index += 1
-      )
-        transcript += event.results[index][0]?.transcript ?? "";
-      if (transcript.trim())
-        setComposerText(
-          [prefix, transcript.trim()].filter(Boolean).join(prefix ? " " : ""),
-        );
+      ) {
+        const result = event.results[index];
+        const text = result[0]?.transcript ?? "";
+        if (result.isFinal) finalText += text;
+        else interimText += text;
+      }
+      session.interim = interimText;
+      // 讲话过程中只累计原始转写,LLM 整理推迟到本次听写结束后一次完成。
+      if (finalText) session.pending += finalText;
+      dictationEngine.apply(session);
     };
     recognition.onerror = (event) => {
       if (
         event.error === "not-allowed" ||
         event.error === "service-not-allowed"
-      )
+      ) {
+        dictationStopRequestedRef.current = true;
         toast.error("未获得麦克风权限");
-      else if (event.error !== "aborted")
-        toast.message("语音转写已停止", {
-          description:
-            event.error === "no-speech"
-              ? "没有检测到语音内容。"
-              : "请稍后再试。",
-        });
-      setIsListening(false);
-      speechRecognitionRef.current = null;
+      } else if (event.error === "aborted") {
+        dictationStopRequestedRef.current = true;
+      }
+      // 其他错误(如 no-speech 静音超时、network 抖动)不终止,
+      // 交给 onend 自动重启,直到用户手动关闭。
     };
     recognition.onend = () => {
-      setIsListening(false);
-      speechRecognitionRef.current = null;
+      // 一轮识别结束后,未定稿的临时结果不会再收到 final 事件,
+      // 并入待整理文本以免内容丢失。
+      if (session.interim) {
+        session.pending += session.interim;
+        session.interim = "";
+      }
+      const finishDictation = () => {
+        setIsListening(false);
+        speechRecognitionRef.current = null;
+        // 语音结束才触发 LLM 整理;进行中可点击「正在润色」标签跳过。
+        finishDictationSession(session);
+      };
+      if (dictationStopRequestedRef.current) {
+        finishDictation();
+        return;
+      }
+      // 静音超时等轮次结束:仅累计原始转写并自动重启,不在中途整理。
+      try {
+        recognition.start();
+      } catch {
+        finishDictation();
+        toast.message("语音转写已停止", { description: "请稍后再试。" });
+      }
     };
 
+    dictationStopRequestedRef.current = false;
     speechRecognitionRef.current = recognition;
+    // 新一轮听写取代旧会话:未完成的润色不再写回输入框,同步收起标签。
+    setDictationFinalizing(null);
+    dictationCleanupSessionRef.current = session;
     try {
       recognition.start();
       setIsListening(true);
     } catch {
       speechRecognitionRef.current = null;
+      dictationCleanupSessionRef.current = null;
       toast.error("无法启动语音转写");
     }
-  }, [composerText, isListening]);
+  }, [
+    activeModelProvider?.id,
+    asrAvailable,
+    asrRealtimeConfigured,
+    composerText,
+    dictationCleanupEnabled,
+    dictationCleanupModel,
+    dictationEngine,
+    finishDictationSession,
+    isListening,
+    selectedModelId,
+  ]);
+
+  const skipDictationFinalizing = useCallback(() => {
+    // 跳过收尾:转写阶段丢弃未完成的语音段,润色阶段废弃在途整理结果,
+    // 两种情况都立即采用已有的原始转写。
+    providerDictationRef.current?.abort();
+    providerDictationRef.current = null;
+    setDictationFinalizing(null);
+    const session = dictationCleanupSessionRef.current;
+    if (!session) return;
+    session.degraded = true;
+    if (session.interim) {
+      session.pending += session.interim;
+      session.interim = "";
+    }
+    if (!session.inFlight && session.pending) {
+      session.cleaned += session.pending;
+      session.pending = "";
+      dictationEngine.apply(session);
+    }
+  }, [dictationEngine]);
 
   const branch = useMutation({
     mutationFn: (messageId: string) => {
@@ -4792,11 +5519,13 @@ export function ChatCanvasPage() {
 
   const canUseNetworkSearch = Boolean(
     hasAuthorizedAgentSearchProvider ||
+      hasQwenCompanionSearchProvider ||
       selectedModel?.capabilities?.hosted_web_search ||
       activeModelProvider?.capabilities.hosted_web_search,
   );
   const retryCanUseNetworkSearch = Boolean(
     hasAuthorizedAgentSearchProvider ||
+      hasQwenCompanionSearchProvider ||
       retrySelectedModel?.capabilities?.hosted_web_search ||
       retryProvider?.capabilities.hosted_web_search,
   );
@@ -5055,6 +5784,15 @@ export function ChatCanvasPage() {
     );
   }, [composerText, firstEnabledMentionIndex, mentionCandidateSignature]);
 
+  // The menu scrolls on small screens; keep the keyboard-selected row visible.
+  useEffect(() => {
+    if (!showMentionMenu) return;
+    document
+      .getElementById(mentionMenuId)
+      ?.querySelector("[aria-selected='true']")
+      ?.scrollIntoView({ block: "nearest" });
+  }, [mentionIndex, mentionMenuId, showMentionMenu]);
+
   const attachLibraryFile = useCallback(
     (file: FileRecord) => {
       setComposerText((current) =>
@@ -5238,11 +5976,41 @@ export function ChatCanvasPage() {
     retry.mutate(variables);
   };
 
+  const submitImageRetry = () => {
+    if (!imageRetryTarget) return;
+    const choice = parseModelChoiceValue(imageRetryChoice);
+    if (!choice) return;
+    const { prompt } = imageRetryTarget;
+    setImageRetryTarget(null);
+    // Keep the composer chip in sync with the newly chosen image model.
+    setSelectedImageProviderId(choice.providerId);
+    setSelectedImageModelId(choice.modelId);
+    void send(prompt, {
+      generationMode: "image",
+      imageProviderId: choice.providerId,
+      imageModelId: choice.modelId,
+    });
+  };
+
   return (
     <div className="chat-canvas-page relative flex h-full min-h-0 flex-col bg-background">
+      <ConversationJumpNav
+        branches={conversationBranchLinks}
+        items={conversationJumpItems}
+        onBranchJump={(targetSessionId) => {
+          if (targetSessionId !== sessionId)
+            navigate(`/w/${workspaceId}/chat/${targetSessionId}`);
+        }}
+        onJump={(messageId) => {
+          setActiveConversationQuestionId(messageId);
+          document
+            .getElementById(`conversation-jump-${messageId}`)
+            ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }}
+      />
       <Conversation className="min-h-0 flex-1">
         <ConversationContent
-          className="mx-auto w-full max-w-4xl gap-7 px-5 py-7 pb-36 sm:px-7"
+          className="mx-auto w-full max-w-4xl gap-7 px-4 py-6 pb-36 sm:px-7 sm:py-7"
           onMouseUp={() => {
             const selected = readTextSelection();
             if (!selected) {
@@ -5373,7 +6141,34 @@ export function ChatCanvasPage() {
                         branch.mutate(message.id);
                     }}
                     onRetry={() => {
-                      if (!persisted || imageAnswer) return;
+                      if (!persisted) return;
+                      if (imageAnswer) {
+                        const prompt =
+                          messages
+                            .find(
+                              (item) =>
+                                item.id === message.parent_message_id &&
+                                item.role === "user",
+                            )
+                            ?.content?.trim() ?? "";
+                        if (!prompt) {
+                          toast.error("未找到原始绘图提示词，无法重试。");
+                          return;
+                        }
+                        setImageRetryChoice(
+                          activeImageProvider && selectedImageModel
+                            ? modelChoiceValue(
+                                activeImageProvider.id,
+                                selectedImageModel.id,
+                              )
+                            : "",
+                        );
+                        setImageRetryTarget({
+                          messageId: message.id,
+                          prompt,
+                        });
+                        return;
+                      }
                       setRetryProviderId(activeModelProvider?.id ?? modelProviders[0]?.id ?? "");
                       setRetryModelId(selectedModelId);
                       setRetryResponseMode(
@@ -5389,21 +6184,27 @@ export function ChatCanvasPage() {
                     }}
                     retryDisabled={
                       !persisted ||
-                      imageAnswer ||
                       sessionIsClosed ||
                       status !== "ready" ||
-                      retry.isPending
+                      retry.isPending ||
+                      (imageAnswer &&
+                        (message.session_id !== sessionId ||
+                          !imageProviders.length))
                     }
                     retryDisabledReason={
                       !persisted
                         ? "回答持久化后才能重试"
-                        : imageAnswer
-                          ? "绘图回答暂不支持文本模型重试"
                         : sessionIsClosed
                           ? "会话已结束；请创建分支或新会话继续学习"
                           : status !== "ready" || retry.isPending
                             ? "当前操作完成后才能重试"
-                            : undefined
+                            : imageAnswer && message.session_id !== sessionId
+                              ? "请先切换到该回答所属的会话版本"
+                              : imageAnswer && !imageProviders.length
+                                ? "当前工作区没有已启用的绘图 Provider"
+                                : imageAnswer
+                                  ? "重试绘图（可切换绘图模型）"
+                                  : undefined
                     }
                     sessionId={message.session_id}
                   />
@@ -5486,6 +6287,28 @@ export function ChatCanvasPage() {
             </Button>
           ))}
           <Button
+            disabled={
+              selectionMenu.source_message_id.startsWith("temp") ||
+              selectionMenu.source_message_id === "welcome-local"
+            }
+            onClick={() => {
+              window.dispatchEvent(
+                new CustomEvent("learngraph:selection-explanation", {
+                  detail: {
+                    sessionId,
+                    sourceMessageId: selectionMenu.source_message_id,
+                    selectedText: selectionMenu.selected_text,
+                  },
+                }),
+              );
+              setSelectionMenu(null);
+            }}
+            size="xs"
+            variant="ghost"
+          >
+            单独解释
+          </Button>
+          <Button
             aria-label="关闭划词操作"
             onClick={() => setSelectionMenu(null)}
             size="icon-xs"
@@ -5497,6 +6320,9 @@ export function ChatCanvasPage() {
       ) : null}
 
       <div className="chat-composer-dock relative z-10 mx-auto w-full max-w-4xl px-3 pb-3 pt-2.5 sm:px-4">
+        {responseMode === "agentic" ? (
+          <SandboxReadinessNotice workspaceId={workspaceId} />
+        ) : null}
         <ConversationContextBar
           goalBound={Boolean(currentSession?.goal_id)}
           graphTitle={graphTitle}
@@ -5678,6 +6504,27 @@ export function ChatCanvasPage() {
               <X className="size-3" />
             </Button>
           </div>
+        ) : null}
+        {dictationFinalizing ? (
+          <button
+            aria-label={
+              dictationFinalizing === "transcribing"
+                ? "正在转写剩余语音，点击跳过并保留已有文本"
+                : "正在润色语音转写，点击跳过并保留原始转写"
+            }
+            className="chat-dictation-polish"
+            onClick={skipDictationFinalizing}
+            title="点击跳过收尾，立即保留已有文本"
+            type="button"
+          >
+            <LoaderCircle className="size-3.5 animate-spin" />
+            <span>
+              {dictationFinalizing === "transcribing"
+                ? "正在转写剩余语音…"
+                : "正在润色语音转写…"}
+            </span>
+            <em>点击跳过</em>
+          </button>
         ) : null}
         <div className="chat-composer-anchor">
         {showMentionMenu ? (
@@ -5956,39 +6803,136 @@ export function ChatCanvasPage() {
             />
           </PromptInputBody>
            <InputGroupAddon align="inline-end" className="chat-composer__end">
+            {contextUsageEnabled &&
+            generationMode === "text" &&
+            sessionId !== "new" &&
+            contextUsage.data ? (
+              <ContextUsageRing usage={contextUsage.data} />
+            ) : null}
+             {(() => {
+               const modelTriggerDisabled =
+                 !activeGenerationProvider ||
+                 sessionIsClosed ||
+                 closeSessionMutation.isPending ||
+                 goalFlow.busy ||
+                 status !== "ready";
+               const modelTriggerAriaLabel =
+                 generationMode === "image"
+                   ? "选择绘图模型"
+                   : "选择响应模式、思考力度和模型";
+               const modelTriggerLabel =
+                 generationMode === "image"
+                   ? `绘图 · ${selectedImageModel?.id ?? "未选择"}`
+                   : `${responseModeLabel} · ${activeModelProvider?.display_name ?? "模型"} / ${selectedModel?.id ?? "未选择"}`;
+               const thinkingChoices = thinkingModes.length ? (
+                 <DropdownMenuRadioGroup
+                   onValueChange={(value) => setThinkingMode(value as ThinkingMode)}
+                   value={thinkingMode}
+                 >
+                   {thinkingModes.map((mode) => (
+                     <DropdownMenuRadioItem key={mode} value={mode}>
+                       {thinkingLabels[mode]}
+                     </DropdownMenuRadioItem>
+                   ))}
+                 </DropdownMenuRadioGroup>
+               ) : (
+                 <DropdownMenuItem disabled>由当前服务商决定</DropdownMenuItem>
+               );
+               const modelChoices = (
+                 <>
+                   <div className="relative px-1 pb-1">
+                     <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                     <Input
+                       aria-label="搜索模型"
+                       className="h-8 pl-8 font-mono text-xs"
+                       onChange={(event) => setModelSearch(event.target.value)}
+                       onKeyDown={(event) => event.stopPropagation()}
+                       onPointerDown={(event) => event.stopPropagation()}
+                       placeholder="搜索模型名称或 Provider…"
+                       value={modelSearch}
+                     />
+                   </div>
+                   {filteredAvailableModelChoices.length ? (
+                     <DropdownMenuRadioGroup
+                       onValueChange={(value) => {
+                         const choice = parseModelChoiceValue(value);
+                         if (!choice) return;
+                         setSelectedProviderId(choice.providerId);
+                         setSelectedModelId(choice.modelId);
+                       }}
+                       value={
+                         activeModelProvider && selectedModelId
+                           ? modelChoiceValue(
+                               activeModelProvider.id,
+                               selectedModelId,
+                             )
+                           : ""
+                       }
+                     >
+                       {filteredAvailableModelChoices.map(({ provider, model }) => (
+                         <DropdownMenuRadioItem
+                           key={`${provider.id}:${model.id}`}
+                           value={modelChoiceValue(provider.id, model.id)}
+                         >
+                           <span className="flex min-w-0 flex-col">
+                             <span className="truncate font-mono">{model.id}</span>
+                             <span className="text-[10px] text-muted-foreground">
+                               {provider.display_name} ·{" "}
+                               {modelProtocolLabel(provider.provider_type)}
+                             </span>
+                           </span>
+                           {model.capabilities?.supports_image_input
+                             ? " · 图片"
+                             : ""}
+                         </DropdownMenuRadioItem>
+                       ))}
+                     </DropdownMenuRadioGroup>
+                   ) : (
+                     <DropdownMenuItem disabled>
+                       {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
+                     </DropdownMenuItem>
+                   )}
+                 </>
+               );
+               const modelMenu = (
              <DropdownMenu
                onOpenChange={(open) => {
                  if (!open) setModelSearch("");
                }}
              >
               <DropdownMenuTrigger asChild>
-                <PromptInputButton
-                  aria-label={
-                    generationMode === "image"
-                      ? "选择绘图模型"
-                      : "选择响应模式、思考力度和模型"
-                  }
-                  className="chat-composer__mode"
-                  disabled={
-                    !activeGenerationProvider ||
-                    sessionIsClosed ||
-                    closeSessionMutation.isPending ||
-                    goalFlow.busy ||
-                    status !== "ready"
-                  }
-                  tooltip={
-                    generationMode === "image" ? "绘图模型" : "响应模式与模型"
-                  }
-                >
-                  <span>
-                    {generationMode === "image"
-                      ? `绘图 · ${selectedImageModel?.id ?? "未选择"}`
-                      : `${responseModeLabel} · ${activeModelProvider?.display_name ?? "模型"} / ${selectedModel?.id ?? "未选择"}`}
-                  </span>
-                  <ChevronDown className="size-3.5" />
-                </PromptInputButton>
+                {isPhoneLayout ? (
+                  <Button
+                    aria-label={modelTriggerAriaLabel}
+                    className="topbar-model-trigger"
+                    disabled={modelTriggerDisabled}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    <span>{modelTriggerLabel}</span>
+                    <ChevronDown className="size-3.5" />
+                  </Button>
+                ) : (
+                  <PromptInputButton
+                    aria-label={modelTriggerAriaLabel}
+                    className="chat-composer__mode"
+                    disabled={modelTriggerDisabled}
+                    tooltip={
+                      generationMode === "image" ? "绘图模型" : "响应模式与模型"
+                    }
+                  >
+                    <span>{modelTriggerLabel}</span>
+                    <ChevronDown className="size-3.5" />
+                  </PromptInputButton>
+                )}
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="chat-model-menu w-60" side="top">
+              <DropdownMenuContent
+                align="end"
+                className="chat-model-menu w-60"
+                collisionPadding={12}
+                side={isPhoneLayout ? "bottom" : "top"}
+              >
                 {generationMode === "image" ? (
                   <>
                     <DropdownMenuLabel>绘图模型</DropdownMenuLabel>
@@ -6077,7 +7021,12 @@ export function ChatCanvasPage() {
                   }}
                   value={responseMode}
                 >
-                  <DropdownMenuRadioItem value="fast">极速</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem
+                    disabled={thinkingRequired}
+                    value="fast"
+                  >
+                    极速{thinkingRequired ? "（该模型仅支持思考）" : ""}
+                  </DropdownMenuRadioItem>
                   <DropdownMenuRadioItem
                     disabled={!supportsThinkingMode}
                     value="thinking"
@@ -6092,93 +7041,59 @@ export function ChatCanvasPage() {
                   </DropdownMenuRadioItem>
                 </DropdownMenuRadioGroup>
                 <DropdownMenuSeparator />
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    思考力度
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      {thinkingModes.length
-                        ? thinkingLabels[thinkingMode]
-                        : "当前模型未声明"}
-                    </span>
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    {thinkingModes.length ? (
-                      <DropdownMenuRadioGroup
-                        onValueChange={(value) => setThinkingMode(value as ThinkingMode)}
-                        value={thinkingMode}
-                      >
-                        {thinkingModes.map((mode) => (
-                          <DropdownMenuRadioItem key={mode} value={mode}>
-                            {thinkingLabels[mode]}
-                          </DropdownMenuRadioItem>
-                        ))}
-                      </DropdownMenuRadioGroup>
-                    ) : (
-                      <DropdownMenuItem disabled>由当前服务商决定</DropdownMenuItem>
-                    )}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>模型</DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent className="max-h-[min(60vh,32rem)] overflow-y-auto">
-                    <div className="relative px-1 pb-1">
-                      <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                      <Input
-                        aria-label="搜索模型"
-                        className="h-8 pl-8 font-mono text-xs"
-                        onChange={(event) => setModelSearch(event.target.value)}
-                        onKeyDown={(event) => event.stopPropagation()}
-                        onPointerDown={(event) => event.stopPropagation()}
-                        placeholder="搜索模型名称或 Provider…"
-                        value={modelSearch}
-                      />
-                    </div>
-                    {filteredAvailableModelChoices.length ? (
-                      <DropdownMenuRadioGroup
-                        onValueChange={(value) => {
-                          const choice = parseModelChoiceValue(value);
-                          if (!choice) return;
-                          setSelectedProviderId(choice.providerId);
-                          setSelectedModelId(choice.modelId);
-                        }}
-                        value={
-                          activeModelProvider && selectedModelId
-                            ? modelChoiceValue(
-                                activeModelProvider.id,
-                                selectedModelId,
-                              )
-                            : ""
-                        }
-                      >
-                        {filteredAvailableModelChoices.map(({ provider, model }) => (
-                          <DropdownMenuRadioItem
-                            key={`${provider.id}:${model.id}`}
-                            value={modelChoiceValue(provider.id, model.id)}
-                          >
-                            <span className="flex min-w-0 flex-col">
-                              <span className="truncate font-mono">{model.id}</span>
-                              <span className="text-[10px] text-muted-foreground">
-                                {provider.display_name} ·{" "}
-                                {modelProtocolLabel(provider.provider_type)}
-                              </span>
-                            </span>
-                            {model.capabilities?.supports_image_input
-                              ? " · 图片"
-                              : ""}
-                          </DropdownMenuRadioItem>
-                        ))}
-                      </DropdownMenuRadioGroup>
-                    ) : (
-                      <DropdownMenuItem disabled>
-                        {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
-                      </DropdownMenuItem>
-                    )}
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
+                {isPhoneLayout ? (
+                  // Sub-menus open sideways and overflow narrow screens, so
+                  // phones get every section inline in one scrollable menu.
+                  <>
+                    <DropdownMenuLabel>
+                      思考力度
+                      {responseMode === "fast" ? (
+                        <span className="ml-2 text-xs font-normal text-muted-foreground">
+                          极速模式下已关闭
+                        </span>
+                      ) : null}
+                    </DropdownMenuLabel>
+                    {responseMode === "fast" ? null : thinkingChoices}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuLabel>模型</DropdownMenuLabel>
+                    {modelChoices}
+                  </>
+                ) : (
+                  <>
+                    <DropdownMenuSub>
+                      <DropdownMenuSubTrigger disabled={responseMode === "fast"}>
+                        思考力度
+                        <span className="ml-auto text-xs text-muted-foreground">
+                          {responseMode === "fast"
+                            ? "已关闭"
+                            : thinkingModes.length
+                            ? thinkingLabels[thinkingMode]
+                            : "当前模型未声明"}
+                        </span>
+                      </DropdownMenuSubTrigger>
+                      <DropdownMenuSubContent>
+                        {thinkingChoices}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuSub>
+                    <DropdownMenuSub>
+                      <DropdownMenuSubTrigger>模型</DropdownMenuSubTrigger>
+                      <DropdownMenuSubContent className="max-h-[min(60vh,32rem)] overflow-y-auto">
+                        {modelChoices}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuSub>
+                  </>
+                )}
                   </>
                 )}
               </DropdownMenuContent>
             </DropdownMenu>
+               );
+               // Portal keeps composer state/context while the trigger lives
+               // in the top bar on phone widths.
+               return isPhoneLayout && topbarModelSlot
+                 ? createPortal(modelMenu, topbarModelSlot)
+                 : modelMenu;
+             })()}
             <PromptInputButton
               aria-label={isListening ? "停止语音输入" : "开始语音输入"}
               aria-pressed={isListening}
@@ -6481,6 +7396,72 @@ export function ChatCanvasPage() {
                 <RefreshCcw className="size-4" />
               )}
               {retry.isPending ? "正在生成新版本…" : "开始重试"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        onOpenChange={(open) => {
+          if (!open) setImageRetryTarget(null);
+        }}
+        open={Boolean(imageRetryTarget)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>重试绘图</DialogTitle>
+            <DialogDescription>
+              选择绘图模型后，将使用原始提示词重新生成一张图片，结果会作为一条新回答发送。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="image-retry-model">绘图模型</Label>
+              <Select
+                disabled={!availableImageModelChoices.length}
+                onValueChange={setImageRetryChoice}
+                value={imageRetryChoice}
+              >
+                <SelectTrigger className="w-full" id="image-retry-model">
+                  <SelectValue
+                    placeholder={
+                      availableImageModelChoices.length
+                        ? "选择绘图模型"
+                        : "正在载入绘图模型…"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {availableImageModelChoices.map(({ provider, model }) => (
+                    <SelectItem
+                      key={`${provider.id}:${model.id}`}
+                      value={modelChoiceValue(provider.id, model.id)}
+                    >
+                      {model.id} · {provider.display_name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {imageRetryTarget ? (
+              <p className="line-clamp-3 text-xs text-muted-foreground">
+                提示词：{imageRetryTarget.prompt}
+              </p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setImageRetryTarget(null)} variant="outline">
+              取消
+            </Button>
+            <Button
+              disabled={
+                !imageRetryTarget ||
+                !parseModelChoiceValue(imageRetryChoice) ||
+                status !== "ready"
+              }
+              onClick={submitImageRetry}
+            >
+              <ImageIcon className="size-4" />
+              重新生成
             </Button>
           </DialogFooter>
         </DialogContent>

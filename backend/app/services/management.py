@@ -23,16 +23,24 @@ from app.domain.models import (
 )
 from app.domain.settings import (
     CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
+    CHAT_CONTEXT_USAGE_SETTING_KEY,
+    CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+    CHAT_DICTATION_CLEANUP_SETTING_KEY,
     CHAT_RESPONSE_STYLE_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
 )
 from app.domain.schemas.management import (
+    ChatContextUsageSettingValue,
+    ChatDictationCleanupSettingValue,
     ChatFeatureModelSettingValue,
     ChatResponseStyleSettingValue,
     ChatSuggestedPromptsSettingValue,
     MigrationPreflightRequest,
     PluginToggleRequest,
+    ProviderBalanceQueryConfig,
+    ProviderBalanceQueryExecuteRequest,
+    ProviderBalanceQueryResultRequest,
     ProviderCreateRequest,
     ProviderSecretRotateRequest,
     ProviderUpdateRequest,
@@ -50,6 +58,7 @@ from app.repositories.domain import (
 )
 from app.providers.catalog import (
     DEEP_RESEARCH_PROVIDER_TYPES,
+    EMBEDDING_PROVIDER_TYPES,
     FETCH_PROVIDER_TYPES,
     IMAGE_GENERATION_PROVIDER_TYPES,
     MEMORY_PROVIDER_TYPES,
@@ -78,6 +87,32 @@ from app.providers.remote.deepseek import (
     is_deepseek_chat_configuration,
     is_official_deepseek_api_base_url,
 )
+from app.providers.remote.codex import (
+    CodexAuthError,
+    ensure_fresh_codex_credentials,
+    fetch_codex_usage,
+    parse_codex_credentials,
+    poll_codex_device_login,
+    start_codex_device_login,
+)
+from app.providers.remote.custom_balance import (
+    API_KEY_PLACEHOLDER as CUSTOM_BALANCE_API_KEY_PLACEHOLDER,
+    BASE_URL_PLACEHOLDER as CUSTOM_BALANCE_BASE_URL_PLACEHOLDER,
+    CustomBalanceQueryError,
+    execute_custom_balance_request,
+)
+from app.providers.remote.balance import (
+    BalanceInfo,
+    BalanceReport,
+    ProviderBalanceError,
+    detect_balance_vendor,
+    fetch_gateway_billing_balance,
+    fetch_moonshot_balance,
+    fetch_openrouter_balance,
+    fetch_siliconflow_balance,
+    official_no_balance_notice,
+    supports_gateway_billing,
+)
 from app.providers.remote.memory import Mem0PlatformAdapter, mem0_entity_id
 from app.providers.remote.anysearch import AnySearchSearchProvider
 from app.providers.remote.research import (
@@ -94,9 +129,11 @@ from app.providers.remote.search import (
 )
 from app.providers.model_options import (
     ModelCapabilityError,
+    catalog_capability_snapshot,
     model_capabilities_for_model,
     validate_model_capability_update,
 )
+from app.providers.model_catalog import unified_model_defaults
 from app.services.provider_secrets import (
     PROVIDER_SECRET_ALGORITHM,
     ProviderSecretUnavailable,
@@ -189,7 +226,7 @@ class ProviderService:
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
                 "hosted_web_search": False,
-                "default_search_route": "disabled",
+                "default_search_route": "auto",
                 "capability_source": "official_catalog",
                 "supports_agent_tools": True,
                 "model_family": "deepseek",
@@ -209,11 +246,29 @@ class ProviderService:
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
                 "hosted_web_search": False,
-                "default_search_route": "disabled",
+                "default_search_route": "auto",
                 "capability_source": "official_catalog",
                 "supports_agent_tools": True,
                 "model_family": "anthropic",
                 "brand_id": "anthropic",
+            }
+        qwen_defaults: dict[str, object] = {}
+        if payload.provider_type == "qwen":
+            qwen_defaults = {
+                "provider_family": "qwen",
+                "brand_id": "qwen",
+                "structured_output_mode": "json_object",
+                "supports_agent_tools": True,
+                "capability_source": "official_catalog",
+                # Per-model hosted tools and modalities are filled by the
+                # unified defaults interface after discovery.
+                "companion_capabilities": [
+                    "web_search",
+                    "web_fetch",
+                    "image_search",
+                    "image_understanding",
+                    "video_understanding",
+                ],
             }
         # Sanitize optional custom headers used by proxy / relay stations.
         incoming_capabilities = dict(payload.capabilities or {})
@@ -224,11 +279,19 @@ class ProviderService:
         capabilities = {
             **deepseek_defaults,
             **anthropic_defaults,
+            **qwen_defaults,
             **incoming_capabilities,
             "provider_role": spec.role,
             "declaration_status": "unverified_user_input",
             "remote_calls_enabled": False,
         }
+        # All currently supported model protocols implement the structured
+        # function-call loop used by Agent mode.  Persist the declaration for
+        # the client as well; otherwise generic OpenAI-compatible providers
+        # depend on an implicit missing-key fallback and can be incorrectly
+        # presented as unavailable by consumers of the provider API.
+        if payload.provider_type in MODEL_PROVIDER_TYPES:
+            capabilities.setdefault("supports_agent_tools", True)
         provider = self.providers.add(
             ProviderConfig(
                 workspace_id=self.workspace_id,
@@ -278,6 +341,23 @@ class ProviderService:
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
         return provider
+
+    def default_model_capabilities(
+        self,
+        model_id: str,
+        *,
+        provider_type: str | None = None,
+    ) -> dict:
+        """Expose the same defaults interface used by request resolution."""
+
+        return {
+            "model_id": model_id,
+            "provider_type": provider_type,
+            "capabilities": unified_model_defaults(
+                model_id,
+                provider_type=provider_type,
+            ),
+        }
 
     def secret_store_status(self) -> dict:
         store = secret_store_from_settings(self.settings)
@@ -444,6 +524,16 @@ class ProviderService:
                 payload.extra_headers
             )
         if payload.default_model is not None:
+            model_states = dict(capabilities.get("model_states") or {})
+            if (
+                provider.provider_type in MODEL_PROVIDER_TYPES
+                and model_states.get(payload.default_model) is False
+            ):
+                raise AppError(
+                    409,
+                    "provider_model_disabled",
+                    "A disabled model cannot be selected as the default model",
+                )
             capabilities["default_model"] = payload.default_model
         if payload.default_image_generation_model_id is not None:
             capabilities["default_image_generation_model_id"] = (
@@ -458,6 +548,8 @@ class ProviderService:
             # Vision companions also expose default_model so discovery UIs and
             # model_provider-shaped adapters can share the same field.
             capabilities.setdefault("default_model", payload.default_vision_model_id)
+        if payload.model_defaults_enabled is not None:
+            capabilities["model_defaults_enabled"] = payload.model_defaults_enabled
         if "enabled" not in fields_set:
             provider.capabilities = capabilities
             self.audit.record(
@@ -647,6 +739,20 @@ class ProviderService:
             capabilities["remote_calls_enabled"] = True
             capabilities["provider_role"] = "transcription"
             provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in EMBEDDING_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "Embedding Provider requires a base URL and encrypted secret",
+                )
+            # Multiple embedding providers may stay enabled; the memory
+            # enhancement settings pick one explicitly by provider id.
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "embedding"
+            provider.status = "enabled_unverified"
         elif enabled and provider.provider_type == "local_mock":
             provider.remote_capability = False
             capabilities["remote_calls_enabled"] = False
@@ -703,7 +809,9 @@ class ProviderService:
                 "Model capabilities can only be configured on a model Provider",
             )
         try:
-            validated = validate_model_capability_update(payload.model_dump())
+            raw_payload = payload.model_dump()
+            raw_payload.pop("apply_to_all", None)
+            validated = validate_model_capability_update(raw_payload)
         except ModelCapabilityError as exc:
             raise AppError(422, "invalid_model_capabilities", str(exc)) from exc
         capabilities = dict(provider.capabilities or {})
@@ -746,11 +854,18 @@ class ProviderService:
                 "Model capabilities can only be configured on a model Provider",
             )
         try:
-            validated = validate_model_capability_update(payload.model_dump())
+            raw_payload = payload.model_dump()
+            apply_to_all = raw_payload.pop("apply_to_all", False)
+            validated = validate_model_capability_update(raw_payload)
         except ModelCapabilityError as exc:
             raise AppError(422, "invalid_model_capabilities", str(exc)) from exc
         capabilities = dict(provider.capabilities or {})
         capabilities["model_defaults"] = validated
+        # Saving a template turns the global override on unless the workspace
+        # has explicitly switched it off.
+        capabilities.setdefault("model_defaults_enabled", True)
+        if apply_to_all:
+            capabilities.pop("models", None)
         provider.capabilities = capabilities
         self.audit.record(
             actor_id=self.actor_id,
@@ -770,6 +885,63 @@ class ProviderService:
             "model_id": "*",
             "capabilities": validated,
         }
+
+    def sync_model_catalog_defaults(
+        self, provider_id: str, model_ids: list[str]
+    ) -> dict:
+        """Write official catalog defaults as the per-model snapshot of every model."""
+
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Model capabilities can only be configured on a model Provider",
+            )
+        capabilities = dict(provider.capabilities or {})
+        models = dict(capabilities.get("models") or {})
+        synced: list[dict] = []
+        for raw_id in model_ids:
+            model_id = raw_id.strip()
+            if not model_id:
+                continue
+            snapshot = catalog_capability_snapshot(
+                model_id, provider_type=provider.provider_type
+            )
+            try:
+                validated = validate_model_capability_update(snapshot)
+            except ModelCapabilityError as exc:
+                raise AppError(
+                    422,
+                    "invalid_model_capabilities",
+                    f"{model_id}: {exc}",
+                ) from exc
+            models[model_id] = validated
+            synced.append(
+                {
+                    "provider_id": provider.id,
+                    "model_id": model_id,
+                    "capabilities": validated,
+                }
+            )
+        if not synced:
+            raise AppError(
+                422, "invalid_model_capabilities", "No valid model ids were provided"
+            )
+        capabilities["models"] = models
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.model_capabilities.sync_catalog",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_id": provider.id,
+                "model_count": len(synced),
+            },
+        )
+        self.db.commit()
+        return {"provider_id": provider.id, "models": synced}
 
     def update_model_state(
         self, provider_id: str, model_id: str, enabled: bool
@@ -909,9 +1081,157 @@ class ProviderService:
             "capabilities": effective,
         }
 
+    # Relay stations get configured under any OpenAI/Anthropic-compatible
+    # protocol; all of them may implement the one-api billing convention.
+    _GATEWAY_BILLING_PROVIDER_TYPES = frozenset(
+        {
+            "openai_compatible_chat",
+            "openai_responses",
+            "qwen",
+            "deepseek_chat",
+            "anthropic_messages",
+            "openai_images",
+            "openai_compatible_vision",
+            "openai_responses_vision",
+            "openai_compatible_transcription",
+        }
+    )
+
+    def _persist_codex_credentials(self, provider_id: str, secret: str) -> None:
+        """Store rotated Codex tokens without bumping the rotation lifecycle.
+
+        A refresh is a background housekeeping event, not an operator key
+        rotation: the audit trail and the secret version both stay meaningful
+        only if automatic rotation is recorded distinctly.
+        """
+
+        record = self._active_secret_record(provider_id)
+        if record is None:
+            return
+        try:
+            encrypted = encrypt_provider_secret(self.settings, secret)
+        except (SecretStoreUnavailable, ValueError):
+            return
+        record.ciphertext = encrypted.ciphertext
+        record.algorithm = encrypted.algorithm
+        record.key_provider = encrypted.key_provider
+        record.key_version = encrypted.key_version
+
+    def _codex_usage(self, provider: ProviderConfig) -> dict:
+        secret = self._decrypt_secret(provider.id)
+        try:
+            credentials, changed = ensure_fresh_codex_credentials(
+                parse_codex_credentials(secret)
+            )
+            if changed:
+                self._persist_codex_credentials(provider.id, credentials.to_secret())
+            usage = fetch_codex_usage(credentials)
+        except CodexAuthError as exc:
+            raise AppError(
+                502,
+                "provider_balance_unavailable",
+                str(exc),
+                {"provider_id": provider.id},
+            ) from exc
+        balance_infos = []
+        if usage.credits_balance and not usage.credits_unlimited:
+            balance_infos.append(
+                {
+                    "currency": "USD",
+                    "total_balance": usage.credits_balance,
+                    "granted_balance": None,
+                    "topped_up_balance": None,
+                }
+            )
+        notices = []
+        if usage.plan_type:
+            notices.append(f"ChatGPT 计划：{usage.plan_type}")
+        if usage.credits_unlimited:
+            notices.append("额度类型：不限量")
+        notices.append("用量按 ChatGPT 订阅计划结算，不消耗 API 额度。")
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.balance.read",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_type": provider.provider_type,
+                "vendor": "codex",
+                "is_available": not usage.limit_reached,
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "vendor": "codex",
+            "vendor_label": "Codex 官方直登",
+            "is_available": not usage.limit_reached,
+            "balance_infos": balance_infos,
+            "usage_windows": [
+                {
+                    "label": window.label,
+                    "used_percent": window.used_percent,
+                    "window_minutes": window.window_minutes,
+                    "resets_at": window.resets_at,
+                }
+                for window in usage.windows
+            ],
+            "notice": "；".join(notices),
+            "queried_at": utc_now(),
+        }
+
+    def codex_device_login_start(self) -> dict:
+        try:
+            login = start_codex_device_login()
+        except CodexAuthError as exc:
+            raise AppError(502, "codex_login_unavailable", str(exc)) from exc
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.codex.device_login.start",
+            resource_type="provider",
+            resource_id="codex",
+            details={"verification_url": login.verification_url},
+        )
+        self.db.commit()
+        return {
+            "device_auth_id": login.device_auth_id,
+            "user_code": login.user_code,
+            "verification_url": login.verification_url,
+            "interval_seconds": login.interval_seconds,
+        }
+
+    def codex_device_login_poll(self, *, device_auth_id: str, user_code: str) -> dict:
+        try:
+            credentials = poll_codex_device_login(
+                device_auth_id=device_auth_id,
+                user_code=user_code,
+            )
+        except CodexAuthError as exc:
+            raise AppError(502, "codex_login_unavailable", str(exc)) from exc
+        if credentials is None:
+            return {"status": "pending", "api_key": None, "account_id": None}
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.codex.device_login.complete",
+            resource_type="provider",
+            resource_id="codex",
+            details={"plan_type": credentials.plan_type},
+        )
+        self.db.commit()
+        # The token set is handed back once so the caller can save it as the
+        # Provider secret through the normal create/rotate path; it is never
+        # persisted by the login endpoints themselves.
+        return {
+            "status": "authorized",
+            "api_key": credentials.to_secret(),
+            "account_id": credentials.account_id,
+            "plan_type": credentials.plan_type,
+        }
+
     def balance(self, provider_id: str) -> dict:
         provider = self.providers.require(provider_id, "provider")
         capabilities = dict(provider.capabilities or {})
+        extra_headers = self._sanitize_extra_headers(capabilities.get("extra_headers"))
         default_model = str(capabilities.get("default_model") or "")
         is_deepseek_family = (
             provider.provider_type == "deepseek_chat"
@@ -921,43 +1241,96 @@ class ProviderService:
             or "deepseek" in default_model.casefold().split("/")[-1]
             or is_deepseek_chat_configuration(provider.provider_type, provider.base_url)
         )
-        # Balance is only safe against the official DeepSeek origin so a custom
-        # gateway never receives a balance request with the saved key.
-        if not is_deepseek_family or not is_official_deepseek_api_base_url(provider.base_url):
-            raise AppError(
-                409,
-                "provider_balance_unsupported",
-                "This Provider does not expose an account-balance endpoint",
-            )
+        if provider.provider_type == "codex_chatgpt":
+            return self._codex_usage(provider)
         if not provider.base_url:
             raise AppError(409, "provider_not_configured", "Provider base URL is missing")
-        api_key = self._decrypt_secret(provider.id)
-        try:
-            is_available, balance_infos = fetch_deepseek_balance(
-                base_url=provider.base_url,
-                api_key=api_key,
-                extra_headers=self._sanitize_extra_headers(
-                    capabilities.get("extra_headers")
-                ),
+        # Balance requests carry the saved key, so each vendor implementation
+        # only ever talks to its verified official origin; everything else may
+        # at most use the relay-station billing convention against the same
+        # host that already receives the key for inference.
+        if is_deepseek_family and is_official_deepseek_api_base_url(provider.base_url):
+            api_key = self._decrypt_secret(provider.id)
+            try:
+                is_available, balance_infos = fetch_deepseek_balance(
+                    base_url=provider.base_url,
+                    api_key=api_key,
+                    extra_headers=extra_headers,
+                )
+            except DeepSeekBalanceError as exc:
+                raise AppError(
+                    502,
+                    "provider_balance_unavailable",
+                    "DeepSeek balance could not be retrieved",
+                    {"provider_id": provider.id},
+                ) from exc
+            report = BalanceReport(
+                vendor="deepseek",
+                vendor_label="DeepSeek",
+                is_available=is_available,
+                infos=[
+                    BalanceInfo(
+                        currency=item.currency,
+                        total_balance=item.total_balance,
+                        granted_balance=item.granted_balance,
+                        topped_up_balance=item.topped_up_balance,
+                    )
+                    for item in balance_infos
+                ],
             )
-        except DeepSeekBalanceError as exc:
-            raise AppError(
-                502,
-                "provider_balance_unavailable",
-                "DeepSeek balance could not be retrieved",
-                {"provider_id": provider.id},
-            ) from exc
+        else:
+            vendor = detect_balance_vendor(provider.base_url)
+            if vendor is None:
+                notice = official_no_balance_notice(provider.base_url)
+                if notice:
+                    raise AppError(409, "provider_balance_unsupported", notice)
+            fetcher = {
+                "moonshot": fetch_moonshot_balance,
+                "siliconflow": fetch_siliconflow_balance,
+                "openrouter": fetch_openrouter_balance,
+            }.get(vendor or "")
+            if fetcher is None:
+                if provider.provider_type in self._GATEWAY_BILLING_PROVIDER_TYPES and (
+                    supports_gateway_billing(provider.base_url)
+                ):
+                    fetcher = fetch_gateway_billing_balance
+                else:
+                    raise AppError(
+                        409,
+                        "provider_balance_unsupported",
+                        "This Provider does not expose an account-balance endpoint",
+                    )
+            api_key = self._decrypt_secret(provider.id)
+            try:
+                report = fetcher(
+                    base_url=provider.base_url,
+                    api_key=api_key,
+                    extra_headers=extra_headers,
+                )
+            except ProviderBalanceError as exc:
+                raise AppError(
+                    502,
+                    "provider_balance_unavailable",
+                    "Account balance could not be retrieved",
+                    {"provider_id": provider.id},
+                ) from exc
         self.audit.record(
             actor_id=self.actor_id,
             action="provider.balance.read",
             resource_type="provider",
             resource_id=provider.id,
-            details={"provider_type": provider.provider_type, "is_available": is_available},
+            details={
+                "provider_type": provider.provider_type,
+                "vendor": report.vendor,
+                "is_available": report.is_available,
+            },
         )
         self.db.commit()
         return {
             "provider_id": provider.id,
-            "is_available": is_available,
+            "vendor": report.vendor,
+            "vendor_label": report.vendor_label,
+            "is_available": report.is_available,
             "balance_infos": [
                 {
                     "currency": item.currency,
@@ -965,10 +1338,167 @@ class ProviderService:
                     "granted_balance": item.granted_balance,
                     "topped_up_balance": item.topped_up_balance,
                 }
-                for item in balance_infos
+                for item in report.infos
             ],
+            "notice": report.notice,
             "queried_at": utc_now(),
         }
+
+    _BALANCE_QUERY_CAPABILITY_KEY = "balance_query"
+
+    def balance_query_config(self, provider_id: str) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        return {
+            "provider_id": provider.id,
+            "config": self._stored_balance_query_config(provider),
+        }
+
+    def update_balance_query_config(
+        self,
+        provider_id: str,
+        config: ProviderBalanceQueryConfig | None,
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        capabilities = dict(provider.capabilities or {})
+        bucket = dict(capabilities.get(self._BALANCE_QUERY_CAPABILITY_KEY) or {})
+        if config is None:
+            bucket.pop("config", None)
+            bucket.pop("last_result", None)
+        else:
+            bucket["config"] = config.model_dump()
+        if bucket:
+            capabilities[self._BALANCE_QUERY_CAPABILITY_KEY] = bucket
+        else:
+            capabilities.pop(self._BALANCE_QUERY_CAPABILITY_KEY, None)
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.balance_query.configure",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "enabled": bool(config.enabled) if config else False,
+                "template_id": config.template_id if config else None,
+                "auto_query_interval_minutes": (
+                    config.auto_query_interval_minutes if config else None
+                ),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        return {
+            "provider_id": provider.id,
+            "config": self._stored_balance_query_config(provider),
+        }
+
+    def execute_balance_query(
+        self,
+        provider_id: str,
+        payload: ProviderBalanceQueryExecuteRequest,
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        request = payload.request
+        needs_base_url = CUSTOM_BALANCE_BASE_URL_PLACEHOLDER in request.url
+        if needs_base_url and not provider.base_url:
+            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        referenced_fields = (
+            request.url,
+            request.body or "",
+            *request.headers.values(),
+        )
+        needs_api_key = any(
+            CUSTOM_BALANCE_API_KEY_PLACEHOLDER in item for item in referenced_fields
+        )
+        api_key = self._optional_secret(provider.id) if needs_api_key else None
+        if needs_api_key and api_key is None:
+            raise AppError(
+                409,
+                "provider_secret_unavailable",
+                "Provider encrypted secret is missing or revoked",
+            )
+        config = self._stored_balance_query_config(provider)
+        timeout_seconds = (
+            payload.timeout_seconds
+            or (config.timeout_seconds if config else None)
+            or 10.0
+        )
+        variables = dict(config.variables) if config else {}
+        if payload.variables is not None:
+            variables.update(payload.variables)
+        variables.pop("baseUrl", None)
+        variables.pop("apiKey", None)
+        try:
+            result = execute_custom_balance_request(
+                url=request.url,
+                method=request.method,
+                headers=request.headers,
+                body=request.body,
+                base_url=provider.base_url or "",
+                api_key=api_key or "",
+                variables=variables,
+                timeout_seconds=timeout_seconds,
+            )
+        except CustomBalanceQueryError as exc:
+            raise AppError(
+                502,
+                "provider_balance_unavailable",
+                str(exc),
+                {"provider_id": provider.id},
+            ) from exc
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.balance.read",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_type": provider.provider_type,
+                "vendor": "custom",
+                "is_available": bool(result.get("ok")),
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            **result,
+            "queried_at": utc_now(),
+        }
+
+    def save_balance_query_result(
+        self,
+        provider_id: str,
+        payload: ProviderBalanceQueryResultRequest,
+    ) -> dict:
+        provider = self.providers.require(provider_id, "provider")
+        capabilities = dict(provider.capabilities or {})
+        bucket = dict(capabilities.get(self._BALANCE_QUERY_CAPABILITY_KEY) or {})
+        queried_at = utc_now()
+        bucket["last_result"] = {
+            **payload.model_dump(),
+            "queried_at": queried_at.isoformat(),
+        }
+        capabilities[self._BALANCE_QUERY_CAPABILITY_KEY] = bucket
+        provider.capabilities = capabilities
+        self.db.commit()
+        self.db.refresh(provider)
+        return {
+            "provider_id": provider.id,
+            **payload.model_dump(),
+            "queried_at": queried_at,
+        }
+
+    def _stored_balance_query_config(
+        self, provider: ProviderConfig
+    ) -> ProviderBalanceQueryConfig | None:
+        bucket = (provider.capabilities or {}).get(
+            self._BALANCE_QUERY_CAPABILITY_KEY
+        )
+        raw = bucket.get("config") if isinstance(bucket, dict) else None
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return ProviderBalanceQueryConfig.model_validate(raw)
+        except ValidationError:
+            return None
 
     def delete(self, provider_id: str) -> dict[str, str]:
         provider = self.providers.require(provider_id, "provider")
@@ -1008,6 +1538,8 @@ class ProviderService:
             *MODEL_PROVIDER_TYPES,
             *IMAGE_GENERATION_PROVIDER_TYPES,
             *VISION_PROVIDER_TYPES,
+            *TRANSCRIPTION_PROVIDER_TYPES,
+            *EMBEDDING_PROVIDER_TYPES,
         }:
             raise AppError(
                 409,
@@ -1036,6 +1568,10 @@ class ProviderService:
                         if provider.provider_type in IMAGE_GENERATION_PROVIDER_TYPES
                         else ["vision"]
                         if provider.provider_type in VISION_PROVIDER_TYPES
+                        else ["transcription"]
+                        if provider.provider_type in TRANSCRIPTION_PROVIDER_TYPES
+                        else ["embedding"]
+                        if provider.provider_type in EMBEDDING_PROVIDER_TYPES
                         else ["llm"]
                     ),
                     "streaming": True,
@@ -1047,8 +1583,16 @@ class ProviderService:
                     "capabilities": model_capabilities_for_model(
                         {
                             **capabilities,
-                            "model_defaults": (
-                                self._deepseek_capabilities(capabilities)
+                            # Injected DeepSeek defaults are built-in behavior,
+                            # not the user template, so they stay active even
+                            # when the global-override switch is off.
+                            **(
+                                {
+                                    "model_defaults": self._deepseek_capabilities(
+                                        capabilities
+                                    ),
+                                    "model_defaults_enabled": True,
+                                }
                                 if (
                                     is_deepseek
                                     or model_id.casefold().startswith("deepseek")
@@ -1058,7 +1602,11 @@ class ProviderService:
                                 and not isinstance(
                                     capabilities.get("model_defaults"), dict
                                 )
-                                else capabilities.get("model_defaults", {})
+                                else {
+                                    "model_defaults": capabilities.get(
+                                        "model_defaults", {}
+                                    )
+                                }
                             ),
                         },
                         model_id,
@@ -1091,7 +1639,7 @@ class ProviderService:
             ),
             "hosted_web_search": False,
             "supports_image_input": capabilities.get("supports_image_input") is True,
-            "default_search_route": capabilities.get("default_search_route", "disabled"),
+            "default_search_route": capabilities.get("default_search_route", "auto"),
             "capability_source": capabilities.get("capability_source", "official_catalog"),
         }
 
@@ -1821,10 +2369,25 @@ class SettingsService:
         self.settings = SettingRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
 
+    # Settings whose values hold credentials (e.g. the SMTP alert password)
+    # are managed through dedicated endpoints with masked views and must not
+    # leak through the generic listing.
+    HIDDEN_SETTING_KEYS = frozenset({"usage.alert_email"})
+
     def list(self) -> list[WorkspaceSetting]:
-        return list(self.settings.list())
+        return [
+            setting
+            for setting in self.settings.list()
+            if setting.key not in self.HIDDEN_SETTING_KEYS
+        ]
 
     def update(self, key: str, payload: SettingUpdateRequest) -> WorkspaceSetting:
+        if key in self.HIDDEN_SETTING_KEYS:
+            raise AppError(
+                403,
+                "setting_managed_elsewhere",
+                "This setting is managed through its dedicated endpoint",
+            )
         value = payload.value
         if key == CHAT_SUGGESTED_PROMPTS_SETTING_KEY:
             try:
@@ -1836,9 +2399,30 @@ class SettingsService:
                     "chat.suggested_prompts must contain only an enabled boolean",
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc
+        elif key == CHAT_DICTATION_CLEANUP_SETTING_KEY:
+            try:
+                value = ChatDictationCleanupSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "chat.dictation_cleanup must contain only an enabled boolean",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key == CHAT_CONTEXT_USAGE_SETTING_KEY:
+            try:
+                value = ChatContextUsageSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "chat.context_usage must contain only an enabled boolean",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
         elif key in {
             CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
             CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
+            CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
         }:
             try:
                 value = ChatFeatureModelSettingValue.model_validate(value).model_dump()

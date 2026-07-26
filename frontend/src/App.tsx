@@ -30,7 +30,7 @@ const SourcesPage = lazy(() => import('@/features/resources/resource-pages').the
 const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
 const MemoryPage = lazy(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
 const ProvidersPage = lazy(() => import('@/features/settings/provider-pages').then((module) => ({ default: module.ProvidersPage })))
-const UsagePage = lazy(() => import('@/features/settings/provider-pages').then((module) => ({ default: module.UsagePage })))
+const UsagePage = lazy(() => import('@/features/settings/usage-pages').then((module) => ({ default: module.UsagePage })))
 const ExtensionsPage = lazy(() => import('@/features/settings/extension-pages').then((module) => ({ default: module.ExtensionsPage })))
 const ResearchSettingsPage = lazy(() => import('@/features/settings/extension-pages').then((module) => ({ default: module.ResearchSettingsPage })))
 const AuditPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.AuditPage })))
@@ -99,6 +99,7 @@ function AppRoutes() {
         <Route element={<PracticePage />} path="practice" />
         <Route element={<ExerciseAnswerPage />} path="practice/:setId/:questionId" />
         <Route element={<MemoryPage />} path="memory" />
+        <Route element={<Navigate replace to="../settings/workspace" />} path="memory/settings" />
         <Route element={<ProvidersPage />} path="settings/providers" />
         <Route element={<UsagePage />} path="settings/usage" />
         <Route element={<ExtensionsPage />} path="settings/extensions" />

@@ -1,12 +1,16 @@
 import type {
+  AlertEmailConfig,
+  AlertEmailConfigUpdate,
+  AlertEmailTestResult,
   BudgetAlert,
   BudgetPolicy,
   BudgetPolicyCreate,
   BudgetPolicyUpdate,
   BudgetStatus,
-  ExchangeRateVersion,
-  PriceVersion,
-  PriceVersionCreate,
+  ExchangeRateInfo,
+  ManualPrice,
+  ManualPriceUpsert,
+  ModelsDevStatus,
   PriceCatalogItem,
   UsageEvent,
   UsageSummary,
@@ -26,32 +30,69 @@ export function clearUsageEvents(): Promise<{ deleted_count: number }> {
   return apiClient.delete<{ deleted_count: number }>("/usage/events");
 }
 
-export function listPriceVersions(): Promise<PriceVersion[]> {
-  return apiClient.get<PriceVersion[]>("/usage/prices");
-}
-
 export function listPriceCatalog(): Promise<PriceCatalogItem[]> {
   return apiClient.get<PriceCatalogItem[]>("/usage/price-catalog");
 }
 
-export function createPriceVersion(
-  payload: PriceVersionCreate,
-): Promise<PriceVersion> {
-  return apiClient.post<PriceVersion, PriceVersionCreate>(
-    "/usage/prices",
+export function getModelsDevStatus(): Promise<ModelsDevStatus> {
+  return apiClient.get<ModelsDevStatus>("/usage/models-dev");
+}
+
+export function refreshModelsDevSnapshot(): Promise<ModelsDevStatus> {
+  return apiClient.post<ModelsDevStatus>("/usage/models-dev/refresh");
+}
+
+export function listManualPrices(): Promise<ManualPrice[]> {
+  return apiClient.get<ManualPrice[]>("/usage/manual-prices");
+}
+
+export function upsertManualPrice(
+  payload: ManualPriceUpsert,
+): Promise<ManualPrice> {
+  return apiClient.put<ManualPrice, ManualPriceUpsert>(
+    "/usage/manual-prices",
     payload,
   );
 }
 
-export function listExchangeRates(): Promise<ExchangeRateVersion[]> {
-  return apiClient.get<ExchangeRateVersion[]>("/usage/exchange-rates");
+export function removeManualPrice(
+  modelId: string,
+): Promise<{ removed_count: number }> {
+  return apiClient.delete<{ removed_count: number }>("/usage/manual-prices", {
+    query: { model_id: modelId },
+  });
 }
 
-export function createExchangeRate(rate: number): Promise<ExchangeRateVersion> {
-  return apiClient.post<ExchangeRateVersion, { rate: number; source: string }>(
-    "/usage/exchange-rates",
-    { rate, source: "workspace_manual" },
+export function getExchangeRate(): Promise<ExchangeRateInfo> {
+  return apiClient.get<ExchangeRateInfo>("/usage/exchange-rate");
+}
+
+export function setExchangeRate(rate: number): Promise<ExchangeRateInfo> {
+  return apiClient.put<ExchangeRateInfo, { rate: number }>(
+    "/usage/exchange-rate",
+    { rate },
   );
+}
+
+export function refreshExchangeRate(): Promise<ExchangeRateInfo> {
+  return apiClient.post<ExchangeRateInfo>("/usage/exchange-rate/refresh");
+}
+
+export function getAlertEmailConfig(): Promise<AlertEmailConfig> {
+  return apiClient.get<AlertEmailConfig>("/usage/alert-email");
+}
+
+export function updateAlertEmailConfig(
+  payload: AlertEmailConfigUpdate,
+): Promise<AlertEmailConfig> {
+  return apiClient.put<AlertEmailConfig, AlertEmailConfigUpdate>(
+    "/usage/alert-email",
+    payload,
+  );
+}
+
+export function sendTestAlertEmail(): Promise<AlertEmailTestResult> {
+  return apiClient.post<AlertEmailTestResult>("/usage/alert-email/test");
 }
 
 export function listBudgetPolicies(): Promise<BudgetPolicy[]> {
@@ -64,22 +105,6 @@ export function createBudgetPolicy(
   return apiClient.post<BudgetPolicy, BudgetPolicyCreate>(
     "/usage/budget-policies",
     payload,
-  );
-}
-
-export function retirePriceVersion(priceId: string): Promise<PriceVersion> {
-  return apiClient.post<PriceVersion, { retired_at?: string }>(
-    `/usage/prices/${encodeURIComponent(priceId)}/retire`,
-    {},
-  );
-}
-
-export function retireExchangeRate(
-  rateId: string,
-): Promise<ExchangeRateVersion> {
-  return apiClient.post<ExchangeRateVersion, { retired_at?: string }>(
-    `/usage/exchange-rates/${encodeURIComponent(rateId)}/retire`,
-    {},
   );
 }
 

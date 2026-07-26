@@ -656,53 +656,130 @@ npm.cmd run check</code></pre>
             </div>
           </div>
           <p>
-            沙箱是 Docker 后端提供的会话级隔离工作区。宿主机不是 fallback：
-            Docker 支持、镜像或配置缺失时返回明确 unavailable。
+            沙箱是 <strong>Docker-only、默认断网、按「聊天会话 × 属主用户」隔离</strong>的代码与文件执行边界。
+            宿主机永远不是 fallback：Docker、镜像 digest 或配置缺失时 probe 返回明确 unavailable，不会退化执行。
+            系统内有两条互相独立的执行路径——<code>sandbox-policy-v1</code> 固定任务（只能跑内置 runner 检查已上传文件）与
+            <code>sandbox-agent-v1</code> Agent 工作区（模型写文件、跑 <code>.py</code>/<code>.js</code> 脚本）——共用同一张
+            <code>SandboxSession</code> 表与容器后端，但按 <code>policy_revision</code> 严格互斥。
           </p>
 
           <div class="sandbox-diagram">
             <div class="sandbox-host">
               <span class="diagram-label">LearnGraph host</span>
-              <div class="host-service">SandboxAgentWorkspaceService<small>授权 · 配额 · 审计 · Artifact</small></div>
+              <div class="host-service">SandboxAgentWorkspaceService<small>argv 策略 · 授权 · 配额 · 审计 · 计费桥（ASR）· Artifact</small></div>
               <div class="sandbox-boundary">
-                <span class="diagram-label">Docker boundary</span>
+                <span class="diagram-label">Docker boundary · network=none · read-only rootfs · uid 65532</span>
                 <div class="container-box">
-                  <strong>固定 Python / Node Runner</strong>
-                  <span>无任意宿主 subprocess</span>
+                  <strong>Unified Runner 镜像</strong>
+                  <span>Python 3.12 + Node + Chromium + ffmpeg · digest pin</span>
                 </div>
                 <div class="workspace-box">
-                  <strong>Session Workspace</strong>
-                  <span>用户 / 会话隔离挂载</span>
+                  <strong>/workspace bind mount</strong>
+                  <span>inputs / work / outputs · 用户×会话隔离</span>
                 </div>
               </div>
             </div>
           </div>
 
-          <h3>默认资源护栏</h3>
+          <h3>容器硬化基线</h3>
+          <div class="plain-grid">
+            <div><strong>网络与文件系统</strong><p><code>network_mode=none</code>、根文件系统只读、<code>/tmp</code> 为 noexec/nosuid tmpfs（64&nbsp;MiB）；容器以 <code>sleep infinity</code> 常驻，命令经 exec 注入。</p></div>
+            <div><strong>身份与能力</strong><p>非 root（uid/gid 65532）、<code>cap_drop=ALL</code>、<code>no-new-privileges</code>、默认拒绝的 seccomp 白名单（显式省略 io_uring）。</p></div>
+            <div><strong>镜像 digest pin</strong><p>镜像必须以 <code>@sha256:</code> 固定；未 pin 时 probe 直接不可用。基础镜像同样按 digest 固定，Bootstrap 冒烟通过后才原子落盘。</p></div>
+            <div><strong>执行环境净化</strong><p>Python 强制 <code>-I -B</code> 隔离模式；<code>PIP_NO_INDEX=1</code>、代理变量置空；前端工具链预装在镜像 <code>/node_modules</code>，零下载、不占工作区配额。</p></div>
+          </div>
+
+          <h3>生命周期与双 TTL</h3>
+          <div class="code-block">
+            <div class="code-header">
+              <span>状态机 · services/sandbox.py + core/scheduler.py</span>
+              <button type="button" data-copy-code>复制</button>
+            </div>
+            <pre><code>CREATED → COLD → STARTING → RUNNING → WARM_IDLE → (COLD | EXPIRED)
+<span class="code-comment"># STARTING 先落库占位再调 Docker，容量统计含 STARTING/RUNNING/WARM_IDLE</span>
+<span class="code-comment"># 超时 kill：容器被丢弃回 COLD；工作区数据保留</span>
+<span class="code-comment"># 清理调度器对 STARTING/RUNNING 会话不动 bind mount（看门狗保护）</span></code></pre>
+          </div>
+          <table>
+            <thead><tr><th>维度</th><th>闲置 TTL</th><th>绝对 TTL</th><th>到期动作</th></tr></thead>
+            <tbody>
+              <tr><td>容器（runtime）</td><td>180s</td><td>1800s</td><td>删除容器，会话降级 COLD（cool-down，工作区保留）</td></tr>
+              <tr><td>工作区（workspace）</td><td>1800s（活动可外推）</td><td>86400s（创建即定死，不可外推）</td><td>删容器 + 二次逃逸校验后 <code>rmtree</code>，会话 EXPIRED</td></tr>
+            </tbody>
+          </table>
+
+          <h3>资源护栏</h3>
           <div class="metric-row">
             <div><strong>180s</strong><span>Wall time</span></div>
             <div><strong>2 CPU</strong><span>CPU 配额</span></div>
-            <div><strong>2 GiB</strong><span>Memory</span></div>
-            <div><strong>256</strong><span>PIDs max</span></div>
+            <div><strong>2 GiB</strong><span>Memory（禁 swap）</span></div>
+            <div><strong>512</strong><span>PIDs（含线程）</span></div>
             <div><strong>256 MiB</strong><span>Workspace disk</span></div>
-            <div><strong>5 MiB</strong><span>Output</span></div>
+            <div><strong>5 MiB</strong><span>Output 截断</span></div>
           </div>
-          <p class="muted">以上为 <code>backend/app/core/config.py</code> 当前默认值，可由部署配置覆盖；实际能力以 probe 为准。</p>
-
-          <h3>Agent 沙箱工具</h3>
-          <p>
-            Agent 可以在授权后创建/复用沙箱 Session、写入 UTF-8 文件、读取和列举工作区文件、执行固定 runner，
-            并把结果导出为可持久化 Artifact。路径、参数数、单文件字节数、输出量、空闲/绝对 TTL、
-            单用户并发和宿主容量均受限。
+          <p class="muted">
+            磁盘配额是双机制：内核级 <code>fsize</code> ulimit 限单文件 + 宿主侧聚合统计在写入前后与执行轮询每一拍检查。
+            宿主层另有保护：单用户 2 个活跃容器、部署级 20 个、宿主内存分配 ≤70%、CPU ≤80%、保留磁盘 ≥20&nbsp;GiB、
+            单用户留存工作区 ≤10 个。默认值见 <code>backend/app/core/config.py</code>（<code>LEARNGRAPH_SANDBOX_*</code>）。
           </p>
-          <div class="callout callout-danger">
-            <span class="callout-icon">×</span>
+
+          <h3>一次 Agent 命令的执行管线</h3>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>argv 策略</strong><p>解释器白名单（python/node），禁止 <code>-c/-m/-e/--eval/-p/-i</code> 内联代码；入口必须是工作区内相对 <code>.py</code>/<code>.js</code> 文件；cwd 只能是 <code>.</code>；参数数与单参字节受限。</p></div></li>
+            <li><span>02</span><div><strong>破坏性预授权</strong><p><code>rm / dd / mkfs / Remove-Item</code> 等命令按路径逐一核对会话级 Grant（仅 <code>work/</code> 子树，TTL 60s–24h）；缺失则 403 授权挑战经 SSE 弹窗回传。</p></div></li>
+            <li><span>03</span><div><strong>幂等与审计</strong><p><code>Idempotency-Key</code> 去重；持久化 <code>SandboxAgentCommand</code> 只存 argv 摘要与脱敏副本，stdout/stderr 落库前同样脱敏。</p></div></li>
+            <li><span>04</span><div><strong>容量与容器</strong><p>进程锁 + 跨进程文件锁下校验用户/宿主容量，先提交 STARTING 占位再 <code>docker create</code>；失败回滚 COLD。</p></div></li>
+            <li><span>05</span><div><strong>快照 → 执行 → 恢复</strong><p>执行前对工作区做 inode 级快照；100ms 粒度轮询超时与聚合配额；执行后凡未授权的删除一律从快照恢复并抛授权挑战——argv 拦不住的 <code>shutil.rmtree</code> 类软删除由此兜底。</p></div></li>
+            <li><span>06</span><div><strong>结果与 SSE</strong><p>exit code / 超时 / 截断 / 延迟落库；结果转成 <code>sandbox_status</code> / <code>sandbox_artifact</code> MessagePart 流式呈现。</p></div></li>
+          </ol>
+
+          <h3>双层存储：物理工作区 + 逻辑工作区</h3>
+          <div class="plain-grid">
+            <div><strong>物理层（bind mount）</strong><p>宿主 <code>{root}/{user}/{session}</code> 挂载为容器 <code>/workspace</code>；随沙箱会话过期被清理。</p></div>
+            <div><strong>逻辑层（内容寻址）</strong><p><code>SessionWorkspaceEntry</code> + <code>ContentBlob</code>（sha256 去重、引用计数）随聊天会话存续。写入双写两层、读取优先逻辑层——<strong>Docker 不可用时附件读取与文件列举依然可用</strong>。</p></div>
+          </div>
+
+          <h3>Agent 工具面</h3>
+          <p>
+            六个工具（<code>sandbox_write_file / read_file / list_files / exec / transcribe_audio / publish_file</code>）
+            仅在 <code>workspace.manage</code> 权限且 <code>SANDBOX_AGENT_ENABLED</code> 时注入；<code>chat_session_id</code>
+            由服务端注入，模型不可伪造。Agent 模式开流前先过 <code>agent_sandbox_readiness()</code> 就绪契约，
+            不可用则整轮拒绝并给出中文修复步骤。音频转写是宿主侧桥：容器不联网、不接触凭据，ASR 调用在宿主完成计费与执行后回写工作区。
+          </p>
+
+          <h3>API 面</h3>
+          <table>
+            <thead><tr><th>端点组</th><th>权限</th><th>职责</th></tr></thead>
+            <tbody>
+              <tr><td><code>/sandbox/profiles</code> · <code>/bootstrap*</code> · <code>/agent/readiness</code></td><td>成员 / <code>workspace.write</code></td><td>能力探测、一键镜像构建（进度/日志）、Agent 就绪契约</td></tr>
+              <tr><td><code>/sandbox/agent/sessions</code> · <code>/agent/commands</code> · <code>/agent/files/*</code></td><td><code>workspace.manage</code></td><td>Agent 会话、命令执行（幂等）、文件读写列举</td></tr>
+              <tr><td><code>/sandbox/tasks*</code> · <code>/sessions*</code></td><td>成员</td><td>固定 runner 任务（file_inspect / extract_inert_text）、会话查询与手动清理</td></tr>
+              <tr><td><code>/sandbox/workspace/*</code> · <code>/authorizations*</code></td><td><code>workspace.manage</code> / <code>workspace.write</code></td><td>逻辑工作区条目与发布；破坏性删除 Grant 的创建与吊销</td></tr>
+            </tbody>
+          </table>
+
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
             <div>
-              <strong>破坏性路径需要额外授权</strong>
-              <p>删除等高风险命令由 SandboxAuthorizationService 识别并要求会话级 Grant；阻断和授权挑战都会进入审计与 SSE。</p>
+              <strong>已知权衡与占位（阅读代码前请先了解）</strong>
+              <p>
+                seccomp 相对 Docker 默认档<strong>有意放行</strong> <code>clone/unshare/chroot</code> 以支持 Chromium 的
+                user-namespace 沙箱；删除 Grant 在 TTL 窗口内可重复使用（非一次性）；
+                <code>runtime_kind</code> 的两个取值已解析到同一镜像（<code>python-node-browser</code> 已标记废弃）；
+                <code>network_policy.allowed_hosts</code>、任务队列（<code>SANDBOX_QUEUED_TASKS_PER_USER</code>）与
+                <code>SANDBOX_TASK_TTL_SECONDS</code> 为占位，当前执行全部同步阻塞。
+                沙箱验收依赖需要真实 Docker 的 <code>backend/scripts/verify_sandbox_runtime.py</code> 端到端脚本。
+              </p>
             </div>
           </div>
-          <div class="source-ref">来源：<code>backend/app/services/sandbox.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/providers/remote/sandbox.py</code></div>
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>三个不同的 “sandbox”</strong>
+              <p>本节指 Docker 执行沙箱；前端另有 iframe 生成式组件预览（<code>sandbox-artifact.tsx</code>，严格 CSP、<code>connect-src 'none'</code>），以及 <code>MessagePart.type="sandbox"</code> 这一混合渲染类型。三者互不相同，勿混用。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/sandbox.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/services/session_workspace.py</code> · <code>backend/app/providers/remote/sandbox.py</code> · <code>backend/sandbox/</code></div>
         </section>
 
         <section id="memory" class="doc-section" data-title="记忆系统">
@@ -714,8 +791,9 @@ npm.cmd run check</code></pre>
             </div>
           </div>
           <p>
-            Memory 采用“Canonical 事实 + Provider 投影”的设计。每条记忆由 LearnGraph 生成稳定
-            <code>lgm_&lt;uuid&gt;</code>；Provider 路径或 Mem0 UUID 只是可重建 Binding。
+            记忆系统是一套 Goal-Scoped Memory Graph：Canonical 事实存 SQLite，Provider 只做可重建投影。
+            每条记忆由 LearnGraph 生成稳定 <code>lgm_&lt;uuid&gt;</code>；Provider 路径或 Mem0 UUID 只是 Binding。
+            基线召回不依赖任何外部模型；抽取、语义检索、会话摘要三条增强管线按工作区独立开启。
           </p>
 
           <div class="memory-layout">
@@ -732,30 +810,112 @@ npm.cmd run check</code></pre>
             </div>
           </div>
 
-          <h3>作用域与注入</h3>
-          <div class="plain-grid">
-            <div><strong>Workspace Memory</strong><p>工作区共同记忆；只有 Workspace 与当前 Session 开关都开启时才注入。</p></div>
-            <div><strong>Session Memory</strong><p>只能绑定同一工作区内的真实 Session，也只能注入所属 Session。</p></div>
-            <div><strong>Zones</strong><p><code>hot</code>、<code>recent</code>、<code>topics</code>、<code>archive</code> 四区组织投影。</p></div>
-            <div><strong>CAS</strong><p>更新推荐携带 <code>expected_revision</code>；冲突返回 409 并修复 Provider 投影到胜出版本。</p></div>
+          <h3>记忆类型注册表</h3>
+          <p>
+            九种类型集中定义在 <code>domain/memory_types.py</code>，每种声明默认知识作用域、跨作用域合并策略与衰减策略。
+            权威业务状态（掌握分、路线版本、存储路径等）禁止写入记忆正文，创建时会被 422 拒绝。
+          </p>
+          <table>
+            <thead><tr><th>类型</th><th>默认作用域</th><th>合并策略</th><th>衰减</th></tr></thead>
+            <tbody>
+              <tr><td><code>semantic_memory</code> 语义事实</td><td>workspace</td><td>UNION</td><td>SLOW</td></tr>
+              <tr><td><code>learning_preference</code> 学习偏好</td><td>workspace</td><td>INHERIT_UNTIL_OVERRIDE</td><td>NONE</td></tr>
+              <tr><td><code>teacher_focus</code> 教学侧重</td><td>goal</td><td>UNION</td><td>GOAL_LIFECYCLE</td></tr>
+              <tr><td><code>misconception</code> 错误概念</td><td>node</td><td>LOCAL_ONLY</td><td>FAST（验证驱动）</td></tr>
+              <tr><td><code>strategy_effectiveness</code> 策略有效性</td><td>goal</td><td>KEYED_MERGE</td><td>SLOW</td></tr>
+              <tr><td><code>decision</code> 决定</td><td>goal</td><td>APPEND</td><td>SLOW</td></tr>
+              <tr><td><code>goal_constraint</code> 目标约束</td><td>goal</td><td>OVERRIDE</td><td>GOAL_LIFECYCLE</td></tr>
+              <tr><td><code>ai_observation</code> AI 观察</td><td>session</td><td>LOCAL_ONLY</td><td>FAST（需确认）</td></tr>
+              <tr><td><code>event_summary</code> 事件总结</td><td>workspace</td><td>APPEND</td><td>SLOW</td></tr>
+            </tbody>
+          </table>
+
+          <h3>召回管线（每轮对话）</h3>
+          <ol class="steps">
+            <li><span>01</span><div><strong>策略闸门</strong><p>工作区总开关与 Session 开关必须同时开启，否则返回空包；Agent 的记忆/跨会话检索工具随同一开关一起消失，关记忆等于真隔离。</p></div></li>
+            <li><span>02</span><div><strong>候选筛选</strong><p>只取 <code>active</code> 且位于 <code>hot / recent / topics</code> 区的记录；<code>archive</code> 区不参与召回。会话命名空间只见本 Session。</p></div></li>
+            <li><span>03</span><div><strong>作用域动态继承</strong><p>子作用域不复制父记忆，查询时按 workspace → goal → node 组装有效视图；当前消息与选中节点作为召回上下文传入。</p></div></li>
+            <li><span>04</span><div><strong>打分与语义放大</strong><p>启发式得分乘上可选的 Embedding 余弦相似度放大项；Embedding 未配置、失败或预算耗尽时静默退回纯启发式。</p></div></li>
+            <li><span>05</span><div><strong>类型感知合并</strong><p><code>OVERRIDE / INHERIT_UNTIL_OVERRIDE</code> 只保留最近作用域赢家并记录冲突；<code>LOCAL_ONLY</code> 不跨界。</p></div></li>
+            <li><span>06</span><div><strong>Top-8 + Token 预算</strong><p>注入块受输入预算约 8%（400–3000 tokens，CJK 感知估算）约束，低排名条目被丢弃而非溢出；只有实际注入的记忆才累计访问强化。</p></div></li>
+          </ol>
+          <div class="code-block">
+            <div class="code-header">
+              <span>打分公式 · services/memory.py</span>
+              <button type="button" data-copy-code>复制</button>
+            </div>
+            <pre><code>strength = importance + 0.25·ln(1+access) + 0.30·confirm + 0.20·success
+           + goal_bonus − decay_rate·elapsed_days − conflict_penalty
+score    = strength × proximity × confidence × zone_factor × boost
+<span class="code-comment"># proximity: node 1.0 / goal 0.85 / session 0.8 / workspace 0.55</span>
+<span class="code-comment"># zone_factor: hot 1.0 / recent 0.9 / topics 0.8；resolved 误区降至 0.15</span>
+<span class="code-comment"># 配置 Embedding 后: score ×= 1 + weight·max(cosine, 0)</span></code></pre>
           </div>
 
+          <h3>草稿流：唯一的自动写入通道</h3>
+          <p>
+            Agent 与后台抽取都不能直写长期记忆，一切变更先落 <code>MemoryDraft</code>（八种操作）。
+            CREATE 在置信度 ≥ 0.75 且类型不要求确认时可自动提交；UPDATE 一律人工审核；
+            SUPERSEDE 会创建新记忆并以 <code>supersedes_id</code> 记录血缘，旧记录移入 <code>archive</code> 冷区留作审计。
+          </p>
+
           <h3>写入与删除语义</h3>
-          <ol class="steps">
-            <li><span>01</span><div><strong>Canonical mutation</strong><p>创建新 Revision、Provider-neutral Journal 与内容 Hash。</p></div></li>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>Canonical mutation</strong><p>创建新 Revision、Provider-neutral Journal 与内容 Hash；更新走 <code>expected_revision</code> 乐观锁，冲突返回 409。</p></div></li>
             <li><span>02</span><div><strong>Provider projection</strong><p>写入 Active Provider，并按稳定 ID + Revision 精确回读校验。</p></div></li>
             <li><span>03</span><div><strong>Commit binding</strong><p>只有回读 Hash 一致才提交 Binding 与业务事务。</p></div></li>
-            <li><span>04</span><div><strong>Recoverable delete</strong><p>删除后正文使用每记忆独立密钥加密保留 30 分钟；普通 Revision 正文立即清空。</p></div></li>
-            <li><span>05</span><div><strong>Cryptographic destruction</strong><p>窗口到期销毁内容密钥与恢复密文；删除 Journal 元数据最长保留 7 天。</p></div></li>
+            <li><span>04</span><div><strong>Recoverable delete</strong><p>删除后正文以每记忆独立密钥加密保留 30 分钟，密钥落在 SQLite 之外；Revision 正文立即清空。</p></div></li>
+            <li><span>05</span><div><strong>Cryptographic destruction</strong><p>窗口到期由保留期调度器销毁内容密钥与恢复密文；删除 Journal 元数据最长保留 7 天。</p></div></li>
           </ol>
+
+          <h3>可选增强管线</h3>
+          <p>
+            配置集中在 WorkspaceSetting <code>memory.enhancement</code>，三条管线互相独立、默认关闭；
+            全部调用计入 <code>usage_events</code>（feature 分别为
+            <code>memory_extraction</code>、<code>memory_embedding</code>、<code>context_summarization</code>），常见模型自动落价。
+          </p>
+          <div class="plain-grid">
+            <div>
+              <strong>自动记忆抽取（Dreaming 式）</strong>
+              <p>后台调度器在会话安静（默认 180s）后，用独立配置的模型从新增轮次抽取候选记忆；
+              游标存 <code>memory_extraction_states</code>，按 content hash 去重，严格走草稿流。预算耗尽时跳过且不推进游标。</p>
+            </div>
+            <div>
+              <strong>语义检索插件（Embedding）</strong>
+              <p>任意 OpenAI 兼容 <code>/embeddings</code> 端点（如 Qwen text-embedding-v4）；
+              向量缓存于 <code>memory_embeddings</code> 并在召回时懒回填，支持一键重建索引。移除配置即恢复无 Embedding 行为。</p>
+            </div>
+            <div>
+              <strong>会话滚动摘要</strong>
+              <p>长会话较早内容由模型滚动压缩为 <code>ContextSummary kind='model'</code>；
+              聊天压缩优先复用覆盖前缀，仅对未覆盖尾部降级为机械截断。模型留空时复用抽取模型。热路径零额外延迟。</p>
+            </div>
+            <div>
+              <strong>注入预览（透明度）</strong>
+              <p><code>GET /memory/package</code> 返回某 Session 下一轮实际注入的记忆清单、得分、作用域冲突与完整 prompt 文本；
+              前端记忆页提供「AI 眼中的我」一键预览。</p>
+            </div>
+          </div>
+
+          <h3>API 面</h3>
+          <table>
+            <thead><tr><th>端点组</th><th>职责</th></tr></thead>
+            <tbody>
+              <tr><td><code>/memory</code> · <code>/{id}/revisions</code> · <code>/{id}/journal</code> · <code>/{id}/bindings</code></td><td>CRUD、版本历史与回滚、审计日志、Provider Binding</td></tr>
+              <tr><td><code>/memory/drafts</code> · <code>/drafts/{id}/decision</code></td><td>草稿提交与 commit / reject 审核</td></tr>
+              <tr><td><code>/memory/policy</code> · <code>/memory/package</code></td><td>工作区 / Session 双开关；注入预览</td></tr>
+              <tr><td><code>/memory/enhancement</code> · <code>/reindex</code> · <code>/extract/{sid}</code> · <code>/summarize/{sid}</code></td><td>增强管线配置、向量重建、手动抽取 / 摘要触发</td></tr>
+              <tr><td><code>/memory/export</code> · <code>/maintenance/purge-expired</code></td><td>Markdown ZIP 导出（含 manifest 哈希）；保留期清理</td></tr>
+            </tbody>
+          </table>
           <div class="callout callout-warning">
             <span class="callout-icon">!</span>
             <div>
               <strong>切换 Provider 必须迁移</strong>
-              <p>记录属于另一 Provider 时，Mutation 返回 <code>409 memory_provider_migration_required</code>；不会静默双写到新 Provider。</p>
+              <p>记录属于另一 Provider 世代时，Mutation 返回 <code>409 memory_provider_migration_required</code>；不会静默双写到新 Provider。</p>
             </div>
           </div>
-          <div class="source-ref">来源：<code>backend/docs/memory.md</code> · <code>backend/app/providers/ports/memory.py</code> · <code>backend/app/providers/local/memory.py</code></div>
+          <div class="source-ref">来源：<code>backend/app/services/memory.py</code> · <code>backend/app/services/memory_enhancement.py</code> · <code>backend/app/domain/memory_types.py</code> · <code>backend/tests/test_memory_subsystem.py</code></div>
         </section>
 
         <section id="streaming" class="doc-section" data-title="消息与 SSE">

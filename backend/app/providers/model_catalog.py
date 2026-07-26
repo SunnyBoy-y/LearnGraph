@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.providers.qwen_catalog import qwen_model_defaults
+
 
 UNKNOWN_MODEL_CONTEXT_TOKENS = 256_000
 
@@ -119,7 +121,67 @@ def model_context_defaults(model_id: str) -> dict[str, Any]:
             "context_window_tokens": 256_000,
             "source_url": "https://platform.kimi.com/docs/models",
         }
+    if (
+        normalized.startswith(
+            (
+                "qwen",
+                "qwq",
+                "deepseek",
+                "siliconflow/deepseek",
+                "vanchin/deepseek",
+                "glm-",
+                "kimi/",
+                "minimax",
+                "xiaomi/mimo-",
+                "mimo-",
+                "stepfun/",
+            )
+        )
+    ):
+        return qwen_model_defaults(model_id)
     return {
         "context_window_tokens": UNKNOWN_MODEL_CONTEXT_TOKENS,
         "source_url": None,
     }
+
+
+def unified_model_defaults(
+    model_id: str,
+    *,
+    provider_type: str | None = None,
+) -> dict[str, Any]:
+    """Project-wide defaults interface built on the models.dev-shaped schema.
+
+    Base defaults come from the reviewed vendor catalogues; when the model id
+    matches a models.dev record (regardless of provider), the models.dev
+    snapshot overrides context window, output limit, thinking availability,
+    and multimodal input support.  Workspace-saved per-Provider configuration
+    is merged later in ``model_options`` and always wins over both.
+    """
+
+    from app.providers.models_dev import capability_overlay
+
+    normalized_provider = (provider_type or "").strip().casefold()
+    normalized_model = model_id.strip().casefold()
+    if normalized_provider == "qwen" or normalized_model.startswith(
+        (
+            "qwen",
+            "qwq",
+            "deepseek",
+            "siliconflow/deepseek",
+            "vanchin/deepseek",
+            "glm-",
+            "kimi",
+            "minimax",
+            "xiaomi/mimo-",
+            "mimo-",
+            "stepfun/",
+        )
+    ):
+        base = qwen_model_defaults(model_id)
+    else:
+        base = model_context_defaults(model_id)
+    overlay = capability_overlay(model_id, base)
+    if overlay:
+        base.update(overlay)
+    return base

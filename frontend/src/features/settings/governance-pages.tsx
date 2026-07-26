@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   ArchiveRestore,
   ArrowRight,
+  Brain,
   Building2,
   Check,
   CheckCheck,
@@ -13,11 +14,12 @@ import {
   Database,
   Download,
   Eye,
-  FileJson,
+  FileText,
+  Gauge,
   HardDrive,
-  History,
   KeyRound,
   MessageSquareText,
+  Mic,
   Moon,
   Play,
   RefreshCcw,
@@ -39,19 +41,25 @@ import {
   deleteAuditEvents,
   downloadFullBackup,
   discoverProviderModels,
-  exportWorkspace,
   getAccountDeletionImpact,
+  getMemoryEnhancement,
+  getMemoryPolicy,
   getMigration,
   listAuditEvents,
   listMigrationAdapters,
   listMigrations,
+  listProviderCatalog,
   listProviders,
+  listSessions,
   listSettings,
   listWorkspaces,
   preflightMigration,
+  reindexMemoryEmbeddings,
   rollbackMigration,
   restoreFullBackup,
   startMigration,
+  updateMemoryEnhancement,
+  updateMemoryPolicy,
   updateSetting,
 } from "@/api";
 import { authStore } from "@/api/auth-store";
@@ -65,6 +73,7 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
+import { SessionCombobox } from "@/components/shared/session-combobox";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -104,13 +113,19 @@ import { Switch } from "@/components/ui/switch";
 import {
   areChatSuggestedPromptsEnabled,
   CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
+  CHAT_CONTEXT_USAGE_SETTING_KEY,
+  CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+  CHAT_DICTATION_CLEANUP_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
+  isChatContextUsageEnabled,
+  isChatDictationCleanupEnabled,
   readChatFeatureModelSetting,
 } from "@/lib/workspace-settings";
 import { cn } from "@/lib/utils";
 import { DatabaseConfigurationSheet } from "@/features/settings/database-configuration-sheet";
 import type { AuditEvent } from "@/types/audit";
+import type { MemoryEnhancementUpdateRequest } from "@/types/memory";
 import type {
   MigrationDatabaseKind,
   MigrationJob,
@@ -123,6 +138,7 @@ const AUDIT_PAGE_SIZE = 20;
 const MODEL_PROVIDER_TYPES = new Set([
   "openai_responses",
   "openai_compatible_chat",
+  "qwen",
   "deepseek_chat",
   "anthropic_messages",
 ]);
@@ -1850,19 +1866,11 @@ export function AuditPage() {
   );
 }
 
-function AccountSecurity({ username }: { username: string }) {
+function PasswordSecurity({ username }: { username: string }) {
   const auth = useAuth();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newPasswordConfirmation, setNewPasswordConfirmation] = useState("");
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const [deletePassword, setDeletePassword] = useState("");
-  const [deleteConfirmation, setDeleteConfirmation] = useState("");
-  const deletionImpact = useQuery({
-    queryKey: ["account-deletion-impact"],
-    queryFn: getAccountDeletionImpact,
-    enabled: deleteOpen,
-  });
   const passwordChange = useMutation({
     mutationFn: () => auth.changePassword(currentPassword, newPassword),
     onError: (error) => toast.error(error.message),
@@ -1873,15 +1881,110 @@ function AccountSecurity({ username }: { username: string }) {
       toast.success("密码已修改，其他设备上的登录会话已撤销");
     },
   });
+  const passwordReady =
+    currentPassword.length > 0 &&
+    newPassword.length >= 12 &&
+    newPassword === newPasswordConfirmation;
+
+  return (
+    <Surface className="p-5">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(320px,1.2fr)]">
+        <div>
+          <div className="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            <KeyRound className="size-5" />
+          </div>
+          <h2 className="mt-4 text-base font-semibold">修改密码</h2>
+          <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
+            新密码至少 12 位，并同时包含字母、数字和足够多的不同字符。修改成功后，当前设备会保持登录，其他设备会退出。
+          </p>
+        </div>
+        <form
+          className="grid gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (newPassword !== newPasswordConfirmation) {
+              toast.error("两次输入的新密码不一致");
+              return;
+            }
+            passwordChange.mutate();
+          }}
+        >
+          <input
+            aria-hidden="true"
+            autoComplete="username"
+            className="sr-only"
+            readOnly
+            tabIndex={-1}
+            value={username}
+          />
+          <Label className="grid gap-2">
+            当前密码
+            <Input
+              autoComplete="current-password"
+              onChange={(event) => setCurrentPassword(event.target.value)}
+              required
+              type="password"
+              value={currentPassword}
+            />
+          </Label>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Label className="grid gap-2">
+              新密码
+              <Input
+                autoComplete="new-password"
+                minLength={12}
+                onChange={(event) => setNewPassword(event.target.value)}
+                required
+                type="password"
+                value={newPassword}
+              />
+            </Label>
+            <Label className="grid gap-2">
+              再次输入新密码
+              <Input
+                autoComplete="new-password"
+                minLength={12}
+                onChange={(event) =>
+                  setNewPasswordConfirmation(event.target.value)
+                }
+                required
+                type="password"
+                value={newPasswordConfirmation}
+              />
+            </Label>
+          </div>
+          {newPasswordConfirmation &&
+          newPassword !== newPasswordConfirmation ? (
+            <p className="text-xs text-destructive">两次输入的新密码不一致。</p>
+          ) : null}
+          <Button
+            className="w-fit"
+            disabled={!passwordReady || passwordChange.isPending}
+            type="submit"
+          >
+            {passwordChange.isPending ? "正在修改…" : "修改密码"}
+          </Button>
+        </form>
+      </div>
+    </Surface>
+  );
+}
+
+function AccountDeletion({ username }: { username: string }) {
+  const auth = useAuth();
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const deletionImpact = useQuery({
+    queryKey: ["account-deletion-impact"],
+    queryFn: getAccountDeletionImpact,
+    enabled: deleteOpen,
+  });
   const accountDeletion = useMutation({
     mutationFn: () => auth.deleteAccount(deletePassword, deleteConfirmation),
     onError: (error) => toast.error(error.message),
     onSuccess: () => toast.success("账户已删除"),
   });
-  const passwordReady =
-    currentPassword.length > 0 &&
-    newPassword.length >= 12 &&
-    newPassword === newPasswordConfirmation;
   const deletionReady =
     deletionImpact.data?.can_delete === true &&
     deletePassword.length > 0 &&
@@ -1898,102 +2001,18 @@ function AccountSecurity({ username }: { username: string }) {
 
   return (
     <>
-      <Surface className="p-5">
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,0.8fr)_minmax(320px,1.2fr)]">
-          <div>
-            <div className="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
-              <KeyRound className="size-5" />
-            </div>
-            <h2 className="mt-4 text-base font-semibold">修改密码</h2>
-            <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-              新密码至少 12 位，并同时包含字母、数字和足够多的不同字符。修改成功后，当前设备会保持登录，其他设备会退出。
-            </p>
-          </div>
-          <form
-            className="grid gap-4"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (newPassword !== newPasswordConfirmation) {
-                toast.error("两次输入的新密码不一致");
-                return;
-              }
-              passwordChange.mutate();
-            }}
-          >
-            <input
-              aria-hidden="true"
-              autoComplete="username"
-              className="sr-only"
-              readOnly
-              tabIndex={-1}
-              value={username}
-            />
-            <Label className="grid gap-2">
-              当前密码
-              <Input
-                autoComplete="current-password"
-                onChange={(event) => setCurrentPassword(event.target.value)}
-                required
-                type="password"
-                value={currentPassword}
-              />
-            </Label>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Label className="grid gap-2">
-                新密码
-                <Input
-                  autoComplete="new-password"
-                  minLength={12}
-                  onChange={(event) => setNewPassword(event.target.value)}
-                  required
-                  type="password"
-                  value={newPassword}
-                />
-              </Label>
-              <Label className="grid gap-2">
-                再次输入新密码
-                <Input
-                  autoComplete="new-password"
-                  minLength={12}
-                  onChange={(event) =>
-                    setNewPasswordConfirmation(event.target.value)
-                  }
-                  required
-                  type="password"
-                  value={newPasswordConfirmation}
-                />
-              </Label>
-            </div>
-            {newPasswordConfirmation &&
-            newPassword !== newPasswordConfirmation ? (
-              <p className="text-xs text-destructive">两次输入的新密码不一致。</p>
-            ) : null}
-            <Button
-              className="w-fit"
-              disabled={!passwordReady || passwordChange.isPending}
-              type="submit"
-            >
-              {passwordChange.isPending ? "正在修改…" : "修改密码"}
-            </Button>
-          </form>
+      <div className="flex flex-col gap-3 rounded-xl border border-red-200/70 bg-background/60 p-4 sm:flex-row sm:items-center dark:border-red-900/60">
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium text-destructive">删除账户</p>
+          <p className="mt-1 text-sm leading-6 text-muted-foreground">
+            删除会立即撤销全部登录和成员权限，并去除账户身份信息。为保留证据与审计完整性，个人工作区中的学习记录不会被伪装成从未发生。
+          </p>
         </div>
-      </Surface>
-
-      <Surface className="border-red-200 bg-red-50/45 p-5 dark:border-red-900 dark:bg-red-950/20">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-          <AlertTriangle className="size-5 shrink-0 text-destructive" />
-          <div className="min-w-0 flex-1">
-            <p className="font-semibold text-destructive">删除账户</p>
-            <p className="mt-1 text-sm leading-6 text-muted-foreground">
-              删除会立即撤销全部登录和成员权限，并去除账户身份信息。为保留证据与审计完整性，个人工作区中的学习记录不会被伪装成从未发生。
-            </p>
-          </div>
-          <Button onClick={() => setDeleteOpen(true)} variant="destructive">
-            <Trash2 className="size-4" />
-            删除我的账户
-          </Button>
-        </div>
-      </Surface>
+        <Button onClick={() => setDeleteOpen(true)} variant="destructive">
+          <Trash2 className="size-4" />
+          删除我的账户
+        </Button>
+      </div>
 
       <AlertDialog onOpenChange={updateDeleteOpen} open={deleteOpen}>
         <AlertDialogContent className="sm:max-w-lg">
@@ -2174,6 +2193,105 @@ export function WorkspaceSettingsPage() {
       toast.success("对话问题提示设置已更新");
     },
   });
+  const saveDictationCleanup = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateSetting(CHAT_DICTATION_CLEANUP_SETTING_KEY, { enabled }),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("语音转写整理设置已更新");
+    },
+  });
+  const saveContextUsage = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateSetting(CHAT_CONTEXT_USAGE_SETTING_KEY, { enabled }),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("上下文用量显示设置已更新");
+    },
+  });
+  const memoryEnhancement = useQuery({
+    queryKey: ["memory-enhancement"],
+    queryFn: getMemoryEnhancement,
+  });
+  const saveMemoryEnhancement = useMutation({
+    mutationFn: (updates: MemoryEnhancementUpdateRequest) =>
+      updateMemoryEnhancement(updates),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (view) => {
+      queryClient.setQueryData(["memory-enhancement"], view);
+      toast.success("记忆设置已更新");
+    },
+  });
+  const reindexEmbeddings = useMutation({
+    mutationFn: reindexMemoryEmbeddings,
+    onError: (error) => toast.error(error.message),
+    onSuccess: async (result) => {
+      toast.success(
+        `索引完成：新嵌入 ${result.embedded} 条 / 已有 ${result.already_indexed} 条`,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["memory-enhancement"] });
+    },
+  });
+  const providerCatalog = useQuery({
+    queryKey: ["provider-catalog"],
+    queryFn: listProviderCatalog,
+  });
+  const memoryPolicy = useQuery({
+    queryKey: ["memory-policy"],
+    queryFn: () => getMemoryPolicy(),
+  });
+  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const [policySessionId, setPolicySessionId] = useState("");
+  useEffect(() => {
+    if (!policySessionId && sessions.data?.[0]) {
+      setPolicySessionId(sessions.data[0].id);
+    }
+  }, [policySessionId, sessions.data]);
+  const sessionPolicy = useQuery({
+    queryKey: ["memory-policy", policySessionId],
+    queryFn: () => getMemoryPolicy(policySessionId),
+    enabled: Boolean(policySessionId),
+  });
+  const savePolicy = useMutation({
+    mutationFn: updateMemoryPolicy,
+    onError: (error) => toast.error(error.message),
+    onSuccess: async () => {
+      toast.success("共同记忆策略已持久化");
+      await queryClient.invalidateQueries({ queryKey: ["memory-policy"] });
+      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+  });
+  const [embeddingModelDraft, setEmbeddingModelDraft] = useState<string | null>(
+    null,
+  );
+  const embeddingProviders = useMemo(() => {
+    const roleByType = new Map(
+      (providerCatalog.data ?? []).map((item) => [item.provider_type, item.role]),
+    );
+    const rows = (providers.data ?? []).filter(
+      (provider) =>
+        provider.enabled && roleByType.get(provider.provider_type) === "embedding",
+    );
+    // A previously configured provider (for example an OpenAI-compatible chat
+    // row that also serves /embeddings) stays selectable after this list
+    // narrowed to the dedicated embedding role.
+    const configuredId = memoryEnhancement.data?.embedding.provider_id;
+    if (configuredId && !rows.some((row) => row.id === configuredId)) {
+      const configured = (providers.data ?? []).find(
+        (row) => row.id === configuredId,
+      );
+      if (configured) rows.push(configured);
+    }
+    return rows;
+  }, [providerCatalog.data, providers.data, memoryEnhancement.data]);
   const saveFeatureModel = useMutation({
     mutationFn: ({
       key,
@@ -2194,19 +2312,6 @@ export function WorkspaceSettingsPage() {
         queryClient.removeQueries({ queryKey: ["suggested-prompts"] });
       }
       toast.success("功能模型设置已更新");
-    },
-  });
-  const workspaceExport = useMutation({
-    mutationFn: exportWorkspace,
-    onError: (error) => toast.error(error.message),
-    onSuccess: (blob) => {
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `learngraph-workspace-${auth.workspaceId}.zip`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-      toast.success("完整工作区导出已生成");
     },
   });
   const current = useMemo(
@@ -2242,6 +2347,16 @@ export function WorkspaceSettingsPage() {
       ),
     [settings.data],
   );
+  const dictationCleanupEnabled = isChatDictationCleanupEnabled(settings.data);
+  const contextUsageEnabled = isChatContextUsageEnabled(settings.data);
+  const dictationCleanupModel = useMemo(
+    () =>
+      readChatFeatureModelSetting(
+        settings.data,
+        CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+      ),
+    [settings.data],
+  );
   const activeWorkspace = useMemo(
     () =>
       (workspaces.data ?? []).find((item) => item.id === auth.workspaceId) ??
@@ -2271,8 +2386,6 @@ export function WorkspaceSettingsPage() {
       </PageFrame>
     );
 
-  const workspaceSettings = settings.data ?? [];
-
   function toggleTheme(value: boolean) {
     setDark(value);
     document.documentElement.classList.toggle("dark", value);
@@ -2289,24 +2402,31 @@ export function WorkspaceSettingsPage() {
     });
   }
 
-  function exportSettings() {
-    const blob = new Blob(
-      [
-        JSON.stringify(
-          { workspace_id: auth.workspaceId, settings: workspaceSettings },
-          null,
-          2,
-        ),
-      ],
-      { type: "application/json" },
-    );
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `learngraph-settings-${auth.workspaceId}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }
+  const memoryExtractionCfg = memoryEnhancement.data?.extraction;
+  const memoryModelValue = featureModelValue(
+    memoryExtractionCfg?.provider_id || null,
+    memoryExtractionCfg?.model_id || null,
+  );
+  // A configured extraction model that discovery no longer lists must stay
+  // visible in the select instead of silently falling back to "未配置".
+  const memoryModelChoices =
+    memoryModelValue !== "default" &&
+    memoryExtractionCfg &&
+    !featureModelChoices.some((choice) => choice.value === memoryModelValue)
+      ? [
+          ...featureModelChoices,
+          {
+            value: memoryModelValue,
+            label: `${
+              (providers.data ?? []).find(
+                (item) => item.id === memoryExtractionCfg.provider_id,
+              )?.display_name ?? memoryExtractionCfg.provider_id
+            } · ${memoryExtractionCfg.model_id}`,
+            providerId: memoryExtractionCfg.provider_id,
+            modelId: memoryExtractionCfg.model_id,
+          },
+        ]
+      : featureModelChoices;
 
   return (
     <PageFrame>
@@ -2395,8 +2515,6 @@ export function WorkspaceSettingsPage() {
         </Surface>
       </div>
 
-      <AccountSecurity username={accountUsername} />
-
       <Surface className="p-5">
         <SectionHeading
           description="这些开关会立即保存到当前工作区"
@@ -2441,12 +2559,178 @@ export function WorkspaceSettingsPage() {
               onCheckedChange={(enabled) => saveSuggestedPrompts.mutate(enabled)}
             />
           </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Mic className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">语音转写智能整理</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  转录时用模型去除语气词并修正错字；每段语音会产生少量模型调用
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="语音转写智能整理"
+              checked={dictationCleanupEnabled}
+              disabled={saveDictationCleanup.isPending}
+              onCheckedChange={(enabled) => saveDictationCleanup.mutate(enabled)}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Gauge className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">上下文用量显示</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  在聊天输入框显示上下文小圆环；悬停可查看上下文大小与距自动压缩的剩余量
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="上下文用量显示"
+              checked={contextUsageEnabled}
+              disabled={saveContextUsage.isPending}
+              onCheckedChange={(enabled) => saveContextUsage.mutate(enabled)}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Brain className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">记忆整理</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  会话空闲后自动提炼长期记忆；模型在下方「记忆整理模型」中配置
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="记忆整理"
+              checked={memoryEnhancement.data?.extraction.enabled ?? false}
+              disabled={
+                memoryEnhancement.isPending || saveMemoryEnhancement.isPending
+              }
+              onCheckedChange={(enabled) =>
+                saveMemoryEnhancement.mutate({ extraction: { enabled } })
+              }
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <FileText className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">会话摘要（LLM 滚动生成）</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  后台把长会话的较早内容滚动压缩成模型摘要，替代机械截断；与记忆整理共用模型
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="会话摘要"
+              checked={memoryEnhancement.data?.summarization.enabled ?? false}
+              disabled={
+                memoryEnhancement.isPending || saveMemoryEnhancement.isPending
+              }
+              onCheckedChange={(enabled) =>
+                saveMemoryEnhancement.mutate({ summarization: { enabled } })
+              }
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Search className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">语义检索（Embedding 插件）</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  记忆召回按相似度增强排序；Embedding 模型在下方配置，不配置时保持默认召回
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="语义检索"
+              checked={memoryEnhancement.data?.embedding.enabled ?? false}
+              disabled={
+                memoryEnhancement.isPending || saveMemoryEnhancement.isPending
+              }
+              onCheckedChange={(enabled) =>
+                saveMemoryEnhancement.mutate({ embedding: { enabled } })
+              }
+            />
+          </div>
         </div>
       </Surface>
 
       <Surface className="p-5">
         <SectionHeading
-          description="可分别为自动标题与下一步问题提示选择模型；留空则跟随对话当前模型。"
+          description="工作区总开关与 Session 开关必须同时启用，记忆才能跨会话注入"
+          title="共同记忆策略"
+        />
+        <div className="mt-5 grid gap-3 lg:grid-cols-2">
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">工作区共同记忆</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                关闭后任何 Session 都不能跨会话注入
+              </p>
+            </div>
+            <Switch
+              aria-label="工作区共同记忆"
+              checked={memoryPolicy.data?.workspace_enabled ?? false}
+              disabled={memoryPolicy.isPending || savePolicy.isPending}
+              onCheckedChange={(workspace_enabled) =>
+                savePolicy.mutate({ workspace_enabled })
+              }
+            />
+          </div>
+          <div className="rounded-xl border p-4">
+            <p className="text-sm font-medium">Session 策略</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              为单个会话单独开启或关闭共同记忆
+            </p>
+            {sessions.data?.length ? (
+              <>
+                <SessionCombobox
+                  className="mt-3"
+                  onChange={setPolicySessionId}
+                  sessions={sessions.data}
+                  value={policySessionId}
+                />
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <span className="text-xs text-muted-foreground">
+                    {sessionPolicy.isError
+                      ? `Session 策略读取失败：${sessionPolicy.error.message}`
+                      : sessionPolicy.data?.effective_enabled
+                        ? "当前有效"
+                        : "当前隔离"}
+                  </span>
+                  <Switch
+                    aria-label="Session 共同记忆"
+                    checked={sessionPolicy.data?.session_enabled ?? false}
+                    disabled={
+                      !policySessionId ||
+                      sessionPolicy.isPending ||
+                      savePolicy.isPending
+                    }
+                    onCheckedChange={(session_enabled) =>
+                      savePolicy.mutate({
+                        session_id: policySessionId,
+                        session_enabled,
+                      })
+                    }
+                  />
+                </div>
+              </>
+            ) : (
+              <p className="mt-3 text-xs text-muted-foreground">
+                当前没有 Session；创建会话后可设置独立策略。
+              </p>
+            )}
+          </div>
+        </div>
+      </Surface>
+
+      <Surface className="p-5">
+        <SectionHeading
+          description="为自动标题、下一步问题提示、语音转写整理、记忆整理与 Embedding 选择模型；对话类功能留空则跟随对话当前模型。"
           title="功能模型"
         />
         <div className="mt-5 grid gap-3 lg:grid-cols-2">
@@ -2514,57 +2798,221 @@ export function WorkspaceSettingsPage() {
               </SelectContent>
             </Select>
           </div>
+          <div className="rounded-xl border p-4">
+            <p className="text-sm font-medium">语音转写整理模型</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              听写时的语气词去除与错字修正；建议选择低价的快速模型
+            </p>
+            <Select
+              disabled={saveFeatureModel.isPending || providers.isPending}
+              onValueChange={(value) => {
+                const parsed = parseFeatureModelValue(value);
+                saveFeatureModel.mutate({
+                  key: CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+                  ...parsed,
+                });
+              }}
+              value={featureModelValue(
+                dictationCleanupModel.provider_id,
+                dictationCleanupModel.model_id,
+              )}
+            >
+              <SelectTrigger aria-label="语音转写整理模型" className="mt-3">
+                <SelectValue placeholder="跟随对话模型" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">跟随对话模型</SelectItem>
+                {featureModelChoices.map((choice) => (
+                  <SelectItem key={choice.value} value={choice.value}>
+                    {choice.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="rounded-xl border p-4">
+            <p className="text-sm font-medium">记忆整理模型</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              自动记忆抽取与会话摘要共用此模型；未配置时两项功能不会运行
+            </p>
+            <Select
+              disabled={
+                saveMemoryEnhancement.isPending ||
+                memoryEnhancement.isPending ||
+                providers.isPending
+              }
+              onValueChange={(value) => {
+                const parsed = parseFeatureModelValue(value);
+                const patch = {
+                  provider_id: parsed.provider_id ?? "",
+                  model_id: parsed.model_id ?? "",
+                };
+                saveMemoryEnhancement.mutate({
+                  extraction: patch,
+                  summarization: patch,
+                });
+              }}
+              value={memoryModelValue}
+            >
+              <SelectTrigger aria-label="记忆整理模型" className="mt-3">
+                <SelectValue placeholder="未配置" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">未配置</SelectItem>
+                {memoryModelChoices.map((choice) => (
+                  <SelectItem key={choice.value} value={choice.value}>
+                    {choice.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="mt-3 flex items-center justify-between gap-3 border-t pt-3">
+              <span className="text-xs text-muted-foreground">
+                高置信新记忆自动写入 Active Memory
+              </span>
+              <Switch
+                aria-label="高置信新记忆自动写入 Active Memory"
+                checked={memoryEnhancement.data?.extraction.auto_commit ?? true}
+                disabled={
+                  memoryEnhancement.isPending || saveMemoryEnhancement.isPending
+                }
+                onCheckedChange={(auto_commit) =>
+                  saveMemoryEnhancement.mutate({ extraction: { auto_commit } })
+                }
+              />
+            </div>
+          </div>
+          <div className="rounded-xl border p-4">
+            <p className="text-sm font-medium">Embedding 模型</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              语义检索召回使用；在
+              <a
+                className="underline underline-offset-2"
+                href={`/w/${auth.workspaceId}/settings/providers`}
+              >
+                Provider 管理
+              </a>
+              的「Embedding」分类下创建服务
+            </p>
+            <Select
+              disabled={
+                saveMemoryEnhancement.isPending ||
+                memoryEnhancement.isPending ||
+                providers.isPending
+              }
+              onValueChange={(value) =>
+                saveMemoryEnhancement.mutate({
+                  embedding: { provider_id: value === "none" ? "" : value },
+                })
+              }
+              value={memoryEnhancement.data?.embedding.provider_id || "none"}
+            >
+              <SelectTrigger aria-label="Embedding Provider" className="mt-3">
+                <SelectValue placeholder="选择 Embedding Provider" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">未配置</SelectItem>
+                {embeddingProviders.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.display_name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="mt-2 flex gap-2">
+              <Input
+                aria-label="Embedding 模型 ID"
+                onChange={(event) => setEmbeddingModelDraft(event.target.value)}
+                placeholder="Embedding 模型 ID，如 text-embedding-v4"
+                value={
+                  embeddingModelDraft ??
+                  memoryEnhancement.data?.embedding.model_id ??
+                  ""
+                }
+              />
+              <Button
+                disabled={
+                  saveMemoryEnhancement.isPending ||
+                  embeddingModelDraft === null ||
+                  embeddingModelDraft.trim() ===
+                    (memoryEnhancement.data?.embedding.model_id ?? "")
+                }
+                onClick={() =>
+                  saveMemoryEnhancement.mutate(
+                    {
+                      embedding: {
+                        model_id: (embeddingModelDraft ?? "").trim(),
+                      },
+                    },
+                    { onSuccess: () => setEmbeddingModelDraft(null) },
+                  )
+                }
+                size="sm"
+                variant="outline"
+              >
+                保存
+              </Button>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3 border-t pt-3">
+              <span className="text-xs text-muted-foreground">
+                已索引 {memoryEnhancement.data?.indexed_memories ?? 0} /{" "}
+                {memoryEnhancement.data?.active_memories ?? 0} 条活跃记忆
+              </span>
+              <Button
+                disabled={
+                  reindexEmbeddings.isPending ||
+                  !(memoryEnhancement.data?.embedding.enabled ?? false)
+                }
+                onClick={() => reindexEmbeddings.mutate()}
+                size="sm"
+                variant="outline"
+              >
+                <RefreshCcw
+                  className={
+                    reindexEmbeddings.isPending
+                      ? "size-4 animate-spin"
+                      : "size-4"
+                  }
+                />
+                重建索引
+              </Button>
+            </div>
+          </div>
         </div>
       </Surface>
 
-      <Surface className="p-5">
-        <SectionHeading
-          description="导出当前工作区配置或完整归档；凭据与认证密文不会进入导出。"
-          title="其他设置"
-        />
-        <div className="mt-4 flex flex-wrap gap-2">
-          <Button onClick={exportSettings} variant="outline">
-            <FileJson className="size-4" />
-            导出设置 JSON
-          </Button>
-          <Button
-            disabled={workspaceExport.isPending}
-            onClick={() => workspaceExport.mutate()}
-            variant="outline"
-          >
-            <HardDrive className="size-4" />
-            {workspaceExport.isPending ? "正在生成…" : "导出完整工作区 ZIP"}
-          </Button>
-          <Button asChild variant="outline">
-            <a
-              href={`/w/${encodeURIComponent(auth.workspaceId)}/settings/audit`}
-            >
-              <History className="size-4" />
-              查看审计
-            </a>
-          </Button>
-        </div>
-      </Surface>
+      <PasswordSecurity username={accountUsername} />
 
       <Surface className="border-red-200 bg-red-50/45 p-5 dark:border-red-900 dark:bg-red-950/20">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-          <AlertTriangle className="size-5 shrink-0 text-destructive" />
-          <div className="min-w-0 flex-1">
+        <div className="flex items-start gap-3">
+          <AlertTriangle className="mt-0.5 size-5 shrink-0 text-destructive" />
+          <div className="min-w-0">
             <p className="font-semibold text-destructive">危险区</p>
             <p className="mt-1 text-sm leading-6 text-muted-foreground">
-              记忆删除提供恢复窗口；Provider 停用会立即阻止新的远程调用。
+              以下操作影响范围大，执行前会二次确认并说明影响范围。
             </p>
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button asChild variant="outline">
-              <a href={`/w/${auth.workspaceId}/memory`}>管理可恢复记忆</a>
-            </Button>
-            <Button asChild variant="outline">
-              <a href={`/w/${auth.workspaceId}/settings/providers`}>
-                管理 Provider
-              </a>
-            </Button>
+        </div>
+        <div className="mt-4 space-y-3">
+          <div className="flex flex-col gap-3 rounded-xl border border-red-200/70 bg-background/60 p-4 sm:flex-row sm:items-center dark:border-red-900/60">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium">记忆与 Provider</p>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">
+                记忆删除提供恢复窗口；Provider 停用会立即阻止新的远程调用。
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button asChild variant="outline">
+                <a href={`/w/${auth.workspaceId}/memory`}>管理可恢复记忆</a>
+              </Button>
+              <Button asChild variant="outline">
+                <a href={`/w/${auth.workspaceId}/settings/providers`}>
+                  管理 Provider
+                </a>
+              </Button>
+            </div>
           </div>
+          <AccountDeletion username={accountUsername} />
         </div>
       </Surface>
     </PageFrame>

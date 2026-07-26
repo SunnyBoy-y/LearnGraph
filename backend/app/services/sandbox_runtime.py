@@ -133,11 +133,14 @@ def resolve_sandbox_image(settings: Settings) -> str | None:
 def resolve_sandbox_image_for_runtime(
     settings: Settings, runtime_kind: str
 ) -> str | None:
-    """Resolve an immutable image without exposing image selection to callers."""
+    """Resolve an immutable image without exposing image selection to callers.
 
-    if runtime_kind == "python-node":
+    Both runtime kinds map to the unified runner image (Chromium, ffmpeg and
+    the frontend toolchain ship in one image).  The ``browser_image_digest``
+    runtime-config field is kept for compatibility and mirrors the same
+    digest.
+    """
+
+    if runtime_kind in {"python-node", "python-node-browser"}:
         return resolve_sandbox_image(settings)
-    if runtime_kind != "python-node-browser":
-        return None
-    persisted = load_runtime_config(settings)
-    return persisted.browser_image_digest if persisted is not None else None
+    return None

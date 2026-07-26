@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
@@ -31,6 +32,7 @@ from app.services.skill_package import (
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_FILES,
     MAX_SKILL_PACKAGE_BYTES,
+    assert_skill_identity_not_reserved,
     normalize_skill_relative_path,
     parse_skill_md_frontmatter,
     guess_mime,
@@ -197,6 +199,15 @@ class SkillMarketService:
         """Refresh market cache from GitHub. Always commits; returns per-seed status summary."""
 
         self.ensure_seeds()
+        if not getattr(self.settings, "skill_market_refresh_enabled", True):
+            return {
+                "attempted": 0,
+                "ready": 0,
+                "failed": 0,
+                "skipped": len(MARKET_SEEDS),
+                "errors": [],
+                "disabled": True,
+            }
         summary: dict[str, Any] = {
             "attempted": 0,
             "ready": 0,
@@ -264,6 +275,16 @@ class SkillMarketService:
                 summary["errors"].append(
                     {"market_id": seed["market_id"], "error": message}
                 )
+        # Aggregate the ClawHub catalog as discovery-only cards (settings-gated,
+        # best-effort — a ClawHub outage must not fail the GitHub refresh).
+        if getattr(self.settings, "clawhub_enabled", False):
+            try:
+                from app.services.skill_clawhub_sync import ClawHubMarketSync
+
+                summary["clawhub"] = ClawHubMarketSync(self.db, self.settings).refresh()
+            except Exception as exc:  # noqa: BLE001
+                self.db.rollback()
+                summary["clawhub"] = {"enabled": True, "error": str(exc)[:200]}
         self.audit.record(
             actor_id=self.actor_id,
             action="skill.market.refresh",
@@ -273,6 +294,7 @@ class SkillMarketService:
                 "attempted": summary["attempted"],
                 "ready": summary["ready"],
                 "failed": summary["failed"],
+                "clawhub": summary.get("clawhub"),
             },
         )
         self.db.commit()
@@ -354,17 +376,19 @@ class SkillMarketService:
             rank=row.rank,
             file_count=len(files),
             has_scripts=has_scripts,
+            official=str(row.source or "").startswith("learngraph"),
         )
 
     def _http_get(self, url: str, timeout: float = 12.0) -> bytes:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "LearnGraph-SkillMarket/1.0",
-                "Accept": "application/vnd.github+json, text/plain, */*",
-            },
-            method="GET",
-        )
+        headers = {
+            "User-Agent": "LearnGraph-SkillMarket/1.0",
+            "Accept": "application/vnd.github+json, text/plain, */*",
+        }
+        token = (getattr(self.settings, "skill_market_github_token", None) or "").strip()
+        host = urllib.parse.urlsplit(url).hostname or ""
+        if token and (host == "github.com" or host.endswith((".github.com", ".githubusercontent.com"))):
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             data = response.read(MAX_SKILL_FILE_BYTES + 1)
         if len(data) > MAX_SKILL_FILE_BYTES:
@@ -442,6 +466,7 @@ class SkillMarketService:
             skill_key = re.sub(r"[^a-z0-9._-]+", "-", skill_key).strip("-")[:80]
             if not KEY_RE.match(skill_key):
                 skill_key = f"mkt-{hashlib.sha256(row.market_id.encode()).hexdigest()[:12]}"
+        assert_skill_identity_not_reserved(skill_key)
         if self.db.scalar(self.skills.query().where(SkillRecord.skill_key == skill_key)):
             raise AppError(409, "skill_key_exists", "Skill key already exists in this workspace")
 
@@ -508,9 +533,18 @@ class SkillMarketService:
         self.db.flush()
         # Recompute via package service helper logic
         from app.services.skill_package import SkillPackageService
+        from app.services.skill_security_scan import attach_scan_report
 
         pkg = SkillPackageService(self.db, self.workspace_id, self.actor_id, self.settings)
         pkg._recompute_package_state(skill)
+        attach_scan_report(
+            skill,
+            [
+                (str(item.get("path") or ""), str(item.get("contents") or ""))
+                for item in files
+                if isinstance(item, dict)
+            ],
+        )
         self.audit.record(
             actor_id=self.actor_id,
             action="skill.market.install",
@@ -527,9 +561,17 @@ class SkillMarketService:
         self.db.refresh(skill)
         return skill
 
-    def import_manual(self, payload: SkillManualImportRequest) -> SkillRecord:
+    def import_manual(
+        self,
+        payload: SkillManualImportRequest,
+        *,
+        origin_type: str = "manual_import",
+        origin_ref: str = "user_editor",
+        report_extra: dict[str, Any] | None = None,
+    ) -> SkillRecord:
         """Install a user-edited multi-file package (must include SKILL.md)."""
 
+        assert_skill_identity_not_reserved(payload.skill_key, payload.source)
         if self.db.scalar(self.skills.query().where(SkillRecord.skill_key == payload.skill_key)):
             raise AppError(409, "skill_key_exists", "Skill key already exists in this workspace")
         if len(payload.files) > MAX_SKILL_FILES:
@@ -571,11 +613,11 @@ class SkillMarketService:
                 name=name,
                 source=payload.source.strip(),
                 version=payload.version.strip(),
-                generated_by="manual_import",
+                generated_by=origin_type,
                 kind="agent_skill_package",
                 package_format="skill_md_v1",
-                origin_type="manual_import",
-                origin_ref="user_editor",
+                origin_type=origin_type,
+                origin_ref=origin_ref[:500],
                 origin_hash=hashlib.sha256(_canonical_bytes([
                     {"path": p, "sha256": hashlib.sha256(d).hexdigest()}
                     for p, d in normalized_files
@@ -588,14 +630,18 @@ class SkillMarketService:
                     "kind": "agent_skill_package",
                     "name": name,
                     "description": description,
-                    "origin": "manual_import",
+                    "origin": origin_type,
                 },
                 manifest_hash="",
                 instructions_markdown=(body or text)[:20_000],
                 required_tools=[],
                 required_permissions=[],
                 allowed_components=[],
-                validation_report={"origin": "manual_import", "file_count": len(normalized_files)},
+                validation_report={
+                    "origin": origin_type,
+                    "file_count": len(normalized_files),
+                    **(report_extra or {}),
+                },
                 status="authorization_required",
                 enabled=False,
             )
@@ -616,10 +662,15 @@ class SkillMarketService:
             )
         self.db.flush()
         from app.services.skill_package import SkillPackageService
+        from app.services.skill_security_scan import attach_scan_report
 
         SkillPackageService(
             self.db, self.workspace_id, self.actor_id, self.settings
         )._recompute_package_state(skill)
+        attach_scan_report(
+            skill,
+            [(p, d.decode("utf-8", errors="replace")) for p, d in normalized_files],
+        )
         self.audit.record(
             actor_id=self.actor_id,
             action="skill.manual.import",
@@ -627,6 +678,7 @@ class SkillMarketService:
             resource_id=skill.id,
             details={
                 "skill_key": skill.skill_key,
+                "origin_type": origin_type,
                 "file_count": len(normalized_files),
                 "content_hash": skill.content_hash,
             },

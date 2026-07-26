@@ -19,6 +19,7 @@ export type MessagePartType =
   | 'sandbox'
   | 'sandbox_artifact'
   | 'sandbox_status'
+  | 'skill_trigger'
   | 'component'
   | 'magic_card'
   | 'error'
@@ -55,6 +56,17 @@ export interface SessionAutoTitleRequest {
   expected_title: string
   provider_id?: string
   model_id?: string
+}
+
+export interface DictationCleanupRequest {
+  text: string
+  context?: string
+  provider_id?: string
+  model_id?: string
+}
+
+export interface DictationCleanupResult {
+  text: string
 }
 
 export interface Session {
@@ -258,6 +270,19 @@ export interface MessageSnapshot extends Message {
 
 export interface BranchSessionRequest {
   title?: string
+}
+
+/** 会话上下文用量估算（展示用，非计费口径）。 */
+export interface SessionContextUsage {
+  session_id: string
+  estimated_tokens: number
+  input_budget_tokens: number
+  compaction_threshold_tokens: number
+  remaining_tokens: number
+  used_ratio: number
+  context_window_tokens: number
+  compaction_ratio: number
+  message_count: number
 }
 
 export interface MessagePartStreamEvent {

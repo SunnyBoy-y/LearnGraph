@@ -88,13 +88,20 @@ MAX_AGENT_ARCHIVE_BYTES = 16 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
-def chromium_seccomp_security_options() -> list[str]:
+def sandbox_seccomp_security_options() -> list[str]:
+    """Allowlist seccomp profile (Docker-default style + Chromium userns).
+
+    Applied to every sandbox container: the unified runner image ships
+    Chromium, so all containers need the userns allowances while keeping the
+    default-deny posture for everything else.
+    """
+
     profile_path = Path(__file__).resolve().parents[3] / "sandbox" / "seccomp_profile.json"
     try:
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SandboxBackendUnavailable(
-            "Chromium sandbox seccomp profile is unavailable"
+            "Sandbox seccomp profile is unavailable"
         ) from exc
     return [
         f"seccomp={json.dumps(profile, separators=(',', ':'))}",
@@ -271,7 +278,9 @@ class DockerSandboxBackend(SandboxBackendPort):
         finally:
             if "client" in locals():
                 client.close()
-        capabilities = [
+        # The unified runner image serves every runtime kind, so the full
+        # capability surface (browser, media, doc conversion) is always on.
+        capabilities = (
             "isolated_workspace",
             "network_none",
             "fixed_runner",
@@ -281,14 +290,20 @@ class DockerSandboxBackend(SandboxBackendPort):
             "process_tree_kill",
             "resource_limits",
             "cold_resume",
-        ]
-        if self.runtime_kind == "python-node-browser":
-            capabilities.extend(("browser", "playwright", "chromium", "headless"))
+            "browser",
+            "playwright",
+            "chromium",
+            "headless",
+            "ffmpeg",
+            "cjk_fonts",
+            "frontend_toolchain",
+            "doc_convert",
+        )
         return SandboxCapabilitySnapshot(
             available=True,
             backend_id=self.backend_id,
             platform=self.platform,
-            capabilities=tuple(capabilities),
+            capabilities=capabilities,
         )
 
     def host_capacity(self) -> tuple[int, int]:
@@ -326,11 +341,10 @@ class DockerSandboxBackend(SandboxBackendPort):
                 read_only=True,
                 user="65532:65532",
                 cap_drop=["ALL"],
-                security_opt=(
-                    chromium_seccomp_security_options()
-                    if spec.runtime_kind == "python-node-browser"
-                    else ["no-new-privileges:true"]
-                ),
+                # One image, one hardened posture: the allowlist seccomp
+                # profile (with Chromium userns allowances) applies to every
+                # container because Chromium ships in the unified image.
+                security_opt=sandbox_seccomp_security_options(),
                 mem_limit=spec.memory_bytes,
                 memswap_limit=spec.memory_swap_bytes,
                 pids_limit=spec.pids_max,
@@ -342,7 +356,10 @@ class DockerSandboxBackend(SandboxBackendPort):
                         hard=spec.disk_bytes,
                     )
                 ],
-                shm_size="1g" if spec.runtime_kind == "python-node-browser" else "64m",
+                # Chromium renders through /dev/shm; tmpfs costs memory only
+                # when actually used, so the browser-grade size is safe for
+                # pure code sessions too.
+                shm_size="1g",
                 mounts=[
                     Mount(
                         target="/workspace",

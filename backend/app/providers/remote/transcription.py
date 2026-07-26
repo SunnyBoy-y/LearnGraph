@@ -39,6 +39,7 @@ class OpenAICompatibleTranscriptionProvider:
         mime_type: str,
         content: bytes,
         language: str | None = None,
+        allow_empty: bool = False,
     ) -> TranscriptionResult:
         data = {"model": self.model_id, "response_format": "verbose_json"}
         if language:
@@ -73,7 +74,7 @@ class OpenAICompatibleTranscriptionProvider:
                 "The transcription provider response has no text"
             )
         text = payload["text"].strip()
-        if not text:
+        if not text and not allow_empty:
             raise TranscriptionProviderError("The transcription provider returned empty text")
         duration = payload.get("duration")
         return TranscriptionResult(

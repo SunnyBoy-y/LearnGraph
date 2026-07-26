@@ -35,42 +35,26 @@ export interface UsageEvent {
   created_at: IsoDateTime;
 }
 
-export interface PriceVersion {
+export interface ManualPrice {
   id: string;
-  workspace_id: string;
-  provider_id: string;
   model_id: string;
-  feature: string;
-  version: number;
-  input_usd_per_million: number;
-  cached_input_usd_per_million: number | null;
-  cache_write_usd_per_million: number | null;
-  output_usd_per_million: number;
-  fixed_usd_per_call: number;
+  provider_id: string;
+  currency: "USD" | "CNY";
+  input_per_million: number;
+  cached_input_per_million: number | null;
+  output_per_million: number;
+  fixed_per_call: number;
   effective_at: IsoDateTime;
-  retired_at: IsoDateTime | null;
-  source: string;
-  conditions: Record<string, unknown>;
-  created_at: IsoDateTime;
 }
 
-export interface PriceVersionCreate {
+export interface ManualPriceUpsert {
+  model_id: string;
   provider_id?: string;
-  model_id?: string;
-  feature?: string;
-  input_usd_per_million?: number;
-  cached_input_usd_per_million?: number | null;
-  cache_write_usd_per_million?: number | null;
-  output_usd_per_million?: number;
-  fixed_usd_per_call?: number;
-  currency?: "USD" | "CNY";
-  input_cny_per_million?: number | null;
-  cached_input_cny_per_million?: number | null;
-  cache_write_cny_per_million?: number | null;
-  output_cny_per_million?: number | null;
-  fixed_cny_per_call?: number | null;
-  source?: string;
-  conditions?: Record<string, unknown>;
+  currency: "USD" | "CNY";
+  input_per_million: number;
+  cached_input_per_million?: number | null;
+  output_per_million: number;
+  fixed_per_call?: number;
 }
 
 export interface PriceCatalogItem {
@@ -89,29 +73,50 @@ export interface PriceCatalogItem {
   conditions: Record<string, unknown>;
   source_url: string;
   as_of: string;
+  source: "builtin" | "models_dev";
 }
 
-export interface PriceCatalogApply {
-  catalog_id: string;
-  provider_id?: string;
-  feature?: string;
-  input_usd_per_million?: number;
-  cached_input_usd_per_million?: number | null;
-  cache_write_usd_per_million?: number | null;
-  output_usd_per_million?: number;
-}
-
-export interface ExchangeRateVersion {
-  id: string;
-  workspace_id: string;
-  base_currency: string;
-  quote_currency: string;
-  version: number;
-  rate: number;
-  effective_at: IsoDateTime;
-  retired_at: IsoDateTime | null;
+export interface ModelsDevStatus {
   source: string;
-  created_at: IsoDateTime;
+  origin: "bundled" | "network" | "network_cache" | "missing";
+  fetched_at: string | null;
+  provider_count: number;
+  model_count: number;
+  priced_model_count: number;
+}
+
+export interface ExchangeRateInfo {
+  rate: number;
+  source: string;
+  effective_at: IsoDateTime;
+}
+
+export interface AlertEmailConfig {
+  enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: "ssl" | "starttls" | "none";
+  smtp_username: string;
+  has_password: boolean;
+  from_address: string;
+  to_addresses: string[];
+}
+
+export interface AlertEmailConfigUpdate {
+  enabled: boolean;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: "ssl" | "starttls" | "none";
+  smtp_username: string;
+  /** null 保留已存密码；空字符串清除 */
+  smtp_password?: string | null;
+  from_address: string;
+  to_addresses: string[];
+}
+
+export interface AlertEmailTestResult {
+  ok: boolean;
+  detail: string;
 }
 
 export interface BudgetPolicy {

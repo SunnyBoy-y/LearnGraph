@@ -8,34 +8,72 @@ of a host capability.  This module deliberately contains no model-provider
 fallbacks or arbitrary HTTP/shell execution.
 """
 
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from io import BytesIO
 import json
+from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from PIL import Image, UnidentifiedImageError
+from sqlalchemy import select
+
 # memory_tools is duck-typed (MemoryService) to avoid circular imports.
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.errors import AppError
+from app.domain.models import (
+    ChatSession,
+    FileRecord,
+    FileReference,
+    ImageGenerationTask,
+    Message,
+)
 from app.providers.ports.image_generation import (
     ImageGenerationProviderPort,
     ImageGenerationRequest,
+    ImageSourceInput,
 )
 from app.providers.ports.search import SearchProviderPort
 from app.providers.remote.search import SearchProviderError, SearchProviderTimeout
+from app.providers.remote.fetch import (
+    FetchProviderError,
+    FetchProviderTimeout,
+    UnsafeFetchURL,
+    require_public_http_url,
+)
+from app.providers.storage_factory import object_storage_provider
 from app.repositories.audit import AuditRepository
+from app.services.chat_attachment_policy import is_image_attachment
 from app.services.image_generations import ImageGenerationService
 from app.services.mcp_skills import MCPAndSkillService
 from app.services.sandbox import SandboxAgentWorkspaceService
 from app.services.session_retrieval import SessionRetrievalService
+from app.services.session_workspace import SessionWorkspaceService
 
 
 AGENT_TOOL_RESULT_MAX_BYTES = 128 * 1024
 MAX_PARALLEL_RESEARCH_CHILDREN = 4
 DEFAULT_CLOCK_TIMEZONE = "UTC"
 MAX_AGENT_IMAGE_PROMPT_CHARS = 2_000
+# Session file tools: durable chat attachments and generated images.
+SESSION_FILE_LIST_MAX = 50
+SESSION_FILE_TEXT_MAX_BYTES = 1 * 1024 * 1024
+SESSION_FILE_TEXT_MAX_CHARS = 40_000
+MAX_IMAGE_EDIT_SOURCES = 4
+# Mirrors the multimodal chat attachment limits in ChatService so an image the
+# user could attach directly is also readable/editable through Agent tools.
+AGENT_IMAGE_INPUT_MAX_BYTES = 10 * 1024 * 1024
+AGENT_IMAGE_INPUT_MAX_PIXELS = 40_000_000
+AGENT_IMAGE_FORMAT_MIME_TYPES = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "WEBP": "image/webp",
+    "GIF": "image/gif",
+}
 
 
 class AgentToolRuntime:
@@ -78,6 +116,7 @@ class AgentToolRuntime:
         *,
         agent_mode_enabled: bool,
         web_search_enabled: bool,
+        memory_enabled: bool = True,
     ) -> list[dict[str, Any]]:
         if not agent_mode_enabled:
             return []
@@ -88,6 +127,10 @@ class AgentToolRuntime:
         definitions.extend(self._canvas_tool_definitions())
         definitions.extend(self._provider_tool_definitions())
         definitions.extend(self._learning_orchestration_tool_definitions())
+        # Durable session files (attachments + generated images) are always
+        # addressable in Agent mode; without these tools the model cannot see
+        # or reference an image from an earlier turn.
+        definitions.extend(self._session_file_tool_definitions())
         definitions.extend(self.extensions.agent_tool_definitions())
         if web_search_enabled and self._search_available:
             definitions.extend(self._web_tool_definitions())
@@ -95,9 +138,12 @@ class AgentToolRuntime:
             definitions.extend(self._image_tool_definitions())
         if self.sandbox is not None and self.sandbox_authorized:
             definitions.extend(self.sandbox.agent_tool_definitions())
-        if self.session_retrieval is not None:
+        # A session with memory disabled must behave like an isolated chat:
+        # cross-session retrieval and memory tools vanish together with the
+        # passive prompt injection, matching the policy the user toggled.
+        if self.session_retrieval is not None and memory_enabled:
             definitions.extend(self._session_retrieval_tool_definitions())
-        if self.memory_tools is not None:
+        if self.memory_tools is not None and memory_enabled:
             definitions.extend(self._memory_tool_definitions())
         return definitions
 
@@ -778,12 +824,48 @@ class AgentToolRuntime:
                                         "enum": ["low", "medium", "high", "xhigh"],
                                     },
                                 },
+                                "thinking_mapping": {
+                                    "type": "object",
+                                    "properties": {
+                                        level: {
+                                            "anyOf": [
+                                                {"type": "string"},
+                                                {"type": "integer", "minimum": 1},
+                                                {"type": "boolean"},
+                                                {"type": "null"},
+                                            ]
+                                        }
+                                        for level in (
+                                            "off",
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                        )
+                                    },
+                                    "additionalProperties": False,
+                                },
                                 "default_thinking_mode": {
                                     "type": "string",
                                     "enum": ["off", "low", "medium", "high", "xhigh"],
                                 },
+                                "thinking_required": {"type": "boolean"},
+                                "reasoning_parameter": {
+                                    "type": "string",
+                                    "enum": [
+                                        "reasoning_effort",
+                                        "reasoning.effort",
+                                        "enable_thinking",
+                                        "thinking_budget",
+                                        "thinking",
+                                    ],
+                                },
                                 "hosted_web_search": {"type": "boolean"},
+                                "hosted_web_fetch": {"type": "boolean"},
+                                "hosted_image_search": {"type": "boolean"},
                                 "supports_image_input": {"type": "boolean"},
+                                "supports_video_input": {"type": "boolean"},
+                                "supports_structured_output": {"type": "boolean"},
                                 "image_input_mode": {
                                     "type": "string",
                                     "enum": ["native", "external_vision", "auto"],
@@ -808,6 +890,86 @@ class AgentToolRuntime:
         )
         return definitions
 
+    @staticmethod
+    def _session_file_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_session_files",
+                    "description": (
+                        "List the durable files of a chat session: user-uploaded "
+                        "attachments and previously generated images, each with a "
+                        "stable file_id. Call this FIRST whenever the user refers "
+                        "to an earlier image or file (e.g. '修改上面的图', 'edit "
+                        "that picture', 'the file I uploaded') so you can resolve "
+                        "the exact file_id instead of guessing from text. Defaults "
+                        "to the current session. Pass session_id ONLY when the "
+                        "user explicitly asks to use files from another "
+                        "conversation."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "string",
+                                "description": (
+                                    "Optional other chat session ID in this "
+                                    "workspace. Use only on the user's explicit "
+                                    "cross-session request; omit for the current "
+                                    "session."
+                                ),
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_session_file",
+                    "description": (
+                        "Read a durable session file by file_id (from "
+                        "list_session_files, an attachment note, or a "
+                        "generate_image result). Images: with target='context' "
+                        "the host attaches the actual picture to the conversation "
+                        "when the active chat model supports image input, so you "
+                        "can see and describe it; before modifying an existing "
+                        "image, read it first, then pass its file_id in "
+                        "generate_image.source_file_ids so the original pixels "
+                        "are preserved. UTF-8 text files return their decoded "
+                        "content. Binary or oversized files (and target="
+                        "'workspace') are materialized into the session workspace "
+                        "inputs/ tree for sandbox tools."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Durable file ID within this workspace.",
+                            },
+                            "target": {
+                                "type": "string",
+                                "enum": ["context", "workspace"],
+                                "description": (
+                                    "context (default): return content to the "
+                                    "conversation (images become visible model "
+                                    "input). workspace: materialize the raw file "
+                                    "into the session workspace inputs/ for "
+                                    "sandbox_list_files / sandbox_exec processing."
+                                ),
+                            },
+                        },
+                        "required": ["file_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
     def _image_tool_definitions(self) -> list[dict[str, Any]]:
         default_provider_id = (
             getattr(self.image_provider, "provider_id", None) or "workspace default"
@@ -824,12 +986,17 @@ class AgentToolRuntime:
                         "Generate an image from a natural-language prompt using the "
                         "workspace image generation Provider. Use only when the user "
                         "explicitly asks for a picture, diagram, illustration, or "
-                        "visual. By default OMIT provider_id and model_id: the tool "
-                        f"will use the configured default image model "
-                        f"{default_provider_id}/{default_model_id}. Specify them only "
-                        "when deliberately choosing another configured, enabled image "
-                        "model after inspecting Provider models. Returns a durable "
-                        "file_id the chat UI can render."
+                        "visual. To MODIFY an existing session image (e.g. '修改上面"
+                        "的图'), you MUST pass its file_id in source_file_ids — "
+                        "resolve it via list_session_files / read_session_file — so "
+                        "the provider edits the original pixels; never re-describe "
+                        "an existing image from memory, which produces a completely "
+                        "different picture. By default OMIT provider_id and "
+                        f"model_id: the tool will use the configured default image "
+                        f"model {default_provider_id}/{default_model_id}. Specify "
+                        "them only when deliberately choosing another configured, "
+                        "enabled image model after inspecting Provider models. "
+                        "Returns a durable file_id the chat UI can render."
                     ),
                     "parameters": {
                         "type": "object",
@@ -861,6 +1028,21 @@ class AgentToolRuntime:
                                     "model ID. Omit to use the default image model."
                                 ),
                             },
+                            "source_file_ids": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1},
+                                "maxItems": MAX_IMAGE_EDIT_SOURCES,
+                                "description": (
+                                    "Existing session image file_ids to edit or use "
+                                    "as the visual reference. REQUIRED when the user "
+                                    "asks to modify a previously generated or "
+                                    "uploaded image: the original pixels are sent to "
+                                    "the image provider so composition and content "
+                                    "are preserved. Obtain file_ids from "
+                                    "list_session_files or earlier generate_image "
+                                    "results."
+                                ),
+                            },
                         },
                         "required": ["prompt"],
                         "additionalProperties": False,
@@ -869,9 +1051,8 @@ class AgentToolRuntime:
             },
         ]
 
-    @staticmethod
-    def _web_tool_definitions() -> list[dict[str, Any]]:
-        return [
+    def _web_tool_definitions(self) -> list[dict[str, Any]]:
+        definitions = [
             {
                 "type": "function",
                 "function": {
@@ -921,6 +1102,60 @@ class AgentToolRuntime:
                 },
             },
         ]
+        if callable(getattr(self.search_provider, "fetch", None)):
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_web_page",
+                        "description": (
+                            "Read the full content of a user-authorized public URL "
+                            "through the configured Qwen web extractor companion."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string", "format": "uri"},
+                            },
+                            "required": ["url"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+        if callable(getattr(self.search_provider, "image_search", None)):
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_images",
+                        "description": (
+                            "Search the public web for images through the configured "
+                            "Qwen Responses image-search companion."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 500,
+                                },
+                                "image_url": {
+                                    "type": "string",
+                                    "format": "uri",
+                                    "description": (
+                                        "Optional public image URL for reverse image search."
+                                    ),
+                                },
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+        return definitions
 
     def execute(
         self,
@@ -931,6 +1166,7 @@ class AgentToolRuntime:
         assistant_message_id: str | None = None,
         assistant_version_id: str | None = None,
         source_message_id: str | None = None,
+        model_supports_image_input: bool = False,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         function = tool_call.get("function")
         if not isinstance(function, dict):
@@ -1019,6 +1255,20 @@ class AgentToolRuntime:
                     {"query": result["query"], "result_count": len(sources)},
                     sources,
                 )
+            if name == "fetch_web_page":
+                return self._fetch_web_page(arguments, allowed_domains)
+            if name == "search_images":
+                return self._search_images(arguments, allowed_domains)
+            if name == "list_session_files":
+                return self._list_session_files(
+                    arguments, chat_session_id=chat_session_id
+                )
+            if name == "read_session_file":
+                return self._read_session_file(
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    model_supports_image_input=model_supports_image_input,
+                )
             if name == "generate_image":
                 return self._execute_generate_image(
                     arguments,
@@ -1060,14 +1310,13 @@ class AgentToolRuntime:
                     meta["file_id"] = result.get("file_id")
                 return self._success(result, meta, [])
             result = self.extensions.invoke_agent_function(name, arguments)
-            return self._success(
-                result,
-                {
-                    "extension_invocation_id": result.get("invocation_id"),
-                    "target_type": result.get("target_type"),
-                },
-                [],
-            )
+            extension_meta: dict[str, Any] = {
+                "extension_invocation_id": result.get("invocation_id"),
+                "target_type": result.get("target_type"),
+            }
+            if isinstance(result.get("skill_trigger"), dict):
+                extension_meta["skill_trigger"] = result["skill_trigger"]
+            return self._success(result, extension_meta, [])
         except AppError as exc:
             return self._failure(exc.code, exc.message, data=exc.details or {})
         except Exception:
@@ -1462,9 +1711,16 @@ class AgentToolRuntime:
                 key: arguments[key]
                 for key in (
                     "reasoning_efforts",
+                    "thinking_mapping",
                     "default_thinking_mode",
+                    "thinking_required",
+                    "reasoning_parameter",
                     "hosted_web_search",
+                    "hosted_web_fetch",
+                    "hosted_image_search",
                     "supports_image_input",
+                    "supports_video_input",
+                    "supports_structured_output",
                     "image_input_mode",
                     "default_search_route",
                 )
@@ -1798,6 +2054,116 @@ class AgentToolRuntime:
             sources,
         )
 
+    def _fetch_web_page(
+        self,
+        arguments: dict[str, Any],
+        allowed_domains: list[str],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        url = arguments.get("url")
+        if (
+            set(arguments) != {"url"}
+            or not isinstance(url, str)
+            or not url.strip()
+            or not callable(getattr(self.search_provider, "fetch", None))
+        ):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "fetch_web_page requires one URL and a compatible Qwen companion",
+            )
+        domains = {
+            item.strip().casefold()
+            for item in allowed_domains
+            if isinstance(item, str) and item.strip()
+        }
+        if not domains:
+            raise AppError(
+                403,
+                "fetch_domain_not_authorized",
+                "Full-page extraction requires an explicitly authorized domain",
+            )
+        try:
+            require_public_http_url(url.strip(), domains)
+            document = self.search_provider.fetch(url.strip())
+            require_public_http_url(document.final_url, domains)
+        except UnsafeFetchURL as exc:
+            raise AppError(
+                422,
+                "fetch_url_blocked",
+                "The requested URL is outside the authorized public domains",
+            ) from exc
+        except FetchProviderTimeout as exc:
+            raise AppError(504, "fetch_provider_timeout", "Web extractor timed out") from exc
+        except FetchProviderError as exc:
+            raise AppError(502, "fetch_provider_failed", "Web extractor failed") from exc
+        result = {
+            "url": document.final_url,
+            "title": document.title,
+            "content": document.content,
+            "content_type": document.content_type,
+        }
+        return self._success(
+            result,
+            {
+                "url": document.final_url,
+                "content_chars": len(document.content),
+                "provider_id": self.search_provider.provider_id,
+            },
+            [],
+        )
+
+    def _search_images(
+        self,
+        arguments: dict[str, Any],
+        allowed_domains: list[str],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        unknown = set(arguments) - {"query", "image_url"}
+        query = arguments.get("query")
+        image_url = arguments.get("image_url")
+        if (
+            unknown
+            or not isinstance(query, str)
+            or not 1 <= len(query.strip()) <= 500
+            or (image_url is not None and not isinstance(image_url, str))
+            or not callable(getattr(self.search_provider, "image_search", None))
+        ):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "search_images requires a query and an optional public image URL",
+            )
+        try:
+            if isinstance(image_url, str):
+                domains = {
+                    item.strip().casefold()
+                    for item in allowed_domains
+                    if isinstance(item, str) and item.strip()
+                }
+                require_public_http_url(image_url.strip(), domains)
+            images = self.search_provider.image_search(
+                query.strip(),
+                image_url=image_url.strip() if isinstance(image_url, str) else None,
+            )
+        except UnsafeFetchURL as exc:
+            raise AppError(
+                422,
+                "image_search_url_blocked",
+                "The reverse-image URL is not a safe public URL",
+            ) from exc
+        except SearchProviderTimeout as exc:
+            raise AppError(504, "search_provider_timeout", "Image search timed out") from exc
+        except SearchProviderError as exc:
+            raise AppError(502, "search_provider_failed", "Image search failed") from exc
+        result = {"query": query.strip(), "images": images}
+        return self._success(
+            result,
+            {
+                "result_count": len(images),
+                "provider_id": self.search_provider.provider_id,
+            },
+            [],
+        )
+
     def _parallel_web_research(
         self,
         arguments: dict[str, Any],
@@ -1884,6 +2250,441 @@ class AgentToolRuntime:
         self.extensions.db.commit()
         return {"parent_run_id": parent_run_id, "child_runs": children}, sources
 
+    def _require_workspace_session(self, session_id: str) -> ChatSession:
+        session = self.extensions.db.scalar(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.workspace_id == self.workspace_id,
+            )
+        )
+        if session is None:
+            raise AppError(
+                404,
+                "session_not_found",
+                "The chat session does not exist in this workspace",
+                {"session_id": session_id},
+            )
+        return session
+
+    def _require_workspace_file(self, file_id: str) -> FileRecord:
+        file = self.extensions.db.scalar(
+            select(FileRecord).where(
+                FileRecord.id == file_id,
+                FileRecord.workspace_id == self.workspace_id,
+            )
+        )
+        if file is None:
+            raise AppError(
+                404,
+                "file_not_found",
+                "The file does not exist in this workspace",
+                {"file_id": file_id},
+            )
+        return file
+
+    @staticmethod
+    def _validated_image_bytes(
+        content: bytes, *, file_id: str
+    ) -> tuple[str, int, int]:
+        """Decode image bytes before they cross a model/provider boundary.
+
+        Mirrors ChatService multimodal validation: a renamed binary blob must
+        never be presented to a remote model or image provider as an image.
+        """
+
+        try:
+            with Image.open(BytesIO(content)) as image:
+                detected_mime = AGENT_IMAGE_FORMAT_MIME_TYPES.get(
+                    (image.format or "").upper()
+                )
+                width, height = image.size
+                if (
+                    detected_mime is None
+                    or width < 1
+                    or height < 1
+                    or width * height > AGENT_IMAGE_INPUT_MAX_PIXELS
+                ):
+                    raise ValueError("unsupported or oversized image dimensions")
+                image.verify()
+            with Image.open(BytesIO(content)) as image:
+                image.load()
+        except (
+            UnidentifiedImageError,
+            Image.DecompressionBombError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise AppError(
+                415,
+                "invalid_image_file",
+                "The stored image bytes could not be decoded safely",
+                {"file_id": file_id},
+            ) from exc
+        return detected_mime, width, height
+
+    def _read_stored_file_bytes(self, file: FileRecord, *, limit_bytes: int) -> bytes:
+        if file.storage_status != "stored":
+            raise AppError(
+                409,
+                "file_unavailable",
+                "The file is not available in object storage",
+                {"file_id": file.id, "storage_status": file.storage_status},
+            )
+        if file.size_bytes > limit_bytes:
+            raise AppError(
+                413,
+                "file_too_large",
+                "The file exceeds the readable size limit for this tool",
+                {"file_id": file.id, "max_bytes": limit_bytes},
+            )
+        storage = object_storage_provider(
+            self.extensions.db, self.workspace_id, self.settings or get_settings()
+        )
+        try:
+            return storage.read_bytes(file.object_key, limit_bytes=limit_bytes)
+        except AppError as exc:
+            raise AppError(
+                409,
+                "file_unavailable",
+                "The file could not be read from object storage",
+                {"file_id": file.id},
+            ) from exc
+
+    def _materialize_session_file(
+        self, chat_session_id: str, file: FileRecord
+    ) -> dict[str, Any]:
+        """Put a durable file into the session workspace inputs/ tree."""
+
+        if file.storage_status != "stored":
+            raise AppError(
+                409,
+                "file_unavailable",
+                "The file is not available in object storage",
+                {"file_id": file.id, "storage_status": file.storage_status},
+            )
+        if self.sandbox is not None and self.sandbox_authorized:
+            views = self.sandbox.seed_chat_attachments(
+                chat_session_id=chat_session_id,
+                files=[file],
+                include_images=True,
+            )
+            view = views[0] if views else None
+        else:
+            workspace = SessionWorkspaceService(
+                self.extensions.db,
+                self.workspace_id,
+                self.actor_id,
+                self.settings or get_settings(),
+            )
+            view = workspace.link_file_record(
+                chat_session_id=chat_session_id,
+                file=file,
+                role="input",
+                source="chat_attachment",
+            )
+        if view is None:
+            raise AppError(
+                409,
+                "file_unavailable",
+                "The file could not be materialized into the session workspace",
+                {"file_id": file.id},
+            )
+        self.extensions.db.commit()
+        return view
+
+    def _list_session_files(
+        self, arguments: dict[str, Any], *, chat_session_id: str
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        raw_session = arguments.get("session_id")
+        target_session_id = (
+            raw_session.strip()
+            if isinstance(raw_session, str) and raw_session.strip()
+            else chat_session_id
+        )
+        self._require_workspace_session(target_session_id)
+        cross_session = target_session_id != chat_session_id
+        db = self.extensions.db
+
+        entries: dict[str, dict[str, Any]] = {}
+        attachment_rows = db.execute(
+            select(FileRecord, Message, FileReference)
+            .join(FileReference, FileReference.file_id == FileRecord.id)
+            .join(Message, FileReference.target_id == Message.id)
+            .where(
+                FileReference.workspace_id == self.workspace_id,
+                FileReference.target_type == "message",
+                Message.session_id == target_session_id,
+                FileRecord.workspace_id == self.workspace_id,
+            )
+            .order_by(Message.created_at)
+        ).all()
+        for file, message, reference in attachment_rows:
+            entries.setdefault(
+                file.id,
+                {
+                    "file_id": file.id,
+                    "filename": file.original_name,
+                    "mime_type": file.mime_type,
+                    "size_bytes": file.size_bytes,
+                    # ImageGenerationService also records generated files as
+                    # message references; keep their origin distinguishable
+                    # from files the user uploaded.
+                    "origin": (
+                        "generated_image"
+                        if reference.relation == "generated_image"
+                        else "user_attachment"
+                    ),
+                    "relation": reference.relation,
+                    "message_id": message.id,
+                    "is_image": is_image_attachment(file),
+                    "storage_status": file.storage_status,
+                    "created_at": (
+                        file.created_at.isoformat() if file.created_at else None
+                    ),
+                },
+            )
+        generated_rows = db.execute(
+            select(FileRecord, ImageGenerationTask)
+            .join(ImageGenerationTask, ImageGenerationTask.file_id == FileRecord.id)
+            .where(
+                ImageGenerationTask.workspace_id == self.workspace_id,
+                ImageGenerationTask.session_id == target_session_id,
+                ImageGenerationTask.status == "completed",
+            )
+            .order_by(ImageGenerationTask.created_at)
+        ).all()
+        for file, task in generated_rows:
+            entries.setdefault(
+                file.id,
+                {
+                    "file_id": file.id,
+                    "filename": file.original_name,
+                    "mime_type": file.mime_type,
+                    "size_bytes": file.size_bytes,
+                    "origin": "generated_image",
+                    "message_id": task.message_id,
+                    "prompt_summary": task.prompt_summary or None,
+                    "is_image": True,
+                    "storage_status": file.storage_status,
+                    "created_at": (
+                        task.created_at.isoformat() if task.created_at else None
+                    ),
+                },
+            )
+        listed = sorted(entries.values(), key=lambda item: item["created_at"] or "")
+        truncated = len(listed) > SESSION_FILE_LIST_MAX
+        if truncated:
+            listed = listed[-SESSION_FILE_LIST_MAX:]
+        if cross_session:
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="agent.session_files.cross_session_list",
+                resource_type="chat_session",
+                resource_id=target_session_id,
+                details={
+                    "requesting_session_id": chat_session_id,
+                    "file_count": len(listed),
+                },
+            )
+            db.commit()
+        return self._success(
+            {
+                "session_id": target_session_id,
+                "cross_session": cross_session,
+                "count": len(listed),
+                "truncated": truncated,
+                "files": listed,
+                "hint": (
+                    "Use read_session_file(file_id=...) to view a file. To modify "
+                    "an existing image, pass its file_id in "
+                    "generate_image.source_file_ids."
+                ),
+            },
+            {
+                "tool": "list_session_files",
+                "session_id": target_session_id,
+                "cross_session": cross_session,
+                "file_count": len(listed),
+            },
+            [],
+        )
+
+    def _read_session_file(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        model_supports_image_input: bool,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        file_id_raw = arguments.get("file_id")
+        if not isinstance(file_id_raw, str) or not file_id_raw.strip():
+            raise AppError(422, "invalid_tool_arguments", "file_id is required")
+        target_raw = arguments.get("target")
+        target = (
+            target_raw.strip().casefold()
+            if isinstance(target_raw, str) and target_raw.strip()
+            else "context"
+        )
+        if target not in {"context", "workspace"}:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "target must be 'context' or 'workspace'",
+            )
+        file = self._require_workspace_file(file_id_raw.strip())
+        base_result = {
+            "file_id": file.id,
+            "filename": file.original_name,
+            "mime_type": file.mime_type,
+            "size_bytes": file.size_bytes,
+        }
+
+        if target == "workspace":
+            view = self._materialize_session_file(chat_session_id, file)
+            return self._success(
+                {
+                    **base_result,
+                    "workspace_path": view.get("path"),
+                    "note": (
+                        "File materialized into the session workspace. Use "
+                        "sandbox_list_files / sandbox_exec to process it "
+                        "(sandbox_read_file only decodes UTF-8 text)."
+                    ),
+                },
+                {
+                    "tool": "read_session_file",
+                    "file_id": file.id,
+                    "workspace_path": view.get("path"),
+                },
+                [],
+            )
+
+        if is_image_attachment(file) or file.mime_type.casefold().startswith("image/"):
+            if file.size_bytes > AGENT_IMAGE_INPUT_MAX_BYTES:
+                view = self._materialize_session_file(chat_session_id, file)
+                return self._success(
+                    {
+                        **base_result,
+                        "image_attached": False,
+                        "workspace_path": view.get("path"),
+                        "note": (
+                            "Image exceeds the direct model input limit; it was "
+                            "materialized into the session workspace instead."
+                        ),
+                    },
+                    {
+                        "tool": "read_session_file",
+                        "file_id": file.id,
+                        "workspace_path": view.get("path"),
+                    },
+                    [],
+                )
+            content = self._read_stored_file_bytes(
+                file, limit_bytes=AGENT_IMAGE_INPUT_MAX_BYTES
+            )
+            mime_type, width, height = self._validated_image_bytes(
+                content, file_id=file.id
+            )
+            if not model_supports_image_input:
+                return self._success(
+                    {
+                        **base_result,
+                        "mime_type": mime_type,
+                        "width": width,
+                        "height": height,
+                        "image_attached": False,
+                        "note": (
+                            "The active chat model does not support image input, "
+                            "so the picture cannot be shown to you directly. You "
+                            "can still pass this file_id in "
+                            "generate_image.source_file_ids to edit it, or call "
+                            "read_session_file with target='workspace' to process "
+                            "it with sandbox tools."
+                        ),
+                    },
+                    {
+                        "tool": "read_session_file",
+                        "file_id": file.id,
+                        "image_attached": False,
+                    },
+                    [],
+                )
+            encoded = base64.b64encode(content).decode("ascii")
+            image_part = {
+                "type": "input_image",
+                "image_url": f"data:{mime_type};base64,{encoded}",
+                "detail": "auto",
+                "file_id": file.id,
+                "original_name": file.original_name,
+            }
+            return self._success(
+                {
+                    **base_result,
+                    "mime_type": mime_type,
+                    "width": width,
+                    "height": height,
+                    "image_attached": True,
+                    "note": (
+                        "The image is attached to the conversation right after "
+                        "this tool result; look at it directly. To edit it, call "
+                        "generate_image with source_file_ids=[this file_id]."
+                    ),
+                },
+                {
+                    "tool": "read_session_file",
+                    "file_id": file.id,
+                    "image_attached": True,
+                    # Ephemeral model input consumed by the chat tool loop; it is
+                    # stripped before the meta is persisted or streamed.
+                    "model_image_parts": [image_part],
+                },
+                [],
+            )
+
+        if file.size_bytes <= SESSION_FILE_TEXT_MAX_BYTES:
+            content = self._read_stored_file_bytes(
+                file, limit_bytes=SESSION_FILE_TEXT_MAX_BYTES
+            )
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+            if text is not None:
+                text_truncated = len(text) > SESSION_FILE_TEXT_MAX_CHARS
+                return self._success(
+                    {
+                        **base_result,
+                        "encoding": "utf-8",
+                        "text": text[:SESSION_FILE_TEXT_MAX_CHARS],
+                        "text_truncated": text_truncated,
+                    },
+                    {
+                        "tool": "read_session_file",
+                        "file_id": file.id,
+                        "text_truncated": text_truncated,
+                    },
+                    [],
+                )
+
+        view = self._materialize_session_file(chat_session_id, file)
+        return self._success(
+            {
+                **base_result,
+                "workspace_path": view.get("path"),
+                "note": (
+                    "The file is binary or too large to inline; it was "
+                    "materialized into the session workspace. Use "
+                    "sandbox_list_files / sandbox_exec to process it."
+                ),
+            },
+            {
+                "tool": "read_session_file",
+                "file_id": file.id,
+                "workspace_path": view.get("path"),
+            },
+            [],
+        )
+
     def _execute_generate_image(
         self,
         arguments: dict[str, Any],
@@ -1931,6 +2732,53 @@ class AgentToolRuntime:
             if isinstance(model_id_raw, str) and model_id_raw.strip()
             else None
         )
+        source_file_ids_raw = arguments.get("source_file_ids")
+        source_file_ids: list[str] = []
+        if source_file_ids_raw is not None:
+            if not isinstance(source_file_ids_raw, list) or not all(
+                isinstance(item, str) and item.strip()
+                for item in source_file_ids_raw
+            ):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "source_file_ids must be a list of file_id strings",
+                )
+            source_file_ids = list(
+                dict.fromkeys(item.strip() for item in source_file_ids_raw)
+            )
+            if len(source_file_ids) > MAX_IMAGE_EDIT_SOURCES:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    f"source_file_ids supports at most {MAX_IMAGE_EDIT_SOURCES} images",
+                )
+        source_inputs: list[ImageSourceInput] = []
+        for source_file_id in source_file_ids:
+            source_file = self._require_workspace_file(source_file_id)
+            if not (
+                is_image_attachment(source_file)
+                or source_file.mime_type.casefold().startswith("image/")
+            ):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "source_file_ids must reference image files",
+                    {"file_id": source_file.id, "mime_type": source_file.mime_type},
+                )
+            content = self._read_stored_file_bytes(
+                source_file, limit_bytes=AGENT_IMAGE_INPUT_MAX_BYTES
+            )
+            source_mime, _, _ = self._validated_image_bytes(
+                content, file_id=source_file.id
+            )
+            source_inputs.append(
+                ImageSourceInput(
+                    image_bytes=content,
+                    mime_type=source_mime,
+                    name=Path(source_file.original_name).name[:100] or "source.png",
+                )
+            )
         image_provider = self.image_provider
         if provider_id is not None or model_id is not None:
             if self.image_provider_resolver is None:
@@ -1970,7 +2818,11 @@ class AgentToolRuntime:
         usage: dict[str, Any] = {}
         try:
             for event in image_provider.stream_generate(
-                ImageGenerationRequest(prompt=prompt, partial_images=0)
+                ImageGenerationRequest(
+                    prompt=prompt,
+                    partial_images=0,
+                    source_images=tuple(source_inputs),
+                )
             ):
                 if event.type == "completed":
                     final_event = event
@@ -1993,20 +2845,26 @@ class AgentToolRuntime:
                         image_provider, "last_request_id", None
                     ),
                     "agent_tool": "generate_image",
+                    "source_file_ids": source_file_ids,
                 },
             )
         except AppError as exc:
             images.fail(task, exc.code, exc.message)
             return self._failure(exc.code, exc.message, data=exc.details or {})
         except Exception as exc:
+            error_detail = " ".join(str(exc).split()).strip()[:300]
             images.fail(
                 task,
                 "image_generation_failed",
-                str(exc)[:500] or "Image generation failed",
+                error_detail or "Image generation failed",
             )
             return self._failure(
                 "image_generation_failed",
-                "The authorized image generation Provider failed",
+                (
+                    f"The authorized image generation Provider failed: {error_detail}"
+                    if error_detail
+                    else "The authorized image generation Provider failed"
+                ),
             )
 
         part = {
@@ -2022,6 +2880,7 @@ class AgentToolRuntime:
                 "title": title,
                 "alt": prompt[:240],
                 "prompt": prompt,
+                "source_file_ids": source_file_ids,
                 "progress_mode": "completed",
                 "preview_revision": 1,
                 "input_tokens": int(usage.get("input_tokens") or 0),
@@ -2050,6 +2909,7 @@ class AgentToolRuntime:
                 "mime_type": file.mime_type,
                 "title": title,
                 "prompt": prompt,
+                "source_file_ids": source_file_ids,
             },
             {
                 "image": True,

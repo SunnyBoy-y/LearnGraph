@@ -1,8 +1,7 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FileSearch,
-  Languages,
   Network,
   PackageCheck,
   Puzzle,
@@ -19,7 +18,9 @@ import { toast } from "sonner";
 import {
   authorizeMcpServer,
   authorizeSkill,
-  createSkillPackage,
+  browseMcpRegistry,
+  checkSkillUpdate,
+  deleteMcpServer,
   deleteSkill,
   installSkill,
   invokeMcpTool,
@@ -36,6 +37,7 @@ import {
   revokeMcpServer,
   revokeSkill,
   togglePlugin,
+  upgradeSkill,
 } from "@/api";
 import {
   ErrorState,
@@ -62,16 +64,19 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { RuntimeControlsBody } from "@/features/settings/control-pages";
-import { SkillPackageEditor } from "@/features/settings/skill-package-editor";
 import {
-  DEFAULT_SKILL_MD_TEMPLATE,
-  SkillTranslateDialog,
-  SkillsHubExtras,
-} from "@/features/settings/skills-hub-extras";
+  ComponentAdministration,
+  McpRevisionPanel,
+  SandboxAdministration,
+  SkillRevisionPanel,
+} from "@/features/settings/control-pages";
+import { SkillPackageEditor } from "@/features/settings/skill-package-editor";
+import { AddSkillDialog } from "@/features/settings/skills-hub-extras";
 import type {
   MCPServerCreate,
+  McpRegistrySearchItem,
   PermissionDecision,
+  Skill,
   SkillCreate,
 } from "@/types/extensions";
 import type { ProviderRole } from "@/types/providers";
@@ -82,57 +87,36 @@ export type ExtensionsHubTab =
   | "skills"
   | "mcp"
   | "components"
-  | "plugins"
-  | "audit";
+  | "sandbox";
 
 const HUB_TABS: Array<{
   value: ExtensionsHubTab;
   label: string;
-  description: string;
 }> = [
-  {
-    value: "overview",
-    label: "总览",
-    description: "Provider、Plugin 与能力健康摘要",
-  },
-  {
-    value: "skills",
-    label: "Skills Hub",
-    description: "已安装 Skill、声明式安装与授权",
-  },
-  {
-    value: "mcp",
-    label: "MCP",
-    description: "注册、刷新能力、授权与调用",
-  },
-  {
-    value: "components",
-    label: "可信组件",
-    description: "Manifest、授权、检查与 Artifact",
-  },
-  {
-    value: "plugins",
-    label: "插件",
-    description: "工作区 Plugin 启停",
-  },
-  {
-    value: "audit",
-    label: "运行与审计",
-    description: "MCP/Skill 修订、组件与 Sandbox 控制面",
-  },
+  { value: "overview", label: "总览" },
+  { value: "skills", label: "Skills Hub" },
+  { value: "mcp", label: "MCP" },
+  { value: "components", label: "可信组件" },
+  { value: "sandbox", label: "沙箱" },
 ];
 
+/** Legacy tab params from removed tabs redirect to their merged destination. */
+const LEGACY_TAB_ALIASES: Record<string, ExtensionsHubTab> = {
+  plugins: "overview",
+  audit: "mcp",
+};
+
 function normalizeHubTab(raw: string | null): ExtensionsHubTab {
+  if (raw && raw in LEGACY_TAB_ALIASES) return LEGACY_TAB_ALIASES[raw];
   const value = (raw ?? "overview") as ExtensionsHubTab;
   if (HUB_TABS.some((tab) => tab.value === value)) return value;
   return "overview";
 }
 
-/** Unified Extensions Center (D-076): single entry for overview, Skills, MCP, components, plugins, runtime. */
+/** Unified Extensions Center (D-076): single entry for overview (incl. plugins), Skills, MCP, components, sandbox. */
 export function ExtensionsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = normalizeHubTab(searchParams.get("tab"));
-  const activeMeta = HUB_TABS.find((item) => item.value === tab) ?? HUB_TABS[0];
 
   const setTab = (next: string) => {
     const normalized = normalizeHubTab(next);
@@ -145,7 +129,7 @@ export function ExtensionsPage() {
   return (
     <PageFrame>
       <PageIntro
-        description="MCP、Skills、插件、可信组件与运行审计的统一入口。安装、秘密、权限、扫描与沙箱执行均由后端完成。"
+        description="MCP、Skills、插件、可信组件与沙箱的统一入口。安装、秘密、权限、扫描与沙箱执行均由后端完成。"
         eyebrow="Extensions hub"
         title="扩展中心"
       />
@@ -160,26 +144,36 @@ export function ExtensionsPage() {
             </TabsTrigger>
           ))}
         </TabsList>
-        <p className="mt-3 text-xs text-muted-foreground">
-          {activeMeta.description}
-        </p>
         <TabsContent className="mt-5 space-y-5" value="overview">
           <ExtensionsOverviewPanel embedded />
         </TabsContent>
         <TabsContent className="mt-5 space-y-5" value="skills">
           <ToolsPage embedded focus="skills" />
+          <details>
+            <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground">
+              高级 · Skill 详情与修订（版本、来源与 Manifest）
+            </summary>
+            <div className="mt-4">
+              <SkillRevisionPanel />
+            </div>
+          </details>
         </TabsContent>
         <TabsContent className="mt-5 space-y-5" value="mcp">
           <ToolsPage embedded focus="mcp" />
+          <details>
+            <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground">
+              高级 · Transport 能力、Server 详情与快照
+            </summary>
+            <div className="mt-4">
+              <McpRevisionPanel />
+            </div>
+          </details>
         </TabsContent>
         <TabsContent className="mt-5 space-y-5" value="components">
-          <RuntimeControlsBody defaultTab="components" />
+          <ComponentAdministration />
         </TabsContent>
-        <TabsContent className="mt-5 space-y-5" value="plugins">
-          <ExtensionsOverviewPanel embedded pluginsOnly />
-        </TabsContent>
-        <TabsContent className="mt-5 space-y-5" value="audit">
-          <RuntimeControlsBody defaultTab="mcp" />
+        <TabsContent className="mt-5 space-y-5" value="sandbox">
+          <SandboxAdministration />
         </TabsContent>
       </Tabs>
     </PageFrame>
@@ -188,10 +182,8 @@ export function ExtensionsPage() {
 
 export function ExtensionsOverviewPanel({
   embedded = false,
-  pluginsOnly = false,
 }: {
   embedded?: boolean;
-  pluginsOnly?: boolean;
 }) {
   const { workspaceId = "" } = useParams();
   const queryClient = useQueryClient();
@@ -253,8 +245,7 @@ export function ExtensionsOverviewPanel({
   ];
   const body = (
     <>
-      {!pluginsOnly ? (
-        <Surface className="p-5">
+      <Surface className="p-5">
           <SectionHeading
             description="状态、版本和远程能力均来自服务端"
             title="实际能力记录"
@@ -299,14 +290,13 @@ export function ExtensionsOverviewPanel({
               </Link>
             </Button>
             <Button asChild size="sm" variant="outline">
-              <Link to={`/w/${workspaceId}/settings/extensions?tab=audit`}>
+              <Link to={`/w/${workspaceId}/settings/extensions?tab=sandbox`}>
                 <TerminalSquare className="size-4" />
-                运行与审计
+                沙箱管理
               </Link>
             </Button>
           </div>
         </Surface>
-      ) : null}
       <Surface className="overflow-hidden" id="installed-plugins">
         <div className="border-b p-5">
           <SectionHeading title="已安装插件" />
@@ -379,115 +369,6 @@ export function ExtensionsOverviewPanel({
   );
 }
 
-function CreatePackageDialog({
-  busy,
-  onCreate,
-}: {
-  busy: boolean;
-  onCreate: (payload: {
-    skill_key: string;
-    name: string;
-    description: string;
-    with_sample_script: boolean;
-  }) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [skillKey, setSkillKey] = useState("my-skill");
-  const [name, setName] = useState("My skill");
-  const [description, setDescription] = useState(
-    "Use when the user needs this capability. Include trigger phrases so the agent matches correctly.",
-  );
-  const [withScript, setWithScript] = useState(false);
-  const [showPreview, setShowPreview] = useState(false);
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    onCreate({
-      skill_key: skillKey.trim(),
-      name: name.trim(),
-      description: description.trim(),
-      with_sample_script: withScript,
-    });
-    setOpen(false);
-  };
-  return (
-    <Dialog onOpenChange={setOpen} open={open}>
-      <DialogTrigger asChild>
-        <Button size="sm" variant="secondary">
-          <TerminalSquare className="size-4" />
-          创建文件包 Skill
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
-        <DialogHeader>
-          <DialogTitle>创建 Agent Skill 文件包</DialogTitle>
-          <DialogDescription>
-            生成标准 SKILL.md 模板（触发条件 · 正文 · 步骤 · 示例）。scripts 仅可在 Docker 沙箱执行。
-          </DialogDescription>
-        </DialogHeader>
-        <form className="space-y-4" onSubmit={submit}>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Label>
-              Skill Key
-              <Input
-                className="mt-2 font-mono text-xs"
-                onChange={(event) => setSkillKey(event.currentTarget.value)}
-                pattern="[a-z0-9][a-z0-9._-]{1,79}"
-                placeholder="my-skill"
-                required
-                value={skillKey}
-              />
-            </Label>
-            <Label>
-              名称
-              <Input
-                className="mt-2"
-                onChange={(event) => setName(event.currentTarget.value)}
-                required
-                value={name}
-              />
-            </Label>
-          </div>
-          <Label>
-            描述 / 触发条件
-            <Textarea
-              className="mt-2"
-              onChange={(event) => setDescription(event.currentTarget.value)}
-              placeholder="Describe when the agent should use this skill…"
-              rows={3}
-              value={description}
-            />
-          </Label>
-          <Label className="flex items-center gap-2 text-xs">
-            <input
-              checked={withScript}
-              onChange={(event) => setWithScript(event.currentTarget.checked)}
-              type="checkbox"
-            />
-            附带示例 scripts/hello.py（仅沙箱可运行）
-          </Label>
-          <button
-            className="text-xs text-muted-foreground underline-offset-2 hover:underline"
-            onClick={() => setShowPreview((value) => !value)}
-            type="button"
-          >
-            {showPreview ? "隐藏模板预览" : "查看 SKILL.md 模板结构"}
-          </button>
-          {showPreview ? (
-            <pre className="max-h-48 overflow-auto rounded-lg bg-muted p-3 font-mono text-[10px] leading-4">
-              {DEFAULT_SKILL_MD_TEMPLATE}
-            </pre>
-          ) : null}
-          <DialogFooter>
-            <Button disabled={busy} type="submit">
-              {busy ? "创建中…" : "创建"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 function InstallMcpDialog({
   busy,
   onInstall,
@@ -504,6 +385,66 @@ function InstallMcpDialog({
   const [bearerToken, setBearerToken] = useState("");
   const [tools, setTools] = useState("");
   const [permissions, setPermissions] = useState("network");
+  const [registryQuery, setRegistryQuery] = useState("");
+  const [registryItems, setRegistryItems] = useState<McpRegistrySearchItem[]>(
+    [],
+  );
+  const [registryCursor, setRegistryCursor] = useState<string | null>(null);
+  const [registrySearching, setRegistrySearching] = useState(false);
+  const loadRegistry = async (options: { reset: boolean; q?: string }) => {
+    setRegistrySearching(true);
+    try {
+      const result = await browseMcpRegistry({
+        q: (options.q ?? registryQuery).trim() || undefined,
+        cursor: options.reset ? undefined : (registryCursor ?? undefined),
+        limit: 8,
+      });
+      setRegistryItems((previous) =>
+        options.reset ? result.items : [...previous, ...result.items],
+      );
+      setRegistryCursor(result.next_cursor);
+      if (options.reset && !result.items.length) {
+        toast.info("MCP Registry 未找到匹配的服务器");
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "MCP Registry 加载失败",
+      );
+    } finally {
+      setRegistrySearching(false);
+    }
+  };
+  useEffect(() => {
+    if (open) {
+      void loadRegistry({ reset: true, q: "" });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- load once per open
+  }, [open]);
+  const applyRegistryItem = (item: McpRegistrySearchItem) => {
+    const shortName =
+      item.title || (item.name.split("/").pop() ?? item.name);
+    setServerKey(
+      shortName
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80),
+    );
+    setDisplayName(shortName);
+    setSource(item.repository_url || item.website_url || item.name);
+    if (item.version) setVersion(item.version);
+    if (item.endpoint_url) setEndpoint(item.endpoint_url);
+    if (item.env_hints.length) {
+      toast.message(`该服务器声明了环境变量：${item.env_hints.join(", ")}`);
+    }
+    toast.success(
+      item.supported
+        ? "已从 Registry 一键预填；请确认工具与权限后注册"
+        : item.endpoint_url
+          ? `已预填；注意：${item.unsupported_reason || "远程类型可能不兼容"}`
+          : "已预填基础信息；该服务器未提供远程端点，需要自行填写 Endpoint",
+    );
+  };
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const requestedTools = tools
@@ -540,13 +481,98 @@ function InstallMcpDialog({
           注册 MCP
         </Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>注册 Streamable HTTP MCP</DialogTitle>
           <DialogDescription>
             注册后仍需刷新能力快照并明确授权，才可执行真实调用。
           </DialogDescription>
         </DialogHeader>
+        <div className="rounded-lg border bg-muted/30 p-3">
+          <p className="text-xs font-medium text-muted-foreground">
+            MCP 市场 · 官方 Registry（registry.modelcontextprotocol.io）——
+            可注册的远程服务器支持一键预填
+          </p>
+          <div className="mt-2 flex gap-2">
+            <Input
+              onChange={(event) => setRegistryQuery(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void loadRegistry({ reset: true });
+                }
+              }}
+              placeholder="搜索，例如 github / postgres / browser；留空浏览全部"
+              value={registryQuery}
+            />
+            <Button
+              disabled={registrySearching}
+              onClick={() => void loadRegistry({ reset: true })}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {registrySearching ? "加载中…" : "搜索"}
+            </Button>
+          </div>
+          {registryItems.length ? (
+            <div className="mt-2 max-h-64 space-y-1 overflow-auto">
+              {registryItems.map((item) => (
+                <button
+                  className="flex w-full items-center gap-2 rounded border bg-background p-2 text-left text-xs enabled:hover:border-primary disabled:opacity-60"
+                  disabled={!item.supported && !item.endpoint_url}
+                  key={item.name}
+                  onClick={() => applyRegistryItem(item)}
+                  title={item.supported ? undefined : item.unsupported_reason}
+                  type="button"
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">
+                      <span className="font-medium">
+                        {item.title || item.name.split("/").pop()}
+                      </span>
+                      <span className="ml-2 font-mono text-[10px] text-muted-foreground">
+                        {item.name}
+                      </span>
+                    </span>
+                    <span className="block truncate text-muted-foreground">
+                      {item.description || item.repository_url}
+                    </span>
+                    {!item.supported ? (
+                      <span className="block truncate text-[10px] text-amber-700 dark:text-amber-300">
+                        {item.unsupported_reason}
+                      </span>
+                    ) : null}
+                  </span>
+                  {item.env_hints.length ? (
+                    <Badge variant="outline">需配置密钥</Badge>
+                  ) : null}
+                  {item.supported ? (
+                    <Badge variant="secondary">一键填入</Badge>
+                  ) : item.endpoint_url ? (
+                    <Badge variant="outline">{item.transport}</Badge>
+                  ) : (
+                    <Badge variant="outline">仅本地包</Badge>
+                  )}
+                </button>
+              ))}
+              {registryCursor ? (
+                <Button
+                  className="w-full"
+                  disabled={registrySearching}
+                  onClick={() => void loadRegistry({ reset: false })}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  {registrySearching ? "加载中…" : "加载更多"}
+                </Button>
+              ) : null}
+            </div>
+          ) : registrySearching ? (
+            <p className="mt-2 text-xs text-muted-foreground">加载中…</p>
+          ) : null}
+        </div>
         <form className="space-y-4" onSubmit={submit}>
           <div className="grid gap-3 sm:grid-cols-2">
             <Label>
@@ -847,22 +873,43 @@ export function ToolsPage({
     onError: (error) => toast.error(error.message),
   });
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
-  const [translateSkillId, setTranslateSkillId] = useState<string | null>(null);
-  const createPackageMutation = useMutation({
-    mutationFn: createSkillPackage,
-    onSuccess: (skill) => {
-      toast.success(`文件包 Skill「${skill.name}」已创建`);
-      setEditingSkillId(skill.id);
-      refresh();
-    },
-    onError: (error) => toast.error(error.message),
-  });
+  const [skillSearch, setSkillSearch] = useState("");
   const deleteSkillMutation = useMutation({
     mutationFn: deleteSkill,
     onSuccess: () => {
       toast.success("Skill 已删除");
       setEditingSkillId(null);
-      setTranslateSkillId(null);
+      refresh();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const updateCheckMutation = useMutation({
+    mutationFn: checkSkillUpdate,
+    onSuccess: (result) => {
+      if (!result.supported) {
+        toast.info(result.message || "此 Skill 不支持上游更新检查");
+        return;
+      }
+      if (!result.update_available) {
+        toast.success(
+          `已是最新（${result.current_commit.slice(0, 12)} @ ${result.checked_ref}）`,
+        );
+        return;
+      }
+      if (
+        window.confirm(
+          `发现上游更新：${result.current_commit.slice(0, 12)} → ${result.latest_commit.slice(0, 12)}。\n升级会替换包内容并需要重新授权，继续？`,
+        )
+      ) {
+        upgradeSkillMutation.mutate(result.skill_id);
+      }
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const upgradeSkillMutation = useMutation({
+    mutationFn: upgradeSkill,
+    onSuccess: (skill) => {
+      toast.success(`已升级到 ${skill.version}，请重新授权`);
       refresh();
     },
     onError: (error) => toast.error(error.message),
@@ -875,6 +922,14 @@ export function ToolsPage({
           ? "能力快照已更新，需要重新授权"
           : "能力快照已核验",
       );
+      refresh();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const deleteMcpMutation = useMutation({
+    mutationFn: deleteMcpServer,
+    onSuccess: () => {
+      toast.success("MCP Server 已删除");
       refresh();
     },
     onError: (error) => toast.error(error.message),
@@ -895,7 +950,13 @@ export function ToolsPage({
         ? authorizeMcpServer(targetId, decision, permissions)
         : authorizeSkill(targetId, decision, permissions),
     onSuccess: (grant) => {
-      toast.success(`权限决定已保存：${grant.decision}`);
+      const decisionLabel =
+        grant.decision === "always"
+          ? "已启用（总是允许）"
+          : grant.decision === "allow_once"
+            ? "允许一次"
+            : "已禁用";
+      toast.success(`权限决定已保存：${decisionLabel}`);
       refresh();
     },
     onError: (error) => toast.error(error.message),
@@ -970,13 +1031,16 @@ export function ToolsPage({
       ) : null}
       {showSkills ? (
         <>
+          <AddSkillDialog
+            onCreatedPackage={(skill) => {
+              setEditingSkillId(skill.id);
+              refresh();
+            }}
+            onInstalled={refresh}
+          />
           <InstallSkillDialog
             busy={installSkillMutation.isPending}
             onInstall={(payload) => installSkillMutation.mutate(payload)}
-          />
-          <CreatePackageDialog
-            busy={createPackageMutation.isPending}
-            onCreate={(payload) => createPackageMutation.mutate(payload)}
           />
         </>
       ) : null}
@@ -993,14 +1057,7 @@ export function ToolsPage({
           title="MCP 与 Skills 管理"
         />
       ) : (
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-sm text-muted-foreground">
-            {focus === "skills"
-              ? "已安装 · 市场 · 创建与授权。高级工具（本机探测 / 沙箱）默认收起。"
-              : focus === "mcp"
-                ? "注册 Streamable HTTP MCP、刷新能力快照并授权调用。"
-                : "MCP 与 Skills 安装与授权。"}
-          </p>
+        <div className="flex flex-wrap items-center justify-end gap-3">
           {actions}
         </div>
       )}
@@ -1098,6 +1155,24 @@ export function ToolsPage({
                     >
                       撤销
                     </Button>
+                    <Button
+                      className="text-destructive hover:text-destructive"
+                      disabled={deleteMcpMutation.isPending}
+                      onClick={() => {
+                        if (
+                          window.confirm(
+                            `删除 MCP Server「${server.display_name}」？将同时移除其凭据、能力快照与授权记录。`,
+                          )
+                        ) {
+                          deleteMcpMutation.mutate(server.id);
+                        }
+                      }}
+                      size="xs"
+                      variant="ghost"
+                    >
+                      <Trash2 className="size-3" />
+                      删除
+                    </Button>
                   </div>
                 </div>
               </div>
@@ -1117,10 +1192,33 @@ export function ToolsPage({
             description={`${skills.data?.length ?? 0} 个已安装 · 授权后可用`}
             title="已安装 Skills"
           />
+          {(skills.data?.length ?? 0) > 0 ? (
+            <div className="relative mt-3">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="pl-9"
+                onChange={(event) => setSkillSearch(event.currentTarget.value)}
+                placeholder="搜索名称、skill key、来源…"
+                value={skillSearch}
+              />
+            </div>
+          ) : null}
         </div>
         {skills.data?.length ? (
-          <div className="divide-y">
-            {skills.data.map((skill) => (
+          (() => {
+            const keyword = skillSearch.trim().toLowerCase();
+            const matchesSearch = (skill: Skill) =>
+              !keyword ||
+              `${skill.name} ${skill.skill_key} ${skill.source}`
+                .toLowerCase()
+                .includes(keyword);
+            const officialSkills = skills.data.filter(
+              (skill) => skill.is_official && matchesSearch(skill),
+            );
+            const userSkills = skills.data.filter(
+              (skill) => !skill.is_official && matchesSearch(skill),
+            );
+            const renderSkillRow = (skill: Skill) => (
               <div
                 className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center"
                 key={skill.id}
@@ -1130,6 +1228,12 @@ export function ToolsPage({
                   <div className="flex flex-wrap items-center gap-2">
                     <p className="font-semibold">{skill.name}</p>
                     <StatePill status={skill.status} />
+                    {skill.is_official ? (
+                      <Badge className="gap-1" variant="default">
+                        <ShieldCheck className="size-3" />
+                        官方
+                      </Badge>
+                    ) : null}
                     {skill.kind === "agent_skill_package" ||
                     skill.package_format === "skill_md_v1" ? (
                       <Badge variant="secondary">文件包</Badge>
@@ -1139,48 +1243,60 @@ export function ToolsPage({
                     {skill.has_scripts ? (
                       <Badge variant="secondary">scripts</Badge>
                     ) : null}
+                    {(() => {
+                      const scan = (
+                        skill.validation_report as {
+                          security_scan?: { risk_level?: string };
+                        }
+                      )?.security_scan;
+                      const risk = scan?.risk_level;
+                      if (risk !== "high" && risk !== "medium") return null;
+                      return (
+                        <Badge
+                          variant={risk === "high" ? "destructive" : "outline"}
+                        >
+                          风险{risk === "high" ? "高" : "中"}
+                        </Badge>
+                      );
+                    })()}
                   </div>
                   <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
                     {skill.skill_key} · v{skill.version} · {skill.source}
                   </p>
                 </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {(["allow_once", "always", "deny"] as const).map(
-                    (decision) => (
-                      <Button
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {skill.is_official ? (
+                    <span className="text-xs text-muted-foreground">
+                      系统管理 · 自动启用
+                    </span>
+                  ) : (
+                    <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+                      <Switch
+                        aria-label={`启用或禁用 ${skill.name}`}
+                        checked={skill.status === "enabled"}
                         disabled={decide.isPending}
-                        key={decision}
-                        onClick={() =>
+                        onCheckedChange={(checked) =>
                           decide.mutate({
                             targetType: "skill",
                             targetId: skill.id,
-                            decision,
-                            permissions: skill.required_permissions,
+                            decision: checked ? "always" : "deny",
+                            permissions: checked
+                              ? skill.required_permissions
+                              : [],
                           })
                         }
-                        size="xs"
-                        variant={decision === "deny" ? "ghost" : "outline"}
-                      >
-                        {decision === "allow_once"
-                          ? "允许一次"
-                          : decision === "always"
-                            ? "总是允许"
-                            : "拒绝"}
-                      </Button>
-                    ),
+                      />
+                      {skill.status === "enabled" ? "启用" : "禁用"}
+                    </label>
                   )}
                   {skill.kind === "agent_skill_package" ||
                   skill.package_format === "skill_md_v1" ? (
                     <Button
-                      onClick={() =>
-                        setEditingSkillId(
-                          editingSkillId === skill.id ? null : skill.id,
-                        )
-                      }
+                      onClick={() => setEditingSkillId(skill.id)}
                       size="xs"
                       variant="outline"
                     >
-                      {editingSkillId === skill.id ? "收起" : "编辑"}
+                      {skill.is_official ? "查看" : "编辑"}
                     </Button>
                   ) : (
                     <Button
@@ -1192,48 +1308,72 @@ export function ToolsPage({
                       运行
                     </Button>
                   )}
-                  <Button
-                    onClick={() => setTranslateSkillId(skill.id)}
-                    size="xs"
-                    variant="outline"
-                  >
-                    <Languages className="size-3" />
-                    翻译
-                  </Button>
-                  <Button
-                    disabled={revoke.isPending}
-                    onClick={() =>
-                      revoke.mutate({
-                        targetType: "skill",
-                        targetId: skill.id,
-                      })
-                    }
-                    size="xs"
-                    variant="ghost"
-                  >
-                    撤销
-                  </Button>
-                  <Button
-                    disabled={deleteSkillMutation.isPending}
-                    onClick={() => {
-                      if (
-                        window.confirm(
-                          `确定永久删除 Skill「${skill.name}」？此操作不可恢复。`,
-                        )
-                      ) {
-                        deleteSkillMutation.mutate(skill.id);
+                  {skill.origin_type === "github_import" ? (
+                    <Button
+                      disabled={
+                        updateCheckMutation.isPending ||
+                        upgradeSkillMutation.isPending
                       }
-                    }}
-                    size="xs"
-                    variant="ghost"
-                  >
-                    <Trash2 className="size-3" />
-                    删除
-                  </Button>
+                      onClick={() => updateCheckMutation.mutate(skill.id)}
+                      size="xs"
+                      variant="outline"
+                    >
+                      <RefreshCcw className="size-3" />
+                      {upgradeSkillMutation.isPending ? "升级中…" : "更新"}
+                    </Button>
+                  ) : null}
+                  {!skill.is_official ? (
+                    <Button
+                      disabled={deleteSkillMutation.isPending}
+                      onClick={() => {
+                        if (
+                          window.confirm(
+                            `确定永久删除 Skill「${skill.name}」？此操作不可恢复。`,
+                          )
+                        ) {
+                          deleteSkillMutation.mutate(skill.id);
+                        }
+                      }}
+                      size="xs"
+                      variant="ghost"
+                    >
+                      <Trash2 className="size-3" />
+                      删除
+                    </Button>
+                  ) : null}
                 </div>
               </div>
-            ))}
-          </div>
+            );
+            if (!officialSkills.length && !userSkills.length) {
+              return (
+                <p className="py-12 text-center text-sm text-muted-foreground">
+                  没有匹配「{skillSearch.trim()}」的 Skill。
+                </p>
+              );
+            }
+            return (
+              <div className="max-h-[420px] overflow-y-auto">
+                {officialSkills.length ? (
+                  <div>
+                    <p className="border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+                      官方 Skills · LearnGraph 内置工作流（图谱生成、路线规划、复习等，系统管理）
+                    </p>
+                    <div className="divide-y">
+                      {officialSkills.map(renderSkillRow)}
+                    </div>
+                  </div>
+                ) : null}
+                {userSkills.length ? (
+                  <div>
+                    <p className="border-y bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+                      用户 Skills · 市场安装 / 导入 / 自建
+                    </p>
+                    <div className="divide-y">{userSkills.map(renderSkillRow)}</div>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })()
         ) : (
           <p className="py-12 text-center text-sm text-muted-foreground">
             尚未安装 Skill。可从市场安装，或创建文件包 / 声明式 Skill。
@@ -1241,34 +1381,36 @@ export function ToolsPage({
         )}
       </Surface>
       ) : null}
-      {showSkills && editingSkillId
-        ? (() => {
-            const skill = skills.data?.find((item) => item.id === editingSkillId);
-            return skill ? <SkillPackageEditor skill={skill} /> : null;
-          })()
-        : null}
-      {showSkills && translateSkillId
+      {showSkills
         ? (() => {
             const skill = skills.data?.find(
-              (item) => item.id === translateSkillId,
+              (item) => item.id === editingSkillId,
             );
-            return skill ? (
-              <SkillTranslateDialog
-                onOpenChange={(open) => {
-                  if (!open) setTranslateSkillId(null);
+            return (
+              <Dialog
+                onOpenChange={(nextOpen) => {
+                  if (!nextOpen) setEditingSkillId(null);
                 }}
-                open
-                skill={skill}
-              />
-            ) : null;
+                open={Boolean(skill)}
+              >
+                <DialogContent
+                  aria-describedby={undefined}
+                  className="max-h-[90vh] overflow-y-auto p-0 sm:max-w-4xl [&>.surface]:rounded-none [&>.surface]:border-0 [&>.surface]:shadow-none"
+                >
+                  <DialogTitle className="sr-only">
+                    {skill ? `文件包 · ${skill.name}` : "Skill 详情"}
+                  </DialogTitle>
+                  {skill ? (
+                    <SkillPackageEditor
+                      key={skill.id}
+                      skill={skill}
+                    />
+                  ) : null}
+                </DialogContent>
+              </Dialog>
+            );
           })()
         : null}
-      {showSkills ? (
-        <SkillsHubExtras
-          onInstalled={refresh}
-          skills={skills.data ?? []}
-        />
-      ) : null}
       {focus === "all" || focus === "mcp" ? (
       <div className="grid gap-5 lg:grid-cols-2">
         <Surface className="p-5">
@@ -1323,52 +1465,6 @@ export function ToolsPage({
           </div>
         </Surface>
       </div>
-      ) : showSkills ? (
-        <details className="rounded-xl border">
-          <summary className="cursor-pointer px-4 py-3 text-sm text-muted-foreground">
-            权限决定与最近调用（{grants.data?.length ?? 0} 条授权 ·{" "}
-            {invocations.data?.length ?? 0} 次调用）
-          </summary>
-          <div className="grid gap-5 border-t p-4 lg:grid-cols-2">
-            <div className="space-y-2">
-              {grants.data?.slice(0, 6).map((grant) => (
-                <div
-                  className="flex items-center gap-3 rounded-lg border p-3 text-xs"
-                  key={grant.id}
-                >
-                  <ShieldCheck className="size-4 text-primary" />
-                  <span className="min-w-0 flex-1 truncate">
-                    {grant.subject_type}:{grant.subject_id}
-                  </span>
-                  <StatePill status={grant.decision} />
-                </div>
-              ))}
-              {!grants.data?.length ? (
-                <p className="py-4 text-center text-sm text-muted-foreground">
-                  尚无权限决定
-                </p>
-              ) : null}
-            </div>
-            <div className="space-y-2">
-              {invocations.data?.slice(0, 6).map((invocation) => (
-                <div
-                  className="flex items-center gap-3 rounded-lg border p-3 text-xs"
-                  key={invocation.id}
-                >
-                  <span className="min-w-0 flex-1 truncate font-mono">
-                    {invocation.tool_name}
-                  </span>
-                  <StatePill status={invocation.status} />
-                </div>
-              ))}
-              {!invocations.data?.length ? (
-                <p className="py-4 text-center text-sm text-muted-foreground">
-                  尚无真实调用记录
-                </p>
-              ) : null}
-            </div>
-          </div>
-        </details>
       ) : null}
     </>
   );

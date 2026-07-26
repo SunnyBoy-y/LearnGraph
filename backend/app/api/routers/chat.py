@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import queue
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query, Response, status
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    Header,
+    Query,
+    Response,
+    UploadFile,
+    WebSocket,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import sessionmaker
 
@@ -17,6 +29,9 @@ from app.domain.schemas.chat import (
     BranchRequest,
     ConceptBranchCreateRequest,
     ConceptBranchPromoteRequest,
+    DictationCleanupRequest,
+    DictationCleanupView,
+    DictationTranscriptionView,
     MessageCreateRequest,
     MessageRetryRequest,
     MessageSnapshotView,
@@ -24,6 +39,7 @@ from app.domain.schemas.chat import (
     MessageVersionView,
     SSEEventEnvelope,
     SessionAutoTitleRequest,
+    SessionContextUsageView,
     SessionCreateRequest,
     SessionView,
     SuggestedPromptBatchView,
@@ -36,9 +52,20 @@ from app.providers.factory import (
     memory_provider_for_workspace,
     model_provider_for_workspace,
     search_provider_for_workspace,
+    transcription_provider_for_workspace,
     vision_provider_for_workspace,
 )
 from app.services.chat import ChatService
+from app.services.dictation import (
+    DictationService,
+    authenticate_realtime_dictation,
+    build_realtime_finish_task,
+    build_realtime_run_task,
+    dashscope_realtime_ws_url,
+    is_realtime_transcription_model,
+    parse_realtime_upstream_event,
+)
+from app.services.billing import BillingService
 from app.services.graph_changes import GraphChangeSetService
 from app.services.image_chat import ImageChatService
 from app.services.memory import MemoryService
@@ -336,11 +363,10 @@ def service(
         context.principal.user_id,
         model_provider_for_workspace(db, context.workspace_id, settings, **model_kwargs),
         search_provider=search_provider,
+        # Recall never probes the semantic provider, so the streaming and
+        # cache paths can share one loader.
         memory_context_loader=memory_service.context_for_session,
-        memory_cache_context_loader=lambda session_id: memory_service.context_for_session(
-            session_id,
-            require_provider_health=False,
-        ),
+        memory_cache_context_loader=memory_service.context_for_session,
         suggested_prompt_context_access_checker=lambda session, session_permission: (
             authorization.can_access_resource(
                 context.workspace,
@@ -407,6 +433,345 @@ def list_sessions(db: DB, context: CurrentWorkspace, settings: AppSettings) -> l
 @router.post("", response_model=SessionView, status_code=status.HTTP_201_CREATED)
 def create_session(payload: SessionCreateRequest, db: DB, context: CurrentWorkspace, settings: AppSettings) -> SessionView:
     return SessionView.model_validate(service(db, context, settings).create_session(payload))
+
+
+# Static path registered before the /{session_id}/... routes below so a
+# session named "dictation" can never shadow it (and vice versa).
+@router.post(
+    "/dictation/cleanup",
+    response_model=DictationCleanupView,
+    responses={
+        402: {
+            "description": (
+                "The workspace hard budget blocks the remote call "
+                "(budget_hard_limit_exceeded)"
+            )
+        },
+        409: {
+            "description": (
+                "Cleanup is disabled, the persisted setting is invalid, or "
+                "usage preflight rejected the call (dictation_cleanup_disabled, "
+                "dictation_cleanup_setting_invalid, usage_price_required)"
+            )
+        },
+        502: {
+            "description": (
+                "The remote Provider returned invalid structured output "
+                "(dictation_cleanup_failed)"
+            )
+        },
+        503: {
+            "description": (
+                "The model Provider is unavailable or not remote-capable "
+                "(model_provider_unavailable, remote_model_required)"
+            )
+        },
+    },
+)
+def cleanup_dictation(
+    payload: DictationCleanupRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> DictationCleanupView:
+    return service(
+        db,
+        context,
+        settings,
+        model_id=payload.model_id,
+        provider_id=payload.provider_id,
+        thinking_mode="off",
+    ).cleanup_dictation(payload)
+
+
+# Static path registered before the /{session_id}/... routes below so a
+# session named "dictation" can never shadow it (and vice versa).
+@router.post(
+    "/dictation/transcriptions",
+    response_model=DictationTranscriptionView,
+    responses={
+        402: {
+            "description": (
+                "The workspace hard budget blocks the remote call "
+                "(budget_hard_limit_exceeded)"
+            )
+        },
+        413: {"description": "The segment exceeds the dictation size bound (audio_segment_too_large)"},
+        415: {"description": "The upload is not audio (audio_required)"},
+        502: {
+            "description": (
+                "The remote ASR Provider failed (transcription_provider_failed)"
+            )
+        },
+        503: {
+            "description": (
+                "No enabled remote ASR Provider matches this request "
+                "(transcription_provider_unavailable)"
+            )
+        },
+    },
+)
+async def transcribe_dictation_segment(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    file: Annotated[UploadFile, File()],
+    provider_id: Annotated[str | None, Form(max_length=36)] = None,
+    model_id: Annotated[str | None, Form(max_length=160)] = None,
+    language: Annotated[str | None, Form(max_length=16)] = None,
+) -> DictationTranscriptionView:
+    """Transcribe one live microphone segment through the workspace ASR Provider.
+
+    The audio is never stored: segments are cut at natural pauses on the
+    client so the Provider's native punctuation inference is preserved and the
+    microphone session keeps running while earlier segments upload.
+    """
+
+    content = await file.read()
+    return DictationTranscriptionView.model_validate(
+        DictationService(
+            db, context.workspace_id, context.principal.user_id, settings
+        ).transcribe_segment(
+            content=content,
+            mime_type=file.content_type or "application/octet-stream",
+            filename=file.filename or "dictation-segment.webm",
+            provider_id=provider_id or None,
+            model_id=model_id or None,
+            language=language or None,
+        )
+    )
+
+
+async def _ws_error(websocket: WebSocket, code: str, message: str) -> None:
+    try:
+        await websocket.send_json({"type": "error", "code": code, "message": message})
+        await websocket.close()
+    except Exception:
+        # 客户端可能已断开;错误通知尽力而为。
+        pass
+
+
+@router.websocket("/dictation/realtime")
+async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings) -> None:
+    """Proxy live microphone PCM to the DashScope realtime ASR WebSocket.
+
+    Realtime models (``qwen3-asr-flash-realtime`` / ``paraformer-realtime`` /
+    ``gummy-realtime``) are WebSocket-only, so the browser keeps ONE duplex
+    connection here and the server bridges it to DashScope with the stored
+    Provider secret.  Client protocol: first frame ``{type:"start", token,
+    workspace_id, sample_rate}``; then binary PCM16 mono frames; then
+    ``{type:"stop"}``.  Server frames: ``ready`` → ``partial``/``final`` text
+    events (native punctuation preserved) → ``done`` or ``error``.
+    """
+
+    await websocket.accept()
+    try:
+        raw_start = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+        start = json.loads(raw_start)
+    except Exception:
+        await _ws_error(websocket, "invalid_start", "Expected a start frame within 10s")
+        return
+    if not isinstance(start, dict) or start.get("type") != "start":
+        await _ws_error(websocket, "invalid_start", "The first frame must be a start message")
+        return
+    token = str(start.get("token") or "")
+    workspace_id = str(start.get("workspace_id") or "")
+    user_id = authenticate_realtime_dictation(db, token, workspace_id)
+    if user_id is None:
+        await _ws_error(websocket, "unauthorized", "A valid session token and workspace are required")
+        return
+    adapter = transcription_provider_for_workspace(
+        db,
+        workspace_id,
+        settings,
+        provider_id=str(start.get("provider_id") or "") or None,
+        model_id=str(start.get("model_id") or "") or None,
+    )
+    if adapter is None:
+        await _ws_error(
+            websocket,
+            "transcription_provider_unavailable",
+            "No enabled remote ASR Provider matches this request",
+        )
+        return
+    if not is_realtime_transcription_model(adapter.model_id):
+        await _ws_error(
+            websocket,
+            "realtime_model_required",
+            "The configured transcription model is not a realtime model",
+        )
+        return
+    upstream_url = dashscope_realtime_ws_url(adapter.base_url)
+    if upstream_url is None:
+        await _ws_error(
+            websocket,
+            "realtime_unsupported_provider",
+            "Realtime dictation requires a DashScope base URL",
+        )
+        return
+    try:
+        sample_rate = int(start.get("sample_rate") or 16_000)
+    except (TypeError, ValueError):
+        sample_rate = 16_000
+    if not 8_000 <= sample_rate <= 48_000:
+        sample_rate = 16_000
+
+    billing = BillingService(db, workspace_id, user_id)
+    try:
+        quote = billing.preflight_model_call(
+            provider_id=adapter.provider_id,
+            model_id=adapter.model_id,
+            feature="audio_transcription",
+            estimated_input_tokens=0,
+            estimated_output_tokens=0,
+            remote_capability=True,
+        )
+        db.commit()
+    except AppError as exc:
+        await _ws_error(websocket, exc.code, exc.message)
+        return
+
+    from websockets.asyncio.client import connect as ws_connect
+
+    started_at = asyncio.get_running_loop().time()
+    try:
+        upstream = await ws_connect(
+            upstream_url,
+            additional_headers={"Authorization": f"bearer {adapter.api_key}"},
+            max_size=2**22,
+            open_timeout=15,
+        )
+    except Exception:
+        await _ws_error(
+            websocket,
+            "upstream_connect_failed",
+            "Could not reach the DashScope realtime ASR endpoint",
+        )
+        return
+
+    task_id, run_task = build_realtime_run_task(adapter.model_id, sample_rate)
+    finish_sent = False
+    try:
+        await upstream.send(run_task)
+        while True:
+            event = parse_realtime_upstream_event(
+                await asyncio.wait_for(upstream.recv(), timeout=20)
+            )
+            if event.event == "task-started":
+                break
+            if event.event == "task-failed":
+                await _ws_error(
+                    websocket, "asr_task_failed", event.error or "DashScope rejected the task"
+                )
+                return
+    except Exception:
+        await _ws_error(websocket, "asr_task_failed", "DashScope did not start the ASR task")
+        return
+    finally:
+        if websocket.client_state.name != "CONNECTED":
+            await upstream.close()
+
+    await websocket.send_json({"type": "ready", "sample_rate": sample_rate})
+
+    async def pump_client() -> str:
+        nonlocal finish_sent
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    return "disconnect"
+                data = message.get("bytes")
+                if data:
+                    await upstream.send(data)
+                    continue
+                text = message.get("text")
+                if not text:
+                    continue
+                try:
+                    frame = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(frame, dict) and frame.get("type") == "stop":
+                    await upstream.send(build_realtime_finish_task(task_id))
+                    finish_sent = True
+                    return "stop"
+        except Exception:
+            return "disconnect"
+
+    async def pump_upstream() -> dict[str, int] | None:
+        """Relay text events until the task ends; returns usage when finished."""
+        try:
+            async for raw_event in upstream:
+                event = parse_realtime_upstream_event(raw_event)
+                if event.event == "result-generated" and event.text is not None:
+                    await websocket.send_json(
+                        {"type": "final" if event.final else "partial", "text": event.text}
+                    )
+                elif event.event == "task-finished":
+                    return event.usage
+                elif event.event == "task-failed":
+                    await _ws_error(
+                        websocket, "asr_task_failed", event.error or "ASR task failed"
+                    )
+                    return None
+        except Exception:
+            return None
+        return None
+
+    client_task = asyncio.create_task(pump_client())
+    upstream_task = asyncio.create_task(pump_upstream())
+    usage: dict[str, int] | None = None
+    stop_reason = "disconnect"
+    try:
+        done, _ = await asyncio.wait(
+            {client_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if client_task in done:
+            stop_reason = client_task.result()
+            if not finish_sent:
+                try:
+                    await upstream.send(build_realtime_finish_task(task_id))
+                    finish_sent = True
+                except Exception:
+                    pass
+            try:
+                usage = await asyncio.wait_for(
+                    upstream_task, timeout=20 if stop_reason == "stop" else 5
+                )
+            except (asyncio.TimeoutError, Exception):
+                upstream_task.cancel()
+        else:
+            usage = upstream_task.result()
+            client_task.cancel()
+    finally:
+        for task in (client_task, upstream_task):
+            if not task.done():
+                task.cancel()
+        try:
+            await upstream.close()
+        except Exception:
+            pass
+
+    latency_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
+    try:
+        billing.record_usage(
+            quote,
+            input_tokens=int((usage or {}).get("input_tokens") or 0),
+            output_tokens=int((usage or {}).get("output_tokens") or 0),
+            attempt=1,
+            latency_ms=latency_ms,
+            usage_reported=bool(usage),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    if stop_reason == "stop":
+        try:
+            await websocket.send_json({"type": "done"})
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @router.post("/{session_id}/auto-title", response_model=SessionView)
@@ -578,6 +943,27 @@ def reject_graph_change_set(
 @router.get("/{session_id}/messages", response_model=list[MessageView])
 def list_messages(session_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[MessageView]:
     return [MessageView.model_validate(item) for item in service(db, context, settings).list_messages(session_id)]
+
+
+@router.get("/{session_id}/context-usage", response_model=SessionContextUsageView)
+def get_session_context_usage(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    model_id: Annotated[str | None, Query(min_length=1, max_length=160)] = None,
+    provider_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    agent_mode: bool = False,
+) -> SessionContextUsageView:
+    return SessionContextUsageView.model_validate(
+        service(
+            db,
+            context,
+            settings,
+            model_id=model_id,
+            provider_id=provider_id,
+        ).context_usage(session_id, agent_mode=agent_mode)
+    )
 
 
 @router.get(

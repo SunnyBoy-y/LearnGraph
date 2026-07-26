@@ -1,14 +1,17 @@
 import type {
+  ContextSummarizationRunResult,
+  EffectiveMemoryPackage,
   MemoryCreateRequest,
   MemoryBinding,
-  MemoryDraft,
-  MemoryDraftCreateRequest,
-  MemoryDraftDecisionRequest,
-  MemoryDraftStatus,
+  MemoryEmbeddingReindexResult,
+  MemoryEnhancement,
+  MemoryEnhancementUpdateRequest,
   MemoryEntry,
+  MemoryExtractionRunResult,
   MemoryNamespace,
   MemoryPolicy,
   MemoryPolicyUpdateRequest,
+  MemoryProviderMigrationResult,
   MemoryProviderStatus,
   MemoryPurgeResult,
   MemoryRevision,
@@ -25,6 +28,7 @@ export function listMemories(params: {
   state?: MemoryState
   namespace?: MemoryNamespace
   session_id?: string
+  include_content?: boolean
 } = {}): Promise<MemoryEntry[]> {
   return apiClient.get<MemoryEntry[]>('/memory', { query: params })
 }
@@ -93,6 +97,10 @@ export function purgeExpiredMemoryContent(): Promise<MemoryPurgeResult> {
   return apiClient.post<MemoryPurgeResult>('/memory/maintenance/purge-expired')
 }
 
+export function migrateMemoryProvider(): Promise<MemoryProviderMigrationResult> {
+  return apiClient.post<MemoryProviderMigrationResult>('/memory/maintenance/migrate-provider')
+}
+
 export function exportMemoryMarkdown(): Promise<Blob> {
   return apiClient.getBlob('/memory/export')
 }
@@ -101,30 +109,40 @@ export function listMemoryTypes(): Promise<MemoryTypeDefinition[]> {
   return apiClient.get<MemoryTypeDefinition[]>('/memory/types')
 }
 
-export function listMemoryDrafts(params: {
-  status?: MemoryDraftStatus | null
+export function getEffectiveMemoryPackage(params: {
   session_id?: string
   goal_id?: string
-} = {}): Promise<MemoryDraft[]> {
-  return apiClient.get<MemoryDraft[]>('/memory/drafts', {
-    query: {
-      status: params.status === null ? undefined : (params.status ?? 'PENDING'),
-      session_id: params.session_id,
-      goal_id: params.goal_id,
-    },
-  })
+} = {}): Promise<EffectiveMemoryPackage> {
+  return apiClient.get<EffectiveMemoryPackage>('/memory/package', { query: params })
 }
 
-export function createMemoryDraft(payload: MemoryDraftCreateRequest): Promise<MemoryDraft> {
-  return apiClient.post<MemoryDraft, MemoryDraftCreateRequest>('/memory/drafts', payload)
+export function getMemoryEnhancement(): Promise<MemoryEnhancement> {
+  return apiClient.get<MemoryEnhancement>('/memory/enhancement')
 }
 
-export function decideMemoryDraft(
-  draftId: string,
-  payload: MemoryDraftDecisionRequest,
-): Promise<MemoryDraft> {
-  return apiClient.post<MemoryDraft, MemoryDraftDecisionRequest>(
-    `/memory/drafts/${encodeURIComponent(draftId)}/decision`,
+export function updateMemoryEnhancement(
+  payload: MemoryEnhancementUpdateRequest,
+): Promise<MemoryEnhancement> {
+  return apiClient.put<MemoryEnhancement, MemoryEnhancementUpdateRequest>(
+    '/memory/enhancement',
     payload,
+  )
+}
+
+export function reindexMemoryEmbeddings(): Promise<MemoryEmbeddingReindexResult> {
+  return apiClient.post<MemoryEmbeddingReindexResult>('/memory/enhancement/reindex')
+}
+
+export function extractSessionMemories(sessionId: string): Promise<MemoryExtractionRunResult> {
+  return apiClient.post<MemoryExtractionRunResult>(
+    `/memory/enhancement/extract/${encodeURIComponent(sessionId)}`,
+  )
+}
+
+export function summarizeSessionContext(
+  sessionId: string,
+): Promise<ContextSummarizationRunResult> {
+  return apiClient.post<ContextSummarizationRunResult>(
+    `/memory/enhancement/summarize/${encodeURIComponent(sessionId)}`,
   )
 }

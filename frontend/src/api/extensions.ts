@@ -1,23 +1,30 @@
 import type {
   ExtensionInvocation,
   ExtensionPermissionGrant,
+  ExternalCatalogSource,
+  ExternalSkillSearchResult,
   MCPRefreshResult,
   MCPServer,
   MCPServerCreate,
+  McpRegistrySearchResult,
   PermissionDecision,
   Skill,
   SkillCreate,
   SkillFileContent,
   SkillFileTree,
   SkillFileWriteResult,
+  SkillGitHubInstallPayload,
+  SkillGitHubPreview,
   SkillLocalProbePolicy,
   SkillLocalProbeScan,
   SkillManualImport,
   SkillMarketList,
+  SkillNpxImportResult,
   SkillPackageCreate,
-  SkillSandboxRunRequest,
-  SkillSandboxRunResult,
+  SkillSecurityScanResult,
+  SkillSemanticReviewResult,
   SkillTranslateResult,
+  SkillUpdateCheck,
   SkillValidateResult,
 } from "@/types/extensions";
 
@@ -72,6 +79,12 @@ export function revokeMcpServer(serverId: string): Promise<MCPServer> {
   return apiClient.post<MCPServer, { reason: string }>(
     `/mcp/servers/${encodeURIComponent(serverId)}/revoke`,
     { reason: "workspace_user_revoked" },
+  );
+}
+
+export function deleteMcpServer(serverId: string): Promise<void> {
+  return apiClient.delete<void>(
+    `/mcp/servers/${encodeURIComponent(serverId)}?reason=workspace_user_deleted`,
   );
 }
 
@@ -158,16 +171,6 @@ export function validateSkillPackage(
   );
 }
 
-export function runSkillSandbox(
-  skillId: string,
-  payload: SkillSandboxRunRequest,
-): Promise<SkillSandboxRunResult> {
-  return apiClient.post<SkillSandboxRunResult, SkillSandboxRunRequest>(
-    `/skills/${encodeURIComponent(skillId)}/sandbox-run`,
-    payload,
-  );
-}
-
 export function listSkillMarket(options?: {
   refresh?: boolean;
   q?: string;
@@ -200,6 +203,114 @@ export function installSkillFromMarket(payload: {
 
 export function importSkillManual(payload: SkillManualImport): Promise<Skill> {
   return apiClient.post<Skill, SkillManualImport>("/skills/import", payload);
+}
+
+export function importSkillArchive(payload: {
+  archive_base64: string;
+  filename?: string;
+  skill_key?: string;
+  name?: string;
+}): Promise<Skill> {
+  return apiClient.post<
+    Skill,
+    { archive_base64: string; filename?: string; skill_key?: string; name?: string }
+  >("/skills/import-archive", payload);
+}
+
+export function importSkillNpx(payload: {
+  command: string;
+  skill_key?: string;
+}): Promise<SkillNpxImportResult> {
+  return apiClient.post<
+    SkillNpxImportResult,
+    { command: string; skill_key?: string }
+  >("/skills/npx-import", payload);
+}
+
+export function previewSkillGitHub(
+  reference: string,
+): Promise<SkillGitHubPreview> {
+  return apiClient.post<SkillGitHubPreview, { reference: string }>(
+    "/skills/github/preview",
+    { reference },
+  );
+}
+
+export function installSkillGitHub(
+  payload: SkillGitHubInstallPayload,
+): Promise<Skill> {
+  return apiClient.post<Skill, SkillGitHubInstallPayload>(
+    "/skills/github/install",
+    payload,
+  );
+}
+
+export function scanSkillSecurity(
+  skillId: string,
+): Promise<SkillSecurityScanResult> {
+  return apiClient.post<SkillSecurityScanResult>(
+    `/skills/${encodeURIComponent(skillId)}/security-scan`,
+  );
+}
+
+export function reviewSkillSemantics(
+  skillId: string,
+  force = false,
+): Promise<SkillSemanticReviewResult> {
+  return apiClient.post<SkillSemanticReviewResult, { force: boolean }>(
+    `/skills/${encodeURIComponent(skillId)}/semantic-review`,
+    { force },
+  );
+}
+
+export function checkSkillUpdate(skillId: string): Promise<SkillUpdateCheck> {
+  return apiClient.post<SkillUpdateCheck>(
+    `/skills/${encodeURIComponent(skillId)}/check-update`,
+  );
+}
+
+export function upgradeSkill(skillId: string): Promise<Skill> {
+  return apiClient.post<Skill>(
+    `/skills/${encodeURIComponent(skillId)}/upgrade`,
+  );
+}
+
+export function listSkillCatalogSources(): Promise<ExternalCatalogSource[]> {
+  return apiClient.get<ExternalCatalogSource[]>("/skills/market/catalogs");
+}
+
+export function searchExternalSkillCatalog(
+  catalog: string,
+  q: string,
+  limit = 10,
+): Promise<ExternalSkillSearchResult> {
+  return apiClient.get<ExternalSkillSearchResult>(
+    "/skills/market/external-search",
+    { query: { catalog, q, limit } },
+  );
+}
+
+export function browseMcpRegistry(options?: {
+  q?: string;
+  cursor?: string;
+  limit?: number;
+}): Promise<McpRegistrySearchResult> {
+  return apiClient.get<McpRegistrySearchResult>("/mcp/registry/browse", {
+    query: {
+      ...(options?.q?.trim() ? { q: options.q.trim() } : {}),
+      ...(options?.cursor ? { cursor: options.cursor } : {}),
+      limit: options?.limit ?? 12,
+    },
+  });
+}
+
+export function searchMcpRegistry(
+  q: string,
+  limit = 10,
+): Promise<McpRegistrySearchResult> {
+  return apiClient.get<McpRegistrySearchResult>("/mcp/registry/search", {
+    query: { q, limit },
+  });
 }
 
 export function getSkillLocalProbePolicy(): Promise<SkillLocalProbePolicy> {

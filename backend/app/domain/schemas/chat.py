@@ -77,6 +77,35 @@ class ModelSessionTitle(BaseModel):
         return normalized
 
 
+class DictationCleanupRequest(BaseModel):
+    # A single finalized ASR chunk. The frontend batches finalized speech
+    # segments before calling, so the bound covers one flush, not a whole
+    # dictation session.
+    text: str = Field(min_length=1, max_length=2_000)
+    # Read-only tail of the already-cleaned transcript, sent for context so
+    # the model can resolve homophones across chunk boundaries.
+    context: str = Field(default="", max_length=400)
+    provider_id: str | None = Field(default=None, min_length=1, max_length=36)
+    model_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ModelDictationCleanup(BaseModel):
+    # Empty output is valid: a chunk made purely of filler words cleans to "".
+    text: str = Field(max_length=4_000)
+
+
+class DictationCleanupView(BaseModel):
+    text: str
+
+
+class DictationTranscriptionView(BaseModel):
+    # Empty text is valid: a segment can be pure silence or breath noise.
+    text: str
+    language: str | None = None
+    duration_seconds: float | None = None
+    request_id: str | None = None
+
+
 class SessionView(ORMModel):
     id: str
     workspace_id: str
@@ -446,6 +475,25 @@ class SSEEventEnvelope(BaseModel):
     part: dict[str, Any] | None = None
     status: str | None = None
     provider_trace: dict[str, Any] | None = None
+
+
+class SessionContextUsageView(BaseModel):
+    """Display-only estimate of how full the session context is.
+
+    ``estimated_tokens`` is a lower bound over the visible timeline; the
+    authoritative compaction decision still happens inside the next stream
+    request (see ``ChatService.context_usage``).
+    """
+
+    session_id: str
+    estimated_tokens: int
+    input_budget_tokens: int
+    compaction_threshold_tokens: int
+    remaining_tokens: int
+    used_ratio: float
+    context_window_tokens: int
+    compaction_ratio: float
+    message_count: int
 
 
 class BranchRequest(BaseModel):

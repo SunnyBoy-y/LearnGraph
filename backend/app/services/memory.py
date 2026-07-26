@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -71,7 +72,10 @@ from app.repositories.domain import (
     SettingRepository,
 )
 from app.services.memory_vault import MemoryRecoveryVault
+from app.services.token_estimate import estimate_tokens
 
+
+logger = logging.getLogger(__name__)
 
 RECOVERY_WINDOW = timedelta(minutes=30)
 DELETION_AUDIT_RETENTION = timedelta(days=7)
@@ -434,18 +438,135 @@ class MemoryService:
             },
         )
 
-    def _assert_provider_generation(self, record: MemoryRecord) -> None:
+    def _migrate_record_to_active_provider(self, record: MemoryRecord) -> None:
+        """Adopt a record from a frozen provider generation into the active one.
+
+        Re-projects the current revision into the active provider so the
+        mutation that follows operates on a binding the provider owns, then
+        commits immediately: a later failure in the caller must not roll the
+        adoption back, or the provider-side copy would be orphaned. The stale
+        local Markdown projection is removed best-effort; a remote projection
+        owned by a now-disabled provider is left in place and its bindings are
+        marked orphaned — the local journal stays authoritative either way.
+        """
+
         if record.provider_id == self.provider.provider_id:
             return
-        raise AppError(
-            409,
-            "memory_provider_migration_required",
-            "This memory belongs to a frozen provider generation and must be migrated before mutation",
-            {
-                "memory_id": record.id,
-                "record_provider_id": record.provider_id,
-                "active_provider_id": self.provider.provider_id,
+        revision = self._ensure_revision(record)
+        if revision is None or revision.content is None:
+            raise AppError(410, "memory_content_destroyed", "Memory content is no longer available")
+        now = utc_now()
+        canonical = self._canonical(
+            record,
+            title=revision.title,
+            content=revision.content,
+            revision=record.revision,
+            zone=record.zone,
+            source_ids=list(record.source_ids or []),
+            now=now,
+        )
+        result = self.provider.upsert(canonical)
+        previous_provider_id = record.provider_id
+        previous_binding_id = record.provider_binding_id
+        previous_was_local = previous_provider_id == self.local_projection.provider_id
+        if previous_was_local and previous_binding_id:
+            try:
+                self.local_projection.delete(previous_binding_id)
+            except Exception:
+                logger.warning(
+                    "Stale local memory projection %s could not be removed during provider migration",
+                    previous_binding_id,
+                    exc_info=True,
+                )
+        for binding in self.db.scalars(
+            self.bindings.query().where(
+                MemoryProviderBinding.memory_id == record.id,
+                MemoryProviderBinding.provider_instance_id == previous_provider_id,
+                MemoryProviderBinding.binding_status == "verified",
+            )
+        ).all():
+            binding.binding_status = "superseded" if previous_was_local else "orphaned"
+        record.provider_id = self.provider.provider_id
+        record.provider_binding_id = result.provider_record_id
+        record.relative_path = result.relative_path
+        record.content_hash = canonical.content_hash
+        self._add_binding(record=record, revision=record.revision, result=result, now=now)
+        self.journal.add(
+            MemoryJournalEntry(
+                workspace_id=self.workspace_id,
+                memory_id=record.id,
+                revision=record.revision,
+                operation="MIGRATE",
+                provider_id=self.provider.provider_id,
+                provider_epoch=self._provider_epoch(),
+                provider_record_id=result.provider_record_id,
+                content_hash=record.content_hash,
+                payload=self._journal_payload(record, revision.content),
+            )
+        )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="memory.provider_migrate",
+            resource_type="memory",
+            resource_id=record.id,
+            details={
+                "from_provider_id": previous_provider_id,
+                "to_provider_id": self.provider.provider_id,
+                "revision": record.revision,
+                "previous_projection": "removed" if previous_was_local else "orphaned",
             },
+        )
+        self.db.commit()
+
+    def migrate_provider_generation(self, *, limit: int = 200) -> dict[str, int]:
+        """Bulk-adopt active frozen-generation records into the active provider.
+
+        Lazy per-mutation migration only covers records that get touched; this
+        sweep completes the active provider's projection for the rest.
+        """
+
+        capped = max(1, min(int(limit), 500))
+        records = list(
+            self.db.scalars(
+                self.memories.query()
+                .where(
+                    MemoryRecord.state == "active",
+                    MemoryRecord.provider_id != self.provider.provider_id,
+                )
+                .order_by(MemoryRecord.updated_at.desc())
+                .limit(capped)
+            ).all()
+        )
+        migrated = 0
+        failed = 0
+        for record in records:
+            try:
+                self._migrate_record_to_active_provider(record)
+                migrated += 1
+            except Exception:
+                self.db.rollback()
+                failed += 1
+                logger.warning(
+                    "Memory %s could not be migrated to provider %s",
+                    record.id,
+                    self.provider.provider_id,
+                    exc_info=True,
+                )
+        return {
+            "migrated": migrated,
+            "failed": failed,
+            "remaining": self._frozen_generation_count(),
+        }
+
+    def _frozen_generation_count(self) -> int:
+        return len(
+            self.db.scalars(
+                select(MemoryRecord.id).where(
+                    MemoryRecord.workspace_id == self.workspace_id,
+                    MemoryRecord.state == "active",
+                    MemoryRecord.provider_id != self.provider.provider_id,
+                )
+            ).all()
         )
 
     def _add_binding(
@@ -538,6 +659,7 @@ class MemoryService:
         state: str = "active",
         namespace: str | None = None,
         session_id: str | None = None,
+        include_content: bool = False,
     ) -> list[MemoryView]:
         self.purge_expired()
         statement = self.memories.query().where(MemoryRecord.state == state)
@@ -548,7 +670,10 @@ class MemoryService:
         if session_id:
             statement = statement.where(MemoryRecord.session_id == session_id)
         records = self.db.scalars(statement.order_by(MemoryRecord.updated_at.desc())).all()
-        views = [self._view(item) for item in records]
+        views = [
+            self._view(item, include_content=include_content and item.state == "active")
+            for item in records
+        ]
         if any(self.db.is_modified(item) for item in records):
             self.db.commit()
         return views
@@ -700,7 +825,7 @@ class MemoryService:
     def update(self, memory_id: str, payload: MemoryUpdateRequest) -> MemoryView:
         self.purge_expired()
         record = self._require_active(memory_id)
-        self._assert_provider_generation(record)
+        self._migrate_record_to_active_provider(record)
         self._check_revision(record, payload.expected_revision)
         current = self._ensure_revision(record)
         if current is None or current.content is None:
@@ -1020,7 +1145,6 @@ class MemoryService:
     def delete(self, memory_id: str) -> MemoryView:
         self.purge_expired()
         record = self._require_active(memory_id)
-        self._assert_provider_generation(record)
         current = self._ensure_revision(record)
         if current is None or current.content is None:
             raise AppError(410, "memory_content_destroyed", "Memory content is no longer available")
@@ -1029,9 +1153,19 @@ class MemoryService:
         audit_until = now + DELETION_AUDIT_RETENTION
         snapshot = self._recovery_snapshot(record)
         encrypted_payload, key_path = self.vault.encrypt(record.id, snapshot)
+        # A frozen-generation binding belongs to a previous provider: the local
+        # projection can be removed directly, but a remote projection owned by
+        # a now-disabled provider must not be called — leave the remote copy
+        # and mark its bindings orphaned below.
+        orphaned_remote_projection = False
         try:
             if record.provider_binding_id:
-                self.provider.delete(record.provider_binding_id)
+                if record.provider_id == self.provider.provider_id:
+                    self.provider.delete(record.provider_binding_id)
+                elif record.provider_id == self.local_projection.provider_id:
+                    self.local_projection.delete(record.provider_binding_id)
+                else:
+                    orphaned_remote_projection = True
         except Exception:
             self.vault.destroy(record.id)
             raise
@@ -1092,7 +1226,12 @@ class MemoryService:
             self.bindings.query().where(MemoryProviderBinding.memory_id == record.id)
         ).all()
         for binding in bindings:
-            binding.binding_status = "deleted"
+            binding.binding_status = (
+                "orphaned"
+                if orphaned_remote_projection
+                and binding.provider_instance_id == record.provider_id
+                else "deleted"
+            )
         self.audit.record(
             actor_id=self.actor_id,
             action="memory.soft_delete",
@@ -1102,6 +1241,7 @@ class MemoryService:
                 "recoverable_until": recoverable_until.isoformat(),
                 "audit_retention_until": audit_until.isoformat(),
                 "provider_id": self.provider.provider_id,
+                "orphaned_remote_projection": orphaned_remote_projection,
             },
         )
         self.db.commit()
@@ -1119,7 +1259,6 @@ class MemoryService:
             )
         if record.state != "deleted":
             raise AppError(409, "memory_not_deleted", "Only a deleted memory can be restored")
-        self._assert_provider_generation(record)
         recovery = self.db.scalar(
             self.recoveries.query().where(MemoryDeletionRecovery.memory_id == record.id)
         )
@@ -1171,6 +1310,9 @@ class MemoryService:
         record.content_hash = canonical.content_hash
         record.relative_path = result.relative_path
         record.revision = next_revision
+        # Restore re-projects into whichever provider is active now, so the
+        # record adopts the current generation even across a provider switch.
+        record.provider_id = self.provider.provider_id
         record.state = "active"
         record.deleted_at = None
         record.recoverable_until = None
@@ -1337,6 +1479,7 @@ class MemoryService:
             remote_capability=bool(self.provider.remote_capability),
             status=status,
             provider_epoch=self._provider_epoch(),
+            frozen_memories=self._frozen_generation_count(),
             details=details,
         )
 
@@ -1405,6 +1548,7 @@ class MemoryService:
         session_id: str | None,
         now: datetime,
         limit: int = 8,
+        semantic_boosts: dict[str, float] | None = None,
     ) -> tuple[list[tuple[MemoryRecord, float]], list[dict]]:
         """Assemble effective memories with type-aware merge (no parent copy)."""
 
@@ -1427,6 +1571,10 @@ class MemoryService:
                 record.zone, 0.5
             )
             score = strength * proximity * reliability * zone_factor * default_boost
+            if semantic_boosts:
+                # Optional embedding plugin: similarity amplifies the heuristic
+                # score, it never replaces it (and never demotes on absence).
+                score *= 1.0 + max(0.0, semantic_boosts.get(record.id, 0.0))
             if score <= 0:
                 continue
             scored.append((record, score))
@@ -1484,10 +1632,15 @@ class MemoryService:
         session_id: str | None = None,
         goal_id: str | None = None,
         node_ids: list[str] | None = None,
-        require_provider_health: bool = True,
         limit: int = 8,
         mark_access: bool = False,
+        query_text: str | None = None,
+        prompt_token_budget: int | None = None,
     ) -> EffectiveMemoryPackageView:
+        # Recall reads only local records/revisions — it never contacts the
+        # semantic provider, so provider availability must not gate (or add
+        # remote-probe latency to) the chat hot path. Provider health surfaces
+        # through /memory/provider and the write paths instead.
         self.purge_expired()
         node_id_set = set(node_ids or [])
         if session_id:
@@ -1497,15 +1650,6 @@ class MemoryService:
             session = self.sessions.get(session_id)
             if session is not None and goal_id is None:
                 goal_id = session.goal_id
-        if require_provider_health:
-            health = self.provider.health()
-            if not health.available:
-                raise AppError(
-                    503,
-                    "memory_provider_unavailable",
-                    "The active memory provider is unavailable",
-                    {"provider_id": self.provider.provider_id},
-                )
         now = utc_now()
         statement = self.memories.query().where(
             MemoryRecord.state == "active",
@@ -1539,6 +1683,20 @@ class MemoryService:
                 eligible.append(record)
             elif not goal_id and not node_id_set and scope_type in {"workspace", "session"}:
                 eligible.append(record)
+        semantic_boosts: dict[str, float] = {}
+        if query_text and eligible:
+            # Optional embedding plugin. Failure or absence of configuration
+            # silently keeps the heuristic (no-embedding) recall pipeline.
+            from app.core.config import get_settings
+            from app.services.memory_enhancement import semantic_boosts_for_records
+
+            semantic_boosts = semantic_boosts_for_records(
+                self.db,
+                self.workspace_id,
+                get_settings(),
+                query_text,
+                eligible,
+            )
         selected, conflicts = self._merge_effective(
             eligible,
             goal_id=goal_id,
@@ -1546,24 +1704,36 @@ class MemoryService:
             session_id=session_id,
             now=now,
             limit=limit,
+            semantic_boosts=semantic_boosts or None,
         )
         views: list[MemoryView] = []
         entries: list[str] = []
+        used_tokens = 0
+        accessed = 0
         for record, score in selected:
-            if mark_access:
-                record.access_count = int(getattr(record, "access_count", 0) or 0) + 1
-                record.last_accessed_at = now
-                record.strength = self._recompute_strength(record, now=now, goal_id=goal_id)
             view = self._view(record, include_content=True, retrieval_score=score)
             views.append(view)
             body = (view.content or record.title)[:2000]
-            entries.append(
+            entry = (
                 f"- memory_id={record.id} type={record.record_kind} "
                 f"scope={record.scope_type}:{record.scope_id or '-'} "
                 f"zone={record.zone} strength={record.strength:.2f} score={score:.2f}\n"
                 f"  {record.title}: {body}"
             )
-        if mark_access and selected:
+            if prompt_token_budget is not None:
+                # The prompt block competes with history for the model input
+                # budget; drop lower-ranked entries instead of overflowing.
+                entry_tokens = estimate_tokens(entry)
+                if entries and used_tokens + entry_tokens > prompt_token_budget:
+                    continue
+                used_tokens += entry_tokens
+            entries.append(entry)
+            if mark_access:
+                record.access_count = int(getattr(record, "access_count", 0) or 0) + 1
+                record.last_accessed_at = now
+                record.strength = self._recompute_strength(record, now=now, goal_id=goal_id)
+                accessed += 1
+        if mark_access and accessed:
             self.db.commit()
         prompt_block = (
             "经工作区与 Session 策略授权的作用域记忆（动态继承，非父副本）：\n"
@@ -1578,24 +1748,26 @@ class MemoryService:
             effective_memories=views,
             conflicts=conflicts,
             prompt_block=prompt_block,
-            token_estimate=max(0, len(prompt_block) // 3),
+            token_estimate=estimate_tokens(prompt_block) if prompt_block else 0,
         )
 
     def context_for_session(
         self,
         session_id: str,
         *,
-        require_provider_health: bool = True,
         goal_id: str | None = None,
         node_ids: list[str] | None = None,
+        query_text: str | None = None,
+        prompt_token_budget: int | None = None,
     ) -> str:
         package = self.effective_memory_package(
             session_id=session_id,
             goal_id=goal_id,
             node_ids=node_ids,
-            require_provider_health=require_provider_health,
             limit=8,
-            mark_access=False,
+            mark_access=True,
+            query_text=query_text,
+            prompt_token_budget=prompt_token_budget,
         )
         return package.prompt_block
 
@@ -1769,7 +1941,7 @@ class MemoryService:
             )
             draft.result_memory_id = created.id
             draft.result_revision = created.revision
-        elif draft.operation in {"UPDATE", "MERGE", "SUPERSEDE"}:
+        elif draft.operation in {"UPDATE", "MERGE"}:
             assert draft.target_memory_id
             updated = self.update(
                 draft.target_memory_id,
@@ -1789,10 +1961,39 @@ class MemoryService:
             )
             draft.result_memory_id = updated.id
             draft.result_revision = updated.revision
-            if draft.operation == "SUPERSEDE":
-                target = self.memories.require(draft.target_memory_id, "memory")
-                # Already updated content; mark supersession chain if content create happened separately.
-                target.supersedes_id = target.supersedes_id
+        elif draft.operation == "SUPERSEDE":
+            # A supersession keeps the old record as auditable history: the
+            # draft content becomes a NEW memory that records its lineage via
+            # ``supersedes_id`` while the superseded record moves to the cold
+            # archive zone (out of recall, still exportable/restorable).
+            assert draft.target_memory_id
+            created = self.create(
+                MemoryCreateRequest(
+                    title=draft.title or draft.memory_type,
+                    content=draft.content or draft.title or draft.memory_type,
+                    namespace="session" if draft.proposed_scope_type == "session" else "workspace",
+                    session_id=draft.session_id if draft.proposed_scope_type == "session" else None,
+                    scope_type=draft.proposed_scope_type,  # type: ignore[arg-type]
+                    scope_id=draft.proposed_scope_id,
+                    goal_id=draft.goal_id,
+                    node_id=draft.node_id,
+                    zone="topics",
+                    record_kind=draft.memory_type,
+                    structured_payload=dict(draft.structured_payload or {}),
+                    confidence=float(draft.confidence),
+                    importance=float(draft.importance),
+                    source=f"draft:{draft.created_by}",
+                    source_ids=source_ids,
+                )
+            )
+            successor = self.memories.require(created.id, "memory")
+            successor.supersedes_id = draft.target_memory_id
+            self.update(
+                draft.target_memory_id,
+                MemoryUpdateRequest(zone="archive", reason=f"superseded_by:{created.id}"),
+            )
+            draft.result_memory_id = created.id
+            draft.result_revision = created.revision
         elif draft.operation == "RETRACT":
             assert draft.target_memory_id
             self.delete(draft.target_memory_id)
@@ -1940,7 +2141,6 @@ class MemoryService:
 
         package = self.effective_memory_package(
             goal_id=goal_id,
-            require_provider_health=False,
             limit=24,
             mark_access=False,
         )

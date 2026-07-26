@@ -29,6 +29,7 @@ from app.services.skill_package import (
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_FILES,
     MAX_SKILL_PACKAGE_BYTES,
+    assert_skill_identity_not_reserved,
     guess_mime,
     normalize_skill_relative_path,
     parse_skill_md_frontmatter,
@@ -323,6 +324,7 @@ class SkillLocalProbeService:
         ).strip("-")[:80]
         if not KEY_RE.match(skill_key):
             raise AppError(400, "invalid_skill_key", "skill_key is invalid")
+        assert_skill_identity_not_reserved(skill_key)
         if self.db.scalar(self.skills.query().where(SkillRecord.skill_key == skill_key)):
             raise AppError(409, "skill_key_exists", "Skill key already exists")
 
@@ -405,10 +407,15 @@ class SkillLocalProbeService:
             )
         self.db.flush()
         from app.services.skill_package import SkillPackageService
+        from app.services.skill_security_scan import attach_scan_report
 
         SkillPackageService(
             self.db, self.workspace_id, self.actor_id, self.settings
         )._recompute_package_state(skill)
+        attach_scan_report(
+            skill,
+            [(p, d.decode("utf-8", errors="replace")) for p, d in files],
+        )
         self.audit.record(
             actor_id=self.actor_id,
             action="skill.local_probe.import",

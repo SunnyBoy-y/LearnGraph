@@ -244,7 +244,7 @@ def seed_demo_data(db: Session) -> None:
 def ensure_demo_data() -> None:
     from app.core.database import SessionLocal
     from app.services.components import ensure_builtin_components
-    from app.services.skill_package import ensure_system_canvas_skill_package
+    from app.services.skill_package import ensure_official_skill_packages
 
     with SessionLocal() as db:
         ensure_auth_identities(db)
@@ -252,7 +252,7 @@ def ensure_demo_data() -> None:
             return
         seed_demo_data(db)
         ensure_builtin_components(db, DEMO_WORKSPACE_ID)
-        ensure_system_canvas_skill_package(db, DEMO_WORKSPACE_ID)
+        ensure_official_skill_packages(db, DEMO_WORKSPACE_ID)
         if db.get(Project, "database") is None:
             db.add(Project(id="database", workspace_id=DEMO_WORKSPACE_ID, title="数据库", primary_goal_id="demo-goal", primary_graph_id="demo-graph", position=0))
         if db.get(Project, "systems") is None:

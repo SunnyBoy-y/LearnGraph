@@ -73,6 +73,13 @@ from app.services.authorization import AuthorizationService
 from app.services.billing import BillingService
 from app.services.learning import EvidenceService
 from app.services.management import UsageService
+from app.services.skill_package import (
+    CONTEXTUAL_OFFICIAL_SKILL_KEYS,
+    MAX_SKILL_FILE_BYTES,
+    assert_skill_identity_not_reserved,
+    is_official_skill_record,
+    normalize_skill_relative_path,
+)
 from app.services.workflow import WorkflowService
 
 
@@ -102,6 +109,32 @@ BUILTIN_TOOL_PERMISSIONS: dict[str, list[str]] = {
     "builtin.usage.summary": ["usage.read"],
     "builtin.usage.budget.create": ["usage.write"],
     "builtin.usage.budget.update": ["usage.write"],
+    "builtin.skills.announce_usage": [],
+    "builtin.skills.list": ["workspace.read"],
+    "builtin.skills.install": ["workspace.write"],
+    "builtin.skills.create": ["workspace.write"],
+    "builtin.skills.write_file": ["workspace.write"],
+    "builtin.skills.set_enabled": ["workspace.write"],
+    "builtin.skills.delete": ["workspace.write"],
+    "builtin.mcp.list": ["workspace.read"],
+    "builtin.mcp.register": ["workspace.write"],
+    "builtin.mcp.set_enabled": ["workspace.write"],
+    "builtin.mcp.delete": ["workspace.write"],
+}
+
+# Extension self-service tools: the Agent can manage the same skill/MCP surface
+# the user configures by clicking, gated by settings and workspace permission.
+MANAGEMENT_TOOL_NAMES = {
+    "builtin.skills.list",
+    "builtin.skills.install",
+    "builtin.skills.create",
+    "builtin.skills.write_file",
+    "builtin.skills.set_enabled",
+    "builtin.skills.delete",
+    "builtin.mcp.list",
+    "builtin.mcp.register",
+    "builtin.mcp.set_enabled",
+    "builtin.mcp.delete",
 }
 
 # The same bounded definitions back both declarative Skills and Agent function
@@ -308,9 +341,199 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "builtin.skills.announce_usage": {
+        "function_name": "lg_skill_used",
+        "description": (
+            "Announce that you are now following an installed Agent Skill package. "
+            "Call this FIRST, before applying a skill's instructions, so the user "
+            "sees which skill was triggered in the conversation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_key": {"type": "string", "minLength": 2, "maxLength": 80},
+            },
+            "required": ["skill_key"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.skills.list": {
+        "function_name": "lg_skills_list",
+        "description": "List every installed workspace Skill with its key, kind, enabled state, and origin.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    "builtin.skills.install": {
+        "function_name": "lg_skill_install",
+        "description": (
+            "Install Agent Skills from GitHub or skills.sh — the server-side equivalent of "
+            "`npx skills add <source> --skill <name>`. Accepts owner/repo, a github.com URL, "
+            "a skills.sh URL, or a full `npx skills add …` command string. Content is fetched "
+            "commit-pinned; no npx or shell runs. Installed skills start unauthorized until "
+            "enabled via lg_skill_set_enabled or by the user."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "minLength": 3, "maxLength": 1000},
+                "skill": {"type": "string", "maxLength": 120},
+                "skill_key": {"type": "string", "maxLength": 80},
+            },
+            "required": ["source"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.skills.create": {
+        "function_name": "lg_skill_create",
+        "description": (
+            "Author a new Agent Skill package from SKILL.md content you write. The package "
+            "is stored as workspace files only; scripts never run on the host. The new skill "
+            "starts unauthorized until enabled."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,79}$"},
+                "name": {"type": "string", "maxLength": 160},
+                "skill_md": {"type": "string", "minLength": 20, "maxLength": 100000},
+                "files": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "contents": {"type": "string", "maxLength": 200000},
+                        },
+                        "required": ["path", "contents"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["skill_key", "skill_md"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.skills.write_file": {
+        "function_name": "lg_skill_write_file",
+        "description": (
+            "Create or overwrite one file inside an existing non-official Skill package "
+            "(e.g. edit SKILL.md). Content changes invalidate the skill's authorization."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_key": {"type": "string", "minLength": 2, "maxLength": 80},
+                "path": {"type": "string", "minLength": 1, "maxLength": 500},
+                "contents": {"type": "string", "maxLength": 500000},
+            },
+            "required": ["skill_key", "path", "contents"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.skills.set_enabled": {
+        "function_name": "lg_skill_set_enabled",
+        "description": (
+            "Enable (grant durable authorization) or disable (revoke) an installed Skill. "
+            "Enabling injects the skill into future Agent turns; the action is audited."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_key": {"type": "string", "minLength": 2, "maxLength": 80},
+                "enabled": {"type": "boolean"},
+                "reason": {"type": "string", "maxLength": 500},
+            },
+            "required": ["skill_key", "enabled"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.skills.delete": {
+        "function_name": "lg_skill_delete",
+        "description": "Permanently delete a non-official workspace Skill and its package files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_key": {"type": "string", "minLength": 2, "maxLength": 80},
+                "reason": {"type": "string", "maxLength": 500},
+            },
+            "required": ["skill_key"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.mcp.list": {
+        "function_name": "lg_mcp_list",
+        "description": "List registered MCP servers with transport, endpoint, enabled state, and discovered tools.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    "builtin.mcp.register": {
+        "function_name": "lg_mcp_register",
+        "description": (
+            "Register a remote Streamable HTTP MCP server and probe its capabilities. "
+            "Servers needing credentials must be configured by the user in the Extension "
+            "Center — never pass secrets here. The server starts unauthorized until enabled."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": 1, "maxLength": 160},
+                "endpoint_url": {"type": "string", "minLength": 8, "maxLength": 1000},
+                "server_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,79}$"},
+                "requested_tools": {
+                    "type": "array",
+                    "maxItems": 40,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                },
+            },
+            "required": ["name", "endpoint_url"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.mcp.set_enabled": {
+        "function_name": "lg_mcp_set_enabled",
+        "description": (
+            "Enable (durable authorization + agent auto-invoke) or disable (revoke) a "
+            "registered MCP server. Enabling refreshes its capability snapshot first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "minLength": 2, "maxLength": 80,
+                            "description": "server_key or server id"},
+                "enabled": {"type": "boolean"},
+                "reason": {"type": "string", "maxLength": 500},
+            },
+            "required": ["server", "enabled"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.mcp.delete": {
+        "function_name": "lg_mcp_delete",
+        "description": "Permanently delete a registered MCP server, its credentials, snapshots, and grants.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "minLength": 2, "maxLength": 80},
+                "reason": {"type": "string", "maxLength": 500},
+            },
+            "required": ["server"],
+            "additionalProperties": False,
+        },
+    },
 }
 SKILL_MAX_INPUT_BYTES = 64 * 1024
 SKILL_MAX_RESULT_BYTES = 256 * 1024
+# Progressive-disclosure reader for Agent Skill packages (fixed name — hashed
+# per-skill names are always exactly ``lg_skill_`` + 20 hex chars).
+SKILL_READ_FUNCTION_NAME = "lg_skill_read"
+SKILL_READ_MAX_CONTENT_CHARS = 48_000
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -473,6 +696,23 @@ class MCPAndSkillService:
             skill.package_format or "declarative_json"
         ) == "declarative_json"
 
+    def _authorized_packages(self) -> list[SkillRecord]:
+        """Enabled file-package skills holding a durable ``always`` grant."""
+
+        result: list[SkillRecord] = []
+        for skill in self.list_skills():
+            if not skill.enabled or skill.status != "enabled":
+                continue
+            if not self._is_agent_skill_package(skill):
+                continue
+            grant = self._usable_grant(
+                "skill", skill.id, self._skill_authorization_hash(skill)
+            )
+            if grant is None or grant.decision != "always":
+                continue
+            result.append(skill)
+        return result
+
     def agent_tool_definitions(self) -> list[dict[str, Any]]:
         """Return hot-pluggable first-party, declarative Skill, and MCP tools.
 
@@ -486,6 +726,9 @@ class MCPAndSkillService:
         callable tools.  See :meth:`agent_skill_package_instructions`.
         """
 
+        self_service_enabled = bool(
+            getattr(self.settings, "agent_extension_self_service_enabled", True)
+        )
         definitions = [
             {
                 "type": "function",
@@ -495,8 +738,44 @@ class MCPAndSkillService:
                     "parameters": spec["parameters"],
                 },
             }
-            for spec in BUILTIN_TOOL_SPECS.values()
+            for tool, spec in BUILTIN_TOOL_SPECS.items()
+            if self_service_enabled or tool not in MANAGEMENT_TOOL_NAMES
         ]
+        if self._authorized_packages():
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": SKILL_READ_FUNCTION_NAME,
+                        "description": (
+                            "Read the full SKILL.md instructions or a bundled file of an "
+                            "authorized LearnGraph Agent Skill package. Use this when a "
+                            "skill listed in the skill catalog matches the current task "
+                            "and you need its complete instructions before applying it, "
+                            "or to load its references/ files on demand."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "skill_key": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 80,
+                                    "description": "The skill_key shown in the skill catalog.",
+                                },
+                                "path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 500,
+                                    "description": "Package-relative file path; defaults to SKILL.md.",
+                                },
+                            },
+                            "required": ["skill_key"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
         for skill in self.list_skills():
             if not skill.enabled or skill.status != "enabled":
                 continue
@@ -585,65 +864,174 @@ class MCPAndSkillService:
         cannot monopolize the model context.
         """
 
-        sections: list[str] = []
         activated = activated_skill_keys or set()
+        inline_limit = max(500, int(getattr(self.settings, "skill_prompt_inline_char_limit", 4_000)))
+        total_budget = max(2_000, int(getattr(self.settings, "skill_prompt_total_char_budget", 16_000)))
+        catalog_max = max(1, int(getattr(self.settings, "skill_prompt_catalog_max_entries", 24)))
+        sections: list[str] = []
+        catalog_lines: list[str] = []
+        used_budget = 0
         skills = sorted(
-            self.list_skills(),
+            self._authorized_packages(),
             key=lambda skill: (skill.skill_key not in activated, skill.created_at, skill.id),
         )
         for skill in skills:
-            if not skill.enabled or skill.status != "enabled":
-                continue
-            if not self._is_agent_skill_package(skill):
-                continue
-            # Contextual system skills are installed durably but injected only
+            # Contextual official skills are installed durably but injected only
             # when the user explicitly activates the matching composer mode.
             if (
-                skill.source == "learngraph_system"
-                and skill.skill_key == "goal-learning-route"
+                is_official_skill_record(skill)
+                and skill.skill_key in CONTEXTUAL_OFFICIAL_SKILL_KEYS
                 and skill.skill_key not in activated
             ):
                 continue
-            grant = self._usable_grant(
-                "skill", skill.id, self._skill_authorization_hash(skill)
-            )
-            if grant is None or grant.decision != "always":
-                continue
             instructions = (skill.instructions_markdown or "").strip()
+            description = ""
+            if isinstance(skill.manifest_json, dict):
+                raw = skill.manifest_json.get("description")
+                if isinstance(raw, str):
+                    description = raw.strip()
             if not instructions:
                 # Fall back to the package description when the body is empty.
-                description = ""
-                if isinstance(skill.manifest_json, dict):
-                    raw = skill.manifest_json.get("description")
-                    if isinstance(raw, str):
-                        description = raw.strip()
                 instructions = description
             if not instructions:
                 continue
-            # Bound each package so many authorized skills stay affordable.
-            body = instructions[:8_000]
-            if len(instructions) > 8_000:
-                body = f"{body}\n…(truncated)"
-            sections.append(
-                f"### Skill: {skill.name} (`{skill.skill_key}`)\n"
-                f"skill_id: {skill.id}\n"
-                f"source: {skill.source}\n"
-                f"version: {skill.version}\n\n"
-                f"{body}"
+            is_activated = skill.skill_key in activated
+            # Progressive disclosure: inline small bodies within budget, list
+            # the rest as catalog entries the model expands via lg_skill_read.
+            inline = is_activated or (
+                len(instructions) <= inline_limit
+                and used_budget + len(instructions) <= total_budget
             )
-            if len(sections) >= 8:
-                break
-        if not sections:
+            if inline:
+                body = instructions[:8_000]
+                if len(instructions) > 8_000:
+                    body = f"{body}\n…(truncated)"
+                used_budget += len(body)
+                sections.append(
+                    f"### Skill: {skill.name} (`{skill.skill_key}`)\n"
+                    f"skill_id: {skill.id}\n"
+                    f"source: {skill.source}\n"
+                    f"version: {skill.version}\n\n"
+                    f"{body}"
+                )
+            elif len(catalog_lines) < catalog_max:
+                summary = " ".join((description or instructions).split())[:200]
+                scripts_note = " · bundled scripts (sandbox-only)" if skill.has_scripts else ""
+                catalog_lines.append(
+                    f"- `{skill.skill_key}` · {skill.name}: {summary}{scripts_note}"
+                )
+        if not sections and not catalog_lines:
             return ""
-        return (
+        parts: list[str] = [
             "Authorized LearnGraph Agent Skill packages for this turn. "
             "Treat each block as optional skill instructions when the user's "
-            "request matches its scope. Follow the instructions; do not invent "
+            "request matches its scope. When you decide to follow one of these "
+            "skills, FIRST call the `lg_skill_used` function with its `skill_key` "
+            "so the user sees which skill was triggered, then apply its "
+            "instructions. Follow the instructions; do not invent "
             "host-side scripts or claim you executed package scripts unless a "
             "sandbox tool result confirms it. Package scripts are never automatic "
-            "tools.\n\n"
-            + "\n\n".join(sections)
+            "tools."
+        ]
+        if sections:
+            parts.append("\n\n".join(sections))
+        if catalog_lines:
+            parts.append(
+                "### Skill catalog (load on demand)\n"
+                "These additional authorized skills are available but not "
+                "inlined. When the user's request matches one, call the "
+                "`lg_skill_read` tool with its `skill_key` to load the full "
+                "SKILL.md instructions (and `path` for bundled reference "
+                "files) before applying it. Do not guess a skill's content "
+                "from its one-line summary.\n"
+                + "\n".join(catalog_lines)
+            )
+        return "\n\n".join(parts)
+
+    def read_skill_package_file(self, arguments: dict[str, Any]) -> ExtensionInvocation:
+        """Serve one authorized package file to the Agent (``lg_skill_read``)."""
+
+        skill_key = str(arguments.get("skill_key") or "").strip()
+        rel_path = str(arguments.get("path") or "SKILL.md").strip() or "SKILL.md"
+        input_json = {"skill_key": skill_key, "path": rel_path}
+        invocation = self._create_invocation(
+            target_type="skill",
+            target_id=skill_key or "unknown",
+            tool_name="skill.read",
+            input_json=input_json,
+            input_size=len(_canonical_bytes(input_json)),
+            timeout_ms=0,
         )
+        invocation.status = "running"
+        invocation.started_at = utc_now()
+        try:
+            skill = next(
+                (s for s in self._authorized_packages() if s.skill_key == skill_key),
+                None,
+            )
+            if skill is None:
+                raise AppError(
+                    404,
+                    "skill_not_found",
+                    "No authorized Agent Skill package matches this skill_key",
+                )
+            invocation.skill_id = skill.id
+            invocation.target_id = skill.id
+            from app.services.skill_package import SkillPackageService
+
+            package = SkillPackageService(
+                self.db, self.workspace_id, self.actor_id, self.settings
+            )
+            file_view = package.read_file(skill.id, rel_path)
+            content = file_view.content
+            if len(content) > 48_000:
+                content = f"{content[:48_000]}\n…(truncated)"
+            result = {
+                "skill_key": skill.skill_key,
+                "skill_name": skill.name,
+                "skill_id": skill.id,
+                "path": file_view.relative_path,
+                "mime_type": file_view.mime_type,
+                "content": content,
+            }
+            result_bytes = _canonical_bytes(result)
+            invocation.status = "succeeded"
+            invocation.result_json = result
+            invocation.result_size_bytes = len(result_bytes)
+            invocation.result_hash = hashlib.sha256(result_bytes).hexdigest()
+            invocation.finished_at = utc_now()
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="skill.package.read",
+                resource_type="skill",
+                resource_id=skill.id,
+                details={
+                    "path": file_view.relative_path,
+                    "invocation_id": invocation.id,
+                },
+            )
+            self.db.commit()
+            self.db.refresh(invocation)
+            return invocation
+        except AppError as exc:
+            self._fail_invocation(
+                invocation,
+                exc.code,
+                exc.message,
+                status="failed",
+                http_status=exc.status_code,
+                details=exc.details,
+            )
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _skill_trigger_payload(skill: SkillRecord, origin: str) -> dict[str, Any]:
+        return {
+            "skill_key": skill.skill_key,
+            "skill_name": skill.name,
+            "skill_id": skill.id,
+            "origin": origin,
+        }
 
     def invoke_agent_function(
         self,
@@ -652,11 +1040,36 @@ class MCPAndSkillService:
     ) -> dict[str, Any]:
         """Dispatch a function exposed by :meth:`agent_tool_definitions`."""
 
+        if function_name == SKILL_READ_FUNCTION_NAME:
+            data = self._invocation_data(self.read_skill_package_file(arguments))
+            result = data.get("result") or {}
+            if data.get("status") == "succeeded" and result.get("skill_key"):
+                data["skill_trigger"] = {
+                    "skill_key": result.get("skill_key"),
+                    "skill_name": result.get("skill_name") or result.get("skill_key"),
+                    "skill_id": result.get("skill_id"),
+                    "origin": "catalog_read",
+                }
+            return data
         for tool_name, spec in BUILTIN_TOOL_SPECS.items():
             if spec["function_name"] == function_name:
-                return self._invocation_data(
+                data = self._invocation_data(
                     self.invoke_builtin_tool(tool_name, arguments)
                 )
+                if (
+                    tool_name == "builtin.skills.announce_usage"
+                    and data.get("status") == "succeeded"
+                ):
+                    result = data.get("result") or {}
+                    if result.get("skill_key"):
+                        data["skill_trigger"] = {
+                            "skill_key": result.get("skill_key"),
+                            "skill_name": result.get("skill_name")
+                            or result.get("skill_key"),
+                            "skill_id": result.get("skill_id"),
+                            "origin": "package_instruction",
+                        }
+                return data
         for skill in self.list_skills():
             if self._agent_skill_function_name(skill.id) == function_name:
                 if not self._is_declarative_skill(skill):
@@ -679,7 +1092,13 @@ class MCPAndSkillService:
                         "agent_tool_not_authorized",
                         "The requested Agent Skill is not enabled with durable authorization",
                     )
-                return self._invocation_data(self.invoke_skill(skill.id, SkillInvokeRequest(input=arguments)))
+                data = self._invocation_data(
+                    self.invoke_skill(skill.id, SkillInvokeRequest(input=arguments))
+                )
+                data["skill_trigger"] = self._skill_trigger_payload(
+                    skill, "declarative_invoke"
+                )
+                return data
         for server in self.list_servers():
             snapshot = self._current_snapshot(server)
             if snapshot is None:
@@ -711,6 +1130,157 @@ class MCPAndSkillService:
                         )
                     )
         raise AppError(403, "agent_tool_not_authorized", "The requested Agent tool is not enabled")
+
+    def read_skill_package_file(self, arguments: dict[str, Any]) -> ExtensionInvocation:
+        """Progressive disclosure: return package file text for an authorized skill.
+
+        Read-only counterpart to the prompt catalog — the model calls this to
+        expand a catalog entry into full SKILL.md instructions (or bundled
+        reference files).  Requires the same durable ``always`` grant as prompt
+        injection; every read is recorded as an ExtensionInvocation.
+        """
+
+        skill_key = str(arguments.get("skill_key") or "").strip()
+        raw_path = str(arguments.get("path") or "SKILL.md").strip() or "SKILL.md"
+        input_json = {"skill_key": skill_key, "path": raw_path}
+        invocation = self._create_invocation(
+            target_type="skill",
+            target_id="",
+            tool_name="skill.read",
+            input_json=input_json,
+            input_size=len(_canonical_bytes(input_json)),
+            timeout_ms=0,
+        )
+        invocation.started_at = utc_now()
+        if not skill_key:
+            self._fail_invocation(
+                invocation,
+                "skill_key_required",
+                "skill_key is required",
+                status="failed",
+                http_status=400,
+            )
+        skill = next(
+            (item for item in self.list_skills() if item.skill_key == skill_key),
+            None,
+        )
+        if skill is None or not self._is_agent_skill_package(skill):
+            self._fail_invocation(
+                invocation,
+                "skill_not_found",
+                f"No authorized Agent Skill package with key `{skill_key}`",
+                status="failed",
+                http_status=404,
+            )
+        invocation.target_id = skill.id
+        invocation.skill_id = skill.id
+        auth_hash = self._skill_authorization_hash(skill)
+        grant = self._usable_grant("skill", skill.id, auth_hash)
+        if (
+            not skill.enabled
+            or skill.status != "enabled"
+            or grant is None
+            or grant.decision != "always"
+        ):
+            self._fail_invocation(
+                invocation,
+                "agent_tool_not_authorized",
+                "The requested skill is not enabled with durable authorization",
+                status="denied",
+                http_status=403,
+            )
+        try:
+            path = normalize_skill_relative_path(raw_path)
+        except AppError as exc:
+            self._fail_invocation(
+                invocation,
+                exc.code,
+                exc.message,
+                status="failed",
+                http_status=exc.status_code,
+            )
+        row = self.db.scalar(
+            select(SkillPackageFile).where(
+                SkillPackageFile.workspace_id == self.workspace_id,
+                SkillPackageFile.skill_id == skill.id,
+                SkillPackageFile.relative_path == path,
+                SkillPackageFile.is_directory.is_(False),
+            )
+        )
+        if row is None:
+            self._fail_invocation(
+                invocation,
+                "skill_file_not_found",
+                f"File `{path}` does not exist in this skill package",
+                status="failed",
+                http_status=404,
+            )
+        from app.services.session_workspace import BlobStore
+
+        try:
+            data = BlobStore(self.db, self.workspace_id, self.settings).read_bytes(
+                row.blob_sha256, limit_bytes=MAX_SKILL_FILE_BYTES
+            )
+            content = data.decode("utf-8")
+        except UnicodeDecodeError:
+            self._fail_invocation(
+                invocation,
+                "skill_file_not_text",
+                "Only UTF-8 text files can be read by the agent",
+                status="failed",
+                http_status=415,
+            )
+        except AppError as exc:
+            self._fail_invocation(
+                invocation,
+                exc.code,
+                exc.message,
+                status="failed",
+                http_status=exc.status_code,
+            )
+        truncated = len(content) > SKILL_READ_MAX_CONTENT_CHARS
+        if truncated:
+            content = content[:SKILL_READ_MAX_CONTENT_CHARS]
+        files = [
+            item.relative_path
+            for item in self.db.scalars(
+                select(SkillPackageFile).where(
+                    SkillPackageFile.workspace_id == self.workspace_id,
+                    SkillPackageFile.skill_id == skill.id,
+                    SkillPackageFile.is_directory.is_(False),
+                ).order_by(SkillPackageFile.relative_path)
+            ).all()
+        ]
+        result = {
+            "skill_key": skill.skill_key,
+            "name": skill.name,
+            "path": path,
+            "content": content,
+            "truncated": truncated,
+            "package_files": files[:64],
+        }
+        invocation.status = "succeeded"
+        invocation.result_json = result
+        invocation.result_size_bytes = len(_canonical_bytes(result))
+        invocation.result_hash = _hash(result)
+        invocation.grant_id = grant.id
+        invocation.authorization_hash = auth_hash
+        invocation.finished_at = utc_now()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="skill.read",
+            resource_type="skill",
+            resource_id=skill.id,
+            details={
+                "skill_key": skill.skill_key,
+                "path": path,
+                "truncated": truncated,
+                "content_chars": len(content),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(invocation)
+        return invocation
 
     @staticmethod
     def _agent_skill_function_name(skill_id: str) -> str:
@@ -1302,6 +1872,41 @@ class MCPAndSkillService:
         self.db.refresh(server)
         return server
 
+    def delete_server(self, server_id: str, reason: str = "workspace_user_deleted") -> None:
+        """Permanently remove an MCP server, its credentials, snapshots, and grants."""
+
+        server = self.require_server(server_id)
+        server_key = server.server_key
+        display_name = server.display_name
+        self._supersede_grants("mcp_server", server.id, revoked=True)
+        # Break the current-snapshot reference before deleting snapshot rows.
+        server.current_snapshot_id = None
+        self.db.flush()
+        for credential in self.db.scalars(
+            self.credentials.query().where(MCPServerCredential.server_id == server.id)
+        ).all():
+            self.db.delete(credential)
+        snapshot_count = 0
+        for snapshot in self.db.scalars(
+            self.snapshots.query().where(MCPCapabilitySnapshot.server_id == server.id)
+        ).all():
+            self.db.delete(snapshot)
+            snapshot_count += 1
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="mcp.server_delete",
+            resource_type="mcp_server",
+            resource_id=server.id,
+            details={
+                "reason": (reason or "")[:1000],
+                "server_key": server_key,
+                "display_name": display_name,
+                "snapshot_count": snapshot_count,
+            },
+        )
+        self.servers.delete(server)
+        self.db.commit()
+
     def list_skills(self) -> list[SkillRecord]:
         return list(
             self.db.scalars(
@@ -1312,7 +1917,33 @@ class MCPAndSkillService:
     def require_skill(self, skill_id: str) -> SkillRecord:
         return self.skills.require(skill_id, "Skill")
 
+    def _resolve_skill_by_key(self, reference: str) -> SkillRecord:
+        value = (reference or "").strip()
+        if value:
+            for skill in self.list_skills():
+                if skill.skill_key == value or skill.id == value:
+                    return skill
+        raise AppError(404, "skill_not_found", f"No skill matches '{value[:80]}'")
+
+    def _resolve_server_reference(self, reference: str) -> MCPServer:
+        value = (reference or "").strip()
+        if value:
+            for server in self.list_servers():
+                if server.server_key == value or server.id == value:
+                    return server
+        raise AppError(404, "mcp_server_not_found", f"No MCP server matches '{value[:80]}'")
+
+    @staticmethod
+    def _require_not_official_skill(skill: SkillRecord) -> None:
+        if is_official_skill_record(skill):
+            raise AppError(
+                403,
+                "official_skill_protected",
+                "Official LearnGraph skills are managed by the system and cannot be modified or removed",
+            )
+
     def create_skill(self, payload: SkillCreateRequest) -> SkillRecord:
+        assert_skill_identity_not_reserved(payload.skill_key, payload.source)
         if self.db.scalar(
             self.skills.query().where(SkillRecord.skill_key == payload.skill_key)
         ):
@@ -1394,6 +2025,7 @@ class MCPAndSkillService:
 
     def update_skill(self, skill_id: str, payload: SkillUpdateRequest) -> SkillRecord:
         skill = self.require_skill(skill_id)
+        self._require_not_official_skill(skill)
         report = self._validate_skill_manifest(payload.manifest)
         manifest_json = payload.manifest.model_dump(mode="json")
         manifest_hash = self._skill_manifest_hash(payload.source, payload.version, manifest_json)
@@ -1670,6 +2302,7 @@ class MCPAndSkillService:
 
     def revoke_skill(self, skill_id: str, reason: str) -> SkillRecord:
         skill = self.require_skill(skill_id)
+        self._require_not_official_skill(skill)
         self._supersede_grants("skill", skill.id, revoked=True)
         skill.enabled = False
         skill.status = "revoked"
@@ -1689,6 +2322,7 @@ class MCPAndSkillService:
         """Permanently remove a skill package/record and its workspace-local files."""
 
         skill = self.require_skill(skill_id)
+        self._require_not_official_skill(skill)
         skill_key = skill.skill_key
         skill_name = skill.name
         self._supersede_grants("skill", skill.id, revoked=True)
@@ -2260,6 +2894,317 @@ class MCPAndSkillService:
             }
 
         workspace, principal, authz = self._runtime_context()
+
+        if tool_name in MANAGEMENT_TOOL_NAMES and not bool(
+            getattr(self.settings, "agent_extension_self_service_enabled", True)
+        ):
+            raise AppError(
+                403,
+                "agent_self_service_disabled",
+                "Agent extension self-service is disabled by workspace settings",
+            )
+
+        if tool_name == "builtin.skills.announce_usage":
+            skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
+            if not skill.enabled or skill.status != "enabled":
+                raise AppError(403, "skill_not_enabled", "该 Skill 未启用或未授权")
+            return {
+                "skill_key": skill.skill_key,
+                "skill_name": skill.name,
+                "skill_id": skill.id,
+                "kind": skill.kind,
+                "acknowledged": True,
+            }
+
+        if tool_name == "builtin.skills.list":
+            self._require_workspace_permission(authz, workspace, "workspace.read")
+            skills = self.list_skills()
+            return {
+                "skills": [
+                    {
+                        "skill_key": item.skill_key,
+                        "name": item.name,
+                        "kind": item.kind,
+                        "package_format": item.package_format,
+                        "enabled": item.enabled,
+                        "status": item.status,
+                        "version": item.version,
+                        "source": item.source,
+                        "origin_type": item.origin_type,
+                        "is_official": bool(item.is_official),
+                        "has_scripts": bool(item.has_scripts),
+                    }
+                    for item in skills
+                ],
+                "count": len(skills),
+            }
+
+        if tool_name == "builtin.skills.install":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            from app.domain.schemas.extensions import SkillNpxImportRequest
+            from app.services.skill_github_import import SkillGitHubImportService
+
+            raw_key = str(arguments.get("skill_key") or "").strip() or None
+            if raw_key and not re.match(r"^[a-z0-9][a-z0-9._-]{1,79}$", raw_key):
+                raise AppError(422, "invalid_tool_arguments", "skill_key format is invalid")
+            skill_filter = str(arguments.get("skill") or "").strip()
+            importer = SkillGitHubImportService(
+                self.db, self.workspace_id, self.actor_id, self.settings
+            )
+            response = importer.install_from_command(
+                SkillNpxImportRequest(
+                    command=str(arguments["source"]).strip(), skill_key=raw_key
+                ),
+                extra_skills=[skill_filter] if skill_filter else [],
+            )
+            return {
+                "reference": response.reference,
+                "owner": response.owner,
+                "repo": response.repo,
+                "commit": response.commit,
+                "requested_skills": response.requested_skills,
+                "installed": [
+                    {
+                        "skill_id": view.id,
+                        "skill_key": view.skill_key,
+                        "name": view.name,
+                        "status": view.status,
+                        "enabled": view.enabled,
+                    }
+                    for view in response.installed
+                ],
+                "skipped": [item.model_dump() for item in response.skipped],
+                "note": "新安装的 Skill 需授权后才会注入 Agent；可调用 lg_skill_set_enabled 启用。",
+            }
+
+        if tool_name == "builtin.skills.create":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            from pydantic import ValidationError as PydanticValidationError
+
+            from app.domain.schemas.extensions import (
+                SkillManualImportFile,
+                SkillManualImportRequest,
+            )
+            from app.services.skill_market import SkillMarketService
+
+            files = [
+                SkillManualImportFile(path="SKILL.md", contents=str(arguments["skill_md"]))
+            ]
+            for item in arguments.get("files") or []:
+                files.append(
+                    SkillManualImportFile(
+                        path=str(item.get("path") or ""),
+                        contents=str(item.get("contents") or ""),
+                    )
+                )
+            try:
+                request = SkillManualImportRequest(
+                    skill_key=str(arguments["skill_key"]),
+                    name=str(arguments.get("name") or "").strip() or None,
+                    source="agent_authored",
+                    version="1.0.0",
+                    files=files,
+                )
+            except PydanticValidationError as exc:
+                raise AppError(422, "invalid_tool_arguments", str(exc)[:500]) from exc
+            skill = SkillMarketService(
+                self.db, self.workspace_id, self.actor_id, self.settings
+            ).import_manual(request, origin_type="agent_authored", origin_ref="agent_tool")
+            return {
+                "skill_id": skill.id,
+                "skill_key": skill.skill_key,
+                "name": skill.name,
+                "status": skill.status,
+                "enabled": skill.enabled,
+                "note": "Skill 已创建但未授权；调用 lg_skill_set_enabled 或让用户在扩展中心启用。",
+            }
+
+        if tool_name == "builtin.skills.write_file":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            from app.domain.schemas.extensions import SkillFileWriteRequest
+            from app.services.skill_package import SkillPackageService
+
+            skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
+            package = SkillPackageService(
+                self.db, self.workspace_id, self.actor_id, self.settings
+            )
+            updated, file_view, reauth = package.write_file(
+                skill.id,
+                str(arguments["path"]),
+                SkillFileWriteRequest(content=str(arguments["contents"])),
+            )
+            return {
+                "skill_key": updated.skill_key,
+                "path": file_view.relative_path,
+                "size_bytes": file_view.size_bytes,
+                "content_hash": updated.content_hash,
+                "reauthorization_required": reauth,
+                "note": (
+                    "内容已更新；授权已失效，请调用 lg_skill_set_enabled 重新启用。"
+                    if reauth
+                    else "内容已更新。"
+                ),
+            }
+
+        if tool_name == "builtin.skills.set_enabled":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
+            reason = str(arguments.get("reason") or "agent_self_service")[:500]
+            if bool(arguments["enabled"]):
+                grant = self.authorize_skill(
+                    skill.id,
+                    PermissionDecisionRequest(decision="always", reason=reason),
+                )
+                self.db.refresh(skill)
+                return {
+                    "skill_key": skill.skill_key,
+                    "enabled": skill.enabled,
+                    "status": skill.status,
+                    "grant_id": grant.id,
+                }
+            updated = self.revoke_skill(skill.id, reason)
+            return {
+                "skill_key": updated.skill_key,
+                "enabled": updated.enabled,
+                "status": updated.status,
+            }
+
+        if tool_name == "builtin.skills.delete":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
+            deleted_key = skill.skill_key
+            self.delete_skill(
+                skill.id, str(arguments.get("reason") or "agent_self_service")
+            )
+            return {"deleted": True, "skill_key": deleted_key}
+
+        if tool_name == "builtin.mcp.list":
+            self._require_workspace_permission(authz, workspace, "workspace.read")
+            servers = []
+            for server in self.list_servers():
+                snapshot = self._current_snapshot(server)
+                servers.append(
+                    {
+                        "server_key": server.server_key,
+                        "display_name": server.display_name,
+                        "transport": server.transport,
+                        "endpoint_url": server.endpoint_url,
+                        "enabled": server.enabled,
+                        "status": server.status,
+                        "agent_auto_invoke": server.agent_auto_invoke,
+                        "requested_tools": list(server.requested_tools or []),
+                        "discovered_tools": [
+                            str(tool.get("name") or "")
+                            for tool in (snapshot.tools if snapshot else [])
+                        ][:40],
+                        "last_error": server.last_error,
+                    }
+                )
+            return {"servers": servers, "count": len(servers)}
+
+        if tool_name == "builtin.mcp.register":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            from pydantic import ValidationError as PydanticValidationError
+
+            from app.domain.schemas.extensions import MCPServerManifest
+
+            name = str(arguments["name"]).strip()
+            endpoint = str(arguments["endpoint_url"]).strip()
+            requested = [
+                str(item).strip()
+                for item in (arguments.get("requested_tools") or [])
+                if str(item).strip()
+            ]
+            server_key = str(arguments.get("server_key") or "").strip()
+            if not server_key:
+                slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")[:60]
+                server_key = (
+                    slug
+                    if re.match(r"^[a-z0-9][a-z0-9._-]{1,79}$", slug)
+                    else f"mcp-{hashlib.sha256(endpoint.encode('utf-8')).hexdigest()[:10]}"
+                )
+            try:
+                create_payload = MCPServerCreateRequest(
+                    server_key=server_key,
+                    display_name=name,
+                    source="agent_registered",
+                    version="1.0.0",
+                    transport="streamable_http",
+                    endpoint_url=endpoint,
+                    manifest=MCPServerManifest(
+                        identity=name,
+                        requested_tools=requested or ["pending-discovery"],
+                        permissions=["network"],
+                    ),
+                    agent_auto_invoke=True,
+                )
+            except PydanticValidationError as exc:
+                raise AppError(422, "invalid_tool_arguments", str(exc)[:500]) from exc
+            server = self.create_server(create_payload)
+            discovered: list[str] = []
+            probe_error: str | None = None
+            try:
+                snapshot = self.refresh_server(server.id)
+                discovered = [
+                    str(tool.get("name") or "")
+                    for tool in snapshot.tools
+                    if tool.get("name")
+                ][:40]
+                if not requested and discovered:
+                    server = self.require_server(server.id)
+                    server.requested_tools = discovered
+                    manifest_json = dict(server.manifest_json or {})
+                    manifest_json["requested_tools"] = discovered
+                    server.manifest_json = manifest_json
+                    self.db.commit()
+            except AppError as exc:
+                probe_error = f"{exc.code}: {exc.message}"
+            return {
+                "server_key": server_key,
+                "server_id": server.id,
+                "endpoint_url": endpoint,
+                "discovered_tools": discovered,
+                "probe_error": probe_error,
+                "note": "已登记；调用 lg_mcp_set_enabled 授权启用，或由用户在扩展中心确认。",
+            }
+
+        if tool_name == "builtin.mcp.set_enabled":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            server = self._resolve_server_reference(str(arguments["server"]))
+            reason = str(arguments.get("reason") or "agent_self_service")[:500]
+            if bool(arguments["enabled"]):
+                if self._current_snapshot(server) is None:
+                    self.refresh_server(server.id)
+                    server = self.require_server(server.id)
+                if not server.agent_auto_invoke:
+                    server.agent_auto_invoke = True
+                grant = self.authorize_server(
+                    server.id,
+                    PermissionDecisionRequest(decision="always", reason=reason),
+                )
+                self.db.refresh(server)
+                return {
+                    "server_key": server.server_key,
+                    "enabled": server.enabled,
+                    "status": server.status,
+                    "agent_auto_invoke": server.agent_auto_invoke,
+                    "grant_id": grant.id,
+                }
+            updated = self.revoke_server(server.id, reason)
+            return {
+                "server_key": updated.server_key,
+                "enabled": updated.enabled,
+                "status": updated.status,
+            }
+
+        if tool_name == "builtin.mcp.delete":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            server = self._resolve_server_reference(str(arguments["server"]))
+            deleted_key = server.server_key
+            self.delete_server(
+                server.id, str(arguments.get("reason") or "agent_self_service")
+            )
+            return {"deleted": True, "server_key": deleted_key}
 
         if tool_name == "builtin.graph.read":
             graph_id = str(arguments["graph_id"])

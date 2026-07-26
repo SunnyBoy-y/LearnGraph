@@ -141,6 +141,80 @@ async def memory_retention_scheduler(
             continue
 
 
+def run_memory_extraction_sweeps() -> dict[str, int]:
+    """ChatGPT-dreaming-style pass over quiet sessions.
+
+    Two independent per-workspace jobs share this cadence: memory extraction
+    (MemoryDrafts) and rolling LLM context summaries (ContextSummary
+    kind='model'). Each is gated by its own workspace enhancement settings.
+    """
+
+    from app.services.memory_enhancement import (
+        run_workspace_extraction_sweep,
+        run_workspace_summarization_sweep,
+    )
+
+    settings = get_settings()
+    totals = {
+        "sessions_processed": 0,
+        "drafts_created": 0,
+        "auto_committed": 0,
+        "sessions_summarized": 0,
+    }
+    with SessionLocal() as db:
+        workspace_ids = list(db.scalars(select(Workspace.id)))
+    for workspace_id in workspace_ids:
+        try:
+            with SessionLocal() as db:
+                workspace = db.get(Workspace, workspace_id)
+                if workspace is None:
+                    continue
+                result = run_workspace_extraction_sweep(
+                    db,
+                    workspace,
+                    settings,
+                    idle_seconds=settings.memory_extraction_idle_seconds,
+                    sessions_per_sweep=settings.memory_extraction_sessions_per_sweep,
+                )
+                summarized = run_workspace_summarization_sweep(
+                    db,
+                    workspace,
+                    settings,
+                    idle_seconds=settings.memory_extraction_idle_seconds,
+                    sessions_per_sweep=settings.memory_extraction_sessions_per_sweep,
+                )
+                result = {**result, **summarized}
+        except Exception:
+            logger.exception(
+                "Memory extraction sweep failed for workspace %s", workspace_id
+            )
+            continue
+        for key in totals:
+            totals[key] += result.get(key, 0)
+    return totals
+
+
+async def memory_extraction_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    interval = max(
+        1,
+        interval_seconds
+        if interval_seconds is not None
+        else get_settings().memory_extraction_interval_seconds,
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_memory_extraction_sweeps)
+        except Exception:
+            logger.exception("Periodic memory extraction wake-up failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
 def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
     settings = get_settings()
     current = now or utc_now()
