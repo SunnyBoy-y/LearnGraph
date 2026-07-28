@@ -218,6 +218,27 @@ class PermissionGrantView(ORMModel):
     created_at: datetime
 
 
+class SkillDeleteRequestView(ORMModel):
+    id: str
+    workspace_id: str
+    skill_id: str
+    skill_key: str
+    skill_name: str
+    requested_by: str
+    required_user_id: str
+    status: str
+    expires_at: datetime
+    confirmed_at: datetime | None
+    created_at: datetime
+
+
+class SkillDeleteConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation_text: str = Field(min_length=1, max_length=160)
+    current_password: SecretStr
+
+
 class MCPInvokeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

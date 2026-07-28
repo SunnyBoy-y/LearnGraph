@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.errors import AppError
-from app.core.security import Principal, SecretCipher, mask_secret
+from app.core.security import Principal, SecretCipher, mask_secret, verify_password
 from app.domain.extension_models import (
     ExtensionInvocation,
     ExtensionPermissionGrant,
@@ -22,6 +22,7 @@ from app.domain.extension_models import (
     MCPServer,
     MCPServerCredential,
     SkillPackageFile,
+    SkillDeleteConfirmation,
     SkillRecord,
     SkillTranslationCache,
 )
@@ -34,6 +35,7 @@ from app.domain.models import (
     MasterySchedule,
     Message,
     FileRecord,
+    User,
     Workspace,
     utc_now,
 )
@@ -111,13 +113,15 @@ BUILTIN_TOOL_PERMISSIONS: dict[str, list[str]] = {
     "builtin.usage.budget.update": ["usage.write"],
     "builtin.skills.announce_usage": [],
     "builtin.skills.list": ["workspace.read"],
+    "builtin.skills.read": ["workspace.read"],
     "builtin.skills.install": ["workspace.write"],
     "builtin.skills.create": ["workspace.write"],
     "builtin.skills.write_file": ["workspace.write"],
     "builtin.skills.set_enabled": ["workspace.write"],
-    "builtin.skills.delete": ["workspace.write"],
+    "builtin.skills.delete.request": ["workspace.write"],
     "builtin.mcp.list": ["workspace.read"],
     "builtin.mcp.register": ["workspace.write"],
+    "builtin.mcp.update": ["workspace.write"],
     "builtin.mcp.set_enabled": ["workspace.write"],
     "builtin.mcp.delete": ["workspace.write"],
 }
@@ -126,13 +130,15 @@ BUILTIN_TOOL_PERMISSIONS: dict[str, list[str]] = {
 # the user configures by clicking, gated by settings and workspace permission.
 MANAGEMENT_TOOL_NAMES = {
     "builtin.skills.list",
+    "builtin.skills.read",
     "builtin.skills.install",
     "builtin.skills.create",
     "builtin.skills.write_file",
     "builtin.skills.set_enabled",
-    "builtin.skills.delete",
+    "builtin.skills.delete.request",
     "builtin.mcp.list",
     "builtin.mcp.register",
+    "builtin.mcp.update",
     "builtin.mcp.set_enabled",
     "builtin.mcp.delete",
 }
@@ -417,6 +423,22 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "builtin.skills.read": {
+        "function_name": "lg_skill_manage_read",
+        "description": (
+            "Read a Skill package file, including disabled non-official Skills. "
+            "Omit path to list the package file tree."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skill_key": {"type": "string", "minLength": 2, "maxLength": 80},
+                "path": {"type": "string", "minLength": 1, "maxLength": 500},
+            },
+            "required": ["skill_key"],
+            "additionalProperties": False,
+        },
+    },
     "builtin.skills.write_file": {
         "function_name": "lg_skill_write_file",
         "description": (
@@ -451,9 +473,13 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
-    "builtin.skills.delete": {
-        "function_name": "lg_skill_delete",
-        "description": "Permanently delete a non-official workspace Skill and its package files.",
+    "builtin.skills.delete.request": {
+        "function_name": "lg_skill_delete_request",
+        "description": (
+            "Request permanent deletion of a non-official workspace Skill. "
+            "This never deletes by itself: the user must complete the hard-coded "
+            "second confirmation and password check in the trusted UI."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -493,6 +519,47 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 },
             },
             "required": ["name", "endpoint_url"],
+            "additionalProperties": False,
+        },
+    },
+    "builtin.mcp.update": {
+        "function_name": "lg_mcp_update",
+        "description": (
+            "Update a registered MCP server's display name, endpoint, requested tools, "
+            "or execution limits. Credentials cannot be read or supplied through this tool. "
+            "A security-relevant change revokes the current authorization until re-enabled."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 80,
+                    "description": "server_key or server id",
+                },
+                "name": {"type": "string", "minLength": 1, "maxLength": 160},
+                "endpoint_url": {"type": "string", "minLength": 8, "maxLength": 1000},
+                "requested_tools": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                },
+                "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 30000},
+                "max_input_bytes": {
+                    "type": "integer",
+                    "minimum": 1024,
+                    "maximum": 262144,
+                },
+                "max_result_bytes": {
+                    "type": "integer",
+                    "minimum": 1024,
+                    "maximum": 1048576,
+                },
+                "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 8},
+            },
+            "required": ["server"],
             "additionalProperties": False,
         },
     },
@@ -2318,6 +2385,136 @@ class MCPAndSkillService:
         self.db.refresh(skill)
         return skill
 
+    def request_skill_deletion(
+        self,
+        skill_id: str,
+        reason: str = "workspace_user_requested",
+    ) -> SkillDeleteConfirmation:
+        """Create an inert request. No Agent-callable path can confirm it."""
+
+        skill = self.require_skill(skill_id)
+        self._require_not_official_skill(skill)
+        now = utc_now()
+        for pending in self.db.scalars(
+            select(SkillDeleteConfirmation).where(
+                SkillDeleteConfirmation.workspace_id == self.workspace_id,
+                SkillDeleteConfirmation.skill_id == skill.id,
+                SkillDeleteConfirmation.status == "pending",
+            )
+        ).all():
+            pending.status = "superseded"
+        confirmation = SkillDeleteConfirmation(
+            workspace_id=self.workspace_id,
+            skill_id=skill.id,
+            skill_key=skill.skill_key,
+            skill_name=skill.name,
+            requested_by=self.actor_id,
+            required_user_id=self.actor_id,
+            reason=(reason or "")[:1000],
+            status="pending",
+            expires_at=now + timedelta(minutes=10),
+        )
+        self.db.add(confirmation)
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="skill.delete.requested",
+            resource_type="skill",
+            resource_id=skill.id,
+            details={
+                "skill_key": skill.skill_key,
+                "confirmation_required": True,
+                "expires_at": confirmation.expires_at.isoformat(),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(confirmation)
+        return confirmation
+
+    def confirm_skill_deletion(
+        self,
+        confirmation_id: str,
+        *,
+        confirmation_text: str,
+        current_password: str,
+        principal: Principal,
+    ) -> SkillDeleteConfirmation:
+        """User-only hard gate: typed name + current-password reauthentication."""
+
+        confirmation = self.db.scalar(
+            select(SkillDeleteConfirmation).where(
+                SkillDeleteConfirmation.id == confirmation_id,
+                SkillDeleteConfirmation.workspace_id == self.workspace_id,
+            )
+        )
+        if confirmation is None:
+            raise AppError(
+                404,
+                "skill_delete_confirmation_not_found",
+                "Skill deletion confirmation was not found",
+            )
+        if confirmation.required_user_id != principal.user_id:
+            raise AppError(
+                403,
+                "skill_delete_confirmation_user_mismatch",
+                "Only the user who received the second confirmation may complete it",
+            )
+        now = utc_now()
+        expires_at = confirmation.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if confirmation.status != "pending" or expires_at <= now:
+            if confirmation.status == "pending":
+                confirmation.status = "expired"
+                self.db.commit()
+            raise AppError(
+                409,
+                "skill_delete_confirmation_expired",
+                "Skill deletion confirmation is no longer active",
+            )
+        if confirmation_text.strip() != confirmation.skill_name:
+            raise AppError(
+                409,
+                "skill_delete_confirmation_mismatch",
+                "Confirmation text must exactly match the Skill name",
+            )
+        user = self.db.scalar(
+            select(User).where(
+                User.id == principal.user_id,
+                User.tenant_id == principal.tenant_id,
+                User.status == "active",
+            )
+        )
+        if user is None or not verify_password(current_password, user.password_hash):
+            raise AppError(
+                401,
+                "invalid_credentials",
+                "Current password is incorrect",
+            )
+        # Re-resolve immediately before deletion so a stale request cannot target
+        # a replacement record with the same display name.
+        skill = self.require_skill(confirmation.skill_id)
+        if (
+            skill.skill_key != confirmation.skill_key
+            or skill.name != confirmation.skill_name
+        ):
+            raise AppError(
+                409,
+                "skill_delete_target_changed",
+                "The Skill changed after confirmation was requested",
+            )
+        confirmation.status = "confirmed"
+        confirmation.confirmed_at = now
+        self.audit.record(
+            actor_id=principal.user_id,
+            action="skill.delete.confirmed_by_user",
+            resource_type="skill",
+            resource_id=skill.id,
+            details={"confirmation_id": confirmation.id, "skill_key": skill.skill_key},
+        )
+        self.delete_skill(skill.id, confirmation.reason or "confirmed_by_user")
+        self.db.refresh(confirmation)
+        return confirmation
+
     def delete_skill(self, skill_id: str, reason: str = "workspace_user_deleted") -> None:
         """Permanently remove a skill package/record and its workspace-local files."""
 
@@ -2939,6 +3136,22 @@ class MCPAndSkillService:
                 "count": len(skills),
             }
 
+        if tool_name == "builtin.skills.read":
+            self._require_workspace_permission(authz, workspace, "workspace.read")
+            from app.services.skill_package import SkillPackageService
+
+            skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
+            package = SkillPackageService(
+                self.db,
+                self.workspace_id,
+                self.actor_id,
+                self.settings,
+            )
+            path = str(arguments.get("path") or "").strip()
+            if path:
+                return package.read_file(skill.id, path).model_dump(mode="json")
+            return package.list_files(skill.id).model_dump(mode="json")
+
         if tool_name == "builtin.skills.install":
             self._require_workspace_permission(authz, workspace, "workspace.write")
             from app.domain.schemas.extensions import SkillNpxImportRequest
@@ -3069,14 +3282,26 @@ class MCPAndSkillService:
                 "status": updated.status,
             }
 
-        if tool_name == "builtin.skills.delete":
+        if tool_name == "builtin.skills.delete.request":
             self._require_workspace_permission(authz, workspace, "workspace.write")
             skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
-            deleted_key = skill.skill_key
-            self.delete_skill(
-                skill.id, str(arguments.get("reason") or "agent_self_service")
+            confirmation = self.request_skill_deletion(
+                skill.id,
+                str(arguments.get("reason") or "agent_self_service"),
             )
-            return {"deleted": True, "skill_key": deleted_key}
+            return {
+                "deleted": False,
+                "confirmation_required": True,
+                "confirmation_id": confirmation.id,
+                "skill_id": confirmation.skill_id,
+                "skill_key": confirmation.skill_key,
+                "skill_name": confirmation.skill_name,
+                "expires_at": confirmation.expires_at.isoformat(),
+                "message": (
+                    "The Skill has not been deleted. The user must personally "
+                    "complete the second confirmation in the trusted UI."
+                ),
+            }
 
         if tool_name == "builtin.mcp.list":
             self._require_workspace_permission(authz, workspace, "workspace.read")
@@ -3166,6 +3391,75 @@ class MCPAndSkillService:
                 "discovered_tools": discovered,
                 "probe_error": probe_error,
                 "note": "已登记；调用 lg_mcp_set_enabled 授权启用，或由用户在扩展中心确认。",
+            }
+
+        if tool_name == "builtin.mcp.update":
+            self._require_workspace_permission(authz, workspace, "workspace.write")
+            from pydantic import ValidationError as PydanticValidationError
+
+            from app.domain.schemas.extensions import MCPServerManifest
+
+            server = self._resolve_server_reference(str(arguments["server"]))
+            current_manifest = dict(server.manifest_json or {})
+            requested_tools = arguments.get("requested_tools")
+            if requested_tools is None:
+                requested_tools = list(server.requested_tools or [])
+            normalized_tools = [
+                str(item).strip()
+                for item in requested_tools
+                if str(item).strip()
+            ]
+            try:
+                manifest = MCPServerManifest(
+                    schema_version="1.0",
+                    identity=str(
+                        arguments.get("name")
+                        or current_manifest.get("identity")
+                        or server.display_name
+                    ),
+                    requested_tools=normalized_tools,
+                    permissions=list(current_manifest.get("permissions") or []),
+                    requested_resources=list(
+                        current_manifest.get("requested_resources") or []
+                    ),
+                    requested_prompts=list(
+                        current_manifest.get("requested_prompts") or []
+                    ),
+                )
+                payload = MCPServerUpdateRequest(
+                    display_name=(
+                        str(arguments["name"]).strip()
+                        if arguments.get("name")
+                        else None
+                    ),
+                    source=server.source,
+                    version=server.version,
+                    endpoint_url=(
+                        str(arguments["endpoint_url"]).strip()
+                        if arguments.get("endpoint_url")
+                        else None
+                    ),
+                    manifest=manifest,
+                    agent_auto_invoke=server.agent_auto_invoke,
+                    timeout_ms=arguments.get("timeout_ms"),
+                    max_input_bytes=arguments.get("max_input_bytes"),
+                    max_result_bytes=arguments.get("max_result_bytes"),
+                    max_concurrency=arguments.get("max_concurrency"),
+                )
+            except PydanticValidationError as exc:
+                raise AppError(
+                    422, "invalid_tool_arguments", str(exc)[:500]
+                ) from exc
+            updated = self.update_server(server.id, payload)
+            return {
+                "server_key": updated.server_key,
+                "display_name": updated.display_name,
+                "endpoint_url": updated.endpoint_url,
+                "requested_tools": list(updated.requested_tools or []),
+                "enabled": updated.enabled,
+                "status": updated.status,
+                "authorization_invalidated": not updated.enabled,
+                "credentials_changed": False,
             }
 
         if tool_name == "builtin.mcp.set_enabled":

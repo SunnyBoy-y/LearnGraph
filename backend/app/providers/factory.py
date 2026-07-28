@@ -5,7 +5,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.secret_store import SecretStoreUnavailable, secret_store_from_settings
-from app.domain.models import ProviderConfig, ProviderSecret, Workspace
+from app.domain.models import (
+    ProviderConfig,
+    ProviderSecret,
+    Workspace,
+    WorkspaceSetting,
+)
+from app.domain.settings import FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY
 from app.providers.local.memory import LocalWorkspaceMemoryProvider
 from app.providers.local.model import LocalDemoModelProvider, UnavailableModelProvider
 from app.providers.catalog import (
@@ -100,6 +106,28 @@ def _secret_for_provider(
     return decrypt_provider_secret(settings, secret_record)
 
 
+def _functional_model_target(
+    db: Session,
+    workspace_id: str,
+    capability: str,
+) -> tuple[str | None, str | None]:
+    setting = db.scalar(
+        select(WorkspaceSetting).where(
+            WorkspaceSetting.workspace_id == workspace_id,
+            WorkspaceSetting.key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
+        )
+    )
+    raw = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    target = raw.get(capability) if isinstance(raw, dict) else None
+    if not isinstance(target, dict):
+        return None, None
+    provider_id = str(target.get("provider_id") or "").strip() or None
+    model_id = str(target.get("model_id") or "").strip() or None
+    if (provider_id is None) != (model_id is None):
+        return None, None
+    return provider_id, model_id
+
+
 def model_provider_for_workspace(
     db: Session,
     workspace_id: str,
@@ -109,6 +137,10 @@ def model_provider_for_workspace(
     search_route: str | None = None,
     provider_id: str | None = None,
 ) -> ModelProviderPort:
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(
+            db, workspace_id, "chat"
+        )
     statement = select(ProviderConfig).where(
         ProviderConfig.workspace_id == workspace_id,
         ProviderConfig.enabled.is_(True),
@@ -411,6 +443,10 @@ def image_provider_for_workspace(
     model_id: str | None = None,
     provider_id: str | None = None,
 ) -> ImageGenerationProviderPort:
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(
+            db, workspace_id, "image_generation"
+        )
     statement = select(ProviderConfig).where(
         ProviderConfig.workspace_id == workspace_id,
         ProviderConfig.enabled.is_(True),
@@ -525,6 +561,10 @@ def vision_provider_for_workspace(
     ChatService image orchestration may call this helper.
     """
 
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(
+            db, workspace_id, "vision"
+        )
     statement = select(ProviderConfig).where(
         ProviderConfig.workspace_id == workspace_id,
         ProviderConfig.enabled.is_(True),
@@ -743,6 +783,9 @@ def search_provider_for_workspace(
     settings: Settings,
     route: str | None = None,
 ) -> SearchProviderPort | None:
+    default_provider_id, _ = _functional_model_target(
+        db, workspace_id, "search"
+    )
     if route == "disabled":
         return None
     if route == "model_native":
@@ -773,6 +816,11 @@ def search_provider_for_workspace(
             ProviderConfig.enabled.is_(True),
             ProviderConfig.remote_capability.is_(True),
             ProviderConfig.provider_type.in_(provider_types),
+            *(
+                [ProviderConfig.id == default_provider_id]
+                if default_provider_id
+                else []
+            ),
         )
         .order_by(ProviderConfig.updated_at.desc())
     ).all())
@@ -798,7 +846,11 @@ def search_provider_for_workspace(
                     "route_unconfigured",
                     "Auto search crosses local/cloud boundaries and requires an explicit authorized chain",
                 )
-    if provider is None and route in {None, "external", "auto"}:
+    if (
+        provider is None
+        and default_provider_id is None
+        and route in {None, "external", "auto"}
+    ):
         qwen_tool = _qwen_companion_for_workspace(
             db,
             workspace_id,
@@ -808,6 +860,11 @@ def search_provider_for_workspace(
         if qwen_tool is not None:
             return qwen_tool
     if provider is None:
+        if default_provider_id:
+            return UnavailableSearchProvider(
+                default_provider_id,
+                "The configured default SearchProvider is unavailable",
+            )
         return UnavailableSearchProvider(
             "unconfigured",
             f"No enabled SearchProvider matches route '{route or 'configured'}'",
@@ -853,6 +910,10 @@ def transcription_provider_for_workspace(
     provider_id: str | None = None,
     model_id: str | None = None,
 ) -> TranscriptionProviderPort | None:
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(
+            db, workspace_id, "transcription"
+        )
     statement = select(ProviderConfig).where(
         ProviderConfig.workspace_id == workspace_id,
         ProviderConfig.enabled.is_(True),
@@ -938,7 +999,10 @@ def deep_research_provider_for_workspace(
     workspace_id: str,
     settings: Settings,
 ) -> DeepResearchProviderPort | None:
-    provider = db.scalar(
+    default_provider_id, default_model_id = _functional_model_target(
+        db, workspace_id, "deep_research"
+    )
+    statement = (
         select(ProviderConfig)
         .where(
             ProviderConfig.workspace_id == workspace_id,
@@ -946,8 +1010,10 @@ def deep_research_provider_for_workspace(
             ProviderConfig.remote_capability.is_(True),
             ProviderConfig.provider_type.in_(DEEP_RESEARCH_PROVIDER_TYPES),
         )
-        .order_by(ProviderConfig.updated_at.desc())
     )
+    if default_provider_id:
+        statement = statement.where(ProviderConfig.id == default_provider_id)
+    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
     if provider is None:
         return None
     if not provider.base_url:
@@ -995,7 +1061,8 @@ def deep_research_provider_for_workspace(
         # The research model is a workspace choice; the adapter only supplies a
         # documented default when the row has not declared one.
         model = str(
-            capabilities.get("deep_research_model")
+            default_model_id
+            or capabilities.get("deep_research_model")
             or capabilities.get("default_model")
             or default_model
         ).strip()
@@ -1019,7 +1086,10 @@ def fetch_provider_for_workspace(
     workspace_id: str,
     settings: Settings,
 ) -> FetchProviderPort | None:
-    provider = db.scalar(
+    default_provider_id, _ = _functional_model_target(
+        db, workspace_id, "fetch"
+    )
+    statement = (
         select(ProviderConfig)
         .where(
             ProviderConfig.workspace_id == workspace_id,
@@ -1027,9 +1097,16 @@ def fetch_provider_for_workspace(
             ProviderConfig.remote_capability.is_(True),
             ProviderConfig.provider_type.in_(FETCH_PROVIDER_TYPES),
         )
-        .order_by(ProviderConfig.updated_at.desc())
     )
+    if default_provider_id:
+        statement = statement.where(ProviderConfig.id == default_provider_id)
+    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
     if provider is None:
+        if default_provider_id:
+            return UnavailableFetchProvider(
+                default_provider_id,
+                "The configured default FetchProvider is unavailable",
+            )
         return _qwen_companion_for_workspace(
             db,
             workspace_id,

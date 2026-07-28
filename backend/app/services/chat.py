@@ -2435,6 +2435,8 @@ class ChatService:
                 "component",
                 "magic_card",
                 "image",
+                "chart",
+                "user_confirmation",
             }:
                 part_type = "sandbox_artifact"
             if isinstance(data, dict):

@@ -56,3 +56,28 @@ def decrypt_provider_secret(settings: Settings, record: ProviderSecret) -> str:
         raise ProviderSecretUnavailable("The configured master key is unavailable") from exc
     except ValueError as exc:
         raise ProviderSecretUnavailable("The Provider secret cannot be decrypted") from exc
+
+
+def decrypt_secret_fields(
+    settings: Settings,
+    *,
+    ciphertext: str,
+    algorithm: str,
+    key_provider: str,
+    key_version: int,
+) -> str:
+    """Open an opaque labelled secret without exposing a public read API."""
+
+    if algorithm != PROVIDER_SECRET_ALGORITHM:
+        raise ProviderSecretUnavailable(
+            f"Unsupported secret algorithm: {algorithm}"
+        )
+    try:
+        key = secret_store_from_settings(
+            settings, provider_name=key_provider
+        ).key(key_version)
+        return SecretCipher(key.secret).decrypt(ciphertext)
+    except SecretStoreUnavailable as exc:
+        raise ProviderSecretUnavailable("The configured master key is unavailable") from exc
+    except ValueError as exc:
+        raise ProviderSecretUnavailable("The labelled secret cannot be decrypted") from exc

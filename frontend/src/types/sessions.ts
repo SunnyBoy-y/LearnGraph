@@ -22,6 +22,7 @@ export type MessagePartType =
   | 'skill_trigger'
   | 'component'
   | 'magic_card'
+  | 'user_confirmation'
   | 'error'
 
 export type MessagePartStatus = 'pending' | 'streaming' | 'completed' | 'failed'

@@ -92,6 +92,20 @@ export interface ExtensionPermissionGrant {
   created_at: IsoDateTime;
 }
 
+export interface SkillDeleteRequest {
+  id: string;
+  workspace_id: string;
+  skill_id: string;
+  skill_key: string;
+  skill_name: string;
+  requested_by: string;
+  required_user_id: string;
+  status: string;
+  expires_at: IsoDateTime;
+  confirmed_at: IsoDateTime | null;
+  created_at: IsoDateTime;
+}
+
 export interface SkillManifest {
   schema_version: "1.0";
   kind: "declarative_review";

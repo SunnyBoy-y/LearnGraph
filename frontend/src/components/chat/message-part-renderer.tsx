@@ -3,7 +3,15 @@ import { useNavigate } from "react-router-dom";
 import {
   Area,
   AreaChart,
+  Bar,
+  BarChart,
+  Cell,
   CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip as ChartTooltip,
   XAxis,
@@ -45,12 +53,14 @@ import { MagicCardHost } from "@/components/chat/magic-card-host";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
 import { downloadFile } from "@/api/files";
+import { confirmSkillDeletion } from "@/api/extensions";
 import {
   TrustedComponentRenderer,
   type TrustedComponentAction,
 } from "@/components/chat/trusted-component-renderer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
@@ -620,6 +630,160 @@ function TextWithCitations({
 }
 
 function ChartPart({ data }: { data: PartData }) {
+  const chartType =
+    data?.chart_type === "pie" ||
+    data?.chart_type === "line" ||
+    data?.chart_type === "bar"
+      ? data.chart_type
+      : null;
+  const labels = Array.isArray(data?.labels)
+    ? data.labels.filter((item): item is string => typeof item === "string")
+    : [];
+  const series = Array.isArray(data?.series)
+    ? data.series.flatMap((item, index) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const record = item as Record<string, unknown>;
+        const values = Array.isArray(record.values)
+          ? record.values.filter(
+              (value): value is number =>
+                typeof value === "number" && Number.isFinite(value),
+            )
+          : [];
+        if (
+          typeof record.name !== "string" ||
+          values.length !== labels.length
+        )
+          return [];
+        return [
+          {
+            key: `series_${index}`,
+            name: record.name,
+            values,
+            color:
+              typeof record.color === "string"
+                ? record.color
+                : `var(--chart-${(index % 5) + 1})`,
+          },
+        ];
+      })
+    : [];
+  const structuredPoints = labels.map((label, index) => ({
+    label,
+    ...Object.fromEntries(
+      series.map((item) => [item.key, item.values[index]]),
+    ),
+  }));
+  const structuredValid =
+    chartType !== null && labels.length > 0 && series.length > 0;
+
+  if (structuredValid) {
+    const common = (
+      <>
+        <ChartTooltip
+          contentStyle={{
+            background: "var(--card)",
+            borderColor: "var(--border)",
+            borderRadius: 10,
+            fontSize: 12,
+          }}
+        />
+        {data?.show_legend !== false ? <Legend /> : null}
+      </>
+    );
+    return (
+      <section
+        aria-label={
+          typeof data?.title === "string" ? data.title : "数据图表"
+        }
+        className="message-chart"
+      >
+        <div className="message-chart__heading">
+          <strong>
+            {typeof data?.title === "string" ? data.title : "数据图表"}
+          </strong>
+          <span>{typeof data?.summary === "string" ? data.summary : `${labels.length} 个数据点`}</span>
+        </div>
+        <div className="message-chart__canvas">
+          <ResponsiveContainer height="100%" width="100%">
+            {chartType === "pie" ? (
+              <PieChart>
+                {common}
+                <Pie
+                  data={structuredPoints}
+                  dataKey={series[0].key}
+                  label={data?.show_values === true}
+                  nameKey="label"
+                >
+                  {structuredPoints.map((point, index) => (
+                    <Cell
+                      fill={
+                        index === 0
+                          ? series[0].color
+                          : `var(--chart-${(index % 5) + 1})`
+                      }
+                      key={`${String(point.label)}-${index}`}
+                    />
+                  ))}
+                </Pie>
+              </PieChart>
+            ) : chartType === "bar" ? (
+              <BarChart data={structuredPoints}>
+                <CartesianGrid
+                  stroke="var(--border)"
+                  strokeDasharray="3 3"
+                  vertical={false}
+                />
+                <XAxis
+                  axisLine={false}
+                  dataKey="label"
+                  fontSize={11}
+                  tickLine={false}
+                />
+                <YAxis axisLine={false} fontSize={11} tickLine={false} width={36} />
+                {common}
+                {series.map((item) => (
+                  <Bar
+                    dataKey={item.key}
+                    fill={item.color}
+                    key={item.key}
+                    name={item.name}
+                  />
+                ))}
+              </BarChart>
+            ) : (
+              <LineChart data={structuredPoints}>
+                <CartesianGrid
+                  stroke="var(--border)"
+                  strokeDasharray="3 3"
+                  vertical={false}
+                />
+                <XAxis
+                  axisLine={false}
+                  dataKey="label"
+                  fontSize={11}
+                  tickLine={false}
+                />
+                <YAxis axisLine={false} fontSize={11} tickLine={false} width={36} />
+                {common}
+                {series.map((item) => (
+                  <Line
+                    dataKey={item.key}
+                    dot
+                    key={item.key}
+                    name={item.name}
+                    stroke={item.color}
+                    strokeWidth={2}
+                    type="monotone"
+                  />
+                ))}
+              </LineChart>
+            )}
+          </ResponsiveContainer>
+        </div>
+      </section>
+    );
+  }
+
   const points = Array.isArray(data?.points)
     ? data.points.filter(
         (item): item is Record<string, number | string> =>
@@ -665,6 +829,95 @@ function ChartPart({ data }: { data: PartData }) {
           </AreaChart>
         </ResponsiveContainer>
       </div>
+    </section>
+  );
+}
+
+function UserConfirmationPart({ data }: { data: PartData }) {
+  const confirmationId =
+    typeof data?.confirmation_id === "string" ? data.confirmation_id : "";
+  const skillName =
+    typeof data?.skill_name === "string" ? data.skill_name : "";
+  const [confirmationText, setConfirmationText] = useState("");
+  const [password, setPassword] = useState("");
+  const [status, setStatus] = useState<"pending" | "submitting" | "confirmed">(
+    "pending",
+  );
+  const [error, setError] = useState("");
+
+  if (!confirmationId || !skillName) {
+    return <EmptyPart>删除确认请求无效或已过期。</EmptyPart>;
+  }
+  if (status === "confirmed") {
+    return (
+      <section className="rounded-xl border border-destructive/30 bg-destructive/5 p-4">
+        <strong>Skill 已由用户确认删除</strong>
+      </section>
+    );
+  }
+  return (
+    <section
+      aria-label={`永久删除 Skill ${skillName}`}
+      className="space-y-4 rounded-xl border border-destructive/40 bg-destructive/5 p-4"
+    >
+      <div>
+        <strong className="text-destructive">需要用户本人二次确认</strong>
+        <p className="mt-1 text-sm text-muted-foreground">
+          永久删除 Skill“{skillName}”不可恢复。智能体不能代替你完成此操作。
+        </p>
+      </div>
+      <Label>
+        输入 Skill 名称
+        <Input
+          autoComplete="off"
+          onChange={(event) => setConfirmationText(event.currentTarget.value)}
+          value={confirmationText}
+        />
+      </Label>
+      <Label>
+        输入当前账户密码
+        <Input
+          autoComplete="current-password"
+          onChange={(event) => setPassword(event.currentTarget.value)}
+          type="password"
+          value={password}
+        />
+      </Label>
+      {error ? (
+        <p className="text-sm text-destructive" role="alert">
+          {error}
+        </p>
+      ) : null}
+      <Button
+        disabled={
+          status === "submitting" ||
+          confirmationText !== skillName ||
+          password.length === 0
+        }
+        onClick={(event) => {
+          if (!event.isTrusted) return;
+          setStatus("submitting");
+          setError("");
+          void confirmSkillDeletion(
+            confirmationId,
+            confirmationText,
+            password,
+          )
+            .then(() => {
+              setPassword("");
+              setStatus("confirmed");
+            })
+            .catch((reason: unknown) => {
+              setStatus("pending");
+              setError(
+                reason instanceof Error ? reason.message : "删除确认失败",
+              );
+            });
+        }}
+        variant="destructive"
+      >
+        {status === "submitting" ? "正在确认…" : "由我本人确认永久删除"}
+      </Button>
     </section>
   );
 }
@@ -1096,6 +1349,8 @@ export function MessagePartRenderer({
       return <SourceListPart data={part.data} />;
     case "chart":
       return <ChartPart data={part.data} />;
+    case "user_confirmation":
+      return <UserConfirmationPart data={part.data} />;
     case "component":
       return (
         <TrustedComponentRenderer

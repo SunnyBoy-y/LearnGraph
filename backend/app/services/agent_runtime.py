@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -31,6 +32,7 @@ from app.domain.models import (
     FileReference,
     ImageGenerationTask,
     Message,
+    MessagePartRecord,
 )
 from app.providers.ports.image_generation import (
     ImageGenerationProviderPort,
@@ -126,6 +128,9 @@ class AgentToolRuntime:
         definitions = list(self._clock_tool_definitions())
         definitions.extend(self._canvas_tool_definitions())
         definitions.extend(self._provider_tool_definitions())
+        definitions.extend(self._management_tool_definitions())
+        definitions.extend(self._model_invocation_tool_definitions())
+        definitions.extend(self._chart_tool_definitions())
         definitions.extend(self._learning_orchestration_tool_definitions())
         # Durable session files (attachments + generated images) are always
         # addressable in Agent mode; without these tools the model cannot see
@@ -726,8 +731,8 @@ class AgentToolRuntime:
                         "name": "create_provider",
                         "description": (
                             "Create a Provider configuration in this workspace. "
-                            "Requires workspace.manage. Optional api_key is stored only "
-                            "in the server Secret Store; the tool result never echoes it."
+                            "Requires workspace.manage. Credentials may only be supplied "
+                            "through a trusted-UI secret label; values are never readable."
                         ),
                         "parameters": {
                             "type": "object",
@@ -735,7 +740,10 @@ class AgentToolRuntime:
                                 "display_name": {"type": "string"},
                                 "provider_type": {"type": "string"},
                                 "base_url": {"type": "string"},
-                                "api_key": {"type": "string"},
+                                "secret_label": {
+                                    "type": "string",
+                                    "description": "Opaque secret://workspace/... label injected by the trusted UI.",
+                                },
                                 "capabilities": {"type": "object"},
                             },
                             "required": ["display_name", "provider_type"],
@@ -772,16 +780,19 @@ class AgentToolRuntime:
                     "function": {
                         "name": "rotate_provider_secret",
                         "description": (
-                            "Replace the encrypted API key for a Provider. "
-                            "Requires workspace.manage. The new key is never returned."
+                            "Replace a Provider credential from a trusted-UI secret label. "
+                            "Requires workspace.manage. The key is never returned."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "provider_id": {"type": "string"},
-                                "api_key": {"type": "string"},
+                                "secret_label": {
+                                    "type": "string",
+                                    "description": "Opaque secret://workspace/... label injected by the trusted UI.",
+                                },
                             },
-                            "required": ["provider_id", "api_key"],
+                            "required": ["provider_id", "secret_label"],
                             "additionalProperties": False,
                         },
                     },
@@ -866,6 +877,22 @@ class AgentToolRuntime:
                                 "supports_image_input": {"type": "boolean"},
                                 "supports_video_input": {"type": "boolean"},
                                 "supports_structured_output": {"type": "boolean"},
+                                "supports_agent_tools": {"type": "boolean"},
+                                "context_window_tokens": {
+                                    "type": "integer",
+                                    "minimum": 8000,
+                                    "maximum": 10000000,
+                                },
+                                "context_limit_tokens": {
+                                    "type": "integer",
+                                    "minimum": 8000,
+                                    "maximum": 10000000,
+                                },
+                                "max_output_tokens": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 1000000,
+                                },
                                 "image_input_mode": {
                                     "type": "string",
                                     "enum": ["native", "external_vision", "auto"],
@@ -889,6 +916,293 @@ class AgentToolRuntime:
             ]
         )
         return definitions
+
+    def _management_tool_definitions(self) -> list[dict[str, Any]]:
+        """Workspace control-plane tools; destructive account/storage actions omitted."""
+
+        definitions: list[dict[str, Any]] = [
+            self._function_definition(
+                "list_settings",
+                "List every Agent-visible workspace setting with defaults, risk, and current value.",
+                {},
+            ),
+            self._function_definition(
+                "get_setting",
+                "Read one Agent-visible workspace setting and its schema metadata.",
+                {"key": {"type": "string", "minLength": 1, "maxLength": 120}},
+                required=["key"],
+            ),
+            self._function_definition(
+                "rename_conversation",
+                "Rename the current conversation or another authorized conversation.",
+                {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "session_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                },
+                required=["title"],
+            ),
+            self._function_definition(
+                "get_provider_balance",
+                "Query configured balance/quota metadata for one Provider. Never returns a key.",
+                {"provider_id": {"type": "string", "minLength": 1, "maxLength": 36}},
+                required=["provider_id"],
+            ),
+            self._function_definition(
+                "get_provider_balance_query_config",
+                "Read a Provider's custom balance-query configuration. Secret variable values are omitted.",
+                {"provider_id": {"type": "string", "minLength": 1, "maxLength": 36}},
+                required=["provider_id"],
+            ),
+            self._function_definition(
+                "get_alert_email_config",
+                "Read masked email-alert configuration. SMTP password is never returned.",
+                {},
+            ),
+            self._function_definition(
+                "get_functional_model_defaults",
+                "Read default Provider/model routing for chat, vision, ASR, image generation, search, fetch, and deep research.",
+                {},
+            ),
+            self._function_definition(
+                "list_secret_labels",
+                "List safe secret labels that can be injected into Provider updates. Never returns secret values or fingerprints.",
+                {},
+            ),
+        ]
+        if not self.can_manage_providers:
+            return definitions
+        definitions.extend(
+            [
+                self._function_definition(
+                    "update_setting",
+                    "Update an Agent-visible workspace setting. Account deletion, storage migration, audit deletion, and security-confirmation settings are forbidden.",
+                    {
+                        "key": {"type": "string", "minLength": 1, "maxLength": 120},
+                        "value": {},
+                    },
+                    required=["key", "value"],
+                ),
+                self._function_definition(
+                    "set_model_enabled",
+                    "Enable or disable one configured Provider model.",
+                    {
+                        "provider_id": {"type": "string"},
+                        "model_id": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                    },
+                    required=["provider_id", "model_id", "enabled"],
+                ),
+                self._function_definition(
+                    "update_provider_balance_query_config",
+                    "Set or clear a Provider's custom balance-query script and schedule. Existing trusted-UI variables are preserved and never exposed.",
+                    {
+                        "provider_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                        "clear": {"type": "boolean"},
+                        "enabled": {"type": "boolean"},
+                        "template_id": {"type": ["string", "null"], "maxLength": 40},
+                        "script": {"type": "string", "minLength": 1, "maxLength": 20000},
+                        "timeout_seconds": {
+                            "type": "number",
+                            "minimum": 1,
+                            "maximum": 60,
+                        },
+                        "auto_query_interval_minutes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 1440,
+                        },
+                    },
+                    required=["provider_id"],
+                ),
+                self._function_definition(
+                    "update_alert_email_config",
+                    "Update email-alert routing. Passwords cannot be supplied here; configure SMTP credentials in the trusted UI.",
+                    {
+                        "enabled": {"type": "boolean"},
+                        "smtp_host": {"type": "string", "maxLength": 255},
+                        "smtp_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                        "smtp_security": {
+                            "type": "string",
+                            "enum": ["ssl", "starttls", "none"],
+                        },
+                        "smtp_username": {"type": "string", "maxLength": 255},
+                        "from_address": {"type": "string", "maxLength": 255},
+                        "to_addresses": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "items": {"type": "string", "maxLength": 255},
+                        },
+                    },
+                    required=[
+                        "enabled",
+                        "smtp_host",
+                        "smtp_port",
+                        "smtp_security",
+                        "smtp_username",
+                        "from_address",
+                        "to_addresses",
+                    ],
+                ),
+                self._function_definition(
+                    "set_functional_model_default",
+                    "Set or clear the default Provider/model for one functional capability.",
+                    {
+                        "capability": {
+                            "type": "string",
+                            "enum": [
+                                "chat",
+                                "vision",
+                                "transcription",
+                                "image_generation",
+                                "search",
+                                "fetch",
+                                "deep_research",
+                            ],
+                        },
+                        "provider_id": {"type": ["string", "null"]},
+                        "model_id": {"type": ["string", "null"]},
+                    },
+                    required=["capability", "provider_id", "model_id"],
+                ),
+            ]
+        )
+        return definitions
+
+    def _model_invocation_tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            self._function_definition(
+                "transcribe_audio",
+                "Call the configured ASR functional model for an authorized workspace audio file.",
+                {
+                    "file_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                    "language": {"type": "string", "maxLength": 32},
+                    "provider_id": {"type": "string", "maxLength": 36},
+                    "model_id": {"type": "string", "maxLength": 160},
+                },
+                required=["file_id"],
+            ),
+            self._function_definition(
+                "analyze_image",
+                "Call the configured vision functional model to inspect an authorized workspace image.",
+                {
+                    "file_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                    "prompt": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    "provider_id": {"type": "string", "maxLength": 36},
+                    "model_id": {"type": "string", "maxLength": 160},
+                },
+                required=["file_id", "prompt"],
+            ),
+            self._function_definition(
+                "start_deep_research",
+                "Create a Deep Research job. Cost-bearing remote jobs remain awaiting explicit user approval.",
+                {
+                    "question": {"type": "string", "minLength": 3, "maxLength": 4000},
+                    "budget_cny": {"type": "number", "minimum": 0, "maximum": 10000},
+                    "allowed_domains": {
+                        "type": "array",
+                        "maxItems": 50,
+                        "items": {"type": "string", "maxLength": 255},
+                    },
+                },
+                required=["question"],
+            ),
+            self._function_definition(
+                "get_deep_research",
+                "Read the status and evidence pack of a previously created Deep Research job.",
+                {
+                    "research_job_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 36,
+                    }
+                },
+                required=["research_job_id"],
+            ),
+        ]
+
+    def _chart_tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            self._function_definition(
+                "create_chart",
+                "Create a readable, durable pie, line, or bar chart with per-series colors and structured source data.",
+                {
+                    "type": {"type": "string", "enum": ["pie", "line", "bar"]},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "labels": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": {"type": "string", "maxLength": 160},
+                    },
+                    "series": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 120,
+                                },
+                                "values": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 100,
+                                    "items": {"type": "number"},
+                                },
+                                "color": {
+                                    "type": "string",
+                                    "pattern": "^#[0-9A-Fa-f]{6}$",
+                                },
+                            },
+                            "required": ["name", "values"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "show_legend": {"type": "boolean"},
+                    "show_values": {"type": "boolean"},
+                },
+                required=["type", "title", "labels", "series"],
+            ),
+            self._function_definition(
+                "read_chart",
+                "Read the exact structured data and summary of a chart previously created in this workspace.",
+                {
+                    "chart_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 36,
+                    }
+                },
+                required=["chart_id"],
+            ),
+        ]
+
+    @staticmethod
+    def _function_definition(
+        name: str,
+        description: str,
+        properties: dict[str, Any],
+        *,
+        required: list[str] | None = None,
+    ) -> dict[str, Any]:
+        parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": False,
+        }
+        if required:
+            parameters["required"] = required
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            },
+        }
 
     @staticmethod
     def _session_file_tool_definitions() -> list[dict[str, Any]]:
@@ -1248,6 +1562,39 @@ class AgentToolRuntime:
                 "put_model_capabilities",
             }:
                 return self._execute_provider_tool(name, arguments)
+            if name in {
+                "list_settings",
+                "get_setting",
+                "update_setting",
+                "rename_conversation",
+                "get_provider_balance",
+                "get_provider_balance_query_config",
+                "update_provider_balance_query_config",
+                "set_model_enabled",
+                "get_alert_email_config",
+                "update_alert_email_config",
+                "get_functional_model_defaults",
+                "set_functional_model_default",
+                "list_secret_labels",
+            }:
+                return self._execute_management_tool(
+                    name,
+                    arguments,
+                    chat_session_id=chat_session_id,
+                )
+            if name in {
+                "transcribe_audio",
+                "analyze_image",
+                "start_deep_research",
+                "get_deep_research",
+            }:
+                return self._execute_model_invocation_tool(
+                    name,
+                    arguments,
+                    chat_session_id=chat_session_id,
+                )
+            if name in {"create_chart", "read_chart"}:
+                return self._execute_chart_tool(name, arguments)
             if name == "search_web":
                 result, sources = self._search(arguments, allowed_domains)
                 return self._success(
@@ -1316,6 +1663,28 @@ class AgentToolRuntime:
             }
             if isinstance(result.get("skill_trigger"), dict):
                 extension_meta["skill_trigger"] = result["skill_trigger"]
+            extension_result = result.get("result")
+            if (
+                isinstance(extension_result, dict)
+                and extension_result.get("confirmation_required") is True
+                and extension_result.get("confirmation_id")
+            ):
+                extension_meta["artifact"] = {
+                    "type": "user_confirmation",
+                    "status": "pending",
+                    "data": {
+                        "action": "skill.delete",
+                        "confirmation_id": extension_result["confirmation_id"],
+                        "skill_id": extension_result.get("skill_id"),
+                        "skill_key": extension_result.get("skill_key"),
+                        "skill_name": extension_result.get("skill_name"),
+                        "expires_at": extension_result.get("expires_at"),
+                        "message": (
+                            "永久删除 Skill 需要用户本人进行二次确认并重新输入当前密码。"
+                            "智能体不能代替用户完成此确认。"
+                        ),
+                    },
+                }
             return self._success(result, extension_meta, [])
         except AppError as exc:
             return self._failure(exc.code, exc.message, data=exc.details or {})
@@ -1508,7 +1877,7 @@ class AgentToolRuntime:
             "display_name": provider.display_name,
             "provider_type": provider.provider_type,
             "base_url": provider.base_url,
-            "api_key_masked": provider.api_key_masked,
+            "api_key_configured": bool(provider.api_key_masked),
             "enabled": bool(provider.enabled),
             "remote_capability": bool(provider.remote_capability),
             "status": provider.status,
@@ -1549,9 +1918,16 @@ class AgentToolRuntime:
             ProviderUpdateRequest,
         )
         from app.providers.catalog import provider_type_spec
+        from app.services.secret_references import SecretReferenceService
         from pydantic import SecretStr
 
         service = self._provider_service()
+        secret_refs = SecretReferenceService(
+            self.extensions.db,
+            self.workspace_id,
+            self.actor_id,
+            self.settings or get_settings(),
+        )
         if name == "list_providers":
             role_filter = arguments.get("role")
             secret_meta = service.secret_metadata()
@@ -1612,8 +1988,13 @@ class AgentToolRuntime:
                     else None
                 ),
                 api_key=(
-                    SecretStr(str(arguments["api_key"]))
-                    if arguments.get("api_key")
+                    SecretStr(
+                        secret_refs.resolve(
+                            str(arguments["secret_label"]),
+                            purpose="provider_api_key",
+                        )
+                    )
+                    if arguments.get("secret_label")
                     else None
                 ),
                 capabilities=(
@@ -1657,13 +2038,21 @@ class AgentToolRuntime:
         if name == "rotate_provider_secret":
             self._require_provider_manage()
             provider_id = str(arguments.get("provider_id") or "").strip()
-            api_key = arguments.get("api_key")
-            if not provider_id or not isinstance(api_key, str) or not api_key.strip():
+            secret_label = arguments.get("secret_label")
+            if (
+                not provider_id
+                or not isinstance(secret_label, str)
+                or not secret_label.strip()
+            ):
                 raise AppError(
                     422,
                     "invalid_tool_arguments",
-                    "provider_id and api_key are required",
+                    "provider_id and secret_label are required",
                 )
+            api_key = secret_refs.resolve(
+                secret_label,
+                purpose="provider_api_key",
+            )
             result = service.rotate_secret(
                 provider_id,
                 ProviderSecretRotateRequest(api_key=SecretStr(api_key)),
@@ -1673,7 +2062,6 @@ class AgentToolRuntime:
                 key: result.get(key)
                 for key in (
                     "provider_id",
-                    "api_key_masked",
                     "status",
                     "secret_version",
                     "key_version",
@@ -1721,6 +2109,10 @@ class AgentToolRuntime:
                     "supports_image_input",
                     "supports_video_input",
                     "supports_structured_output",
+                    "supports_agent_tools",
+                    "context_window_tokens",
+                    "context_limit_tokens",
+                    "max_output_tokens",
                     "image_input_mode",
                     "default_search_route",
                 )
@@ -1739,6 +2131,724 @@ class AgentToolRuntime:
                 [],
             )
         raise AppError(404, "unknown_provider_tool", f"Unknown provider tool: {name}")
+
+    def _execute_management_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from app.domain.schemas.chat import SessionUpdateRequest
+        from app.domain.schemas.management import (
+            ProviderModelStateUpdateRequest,
+            SettingUpdateRequest,
+        )
+        from app.domain.settings import FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY
+        from app.providers.catalog import provider_type_spec
+        from app.services import alert_email
+        from app.services.management import SettingsService
+        from app.services.secret_references import SecretReferenceService
+        from app.services.workflow import WorkflowService
+
+        db = self.extensions.db
+        settings_service = SettingsService(db, self.workspace_id, self.actor_id)
+        if name == "list_settings":
+            items = settings_service.catalog()
+            return self._success(
+                {"settings": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+        if name == "get_setting":
+            key = str(arguments.get("key") or "").strip()
+            if not key:
+                raise AppError(422, "invalid_tool_arguments", "key is required")
+            return self._success(
+                settings_service.get(key),
+                {"tool": name, "setting_key": key},
+                [],
+            )
+        if name == "rename_conversation":
+            title = str(arguments.get("title") or "").strip()
+            session_id = str(arguments.get("session_id") or chat_session_id).strip()
+            if not title:
+                raise AppError(422, "invalid_tool_arguments", "title is required")
+            if self.extensions.workspace is None or self.extensions.principal is None:
+                raise AppError(
+                    403,
+                    "agent_runtime_context_missing",
+                    "Conversation management requires an authorized user context",
+                )
+            session = WorkflowService(
+                db,
+                self.extensions.workspace,
+                self.extensions.principal,
+            ).update_session(session_id, SessionUpdateRequest(title=title))
+            return self._success(
+                {"session_id": session.id, "title": session.title},
+                {"tool": name, "session_id": session.id, "mutated": True},
+                [],
+            )
+        if name == "get_provider_balance":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(
+                    422, "invalid_tool_arguments", "provider_id is required"
+                )
+            result = self._provider_service().balance(provider_id)
+            return self._success(
+                result,
+                {"tool": name, "provider_id": provider_id},
+                [],
+            )
+        if name == "get_provider_balance_query_config":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(
+                    422, "invalid_tool_arguments", "provider_id is required"
+                )
+            result = self._provider_service().balance_query_config(provider_id)
+            config = result.get("config")
+            if config is not None:
+                dumped = config.model_dump(mode="json")
+                dumped["variable_names"] = sorted(dumped.pop("variables", {}).keys())
+                result = {"provider_id": provider_id, "config": dumped}
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "secret_redacted": True,
+                },
+                [],
+            )
+        if name == "get_alert_email_config":
+            self._require_provider_manage()
+            return self._success(
+                alert_email.load_config(db, self.workspace_id).view(),
+                {"tool": name, "secret_redacted": True},
+                [],
+            )
+        if name == "get_functional_model_defaults":
+            return self._success(
+                settings_service.get(FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY),
+                {"tool": name},
+                [],
+            )
+        if name == "list_secret_labels":
+            self._require_provider_manage()
+            raw_items = SecretReferenceService(
+                db,
+                self.workspace_id,
+                self.actor_id,
+                self.settings or get_settings(),
+            ).list()
+            items = [
+                {
+                    "reference": item["reference"],
+                    "purpose": item["purpose"],
+                    "version": item["version"],
+                    "updated_at": item["updated_at"],
+                }
+                for item in raw_items
+            ]
+            return self._success(
+                {"labels": items, "count": len(items)},
+                {"tool": name, "secret_redacted": True, "count": len(items)},
+                [],
+            )
+
+        self._require_provider_manage()
+        if name == "update_setting":
+            key = str(arguments.get("key") or "").strip()
+            if not key:
+                raise AppError(422, "invalid_tool_arguments", "key is required")
+            settings_service.require_agent_writable(key)
+            if key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY:
+                raise AppError(
+                    409,
+                    "dedicated_setting_tool_required",
+                    "Use set_functional_model_default so the Provider and model are validated",
+                )
+            item = settings_service.update(
+                key,
+                SettingUpdateRequest(value=arguments.get("value")),
+            )
+            return self._success(
+                {"key": item.key, "value": item.value},
+                {"tool": name, "setting_key": key, "mutated": True},
+                [],
+            )
+        if name == "update_provider_balance_query_config":
+            from app.domain.schemas.management import ProviderBalanceQueryConfig
+
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(
+                    422, "invalid_tool_arguments", "provider_id is required"
+                )
+            provider_service = self._provider_service()
+            if bool(arguments.get("clear")):
+                result = provider_service.update_balance_query_config(
+                    provider_id, None
+                )
+            else:
+                existing = provider_service.balance_query_config(provider_id).get(
+                    "config"
+                )
+                if not isinstance(arguments.get("script"), str):
+                    raise AppError(
+                        422,
+                        "invalid_tool_arguments",
+                        "script is required unless clear is true",
+                    )
+                config = ProviderBalanceQueryConfig(
+                    enabled=bool(arguments.get("enabled", True)),
+                    template_id=arguments.get("template_id"),
+                    script=str(arguments["script"]),
+                    timeout_seconds=float(arguments.get("timeout_seconds", 10)),
+                    auto_query_interval_minutes=int(
+                        arguments.get("auto_query_interval_minutes", 0)
+                    ),
+                    # These may contain trusted UI values and are deliberately
+                    # neither shown to nor editable by the Agent.
+                    variables=(
+                        dict(existing.variables)
+                        if existing is not None
+                        else {}
+                    ),
+                )
+                result = provider_service.update_balance_query_config(
+                    provider_id, config
+                )
+            config = result.get("config")
+            if config is not None:
+                dumped = config.model_dump(mode="json")
+                dumped["variable_names"] = sorted(dumped.pop("variables", {}).keys())
+                result = {"provider_id": provider_id, "config": dumped}
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "mutated": True,
+                    "secret_redacted": True,
+                },
+                [],
+            )
+        if name == "set_model_enabled":
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            model_id = str(arguments.get("model_id") or "").strip()
+            enabled = arguments.get("enabled")
+            if not provider_id or not model_id or not isinstance(enabled, bool):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id, model_id and enabled are required",
+                )
+            result = self._provider_service().update_model_state(
+                provider_id,
+                model_id,
+                ProviderModelStateUpdateRequest(enabled=enabled),
+            )
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "mutated": True,
+                },
+                [],
+            )
+        if name == "update_alert_email_config":
+            result = alert_email.save_config(
+                db,
+                self.workspace_id,
+                self.actor_id,
+                enabled=bool(arguments.get("enabled")),
+                smtp_host=str(arguments.get("smtp_host") or ""),
+                smtp_port=int(arguments.get("smtp_port") or 465),
+                smtp_security=str(arguments.get("smtp_security") or "ssl"),
+                smtp_username=str(arguments.get("smtp_username") or ""),
+                # Agent tools never accept credential material. Existing trusted-
+                # UI password configuration is preserved.
+                smtp_password=None,
+                from_address=str(arguments.get("from_address") or ""),
+                to_addresses=[
+                    str(item)
+                    for item in (arguments.get("to_addresses") or [])
+                    if isinstance(item, str)
+                ],
+            ).view()
+            return self._success(
+                result,
+                {"tool": name, "mutated": True, "secret_redacted": True},
+                [],
+            )
+        if name == "set_functional_model_default":
+            capability = str(arguments.get("capability") or "").strip()
+            provider_id = arguments.get("provider_id")
+            model_id = arguments.get("model_id")
+            if (provider_id is None) != (model_id is None):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and model_id must both be set or both be null",
+                )
+            current = settings_service.get(
+                FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY
+            ).get("value")
+            defaults = dict(current) if isinstance(current, dict) else {}
+            if provider_id is None:
+                defaults.pop(capability, None)
+            else:
+                provider = next(
+                    (
+                        item
+                        for item in self._provider_service().list()
+                        if item.id == str(provider_id)
+                    ),
+                    None,
+                )
+                if provider is None or not provider.enabled:
+                    raise AppError(
+                        409,
+                        "functional_model_provider_unavailable",
+                        "The selected Provider is not configured and enabled",
+                    )
+                spec = provider_type_spec(provider.provider_type)
+                expected_role = "model" if capability == "chat" else capability
+                declared_role = (
+                    (provider.capabilities or {}).get("provider_role")
+                    or (spec.role if spec is not None else None)
+                )
+                if declared_role != expected_role:
+                    raise AppError(
+                        409,
+                        "functional_model_capability_mismatch",
+                        "The selected Provider does not match the functional capability",
+                        {
+                            "expected_role": expected_role,
+                            "provider_role": declared_role,
+                        },
+                    )
+                states = (provider.capabilities or {}).get("model_states")
+                if isinstance(states, dict) and states.get(str(model_id)) is False:
+                    raise AppError(
+                        409,
+                        "provider_model_disabled",
+                        "A disabled model cannot be selected as a functional default",
+                    )
+                defaults[capability] = {
+                    "provider_id": str(provider_id),
+                    "model_id": str(model_id),
+                }
+            item = settings_service.update(
+                FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
+                SettingUpdateRequest(value=defaults),
+            )
+            return self._success(
+                {"key": item.key, "defaults": item.value},
+                {"tool": name, "capability": capability, "mutated": True},
+                [],
+            )
+        raise AppError(404, "unknown_management_tool", f"Unknown management tool: {name}")
+
+    def _execute_model_invocation_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from app.domain.schemas.research import ResearchJobView, ResearchRequest
+        from app.providers.factory import (
+            deep_research_provider_for_workspace,
+            search_provider_for_workspace,
+            transcription_provider_for_workspace,
+            vision_provider_for_workspace,
+        )
+        from app.providers.ports.model import ProviderChatMessage
+        from app.services.research import ResearchService
+
+        db = self.extensions.db
+        settings = self.settings or get_settings()
+        if name == "transcribe_audio":
+            file = self._require_workspace_file(str(arguments.get("file_id") or ""))
+            if not file.mime_type.casefold().split(";", 1)[0].startswith("audio/"):
+                raise AppError(
+                    415,
+                    "audio_required",
+                    "transcribe_audio requires an audio file",
+                )
+            provider = transcription_provider_for_workspace(
+                db,
+                self.workspace_id,
+                settings,
+                provider_id=(
+                    str(arguments["provider_id"])
+                    if arguments.get("provider_id")
+                    else None
+                ),
+                model_id=(
+                    str(arguments["model_id"])
+                    if arguments.get("model_id")
+                    else None
+                ),
+            )
+            if provider is None or not getattr(provider, "available", True):
+                raise AppError(
+                    503,
+                    "transcription_provider_unavailable",
+                    "No enabled ASR functional model is available",
+                )
+            content = self._read_stored_file_bytes(
+                file,
+                limit_bytes=50 * 1024 * 1024,
+            )
+            result = provider.transcribe(
+                filename=file.original_name,
+                mime_type=file.mime_type,
+                content=content,
+                language=(
+                    str(arguments["language"]).strip()
+                    if arguments.get("language")
+                    else None
+                ),
+            )
+            payload = {
+                "file_id": file.id,
+                "text": result.text,
+                "language": result.language,
+                "duration_seconds": result.duration_seconds,
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+                "usage": result.usage,
+            }
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="agent.model.invoke.transcription",
+                resource_type="file",
+                resource_id=file.id,
+                details={
+                    "provider_id": provider.provider_id,
+                    "model_id": provider.model_id,
+                    "chat_session_id": chat_session_id,
+                },
+            )
+            db.commit()
+            return self._success(
+                payload,
+                {
+                    "tool": name,
+                    "provider_id": provider.provider_id,
+                    "model_id": provider.model_id,
+                },
+                [],
+            )
+        if name == "analyze_image":
+            file = self._require_workspace_file(str(arguments.get("file_id") or ""))
+            content = self._read_stored_file_bytes(
+                file,
+                limit_bytes=AGENT_IMAGE_INPUT_MAX_BYTES,
+            )
+            mime_type, width, height = self._validated_image_bytes(
+                content,
+                file_id=file.id,
+            )
+            provider = vision_provider_for_workspace(
+                db,
+                self.workspace_id,
+                settings,
+                provider_id=(
+                    str(arguments["provider_id"])
+                    if arguments.get("provider_id")
+                    else None
+                ),
+                model_id=(
+                    str(arguments["model_id"])
+                    if arguments.get("model_id")
+                    else None
+                ),
+            )
+            if not getattr(provider, "available", True) or not getattr(
+                provider, "supports_image_input", False
+            ):
+                raise AppError(
+                    503,
+                    "vision_provider_unavailable",
+                    "No enabled vision functional model is available",
+                )
+            encoded = base64.b64encode(content).decode("ascii")
+            text_parts: list[str] = []
+            for event in provider.stream_chat(
+                [
+                    ProviderChatMessage(
+                        role="user",
+                        content=str(arguments.get("prompt") or "").strip(),
+                        content_parts=[
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:{mime_type};base64,{encoded}",
+                                "detail": "auto",
+                            }
+                        ],
+                    )
+                ]
+            ):
+                if event.content:
+                    text_parts.append(event.content)
+            answer = "".join(text_parts).strip()
+            if not answer:
+                raise AppError(
+                    502,
+                    "vision_provider_empty_response",
+                    "The vision model returned no description",
+                )
+            payload = {
+                "file_id": file.id,
+                "width": width,
+                "height": height,
+                "analysis": answer,
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+            }
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="agent.model.invoke.vision",
+                resource_type="file",
+                resource_id=file.id,
+                details={
+                    "provider_id": provider.provider_id,
+                    "model_id": provider.model_id,
+                    "chat_session_id": chat_session_id,
+                },
+            )
+            db.commit()
+            return self._success(
+                payload,
+                {
+                    "tool": name,
+                    "provider_id": provider.provider_id,
+                    "model_id": provider.model_id,
+                },
+                [],
+            )
+
+        search_provider = search_provider_for_workspace(
+            db,
+            self.workspace_id,
+            settings,
+            route="auto",
+        )
+        if search_provider is None:
+            raise AppError(
+                503,
+                "search_provider_unavailable",
+                "No SearchProvider is configured for research",
+            )
+        research = ResearchService(
+            db,
+            self.workspace_id,
+            self.actor_id,
+            search_provider,
+            deep_research_provider_for_workspace(
+                db,
+                self.workspace_id,
+                settings,
+            ),
+            settings,
+        )
+        if name == "start_deep_research":
+            job = research.create_research(
+                ResearchRequest(
+                    question=str(arguments.get("question") or "").strip(),
+                    budget_cny=float(arguments.get("budget_cny") or 0),
+                    allowed_domains=[
+                        str(item)
+                        for item in (arguments.get("allowed_domains") or [])
+                        if isinstance(item, str)
+                    ],
+                )
+            )
+            payload = ResearchJobView.model_validate(job).model_dump(mode="json")
+            payload["user_approval_required"] = job.status == "awaiting_approval"
+            return self._success(
+                payload,
+                {
+                    "tool": name,
+                    "research_job_id": job.id,
+                    "status": job.status,
+                },
+                [],
+            )
+        if name == "get_deep_research":
+            job_id = str(arguments.get("research_job_id") or "").strip()
+            job = research.get_research(job_id)
+            return self._success(
+                ResearchJobView.model_validate(job).model_dump(mode="json"),
+                {"tool": name, "research_job_id": job.id, "status": job.status},
+                [],
+            )
+        raise AppError(
+            404,
+            "unknown_model_invocation_tool",
+            f"Unknown model invocation tool: {name}",
+        )
+
+    def _execute_chart_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        if name == "read_chart":
+            chart_id = str(arguments.get("chart_id") or "").strip()
+            part = next(
+                (
+                    item
+                    for item in self.extensions.db.scalars(
+                        select(MessagePartRecord).where(
+                            MessagePartRecord.workspace_id == self.workspace_id,
+                            MessagePartRecord.part_type == "chart",
+                        )
+                    ).all()
+                    if isinstance(item.data, dict)
+                    and item.data.get("chart_id") == chart_id
+                ),
+                None,
+            )
+            if part is None:
+                raise AppError(404, "chart_not_found", "Chart was not found")
+            return self._success(
+                dict(part.data or {}),
+                {"tool": name, "chart_id": chart_id},
+                [],
+            )
+
+        chart_type = str(arguments.get("type") or "").strip()
+        title = str(arguments.get("title") or "").strip()
+        labels = arguments.get("labels")
+        raw_series = arguments.get("series")
+        if (
+            chart_type not in {"pie", "line", "bar"}
+            or not title
+            or not isinstance(labels, list)
+            or not labels
+            or len(labels) > 100
+            or not isinstance(raw_series, list)
+            or not raw_series
+            or len(raw_series) > 8
+        ):
+            raise AppError(
+                422,
+                "invalid_chart_data",
+                "Chart type, title, labels, and series are required",
+            )
+        clean_labels = [str(item)[:160] for item in labels]
+        palette = [
+            "#4F46E5",
+            "#0EA5E9",
+            "#10B981",
+            "#F59E0B",
+            "#EF4444",
+            "#8B5CF6",
+            "#EC4899",
+            "#64748B",
+        ]
+        clean_series: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_series):
+            if not isinstance(item, dict):
+                raise AppError(422, "invalid_chart_data", "Each series must be an object")
+            values = item.get("values")
+            if not isinstance(values, list) or len(values) != len(clean_labels):
+                raise AppError(
+                    422,
+                    "invalid_chart_data",
+                    "Every series must have exactly one numeric value per label",
+                )
+            if any(
+                not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in values
+            ):
+                raise AppError(
+                    422,
+                    "invalid_chart_data",
+                    "Chart values must be finite numbers",
+                )
+            color = str(item.get("color") or palette[index % len(palette)])
+            if (
+                len(color) != 7
+                or not color.startswith("#")
+                or any(character not in "0123456789abcdefABCDEF" for character in color[1:])
+            ):
+                raise AppError(
+                    422,
+                    "invalid_chart_color",
+                    "Chart colors must use #RRGGBB format",
+                )
+            clean_series.append(
+                {
+                    "name": str(item.get("name") or f"Series {index + 1}")[:120],
+                    "values": [float(value) for value in values],
+                    "color": color.upper(),
+                }
+            )
+        if chart_type == "pie" and len(clean_series) != 1:
+            raise AppError(
+                422,
+                "invalid_chart_data",
+                "Pie charts require exactly one series",
+            )
+        extrema = [
+            value
+            for series in clean_series
+            for value in series["values"]
+        ]
+        summary = (
+            f"{title}: {len(clean_labels)} categories, {len(clean_series)} series; "
+            f"minimum {min(extrema):g}, maximum {max(extrema):g}."
+        )
+        data = {
+            "chart_id": str(uuid4()),
+            "chart_type": chart_type,
+            "title": title[:240],
+            "labels": clean_labels,
+            "series": clean_series,
+            "show_legend": bool(arguments.get("show_legend", True)),
+            "show_values": bool(arguments.get("show_values", False)),
+            "summary": summary,
+            "source": "agent_structured_data",
+        }
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="agent.chart.create",
+            resource_type="chart",
+            resource_id=data["chart_id"],
+            details={
+                "chart_type": chart_type,
+                "category_count": len(clean_labels),
+                "series_count": len(clean_series),
+            },
+        )
+        self.extensions.db.commit()
+        return self._success(
+            data,
+            {
+                "tool": name,
+                "chart_id": data["chart_id"],
+                "artifact": {
+                    "type": "chart",
+                    "status": "completed",
+                    "data": data,
+                },
+            },
+            [],
+        )
 
     def _execute_canvas_tool(
         self,

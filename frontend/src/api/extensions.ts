@@ -10,6 +10,7 @@ import type {
   PermissionDecision,
   Skill,
   SkillCreate,
+  SkillDeleteRequest,
   SkillFileContent,
   SkillFileTree,
   SkillFileWriteResult,
@@ -385,9 +386,28 @@ export function revokeSkill(skillId: string): Promise<Skill> {
   );
 }
 
-export function deleteSkill(skillId: string): Promise<void> {
-  return apiClient.delete<void>(
-    `/skills/${encodeURIComponent(skillId)}`,
+export function requestSkillDeletion(
+  skillId: string,
+): Promise<SkillDeleteRequest> {
+  return apiClient.post<SkillDeleteRequest>(
+    `/skills/${encodeURIComponent(skillId)}/delete-request`,
+  );
+}
+
+export function confirmSkillDeletion(
+  confirmationId: string,
+  confirmationText: string,
+  currentPassword: string,
+): Promise<SkillDeleteRequest> {
+  return apiClient.post<
+    SkillDeleteRequest,
+    { confirmation_text: string; current_password: string }
+  >(
+    `/skills/delete-confirmations/${encodeURIComponent(confirmationId)}/confirm`,
+    {
+      confirmation_text: confirmationText,
+      current_password: currentPassword,
+    },
   );
 }
 

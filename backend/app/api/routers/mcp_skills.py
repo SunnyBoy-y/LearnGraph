@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query, status
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.core.errors import AppError
 from app.domain.schemas.extensions import (
     BuiltinToolView,
     ExtensionInvocationView,
@@ -19,6 +20,8 @@ from app.domain.schemas.extensions import (
     PermissionDecisionRequest,
     PermissionGrantView,
     SkillCreateRequest,
+    SkillDeleteConfirmRequest,
+    SkillDeleteRequestView,
     SkillFileContentView,
     SkillFileTreeView,
     SkillFileWriteRequest,
@@ -807,9 +810,59 @@ def delete_skill(
     settings: AppSettings,
     reason: str = Query(default="workspace_user_deleted", max_length=1000),
 ) -> None:
-    """Permanently delete a workspace Skill and its package files. Revoke only disables authorization."""
+    """Legacy direct-delete path is deliberately disabled by a hard-coded gate."""
     context.require_permission("workspace.write")
-    service(db, context, settings).delete_skill(skill_id, reason)
+    del reason
+    confirmation = service(db, context, settings).request_skill_deletion(
+        skill_id,
+        "legacy_delete_endpoint",
+    )
+    raise AppError(
+        409,
+        "skill_delete_confirmation_required",
+        "Skill deletion requires a second confirmation by the user",
+        {"confirmation_id": confirmation.id, "skill_name": confirmation.skill_name},
+    )
+
+
+@router.post(
+    "/skills/{skill_id}/delete-request",
+    response_model=SkillDeleteRequestView,
+    status_code=status.HTTP_201_CREATED,
+)
+def request_skill_delete(
+    skill_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    reason: str = Query(default="workspace_user_requested", max_length=1000),
+) -> SkillDeleteRequestView:
+    context.require_permission("workspace.write")
+    return SkillDeleteRequestView.model_validate(
+        service(db, context, settings).request_skill_deletion(skill_id, reason)
+    )
+
+
+@router.post(
+    "/skills/delete-confirmations/{confirmation_id}/confirm",
+    response_model=SkillDeleteRequestView,
+)
+def confirm_skill_delete(
+    confirmation_id: str,
+    payload: SkillDeleteConfirmRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SkillDeleteRequestView:
+    context.require_permission("workspace.write")
+    return SkillDeleteRequestView.model_validate(
+        service(db, context, settings).confirm_skill_deletion(
+            confirmation_id,
+            confirmation_text=payload.confirmation_text,
+            current_password=payload.current_password.get_secret_value(),
+            principal=context.principal,
+        )
+    )
 
 
 @router.get("/extension-permission-grants", response_model=list[PermissionGrantView])

@@ -668,6 +668,24 @@ class ProviderSecretRotateRequest(BaseModel):
     api_key: SecretStr
 
 
+class WorkspaceSecretReferenceUpsertRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    secret: SecretStr
+    purpose: str = Field(default="provider_api_key", min_length=1, max_length=80)
+
+
+class WorkspaceSecretReferenceView(BaseModel):
+    label: str
+    reference: str
+    purpose: str
+    secret_masked: str
+    version: int
+    key_provider: str
+    key_version: int
+    updated_at: datetime
+
+
 class ProviderSecretLifecycleView(BaseModel):
     provider_id: str
     api_key_masked: str | None
@@ -984,6 +1002,27 @@ class ChatFeatureModelSettingValue(BaseModel):
         if (self.provider_id is None) != (self.model_id is None):
             raise ValueError("provider_id and model_id must both be set or both be null")
         return self
+
+
+class FunctionalModelTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_id: str = Field(min_length=1, max_length=36)
+    model_id: str = Field(min_length=1, max_length=160)
+
+
+class FunctionalModelDefaultsSettingValue(BaseModel):
+    """Workspace routing defaults for capability-specific model invocation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat: FunctionalModelTarget | None = None
+    vision: FunctionalModelTarget | None = None
+    transcription: FunctionalModelTarget | None = None
+    image_generation: FunctionalModelTarget | None = None
+    search: FunctionalModelTarget | None = None
+    fetch: FunctionalModelTarget | None = None
+    deep_research: FunctionalModelTarget | None = None
 
 
 class ChatResponseStyleSettingValue(BaseModel):

@@ -1568,6 +1568,29 @@ class ProviderSecret(Base, TimestampMixin, WorkspaceScopedMixin):
     revoked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class WorkspaceSecretReference(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Opaque workspace secret addressable by label but never readable."""
+
+    __tablename__ = "workspace_secret_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "label",
+            name="uq_workspace_secret_reference_label",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    label: Mapped[str] = mapped_column(String(120), index=True)
+    purpose: Mapped[str] = mapped_column(String(80), default="provider_api_key")
+    ciphertext: Mapped[str] = mapped_column(Text)
+    algorithm: Mapped[str] = mapped_column(String(64))
+    key_provider: Mapped[str] = mapped_column(String(32))
+    key_version: Mapped[int] = mapped_column(Integer, default=1)
+    secret_masked: Mapped[str] = mapped_column(String(80))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class PriceVersion(Base, TimestampMixin, WorkspaceScopedMixin):
     """Immutable model/feature tariff version in USD."""
 

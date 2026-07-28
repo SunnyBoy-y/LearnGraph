@@ -20,8 +20,8 @@ import {
   authorizeSkill,
   browseMcpRegistry,
   checkSkillUpdate,
+  confirmSkillDeletion,
   deleteMcpServer,
-  deleteSkill,
   installSkill,
   invokeMcpTool,
   invokeSkill,
@@ -34,6 +34,7 @@ import {
   listSkills,
   refreshMcpServer,
   registerMcpServer,
+  requestSkillDeletion,
   revokeMcpServer,
   revokeSkill,
   togglePlugin,
@@ -78,6 +79,7 @@ import type {
   PermissionDecision,
   Skill,
   SkillCreate,
+  SkillDeleteRequest,
 } from "@/types/extensions";
 import type { ProviderRole } from "@/types/providers";
 
@@ -874,11 +876,37 @@ export function ToolsPage({
   });
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
   const [skillSearch, setSkillSearch] = useState("");
-  const deleteSkillMutation = useMutation({
-    mutationFn: deleteSkill,
+  const [deleteTarget, setDeleteTarget] = useState<Skill | null>(null);
+  const [deleteRequest, setDeleteRequest] =
+    useState<SkillDeleteRequest | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [deletePassword, setDeletePassword] = useState("");
+  const requestSkillDeleteMutation = useMutation({
+    mutationFn: (skill: Skill) => requestSkillDeletion(skill.id),
+    onSuccess: (request, skill) => {
+      setDeleteTarget(skill);
+      setDeleteRequest(request);
+      setDeleteConfirmation("");
+      setDeletePassword("");
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const confirmSkillDeleteMutation = useMutation({
+    mutationFn: () => {
+      if (!deleteRequest) throw new Error("删除确认请求不存在或已过期");
+      return confirmSkillDeletion(
+        deleteRequest.id,
+        deleteConfirmation,
+        deletePassword,
+      );
+    },
     onSuccess: () => {
       toast.success("Skill 已删除");
       setEditingSkillId(null);
+      setDeleteTarget(null);
+      setDeleteRequest(null);
+      setDeleteConfirmation("");
+      setDeletePassword("");
       refresh();
     },
     onError: (error) => toast.error(error.message),
@@ -1049,6 +1077,66 @@ export function ToolsPage({
 
   const body = (
     <>
+      <Dialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !confirmSkillDeleteMutation.isPending) {
+            setDeleteTarget(null);
+            setDeleteRequest(null);
+            setDeleteConfirmation("");
+            setDeletePassword("");
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>永久删除 Skill</DialogTitle>
+            <DialogDescription>
+              此操作不可恢复，并可能影响依赖该 Skill 的智能体或工作流。
+              必须由你本人完成二次确认；智能体不能代替你点击确认。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <Label>
+              输入 Skill 名称“{deleteTarget?.name ?? ""}”
+              <Input
+                autoComplete="off"
+                onChange={(event) =>
+                  setDeleteConfirmation(event.currentTarget.value)
+                }
+                value={deleteConfirmation}
+              />
+            </Label>
+            <Label>
+              输入当前账户密码
+              <Input
+                autoComplete="current-password"
+                onChange={(event) => setDeletePassword(event.currentTarget.value)}
+                type="password"
+                value={deletePassword}
+              />
+            </Label>
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={
+                confirmSkillDeleteMutation.isPending ||
+                deleteConfirmation !== (deleteTarget?.name ?? "") ||
+                deletePassword.length === 0
+              }
+              onClick={(event) => {
+                if (!event.isTrusted) return;
+                confirmSkillDeleteMutation.mutate();
+              }}
+              variant="destructive"
+            >
+              {confirmSkillDeleteMutation.isPending
+                ? "正在删除…"
+                : "由我本人确认永久删除"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {!embedded ? (
         <PageIntro
           actions={actions}
@@ -1324,16 +1412,8 @@ export function ToolsPage({
                   ) : null}
                   {!skill.is_official ? (
                     <Button
-                      disabled={deleteSkillMutation.isPending}
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `确定永久删除 Skill「${skill.name}」？此操作不可恢复。`,
-                          )
-                        ) {
-                          deleteSkillMutation.mutate(skill.id);
-                        }
-                      }}
+                      disabled={requestSkillDeleteMutation.isPending}
+                      onClick={() => requestSkillDeleteMutation.mutate(skill)}
                       size="xs"
                       variant="ghost"
                     >

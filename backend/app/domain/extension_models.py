@@ -125,6 +125,25 @@ class SkillRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     authorization_generation: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class SkillDeleteConfirmation(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Hard-coded, expiring user-presence gate for permanent Skill deletion."""
+
+    __tablename__ = "skill_delete_confirmations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    skill_id: Mapped[str] = mapped_column(String(36), index=True)
+    skill_key: Mapped[str] = mapped_column(String(80), index=True)
+    skill_name: Mapped[str] = mapped_column(String(160))
+    requested_by: Mapped[str] = mapped_column(String(64))
+    required_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class SkillPackageFile(Base, TimestampMixin, WorkspaceScopedMixin):
     """One file in an agent_skill_package tree; bytes live in ContentBlob by sha256."""
 

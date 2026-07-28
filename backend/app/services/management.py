@@ -29,6 +29,7 @@ from app.domain.settings import (
     CHAT_RESPONSE_STYLE_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
+    FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
 )
 from app.domain.schemas.management import (
     ChatContextUsageSettingValue,
@@ -36,6 +37,7 @@ from app.domain.schemas.management import (
     ChatFeatureModelSettingValue,
     ChatResponseStyleSettingValue,
     ChatSuggestedPromptsSettingValue,
+    FunctionalModelDefaultsSettingValue,
     MigrationPreflightRequest,
     PluginToggleRequest,
     ProviderBalanceQueryConfig,
@@ -2373,6 +2375,93 @@ class SettingsService:
     # are managed through dedicated endpoints with masked views and must not
     # leak through the generic listing.
     HIDDEN_SETTING_KEYS = frozenset({"usage.alert_email"})
+    SETTING_CATALOG: dict[str, dict] = {
+        CHAT_SUGGESTED_PROMPTS_SETTING_KEY: {
+            "description": "Generate suggested follow-up prompts after chat replies",
+            "default": {"enabled": True},
+            "risk": "low",
+        },
+        CHAT_DICTATION_CLEANUP_SETTING_KEY: {
+            "description": "Clean up dictated text with the configured model",
+            "default": {"enabled": False},
+            "risk": "low",
+        },
+        CHAT_CONTEXT_USAGE_SETTING_KEY: {
+            "description": "Show and use conversation context accounting",
+            "default": {"enabled": True},
+            "risk": "low",
+        },
+        CHAT_AUTO_TITLE_MODEL_SETTING_KEY: {
+            "description": "Default model for automatic conversation titles",
+            "default": {"provider_id": None, "model_id": None},
+            "risk": "medium",
+        },
+        CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY: {
+            "description": "Default model for suggested prompts",
+            "default": {"provider_id": None, "model_id": None},
+            "risk": "medium",
+        },
+        CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY: {
+            "description": "Default model for dictation cleanup",
+            "default": {"provider_id": None, "model_id": None},
+            "risk": "medium",
+        },
+        FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY: {
+            "description": "Capability-specific default Provider/model routing",
+            "default": {},
+            "risk": "medium",
+        },
+        CHAT_RESPONSE_STYLE_SETTING_KEY: {
+            "description": "Workspace response style and presentation preferences",
+            "default": {
+                "base_style": "default",
+                "warmth": 0,
+                "enthusiasm": 0,
+                "headings_and_lists": 0,
+                "emoji": 0,
+                "verbosity": 0,
+            },
+            "risk": "low",
+        },
+        "usage.display_currency": {
+            "description": "Display currency for usage views",
+            "default": "CNY",
+            "risk": "low",
+        },
+        "ui.preferences": {
+            "description": "Workspace user-interface preferences",
+            "default": {},
+            "risk": "low",
+        },
+        "memory.shared_policy": {
+            "description": "Workspace-wide shared-memory switch",
+            "default": {"workspace_enabled": False},
+            "risk": "medium",
+        },
+        "memory.enhancement": {
+            "description": "Memory extraction, embedding recall, and summarization switches",
+            "default": {
+                "extraction": {
+                    "enabled": False,
+                    "provider_id": "",
+                    "model_id": "",
+                    "auto_commit": True,
+                },
+                "embedding": {
+                    "enabled": False,
+                    "provider_id": "",
+                    "model_id": "",
+                    "semantic_weight": 0.8,
+                },
+                "summarization": {
+                    "enabled": False,
+                    "provider_id": "",
+                    "model_id": "",
+                },
+            },
+            "risk": "medium",
+        },
+    }
 
     def list(self) -> list[WorkspaceSetting]:
         return [
@@ -2380,6 +2469,58 @@ class SettingsService:
             for setting in self.settings.list()
             if setting.key not in self.HIDDEN_SETTING_KEYS
         ]
+
+    def catalog(self) -> list[dict]:
+        persisted = {item.key: item for item in self.list()}
+        keys = sorted(set(self.SETTING_CATALOG) | set(persisted))
+        return [
+            {
+                "key": key,
+                "value": (
+                    persisted[key].value
+                    if key in persisted
+                    else self.SETTING_CATALOG.get(key, {}).get("default")
+                ),
+                "persisted": key in persisted,
+                "description": self.SETTING_CATALOG.get(key, {}).get(
+                    "description", "Workspace setting"
+                ),
+                "risk": self.SETTING_CATALOG.get(key, {}).get("risk", "medium"),
+                # Secure-by-default: newly persisted internal settings are not
+                # silently exposed to Agent writes until added to this catalog.
+                "agent_writable": key in self.SETTING_CATALOG,
+            }
+            for key in keys
+        ]
+
+    def get(self, key: str) -> dict:
+        if key in self.HIDDEN_SETTING_KEYS:
+            raise AppError(
+                403,
+                "setting_managed_elsewhere",
+                "This setting is managed through its dedicated masked interface",
+            )
+        setting = self.db.scalar(
+            self.settings.query().where(WorkspaceSetting.key == key)
+        )
+        definition = self.SETTING_CATALOG.get(key, {})
+        return {
+            "key": key,
+            "value": setting.value if setting is not None else definition.get("default"),
+            "persisted": setting is not None,
+            "description": definition.get("description", "Workspace setting"),
+            "risk": definition.get("risk", "medium"),
+            "agent_writable": key in self.SETTING_CATALOG,
+        }
+
+    def require_agent_writable(self, key: str) -> None:
+        if key not in self.SETTING_CATALOG or key in self.HIDDEN_SETTING_KEYS:
+            raise AppError(
+                403,
+                "agent_setting_forbidden",
+                "This setting is not approved for Agent control",
+                {"key": key},
+            )
 
     def update(self, key: str, payload: SettingUpdateRequest) -> WorkspaceSetting:
         if key in self.HIDDEN_SETTING_KEYS:
@@ -2450,6 +2591,47 @@ class SettingsService:
                     ),
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc
+        elif key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY:
+            try:
+                value = FunctionalModelDefaultsSettingValue.model_validate(
+                    value
+                ).model_dump(exclude_none=True)
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "models.functional_defaults contains an invalid Provider/model target",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key == "memory.shared_policy":
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"workspace_enabled"}
+                or not isinstance(value.get("workspace_enabled"), bool)
+            ):
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "memory.shared_policy requires a workspace_enabled boolean",
+                )
+            value = {"workspace_enabled": value["workspace_enabled"]}
+        elif key == "memory.enhancement":
+            from app.domain.schemas.management import MemoryEnhancementUpdateRequest
+            from app.services.memory_enhancement import default_enhancement_config
+
+            try:
+                update = MemoryEnhancementUpdateRequest.model_validate(value)
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "memory.enhancement contains invalid model or switch configuration",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+            normalized = default_enhancement_config()
+            for section, patch in update.model_dump(exclude_none=True).items():
+                normalized[section].update(patch)
+            value = normalized
         setting = self.db.scalar(self.settings.query().where(WorkspaceSetting.key == key))
         if setting is None:
             setting = self.settings.add(

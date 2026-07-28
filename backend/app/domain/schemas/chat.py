@@ -28,6 +28,7 @@ MessagePartType = Literal[
     "sandbox_status",
     "component",
     "magic_card",
+    "user_confirmation",
     "error",
 ]
 

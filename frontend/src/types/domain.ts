@@ -119,6 +119,7 @@ export type MessagePartType =
   | 'sandbox_artifact'
   | 'sandbox_status'
   | 'component'
+  | 'user_confirmation'
   | 'error'
 
 export type MessagePart = {

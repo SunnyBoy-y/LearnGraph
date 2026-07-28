@@ -30,10 +30,13 @@ from app.domain.schemas.management import (
     ProviderBalanceQueryResultView,
     ProviderBalanceView,
     SecretStoreStatusView,
+    WorkspaceSecretReferenceUpsertRequest,
+    WorkspaceSecretReferenceView,
 )
 from app.core.errors import AppError
 from app.domain.schemas.common import ActionResponse
 from app.services.management import ProviderService
+from app.services.secret_references import SecretReferenceService
 
 
 router = APIRouter(prefix="/providers", tags=["providers"])
@@ -41,6 +44,17 @@ router = APIRouter(prefix="/providers", tags=["providers"])
 
 def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> ProviderService:
     return ProviderService(db, context.workspace_id, context.principal.user_id, settings)
+
+
+def secret_reference_service(
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> SecretReferenceService:
+    return SecretReferenceService(
+        db,
+        context.workspace_id,
+        context.principal.user_id,
+        settings,
+    )
 
 
 @router.get("", response_model=list[ProviderView])
@@ -81,6 +95,41 @@ def secret_store_status(
 ) -> SecretStoreStatusView:
     return SecretStoreStatusView.model_validate(
         service(db, context, settings).secret_store_status()
+    )
+
+
+@router.get("/secret-labels", response_model=list[WorkspaceSecretReferenceView])
+def list_secret_labels(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> list[WorkspaceSecretReferenceView]:
+    """Return label metadata only; secrets and ciphertext are never serialized."""
+
+    context.require_permission("workspace.manage")
+    return [
+        WorkspaceSecretReferenceView.model_validate(item)
+        for item in secret_reference_service(db, context, settings).list()
+    ]
+
+
+@router.put("/secret-labels/{label}", response_model=WorkspaceSecretReferenceView)
+def inject_secret_label(
+    label: str,
+    payload: WorkspaceSecretReferenceUpsertRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> WorkspaceSecretReferenceView:
+    """Trusted UI injection; Agent tools may reference this label but cannot read it."""
+
+    context.require_permission("workspace.manage")
+    return WorkspaceSecretReferenceView.model_validate(
+        secret_reference_service(db, context, settings).upsert(
+            label,
+            payload.secret,
+            payload.purpose,
+        )
     )
 
 
