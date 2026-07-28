@@ -1,4 +1,5 @@
 import type { AuthSession, LoginResponse } from '@/types/auth'
+import { createUuid } from '@/lib/uuid'
 
 const TOKEN_KEY = 'learngraph.access_token'
 const WORKSPACE_KEY = 'learngraph.workspace_id'
@@ -44,10 +45,7 @@ function persistentStorage(): Storage | null {
 }
 
 function createDeviceId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return `device-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return createUuid()
 }
 
 function read(key: string, fallback: string | null): string | null {

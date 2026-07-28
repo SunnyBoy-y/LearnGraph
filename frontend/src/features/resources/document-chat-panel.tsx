@@ -7,6 +7,7 @@ import {
 } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
+import { createUuid } from "@/lib/uuid";
 import {
   ArrowUp,
   ChevronDown,
@@ -561,7 +562,7 @@ export function DocumentChatPanel({
       thinking_mode: thinkingModes.length ? thinkingMode : undefined,
       document_selection: documentSelection,
     };
-    const idempotencyKey = `document-chat-${crypto.randomUUID()}`;
+    const idempotencyKey = `document-chat-${createUuid()}`;
     const seenEventIds = new Set<string>();
     let lastEventId: string | undefined;
     let completed = false;

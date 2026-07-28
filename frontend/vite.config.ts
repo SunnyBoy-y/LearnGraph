@@ -12,6 +12,7 @@ const backendOrigin = process.env.LEARNGRAPH_BACKEND_ORIGIN?.trim() || 'http://1
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
+    host: '0.0.0.0', 
     proxy: {
       '/api': {
         target: backendOrigin,

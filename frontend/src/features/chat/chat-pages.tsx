@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { createUuid } from "@/lib/uuid";
 import {
   useMutation,
   useQueries,
@@ -3737,7 +3738,7 @@ export function ChatCanvasPage() {
         selection_context:
           requestedGenerationMode === "text" ? selectionContext : undefined,
       };
-      const idempotencyKey = `chat-${window.crypto.randomUUID()}`;
+      const idempotencyKey = `chat-${createUuid()}`;
       const seenEventIds = new Set<string>();
       let lastEventId: string | undefined;
       let completed = false;
@@ -6484,20 +6485,6 @@ export function ChatCanvasPage() {
             <Button
               aria-label="退出绘图模式"
               onClick={() => setGenerationMode("text")}
-              size="icon-xs"
-              variant="ghost"
-            >
-              <X className="size-3" />
-            </Button>
-          </div>
-        ) : null}
-        {searchRoute !== "disabled" ? (
-          <div className="chat-search-action" role="status">
-            <Search className="size-3.5" />
-            <span>下一条消息将请求真实联网搜索</span>
-            <Button
-              aria-label="关闭联网搜索"
-              onClick={() => setSearchRoute("disabled")}
               size="icon-xs"
               variant="ghost"
             >

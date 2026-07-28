@@ -107,7 +107,7 @@ function canListenOnPort(port) {
     const server = net.createServer()
     server.unref()
     server.once('error', () => resolve(false))
-    server.listen({ host: '127.0.0.1', port }, () => {
+    server.listen({ host: '0.0.0.0', port }, () => {
       server.close(() => resolve(true))
     })
   })
@@ -346,6 +346,9 @@ async function main() {
     console.log(`Frontend port ${options.frontendPort} is in use; using ${frontendPort} instead.`)
   }
 
+  // Bind both services to all interfaces so another device on the LAN can
+  // reach the dev server.  The browser still uses same-origin /api requests.
+  const listenHost = process.env.LEARNGRAPH_LISTEN_HOST?.trim() || '0.0.0.0'
   const backendOrigin = `http://127.0.0.1:${options.backendPort}`
   const frontendOrigin = `http://127.0.0.1:${frontendPort}`
   // Default to same-origin '/' so the browser calls the Vite dev proxy and
@@ -375,7 +378,7 @@ async function main() {
         '--reload-dir',
         path.join(backendDir, 'app'),
         '--host',
-        '127.0.0.1',
+        listenHost,
         '--port',
         String(options.backendPort),
       ],
@@ -398,7 +401,7 @@ async function main() {
     'dev',
     '--',
     '--host',
-    '127.0.0.1',
+    listenHost,
     '--port',
     String(frontendPort),
     '--strictPort',

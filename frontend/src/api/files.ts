@@ -1,4 +1,5 @@
 import type { ActionResponse } from "@/types/common";
+import { createUuid } from "@/lib/uuid";
 import type {
   DocumentJob,
   AudioTranscription,
@@ -144,7 +145,7 @@ export function transcribeAudioFile(
   return apiClient.post<AudioTranscription, typeof payload>(
     `/files/${encodeURIComponent(fileId)}/transcriptions`,
     payload,
-    { headers: { 'Idempotency-Key': `audio-transcription-${crypto.randomUUID()}` } },
+    { headers: { 'Idempotency-Key': `audio-transcription-${createUuid()}` } },
   )
 }
 

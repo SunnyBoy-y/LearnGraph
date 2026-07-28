@@ -106,6 +106,14 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
+    # Direct API access from a LAN-hosted frontend is supported as well as
+    # the normal same-origin Vite proxy. Keep credentials enabled while
+    # limiting the regex to private/local network addresses.
+    allow_origin_regex=(
+        r"^https?://(?:localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|"
+        r"192\.168\.(?:\d{1,3}\.)?\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})"
+        r"(?::\d+)?$"
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

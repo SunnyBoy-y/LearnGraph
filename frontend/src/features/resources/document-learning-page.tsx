@@ -6,6 +6,7 @@ import {
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { createUuid } from "@/lib/uuid";
 import {
   ArrowLeft,
   BookOpenText,
@@ -435,7 +436,7 @@ export function DocumentLearningPage() {
     onError: (error) => toast.error(error.message),
   });
   const startJob = useMutation({
-    mutationFn: () => createDocumentJob(fileId, `document-${crypto.randomUUID()}`),
+    mutationFn: () => createDocumentJob(fileId, `document-${createUuid()}`),
     onSuccess: (created) => {
       setActiveJobId(created.id);
       queryClient.setQueryData(["document-job", created.id], created);
@@ -810,7 +811,7 @@ export function DocumentLearningPage() {
                     setEmbeddedImages((current) => [
                       ...current,
                       {
-                        id: crypto.randomUUID(),
+                        id: createUuid(),
                         blob: blob.data!,
                         filename: file.original_name,
                         locator: { file_id: file.id, kind: "primary_image" },
@@ -831,7 +832,7 @@ export function DocumentLearningPage() {
               mimeType={file.mime_type}
               onEmbeddedImage={(image) => setEmbeddedImages((current) => [
                 ...current,
-                { id: crypto.randomUUID(), ...image },
+                { id: createUuid(), ...image },
               ])}
               onPdfPageChange={setPageNumber}
               onTextSelection={selectDocumentText}
@@ -964,7 +965,7 @@ export function DocumentLearningPage() {
                     <Button
                       className="mt-3 w-full"
                       onClick={() => {
-                        setChatQuestion({ id: crypto.randomUUID(), text: query });
+                        setChatQuestion({ id: createUuid(), text: query });
                         setRightPanel("chat");
                       }}
                       variant="outline"
