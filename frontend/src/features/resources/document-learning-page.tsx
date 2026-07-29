@@ -91,6 +91,29 @@ function chunkOutlineLabel(chunk: FileTextChunk) {
 }
 
 
+function overlapLength(haystack: string, needle: string) {
+  if (!needle) return 0;
+  if (haystack.includes(needle)) return needle.length;
+  // Longest common substring length (dynamic programming).  Used only as a
+  // fallback for cross-chunk selections, so the O(n*m) cost is acceptable on
+  // the selection text against a single chunk's content.
+  const n = haystack.length;
+  const m = needle.length;
+  let best = 0;
+  let prev = new Array(m + 1).fill(0);
+  for (let i = 1; i <= n; i += 1) {
+    const curr = new Array(m + 1).fill(0);
+    for (let j = 1; j <= m; j += 1) {
+      if (haystack[i - 1] === needle[j - 1]) {
+        curr[j] = prev[j - 1] + 1;
+        if (curr[j] > best) best = curr[j];
+      }
+    }
+    prev = curr;
+  }
+  return best;
+}
+
 function chunkForSelection(
   text: string,
   chunks: FileTextChunk[],
@@ -100,12 +123,27 @@ function chunkForSelection(
   const candidates = page
     ? chunks.filter((chunk) => pageForChunk(chunk) === page)
     : chunks;
-  return (
+  const exact =
     candidates.find((chunk) => chunk.content.includes(text)) ??
     candidates.find((chunk) => normalizedSelection(chunk.content).includes(normalized)) ??
     chunks.find((chunk) => chunk.content.includes(text)) ??
-    chunks.find((chunk) => normalizedSelection(chunk.content).includes(normalized))
-  );
+    chunks.find((chunk) => normalizedSelection(chunk.content).includes(normalized));
+  if (exact) return exact;
+  // Cross-chunk / duplicate-text fallback: pick the chunk with the longest
+  // overlap with the selection so we anchor on the best single match.  Returns
+  // undefined when there is no overlap at all — the caller then degrades to
+  // whole-file context with the selection attached as an unverified hint.
+  const pool = candidates.length ? candidates : chunks;
+  let bestChunk: FileTextChunk | undefined;
+  let bestScore = 0;
+  for (const chunk of pool) {
+    const score = overlapLength(normalizedSelection(chunk.content), normalized);
+    if (score > bestScore) {
+      bestScore = score;
+      bestChunk = chunk;
+    }
+  }
+  return bestScore > 0 ? bestChunk : undefined;
 }
 
 
@@ -211,7 +249,7 @@ export function DocumentLearningPage() {
   const chatSessionId = searchParams.get("chat") ?? "";
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<DocumentQueryScope>("file");
-  const [selected, setSelected] = useState<{ chunk: FileTextChunk; text: string } | null>(null);
+  const [selected, setSelected] = useState<{ chunk: FileTextChunk | null; text: string } | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [goalId, setGoalId] = useState("");
   const [scopeFileIds, setScopeFileIds] = useState<string[]>([fileId]);
@@ -299,6 +337,11 @@ export function DocumentLearningPage() {
     void queryClient.invalidateQueries({ queryKey: ["file-chunks", fileId] });
     void queryClient.invalidateQueries({ queryKey: ["document-revisions", fileId] });
     void queryClient.invalidateQueries({ queryKey: ["document-job-events", jobId] });
+    // Re-indexing invalidates the stored chunk_id anchor; clear the selection
+    // so a stale chunk_id is never sent (the user must re-select for the new
+    // revision, which now degrades gracefully instead of erroring).
+    setSelected(null);
+    setSelectionMenu(null);
   }, [fileId, job.data?.file_id, job.data?.status, jobId, queryClient]);
 
   const activeChunk = chunks.data?.find((item) => item.id === activeChunkId);
@@ -319,14 +362,15 @@ export function DocumentLearningPage() {
 
   const pendingSelection = useMemo<PendingDocumentSelection | null>(() => {
     if (!selected || !file) return null;
-    const revisionId = selected.chunk.document_revision_id ?? revisions.data?.[0]?.id;
+    const revisionId =
+      selected.chunk?.document_revision_id ?? revisions.data?.[0]?.id;
     if (!revisionId) return null;
     return {
       file_id: file.id,
       document_revision_id: revisionId,
-      chunk_id: selected.chunk.id,
-      locator: selected.chunk.locator_json,
-      locator_label: selected.chunk.locator,
+      chunk_id: selected.chunk?.id ?? null,
+      locator: selected.chunk?.locator_json ?? {},
+      locator_label: selected.chunk?.locator ?? "",
       selected_text: selected.text,
     };
   }, [file, revisions.data, selected]);
@@ -346,15 +390,19 @@ export function DocumentLearningPage() {
     const hintedPage =
       typeof locatorHint?.page === "number" ? locatorHint.page : undefined;
     const chunk = knownChunk ?? chunkForSelection(text, chunks.data ?? [], hintedPage);
-    if (!chunk?.document_revision_id && !revisions.data?.[0]?.id) {
+    const fallbackRevisionId = revisions.data?.[0]?.id;
+    const revisionId = chunk?.document_revision_id ?? fallbackRevisionId;
+    if (!revisionId) {
       toast.error("该选区尚未绑定可验证的文档 Revision，请先建立索引。");
       return;
     }
     if (!chunk) {
-      toast.error("选区与当前索引不一致，请刷新索引后重试。");
-      return;
+      // Cross-chunk / stale-index selection: degrade to whole-file context
+      // with the selection text attached as an unverified hint instead of
+      // rejecting the user's request.
+      toast.warning("选区未能精确定位到分块，将以整文件上下文 + 选区提示发送。");
     }
-    setSelected({ chunk, text });
+    setSelected({ chunk: chunk ?? null, text });
     setSelectionMenu(
       firstLineRect
         ? { left: Math.max(8, firstLineRect.left + firstLineRect.width / 2), top: Math.max(8, firstLineRect.top - 10) }

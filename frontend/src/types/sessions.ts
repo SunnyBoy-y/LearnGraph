@@ -167,7 +167,8 @@ export interface MessageSelectionContext {
 export interface DocumentSelectionContext {
   file_id: string
   document_revision_id: string
-  chunk_id: string
+  /** Best-effort anchor; omitted when the selection cannot be resolved to a single chunk. */
+  chunk_id?: string | null
   locator: UnknownRecord
   selected_text: string
   selected_text_hash: string

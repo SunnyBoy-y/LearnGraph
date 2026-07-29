@@ -296,24 +296,37 @@ class SandboxTaskService:
             "image_pinned": image_ref_is_pinned(resolved),
         }
 
-    def list_sessions(self, chat_session_id: str | None = None) -> list[SandboxSession]:
+    def list_sessions(
+        self,
+        chat_session_id: str | None = None,
+        *,
+        include_all: bool = False,
+        include_cleaned: bool = False,
+    ) -> list[SandboxSession]:
+        if include_all and not (self.principal and self.principal.is_system_admin):
+            raise AppError(403, "system_admin_required", "System administrator permission is required")
         query = select(SandboxSession).where(
             SandboxSession.workspace_id == self.workspace_id,
-            SandboxSession.owner_user_id == self.actor_id,
         )
+        if not include_all:
+            query = query.where(SandboxSession.owner_user_id == self.actor_id)
+        if not include_cleaned:
+            query = query.where(SandboxSession.cleanup_status != "cleaned")
         if chat_session_id:
             self._require_chat_session(chat_session_id)
             query = query.where(SandboxSession.chat_session_id == chat_session_id)
         return list(self.db.scalars(query.order_by(SandboxSession.created_at.desc())).all())
 
-    def get_session(self, session_id: str) -> SandboxSession:
-        session = self.db.scalar(
-            select(SandboxSession).where(
-                SandboxSession.id == session_id,
-                SandboxSession.workspace_id == self.workspace_id,
-                SandboxSession.owner_user_id == self.actor_id,
-            )
-        )
+    def get_session(self, session_id: str, *, include_all: bool = False) -> SandboxSession:
+        if include_all and not (self.principal and self.principal.is_system_admin):
+            raise AppError(403, "system_admin_required", "System administrator permission is required")
+        conditions = [
+            SandboxSession.id == session_id,
+            SandboxSession.workspace_id == self.workspace_id,
+        ]
+        if not include_all:
+            conditions.append(SandboxSession.owner_user_id == self.actor_id)
+        session = self.db.scalar(select(SandboxSession).where(*conditions))
         if session is None:
             raise AppError(404, "sandbox_session_not_found", "Sandbox session was not found")
         return session
@@ -708,8 +721,8 @@ class SandboxTaskService:
         self.db.refresh(task)
         return task
 
-    def cleanup(self, session_id: str) -> SandboxSession:
-        session = self.get_session(session_id)
+    def cleanup(self, session_id: str, *, include_all: bool = False) -> SandboxSession:
+        session = self.get_session(session_id, include_all=include_all)
         if session.cleanup_status == "cleaned":
             return session
         session.cleanup_status = "running"

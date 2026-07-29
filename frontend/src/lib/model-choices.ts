@@ -116,5 +116,6 @@ export function parseModelChoiceValue(
 export function modelProtocolLabel(providerType: string): string {
   if (providerType === "openai_responses") return "Responses";
   if (providerType === "anthropic_messages") return "Anthropic Messages";
+  if (providerType === "ollama") return "Ollama";
   return "Compatible Chat";
 }

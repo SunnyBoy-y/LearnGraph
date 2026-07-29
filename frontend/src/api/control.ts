@@ -21,7 +21,12 @@ import type {
   SandboxSession,
   SandboxTask,
 } from "@/types/control";
-import type { MCPServer, MCPCapabilitySnapshot, Skill } from "@/types/extensions";
+import type {
+  MCPServer,
+  MCPServerManifest,
+  MCPCapabilitySnapshot,
+  Skill,
+} from "@/types/extensions";
 
 import { apiClient } from "./client";
 
@@ -163,7 +168,7 @@ export function updateMcpServer(
     endpoint_url: string | null;
     bearer_token?: string;
     clear_bearer_token?: boolean;
-    manifest: MCPServer["manifest_json"];
+    manifest: MCPServerManifest;
     agent_auto_invoke?: boolean;
     timeout_ms?: number;
     max_input_bytes?: number;

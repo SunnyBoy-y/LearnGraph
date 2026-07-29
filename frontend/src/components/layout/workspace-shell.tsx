@@ -140,9 +140,16 @@ import {
   sortSidebarSessions,
   subscribeSessionActivity,
 } from "@/lib/session-activity";
+import {
+  defaultComposerPrefsForResponseMode,
+  hasSessionComposerPrefs,
+  setSessionComposerPrefs,
+} from "@/lib/session-composer-prefs";
+import { readChatDefaultResponseMode } from "@/lib/workspace-settings";
 import type { Session } from "@/types/sessions";
 import type { Graph, GraphNode, GraphSummary } from "@/types/graphs";
 import type { DeleteImpact } from "@/types/workflow";
+import type { WorkspaceSetting } from "@/types/settings";
 
 type NavItem = {
   label: string;
@@ -478,6 +485,17 @@ function SidebarNav({
     queryKey: ["sessions"],
     queryFn: listSessions,
   });
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: listSettings,
+  });
+  const workspaceDefaultResponseMode = useMemo(
+    () =>
+      readChatDefaultResponseMode(
+        settingsQuery.data as WorkspaceSetting[] | undefined,
+      ),
+    [settingsQuery.data],
+  );
   const [activeSessionId, setActiveSessionId] = useState("");
   /** Empty draft kept for reuse; hidden from the sidebar until the first message. */
   const [hiddenDraftSessionId, setHiddenDraftSessionId] = useState<string | null>(
@@ -794,6 +812,28 @@ function SidebarNav({
         !options.learningNode &&
         draftSessionId.current
       ) {
+        // Empty drafts opened via "新对话" should always present the workspace
+        // default response mode, even if an earlier race polluted localStorage.
+        // If the workspace setting is still loading, fetch it first so we do
+        // not silently seed the product default (agentic) over a 思考/极速 default.
+        let resolvedMode = workspaceDefaultResponseMode;
+        if (settingsQuery.isPending) {
+          try {
+            const settings =
+              (await queryClient.fetchQuery({
+                queryKey: ["settings"],
+                queryFn: listSettings,
+              })) as WorkspaceSetting[] | undefined;
+            resolvedMode = readChatDefaultResponseMode(settings);
+          } catch {
+            // Fall back to the memoized value; the chat canvas will re-seed
+            // once settings resolve.
+          }
+        }
+        setSessionComposerPrefs(
+          draftSessionId.current,
+          defaultComposerPrefsForResponseMode(resolvedMode),
+        );
         setActiveSessionId(draftSessionId.current);
         navigate(`${base}/chat/${draftSessionId.current}`);
         onNavigate?.();
@@ -812,6 +852,33 @@ function SidebarNav({
           graph_id: project?.graphId ?? null,
           project_id: project?.id ?? null,
         });
+        // Seed the workspace default response mode before the chat canvas
+        // hydrates, so a new draft does not inherit another session's "极速".
+        // If the workspace setting is still loading (e.g. the user clicked
+        // "新对话" before /settings resolved), fetch it first — otherwise the
+        // seed would silently fall back to the product default (agentic) and
+        // a workspace default of 思考/极速 would never take effect on new
+        // chats because the chat canvas treats the seeded prefs as final.
+        if (!hasSessionComposerPrefs(session.id)) {
+          let resolvedMode = workspaceDefaultResponseMode;
+          if (settingsQuery.isPending) {
+            try {
+              const settings =
+                (await queryClient.fetchQuery({
+                  queryKey: ["settings"],
+                  queryFn: listSettings,
+                })) as WorkspaceSetting[] | undefined;
+              resolvedMode = readChatDefaultResponseMode(settings);
+            } catch {
+              // Keep the memoized value; settings may still resolve later
+              // and the chat canvas restore-effect will re-seed.
+            }
+          }
+          setSessionComposerPrefs(
+            session.id,
+            defaultComposerPrefsForResponseMode(resolvedMode),
+          );
+        }
         queryClient.setQueryData<Session[]>(["sessions"], (current) => [
           session,
           ...(current ?? []).filter((item) => item.id !== session.id),
@@ -883,6 +950,7 @@ function SidebarNav({
       queryClient,
       releaseDraftSession,
       trackDraftSession,
+      workspaceDefaultResponseMode,
     ],
   );
 

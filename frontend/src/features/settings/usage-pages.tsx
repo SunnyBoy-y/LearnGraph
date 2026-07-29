@@ -7,6 +7,8 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  Line,
+  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -232,6 +234,10 @@ interface TrendBucket {
   cost: number;
   tokens: number;
   calls: number;
+  cachedRead: number;
+  cachedWrite: number;
+  uncachedInput: number;
+  hitRate: number | null;
 }
 
 function buildBuckets(
@@ -253,11 +259,21 @@ function buildBuckets(
       cost: 0,
       tokens: 0,
       calls: 0,
+      cachedRead: 0,
+      cachedWrite: 0,
+      uncachedInput: 0,
+      hitRate: null,
     };
+    const cachedRead = event.cached_input_tokens ?? 0;
+    const cachedWrite = event.cache_creation_input_tokens ?? 0;
     current.cost +=
       displayCurrency === "CNY" ? event.cost_cny : event.cost_usd;
     current.tokens += event.input_tokens + event.output_tokens;
     current.calls += 1;
+    current.cachedRead += cachedRead;
+    current.cachedWrite += cachedWrite;
+    // 缓存读写均包含在 input_tokens 总量中，不重复累加；普通输入为扣除缓存部分后的余量。
+    current.uncachedInput += Math.max(0, event.input_tokens - cachedRead - cachedWrite);
     groups.set(key, current);
   }
   // 补零桶让趋势的空白时间段可见；桶数过多时跳过以免拖慢渲染。
@@ -271,13 +287,23 @@ function buildBuckets(
           cost: 0,
           tokens: 0,
           calls: 0,
+          cachedRead: 0,
+          cachedWrite: 0,
+          uncachedInput: 0,
+          hitRate: null,
         });
       }
     }
   }
   return [...groups.entries()]
     .sort((left, right) => left[0] - right[0])
-    .map(([, value]) => value);
+    .map(([, value]) => {
+      const totalInput = value.cachedRead + value.cachedWrite + value.uncachedInput;
+      return {
+        ...value,
+        hitRate: totalInput > 0 ? (value.cachedRead / totalInput) * 100 : null,
+      };
+    });
 }
 
 /** 子序列式模糊匹配："cld5" 可命中 "claude-fable-5"。 */
@@ -492,6 +518,8 @@ function OverviewSection({
         model: string;
         calls: number;
         inputTokens: number;
+        cachedInputTokens: number;
+        cacheCreationInputTokens: number;
         outputTokens: number;
         costUsd: number;
         costCny: number;
@@ -504,12 +532,16 @@ function OverviewSection({
         model: event.model_id,
         calls: 0,
         inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
         outputTokens: 0,
         costUsd: 0,
         costCny: 0,
       };
       current.calls += 1;
       current.inputTokens += event.input_tokens;
+      current.cachedInputTokens += event.cached_input_tokens ?? 0;
+      current.cacheCreationInputTokens += event.cache_creation_input_tokens ?? 0;
       current.outputTokens += event.output_tokens;
       current.costUsd += event.cost_usd;
       current.costCny += event.cost_cny;
@@ -524,6 +556,8 @@ function OverviewSection({
         "model",
         "calls",
         "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
         "output_tokens",
         "total_tokens",
         "cost_usd",
@@ -534,6 +568,8 @@ function OverviewSection({
         item.model,
         item.calls,
         item.inputTokens,
+        item.cachedInputTokens,
+        item.cacheCreationInputTokens,
         item.outputTokens,
         item.inputTokens + item.outputTokens,
         item.costUsd.toFixed(6),
@@ -544,6 +580,8 @@ function OverviewSection({
         "",
         items.reduce((total, item) => total + item.calls, 0),
         items.reduce((total, item) => total + item.inputTokens, 0),
+        items.reduce((total, item) => total + item.cachedInputTokens, 0),
+        items.reduce((total, item) => total + item.cacheCreationInputTokens, 0),
         items.reduce((total, item) => total + item.outputTokens, 0),
         items.reduce(
           (total, item) => total + item.inputTokens + item.outputTokens,
@@ -565,11 +603,28 @@ function OverviewSection({
     URL.revokeObjectURL(url);
   }
 
-  const chartTooltipStyle = {
-    background: "var(--card)",
-    borderColor: "var(--border)",
-    borderRadius: 10,
-  } as const;
+      const chartTooltipStyle = {
+        background: "var(--card)",
+        borderColor: "var(--border)",
+        borderRadius: 10,
+      } as const;
+
+  const cacheTotals = useMemo(() => {
+    let cachedRead = 0;
+    let cachedWrite = 0;
+    let uncachedInput = 0;
+    for (const event of filtered) {
+      cachedRead += event.cached_input_tokens ?? 0;
+      cachedWrite += event.cache_creation_input_tokens ?? 0;
+      uncachedInput += Math.max(
+        0,
+        event.input_tokens - (event.cached_input_tokens ?? 0) - (event.cache_creation_input_tokens ?? 0),
+      );
+    }
+    const totalInput = cachedRead + cachedWrite + uncachedInput;
+    const hitRate = totalInput > 0 ? (cachedRead / totalInput) * 100 : null;
+    return { cachedRead, cachedWrite, uncachedInput, totalInput, hitRate };
+  }, [filtered]);
 
   return (
     <>
@@ -776,57 +831,145 @@ function OverviewSection({
         </Surface>
       </div>
 
-      <Surface className="p-5">
-        <SectionHeading
-          description={`当前筛选范围内的实际 HTTP Attempt 次数 · 共 ${totalCalls.toLocaleString()} 次`}
-          title="调用次数统计"
-        />
-        {buckets.length ? (
-          <div className="mt-4 h-56">
-            <ResponsiveContainer height="100%" width="100%">
-              <BarChart data={buckets}>
-                <CartesianGrid
-                  stroke="var(--border)"
-                  strokeDasharray="3 3"
-                  vertical={false}
-                />
-                <XAxis
-                  axisLine={false}
-                  dataKey="time"
-                  fontSize={11}
-                  minTickGap={32}
-                  tickLine={false}
-                />
-                <YAxis
-                  allowDecimals={false}
-                  axisLine={false}
-                  fontSize={11}
-                  tickLine={false}
-                  width={40}
-                />
-                <Tooltip
-                  contentStyle={chartTooltipStyle}
-                  cursor={{ fill: "var(--muted)", opacity: 0.5 }}
-                  formatter={(value) => [
-                    `${Number(value ?? 0).toLocaleString()} 次`,
-                    "调用",
-                  ]}
-                />
-                <Bar
-                  dataKey="calls"
-                  fill="var(--primary)"
-                  maxBarSize={28}
-                  radius={[4, 4, 0, 0]}
-                />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        ) : (
-          <p className="grid h-56 place-items-center text-sm text-muted-foreground">
-            当前筛选范围内暂无调用
-          </p>
-        )}
-      </Surface>
+      <div className="grid gap-5 lg:grid-cols-2">
+        <Surface className="p-5">
+          <SectionHeading
+            description={`当前筛选范围内的实际 HTTP Attempt 次数 · 共 ${totalCalls.toLocaleString()} 次`}
+            title="调用次数统计"
+          />
+          {buckets.length ? (
+            <div className="mt-4 h-56">
+              <ResponsiveContainer height="100%" width="100%">
+                <BarChart data={buckets}>
+                  <CartesianGrid
+                    stroke="var(--border)"
+                    strokeDasharray="3 3"
+                    vertical={false}
+                  />
+                  <XAxis
+                    axisLine={false}
+                    dataKey="time"
+                    fontSize={11}
+                    minTickGap={32}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    allowDecimals={false}
+                    axisLine={false}
+                    fontSize={11}
+                    tickLine={false}
+                    width={40}
+                  />
+                  <Tooltip
+                    contentStyle={chartTooltipStyle}
+                    cursor={{ fill: "var(--muted)", opacity: 0.5 }}
+                    formatter={(value) => [
+                      `${Number(value ?? 0).toLocaleString()} 次`,
+                      "调用",
+                    ]}
+                  />
+                  <Bar
+                    dataKey="calls"
+                    fill="var(--primary)"
+                    maxBarSize={28}
+                    radius={[4, 4, 0, 0]}
+                  />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <p className="grid h-56 place-items-center text-sm text-muted-foreground">
+              当前筛选范围内暂无调用
+            </p>
+          )}
+        </Surface>
+
+        <Surface className="p-5">
+          <SectionHeading
+            description={
+              cacheTotals.hitRate !== null
+                ? `输入 Token 缓存命中率随时间变化 · 区间均值 ${cacheTotals.hitRate.toFixed(1)}%`
+                : "输入 Token 缓存命中率随时间变化"
+            }
+            title="缓存命中"
+          />
+          {buckets.some((bucket) => bucket.hitRate !== null) ? (
+            <div className="mt-4 h-56">
+              <ResponsiveContainer height="100%" width="100%">
+                <LineChart data={buckets}>
+                  <CartesianGrid
+                    stroke="var(--border)"
+                    strokeDasharray="3 3"
+                    vertical={false}
+                  />
+                  <XAxis
+                    axisLine={false}
+                    dataKey="time"
+                    fontSize={11}
+                    minTickGap={32}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    axisLine={false}
+                    domain={[0, 100]}
+                    fontSize={11}
+                    tickFormatter={(value) => `${value}%`}
+                    tickLine={false}
+                    width={44}
+                  />
+                  <Tooltip
+                    contentStyle={chartTooltipStyle}
+                    formatter={(value) => [
+                      value === null || value === undefined
+                        ? "—"
+                        : `${Number(value).toFixed(1)}%`,
+                      "缓存命中率",
+                    ]}
+                  />
+                  <Line
+                    connectNulls
+                    dataKey="hitRate"
+                    dot={false}
+                    stroke="var(--chart-1)"
+                    strokeWidth={2}
+                    type="monotone"
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <p className="grid h-56 place-items-center text-sm text-muted-foreground">
+              当前筛选范围内暂无输入 Token
+            </p>
+          )}
+          <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-xs">
+            <li className="flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className="size-2.5 rounded-full"
+                style={{ background: "var(--chart-1)" }}
+              />
+              缓存读 {cacheTotals.cachedRead.toLocaleString()}
+            </li>
+            <li className="flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className="size-2.5 rounded-full"
+                style={{ background: "var(--chart-3)" }}
+              />
+              缓存写 {cacheTotals.cachedWrite.toLocaleString()}
+            </li>
+            <li className="flex items-center gap-1.5">
+              <span
+                aria-hidden
+                className="size-2.5 rounded-full"
+                style={{ background: "var(--muted-foreground)", opacity: 0.35 }}
+              />
+              未命中 {cacheTotals.uncachedInput.toLocaleString()}
+            </li>
+          </ul>
+        </Surface>
+      </div>
     </>
   );
 }
@@ -1450,6 +1593,7 @@ function CreateBudgetPolicyDialog({
     "calendar_month_utc",
   );
   const [mode, setMode] = useState<PolicyMode>("alert");
+  const [currency, setCurrency] = useState<"USD" | "CNY">("CNY");
   const [amount, setAmount] = useState("");
   const [warnAmount, setWarnAmount] = useState("");
 
@@ -1472,6 +1616,7 @@ function CreateBudgetPolicyDialog({
     setModelId("");
     setPeriod("calendar_month_utc");
     setMode("alert");
+    setCurrency("CNY");
     setAmount("");
     setWarnAmount("");
   }
@@ -1494,6 +1639,7 @@ function CreateBudgetPolicyDialog({
       model_id: scope === "model" ? modelId.trim() : "*",
       feature: "*",
       period,
+      limit_currency: currency,
       soft_limit_cny: mode === "alert" ? amountValue : warnValue,
       hard_limit_cny: mode === "block" ? amountValue : null,
       enabled: true,
@@ -1602,24 +1748,43 @@ function CreateBudgetPolicyDialog({
                 </datalist>
               </div>
             ) : null}
-            <div className="space-y-2">
-              <Label>达到额度后</Label>
-              <Select
-                onValueChange={(value) => setMode(value as PolicyMode)}
-                value={mode}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="alert">仅告警，不停用</SelectItem>
-                  <SelectItem value="block">自动停用（阻断后续调用）</SelectItem>
-                </SelectContent>
-              </Select>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>达到额度后</Label>
+                <Select
+                  onValueChange={(value) => setMode(value as PolicyMode)}
+                  value={mode}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="alert">仅告警，不停用</SelectItem>
+                    <SelectItem value="block">自动停用（阻断后续调用）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>额度币种</Label>
+                <Select
+                  onValueChange={(value) => setCurrency(value as "USD" | "CNY")}
+                  value={currency}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="CNY">CNY（人民币）</SelectItem>
+                    <SelectItem value="USD">USD（美元，按当前汇率折算）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="budget-create-amount">额度金额 CNY</Label>
+                <Label htmlFor="budget-create-amount">
+                  额度金额 {currency === "CNY" ? "CNY ¥" : "USD $"}
+                </Label>
                 <Input
                   id="budget-create-amount"
                   min="0"
@@ -1631,7 +1796,9 @@ function CreateBudgetPolicyDialog({
               </div>
               {mode === "block" ? (
                 <div className="space-y-2">
-                  <Label htmlFor="budget-create-warn">提前告警金额 CNY（可选）</Label>
+                  <Label htmlFor="budget-create-warn">
+                    提前告警金额 {currency === "CNY" ? "CNY ¥" : "USD $"}（可选）
+                  </Label>
                   <Input
                     id="budget-create-warn"
                     min="0"
@@ -1643,6 +1810,11 @@ function CreateBudgetPolicyDialog({
                 </div>
               ) : null}
             </div>
+            {currency === "USD" ? (
+              <p className="text-xs text-muted-foreground">
+                美元额度在调用前按当前 USD/CNY 汇率折算成人民币门槛；汇率变化后门槛随之浮动。
+              </p>
+            ) : null}
             {!amountsValid && amount !== "" ? (
               <p className="text-xs text-destructive">
                 额度必须大于 0；提前告警金额不能高于额度金额。
@@ -1677,6 +1849,9 @@ function EditBudgetPolicyDialog({
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState(policy.name);
+  const [currency, setCurrency] = useState<"USD" | "CNY">(
+    policy.limit_currency ?? "CNY",
+  );
   const [softLimit, setSoftLimit] = useState(
     policy.soft_limit_cny === null ? "" : String(policy.soft_limit_cny),
   );
@@ -1694,6 +1869,7 @@ function EditBudgetPolicyDialog({
 
   function resetFromPolicy() {
     setName(policy.name);
+    setCurrency(policy.limit_currency ?? "CNY");
     setSoftLimit(policy.soft_limit_cny === null ? "" : String(policy.soft_limit_cny));
     setHardLimit(policy.hard_limit_cny === null ? "" : String(policy.hard_limit_cny));
     setEnabled(policy.enabled);
@@ -1705,6 +1881,7 @@ function EditBudgetPolicyDialog({
     try {
       await onUpdate({
         name: name.trim(),
+        limit_currency: currency,
         soft_limit_cny: soft,
         hard_limit_cny: hard,
         enabled,
@@ -1749,9 +1926,31 @@ function EditBudgetPolicyDialog({
                 value={name}
               />
             </div>
+            <div className="space-y-2">
+              <Label>额度币种</Label>
+              <Select
+                onValueChange={(value) => setCurrency(value as "USD" | "CNY")}
+                value={currency}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="CNY">CNY（人民币）</SelectItem>
+                  <SelectItem value="USD">USD（美元，按当前汇率折算）</SelectItem>
+                </SelectContent>
+              </Select>
+              {currency === "USD" ? (
+                <p className="text-xs text-muted-foreground">
+                  美元额度在调用前按当前 USD/CNY 汇率折算成人民币门槛；汇率变化后门槛随之浮动。
+                </p>
+              ) : null}
+            </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor={`budget-policy-soft-${policy.id}`}>软告警 CNY</Label>
+                <Label htmlFor={`budget-policy-soft-${policy.id}`}>
+                  软告警 {currency === "CNY" ? "CNY ¥" : "USD $"}
+                </Label>
                 <Input
                   id={`budget-policy-soft-${policy.id}`}
                   min="0"
@@ -1761,7 +1960,9 @@ function EditBudgetPolicyDialog({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor={`budget-policy-hard-${policy.id}`}>硬停用 CNY</Label>
+                <Label htmlFor={`budget-policy-hard-${policy.id}`}>
+                  硬停用 {currency === "CNY" ? "CNY ¥" : "USD $"}
+                </Label>
                 <Input
                   id={`budget-policy-hard-${policy.id}`}
                   min="0"
@@ -2070,9 +2271,14 @@ function UsageEventsTable({
                 </td>
                 <td className="px-5 py-3">{event.feature}</td>
                 <td className="px-5 py-3 font-mono tabular-nums">
-                  <p>{(event.input_tokens + event.output_tokens).toLocaleString()}</p>
+                  <p>
+                    {(event.total_tokens ?? event.input_tokens + event.output_tokens).toLocaleString()}
+                  </p>
                   <p className="mt-0.5 text-[10px] text-muted-foreground">
-                    in {event.input_tokens.toLocaleString()} · out {event.output_tokens.toLocaleString()}
+                    输入 {event.input_tokens.toLocaleString()} · 缓存读{" "}
+                    {(event.cached_input_tokens ?? 0).toLocaleString()} · 缓存写{" "}
+                    {(event.cache_creation_input_tokens ?? 0).toLocaleString()} · 输出{" "}
+                    {event.output_tokens.toLocaleString()}
                   </p>
                 </td>
                 <td className="px-5 py-3 tabular-nums">{event.attempt}</td>
@@ -2329,6 +2535,8 @@ export function UsagePage() {
         "model_id",
         "feature",
         "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
         "output_tokens",
         "attempt",
         "cost_usd",
@@ -2343,6 +2551,8 @@ export function UsagePage() {
         event.model_id,
         event.feature,
         event.input_tokens,
+        event.cached_input_tokens ?? 0,
+        event.cache_creation_input_tokens ?? 0,
         event.output_tokens,
         event.attempt,
         event.cost_usd,
@@ -2436,7 +2646,7 @@ export function UsagePage() {
             </Button>
           </div>
         }
-        description="每次实际 HTTP Attempt 追加一条用量事件，失败重试也单独计入；人民币计费模型按人民币计价，美元计费模型按美元计价，汇总按当前汇率折算，历史账本保留调用时快照。"
+        description="每次实际 HTTP Attempt 追加一条用量事件，失败重试也单独计入；缓存读写 Token 均包含在输入 Token 总量中，不重复累加；人民币计费模型按人民币计价，美元计费模型按美元计价，汇总按当前汇率折算，历史账本保留调用时快照。"
         eyebrow="Usage ledger"
         title="用量计费与预算"
       />
@@ -2445,7 +2655,7 @@ export function UsagePage() {
           {
             label: "输入 Token",
             value: usageSummary.input_tokens.toLocaleString(),
-            hint: "当前工作区",
+            hint: `缓存读 ${(usageSummary.cached_input_tokens ?? 0).toLocaleString()} · 缓存写 ${(usageSummary.cache_creation_input_tokens ?? 0).toLocaleString()}`,
           },
           {
             label: "输出 Token",
@@ -2526,12 +2736,24 @@ export function UsagePage() {
               <div className="mt-4 space-y-3">
                 {policyItems.map((policy) => {
                   const status = statusByPolicy.get(policy.id);
-                  const limit =
+                  const currency = policy.limit_currency ?? "CNY";
+                  const nativeSymbol = currency === "CNY" ? "¥" : "$";
+                  const effectiveLimit =
+                    status?.hard_limit_cny_effective ??
+                    status?.soft_limit_cny_effective ??
+                    null;
+                  const nativeLimit =
                     policy.hard_limit_cny ?? policy.soft_limit_cny ?? null;
+                  // Percent uses the effective CNY limit vs. CNY spend, so USD
+                  // limits float with the current exchange rate.
                   const percent =
-                    status && limit
-                      ? Math.min(100, Math.round((status.spent_cny / limit) * 100))
+                    status && effectiveLimit
+                      ? Math.min(100, Math.round((status.spent_cny / effectiveLimit) * 100))
                       : null;
+                  const limitLabel = (value: number | null, ccy: "USD" | "CNY") =>
+                    value === null
+                      ? "未设置"
+                      : `${ccy === "CNY" ? "¥" : "$"}${value.toFixed(2)}`;
                   return (
                     <div className="rounded-xl border p-4" key={policy.id}>
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -2541,6 +2763,10 @@ export function UsagePage() {
                             <StatePill
                               label={policy.hard_limit_cny !== null ? "自动停用" : "仅告警"}
                               status={policy.hard_limit_cny !== null ? "warning" : "approved"}
+                            />
+                            <StatePill
+                              label={currency === "USD" ? "USD 额度" : "CNY 额度"}
+                              status={currency === "USD" ? "local_mock" : "approved"}
                             />
                             <StatePill label={policy.enabled ? "已启用" : "已停用"} status={policy.enabled ? "approved" : "archived"} />
                             {status?.hard_exceeded ? (
@@ -2553,7 +2779,7 @@ export function UsagePage() {
                             <span title={policy.provider_id}>{shortId(policy.provider_id)}</span> / {policy.model_id} / {policy.feature} · {policy.period === "calendar_day_utc" ? "每日" : "每月"}
                           </p>
                           <p className="mt-1 text-muted-foreground">
-                            软告警 {policy.soft_limit_cny === null ? "未设置" : `¥${policy.soft_limit_cny.toFixed(2)}`} · 硬停用 {policy.hard_limit_cny === null ? "未设置" : `¥${policy.hard_limit_cny.toFixed(2)}`}
+                            软告警 {limitLabel(policy.soft_limit_cny, currency)} · 硬停用 {limitLabel(policy.hard_limit_cny, currency)}
                           </p>
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
@@ -2577,7 +2803,11 @@ export function UsagePage() {
                         <div className="mt-3 flex items-center gap-2">
                           <Progress value={percent} />
                           <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-                            ¥{status.spent_cny.toFixed(4)} / ¥{Number(limit).toFixed(2)} · {percent}%
+                            ¥{status.spent_cny.toFixed(4)} / ¥{Number(effectiveLimit).toFixed(2)}
+                            {currency === "USD" && nativeLimit !== null
+                              ? `（${nativeSymbol}${nativeLimit.toFixed(2)} 按汇率）`
+                              : ""}{" "}
+                            · {percent}%
                           </span>
                         </div>
                       ) : null}

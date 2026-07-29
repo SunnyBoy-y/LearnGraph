@@ -23,6 +23,15 @@ export interface MCPServerCreate {
   agent_auto_invoke?: boolean;
 }
 
+export interface BuiltinMcpTool {
+  tool: string;
+  function_name: string;
+  description: string;
+  description_zh: string | null;
+  parameters: UnknownRecord;
+  permissions: string[];
+}
+
 export interface MCPServer {
   id: string;
   workspace_id: string;

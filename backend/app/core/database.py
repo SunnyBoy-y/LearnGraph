@@ -18,8 +18,10 @@ class Base(DeclarativeBase):
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-SQLITE_BUSY_TIMEOUT_MS = 5_000
-SQLITE_MIN_SAFE_WAL_VERSION = (3, 51, 3)
+# Wait long enough for concurrent request + scheduler writers. The previous
+# 5s budget was shorter than multi-second chat/memory commits under load.
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+SQLITE_BUSY_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1_000
 
 database_url = make_url(settings.database_url)
 is_sqlite = database_url.get_backend_name() == "sqlite"
@@ -28,7 +30,11 @@ if is_sqlite and database_url.database and database_url.database != ":memory:":
 
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False}
+    connect_args={
+        "check_same_thread": False,
+        # pysqlite lock wait (seconds). Mirrors PRAGMA busy_timeout below.
+        "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
+    }
     if is_sqlite
     else {},
 )
@@ -42,22 +48,24 @@ def _configure_sqlite_connection(dbapi_connection: Any, _: Any) -> None:
             raise RuntimeError("SQLite foreign key enforcement could not be enabled")
         cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
 
-        version_text = cursor.execute("SELECT sqlite_version()").fetchone()[0]
-        version = tuple(int(part) for part in version_text.split("."))
         database_path = cursor.execute("PRAGMA database_list").fetchone()[2]
         is_network_path = str(database_path).startswith(("\\\\", "//"))
-        if database_path and not is_network_path and version >= SQLITE_MIN_SAFE_WAL_VERSION:
+        # WAL is required for concurrent readers/writers on a local desktop DB.
+        # The previous 3.51.3 gate kept Python's bundled 3.45.x on rollback
+        # journal mode, which surfaces as OperationalError: database is locked
+        # under normal multi-request auth/session traffic.
+        if database_path and not is_network_path and database_path != ":memory:":
             journal_mode = cursor.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             if str(journal_mode).casefold() != "wal":
-                raise RuntimeError("SQLite WAL mode could not be enabled")
-            cursor.execute("PRAGMA synchronous=NORMAL")
+                logger.warning(
+                    "SQLite WAL mode requested but journal_mode=%s; concurrent writes may lock",
+                    journal_mode,
+                )
+            else:
+                cursor.execute("PRAGMA synchronous=NORMAL")
         elif is_network_path:
-            logger.warning("SQLite database is on a network path; keeping rollback journal mode")
-        elif database_path:
             logger.warning(
-                "SQLite %s is below the verified WAL minimum %s; keeping rollback journal mode",
-                version_text,
-                ".".join(str(part) for part in SQLITE_MIN_SAFE_WAL_VERSION),
+                "SQLite database is on a network path; keeping rollback journal mode"
             )
     finally:
         cursor.close()
@@ -389,10 +397,15 @@ def _apply_sqlite_additive_migrations() -> None:
             "fixed_usd_per_call": "FLOAT NOT NULL DEFAULT 0.0",
             "usd_cny_rate": "FLOAT NOT NULL DEFAULT 0.0",
             "cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "cache_creation_input_tokens": "INTEGER NOT NULL DEFAULT 0",
             "reasoning_tokens": "INTEGER NOT NULL DEFAULT 0",
             "total_tokens": "INTEGER NOT NULL DEFAULT 0",
             "cached_input_usd_per_million": "FLOAT NOT NULL DEFAULT 0.0",
+            "cache_write_usd_per_million": "FLOAT NOT NULL DEFAULT 0.0",
             "price_multiplier": "FLOAT NOT NULL DEFAULT 1.0",
+        },
+        "budget_policies": {
+            "limit_currency": "VARCHAR(8) NOT NULL DEFAULT 'CNY'",
         },
         "price_versions": {
             "cached_input_usd_per_million": "FLOAT",

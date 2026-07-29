@@ -1,6 +1,8 @@
 import type {
   CodexDeviceLoginPoll,
   CodexDeviceLoginStart,
+  CopilotDeviceLoginPoll,
+  CopilotDeviceLoginStart,
   ProviderBalance,
   ProviderBalanceQueryConfig,
   ProviderBalanceQueryExecuteResponse,
@@ -99,6 +101,23 @@ export function saveProviderBalanceQueryResult(
 ): Promise<ProviderBalanceQueryLastResult & { provider_id: string }> {
   return apiClient.put(
     `/providers/${encodeURIComponent(providerId)}/balance-query/result`,
+    payload,
+  );
+}
+
+export function startCopilotDeviceLogin(): Promise<CopilotDeviceLoginStart> {
+  return apiClient.post<CopilotDeviceLoginStart, Record<string, never>>(
+    "/providers/copilot/device-login",
+    {},
+  );
+}
+
+export function pollCopilotDeviceLogin(payload: {
+  device_auth_id: string;
+  user_code: string;
+}): Promise<CopilotDeviceLoginPoll> {
+  return apiClient.post<CopilotDeviceLoginPoll, typeof payload>(
+    "/providers/copilot/device-login/poll",
     payload,
   );
 }

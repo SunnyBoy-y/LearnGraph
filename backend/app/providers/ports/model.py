@@ -2,7 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypedDict
+
+
+class ProviderUsage(TypedDict, total=False):
+    """Provider-neutral token usage.
+
+    ``input_tokens`` is the total prompt input. Cache reads and cache writes are
+    disjoint subsets of that total; output reasoning is a subset of output.
+    """
+
+    input_tokens: int
+    cached_input_tokens: int
+    cache_creation_input_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +129,7 @@ class ModelProviderPort(Protocol):
     remote_capability: bool
     context_window_tokens: int
     max_output_tokens: int
-    last_usage: dict[str, int]
+    last_usage: ProviderUsage
     last_request_id: str | None
 
     def stream_answer(self, prompt: str) -> Iterable[str]: ...

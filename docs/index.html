@@ -77,6 +77,7 @@
               <a href="#sandbox">沙箱</a>
               <a href="#memory">记忆系统</a>
               <a href="#streaming">消息与 SSE</a>
+              <a href="#trusted-components">可信组件</a>
               <a href="#security">安全与授权</a>
             </div>
             <div class="nav-group">
@@ -949,9 +950,275 @@ score    = strength × proximity × confidence × zone_factor × boost
           </p>
         </section>
 
-        <section id="security" class="doc-section" data-title="安全与授权">
+        <section id="trusted-components" class="doc-section" data-title="可信组件">
           <div class="section-heading">
             <span class="section-index">15</span>
+            <div>
+              <p class="overline">Trusted components</p>
+              <h2>可信组件</h2>
+            </div>
+          </div>
+          <p>
+            可信组件是助手消息流里的声明式 UI 卡片（选择题、填空、天气卡、指标卡、图片框等）。它用 JSON Schema
+            声明数据面，而不是把任意 HTML/React 注入宿主 DOM。Agent 可通过 <code>canvas_emit_trusted_component</code>
+            发布内置组件，也可注册并授权第三方组件 Manifest 再发布。所有写操作经后端 Schema 守卫、哈希与审计，
+            前端对未注册或未通过 Schema 的组件安全降级为 JSON 预览，绝不执行脚本。
+          </p>
+
+          <div class="compare">
+            <div>
+              <span class="compare-label">Channel A · 声明式</span>
+              <h3>内置目录 · 宿主 DOM</h3>
+              <ul>
+                <li>8 个内置 <code>component_type</code>：<code>weather_card</code>、<code>metric_card</code>、
+                  <code>option_group</code>、<code>single_choice</code>、<code>multiple_choice</code>、
+                  <code>fill_blank</code>、<code>short_answer_table</code>、<code>image_frame</code></li>
+                <li>渲染器 <code>trusted-bundle</code>，由前端编译好的 React 组件在宿主 DOM 直接渲染</li>
+                <li><strong>端到端可用</strong>，是 Agent 默认的表单 / 展示通道</li>
+                <li>权限由系统白名单固定，工作区不可改写</li>
+              </ul>
+            </div>
+            <div>
+              <span class="compare-label">Channel B · 沙箱</span>
+              <h3>第三方 Manifest · 隔离浏览器</h3>
+              <ul>
+                <li>任意 <code>component_id</code>，经工作区导入 Manifest 注册</li>
+                <li>渲染器固定为 <code>sandbox</code>，结果以 <code>sandbox_artifact</code> 交付</li>
+                <li><strong>条件可用</strong>：依赖未配置的隔离浏览器渲染器，缺失时 <code>runtime_status=unavailable</code> 安全降级</li>
+                <li>需工作区显式授权后才可发布或生成 Artifact</li>
+              </ul>
+            </div>
+          </div>
+
+          <h3>协议生命周期</h3>
+          <div class="state-machine">
+            <code>register</code><i>→</i><code>health_check</code><i>→</i><code>authorize（+enable）</code><i>→</i><code>artifact / event_validate</code>
+            <small>版本、Schema、权限或包哈希变化会废止旧授权，需重新授权；同一 <code>version</code> 的 Manifest 不可替换。</small>
+          </div>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>register</strong><p>提交完整 Manifest，服务端做静态 Schema 守卫、签名记录与 example_data 校验，落 Plugin 与 ManifestVersion。</p></div></li>
+            <li><span>02</span><div><strong>health_check</strong><p>对当前 Manifest 跑 JSON Schema 校验（render 检查在隔离浏览器未配置时标记 unavailable，不阻断）。</p></div></li>
+            <li><span>03</span><div><strong>authorize + enable</strong><p>工作区对当前版本 + 权限指纹授权并启用插件；内置组件由系统固定，工作区不可改。</p></div></li>
+            <li><span>04</span><div><strong>artifact / event_validate</strong><p>用授权后的组件把 <code>data</code> 校验成 Artifact，或把用户事件按 <code>event_schema</code> 校验后再处理。发布前由 <code>assert_can_enable</code> 校验 Manifest、授权与 health 全部当前。</p></div></li>
+          </ol>
+
+          <h3>Manifest 字段规范</h3>
+          <div class="definition-list compact">
+            <div><code>component_id</code><p>全局唯一标识，<code>^[A-Za-z0-9][A-Za-z0-9._-]{1,119}$</code>；内置 8 个 ID 与 <code>source=builtin</code> 保留，第三方不可占用。</p></div>
+            <div><code>version</code><p>SemVer，<code>max 40</code> 字符；同一 version 落库后不可替换。</p></div>
+            <div><code>display_name</code><p>展示名，1–160 字符。</p></div>
+            <div><code>renderer</code><p>第三方导入固定为 <code>sandbox</code>；<code>trusted-bundle</code> 仅系统内置可用。</p></div>
+            <div><code>source</code><p>来源标签，1–160 字符；<code>builtin</code> 为系统保留值。</p></div>
+            <div><code>package_hash</code><p>组件包 sha256（64 位十六进制），由发布方计算并声明；服务端标记 <code>declared_unverified</code>。</p></div>
+            <div><code>signature</code><p>可选签名声明（<code>ed25519</code> 或 <code>ecdsa-p256-sha256</code>）；当前无信任锚，仅记录为 <code>unverified</code>。</p></div>
+            <div><code>data_schema</code><p>组件数据的 JSON Schema，必须顶层 <code>type=object</code> 且 <code>additionalProperties=false</code>。</p></div>
+            <div><code>event_schema</code><p>用户事件 JSON Schema，同样要求顶层闭合对象。</p></div>
+            <div><code>permissions</code><p><code>network_domains</code>（精确 DNS 主机，禁通配/带 scheme）、<code>file_read</code>、<code>clipboard_write</code>、<code>message_actions</code>（小写标识）。</p></div>
+            <div><code>size_limits</code><p><code>min_height</code> ≥40、<code>max_height</code> ≤2000，且 min ≤ max。</p></div>
+            <div><code>example_data</code><p>必须通过自身 <code>data_schema</code> 校验的最小示例。</p></div>
+            <div><code>skill_triggers</code><p>最多 64 条触发词，可选。</p></div>
+          </div>
+
+          <h3>Schema 安全约束</h3>
+          <div class="plain-grid">
+            <div><strong>闭合对象</strong><p><code>data_schema</code> / <code>event_schema</code> 顶层必须 <code>type=object</code> 且 <code>additionalProperties=false</code>。</p></div>
+            <div><strong>禁止可执行内容</strong><p>字段名不得为 <code>html</code>、<code>raw_html</code>、<code>javascript</code>、<code>script</code>、<code>srcdoc</code>、<code>react_code</code>、<code>dangerouslysetinnerhtml</code>；实例字符串不得含 <code>&lt;script</code>、<code>javascript:</code>、<code>&lt;iframe</code>、<code>srcdoc=</code> 等标记。</p></div>
+            <div><strong>禁止外部引用</strong><p>Schema 不得用非 <code>#/</code> 开头的 <code>$ref</code>；不得声明 <code>contentMediaType</code> 为 <code>text/html</code>、<code>application/javascript</code>、<code>text/javascript</code>。</p></div>
+            <div><strong>禁正则执行</strong><p>Schema 不得含 <code>pattern</code> 字段（不执行调用方提供的正则）。</p></div>
+            <div><strong>体量上限</strong><p>单 Schema ≤64KB、单实例 ≤64KB、深度 ≤16、节点 ≤1000。</p></div>
+            <div><strong>禁 null</strong><p>可选字段省略即可，不要传 <code>null</code>；后端对内置 props 会做 null 剥离。</p></div>
+          </div>
+
+          <h3>内置组件最小合法 props</h3>
+          <div class="code-block">
+            <div class="code-header"><span>option_group / single_choice / multiple_choice</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "title": "你更希望怎样验收这次学习？",
+  "description": "单选一项后继续",
+  "options": [
+    { "id": "project", "label": "完成一个小项目" },
+    { "id": "explain", "label": "能够清楚讲解" }
+  ],
+  "allow_custom": true,
+  "allow_skip": true,
+  "submit_label": "确认并继续"
+}</code></pre>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>fill_blank</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "title": "请补全 ACID 中的 A",
+  "prompt": "ACID 中的 A 代表 ____",
+  "placeholder": "Atomicity / 原子性",
+  "multiline": false,
+  "submit_label": "提交",
+  "blank_ids": ["answer"]
+}</code></pre>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>short_answer_table</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "title": "简答题",
+  "columns": ["问题", "你的回答"],
+  "rows": [["为什么需要索引？", ""]]
+}</code></pre>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>weather_card</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "title": "杭州明日天气",
+  "location": "杭州",
+  "condition": "多云",
+  "temperature_c": 27,
+  "high_c": 29,
+  "low_c": 21,
+  "summary": "适合户外轻量复习",
+  "unit": "C",
+  "actions": [
+    { "id": "create_plan", "label": "生成明日学习计划", "event": "create_plan" }
+  ]
+}</code></pre>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>metric_card</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "title": "今日学习指标",
+  "description": "来自当前目标进度",
+  "metrics": [
+    { "id": "mastery", "label": "掌握度", "value": "62%", "hint": "近 7 日" },
+    { "id": "reviews", "label": "待复习", "value": 3 }
+  ]
+}</code></pre>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>image_frame</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "title": "示意图",
+  "alt": "B+ 树结构示意",
+  "status": "placeholder"
+}</code></pre>
+          </div>
+
+          <h3>完整第三方 Manifest 示例</h3>
+          <p>
+            以下是一个自定义 <code>quiz_card</code> 的完整 Manifest，可直接用于 <code>POST /api/v1/plugins/components</code>
+            或智能体的 <code>component_register_manifest</code> 工具。它满足全部 Schema 安全约束：顶层闭合对象、无禁用字段、
+            无 <code>pattern</code> / 外部 <code>$ref</code>、<code>example_data</code> 能通过自身 <code>data_schema</code>。
+          </p>
+          <div class="code-block">
+            <div class="code-header"><span>quiz_card Manifest · POST /plugins/components</span><button type="button" data-copy-code>复制</button></div>
+            <pre><code>{
+  "component_id": "acme.quiz_card",
+  "version": "1.0.0",
+  "display_name": "Quiz Card",
+  "renderer": "sandbox",
+  "author": "Acme",
+  "source": "acme-marketplace",
+  "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "compatible_learngraph": { "minimum": "0.1.0" },
+  "uninstall_behavior": "retain_data",
+  "data_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["question", "answer"],
+    "properties": {
+      "title": { "type": "string", "maxLength": 500 },
+      "question": { "type": "string", "maxLength": 2000 },
+      "answer": { "type": "string", "maxLength": 2000 },
+      "hint": { "type": "string", "maxLength": 500 }
+    }
+  },
+  "event_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["type", "value"],
+    "properties": {
+      "type": { "type": "string", "enum": ["submit", "change", "select"] },
+      "value": {
+        "oneOf": [
+          { "type": "string", "maxLength": 10000 },
+          { "type": "array", "maxItems": 100, "items": { "type": "string", "maxLength": 1000 } }
+        ]
+      }
+    }
+  },
+  "permissions": {
+    "network_domains": [],
+    "file_read": false,
+    "clipboard_write": false,
+    "message_actions": ["submit"]
+  },
+  "size_limits": { "min_height": 80, "max_height": 480 },
+  "skill_triggers": [],
+  "example_data": {
+    "title": "练习",
+    "question": "2 + 2 = ?",
+    "answer": "4",
+    "hint": "十以内加法"
+  }
+}</code></pre>
+          </div>
+
+          <h3>事件协议</h3>
+          <p>
+            用户在卡片上的交互以事件形式回传，按组件 Manifest 的 <code>event_schema</code> 校验。内置组件的默认
+            <code>event_schema</code> 要求 <code>type</code>（<code>submit</code> / <code>change</code> / <code>select</code>）
+            与 <code>value</code>（字符串或字符串数组）。<code>allowed_events</code> 限定可触发的事件名，
+            选项类默认 <code>["submit"]</code>，<code>weather_card</code>/<code>metric_card</code> 由
+            <code>actions[].event</code> 推导，<code>image_frame</code> 默认为空。
+          </p>
+
+          <h3>智能体创建并应用</h3>
+          <p>
+            Agent 在拥有 <code>workspace.manage</code> 权限时，可直接在对话里创建并应用可信组件，无需切到设置页：
+          </p>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>component_register_manifest</strong><p>提交第三方 Manifest，服务端做静态与健康检查并落审计；内置 ID 被拒绝。</p></div></li>
+            <li><span>02</span><div><strong>component_authorize</strong><p>对刚注册的 <code>plugin_id</code> + <code>manifest_version_id</code> 授权当前工作区并启用插件（<code>enable=false</code> 可仅授权不启用）。</p></div></li>
+            <li><span>03</span><div><strong>component_list</strong><p>查询已注册组件及其授权/启用状态，决定下一步是授权还是发布。</p></div></li>
+            <li><span>04</span><div><strong>canvas_emit_trusted_component</strong><p>对自定义 <code>component_type</code> 传其 <code>component_id</code> 发布；已授权则按 <code>sandbox_artifact</code> 交付。</p></div></li>
+          </ol>
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
+            <div>
+              <strong>第三方组件渲染是条件可用</strong>
+              <p>
+                第三方组件渲染器固定为 <code>sandbox</code>，依赖隔离浏览器渲染器；当前未配置，发布会以
+                <code>sandbox_artifact</code> 安全降级（<code>runtime_status=unavailable</code>）交付，不会把任意代码注入宿主 DOM。
+                内置 8 类组件不受此限制，端到端可用。
+              </p>
+            </div>
+          </div>
+
+          <h3>API 面</h3>
+          <table>
+            <thead><tr><th>端点组</th><th>权限</th><th>职责</th></tr></thead>
+            <tbody>
+              <tr><td><code>POST /plugins/components</code></td><td><code>workspace.write</code></td><td>导入并校验第三方 Manifest（注册）</td></tr>
+              <tr><td><code>GET /{plugin_id}/manifests</code> · <code>/authorizations</code> · <code>/checks</code></td><td><code>workspace.write</code></td><td>列出版本、授权与检查记录</td></tr>
+              <tr><td><code>POST /{plugin_id}/authorizations</code> · <code>/authorizations/revoke</code></td><td><code>workspace.write</code></td><td>授权或撤销当前工作区</td></tr>
+              <tr><td><code>POST /{plugin_id}/checks</code></td><td><code>workspace.write</code></td><td>触发 health / render 检查</td></tr>
+              <tr><td><code>POST /{plugin_id}/artifacts</code></td><td>已授权</td><td>按授权边界生成受控 Artifact</td></tr>
+              <tr><td><code>POST /{plugin_id}/events/validate</code></td><td>已授权</td><td>按 event_schema 校验用户事件</td></tr>
+            </tbody>
+          </table>
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>Agent 工具与 HTTP 复用同一服务</strong>
+              <p>
+                <code>component_register_manifest</code> / <code>component_authorize</code> / <code>component_list</code>
+                复用 <code>ComponentService</code>，与上方 HTTP 端点共享 Schema 守卫、哈希、审计与重授权逻辑；
+                Agent 工具额外要求 <code>workspace.manage</code>。
+              </p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/domain/schemas/components.py</code> · <code>backend/app/services/components.py</code> · <code>backend/app/services/canvas_cards.py</code> · <code>frontend/src/components/chat/trusted-component-renderer.tsx</code> · <code>backend/app/skills/canvas_emit_trusted_component/SKILL.md</code></div>
+        </section>
+
+        <section id="security" class="doc-section" data-title="安全与授权">
+          <div class="section-heading">
+            <span class="section-index">16</span>
             <div>
               <p class="overline">Security model</p>
               <h2>安全与授权</h2>
@@ -970,7 +1237,7 @@ score    = strength × proximity × confidence × zone_factor × boost
 
         <section id="repo-map" class="doc-section" data-title="代码地图">
           <div class="section-heading">
-            <span class="section-index">16</span>
+            <span class="section-index">17</span>
             <div>
               <p class="overline">Repository map</p>
               <h2>代码地图</h2>
@@ -998,7 +1265,7 @@ score    = strength × proximity × confidence × zone_factor × boost
 
         <section id="extension-guide" class="doc-section" data-title="扩展指南">
           <div class="section-heading">
-            <span class="section-index">17</span>
+            <span class="section-index">18</span>
             <div>
               <p class="overline">Extension guide</p>
               <h2>扩展指南</h2>
@@ -1025,7 +1292,7 @@ score    = strength × proximity × confidence × zone_factor × boost
 
         <section id="verification" class="doc-section final-section" data-title="验证与完成定义">
           <div class="section-heading">
-            <span class="section-index">18</span>
+            <span class="section-index">19</span>
             <div>
               <p class="overline">Verification</p>
               <h2>验证与完成定义</h2>

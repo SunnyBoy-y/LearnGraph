@@ -239,9 +239,12 @@ def list_sessions(
     settings: AppSettings,
     chat_session_id: Annotated[str | None, Query(max_length=36)] = None,
 ) -> list[SandboxSessionView]:
+    include_all = context.principal.is_system_admin
     return [
         SandboxSessionView.model_validate(item)
-        for item in service(db, context, settings).list_sessions(chat_session_id)
+        for item in service(db, context, settings).list_sessions(
+            chat_session_id, include_all=include_all, include_cleaned=False
+        )
     ]
 
 
@@ -250,7 +253,9 @@ def get_session(
     sandbox_session_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings
 ) -> SandboxSessionView:
     return SandboxSessionView.model_validate(
-        service(db, context, settings).get_session(sandbox_session_id)
+        service(db, context, settings).get_session(
+            sandbox_session_id, include_all=context.principal.is_system_admin
+        )
     )
 
 
@@ -314,7 +319,9 @@ def cleanup_session(
     sandbox_session_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings
 ) -> SandboxSessionView:
     return SandboxSessionView.model_validate(
-        service(db, context, settings).cleanup(sandbox_session_id)
+        service(db, context, settings).cleanup(
+            sandbox_session_id, include_all=context.principal.is_system_admin
+        )
     )
 
 

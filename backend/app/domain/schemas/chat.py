@@ -353,7 +353,11 @@ class SuggestedPromptBatchView(BaseModel):
 class DocumentSelectionContext(BaseModel):
     file_id: str = Field(min_length=1, max_length=36)
     document_revision_id: str = Field(min_length=1, max_length=36)
-    chunk_id: str = Field(min_length=1, max_length=36)
+    # chunk_id is a best-effort anchor; when the browser selection cannot be
+    # resolved to a single chunk (cross-chunk, stale index, duplicate text) it
+    # is omitted and the request degrades to whole-file context with the
+    # selected_text attached as an unverified hint.
+    chunk_id: str | None = Field(default=None, max_length=36)
     locator: dict[str, Any] = Field(default_factory=dict)
     selected_text: str = Field(min_length=1, max_length=50_000)
     selected_text_hash: str = Field(
@@ -367,7 +371,11 @@ class DocumentSelectionContext(BaseModel):
         if not self.selected_text.strip():
             raise ValueError("selected_text cannot contain only whitespace")
         locator_chunk_id = self.locator.get("chunk_id")
-        if locator_chunk_id is not None and str(locator_chunk_id) != self.chunk_id:
+        if (
+            locator_chunk_id is not None
+            and self.chunk_id is not None
+            and str(locator_chunk_id) != self.chunk_id
+        ):
             raise ValueError("locator.chunk_id must match chunk_id")
         locator_revision_id = self.locator.get("document_revision_id")
         if (

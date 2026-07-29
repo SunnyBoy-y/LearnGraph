@@ -4,6 +4,7 @@ import {
   FileSearch,
   Network,
   PackageCheck,
+  Pencil,
   Puzzle,
   RefreshCcw,
   Search,
@@ -25,8 +26,7 @@ import {
   installSkill,
   invokeMcpTool,
   invokeSkill,
-  listExtensionGrants,
-  listExtensionInvocations,
+  listBuiltinMcpTools,
   listMcpServers,
   listPlugins,
   listProviderCatalog,
@@ -38,6 +38,7 @@ import {
   revokeMcpServer,
   revokeSkill,
   togglePlugin,
+  updateMcpServer,
   upgradeSkill,
 } from "@/api";
 import {
@@ -74,6 +75,8 @@ import {
 import { SkillPackageEditor } from "@/features/settings/skill-package-editor";
 import { AddSkillDialog } from "@/features/settings/skills-hub-extras";
 import type {
+  BuiltinMcpTool,
+  MCPServer,
   MCPServerCreate,
   McpRegistrySearchItem,
   PermissionDecision,
@@ -380,6 +383,7 @@ function InstallMcpDialog({
 }) {
   const [open, setOpen] = useState(false);
   const [serverKey, setServerKey] = useState("");
+  const [serverKeyError, setServerKeyError] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [source, setSource] = useState("");
   const [version, setVersion] = useState("1.0.0");
@@ -432,6 +436,7 @@ function InstallMcpDialog({
         .replace(/^-+|-+$/g, "")
         .slice(0, 80),
     );
+    setServerKeyError("");
     setDisplayName(shortName);
     setSource(item.repository_url || item.website_url || item.name);
     if (item.version) setVersion(item.version);
@@ -449,6 +454,14 @@ function InstallMcpDialog({
   };
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    const normalizedServerKey = serverKey.trim();
+    if (!/^[a-z0-9][a-z0-9._-]{0,79}$/.test(normalizedServerKey)) {
+      setServerKeyError(
+        "请输入 1–80 个字符：以小写字母或数字开头，仅使用小写字母、数字、点、下划线或连字符。",
+      );
+      return;
+    }
+    setServerKeyError("");
     const requestedTools = tools
       .split(",")
       .map((item) => item.trim())
@@ -458,7 +471,7 @@ function InstallMcpDialog({
       .map((item) => item.trim())
       .filter(Boolean);
     onInstall({
-      server_key: serverKey.trim(),
+      server_key: normalizedServerKey,
       display_name: displayName.trim(),
       source: source.trim(),
       version: version.trim(),
@@ -467,7 +480,7 @@ function InstallMcpDialog({
       ...(bearerToken ? { bearer_token: bearerToken } : {}),
       manifest: {
         schema_version: "1.0",
-        identity: serverKey.trim(),
+        identity: normalizedServerKey,
         requested_tools: requestedTools,
         permissions: requiredPermissions,
         requested_resources: [],
@@ -580,10 +593,32 @@ function InstallMcpDialog({
             <Label>
               Server Key
               <Input
-                onChange={(event) => setServerKey(event.currentTarget.value)}
+                aria-describedby={serverKeyError ? "mcp-server-key-error" : undefined}
+                aria-invalid={serverKeyError ? true : undefined}
+                autoCapitalize="none"
+                maxLength={80}
+                onChange={(event) => {
+                  setServerKey(event.currentTarget.value);
+                  if (serverKeyError) setServerKeyError("");
+                }}
+                pattern="[a-z0-9][a-z0-9._-]{0,79}"
+                placeholder="例如 box-mcp"
                 required
+                spellCheck={false}
                 value={serverKey}
               />
+              {serverKeyError ? (
+                <span
+                  className="text-xs font-normal text-destructive"
+                  id="mcp-server-key-error"
+                >
+                  {serverKeyError}
+                </span>
+              ) : (
+                <span className="text-xs font-normal text-muted-foreground">
+                  1–80 个字符，仅限小写字母、数字、点、下划线和连字符。
+                </span>
+              )}
             </Label>
             <Label>
               显示名称
@@ -767,7 +802,7 @@ function InvokeMcpDialog({
     <Dialog>
       <DialogTrigger asChild>
         <Button disabled={!tools.length} size="xs" variant="outline">
-          调用工具
+          手动测试
         </Button>
       </DialogTrigger>
       <DialogContent>
@@ -826,6 +861,233 @@ function InvokeMcpDialog({
   );
 }
 
+function EditMcpDialog({
+  busy,
+  server,
+  onSave,
+}: {
+  busy: boolean;
+  server: MCPServer;
+  onSave: (payload: Parameters<typeof updateMcpServer>[1]) => void;
+}) {
+  const manifest = server.manifest_json as Partial<{
+    schema_version: "1.0";
+    identity: string;
+    requested_tools: string[];
+    permissions: string[];
+    requested_resources: string[];
+    requested_prompts: string[];
+  }>;
+  const [open, setOpen] = useState(false);
+  const [displayName, setDisplayName] = useState(server.display_name);
+  const [source, setSource] = useState(server.source);
+  const [version, setVersion] = useState(server.version);
+  const [endpoint, setEndpoint] = useState(server.endpoint_url ?? "");
+  const [bearerToken, setBearerToken] = useState("");
+  const [clearBearerToken, setClearBearerToken] = useState(false);
+  const [tools, setTools] = useState(server.requested_tools.join(", "));
+  const [permissions, setPermissions] = useState(
+    server.required_permissions.join(", "),
+  );
+
+  return (
+    <Dialog onOpenChange={setOpen} open={open}>
+      <DialogTrigger asChild>
+        <Button size="xs" variant="outline">
+          <Pencil className="size-3" />
+          编辑
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>编辑 {server.display_name}</DialogTitle>
+          <DialogDescription>
+            修改连接或能力声明后请重新探测。Server Key 与传输类型不可修改。
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSave({
+              display_name: displayName.trim(),
+              source: source.trim(),
+              version: version.trim(),
+              endpoint_url: endpoint.trim() || null,
+              ...(bearerToken ? { bearer_token: bearerToken } : {}),
+              clear_bearer_token: clearBearerToken,
+              manifest: {
+                schema_version: "1.0",
+                identity: manifest.identity ?? server.server_key,
+                requested_tools: tools.split(",").map((item) => item.trim()).filter(Boolean),
+                permissions: permissions.split(",").map((item) => item.trim()).filter(Boolean),
+                requested_resources: manifest.requested_resources ?? [],
+                requested_prompts: manifest.requested_prompts ?? [],
+              },
+            });
+          }}
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Label>
+              显示名称
+              <Input required value={displayName} onChange={(event) => setDisplayName(event.currentTarget.value)} />
+            </Label>
+            <Label>
+              版本
+              <Input required value={version} onChange={(event) => setVersion(event.currentTarget.value)} />
+            </Label>
+          </div>
+          <Label>
+            来源
+            <Input required value={source} onChange={(event) => setSource(event.currentTarget.value)} />
+          </Label>
+          <Label>
+            Endpoint URL
+            <Input required={server.transport === "streamable_http"} value={endpoint} onChange={(event) => setEndpoint(event.currentTarget.value)} />
+          </Label>
+          <Label>
+            工具（逗号分隔）
+            <Input value={tools} onChange={(event) => setTools(event.currentTarget.value)} />
+          </Label>
+          <Label>
+            权限（逗号分隔）
+            <Input value={permissions} onChange={(event) => setPermissions(event.currentTarget.value)} />
+          </Label>
+          <Label>
+            新 Bearer Token（留空则保持不变）
+            <Input disabled={clearBearerToken} type="password" value={bearerToken} onChange={(event) => setBearerToken(event.currentTarget.value)} />
+          </Label>
+          {server.auth_configured ? (
+            <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Switch checked={clearBearerToken} onCheckedChange={setClearBearerToken} />
+              清除现有 Bearer Token
+            </label>
+          ) : null}
+          <DialogFooter>
+            <Button disabled={busy} type="submit">
+              {busy ? "保存中…" : "保存配置"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function BuiltinToolDetailDialog({
+  tool,
+  onOpenChange,
+}: {
+  tool: BuiltinMcpTool | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [locale, setLocale] = useState<"zh" | "en">("zh");
+  const [copied, setCopied] = useState(false);
+  const parametersText = tool
+    ? JSON.stringify(tool.parameters, null, 2)
+    : "";
+  const zhAvailable = Boolean(tool?.description_zh);
+  const description =
+    locale === "zh" && tool?.description_zh
+      ? tool.description_zh
+      : tool?.description ?? "";
+  const descriptionLabel =
+    locale === "zh"
+      ? zhAvailable
+        ? "中文"
+        : "中文（暂无译文，显示英文原文）"
+      : "English";
+
+  return (
+    <Dialog onOpenChange={onOpenChange} open={tool !== null}>
+      <DialogContent
+        aria-describedby={undefined}
+        className="max-h-[90vh] overflow-y-auto p-0 sm:max-w-2xl"
+      >
+        <DialogHeader>
+          <DialogTitle className="sr-only">
+            {tool ? `系统工具 · ${tool.tool}` : "系统工具详情"}
+          </DialogTitle>
+        </DialogHeader>
+        {tool ? (
+          <div className="space-y-4 p-5">
+            <div className="flex items-start gap-3">
+              <ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="font-mono text-sm font-semibold">{tool.tool}</p>
+                  <Badge variant="secondary">系统</Badge>
+                </div>
+                <p className="mt-1 font-mono text-xs text-muted-foreground">
+                  function: {tool.function_name}
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <Tabs
+                onValueChange={(value) => setLocale(value as "zh" | "en")}
+                value={locale}
+              >
+                <TabsList>
+                  <TabsTrigger value="zh">{descriptionLabel}</TabsTrigger>
+                  <TabsTrigger value="en">English</TabsTrigger>
+                </TabsList>
+                <TabsContent className="mt-3" value="zh">
+                  <p className="text-sm leading-relaxed">{description}</p>
+                </TabsContent>
+                <TabsContent className="mt-3" value="en">
+                  <p className="text-sm leading-relaxed">{tool.description}</p>
+                </TabsContent>
+              </Tabs>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-medium text-muted-foreground">
+                  parameters（协议内容）
+                </p>
+                <Button
+                  onClick={() => {
+                    void navigator.clipboard
+                      .writeText(parametersText)
+                      .then(() => {
+                        setCopied(true);
+                        toast.success("已复制 parameters JSON");
+                        window.setTimeout(() => setCopied(false), 1500);
+                      })
+                      .catch(() => toast.error("复制失败"));
+                  }}
+                  size="xs"
+                  variant="ghost"
+                >
+                  {copied ? "已复制" : "复制"}
+                </Button>
+              </div>
+              <pre className="mt-2 max-h-72 overflow-auto rounded-md bg-muted/60 p-3 font-mono text-xs leading-relaxed">
+                {parametersText}
+              </pre>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium text-muted-foreground">权限</p>
+              {tool.permissions.length ? (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {tool.permissions.map((permission) => (
+                    <Badge key={permission} variant="outline">{permission}</Badge>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-1 text-xs text-muted-foreground">无需额外权限</p>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function ToolsPage({
   embedded = false,
   focus = "all",
@@ -841,22 +1103,16 @@ export function ToolsPage({
     queryKey: ["mcp-servers"],
     queryFn: listMcpServers,
   });
+  const builtinTools = useQuery({
+    queryKey: ["builtin-mcp-tools"],
+    queryFn: listBuiltinMcpTools,
+    enabled: showMcp,
+  });
   const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
-  const grants = useQuery({
-    queryKey: ["extension-grants"],
-    queryFn: listExtensionGrants,
-  });
-  const invocations = useQuery({
-    queryKey: ["extension-invocations"],
-    queryFn: listExtensionInvocations,
-  });
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
     void queryClient.invalidateQueries({ queryKey: ["skills"] });
-    void queryClient.invalidateQueries({ queryKey: ["extension-grants"] });
-    void queryClient.invalidateQueries({
-      queryKey: ["extension-invocations"],
-    });
+    void queryClient.invalidateQueries({ queryKey: ["builtin-mcp-tools"] });
   };
   const installMcp = useMutation({
     mutationFn: registerMcpServer,
@@ -876,6 +1132,9 @@ export function ToolsPage({
   });
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
   const [skillSearch, setSkillSearch] = useState("");
+  const [viewingBuiltinTool, setViewingBuiltinTool] = useState<BuiltinMcpTool | null>(
+    null,
+  );
   const [deleteTarget, setDeleteTarget] = useState<Skill | null>(null);
   const [deleteRequest, setDeleteRequest] =
     useState<SkillDeleteRequest | null>(null);
@@ -950,6 +1209,20 @@ export function ToolsPage({
           ? "能力快照已更新，需要重新授权"
           : "能力快照已核验",
       );
+      refresh();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const updateMcpMutation = useMutation({
+    mutationFn: ({
+      serverId,
+      payload,
+    }: {
+      serverId: string;
+      payload: Parameters<typeof updateMcpServer>[1];
+    }) => updateMcpServer(serverId, payload),
+    onSuccess: () => {
+      toast.success("MCP 配置已保存，请重新探测能力");
       refresh();
     },
     onError: (error) => toast.error(error.message),
@@ -1030,7 +1303,7 @@ export function ToolsPage({
     },
     onError: (error) => toast.error(error.message),
   });
-  const queries = [servers, skills, grants, invocations];
+  const queries = [servers, skills, ...(showMcp ? [builtinTools] : [])];
   if (queries.some((query) => query.isPending))
     return embedded ? (
       <LoadingState />
@@ -1150,11 +1423,57 @@ export function ToolsPage({
         </div>
       )}
       {showMcp ? (
+      <>
       <Surface className="overflow-hidden">
         <div className="border-b p-5">
           <SectionHeading
-            description={`${servers.data?.length ?? 0} 个服务`}
-            title="MCP 服务"
+            description={`${builtinTools.data?.length ?? 0} 个第一方工具 · 随系统提供，只读`}
+            title="系统自带 MCP"
+          />
+        </div>
+        {builtinTools.data?.length ? (
+          <div className="grid gap-px bg-border sm:grid-cols-2 lg:grid-cols-3">
+            {builtinTools.data.map((tool) => (
+              <button
+                className="group bg-background p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                key={tool.tool}
+                onClick={() => setViewingBuiltinTool(tool)}
+                type="button"
+              >
+                <div className="flex items-start gap-3">
+                  <ShieldCheck className="mt-0.5 size-4 shrink-0 text-primary" />
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate font-mono text-sm font-semibold">{tool.tool}</p>
+                      <Badge variant="secondary">系统</Badge>
+                    </div>
+                    <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                      {tool.description_zh ?? tool.description}
+                    </p>
+                    {tool.permissions.length ? (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {tool.permissions.map((permission) => (
+                          <Badge key={permission} variant="outline">{permission}</Badge>
+                        ))}
+                      </div>
+                    ) : null}
+                    <p className="mt-2 text-[11px] text-muted-foreground/70 opacity-0 transition-opacity group-hover:opacity-100">
+                      点击查看协议内容 →
+                    </p>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="py-10 text-center text-sm text-muted-foreground">暂无系统自带 MCP 工具</p>
+        )}
+      </Surface>
+      <Surface className="overflow-hidden">
+        <div className="border-b p-5">
+          <SectionHeading
+            description={`${servers.data?.length ?? 0} 个用户配置`}
+            title="用户配置的 MCP"
           />
         </div>
         {servers.data?.length ? (
@@ -1192,32 +1511,8 @@ export function ToolsPage({
                       variant="outline"
                     >
                       <RefreshCcw className="size-3" />
-                      刷新能力
+                      探测
                     </Button>
-                    {(["allow_once", "always", "deny"] as const).map(
-                      (decision) => (
-                        <Button
-                          disabled={decide.isPending}
-                          key={decision}
-                          onClick={() =>
-                            decide.mutate({
-                              targetType: "mcp",
-                              targetId: server.id,
-                              decision,
-                              permissions: server.required_permissions,
-                            })
-                          }
-                          size="xs"
-                          variant={decision === "deny" ? "ghost" : "outline"}
-                        >
-                          {decision === "allow_once"
-                            ? "允许一次"
-                            : decision === "always"
-                              ? "总是允许"
-                              : "拒绝"}
-                        </Button>
-                      ),
-                    )}
                     <InvokeMcpDialog
                       busy={invokeMcp.isPending}
                       onInvoke={(tool, argumentsJson) =>
@@ -1230,19 +1525,33 @@ export function ToolsPage({
                       serverName={server.display_name}
                       tools={server.requested_tools}
                     />
-                    <Button
-                      disabled={revoke.isPending}
-                      onClick={() =>
-                        revoke.mutate({
-                          targetType: "mcp",
-                          targetId: server.id,
-                        })
+                    <EditMcpDialog
+                      busy={updateMcpMutation.isPending}
+                      onSave={(payload) =>
+                        updateMcpMutation.mutate({ serverId: server.id, payload })
                       }
-                      size="xs"
-                      variant="ghost"
-                    >
-                      撤销
-                    </Button>
+                      server={server}
+                    />
+                    <label className="flex cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">
+                      <Switch
+                        aria-label={`启用或禁用 ${server.display_name}`}
+                        checked={server.enabled}
+                        disabled={decide.isPending || revoke.isPending}
+                        onCheckedChange={(checked) => {
+                          if (checked) {
+                            decide.mutate({
+                              targetType: "mcp",
+                              targetId: server.id,
+                              decision: "always",
+                              permissions: server.required_permissions,
+                            });
+                          } else {
+                            revoke.mutate({ targetType: "mcp", targetId: server.id });
+                          }
+                        }}
+                      />
+                      {server.enabled ? "已启用" : "已停用"}
+                    </label>
                     <Button
                       className="text-destructive hover:text-destructive"
                       disabled={deleteMcpMutation.isPending}
@@ -1268,10 +1577,11 @@ export function ToolsPage({
           </div>
         ) : (
           <p className="py-12 text-center text-sm text-muted-foreground">
-            尚未注册 MCP 服务
+            尚未配置用户 MCP 服务
           </p>
         )}
       </Surface>
+      </>
       ) : null}
       {showSkills ? (
       <Surface className="overflow-hidden">
@@ -1491,61 +1801,12 @@ export function ToolsPage({
             );
           })()
         : null}
-      {focus === "all" || focus === "mcp" ? (
-      <div className="grid gap-5 lg:grid-cols-2">
-        <Surface className="p-5">
-          <SectionHeading title="权限决定" />
-          <div className="mt-4 space-y-2">
-            {grants.data?.slice(0, 8).map((grant) => (
-              <div
-                className="flex items-center gap-3 rounded-lg border p-3 text-xs"
-                key={grant.id}
-              >
-                <ShieldCheck className="size-4 text-primary" />
-                <span className="min-w-0 flex-1 truncate">
-                  {grant.subject_type}:{grant.subject_id}
-                </span>
-                <StatePill status={grant.decision} />
-              </div>
-            ))}
-            {!grants.data?.length ? (
-              <p className="py-8 text-center text-sm text-muted-foreground">
-                尚无权限决定
-              </p>
-            ) : null}
-          </div>
-        </Surface>
-        <Surface className="p-5">
-          <SectionHeading title="最近调用" />
-          <div className="mt-4 space-y-2">
-            {invocations.data?.slice(0, 8).map((invocation) => (
-              <details className="rounded-lg border p-3" key={invocation.id}>
-                <summary className="flex cursor-pointer items-center gap-3 text-xs">
-                  <span className="min-w-0 flex-1 truncate font-mono">
-                    {invocation.tool_name}
-                  </span>
-                  <StatePill status={invocation.status} />
-                </summary>
-                <pre className="mt-3 max-h-48 overflow-auto rounded bg-muted p-3 text-[10px]">
-                  {JSON.stringify(
-                    invocation.error_message
-                      ? { error: invocation.error_message }
-                      : invocation.result_json,
-                    null,
-                    2,
-                  )}
-                </pre>
-              </details>
-            ))}
-            {!invocations.data?.length ? (
-              <p className="py-8 text-center text-sm text-muted-foreground">
-                尚无真实调用记录
-              </p>
-            ) : null}
-          </div>
-        </Surface>
-      </div>
-      ) : null}
+      <BuiltinToolDetailDialog
+        onOpenChange={(open) => {
+          if (!open) setViewingBuiltinTool(null);
+        }}
+        tool={viewingBuiltinTool}
+      />
     </>
   );
   if (embedded) return <div className="space-y-5">{body}</div>;

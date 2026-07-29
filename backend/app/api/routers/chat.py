@@ -762,6 +762,11 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
             quote,
             input_tokens=int((usage or {}).get("input_tokens") or 0),
             output_tokens=int((usage or {}).get("output_tokens") or 0),
+            cached_input_tokens=int((usage or {}).get("cached_input_tokens") or 0),
+            cache_creation_input_tokens=int(
+                (usage or {}).get("cache_creation_input_tokens") or 0
+            ),
+            reasoning_tokens=int((usage or {}).get("reasoning_tokens") or 0),
             attempt=1,
             latency_ms=latency_ms,
             usage_reported=bool(usage),

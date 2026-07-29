@@ -1220,6 +1220,7 @@ class ChatService:
             "input_tokens": 0,
             "output_tokens": 0,
             "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
             "reasoning_tokens": 0,
         }
         for index, part in enumerate(media_parts, start=1):
@@ -1288,6 +1289,7 @@ class ChatService:
                     input_tokens=int(usage.get("input_tokens") or 0),
                     output_tokens=int(usage.get("output_tokens") or 0),
                     cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                     reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                     attempt=1,
                     latency_ms=latency_ms,
@@ -1564,7 +1566,6 @@ class ChatService:
         input_tokens = max(
             2_000,
             int(getattr(self.model_provider, "context_window_tokens", 32_000))
-            - int(getattr(self.model_provider, "max_output_tokens", 2_000))
             - 2_048,
         )
         return min(24_000, max(2_400, int(input_tokens * 4 * 0.35)))
@@ -1573,7 +1574,6 @@ class ChatService:
         return max(
             2_000,
             int(getattr(self.model_provider, "context_window_tokens", 256_000))
-            - int(getattr(self.model_provider, "max_output_tokens", 4_096))
             - 2_048,
         )
 
@@ -1655,12 +1655,17 @@ class ChatService:
             and value.get("workspace_recall_enabled", True)
         )
 
-    @staticmethod
-    def _context_compaction_ratio(agent_mode: bool) -> float:
-        # Agent sessions reserve most of the physical window for future tool
-        # calls and tool results. Fast/thinking sessions retain the established
-        # high-water mark.
-        return 1 / 3 if agent_mode else 0.8
+    def _context_compaction_ratio(self, agent_mode: bool) -> float:
+        capabilities = getattr(self.model_provider, "capabilities", {})
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        default = 1 / 3 if agent_mode else 0.8
+        key = "agent_compaction_ratio" if agent_mode else "chat_compaction_ratio"
+        try:
+            ratio = float(capabilities.get(key, default))
+        except (TypeError, ValueError):
+            ratio = default
+        return min(1.0, max(0.1, ratio))
 
     def _preflight_model_call(
         self,
@@ -3013,12 +3018,9 @@ class ChatService:
         ):
             return self._document_selection_preview
         selection_locator = dict(selection.locator)
-        selection_locator.update(
-            {
-                "chunk_id": selection.chunk_id,
-                "document_revision_id": selection.document_revision_id,
-            }
-        )
+        if selection.chunk_id is not None:
+            selection_locator["chunk_id"] = selection.chunk_id
+        selection_locator["document_revision_id"] = selection.document_revision_id
         preview = DocumentLearningService(
             self.db,
             self.workspace_id,
@@ -3032,7 +3034,7 @@ class ChatService:
                 locator=selection_locator,
                 selected_text=selection.selected_text,
                 selected_text_hash=selection.selected_text_hash,
-                max_results=1,
+                max_results=8,
             )
         )
         self._document_selection_preview_key = selection_key
@@ -3204,6 +3206,7 @@ class ChatService:
 
             lines: list[str] = []
             remaining = self._document_context_char_budget()
+            selection_hit_verified = False
             for preview, is_selection_scope in previews:
                 for hit in preview.hits:
                     if remaining <= 0:
@@ -3211,8 +3214,11 @@ class ChatService:
                     selected_hit = bool(
                         is_selection_scope
                         and document_selection is not None
+                        and document_selection.chunk_id is not None
                         and hit.chunk_id == document_selection.chunk_id
                     )
+                    if selected_hit:
+                        selection_hit_verified = True
                     content = hit.quote[:remaining]
                     context_kind = "用户明确选区" if selected_hit else "文件摘录"
                     lines.append(
@@ -3238,6 +3244,11 @@ class ChatService:
                             "retrieval_trace_id": preview.trace_id,
                             "retrieval_scope": preview.scope,
                             "selection_verified": selected_hit,
+                            "selection_status": (
+                                "verified" if selected_hit
+                                else "none" if document_selection is None
+                                else "unverified_degraded"
+                            ),
                         }
                     )
                     persisted_hit = self.db.scalar(
@@ -3249,6 +3260,45 @@ class ChatService:
                     )
                     if persisted_hit is not None:
                         persisted_hit.used_in_context = True
+            # When the selection did not verify (stale index, cross-chunk, or
+            # no chunk_id), still surface the user's selected_text as an
+            # explicit unverified hint so the model can attend to what the user
+            # pointed at while answering from the whole file.
+            if (
+                document_selection is not None
+                and not selection_hit_verified
+                and remaining > 0
+            ):
+                selected_file = self.files.require(
+                    document_selection.file_id, "selected document"
+                )
+                hint_text = document_selection.selected_text[:remaining]
+                lines.append(
+                    "- 用户明确选区（可能未校验）：文件名 "
+                    f"{selected_file.original_name}，file_id={document_selection.file_id}：\n"
+                    f"{hint_text}"
+                )
+                remaining -= len(hint_text)
+                self.document_source_results.append(
+                    {
+                        "title": f"{selected_file.original_name} · 用户明确选区（可能未校验）",
+                        "url": (
+                            f"/w/{self.workspace_id}/documents/{document_selection.file_id}"
+                        ),
+                        "file_id": document_selection.file_id,
+                        "filename": selected_file.original_name,
+                        "document_revision_id": document_selection.document_revision_id,
+                        "chunk_id": document_selection.chunk_id,
+                        "locator": dict(document_selection.locator),
+                        "locator_json": {},
+                        "content_hash": "",
+                        "quote": document_selection.selected_text,
+                        "retrieval_trace_id": None,
+                        "retrieval_scope": "selection",
+                        "selection_verified": False,
+                        "selection_status": "unverified_degraded",
+                    }
+                )
             if lines:
                 sections.append(
                     "本次授权文件原文（回答应优先依据以下内容）：\n" + "\n".join(lines)
@@ -3681,6 +3731,7 @@ class ChatService:
                     input_tokens=int(attempt_usage.get("input_tokens") or 0),
                     output_tokens=int(attempt_usage.get("output_tokens") or 0),
                     cached_input_tokens=int(attempt_usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(attempt_usage.get("cache_creation_input_tokens") or 0),
                     reasoning_tokens=int(attempt_usage.get("reasoning_tokens") or 0),
                     attempt=attempt_no,
                     latency_ms=int((time.monotonic() - started_at) * 1000),
@@ -3718,6 +3769,9 @@ class ChatService:
             "search_route": getattr(self.model_provider, "search_route", "disabled"),
             "input_tokens": int(usage.get("input_tokens") or 0),
             "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+            "cache_creation_input_tokens": int(
+                usage.get("cache_creation_input_tokens") or 0
+            ),
             "output_tokens": int(usage.get("output_tokens") or 0),
             "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
             "document_retrieval_trace_id": document_trace_id,
@@ -3935,6 +3989,7 @@ class ChatService:
                 input_tokens=int(usage.get("input_tokens") or 0),
                 output_tokens=int(usage.get("output_tokens") or 0),
                 cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
@@ -4199,6 +4254,7 @@ class ChatService:
                 input_tokens=int(usage.get("input_tokens") or 0),
                 output_tokens=int(usage.get("output_tokens") or 0),
                 cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
@@ -4420,6 +4476,7 @@ class ChatService:
                 input_tokens=int(usage.get("input_tokens") or 0),
                 output_tokens=int(usage.get("output_tokens") or 0),
                 cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
@@ -4934,6 +4991,7 @@ class ChatService:
                 input_tokens=int(usage.get("input_tokens") or 0),
                 output_tokens=int(usage.get("output_tokens") or 0),
                 cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
@@ -6618,6 +6676,7 @@ class ChatService:
                     input_tokens=int(usage.get("input_tokens") or 0),
                     output_tokens=int(usage.get("output_tokens") or 0),
                     cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                     reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                     attempt=active_attempt_no,
                     latency_ms=int((time.monotonic() - active_started_at) * 1000),
@@ -7359,6 +7418,10 @@ class ChatService:
                                     provider_trace.get("cached_input_tokens") or 0
                                 )
                                 + int(usage.get("cached_input_tokens") or 0),
+                                "cache_creation_input_tokens": int(
+                                    provider_trace.get("cache_creation_input_tokens") or 0
+                                )
+                                + int(usage.get("cache_creation_input_tokens") or 0),
                                 "output_tokens": int(
                                     provider_trace.get("output_tokens") or 0
                                 )
@@ -7429,6 +7492,10 @@ class ChatService:
                                 provider_trace.get("cached_input_tokens") or 0
                             )
                             + int(usage.get("cached_input_tokens") or 0),
+                            "cache_creation_input_tokens": int(
+                                provider_trace.get("cache_creation_input_tokens") or 0
+                            )
+                            + int(usage.get("cache_creation_input_tokens") or 0),
                             "output_tokens": int(
                                 provider_trace.get("output_tokens") or 0
                             )
@@ -8407,25 +8474,28 @@ class ChatService:
             )
             for file in attached_files
         ]
-        selection_source = next(
-            (
-                source
-                for source in self.document_source_results
-                if source.get("selection_verified") is True
-                and payload.document_selection is not None
-                and source.get("file_id") == payload.document_selection.file_id
-                and source.get("chunk_id") == payload.document_selection.chunk_id
-            ),
-            None,
-        )
+        selection_source: dict | None = None
+        selection_status = "none"
+        if payload.document_selection is not None:
+            requested_chunk_id = payload.document_selection.chunk_id
+            for source in self.document_source_results:
+                if source.get("file_id") != payload.document_selection.file_id:
+                    continue
+                if (
+                    requested_chunk_id is not None
+                    and source.get("chunk_id") != requested_chunk_id
+                ):
+                    continue
+                status = source.get("selection_status")
+                if status == "verified":
+                    selection_source = source
+                    selection_status = "verified"
+                    break
+                if selection_source is None and status == "unverified_degraded":
+                    selection_source = source
+                    selection_status = "unverified_degraded"
         document_selection_snapshot: dict | None = None
         if payload.document_selection is not None:
-            if selection_source is None:
-                raise AppError(
-                    409,
-                    "document_selection_not_verified",
-                    "The document selection was not included in authorized context",
-                )
             selected_file = self.files.require(
                 payload.document_selection.file_id,
                 "selected document",
@@ -8443,14 +8513,30 @@ class ChatService:
                     ),
                     "chunk_id": payload.document_selection.chunk_id,
                     "locator": dict(payload.document_selection.locator),
-                    "locator_label": str(selection_source.get("locator") or ""),
+                    "locator_label": str(
+                        selection_source.get("locator")
+                        if selection_source is not None
+                        else payload.document_selection.locator.get("locator_label")
+                        or ""
+                    ),
                     "selected_text_hash": (
                         payload.document_selection.selected_text_hash.lower()
                     ),
-                    "verified_locator": selection_source.get("locator"),
-                    "verified_locator_json": selection_source.get("locator_json"),
-                    "retrieval_trace_id": selection_source.get(
-                        "retrieval_trace_id"
+                    "selection_status": selection_status,
+                    "verified_locator": (
+                        selection_source.get("locator")
+                        if selection_source is not None and selection_status == "verified"
+                        else None
+                    ),
+                    "verified_locator_json": (
+                        selection_source.get("locator_json")
+                        if selection_source is not None and selection_status == "verified"
+                        else None
+                    ),
+                    "retrieval_trace_id": (
+                        selection_source.get("retrieval_trace_id")
+                        if selection_source is not None
+                        else None
                     ),
                 },
             )
@@ -9480,7 +9566,12 @@ class ChatService:
                             quote,
                             input_tokens=int(usage.get("input_tokens") or 0),
                             output_tokens=int(usage.get("output_tokens") or 0),
-                            cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                            cached_input_tokens=int(
+                                usage.get("cached_input_tokens") or 0
+                            ),
+                            cache_creation_input_tokens=int(
+                                usage.get("cache_creation_input_tokens") or 0
+                            ),
                             reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                             attempt=attempt_no,
                             latency_ms=int(
@@ -9497,6 +9588,10 @@ class ChatService:
                                 provider_trace.get("cached_input_tokens") or 0
                             )
                             + int(usage.get("cached_input_tokens") or 0),
+                            "cache_creation_input_tokens": int(
+                                provider_trace.get("cache_creation_input_tokens") or 0
+                            )
+                            + int(usage.get("cache_creation_input_tokens") or 0),
                             "output_tokens": int(provider_trace.get("output_tokens") or 0)
                             + int(usage.get("output_tokens") or 0),
                             "reasoning_tokens": int(
@@ -10089,6 +10184,7 @@ class ChatService:
                             input_tokens=int(timeout_usage.get("input_tokens") or 0),
                             output_tokens=int(timeout_usage.get("output_tokens") or 0),
                             cached_input_tokens=int(timeout_usage.get("cached_input_tokens") or 0),
+                            cache_creation_input_tokens=int(timeout_usage.get("cache_creation_input_tokens") or 0),
                             reasoning_tokens=int(timeout_usage.get("reasoning_tokens") or 0),
                             attempt=attempt_no,
                             latency_ms=int(

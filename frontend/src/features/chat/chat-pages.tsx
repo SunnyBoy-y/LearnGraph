@@ -2283,9 +2283,24 @@ export function ChatCanvasPage() {
     () => readChatDefaultResponseMode(settings.data),
     [settings.data],
   );
+  // Gate persist on a *state* marker, not a ref. When sessionId flips, this
+  // render still holds the previous session's responseMode; a ref flipped at
+  // the end of the restore effect would let the same-cycle persist effect write
+  // that stale mode into the new session's localStorage (e.g. 极速 onto a draft
+  // that should inherit the workspace default 智能体).
+  const [composerPrefsReadySessionId, setComposerPrefsReadySessionId] =
+    useState<string | null>(null);
 
   // Restore per-session composer prefs whenever the active session changes.
   useEffect(() => {
+    // Workspace default only matters when this session has no local prefs yet.
+    // Existing sessions can restore immediately; drafts wait for settings so we
+    // do not seed/persist the product fallback before the admin default arrives.
+    const hasStoredPrefs =
+      Boolean(sessionId) &&
+      sessionId !== "new" &&
+      hasSessionComposerPrefs(sessionId);
+    if (!hasStoredPrefs && settings.isPending) return;
     if (!sessionId || sessionId === "new") {
       const defaults = defaultComposerPrefsForResponseMode(
         workspaceDefaultResponseMode,
@@ -2294,9 +2309,11 @@ export function ChatCanvasPage() {
       setThinkingMode(defaults.thinkingMode);
       setSearchRoute(defaults.searchRoute);
       setGenerationMode(defaults.generationMode);
+      // Batched with the mode updates above; persist sees them on the next render.
+      setComposerPrefsReadySessionId(sessionId || "new");
       return;
     }
-    const stored = hasSessionComposerPrefs(sessionId)
+    const stored = hasStoredPrefs
       ? getSessionComposerPrefs(sessionId)
       : defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode);
     const session = sessions.data?.find((item) => item.id === sessionId);
@@ -2331,7 +2348,13 @@ export function ChatCanvasPage() {
     setSelectedModelId(merged.modelId ?? "");
     setSelectedImageProviderId(merged.imageProviderId ?? "");
     setSelectedImageModelId(merged.imageModelId ?? "");
-  }, [sessionId, sessions.data, workspaceDefaultResponseMode]);
+    setComposerPrefsReadySessionId(sessionId);
+  }, [
+    sessionId,
+    sessions.data,
+    settings.isPending,
+    workspaceDefaultResponseMode,
+  ]);
 
   // Clear the in-flight resume latch when switching sessions so a new session
   // can auto-resume independently. Do NOT abort background streams — concurrent
@@ -2346,6 +2369,8 @@ export function ChatCanvasPage() {
   // Persist composer mode changes against the active session id.
   useEffect(() => {
     if (!sessionId || sessionId === "new") return;
+    // Wait until the restore effect's mode updates have committed for this id.
+    if (composerPrefsReadySessionId !== sessionId) return;
     setSessionComposerPrefs(sessionId, {
       responseMode,
       thinkingMode,
@@ -2357,6 +2382,7 @@ export function ChatCanvasPage() {
       imageModelId: selectedImageModelId || undefined,
     });
   }, [
+    composerPrefsReadySessionId,
     generationMode,
     responseMode,
     searchRoute,
@@ -3532,6 +3558,14 @@ export function ChatCanvasPage() {
   );
   const rememberCreatedSession = useCallback(
     (session: Session) => {
+      // Seed workspace default response mode before the chat route hydrates so a
+      // brand-new draft never inherits a previous session's "极速" via localStorage.
+      if (!hasSessionComposerPrefs(session.id)) {
+        setSessionComposerPrefs(
+          session.id,
+          defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
+        );
+      }
       queryClient.setQueryData<Session[]>(["sessions"], (current) => [
         session,
         ...(current ?? []).filter((item) => item.id !== session.id),
@@ -3540,7 +3574,7 @@ export function ChatCanvasPage() {
         new CustomEvent("learngraph:session-created", { detail: { session } }),
       );
     },
-    [queryClient],
+    [queryClient, workspaceDefaultResponseMode],
   );
   useEffect(() => {
     if (sessionId !== "new" || goalMode) return;
@@ -3553,6 +3587,12 @@ export function ChatCanvasPage() {
         queryClient.getQueryData<Session[]>(["sessions"]) ?? []
       ).find((session) => session.id === existingDraftId);
       if (cached) {
+        // Blank drafts re-opened via /chat/new adopt the current workspace
+        // default, clearing any mode stamped by a previous session switch race.
+        setSessionComposerPrefs(
+          existingDraftId,
+          defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
+        );
         preserveDraftForSessionRef.current = existingDraftId;
         navigate(`/w/${workspaceId}/chat/${existingDraftId}`, {
           replace: true,
@@ -3567,6 +3607,10 @@ export function ChatCanvasPage() {
         .then((session) => {
           if (cancelled) return;
           if (session) {
+            setSessionComposerPrefs(
+              session.id,
+              defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
+            );
             preserveDraftForSessionRef.current = session.id;
             navigate(`/w/${workspaceId}/chat/${session.id}`, {
               replace: true,
@@ -3635,6 +3679,7 @@ export function ChatCanvasPage() {
     queryClient,
     rememberCreatedSession,
     sessionId,
+    workspaceDefaultResponseMode,
     workspaceId,
   ]);
   const completeGoalSetup = useCallback(
@@ -4768,6 +4813,7 @@ export function ChatCanvasPage() {
         if (
           requestedGenerationMode === "text" &&
           responseMode === "agentic" &&
+          !goalMode &&
           !(await ensureAgentSandboxReady())
         ) {
           return;
@@ -4860,13 +4906,9 @@ export function ChatCanvasPage() {
             toast.message("请补充要生成的画面描述。");
           return;
         }
-        if (
-          goalMode &&
-          responseMode !== "agentic" &&
-          searchRoute === "disabled"
-        ) {
-          if (goalFlow.stage !== "capture") {
-            toast.message("请先完成上方的目标审核，或开启联网搜索继续调研。");
+        if (goalMode && requestedGenerationMode === "text") {
+          if (goalFlow.stage !== "capture" || goalFlow.busy) {
+            toast.message("请先完成上方的目标审核。");
             return;
           }
           if (fileIds.length) {
@@ -4903,7 +4945,6 @@ export function ChatCanvasPage() {
       goalMode,
       pendingFiles,
       responseMode,
-      searchRoute,
       selectedModelSupportsImageInput,
       selectedImageModel,
       send,
@@ -5938,10 +5979,7 @@ export function ChatCanvasPage() {
     staleTime: 15_000,
   });
   const goalComposerLocked = Boolean(
-    goalMode &&
-      responseMode !== "agentic" &&
-      searchRoute === "disabled" &&
-      goalFlow.stage !== "capture",
+    goalMode && goalFlow.stage !== "capture",
   );
   const goalStageLabel =
     goalFlow.stage === "capture"

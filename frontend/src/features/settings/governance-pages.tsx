@@ -147,6 +147,7 @@ const MODEL_PROVIDER_TYPES = new Set([
   "codex_chatgpt",
   "deepseek_chat",
   "anthropic_messages",
+  "ollama",
 ]);
 
 const migrationTargetOptions: Record<

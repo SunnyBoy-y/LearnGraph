@@ -280,6 +280,10 @@ LearnGraph/
 
 LearnGraph 基于 [MIT License](./LICENSE) 开源。
 
+## 🙏 鸣谢
+
+感谢 [CC-Switch](https://github.com/farion1231/cc-switch) 的开源贡献。本项目的 GitHub Copilot 接入，以及 Baidu Qianfan Coding Plan、火山 Agentplan、OpenRouter、Longcat、Kimi、Kimi For Coding、ModelScope 和 Xiaomi MiMo 快捷配置参考了 CC-Switch 的供应商预设与适配工作。
+
 ## 友情链接
 学AI上L站！
 https://linux.do/

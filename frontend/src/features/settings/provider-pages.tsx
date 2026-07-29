@@ -40,8 +40,10 @@ import {
   listProviderCatalog,
   listProviders,
   pollCodexDeviceLogin,
+  pollCopilotDeviceLogin,
   probeProvider,
   rotateProviderSecret,
+  startCopilotDeviceLogin,
   startCodexDeviceLogin,
   syncProviderModelCatalogDefaults,
   updateProviderModelCapabilities,
@@ -103,6 +105,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Slider } from "@/components/ui/slider";
 import {
   isAnthropicProvider,
   isDeepSeekProvider,
@@ -123,6 +126,7 @@ import {
 } from "./balance-query";
 import type {
   CodexDeviceLoginStart,
+  CopilotDeviceLoginStart,
   Provider,
   ProviderBalance,
   ProviderModelCapabilities,
@@ -1714,6 +1718,8 @@ function parseExtraHeadersInput(input: string): Record<string, string> {
   return headers;
 }
 
+type QuickProtocol = "openai" | "anthropic";
+
 type QuickProvider = {
   id: string;
   name: string;
@@ -1721,8 +1727,12 @@ type QuickProvider = {
   baseUrl: string;
   brandId: string;
   iconUrl: string;
-  protocol: "openai" | "anthropic";
+  protocol: QuickProtocol;
   keyUrl?: string;
+  defaultModel?: string;
+  endpoints?: Partial<Record<QuickProtocol, string>>;
+  models?: Partial<Record<QuickProtocol, string>>;
+  capabilityOverrides?: Record<string, unknown>;
 };
 
 const QUICK_PROVIDERS: QuickProvider[] = [
@@ -1730,9 +1740,18 @@ const QUICK_PROVIDERS: QuickProvider[] = [
   { id: "deepseek", name: "DeepSeek", description: "OpenAI 兼容接口", baseUrl: "https://api.deepseek.com", brandId: "deepseek", iconUrl: "https://cdn.simpleicons.org/deepseek/4D6BFE", protocol: "openai", keyUrl: "https://platform.deepseek.com/api_keys" },
   { id: "qwen", name: "通义千问", description: "阿里云 Model Studio", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", brandId: "qwen", iconUrl: "https://cdn.simpleicons.org/qwen", protocol: "openai", keyUrl: "https://bailian.console.aliyun.com/?tab=model#/api-key" },
   { id: "gemini", name: "Google Gemini", description: "OpenAI 兼容接口", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", brandId: "gemini", iconUrl: "https://cdn.simpleicons.org/googlegemini", protocol: "openai", keyUrl: "https://aistudio.google.com/apikey" },
-  { id: "mimo", name: "Xiaomi MiMo", description: "OpenAI 兼容接口", baseUrl: "https://api.xiaomimimo.com/v1", brandId: "mimo", iconUrl: "https://cdn.simpleicons.org/xiaomi", protocol: "openai", keyUrl: "https://platform.xiaomimimo.com/#/console/api-keys" },
+  { id: "mimo", name: "Xiaomi MiMo", description: "OpenAI / Anthropic 兼容", baseUrl: "https://api.xiaomimimo.com/v1", brandId: "mimo", iconUrl: "https://cdn.simpleicons.org/xiaomi", protocol: "openai", keyUrl: "https://platform.xiaomimimo.com/#/console/api-keys", defaultModel: "mimo-v2.5-pro", endpoints: { openai: "https://api.xiaomimimo.com/v1", anthropic: "https://api.xiaomimimo.com/anthropic" }, models: { openai: "mimo-v2.5-pro", anthropic: "mimo-v2.5-pro" } },
   { id: "anthropic", name: "Anthropic", description: "Claude Messages API", baseUrl: "https://api.anthropic.com", brandId: "anthropic", iconUrl: "https://cdn.simpleicons.org/anthropic", protocol: "anthropic", keyUrl: "https://platform.claude.com/settings/keys" },
+  { id: "github_copilot", name: "GitHub Copilot", description: "GitHub 账号设备授权", baseUrl: "https://api.githubcopilot.com", brandId: "github", iconUrl: "https://cdn.simpleicons.org/github", protocol: "openai", defaultModel: "claude-sonnet-5", models: { openai: "claude-sonnet-5" } },
+  { id: "qianfan", name: "Baidu Qianfan Coding Plan", description: "Anthropic 兼容接口", baseUrl: "https://qianfan.baidubce.com/anthropic/coding", brandId: "qianfan", iconUrl: "https://cdn.simpleicons.org/baidu", protocol: "anthropic", keyUrl: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application", defaultModel: "qianfan-code-latest", models: { anthropic: "qianfan-code-latest" } },
+  { id: "volc_agentplan", name: "火山 Agentplan", description: "Anthropic 兼容接口", baseUrl: "https://ark.cn-beijing.volces.com/api/coding", brandId: "volc_agentplan", iconUrl: "https://cdn.simpleicons.org/bytedance", protocol: "anthropic", keyUrl: "https://www.volcengine.com/activity/codingplan", defaultModel: "ark-code-latest", models: { anthropic: "ark-code-latest" } },
+  { id: "openrouter", name: "OpenRouter", description: "Anthropic 兼容接口", baseUrl: "https://openrouter.ai/api", brandId: "openrouter", iconUrl: "https://cdn.simpleicons.org/openrouter", protocol: "anthropic", keyUrl: "https://openrouter.ai/keys", defaultModel: "anthropic/claude-sonnet-5", models: { anthropic: "anthropic/claude-sonnet-5" } },
+  { id: "longcat", name: "Longcat", description: "Anthropic 兼容接口", baseUrl: "https://api.longcat.chat/anthropic", brandId: "longcat", iconUrl: "https://cdn.simpleicons.org/cat", protocol: "anthropic", keyUrl: "https://longcat.chat/platform/api_keys", defaultModel: "LongCat-2.0", models: { anthropic: "LongCat-2.0" }, capabilityOverrides: { max_output_tokens: 131072 } },
+  { id: "kimi", name: "Kimi", description: "Anthropic 兼容接口", baseUrl: "https://api.moonshot.cn/anthropic", brandId: "kimi", iconUrl: "https://cdn.simpleicons.org/moonshot", protocol: "anthropic", keyUrl: "https://platform.kimi.com/console/api-keys", defaultModel: "kimi-k2.7-code", models: { anthropic: "kimi-k2.7-code" } },
+  { id: "kimi_coding", name: "Kimi For Coding", description: "Anthropic 兼容 Coding Plan", baseUrl: "https://api.kimi.com/coding/", brandId: "kimi_coding", iconUrl: "https://cdn.simpleicons.org/moonshot", protocol: "anthropic", keyUrl: "https://www.kimi.com/code/", defaultModel: "kimi-for-coding", models: { anthropic: "kimi-for-coding" }, capabilityOverrides: { context_window_tokens: 262144, context_limit_tokens: 262144 } },
+  { id: "modelscope", name: "ModelScope", description: "Anthropic 兼容接口", baseUrl: "https://api-inference.modelscope.cn", brandId: "modelscope", iconUrl: "https://cdn.simpleicons.org/modelscope", protocol: "anthropic", keyUrl: "https://modelscope.cn/my/myaccesstoken", defaultModel: "ZhipuAI/GLM-5.1", models: { anthropic: "ZhipuAI/GLM-5.1" } },
   { id: "minimax", name: "MiniMax", description: "OpenAI 兼容接口", baseUrl: "https://api.minimaxi.com/v1", brandId: "minimax", iconUrl: "https://cdn.simpleicons.org/minimax", protocol: "openai", keyUrl: "https://platform.minimaxi.com/user-center/basic-information/interface-key" },
+  { id: "ollama", name: "Ollama", description: "本地模型（无需 API Key）", baseUrl: "http://127.0.0.1:11434/v1", brandId: "ollama", iconUrl: "https://cdn.simpleicons.org/ollama", protocol: "openai" },
 ];
 
 type RoleQuickProvider = {
@@ -1744,6 +1763,11 @@ type RoleQuickProvider = {
   iconUrl?: string;
   keyUrl?: string;
   providerType: string;
+  protocol?: QuickProtocol;
+  defaultModel?: string;
+  endpoints?: QuickProvider["endpoints"];
+  models?: QuickProvider["models"];
+  capabilityOverrides?: Record<string, unknown>;
   isCustom?: boolean;
 };
 
@@ -1757,12 +1781,15 @@ function roleQuickProviders(
     );
   const compatibleChat = findType("openai_compatible_chat");
   const qwenChat = findType("qwen");
+  const ollamaChat = findType("ollama");
+  const copilotChat = findType("github_copilot");
   const openAi = findType("openai_responses");
   const openAiVision = findType("openai_responses_vision");
   const compatibleVision = findType("openai_compatible_vision");
   const openAiImages = findType("openai_images");
   const compatibleTranscription = findType("openai_compatible_transcription");
   const compatibleEmbedding = findType("openai_compatible_embedding");
+  const ollamaEmbedding = findType("ollama_embedding");
   const qwenDeepResearch = findType("qwen_deep_research");
 
   if (role === "model") {
@@ -1772,17 +1799,26 @@ function roleQuickProviders(
           ? openAi?.provider_type
           : preset.id === "qwen"
             ? (qwenChat ?? compatibleChat)?.provider_type
-            : preset.protocol === "anthropic"
-              ? findType("anthropic_messages")?.provider_type
-              : compatibleChat?.provider_type;
+            : preset.id === "ollama"
+              ? ollamaChat?.provider_type
+              : preset.id === "github_copilot"
+                ? copilotChat?.provider_type
+                : preset.protocol === "anthropic"
+                ? findType("anthropic_messages")?.provider_type
+                : compatibleChat?.provider_type;
       return providerType ? [{ ...preset, providerType }] : [];
     });
   }
 
   if (role === "vision") {
     return QUICK_PROVIDERS.flatMap((preset) => {
-      // DeepSeek does not currently expose a supported vision preset.
-      if (preset.id === "deepseek" || preset.protocol === "anthropic") return [];
+      // DeepSeek and GitHub Copilot do not currently expose supported vision presets.
+      if (
+        preset.id === "deepseek" ||
+        preset.id === "github_copilot" ||
+        preset.protocol === "anthropic"
+      )
+        return [];
       const providerType =
         preset.id === "openai"
           ? openAiVision?.provider_type
@@ -1849,6 +1885,19 @@ function roleQuickProviders(
         keyUrl: "https://platform.openai.com/api-keys",
         providerType: compatibleEmbedding.provider_type,
       },
+      ...(ollamaEmbedding
+        ? [
+            {
+              id: "ollama",
+              name: "Ollama",
+              description: "本地 Embeddings（nomic-embed-text 等）",
+              baseUrl: "http://127.0.0.1:11434/v1",
+              brandId: "ollama",
+              iconUrl: "https://cdn.simpleicons.org/ollama",
+              providerType: ollamaEmbedding.provider_type,
+            },
+          ]
+        : []),
     ];
   }
 
@@ -2000,6 +2049,104 @@ function CodexDeviceLoginPanel({
   );
 }
 
+function CopilotDeviceLoginPanel({
+  hasCredential,
+  onAuthorized,
+}: {
+  hasCredential: boolean;
+  onAuthorized: (secret: string) => void;
+}) {
+  const [login, setLogin] = useState<CopilotDeviceLoginStart | null>(null);
+  const [error, setError] = useState<string>();
+  const [waiting, setWaiting] = useState(false);
+
+  const start = useMutation({
+    mutationFn: startCopilotDeviceLogin,
+    onSuccess: (data) => {
+      setError(undefined);
+      setLogin(data);
+      setWaiting(true);
+      window.open(data.verification_url, "_blank", "noopener,noreferrer");
+    },
+    onError: (mutationError: Error) => setError(mutationError.message),
+  });
+
+  useEffect(() => {
+    if (!login || !waiting) return;
+    let cancelled = false;
+    const deadline = Date.now() + 15 * 60 * 1000;
+    const timer = window.setInterval(async () => {
+      if (cancelled) return;
+      if (Date.now() > deadline) {
+        setWaiting(false);
+        setError("GitHub 设备码已过期，请重新授权。");
+        return;
+      }
+      try {
+        const result = await pollCopilotDeviceLogin({
+          device_auth_id: login.device_auth_id,
+          user_code: login.user_code,
+        });
+        if (cancelled || result.status !== "authorized" || !result.api_key) return;
+        setWaiting(false);
+        onAuthorized(result.api_key);
+        toast.success("GitHub Copilot 授权成功，凭据已填入");
+      } catch (pollError) {
+        if (cancelled) return;
+        setWaiting(false);
+        setError(
+          pollError instanceof Error
+            ? pollError.message
+            : "GitHub Copilot 授权轮询失败",
+        );
+      }
+    }, Math.max(1, login.interval_seconds) * 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [login, waiting, onAuthorized]);
+
+  return (
+    <div className="space-y-2 rounded-xl border bg-muted/25 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-medium">使用 GitHub 账号授权 Copilot</p>
+        <Button
+          disabled={start.isPending || waiting}
+          onClick={() => start.mutate()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          <LockKeyhole className="size-3" />
+          {waiting ? "等待授权…" : hasCredential ? "重新授权" : "开始授权"}
+        </Button>
+      </div>
+      {login ? (
+        <div className="space-y-1.5">
+          <p className="text-xs text-muted-foreground">
+            在 GitHub 页面输入配对码；完成后本页会自动收取凭据。
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="rounded-md border bg-background px-2 py-1 font-mono text-sm tracking-widest">
+              {login.user_code}
+            </code>
+            <a
+              className="text-xs text-primary underline-offset-4 hover:underline"
+              href={login.verification_url}
+              rel="noreferrer"
+              target="_blank"
+            >
+              重新打开授权页 ↗
+            </a>
+          </div>
+        </div>
+      ) : null}
+      {error ? <p className="text-xs text-destructive" role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
 function QuickBrandIcon({ iconUrl, name }: { iconUrl?: string; name: string }) {
   const [failedUrl, setFailedUrl] = useState<string>();
   if (!iconUrl || failedUrl === iconUrl) {
@@ -2015,17 +2162,32 @@ function QuickBrandIcon({ iconUrl, name }: { iconUrl?: string; name: string }) {
   );
 }
 
+function normalizedQuickEndpoint(value: string) {
+  return value.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function isKnownQuickEndpoint(preset: RoleQuickProvider, value: string) {
+  const normalized = normalizedQuickEndpoint(value);
+  return Boolean(normalized) && Object.values(
+    preset.endpoints ?? { [preset.protocol ?? "openai"]: preset.baseUrl },
+  ).some(
+    (endpoint) =>
+      Boolean(endpoint) && normalizedQuickEndpoint(endpoint ?? "") === normalized,
+  );
+}
+
 function providerQuickBrand(provider: Provider): QuickProvider | undefined {
   const brandId = String(provider.capabilities.brand_id ?? "").toLowerCase();
-  const baseUrl = provider.base_url?.toLowerCase() ?? "";
+  const baseUrl = normalizedQuickEndpoint(provider.base_url ?? "");
   const name = provider.display_name.toLowerCase();
   return QUICK_PROVIDERS.find(
     (item) =>
       item.brandId === brandId ||
-      (item.id !== "openai" &&
-        (baseUrl.includes(item.id === "mimo" ? "xiaomimimo" : item.id) ||
-          name.includes(item.id) ||
-          name.includes(item.name.toLowerCase()))),
+      Object.values(item.endpoints ?? { [item.protocol]: item.baseUrl }).some(
+        (endpoint) => normalizedQuickEndpoint(endpoint ?? "") === baseUrl,
+      ) ||
+      name.includes(item.id) ||
+      name.includes(item.name.toLowerCase()),
   );
 }
 
@@ -2161,8 +2323,16 @@ function ProviderDialog({
     const next = catalog.find((item) => item.provider_type === nextType);
     if (!next) return;
     if (role === "model" && next.role === "model") {
-      // Transport is an endpoint-level choice. Keep the selected vendor/model
-      // preset, URL and display name when switching wire protocols.
+      const nextProtocol: QuickProtocol =
+        next.provider_type === "anthropic_messages" ? "anthropic" : "openai";
+      if (
+        activeQuickProvider &&
+        activeQuickProvider.id !== "github_copilot" &&
+        isKnownQuickEndpoint(activeQuickProvider, baseUrl)
+      ) {
+        const nextEndpoint = activeQuickProvider.endpoints?.[nextProtocol];
+        if (nextEndpoint) setBaseUrl(nextEndpoint);
+      }
       setType(next.provider_type);
       return;
     }
@@ -2231,6 +2401,9 @@ function ProviderDialog({
       : undefined;
   const apiKeyUrl = quickKeyUrl ?? specKeyUrl;
   const isCodex = type === "codex_chatgpt";
+  const isCopilot = type === "github_copilot";
+  const activeProtocol: QuickProtocol =
+    type === "anthropic_messages" ? "anthropic" : "openai";
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -2252,6 +2425,14 @@ function ProviderDialog({
     if (activeQuickProvider?.brandId) {
       capabilities.brand_id = activeQuickProvider.brandId;
     }
+    if (role === "model" && activeQuickProvider?.defaultModel) {
+      const defaultModel =
+        activeQuickProvider.models?.[activeProtocol] ??
+        activeQuickProvider.defaultModel;
+      capabilities.default_model = defaultModel;
+      capabilities.discovered_model_ids = [defaultModel];
+      Object.assign(capabilities, activeQuickProvider.capabilityOverrides);
+    }
     // Seed recommended default model IDs for 通义千问 embedding / ASR presets
     // so the row can be enabled without a second manual step.
     if (role === "transcription" && activeQuickProvider?.brandId === "qwen") {
@@ -2267,6 +2448,10 @@ function ProviderDialog({
     if (role === "embedding" && activeQuickProvider?.brandId === "openai") {
       capabilities.default_model = "text-embedding-3-small";
       capabilities.default_embedding_model_id = "text-embedding-3-small";
+    }
+    if (role === "embedding" && activeQuickProvider?.brandId === "ollama") {
+      capabilities.default_model = "nomic-embed-text";
+      capabilities.default_embedding_model_id = "nomic-embed-text";
     }
     if (selected.provider_type === "qwen_deep_research") {
       capabilities.default_model = "qwen-deep-research";
@@ -2480,10 +2665,14 @@ function ProviderDialog({
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2">
                 <Label htmlFor="provider-key">
-                  {isCodex ? "Codex 凭据" : "API Key"}
+                  {isCodex
+                    ? "Codex 凭据"
+                    : isCopilot
+                      ? "GitHub OAuth 凭据"
+                      : "API Key"}
                   {selected?.requires_secret ? "（启用必填）" : "（可选）"}
                 </Label>
-                {apiKeyUrl && !isCodex ? (
+                {apiKeyUrl && !isCodex && !isCopilot ? (
                   <a
                     className="text-xs text-primary underline-offset-4 hover:underline"
                     href={apiKeyUrl}
@@ -2505,6 +2694,15 @@ function ProviderDialog({
                   }}
                 />
               ) : null}
+              {isCopilot ? (
+                <CopilotDeviceLoginPanel
+                  hasCredential={Boolean(key)}
+                  onAuthorized={(secret) => {
+                    setKey(secret);
+                    setName("GitHub Copilot");
+                  }}
+                />
+              ) : null}
               <Input
                 autoComplete="off"
                 id="provider-key"
@@ -2512,7 +2710,9 @@ function ProviderDialog({
                 placeholder={
                   isCodex
                     ? "直登后自动填入，也可粘贴 ~/.codex/auth.json 内容"
-                    : "仅提交一次"
+                    : isCopilot
+                      ? "授权后自动填入 GitHub OAuth token"
+                      : "仅提交一次"
                 }
                 type="password"
                 value={key}
@@ -2521,6 +2721,11 @@ function ProviderDialog({
                 <p className="text-xs leading-5 text-muted-foreground">
                   凭据为 ChatGPT OAuth 令牌，按订阅计划计费而非 API 额度。令牌会自动续期，
                   续期后的新令牌将加密保存。
+                </p>
+              ) : null}
+              {isCopilot ? (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  长期 GitHub OAuth token 会进入 Secret Store；调用时后端仅在内存中换取短期 Copilot token。
                 </p>
               ) : null}
             </div>
@@ -2588,6 +2793,39 @@ function normalizeDefaultSearchRoute(route: SearchRoute | undefined): SearchRout
   return route === "local" ? "external" : "auto";
 }
 
+function normalizeReasoningParameter(value: unknown): ReasoningParameter {
+  if (
+    value === "reasoning_effort" ||
+    value === "reasoning.effort" ||
+    value === "enable_thinking" ||
+    value === "thinking_budget" ||
+    value === "thinking"
+  ) {
+    return value;
+  }
+  return "reasoning_effort";
+}
+
+function normalizeLoadedCapabilities(
+  capabilities: ProviderModelCapabilities,
+): ProviderModelCapabilities {
+  const chatRatio = Number(capabilities.chat_compaction_ratio);
+  const agentRatio = Number(capabilities.agent_compaction_ratio);
+  return {
+    ...capabilities,
+    reasoning_parameter: normalizeReasoningParameter(capabilities.reasoning_parameter),
+    default_search_route: normalizeDefaultSearchRoute(capabilities.default_search_route),
+    chat_compaction_ratio:
+      Number.isFinite(chatRatio) && chatRatio >= 0.1 && chatRatio <= 1
+        ? chatRatio
+        : 0.8,
+    agent_compaction_ratio:
+      Number.isFinite(agentRatio) && agentRatio >= 0.1 && agentRatio <= 1
+        ? agentRatio
+        : 1 / 3,
+  };
+}
+
 function emptyModelCapabilities(): ProviderModelCapabilities {
   return {
     // New LLM connections default to reasoning on; unsupported models can be
@@ -2610,6 +2848,8 @@ function emptyModelCapabilities(): ProviderModelCapabilities {
     context_window_tokens: 256_000,
     context_limit_tokens: 256_000,
     max_output_tokens: 4_096,
+    chat_compaction_ratio: 0.8,
+    agent_compaction_ratio: 1 / 3,
   };
 }
 
@@ -2715,15 +2955,12 @@ function ModelCapabilitiesDialog({
         ? defaults
         : {}),
     } as ProviderModelCapabilities;
-    setCapabilities({
-      ...merged,
-      default_search_route: normalizeDefaultSearchRoute(merged.default_search_route),
-    });
+    setCapabilities(normalizeLoadedCapabilities(merged));
   }, [editScope, provider.capabilities.model_defaults]);
 
   const save = useMutation({
     mutationFn: (payload: ProviderModelCapabilities) =>
-      updateProviderModelGroupCapabilities(provider.id, payload),
+      updateProviderModelGroupCapabilities(provider.id, capabilitiesForSave(payload)),
     onSuccess: (snapshot) => {
       onSaved(snapshot);
       toast.success("全局模板已保存");
@@ -2813,6 +3050,11 @@ function ModelCapabilitiesDialog({
       !capabilities.hosted_web_search
     ) {
       toast.error("模型原生联网需要先确认托管网页搜索能力");
+      return;
+    }
+    const contextError = capabilityContextError(capabilities);
+    if (contextError) {
+      toast.error(contextError);
       return;
     }
     // Model switches are part of this supplier configuration and commit with
@@ -3055,6 +3297,113 @@ function ModelCapabilitiesDialog({
   );
 }
 
+function clampCompactionPercent(value: number): number {
+  if (!Number.isFinite(value)) return 10;
+  return Math.min(100, Math.max(10, Math.round(value)));
+}
+
+function CompactionRatioField({
+  description,
+  label,
+  onChange,
+  ratio,
+  tokenLimit,
+}: {
+  description: string;
+  label: string;
+  onChange: (ratio: number) => void;
+  ratio: number;
+  tokenLimit: number;
+}) {
+  const percent = clampCompactionPercent(ratio * 100);
+  const updatePercent = (value: number) => onChange(clampCompactionPercent(value) / 100);
+
+  return (
+    <div className="space-y-3 rounded-lg border p-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <Label>{label}</Label>
+          <p className="mt-1 text-xs text-muted-foreground">{description}</p>
+        </div>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          约 {Math.round(tokenLimit * (percent / 100)).toLocaleString()} tokens
+        </span>
+      </div>
+      <Slider
+        aria-label={`${label}百分比`}
+        max={100}
+        min={10}
+        onValueChange={([value]) => updatePercent(value ?? percent)}
+        step={1}
+        value={[percent]}
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        {[30, 80].map((quickValue) => (
+          <Button
+            className="h-8 px-3 text-xs"
+            key={quickValue}
+            onClick={() => updatePercent(quickValue)}
+            type="button"
+            variant={percent === quickValue ? "default" : "outline"}
+          >
+            {quickValue}%
+          </Button>
+        ))}
+        <div className="relative ml-auto w-24">
+          <Input
+            aria-label={`${label}比例`}
+            className="h-8 pr-7 text-right tabular-nums"
+            max={100}
+            min={10}
+            onChange={(event) => updatePercent(Number(event.target.value))}
+            step={1}
+            type="number"
+            value={percent}
+          />
+          <span className="pointer-events-none absolute inset-y-0 right-2 flex items-center text-xs text-muted-foreground">
+            %
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function capabilityContextError(capabilities: ProviderModelCapabilities): string | null {
+  if (
+    !Number.isFinite(capabilities.context_window_tokens) ||
+    capabilities.context_window_tokens < 8_000 ||
+    capabilities.context_window_tokens > 10_000_000
+  ) {
+    return "最大输入上下文必须在 8,000 到 10,000,000 tokens 之间";
+  }
+  if (
+    !Number.isFinite(capabilities.max_output_tokens) ||
+    capabilities.max_output_tokens < 1 ||
+    capabilities.max_output_tokens > 1_000_000
+  ) {
+    return "最大输出上下文必须在 1 到 1,000,000 tokens 之间";
+  }
+  if (
+    capabilities.chat_compaction_ratio < 0.1 ||
+    capabilities.chat_compaction_ratio > 1 ||
+    capabilities.agent_compaction_ratio < 0.1 ||
+    capabilities.agent_compaction_ratio > 1
+  ) {
+    return "压缩门槛必须在 10% 到 100% 之间";
+  }
+  return null;
+}
+
+function capabilitiesForSave(
+  capabilities: ProviderModelCapabilities,
+): ProviderModelCapabilities {
+  return {
+    ...capabilities,
+    context_limit_tokens: capabilities.context_window_tokens,
+  };
+}
+
 function CapabilityFormFields({
   capabilities,
   idPrefix,
@@ -3087,53 +3436,37 @@ function CapabilityFormFields({
 
   return (
     <>
-      <section className="space-y-3 rounded-xl border p-4">
+      <section className="space-y-4 rounded-xl border p-4">
         <div>
-          <p className="text-sm font-semibold">上下文上限</p>
+          <p className="text-sm font-semibold">上下文限制</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            未知模型默认 256K。智能体达到有效上限的 1/3 时压缩；极速/思考达到 80% 时压缩。
+            分别设置模型可接收的最大输入和最大输出，并按模式控制历史消息压缩门槛。
           </p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-3">
+        <div className="grid gap-4 sm:grid-cols-2">
           <Label>
-            模型总上下文
+            最大输入上下文
             <Input
               className="mt-2"
-              min={8000}
-              onChange={(event) =>
+              max={10_000_000}
+              min={8_000}
+              onChange={(event) => {
+                const value = Number(event.target.value);
                 setCapabilities((current) => ({
                   ...current,
-                  context_window_tokens: Number(event.target.value),
-                  context_limit_tokens: Math.min(
-                    current.context_limit_tokens,
-                    Number(event.target.value),
-                  ),
-                }))
-              }
+                  context_window_tokens: value,
+                  context_limit_tokens: value,
+                }));
+              }}
               type="number"
               value={capabilities.context_window_tokens}
             />
           </Label>
           <Label>
-            使用上限
+            最大输出上下文
             <Input
               className="mt-2"
-              max={capabilities.context_window_tokens}
-              min={8000}
-              onChange={(event) =>
-                setCapabilities((current) => ({
-                  ...current,
-                  context_limit_tokens: Number(event.target.value),
-                }))
-              }
-              type="number"
-              value={capabilities.context_limit_tokens}
-            />
-          </Label>
-          <Label>
-            最大输出
-            <Input
-              className="mt-2"
+              max={1_000_000}
               min={1}
               onChange={(event) =>
                 setCapabilities((current) => ({
@@ -3145,6 +3478,32 @@ function CapabilityFormFields({
               value={capabilities.max_output_tokens}
             />
           </Label>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <CompactionRatioField
+            description="极速与思考模式共用此门槛。"
+            label="对话模式压缩门槛"
+            onChange={(ratio) =>
+              setCapabilities((current) => ({
+                ...current,
+                chat_compaction_ratio: ratio,
+              }))
+            }
+            ratio={capabilities.chat_compaction_ratio}
+            tokenLimit={capabilities.context_window_tokens}
+          />
+          <CompactionRatioField
+            description="为后续工具调用和结果预留空间。"
+            label="智能体模式压缩门槛"
+            onChange={(ratio) =>
+              setCapabilities((current) => ({
+                ...current,
+                agent_compaction_ratio: ratio,
+              }))
+            }
+            ratio={capabilities.agent_compaction_ratio}
+            tokenLimit={capabilities.context_window_tokens}
+          />
         </div>
       </section>
       <section className="space-y-3 rounded-xl border p-4">
@@ -3462,12 +3821,13 @@ function ModelOverrideDialog({
   useEffect(() => {
     if (capabilitiesQuery.data) {
       const next = capabilitiesQuery.data.capabilities;
-      setCapabilities({
-        ...emptyModelCapabilities(),
-        ...next,
-        image_input_mode: next.image_input_mode ?? "auto",
-        default_search_route: normalizeDefaultSearchRoute(next.default_search_route),
-      });
+      setCapabilities(
+        normalizeLoadedCapabilities({
+          ...emptyModelCapabilities(),
+          ...next,
+          image_input_mode: next.image_input_mode ?? "auto",
+        }),
+      );
     } else if (snapshotMissing) {
       setCapabilities(emptyModelCapabilities());
     }
@@ -3480,22 +3840,25 @@ function ModelOverrideDialog({
         ...emptyModelCapabilities(),
         ...view.capabilities,
       } as ProviderModelCapabilities;
-      setCapabilities({
-        ...merged,
-        // The catalog may report internal source labels the save schema
-        // rejects; a user-triggered fill is always an official-catalog value.
-        capability_source: "official_catalog",
-        default_search_route: normalizeDefaultSearchRoute(
-          merged.default_search_route,
-        ),
-      });
+      setCapabilities(
+        normalizeLoadedCapabilities({
+          ...merged,
+          // The catalog may report internal source labels the save schema
+          // rejects; a user-triggered fill is always an official-catalog value.
+          capability_source: "official_catalog",
+        }),
+      );
       toast.success("已填入官方默认参数，确认后请保存");
     },
     onError: (error) => toast.error(error.message),
   });
   const save = useMutation({
     mutationFn: () =>
-      updateProviderModelCapabilities(provider.id, modelId, capabilities),
+      updateProviderModelCapabilities(
+        provider.id,
+        modelId,
+        capabilitiesForSave(capabilities),
+      ),
     onSuccess: (snapshot) => {
       queryClient.setQueryData(
         ["provider-model-capabilities", provider.id, modelId],
@@ -3525,6 +3888,11 @@ function ModelOverrideDialog({
       !capabilities.hosted_web_search
     ) {
       toast.error("模型原生联网需要先确认托管网页搜索能力");
+      return;
+    }
+    const contextError = capabilityContextError(capabilities);
+    if (contextError) {
+      toast.error(contextError);
       return;
     }
     save.mutate();

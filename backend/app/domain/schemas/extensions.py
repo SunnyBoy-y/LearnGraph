@@ -93,7 +93,7 @@ class MCPServerManifest(BaseModel):
 class MCPServerCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    server_key: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{1,79}$")
+    server_key: str = Field(min_length=1, max_length=80)
     display_name: str = Field(min_length=1, max_length=160)
     source: str = Field(min_length=1, max_length=255)
     version: str = Field(min_length=1, max_length=80)
@@ -106,6 +106,24 @@ class MCPServerCreateRequest(BaseModel):
     max_input_bytes: int = Field(default=64 * 1024, ge=1_024, le=256 * 1024)
     max_result_bytes: int = Field(default=256 * 1024, ge=1_024, le=1024 * 1024)
     max_concurrency: int = Field(default=1, ge=1, le=8)
+
+    @field_validator("server_key")
+    @classmethod
+    def validate_server_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Server Key is required")
+        if not all(
+            character.isascii()
+            and (character.islower() or character.isdigit() or character in "._-")
+            for character in normalized
+        ):
+            raise ValueError(
+                "Server Key must start with a lowercase letter or digit and contain only lowercase letters, digits, '.', '_' and '-'"
+            )
+        if not (normalized[0].islower() or normalized[0].isdigit()):
+            raise ValueError("Server Key must start with a lowercase letter or digit")
+        return normalized
 
     @model_validator(mode="after")
     def validate_transport_fields(self) -> "MCPServerCreateRequest":
@@ -641,6 +659,7 @@ class BuiltinToolView(BaseModel):
     tool: str
     function_name: str
     description: str
+    description_zh: str | None = None
     parameters: dict[str, Any]
     permissions: list[str]
 

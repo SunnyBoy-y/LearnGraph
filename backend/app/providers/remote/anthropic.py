@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from app.providers.model_options import ModelCallOptions
-from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
+from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent, ProviderUsage
 from app.providers.remote.openai import (
     ProviderHTTPError,
     ProviderResponseError,
@@ -101,6 +101,56 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
         if root.endswith("/v1"):
             return f"{root}/messages"
         return f"{root}/v1/messages"
+
+    @staticmethod
+    def _normalized_usage(usage: dict[str, Any]) -> ProviderUsage:
+        uncached = max(0, int(usage.get("input_tokens") or 0))
+        cached = max(0, int(usage.get("cache_read_input_tokens") or 0))
+        created = max(0, int(usage.get("cache_creation_input_tokens") or 0))
+        return {
+            "input_tokens": uncached + cached + created,
+            "cached_input_tokens": cached,
+            "cache_creation_input_tokens": created,
+            "output_tokens": max(0, int(usage.get("output_tokens") or 0)),
+            "reasoning_tokens": 0,
+        }
+
+    def _merge_usage(self, usage: dict[str, Any]) -> None:
+        current_cached = int(self.last_usage.get("cached_input_tokens") or 0)
+        current_created = int(self.last_usage.get("cache_creation_input_tokens") or 0)
+        current_uncached = max(
+            0,
+            int(self.last_usage.get("input_tokens") or 0)
+            - current_cached
+            - current_created,
+        )
+        uncached = (
+            max(0, int(usage.get("input_tokens") or 0))
+            if "input_tokens" in usage
+            else current_uncached
+        )
+        cached = (
+            max(0, int(usage.get("cache_read_input_tokens") or 0))
+            if "cache_read_input_tokens" in usage
+            else current_cached
+        )
+        created = (
+            max(0, int(usage.get("cache_creation_input_tokens") or 0))
+            if "cache_creation_input_tokens" in usage
+            else current_created
+        )
+        output = (
+            max(0, int(usage.get("output_tokens") or 0))
+            if "output_tokens" in usage
+            else int(self.last_usage.get("output_tokens") or 0)
+        )
+        self.last_usage = {
+            "input_tokens": uncached + cached + created,
+            "cached_input_tokens": cached,
+            "cache_creation_input_tokens": created,
+            "output_tokens": output,
+            "reasoning_tokens": 0,
+        }
 
     _MODEL_VERSION_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d+))?")
 
@@ -379,14 +429,7 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                         elif event_type == "message_delta":
                             usage = event.get("usage")
                             if isinstance(usage, dict):
-                                self.last_usage = {
-                                    "input_tokens": int(usage.get("input_tokens") or 0),
-                                    "cached_input_tokens": int(
-                                        usage.get("cache_read_input_tokens") or 0
-                                    ),
-                                    "output_tokens": int(usage.get("output_tokens") or 0),
-                                    "reasoning_tokens": 0,
-                                }
+                                self._merge_usage(usage)
                             delta = event.get("delta")
                             if isinstance(delta, dict) and delta.get("stop_reason"):
                                 # Defer completed until message_stop so tool aggregates settle.
@@ -396,14 +439,7 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                             if isinstance(message, dict):
                                 usage = message.get("usage")
                                 if isinstance(usage, dict):
-                                    self.last_usage = {
-                                        "input_tokens": int(usage.get("input_tokens") or 0),
-                                        "cached_input_tokens": int(
-                                            usage.get("cache_read_input_tokens") or 0
-                                        ),
-                                        "output_tokens": int(usage.get("output_tokens") or 0),
-                                        "reasoning_tokens": 0,
-                                    }
+                                    self._merge_usage(usage)
                         elif event_type == "message_stop":
                             completed = True
                             tool_calls = [
@@ -467,10 +503,5 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
             raise ProviderResponseError("Anthropic structured result must be an object")
         usage = data.get("usage")
         if isinstance(usage, dict):
-            self.last_usage = {
-                "input_tokens": int(usage.get("input_tokens") or 0),
-                "cached_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
-                "output_tokens": int(usage.get("output_tokens") or 0),
-                "reasoning_tokens": 0,
-            }
+            self._merge_usage(usage)
         return result

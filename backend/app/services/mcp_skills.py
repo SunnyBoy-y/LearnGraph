@@ -321,6 +321,7 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 },
                 "soft_limit_cny": {"type": "number", "minimum": 0},
                 "hard_limit_cny": {"type": "number", "minimum": 0},
+                "limit_currency": {"type": "string", "enum": ["CNY", "USD"]},
                 "enabled": {"type": "boolean"},
             },
             "required": ["name", "provider_id", "model_id", "feature", "period"],
@@ -341,6 +342,7 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "name": {"type": "string", "minLength": 1, "maxLength": 160},
                 "soft_limit_cny": {"type": ["number", "null"], "minimum": 0},
                 "hard_limit_cny": {"type": ["number", "null"], "minimum": 0},
+                "limit_currency": {"type": "string", "enum": ["CNY", "USD"]},
                 "enabled": {"type": "boolean"},
             },
             "required": ["policy_id", "name", "enabled"],
@@ -511,7 +513,7 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "name": {"type": "string", "minLength": 1, "maxLength": 160},
                 "endpoint_url": {"type": "string", "minLength": 8, "maxLength": 1000},
-                "server_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,79}$"},
+                "server_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"},
                 "requested_tools": {
                     "type": "array",
                     "maxItems": 40,
@@ -594,6 +596,39 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+}
+
+# View-only Chinese descriptions for the built-in tool catalog (D-082).
+# These translations power the "click to view protocol" UI and never reach the
+# runtime tool definitions or agent registry, which stay on the English specs
+# below so agent behavior is unchanged.
+BUILTIN_TOOL_DESCRIPTION_ZH: dict[str, str] = {
+    "builtin.review.list_due": "读取当前到期的 LearnGraph 复习节点。",
+    "builtin.graph.read": "读取已授权的目标图谱，并按标签或描述检索匹配的节点。",
+    "builtin.graph.update_candidate_node": "更新候选图谱修订中的一个节点。已发布的图谱不可变，必须通过经审核的提案修改。",
+    "builtin.roadmap.read": "按路线图 ID 或 Goal 的最新路线图读取已授权路线图。",
+    "builtin.roadmap.replan": "基于 Goal 当前的图谱与已验证的学习事实，创建新的可审核路线图草稿。不会直接发布路线图。",
+    "builtin.action.list": "读取已授权的已排程与未排程学习动作，用于日历规划。",
+    "builtin.action.create": "创建用户拥有的已排程学习动作；不会改动已发布路线图中的动作。",
+    "builtin.action.update": "更新已授权的学习动作或其截止时间。已发布路线图中的动作仅允许安全的向前推进状态转换。",
+    "builtin.learning.mastery.read": "读取有证据支撑的掌握度与复习状态。仅浏览或导入文件不会被计为掌握。",
+    "builtin.learning.evidence.record": "将可溯源的用户学习证据记录为待审核，并关联到既有文件、消息或正确答题。此操作不能直接授予掌握度或采纳证据。",
+    "builtin.usage.summary": "读取已持久化的 Token 与成本用量，保持美元与人民币数值各自独立。",
+    "builtin.usage.budget.create": "创建工作区 Token 成本预算策略；用量历史本身保持不可变。",
+    "builtin.usage.budget.update": "更新既有工作区 Token 成本预算策略；不能改写用量历史。",
+    "builtin.skills.announce_usage": "声明当前正在使用某个已安装的 Agent Skill 包。请在应用 skill 指令之前首先调用，以便用户在对话中看到触发了哪个 skill。",
+    "builtin.skills.list": "列出工作区已安装的全部 Skill，包含 key、类型、启用状态与来源。",
+    "builtin.skills.install": "从 GitHub 或 skills.sh 安装 Agent Skill —— 等价于 `npx skills add <source> --skill <name>` 的服务端实现。接受 owner/repo、github.com URL、skills.sh URL 或完整 `npx skills add …` 命令字符串。内容按固定 commit 拉取，不运行 npx 或 shell。安装后初始为未授权，需通过 lg_skill_set_enabled 或用户启用。",
+    "builtin.skills.create": "用你编写的 SKILL.md 内容创建新的 Agent Skill 包。包仅以工作区文件形式存储，脚本从不在宿主执行。新 skill 初始为未授权，启用后生效。",
+    "builtin.skills.read": "读取 Skill 包文件，含被禁用的非官方 Skill。省略 path 时列出包文件树。",
+    "builtin.skills.write_file": "在既有非官方 Skill 包内创建或覆盖单个文件（例如编辑 SKILL.md）。内容变更会使其授权失效。",
+    "builtin.skills.set_enabled": "启用（授予持久授权）或禁用（撤销）已安装的 Skill。启用会将 skill 注入后续 Agent 轮次；该操作会被审计。",
+    "builtin.skills.delete.request": "请求永久删除某个非官方工作区 Skill。此操作本身不会直接删除：用户必须在可信 UI 中完成硬编码的二次确认与密码校验。",
+    "builtin.mcp.list": "列出已登记的 MCP Server，包含传输方式、endpoint、启用状态与发现的工具。",
+    "builtin.mcp.register": "登记远程 Streamable HTTP MCP Server 并探测其能力。需要凭据的 Server 必须由用户在扩展中心配置——切勿通过此工具传递密钥。Server 初始为未授权，启用后生效。",
+    "builtin.mcp.update": "更新已登记 MCP Server 的显示名、endpoint、请求工具或执行限制。凭据无法通过此工具读取或提交。安全相关变更会撤销当前授权，直到重新启用。",
+    "builtin.mcp.set_enabled": "启用（持久授权 + Agent 自动调用）或禁用（撤销）已登记的 MCP Server。启用前会先刷新其能力快照。",
+    "builtin.mcp.delete": "永久删除已登记的 MCP Server 及其凭据、快照与授权记录。",
 }
 SKILL_MAX_INPUT_BYTES = 64 * 1024
 SKILL_MAX_RESULT_BYTES = 256 * 1024
@@ -740,6 +775,7 @@ class MCPAndSkillService:
                 "tool": tool,
                 "function_name": spec["function_name"],
                 "description": spec["description"],
+                "description_zh": BUILTIN_TOOL_DESCRIPTION_ZH.get(tool),
                 "parameters": spec["parameters"],
                 "permissions": BUILTIN_TOOL_PERMISSIONS[tool],
             }
@@ -3345,7 +3381,7 @@ class MCPAndSkillService:
                 slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")[:60]
                 server_key = (
                     slug
-                    if re.match(r"^[a-z0-9][a-z0-9._-]{1,79}$", slug)
+                    if re.match(r"^[a-z0-9][a-z0-9._-]{0,79}$", slug)
                     else f"mcp-{hashlib.sha256(endpoint.encode('utf-8')).hexdigest()[:10]}"
                 )
             try:
@@ -3801,6 +3837,7 @@ class MCPAndSkillService:
                     period=str(arguments["period"]),
                     soft_limit_cny=arguments.get("soft_limit_cny"),
                     hard_limit_cny=arguments.get("hard_limit_cny"),
+                    limit_currency=str(arguments.get("limit_currency", "CNY")),
                     enabled=bool(arguments.get("enabled", True)),
                 )
             else:
@@ -3809,6 +3846,7 @@ class MCPAndSkillService:
                     name=str(arguments["name"]),
                     soft_limit_cny=arguments.get("soft_limit_cny"),
                     hard_limit_cny=arguments.get("hard_limit_cny"),
+                    limit_currency=str(arguments.get("limit_currency", "CNY")),
                     enabled=bool(arguments["enabled"]),
                 )
             return BudgetPolicyView.model_validate(policy).model_dump(mode="json")

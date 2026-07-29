@@ -70,6 +70,23 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         key_management_url="https://platform.openai.com/api-keys",
     ),
     ProviderTypeSpec(
+        provider_type="github_copilot",
+        role="model",
+        label="GitHub Copilot",
+        description=(
+            "GitHub Copilot Chat-compatible models authenticated with GitHub Device OAuth."
+        ),
+        requires_base_url=True,
+        requires_secret=True,
+        supports_model_discovery=True,
+        default_base_url="https://api.githubcopilot.com",
+        probe_notice="探测会换取短期 Copilot token 并调用 GET /models，不会生成内容。",
+        brand_id="github",
+        brand_icon_url="https://cdn.simpleicons.org/github",
+        documentation_url="https://docs.github.com/en/copilot",
+        key_management_url="https://github.com/settings/apps/authorizations",
+    ),
+    ProviderTypeSpec(
         provider_type="openai_compatible_chat",
         role="model",
         label="OpenAI-compatible Chat",
@@ -214,6 +231,28 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         documentation_url="https://api-docs.deepseek.com/",
         key_management_url="https://platform.deepseek.com/api_keys",
         supports_account_balance=True,
+    ),
+    ProviderTypeSpec(
+        provider_type="ollama",
+        role="model",
+        label="Ollama（本地）",
+        description=(
+            "本地 Ollama 的 OpenAI 兼容 Chat 接口，支持模型发现、工具调用，"
+            "以及 thinking 模型的原生 think 参数（low/medium/high/max）。"
+            "默认无需 API Key；若启用了 OLLAMA_API_KEY 可在此填写。"
+        ),
+        requires_base_url=True,
+        requires_secret=False,
+        supports_model_discovery=True,
+        supports_probe=True,
+        default_base_url="http://127.0.0.1:11434/v1",
+        probe_notice=(
+            "探测会调用 Ollama GET /v1/models（失败时回退 /api/tags），不会生成内容。"
+            "请确认本机已启动 ollama serve，并已 pull 至少一个模型。"
+        ),
+        brand_id="ollama",
+        brand_icon_url="https://cdn.simpleicons.org/ollama",
+        documentation_url="https://docs.ollama.com/capabilities/openai-compatibility",
     ),
     ProviderTypeSpec(
         provider_type="anthropic_messages",
@@ -535,6 +574,27 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         default_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         brand_id="openai_compatible",
         documentation_url="https://platform.openai.com/docs/api-reference/embeddings",
+    ),
+    ProviderTypeSpec(
+        provider_type="ollama_embedding",
+        role="embedding",
+        label="Ollama Embedding（本地）",
+        description=(
+            "本地 Ollama 的 OpenAI 兼容 /v1/embeddings 接口，用于语义记忆召回。"
+            "常用模型如 nomic-embed-text、mxbai-embed-large、bge-m3。"
+            "默认无需 API Key。"
+        ),
+        requires_base_url=True,
+        requires_secret=False,
+        supports_model_discovery=True,
+        supports_probe=False,
+        default_base_url="http://127.0.0.1:11434/v1",
+        brand_id="ollama",
+        brand_icon_url="https://cdn.simpleicons.org/ollama",
+        documentation_url="https://docs.ollama.com/api/embed",
+        probe_notice=(
+            "模型列表通过 GET /v1/models（或 /api/tags）读取；请先 ollama pull 嵌入模型。"
+        ),
     ),
     ProviderTypeSpec(
         provider_type="mem0_platform",

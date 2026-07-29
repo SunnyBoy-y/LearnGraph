@@ -50,6 +50,7 @@ from app.providers.remote.openai import (
     normalize_openai_api_base_url,
 )
 from app.providers.remote.anthropic import AnthropicMessagesProvider, normalize_anthropic_api_base_url
+from app.providers.remote.copilot import GitHubCopilotChatProvider
 from app.providers.remote.codex import (
     CODEX_BASE_URL,
     CodexAuthError,
@@ -61,6 +62,13 @@ from app.providers.remote.codex_provider import CodexResponsesProvider
 from app.providers.remote.images import (
     OpenAIImagesProvider,
     UnavailableImageGenerationProvider,
+)
+from app.providers.remote.ollama import (
+    OllamaChatProvider,
+    OllamaEmbeddingProvider,
+    is_ollama_provider_type,
+    normalize_ollama_api_base_url,
+    resolve_ollama_api_key,
 )
 from app.providers.remote.research import (
     HTTPDeepResearchProvider,
@@ -244,7 +252,9 @@ def model_provider_for_workspace(
                 provider_id=provider.id,
                 model_id=resolved_model_id,
             )
-        if not api_key:
+        # Ollama is local by default and does not require a real secret; the
+        # adapter substitutes the conventional ``ollama`` bearer when empty.
+        if not api_key and not is_ollama_provider_type(provider.provider_type):
             return UnavailableModelProvider(
                 "The enabled model provider has no usable encrypted secret",
                 provider_id=provider.id,
@@ -256,8 +266,12 @@ def model_provider_for_workspace(
             effective_base_url = CODEX_BASE_URL
         elif provider.provider_type == "openai_responses":
             effective_base_url = normalize_openai_api_base_url(provider.base_url)
+        elif provider.provider_type == "github_copilot":
+            effective_base_url = "https://api.githubcopilot.com"
         elif provider.provider_type == "anthropic_messages":
             effective_base_url = normalize_anthropic_api_base_url(provider.base_url)
+        elif is_ollama_provider_type(provider.provider_type):
+            effective_base_url = normalize_ollama_api_base_url(provider.base_url)
         else:
             effective_base_url = provider.base_url
         extra_headers = _extra_headers_from_capabilities(capabilities)
@@ -268,13 +282,7 @@ def model_provider_for_workspace(
         context_window_tokens = int(
             effective_model_capabilities.get("context_window_tokens") or 256_000
         )
-        context_limit_tokens = min(
-            context_window_tokens,
-            int(
-                effective_model_capabilities.get("context_limit_tokens")
-                or context_window_tokens
-            ),
-        )
+        context_limit_tokens = context_window_tokens
         common = {
             "provider_id": provider.id,
             # Keep the persisted provider type unchanged for legacy workspaces,
@@ -353,8 +361,21 @@ def model_provider_for_workspace(
             return CodexResponsesProvider(**common, credentials=credentials)
         if provider.provider_type == "openai_responses":
             return OpenAIResponsesProvider(**common)
+        if provider.provider_type == "github_copilot":
+            return GitHubCopilotChatProvider(
+                **common,
+                structured_output_mode="json_schema",
+                supports_structured_chat=True,
+            )
         if provider.provider_type == "anthropic_messages":
             return AnthropicMessagesProvider(**common)
+        if provider.provider_type == "ollama":
+            common["api_key"] = resolve_ollama_api_key(api_key)
+            return OllamaChatProvider(
+                **common,
+                structured_output_mode="json_object",
+                supports_structured_chat=True,
+            )
         if provider.provider_type == "deepseek_chat" or (
             provider.provider_type == "openai_compatible_chat" and is_deepseek
         ):
@@ -997,15 +1018,27 @@ def embedding_provider_for_workspace(
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
     except Exception:
         return None
-    if not api_key:
+    is_ollama = is_ollama_provider_type(provider.provider_type) or (
+        str((provider.capabilities or {}).get("brand_id") or "").casefold() == "ollama"
+    )
+    if not api_key and not is_ollama:
         return None
     capabilities = dict(provider.capabilities or {})
+    extra_headers = _extra_headers_from_capabilities(capabilities)
+    if is_ollama:
+        return OllamaEmbeddingProvider(
+            provider_id=provider.id,
+            model_id=resolved_model,
+            base_url=provider.base_url,
+            api_key=api_key,
+            extra_headers=extra_headers,
+        )
     return OpenAICompatibleEmbeddingProvider(
         provider_id=provider.id,
         model_id=resolved_model,
         base_url=provider.base_url,
         api_key=api_key,
-        extra_headers=_extra_headers_from_capabilities(capabilities),
+        extra_headers=extra_headers,
     )
 
 

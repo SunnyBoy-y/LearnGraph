@@ -85,6 +85,8 @@ export const MODEL_PROVIDER_TYPES = [
   "codex_chatgpt",
   "deepseek_chat",
   "anthropic_messages",
+  "github_copilot",
+  "ollama",
 ] as const;
 
 export function isModelProviderType(providerType: string): boolean {
@@ -372,6 +374,19 @@ export interface ProviderBalance {
   queried_at: IsoDateTime;
 }
 
+export interface CopilotDeviceLoginStart {
+  device_auth_id: string;
+  user_code: string;
+  verification_url: string;
+  interval_seconds: number;
+}
+
+export interface CopilotDeviceLoginPoll {
+  status: "pending" | "authorized";
+  /** The GitHub OAuth token, returned once for the Provider Secret Store. */
+  api_key: string | null;
+}
+
 export interface CodexDeviceLoginStart {
   device_auth_id: string;
   user_code: string;
@@ -456,11 +471,16 @@ export interface ProviderModelCapabilities {
   image_input_mode?: ImageInputMode;
   default_search_route: SearchRoute;
   capability_source: ModelCapabilitySource;
-  /** Vendor-declared physical context window. */
+  /** Maximum input context accepted by the model. */
   context_window_tokens: number;
-  /** Workspace-selected cap; cannot exceed the physical window. */
+  /** Legacy alias retained for persisted capability snapshots. */
   context_limit_tokens: number;
+  /** Maximum tokens the model may generate. */
   max_output_tokens: number;
+  /** Chat/thinking history compaction threshold as a 0-1 ratio. */
+  chat_compaction_ratio: number;
+  /** Agentic history compaction threshold as a 0-1 ratio. */
+  agent_compaction_ratio: number;
 }
 
 export type ProviderModelCapabilityUpdateRequest = ProviderModelCapabilities;

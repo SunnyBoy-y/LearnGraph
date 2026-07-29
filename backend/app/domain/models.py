@@ -1771,8 +1771,12 @@ class BudgetPolicy(Base, TimestampMixin, WorkspaceScopedMixin):
     model_id: Mapped[str] = mapped_column(String(160), default="*", index=True)
     feature: Mapped[str] = mapped_column(String(80), default="*", index=True)
     period: Mapped[str] = mapped_column(String(32), default="calendar_month_utc")
+    # The soft/hard limit values are expressed in `limit_currency` (USD or CNY).
+    # The "_cny" column name is retained for schema continuity; at evaluation
+    # time a USD limit is converted to CNY by the current exchange rate.
     soft_limit_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
     hard_limit_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
+    limit_currency: Mapped[str] = mapped_column(String(8), default="CNY")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
@@ -1816,6 +1820,7 @@ class UsageEvent(Base, TimestampMixin, WorkspaceScopedMixin):
     feature: Mapped[str] = mapped_column(String(80))
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cached_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_creation_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -1833,6 +1838,7 @@ class UsageEvent(Base, TimestampMixin, WorkspaceScopedMixin):
     )
     input_usd_per_million: Mapped[float] = mapped_column(Float, default=0.0)
     cached_input_usd_per_million: Mapped[float] = mapped_column(Float, default=0.0)
+    cache_write_usd_per_million: Mapped[float] = mapped_column(Float, default=0.0)
     price_multiplier: Mapped[float] = mapped_column(Float, default=1.0)
     output_usd_per_million: Mapped[float] = mapped_column(Float, default=0.0)
     fixed_usd_per_call: Mapped[float] = mapped_column(Float, default=0.0)

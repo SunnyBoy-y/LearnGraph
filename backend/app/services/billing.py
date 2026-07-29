@@ -80,12 +80,14 @@ class BillingQuote:
     exchange_rate_version_id: str | None
     input_usd_per_million: float
     cached_input_usd_per_million: float
+    cache_write_usd_per_million: float
     price_multiplier: float
     output_usd_per_million: float
     fixed_usd_per_call: float
     pricing_currency: str
     input_cny_per_million: float
     cached_input_cny_per_million: float
+    cache_write_cny_per_million: float
     output_cny_per_million: float
     fixed_cny_per_call: float
     usd_cny_rate: float
@@ -107,12 +109,14 @@ class BillingQuote:
             exchange_rate_version_id=value.get("exchange_rate_version_id"),
             input_usd_per_million=float(value.get("input_usd_per_million") or 0),
             cached_input_usd_per_million=float(value.get("cached_input_usd_per_million") or value.get("input_usd_per_million") or 0),
+            cache_write_usd_per_million=float(value.get("cache_write_usd_per_million") or value.get("input_usd_per_million") or 0),
             price_multiplier=float(value.get("price_multiplier") or 1),
             output_usd_per_million=float(value.get("output_usd_per_million") or 0),
             fixed_usd_per_call=float(value.get("fixed_usd_per_call") or 0),
             pricing_currency=str(value.get("pricing_currency") or "USD").upper(),
             input_cny_per_million=float(value.get("input_cny_per_million") or 0),
             cached_input_cny_per_million=float(value.get("cached_input_cny_per_million") or 0),
+            cache_write_cny_per_million=float(value.get("cache_write_cny_per_million") or value.get("input_cny_per_million") or 0),
             output_cny_per_million=float(value.get("output_cny_per_million") or 0),
             fixed_cny_per_call=float(value.get("fixed_cny_per_call") or 0),
             usd_cny_rate=float(value.get("usd_cny_rate") or DEFAULT_USD_CNY_RATE),
@@ -465,8 +469,12 @@ class BillingService:
         soft_limit_cny: float | None,
         hard_limit_cny: float | None,
         enabled: bool,
+        limit_currency: str = "CNY",
     ) -> BudgetPolicy:
         self._validate_limits(soft_limit_cny, hard_limit_cny)
+        currency = (limit_currency or "CNY").strip().upper()
+        if currency not in {"USD", "CNY"}:
+            raise AppError(422, "invalid_limit_currency", "Budget currency must be USD or CNY")
         scope = self._normalized_scope(provider_id, model_id, feature)
         existing = self.db.scalar(
             self.policies.query().where(
@@ -492,6 +500,7 @@ class BillingService:
                 period=period,
                 soft_limit_cny=soft_limit_cny,
                 hard_limit_cny=hard_limit_cny,
+                limit_currency=currency,
                 enabled=enabled,
             )
         )
@@ -500,7 +509,7 @@ class BillingService:
             action="usage.budget_policy.created",
             resource_type="budget_policy",
             resource_id=policy.id,
-            details={"scope": list(scope), "period": period},
+            details={"scope": list(scope), "period": period, "limit_currency": currency},
         )
         self.db.commit()
         self.db.refresh(policy)
@@ -514,12 +523,17 @@ class BillingService:
         soft_limit_cny: float | None,
         hard_limit_cny: float | None,
         enabled: bool,
+        limit_currency: str = "CNY",
     ) -> BudgetPolicy:
         self._validate_limits(soft_limit_cny, hard_limit_cny)
+        currency = (limit_currency or "CNY").strip().upper()
+        if currency not in {"USD", "CNY"}:
+            raise AppError(422, "invalid_limit_currency", "Budget currency must be USD or CNY")
         policy = self.policies.require(policy_id, "budget policy")
         policy.name = name
         policy.soft_limit_cny = soft_limit_cny
         policy.hard_limit_cny = hard_limit_cny
+        policy.limit_currency = currency
         policy.enabled = enabled
         self.audit.record(
             actor_id=self.actor_id,
@@ -566,10 +580,15 @@ class BillingService:
 
     def budget_statuses(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
         current = self._as_utc(now or utc_now())
+        rate = self._active_exchange_rate(current)
         result: list[dict[str, Any]] = []
         for policy in self.list_budget_policies():
             start, end = self._period_bounds(policy.period, current)
             spent = self._spent_for_policy(policy, start, end)
+            spent_usd = spent / rate.rate if rate.rate else 0.0
+            soft_eff, hard_eff, soft_usd, hard_usd = self._effective_limits(
+                policy, rate.rate
+            )
             result.append(
                 {
                     "policy_id": policy.id,
@@ -583,13 +602,16 @@ class BillingService:
                     "spent_cny": spent,
                     "soft_limit_cny": policy.soft_limit_cny,
                     "hard_limit_cny": policy.hard_limit_cny,
+                    "soft_limit_cny_effective": soft_eff,
+                    "hard_limit_cny_effective": hard_eff,
+                    "spent_usd": spent_usd,
+                    "soft_limit_usd": soft_usd,
+                    "hard_limit_usd": hard_usd,
                     "soft_exceeded": bool(
-                        policy.soft_limit_cny is not None
-                        and spent >= policy.soft_limit_cny
+                        soft_eff is not None and spent >= soft_eff
                     ),
                     "hard_exceeded": bool(
-                        policy.hard_limit_cny is not None
-                        and spent >= policy.hard_limit_cny
+                        hard_eff is not None and spent >= hard_eff
                     ),
                     "enabled": policy.enabled,
                 }
@@ -618,12 +640,14 @@ class BillingService:
                 exchange_rate_version_id=None,
                 input_usd_per_million=0,
                 cached_input_usd_per_million=0,
+                cache_write_usd_per_million=0,
                 price_multiplier=1,
                 output_usd_per_million=0,
                 fixed_usd_per_call=0,
                 pricing_currency="USD",
                 input_cny_per_million=0,
                 cached_input_cny_per_million=0,
+                cache_write_cny_per_million=0,
                 output_cny_per_million=0,
                 fixed_cny_per_call=0,
                 usd_cny_rate=0,
@@ -632,12 +656,14 @@ class BillingService:
                 quoted_at=current.isoformat(),
             )
         policies = self._matching_policies(provider_id, model_id, feature)
+        rate = self._active_exchange_rate(current)
         self._block_if_already_exhausted(
             policies,
             provider_id=provider_id,
             model_id=model_id,
             feature=feature,
             now=current,
+            rate=rate.rate,
         )
         price = self._active_price(provider_id, model_id, feature, current, max(0, estimated_input_tokens))
         if price is None:
@@ -649,7 +675,6 @@ class BillingService:
                 input_tokens=max(0, estimated_input_tokens),
             )
         multiplier = self._price_multiplier(price, current) if price else 1.0
-        rate = self._active_exchange_rate(current)
         if price is None and policies:
             self.db.commit()
             raise AppError(
@@ -688,6 +713,7 @@ class BillingService:
             feature=feature,
             projected_cost_cny=projected_cny,
             now=current,
+            rate=rate.rate,
         )
         return BillingQuote(
             provider_id=provider_id,
@@ -698,12 +724,14 @@ class BillingService:
             exchange_rate_version_id=rate.id,
             input_usd_per_million=price.input_usd_per_million if price else 0,
             cached_input_usd_per_million=(price.cached_input_usd_per_million if price and price.cached_input_usd_per_million is not None else price.input_usd_per_million if price else 0),
+            cache_write_usd_per_million=(price.cache_write_usd_per_million if price and price.cache_write_usd_per_million is not None else price.input_usd_per_million if price else 0),
             price_multiplier=multiplier,
             output_usd_per_million=price.output_usd_per_million if price else 0,
             fixed_usd_per_call=price.fixed_usd_per_call if price else 0,
             pricing_currency=pricing_currency,
             input_cny_per_million=native_cny_rates["input"],
             cached_input_cny_per_million=native_cny_rates["cached_input"],
+            cache_write_cny_per_million=native_cny_rates["cache_write"],
             output_cny_per_million=native_cny_rates["output"],
             fixed_cny_per_call=native_cny_rates["fixed"],
             usd_cny_rate=rate.rate,
@@ -723,15 +751,16 @@ class BillingService:
         model_id = "deep-research"
         feature = "deep_research"
         policies = self._matching_policies(provider_id, model_id, feature)
+        rate = self._active_exchange_rate(current)
         self._block_if_already_exhausted(
             policies,
             provider_id=provider_id,
             model_id=model_id,
             feature=feature,
             now=current,
+            rate=rate.rate,
         )
         price = self._active_price(provider_id, model_id, feature, current, 0)
-        rate = self._active_exchange_rate(current)
         projected_cny = max(0.0, estimated_cost_cny)
         projected_usd = projected_cny / rate.rate if rate.rate else 0.0
         self._evaluate_policies(
@@ -741,6 +770,7 @@ class BillingService:
             feature=feature,
             projected_cost_cny=projected_cny,
             now=current,
+            rate=rate.rate,
         )
         return BillingQuote(
             provider_id=provider_id,
@@ -751,12 +781,14 @@ class BillingService:
             exchange_rate_version_id=rate.id,
             input_usd_per_million=price.input_usd_per_million if price else 0,
             cached_input_usd_per_million=(price.cached_input_usd_per_million if price and price.cached_input_usd_per_million is not None else price.input_usd_per_million if price else 0),
+            cache_write_usd_per_million=(price.cache_write_usd_per_million if price and price.cache_write_usd_per_million is not None else price.input_usd_per_million if price else 0),
             price_multiplier=self._price_multiplier(price, current) if price else 1,
             output_usd_per_million=price.output_usd_per_million if price else 0,
             fixed_usd_per_call=price.fixed_usd_per_call if price else 0,
             pricing_currency="USD",
             input_cny_per_million=0,
             cached_input_cny_per_million=0,
+            cache_write_cny_per_million=0,
             output_cny_per_million=0,
             fixed_cny_per_call=0,
             usd_cny_rate=rate.rate,
@@ -773,6 +805,7 @@ class BillingService:
         output_tokens: int,
         attempt: int,
         cached_input_tokens: int = 0,
+        cache_creation_input_tokens: int = 0,
         reasoning_tokens: int = 0,
         latency_ms: int = 0,
         provider_reported_cost_cny: float | None = None,
@@ -781,6 +814,11 @@ class BillingService:
         normalized_input = max(0, int(input_tokens))
         normalized_output = max(0, int(output_tokens))
         normalized_cached = min(normalized_input, max(0, int(cached_input_tokens)))
+        normalized_created = min(
+            normalized_input - normalized_cached,
+            max(0, int(cache_creation_input_tokens)),
+        )
+        normalized_uncached = normalized_input - normalized_cached - normalized_created
         normalized_reasoning = min(normalized_output, max(0, int(reasoning_tokens)))
         if not quote.remote_capability:
             cost_usd = 0.0
@@ -800,7 +838,7 @@ class BillingService:
         elif quote.price_version_id is not None:
             if quote.pricing_currency == "CNY":
                 cost_cny = self._priced_cost_usd(
-                    input_tokens=normalized_input - normalized_cached,
+                    input_tokens=normalized_uncached,
                     output_tokens=normalized_output,
                     input_rate=quote.input_cny_per_million,
                     output_rate=quote.output_cny_per_million,
@@ -809,17 +847,23 @@ class BillingService:
                     normalized_cached
                     * quote.cached_input_cny_per_million
                     / 1_000_000
+                ) + (
+                    normalized_created
+                    * quote.cache_write_cny_per_million
+                    / 1_000_000
                 )
                 cost_cny *= quote.price_multiplier
                 cost_usd = cost_cny / quote.usd_cny_rate if quote.usd_cny_rate else 0.0
             else:
                 cost_usd = self._priced_cost_usd(
-                    input_tokens=normalized_input - normalized_cached,
+                    input_tokens=normalized_uncached,
                     output_tokens=normalized_output,
                     input_rate=quote.input_usd_per_million,
                     output_rate=quote.output_usd_per_million,
                     fixed=quote.fixed_usd_per_call,
-                ) + normalized_cached * quote.cached_input_usd_per_million / 1_000_000
+                ) + normalized_cached * quote.cached_input_usd_per_million / 1_000_000 + (
+                    normalized_created * quote.cache_write_usd_per_million / 1_000_000
+                )
                 cost_usd *= quote.price_multiplier
                 cost_cny = cost_usd * quote.usd_cny_rate
             status = "priced"
@@ -835,6 +879,7 @@ class BillingService:
                 feature=quote.feature,
                 input_tokens=normalized_input,
                 cached_input_tokens=normalized_cached,
+                cache_creation_input_tokens=normalized_created,
                 output_tokens=normalized_output,
                 reasoning_tokens=normalized_reasoning,
                 total_tokens=normalized_input + normalized_output,
@@ -846,6 +891,7 @@ class BillingService:
                 exchange_rate_version_id=quote.exchange_rate_version_id,
                 input_usd_per_million=quote.input_usd_per_million,
                 cached_input_usd_per_million=quote.cached_input_usd_per_million,
+                cache_write_usd_per_million=quote.cache_write_usd_per_million,
                 price_multiplier=quote.price_multiplier,
                 output_usd_per_million=quote.output_usd_per_million,
                 fixed_usd_per_call=quote.fixed_usd_per_call,
@@ -1078,6 +1124,7 @@ class BillingService:
             return "USD", {
                 "input": 0.0,
                 "cached_input": 0.0,
+                "cache_write": 0.0,
                 "output": 0.0,
                 "fixed": 0.0,
             }
@@ -1087,6 +1134,7 @@ class BillingService:
             return "USD", {
                 "input": 0.0,
                 "cached_input": 0.0,
+                "cache_write": 0.0,
                 "output": 0.0,
                 "fixed": 0.0,
             }
@@ -1102,6 +1150,7 @@ class BillingService:
         return "CNY", {
             "input": input_rate,
             "cached_input": number("cached_input_cny_per_million", input_rate),
+            "cache_write": number("cache_write_cny_per_million", input_rate),
             "output": number("output_cny_per_million"),
             "fixed": number("fixed_cny_per_call"),
         }
@@ -1207,13 +1256,15 @@ class BillingService:
         model_id: str,
         feature: str,
         now: datetime,
+        rate: float,
     ) -> None:
         for policy in policies:
             if policy.hard_limit_cny is None:
                 continue
             start, end = self._period_bounds(policy.period, now)
             spent = self._spent_for_policy(policy, start, end)
-            if spent >= policy.hard_limit_cny:
+            _, hard_eff, _, _ = self._effective_limits(policy, rate)
+            if hard_eff is not None and spent >= hard_eff:
                 self._persist_alert(
                     policy,
                     level="hard",
@@ -1224,10 +1275,10 @@ class BillingService:
                     end=end,
                     spent=spent,
                     projected=0,
-                    limit=policy.hard_limit_cny,
+                    limit=hard_eff,
                 )
                 self.db.commit()
-                raise self._hard_limit_error(policy, spent, 0)
+                raise self._hard_limit_error(policy, spent, 0, hard_eff)
 
     def _evaluate_policies(
         self,
@@ -1238,17 +1289,16 @@ class BillingService:
         feature: str,
         projected_cost_cny: float,
         now: datetime,
+        rate: float,
     ) -> None:
         hard_error: AppError | None = None
         changed = False
         for policy in policies:
             start, end = self._period_bounds(policy.period, now)
             spent = self._spent_for_policy(policy, start, end)
+            soft_eff, hard_eff, _, _ = self._effective_limits(policy, rate)
             projected_total = spent + projected_cost_cny
-            if (
-                policy.soft_limit_cny is not None
-                and projected_total >= policy.soft_limit_cny
-            ):
+            if soft_eff is not None and projected_total >= soft_eff:
                 self._persist_alert(
                     policy,
                     level="soft",
@@ -1259,13 +1309,10 @@ class BillingService:
                     end=end,
                     spent=spent,
                     projected=projected_cost_cny,
-                    limit=policy.soft_limit_cny,
+                    limit=soft_eff,
                 )
                 changed = True
-            if (
-                policy.hard_limit_cny is not None
-                and projected_total > policy.hard_limit_cny
-            ):
+            if hard_eff is not None and projected_total > hard_eff:
                 self._persist_alert(
                     policy,
                     level="hard",
@@ -1276,13 +1323,14 @@ class BillingService:
                     end=end,
                     spent=spent,
                     projected=projected_cost_cny,
-                    limit=policy.hard_limit_cny,
+                    limit=hard_eff,
                 )
                 changed = True
                 hard_error = self._hard_limit_error(
                     policy,
                     spent,
                     projected_cost_cny,
+                    hard_eff,
                 )
         if changed:
             self.db.commit()
@@ -1464,7 +1512,13 @@ class BillingService:
         policy: BudgetPolicy,
         spent: float,
         projected: float,
+        effective_limit_cny: float | None = None,
     ) -> AppError:
+        hard_limit = (
+            effective_limit_cny
+            if effective_limit_cny is not None
+            else policy.hard_limit_cny
+        )
         return AppError(
             402,
             "budget_hard_limit_exceeded",
@@ -1473,9 +1527,37 @@ class BillingService:
                 "policy_id": policy.id,
                 "spent_cny": spent,
                 "projected_cost_cny": projected,
-                "hard_limit_cny": policy.hard_limit_cny,
+                "hard_limit_cny": hard_limit,
+                "limit_currency": policy.limit_currency,
             },
         )
+
+    @staticmethod
+    def _effective_limits(
+        policy: BudgetPolicy,
+        usd_cny_rate: float,
+    ) -> tuple[float | None, float | None, float | None, float | None]:
+        """Return (soft_cny, hard_cny, soft_usd, hard_usd) for a policy.
+
+        Limits are authored in ``policy.limit_currency``. USD limits are
+        converted to their CNY equivalent using the current rate so they
+        float with the exchange rate; CNY limits are used as-authored.
+        The USD projections are kept for display and audit.
+        """
+        currency = (policy.limit_currency or "CNY").strip().upper()
+        soft_native = policy.soft_limit_cny
+        hard_native = policy.hard_limit_cny
+        if currency == "USD":
+            # A USD limit floats with the exchange rate: the effective CNY
+            # threshold scales as the rate moves. Without a usable rate the
+            # policy cannot enforce, so the limit is treated as unset.
+            soft_cny = soft_native * usd_cny_rate if soft_native is not None and usd_cny_rate else None
+            hard_cny = hard_native * usd_cny_rate if hard_native is not None and usd_cny_rate else None
+            return soft_cny, hard_cny, soft_native, hard_native
+        # CNY-native: project to USD for display only.
+        soft_usd = soft_native / usd_cny_rate if soft_native is not None and usd_cny_rate else None
+        hard_usd = hard_native / usd_cny_rate if hard_native is not None and usd_cny_rate else None
+        return soft_native, hard_native, soft_usd, hard_usd
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:

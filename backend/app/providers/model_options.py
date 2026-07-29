@@ -243,6 +243,11 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("context_limit_tokens") or context_window_tokens
     )
     max_output_tokens = int(payload.get("max_output_tokens") or 4_096)
+    try:
+        chat_compaction_ratio = float(payload.get("chat_compaction_ratio", 0.8))
+        agent_compaction_ratio = float(payload.get("agent_compaction_ratio", 1 / 3))
+    except (TypeError, ValueError) as exc:
+        raise ModelCapabilityError("compaction ratios must be numeric") from exc
     if context_window_tokens < 8_000 or context_window_tokens > 10_000_000:
         raise ModelCapabilityError(
             "context_window_tokens must be between 8,000 and 10,000,000"
@@ -251,10 +256,14 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         raise ModelCapabilityError(
             "context_limit_tokens must be between 8,000 and context_window_tokens"
         )
-    if max_output_tokens < 1 or max_output_tokens >= context_limit_tokens:
+    if max_output_tokens < 1 or max_output_tokens > 1_000_000:
         raise ModelCapabilityError(
-            "max_output_tokens must be positive and below context_limit_tokens"
+            "max_output_tokens must be between 1 and 1,000,000"
         )
+    if not 0.1 <= chat_compaction_ratio <= 1.0:
+        raise ModelCapabilityError("chat_compaction_ratio must be between 0.1 and 1.0")
+    if not 0.1 <= agent_compaction_ratio <= 1.0:
+        raise ModelCapabilityError("agent_compaction_ratio must be between 0.1 and 1.0")
     return {
         "reasoning_efforts": list(dict.fromkeys(efforts)),
         "thinking_mapping": dict(mapping),
@@ -274,6 +283,8 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         "context_window_tokens": context_window_tokens,
         "context_limit_tokens": context_limit_tokens,
         "max_output_tokens": max_output_tokens,
+        "chat_compaction_ratio": chat_compaction_ratio,
+        "agent_compaction_ratio": agent_compaction_ratio,
     }
 
 
@@ -298,6 +309,8 @@ _CATALOG_BASE_CAPABILITIES: dict[str, Any] = {
     "context_window_tokens": UNKNOWN_MODEL_CONTEXT_TOKENS,
     "context_limit_tokens": UNKNOWN_MODEL_CONTEXT_TOKENS,
     "max_output_tokens": 4_096,
+    "chat_compaction_ratio": 0.8,
+    "agent_compaction_ratio": 1 / 3,
 }
 
 
@@ -354,7 +367,13 @@ def catalog_capability_snapshot(
     merged["context_window_tokens"] = window
     merged["context_limit_tokens"] = min(limit, window)
     output = int(merged.get("max_output_tokens") or 4_096)
-    merged["max_output_tokens"] = max(1, min(output, merged["context_limit_tokens"] - 1))
+    merged["max_output_tokens"] = max(1, min(output, 1_000_000))
+    merged["chat_compaction_ratio"] = min(
+        1.0, max(0.1, float(merged.get("chat_compaction_ratio", 0.8)))
+    )
+    merged["agent_compaction_ratio"] = min(
+        1.0, max(0.1, float(merged.get("agent_compaction_ratio", 1 / 3)))
+    )
     return merged
 
 

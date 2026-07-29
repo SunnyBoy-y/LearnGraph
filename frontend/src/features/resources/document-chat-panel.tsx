@@ -96,7 +96,8 @@ type ChatStatus = "ready" | "submitted" | "streaming" | "error";
 export interface PendingDocumentSelection {
   file_id: string;
   document_revision_id: string;
-  chunk_id: string;
+  /** Best-effort chunk anchor; null when the selection could not be resolved to a single chunk. */
+  chunk_id: string | null;
   locator: Record<string, unknown>;
   locator_label: string;
   selected_text: string;
@@ -851,8 +852,10 @@ export function DocumentChatPanel({
           <FileText className="mt-0.5 size-3.5 flex-none text-primary" />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <strong className="truncate">{selection.locator_label}</strong>
-              <span className="text-muted-foreground">已校验后发送</span>
+              <strong className="truncate">{selection.locator_label || "整文件上下文"}</strong>
+              <span className="text-muted-foreground">
+                {selection.chunk_id ? "已校验后发送" : "以整文件 + 选区提示发送"}
+              </span>
             </div>
             <p className="mt-1 line-clamp-3 leading-4 text-muted-foreground">
               {selection.selected_text}

@@ -128,6 +128,7 @@ class GoalService:
                     input_tokens=int(usage.get("input_tokens") or 0),
                     output_tokens=int(usage.get("output_tokens") or 0),
                     cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                     reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                     attempt=attempt,
                     usage_reported=bool(usage),

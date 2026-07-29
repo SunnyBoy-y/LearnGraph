@@ -91,6 +91,14 @@ from app.providers.remote.deepseek import (
     is_deepseek_chat_configuration,
     is_official_deepseek_api_base_url,
 )
+from app.providers.remote.copilot import (
+    ProviderHTTPError as CopilotProviderHTTPError,
+    ProviderResponseError as CopilotProviderResponseError,
+    ProviderTimeoutError as CopilotProviderTimeoutError,
+    discover_copilot_models,
+    poll_copilot_device_login,
+    start_copilot_device_login,
+)
 from app.providers.remote.codex import (
     CODEX_DEFAULT_MODEL,
     CODEX_KNOWN_MODELS,
@@ -290,7 +298,54 @@ class ProviderService:
                 "model_states": {model_id: True for model_id in CODEX_KNOWN_MODELS},
                 "default_model": CODEX_DEFAULT_MODEL,
             }
-        qwen_research_defaults: dict[str, object] = {}
+        ollama_defaults: dict[str, object] = {}
+        if payload.provider_type == "ollama":
+            ollama_defaults = {
+                "brand_id": "ollama",
+                "model_family": "ollama",
+                "provider_family": "ollama",
+                "capability_source": "official_catalog",
+                "supports_agent_tools": True,
+                "structured_output_mode": "json_object",
+                # Thinking models (DeepSeek-R1, Qwen3, GPT-OSS, …) can opt in via
+                # the capability editor; default keeps fast mode available.
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "thinking_mapping": {
+                    "off": False,
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                    "xhigh": "max",
+                },
+                "default_thinking_mode": "off",
+                "reasoning_parameter": "thinking",
+                "hosted_web_search": False,
+                "default_search_route": "external",
+            }
+        if payload.provider_type == "ollama_embedding":
+            ollama_defaults = {
+                "brand_id": "ollama",
+                "model_family": "ollama",
+                "provider_family": "ollama",
+                "capability_source": "official_catalog",
+                "provider_role": "embedding",
+            }
+        copilot_defaults: dict[str, object] = {}
+        if payload.provider_type == "github_copilot":
+            copilot_defaults = {
+                "brand_id": "github",
+                "model_family": "github_copilot",
+                "provider_family": "github_copilot",
+                "capability_source": "official_catalog",
+                "supports_agent_tools": True,
+                "structured_output_mode": "json_schema",
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "thinking_mapping": {"off": None, "low": "low", "medium": "medium", "high": "high", "xhigh": "high"},
+                "default_thinking_mode": "off",
+                "reasoning_parameter": "reasoning_effort",
+                "hosted_web_search": False,
+                "default_search_route": "external",
+            }
         if payload.provider_type == "qwen_deep_research":
             known = list(QwenDeepResearchProvider.KNOWN_MODELS)
             qwen_research_defaults = {
@@ -313,6 +368,8 @@ class ProviderService:
             **anthropic_defaults,
             **qwen_defaults,
             **codex_defaults,
+            **ollama_defaults,
+            **copilot_defaults,
             **qwen_research_defaults,
             **incoming_capabilities,
             "provider_role": spec.role,
@@ -326,6 +383,12 @@ class ProviderService:
         # presented as unavailable by consumers of the provider API.
         if payload.provider_type in MODEL_PROVIDER_TYPES:
             capabilities.setdefault("supports_agent_tools", True)
+        # Local providers (Ollama) are fully configured with only a base URL.
+        configured_without_secret = (
+            not secret
+            and not spec.requires_secret
+            and bool(payload.base_url)
+        )
         provider = self.providers.add(
             ProviderConfig(
                 workspace_id=self.workspace_id,
@@ -337,7 +400,11 @@ class ProviderService:
                 enabled=False,
                 remote_capability=False,
                 capabilities=capabilities,
-                status="configured_disabled" if secret else "unconfigured",
+                status=(
+                    "configured_disabled"
+                    if secret or configured_without_secret
+                    else "unconfigured"
+                ),
             )
         )
         self.db.flush()
@@ -371,6 +438,16 @@ class ProviderService:
             and spec.supports_probe
             and provider.provider_type in MODEL_PROVIDER_TYPES
         ):
+            self._probe_after_configuration(provider.id)
+            provider = self.providers.require(provider.id, "provider")
+            self.db.refresh(provider)
+        elif (
+            not secret
+            and spec.supports_probe
+            and provider.provider_type == "ollama"
+            and provider.base_url
+        ):
+            # Local Ollama needs no API key; still auto-probe so discovery runs.
             self._probe_after_configuration(provider.id)
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
@@ -617,8 +694,17 @@ class ProviderService:
         assert isinstance(enabled, bool)
         if enabled and provider.provider_type in MODEL_PROVIDER_TYPES:
             secret = self._active_secret_record(provider.id)
-            if secret is None or not provider.base_url:
-                raise AppError(409, "provider_not_configured", "Provider requires a base URL and encrypted secret")
+            requires_secret = provider.provider_type != "ollama"
+            if (requires_secret and secret is None) or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    (
+                        "Provider requires a base URL"
+                        if provider.provider_type == "ollama"
+                        else "Provider requires a base URL and encrypted secret"
+                    ),
+                )
             if not str(capabilities.get("default_model") or "").strip():
                 raise AppError(409, "provider_model_required", "A default model is required before enabling")
             provider.remote_capability = True
@@ -779,11 +865,16 @@ class ProviderService:
             provider.status = "enabled_unverified"
         elif enabled and provider.provider_type in EMBEDDING_PROVIDER_TYPES:
             secret = self._active_secret_record(provider.id)
-            if secret is None or not provider.base_url:
+            requires_secret = provider.provider_type != "ollama_embedding"
+            if (requires_secret and secret is None) or not provider.base_url:
                 raise AppError(
                     409,
                     "provider_not_configured",
-                    "Embedding Provider requires a base URL and encrypted secret",
+                    (
+                        "Embedding Provider requires a base URL"
+                        if provider.provider_type == "ollama_embedding"
+                        else "Embedding Provider requires a base URL and encrypted secret"
+                    ),
                 )
             # Multiple embedding providers may stay enabled; the memory
             # enhancement settings pick one explicitly by provider id.
@@ -1217,6 +1308,38 @@ class ProviderService:
             "notice": "；".join(notices),
             "queried_at": utc_now(),
         }
+
+    def github_copilot_device_login_start(self) -> dict:
+        try:
+            login = start_copilot_device_login()
+        except (CopilotProviderHTTPError, CopilotProviderResponseError, CopilotProviderTimeoutError) as exc:
+            raise AppError(502, "github_copilot_login_unavailable", str(exc)) from exc
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.github_copilot.device_login.start",
+            resource_type="provider",
+            resource_id="github_copilot",
+            details={"verification_url": login.verification_url},
+        )
+        self.db.commit()
+        return {"device_auth_id": login.device_auth_id, "user_code": login.user_code, "verification_url": login.verification_url, "interval_seconds": login.interval_seconds}
+
+    def github_copilot_device_login_poll(self, *, device_auth_id: str, user_code: str) -> dict:
+        try:
+            credentials = poll_copilot_device_login(device_auth_id=device_auth_id, user_code=user_code)
+        except (CopilotProviderHTTPError, CopilotProviderResponseError, CopilotProviderTimeoutError) as exc:
+            raise AppError(502, "github_copilot_login_unavailable", str(exc)) from exc
+        if credentials is None:
+            return {"status": "pending", "api_key": None}
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.github_copilot.device_login.complete",
+            resource_type="provider",
+            resource_id="github_copilot",
+            details={},
+        )
+        self.db.commit()
+        return {"status": "authorized", "api_key": credentials.github_token}
 
     def codex_device_login_start(self) -> dict:
         try:
@@ -1957,11 +2080,25 @@ class ProviderService:
             return list(QwenDeepResearchProvider.KNOWN_MODELS)
         if not provider.base_url:
             raise AppError(409, "provider_not_configured", "Provider base URL is missing")
-        api_key = self._decrypt_secret(provider.id)
         extra_headers = self._sanitize_extra_headers(
             (provider.capabilities or {}).get("extra_headers")
         )
         try:
+            if provider.provider_type in {"ollama", "ollama_embedding"}:
+                from app.providers.remote.ollama import discover_ollama_models
+
+                return discover_ollama_models(
+                    base_url=provider.base_url,
+                    api_key=self._optional_secret(provider.id),
+                    extra_headers=extra_headers,
+                )
+            api_key = self._decrypt_secret(provider.id)
+            if provider.provider_type == "github_copilot":
+                return discover_copilot_models(
+                    base_url=provider.base_url,
+                    github_token=api_key,
+                    extra_headers=extra_headers,
+                )
             if provider.provider_type == "anthropic_messages":
                 from app.providers.remote.anthropic import discover_anthropic_models
 
@@ -1975,6 +2112,12 @@ class ProviderService:
                 api_key=api_key,
                 extra_headers=extra_headers,
             )
+        except CopilotProviderTimeoutError as exc:
+            raise AppError(504, "provider_timeout", "Provider model discovery timed out") from exc
+        except CopilotProviderResponseError as exc:
+            raise AppError(502, "provider_invalid_response", str(exc)) from exc
+        except CopilotProviderHTTPError as exc:
+            raise AppError(502, "provider_http_error", str(exc)) from exc
         except ProviderTimeoutError as exc:
             raise AppError(504, "provider_timeout", "Provider model discovery timed out") from exc
         except ProviderResponseError as exc:
@@ -2176,6 +2319,7 @@ class UsageService:
             select(
                 func.coalesce(func.sum(filtered.c.input_tokens), 0),
                 func.coalesce(func.sum(filtered.c.cached_input_tokens), 0),
+                func.coalesce(func.sum(filtered.c.cache_creation_input_tokens), 0),
                 func.coalesce(func.sum(filtered.c.output_tokens), 0),
                 func.coalesce(func.sum(filtered.c.reasoning_tokens), 0),
                 func.coalesce(func.sum(filtered.c.total_tokens), 0),
@@ -2199,12 +2343,13 @@ class UsageService:
             workspace_id=self.workspace_id,
             input_tokens=int(values[0]),
             cached_input_tokens=int(values[1]),
-            output_tokens=int(values[2]),
-            reasoning_tokens=int(values[3]),
-            total_tokens=int(values[4]),
-            attempts=int(values[5]),
-            cost_usd=float(values[6]),
-            cost_cny=float(values[7]),
+            cache_creation_input_tokens=int(values[2]),
+            output_tokens=int(values[3]),
+            reasoning_tokens=int(values[4]),
+            total_tokens=int(values[5]),
+            attempts=int(values[6]),
+            cost_usd=float(values[7]),
+            cost_cny=float(values[8]),
             unpriced_events=int(unpriced_count),
             remote_usage_recorded=bool(remote_count),
         )

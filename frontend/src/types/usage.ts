@@ -3,7 +3,11 @@ import type { IsoDateTime } from "./common";
 export interface UsageSummary {
   workspace_id: string;
   input_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
   output_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
   attempts: number;
   cost_usd: number;
   cost_cny: number;
@@ -18,7 +22,11 @@ export interface UsageEvent {
   model_id: string;
   feature: string;
   input_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
   output_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
   attempt: number;
   cost_usd: number;
   cost_cny: number;
@@ -27,6 +35,7 @@ export interface UsageEvent {
   exchange_rate_version_id: string | null;
   input_usd_per_million: number;
   cached_input_usd_per_million: number;
+  cache_write_usd_per_million: number;
   price_multiplier: number;
   output_usd_per_million: number;
   fixed_usd_per_call: number;
@@ -129,6 +138,7 @@ export interface BudgetPolicy {
   period: "calendar_day_utc" | "calendar_month_utc";
   soft_limit_cny: number | null;
   hard_limit_cny: number | null;
+  limit_currency: "USD" | "CNY";
   enabled: boolean;
   created_at: IsoDateTime;
   updated_at: IsoDateTime;
@@ -142,6 +152,7 @@ export interface BudgetPolicyCreate {
   period?: "calendar_day_utc" | "calendar_month_utc";
   soft_limit_cny?: number | null;
   hard_limit_cny?: number | null;
+  limit_currency?: "USD" | "CNY";
   enabled?: boolean;
 }
 
@@ -149,6 +160,7 @@ export interface BudgetPolicyUpdate {
   name: string;
   soft_limit_cny?: number | null;
   hard_limit_cny?: number | null;
+  limit_currency?: "USD" | "CNY";
   enabled?: boolean;
 }
 
@@ -164,6 +176,11 @@ export interface BudgetStatus {
   spent_cny: number;
   soft_limit_cny: number | null;
   hard_limit_cny: number | null;
+  soft_limit_cny_effective: number | null;
+  hard_limit_cny_effective: number | null;
+  spent_usd: number;
+  soft_limit_usd: number | null;
+  hard_limit_usd: number | null;
   soft_exceeded: boolean;
   hard_exceeded: boolean;
   enabled: boolean;

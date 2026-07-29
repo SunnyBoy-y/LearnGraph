@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import Depends, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -64,9 +65,14 @@ def current_principal(
     )
     if user is None or user.status != "active":
         raise AppError(401, "identity_inactive", "The authenticated identity is not active")
+    # last_seen is telemetry only. Never fail an otherwise valid request because
+    # SQLite is briefly locked by a chat write or background scheduler tick.
     if _utc(auth_session.last_seen_at) + timedelta(minutes=5) < now:
         auth_session.last_seen_at = now
-        db.commit()
+        try:
+            db.commit()
+        except OperationalError:
+            db.rollback()
     return Principal(
         user_id=user.id,
         username=user.username,

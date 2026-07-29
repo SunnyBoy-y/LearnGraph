@@ -130,6 +130,7 @@ class AgentToolRuntime:
         # mode so the model does not guess "today" from training data.
         definitions = list(self._clock_tool_definitions())
         definitions.extend(self._canvas_tool_definitions())
+        definitions.extend(self._component_admin_tool_definitions())
         definitions.extend(self._provider_tool_definitions())
         definitions.extend(self._management_tool_definitions())
         definitions.extend(self._model_invocation_tool_definitions())
@@ -623,6 +624,112 @@ class AgentToolRuntime:
                             "node_id": {"type": "string"},
                         },
                         "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def _component_admin_tool_definitions(self) -> list[dict[str, Any]]:
+        """Trusted-component Manifest admin tools. Gated by workspace.manage
+        (the same flag that gates Provider write tools), so they only register
+        when the Agent is acting for a workspace manager. All writes delegate
+        to ComponentService, which performs Schema guards, hashing, audit and
+        re-authorization — the Agent never touches the catalog directly.
+        """
+        if not self.can_manage_providers:
+            return []
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "component_register_manifest",
+                    "description": (
+                        "Register a third-party trusted component Manifest in "
+                        "this workspace. The server runs static Schema guards, "
+                        "records signature/package-hash status and a health check, "
+                        "then returns the plugin_id + manifest_version_id. The "
+                        "component_id must not collide with the 8 built-in "
+                        "component identities. After registration, call "
+                        "component_authorize to authorize this version before it "
+                        "can be published. Requires workspace.manage. Third-party "
+                        "components render in the isolated browser sandbox; "
+                        "until that renderer is configured, published artifacts "
+                        "are delivered as a safe sandbox_artifact downgrade."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "manifest": {
+                                "type": "object",
+                                "description": (
+                                    "Full ComponentManifestImportRequest body: "
+                                    "component_id, version, display_name, "
+                                    "renderer (sandbox for third-party), source, "
+                                    "package_hash, data_schema, event_schema, "
+                                    "permissions, size_limits, example_data."
+                                ),
+                            }
+                        },
+                        "required": ["manifest"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "component_authorize",
+                    "description": (
+                        "Authorize the current Manifest version of a registered "
+                        "component for this workspace, and enable the plugin so it "
+                        "can be published. Requires workspace.manage. Must be "
+                        "called after component_register_manifest (or after a "
+                        "version/permission change that supersedes the old grant). "
+                        "Built-in components are authorized by the system and "
+                        "cannot be authorized through this tool. Set enable=false "
+                        "to authorize without enabling."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "plugin_id": {"type": "string"},
+                            "manifest_version_id": {"type": "string"},
+                            "scope": {
+                                "type": "string",
+                                "enum": ["current_workspace"],
+                                "default": "current_workspace",
+                            },
+                            "enable": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": "Also enable the plugin after authorizing.",
+                            },
+                        },
+                        "required": ["plugin_id", "manifest_version_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "component_list",
+                    "description": (
+                        "List trusted-component plugins registered in this "
+                        "workspace, with their current manifest and authorization "
+                        "status. Read-only; use it to decide whether a component "
+                        "needs authorization or is ready to publish. Pass a "
+                        "plugin_id to restrict to one plugin."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "plugin_id": {
+                                "type": "string",
+                                "description": "Optional; omit to list all components.",
+                            }
+                        },
                         "additionalProperties": False,
                     },
                 },
@@ -1567,6 +1674,12 @@ class AgentToolRuntime:
                 "canvas_emit_magic_card",
             }:
                 return self._execute_canvas_tool(name, arguments, chat_session_id=chat_session_id)
+            if name in {
+                "component_register_manifest",
+                "component_authorize",
+                "component_list",
+            }:
+                return self._execute_component_admin_tool(name, arguments)
             if name == "lg_graph_propose_change":
                 return self._execute_graph_proposal_tool(
                     arguments,
@@ -1929,6 +2042,196 @@ class AgentToolRuntime:
                 "permission_denied",
                 "Permission 'workspace.manage' is required for Provider write tools",
             )
+
+    def _require_component_manage(self) -> None:
+        if not self.can_manage_providers:
+            raise AppError(
+                403,
+                "permission_denied",
+                "Permission 'workspace.manage' is required for trusted-component admin tools",
+            )
+
+    def _component_service(self):
+        from app.services.components import ComponentService
+
+        return ComponentService(
+            self.extensions.db,
+            self.workspace_id,
+            self.actor_id,
+        )
+
+    def _execute_component_admin_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from app.domain.models import PluginRecord
+        from app.domain.schemas.components import (
+            ComponentAuthorizationRequest,
+            ComponentManifestImportRequest,
+        )
+        from app.repositories.domain import PluginRepository
+
+        self._require_component_manage()
+        service = self._component_service()
+
+        if name == "component_register_manifest":
+            manifest_payload = arguments.get("manifest")
+            if not isinstance(manifest_payload, dict):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "manifest must be a JSON object",
+                )
+            try:
+                payload = ComponentManifestImportRequest.model_validate(
+                    manifest_payload
+                )
+            except Exception as exc:  # pydantic validation details
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    f"manifest failed validation: {exc}",
+                ) from exc
+            plugin, manifest, reauth_required, reasons, checks = service.register(payload)
+            return self._success(
+                {
+                    "plugin_id": plugin.id,
+                    "manifest_version_id": manifest.id,
+                    "component_id": manifest.component_id,
+                    "version": manifest.version,
+                    "display_name": manifest.display_name,
+                    "renderer": manifest.renderer,
+                    "reauthorization_required": reauth_required,
+                    "reauthorization_reasons": reasons,
+                    "checks": [
+                        {
+                            "check_type": check.check_type,
+                            "status": check.status,
+                            "executor": check.executor,
+                        }
+                        for check in checks
+                    ],
+                    "next_step": (
+                        "Call component_authorize with this plugin_id and "
+                        "manifest_version_id to authorize it in this workspace."
+                    ),
+                },
+                {"tool": name, "component_id": manifest.component_id},
+                [],
+            )
+
+        if name == "component_authorize":
+            from app.domain.schemas.management import PluginToggleRequest
+            from app.services.management import PluginService
+
+            plugin_id = str(arguments.get("plugin_id") or "").strip()
+            manifest_version_id = str(
+                arguments.get("manifest_version_id") or ""
+            ).strip()
+            if not plugin_id or not manifest_version_id:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "plugin_id and manifest_version_id are required",
+                )
+            scope = arguments.get("scope")
+            auth_request = ComponentAuthorizationRequest(
+                manifest_version_id=manifest_version_id,
+                scope=scope if isinstance(scope, str) else "current_workspace",
+            )
+            authorization = service.authorize(plugin_id, auth_request)
+            # Authorizing also enables the plugin so the Agent can publish it
+            # without a separate enable step; assert_can_enable is enforced
+            # inside PluginService.toggle for trusted_component plugins.
+            enable_flag = arguments.get("enable")
+            should_enable = (
+                enable_flag if isinstance(enable_flag, bool) else True
+            )
+            enable_status: dict[str, Any] = {"plugin_enabled": None, "plugin_status": None}
+            if should_enable:
+                plugin_service = PluginService(
+                    self.extensions.db,
+                    self.workspace_id,
+                    self.actor_id,
+                )
+                toggled = plugin_service.toggle(
+                    plugin_id, PluginToggleRequest(enabled=True)
+                )
+                enable_status = {
+                    "plugin_enabled": bool(toggled.enabled),
+                    "plugin_status": toggled.status,
+                }
+            return self._success(
+                {
+                    "authorization_id": authorization.id,
+                    "status": authorization.status,
+                    "manifest_version_id": authorization.manifest_version_id,
+                    "scope": authorization.scope,
+                    **enable_status,
+                    "next_step": (
+                        "The component is authorized and enabled. Emit it via "
+                        "canvas_emit_trusted_component using its component_id as "
+                        "component_type. Third-party artifacts render as a safe "
+                        "sandbox_artifact downgrade until the isolated browser "
+                        "renderer is configured."
+                    ),
+                },
+                {"tool": name, "plugin_id": plugin_id},
+                [],
+            )
+
+        if name == "component_list":
+            plugin_id = arguments.get("plugin_id")
+            plugins_repo = PluginRepository(
+                self.extensions.db, self.workspace_id
+            )
+            query = plugins_repo.query().where(
+                PluginRecord.plugin_type == "trusted_component"
+            )
+            if isinstance(plugin_id, str) and plugin_id.strip():
+                query = query.where(PluginRecord.id == plugin_id.strip())
+            plugins = list(self.extensions.db.scalars(query).all())
+            items: list[dict[str, Any]] = []
+            for plugin in plugins:
+                manifest = service.manifests.current(plugin)
+                authorization = service.authorizations.active_for_plugin(plugin.id)
+                health = (
+                    service.checks.latest(plugin.id, manifest.id, "health")
+                    if manifest is not None
+                    else None
+                )
+                items.append(
+                    {
+                        "plugin_id": plugin.id,
+                        "component_id": plugin.plugin_key,
+                        "name": plugin.name,
+                        "version": plugin.version,
+                        "enabled": bool(plugin.enabled),
+                        "status": plugin.status,
+                        "manifest_version_id": manifest.id if manifest else None,
+                        "renderer": manifest.renderer if manifest else None,
+                        "source": manifest.source if manifest else None,
+                        "authorized": authorization is not None,
+                        "authorization_status": (
+                            authorization.status if authorization else None
+                        ),
+                        "health_status": health.status if health else None,
+                        "ready_to_publish": (
+                            authorization is not None
+                            and manifest is not None
+                            and health is not None
+                            and health.status == "passed"
+                        ),
+                    }
+                )
+            return self._success(
+                {"components": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+
+        raise AppError(404, "unknown_tool", f"Unknown component admin tool: {name}")
 
     def _execute_provider_tool(
         self,
@@ -2876,6 +3179,86 @@ class AgentToolRuntime:
             [],
         )
 
+    def _emit_custom_component_part(
+        self,
+        *,
+        component_type: str,
+        props: dict[str, Any],
+        component_id: str | None,
+        allowed_events: list[str] | None,
+        schema_version: str,
+    ) -> dict[str, Any]:
+        """Publish an authorized custom (third-party) trusted component.
+
+        Resolves the registered plugin by ``component_id`` (passed as
+        ``component_type``), requires a current, authorized manifest, and
+        validates ``props`` against the manifest's ``data_schema`` via
+        ``ComponentService.create_artifact``. The isolated browser renderer
+        is not configured, so the result is delivered as a safe
+        ``sandbox_artifact`` downgrade (runtime_status=unavailable); no
+        untrusted code enters the host DOM.
+        """
+        from app.domain.models import PluginRecord
+        from app.domain.schemas.components import ComponentArtifactRequest
+        from app.repositories.domain import PluginRepository
+
+        service = self._component_service()
+        plugins = PluginRepository(self.extensions.db, self.workspace_id)
+        plugin = self.extensions.db.scalar(
+            plugins.query().where(PluginRecord.plugin_key == component_type)
+        )
+        if plugin is None or plugin.plugin_type != "trusted_component":
+            raise AppError(
+                422,
+                "canvas_component_type_unsupported",
+                f"Component type '{component_type}' is not a registered "
+                "trusted component in this workspace; register and authorize "
+                "its Manifest first.",
+            )
+        manifest = service.manifests.current(plugin)
+        if manifest is None:
+            raise AppError(
+                409,
+                "component_manifest_required",
+                "The component has no current manifest",
+            )
+        # create_artifact re-checks enablement, authorization, schema and
+        # records the audit entry. It raises on stale authorization.
+        artifact = service.create_artifact(
+            plugin.id,
+            ComponentArtifactRequest(
+                manifest_version_id=manifest.id,
+                data=props,
+            ),
+        )
+        events = allowed_events
+        if events is None:
+            events = ["submit"]
+        cleaned_events: list[str] = []
+        for event in events:
+            if isinstance(event, str) and event and event not in cleaned_events:
+                cleaned_events.append(event[:80])
+        data = {
+            "component_type": component_type,
+            "component_id": component_id or f"{component_type}_{manifest.version}",
+            "schema_version": (schema_version or manifest.version)[:32],
+            "props": props,
+            "allowed_events": cleaned_events[:10],
+            "delivery_mode": artifact.delivery_mode,
+            "runtime_status": artifact.runtime_status,
+            "manifest_version_id": artifact.manifest_version_id,
+            "sandbox_executed": artifact.sandbox_executed,
+        }
+        if artifact.sandbox_artifact is not None:
+            data["sandbox_artifact"] = artifact.sandbox_artifact
+        title = props.get("title") or props.get("name") or component_type
+        return {
+            "type": "component",
+            "status": "completed",
+            "content": str(title)[:500],
+            "data": data,
+        }
+
     def _execute_canvas_tool(
         self,
         name: str,
@@ -2902,6 +3285,9 @@ class AgentToolRuntime:
                 [],
             )
         if name == "canvas_emit_trusted_component":
+            from app.services.canvas_cards import CHANNEL_A_TYPES
+            from app.services.components import BUILTIN_COMPONENT_IDS
+
             component_type = arguments.get("component_type")
             props = arguments.get("props")
             if not isinstance(component_type, str) or not component_type:
@@ -2911,19 +3297,43 @@ class AgentToolRuntime:
             allowed_events = arguments.get("allowed_events")
             if allowed_events is not None and not isinstance(allowed_events, list):
                 raise AppError(422, "invalid_tool_arguments", "allowed_events must be an array")
-            part = build_trusted_component_part(
-                component_type=component_type,
-                props=props,
-                component_id=arguments.get("component_id")
-                if isinstance(arguments.get("component_id"), str)
-                else None,
-                allowed_events=[str(item) for item in allowed_events]
-                if isinstance(allowed_events, list)
-                else None,
-                schema_version=arguments.get("schema_version")
-                if isinstance(arguments.get("schema_version"), str)
-                else "1.0",
+
+            is_builtin = (
+                component_type in CHANNEL_A_TYPES
+                and component_type in BUILTIN_COMPONENT_IDS
             )
+            if is_builtin:
+                part = build_trusted_component_part(
+                    component_type=component_type,
+                    props=props,
+                    component_id=arguments.get("component_id")
+                    if isinstance(arguments.get("component_id"), str)
+                    else None,
+                    allowed_events=[str(item) for item in allowed_events]
+                    if isinstance(allowed_events, list)
+                    else None,
+                    schema_version=arguments.get("schema_version")
+                    if isinstance(arguments.get("schema_version"), str)
+                    else "1.0",
+                )
+            else:
+                # Custom third-party component: resolve the authorized manifest
+                # in this workspace and validate props against its data_schema.
+                # The isolated browser renderer is not configured, so the
+                # artifact is delivered as a safe sandbox_artifact downgrade.
+                part = self._emit_custom_component_part(
+                    component_type=component_type,
+                    props=props,
+                    component_id=arguments.get("component_id")
+                    if isinstance(arguments.get("component_id"), str)
+                    else None,
+                    allowed_events=[str(item) for item in allowed_events]
+                    if isinstance(allowed_events, list)
+                    else None,
+                    schema_version=arguments.get("schema_version")
+                    if isinstance(arguments.get("schema_version"), str)
+                    else "1.0",
+                )
             self.audit.record(
                 actor_id=self.actor_id,
                 action="canvas.emit_trusted_component",
@@ -2932,16 +3342,22 @@ class AgentToolRuntime:
                 details={
                     "component_type": component_type,
                     "component_id": (part.get("data") or {}).get("component_id"),
+                    "custom_component": not is_builtin,
                 },
             )
             self.extensions.db.commit()
             return self._success(
                 {
                     "published": True,
-                    "channel": "declarative",
+                    "channel": "declarative" if is_builtin else "sandbox_artifact",
                     "component_type": component_type,
                     "part_type": "component",
                     "component_id": (part.get("data") or {}).get("component_id"),
+                    "runtime_status": (
+                        "builtin_registry_validated"
+                        if is_builtin
+                        else (part.get("data") or {}).get("runtime_status")
+                    ),
                 },
                 {
                     "canvas": True,

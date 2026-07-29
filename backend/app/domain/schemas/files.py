@@ -265,12 +265,8 @@ class DocumentQueryPreviewRequest(BaseModel):
             raise ValueError(
                 "section scope requires locator.chunk_id or locator.section_path"
             )
-        if self.scope == "selection" and not (
-            self.locator.get("chunk_id") and self.selected_text
-        ):
-            raise ValueError(
-                "selection scope requires locator.chunk_id and selected_text"
-            )
+        if self.scope == "selection" and not self.selected_text:
+            raise ValueError("selection scope requires selected_text")
         return self
 
 
@@ -288,9 +284,13 @@ class DocumentQueryHitView(BaseModel):
     content_hash: str
 
 
+DocumentSelectionStatus = Literal["verified", "unverified_degraded", "none"]
+
+
 class DocumentQueryPreviewView(BaseModel):
     trace_id: str
     strategy: str
     scope: DocumentQueryScope
     hits: list[DocumentQueryHitView]
     warnings: list[str] = Field(default_factory=list)
+    selection_status: DocumentSelectionStatus = "none"

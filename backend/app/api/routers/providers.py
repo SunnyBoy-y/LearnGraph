@@ -5,6 +5,9 @@ from fastapi import APIRouter, status
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.domain.schemas.management import (
     CodexDeviceLoginPollRequest,
+    GitHubCopilotDeviceLoginPollRequest,
+    GitHubCopilotDeviceLoginPollView,
+    GitHubCopilotDeviceLoginStartView,
     CodexDeviceLoginPollView,
     CodexDeviceLoginStartView,
     MasterKeyRotationView,
@@ -172,6 +175,31 @@ def rotate_provider_secret(
 @router.get("/{provider_id}/models")
 def discover_models(provider_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> dict:
     return service(db, context, settings).models(provider_id)
+
+
+@router.post("/copilot/device-login", response_model=GitHubCopilotDeviceLoginStartView)
+def start_copilot_device_login(
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> GitHubCopilotDeviceLoginStartView:
+    if "workspace.manage" not in context.permissions:
+        raise AppError(403, "permission_denied", "Permission 'workspace.manage' is required to sign in to GitHub Copilot")
+    return GitHubCopilotDeviceLoginStartView.model_validate(
+        service(db, context, settings).github_copilot_device_login_start()
+    )
+
+
+@router.post("/copilot/device-login/poll", response_model=GitHubCopilotDeviceLoginPollView)
+def poll_copilot_device_login(
+    payload: GitHubCopilotDeviceLoginPollRequest,
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> GitHubCopilotDeviceLoginPollView:
+    if "workspace.manage" not in context.permissions:
+        raise AppError(403, "permission_denied", "Permission 'workspace.manage' is required to sign in to GitHub Copilot")
+    return GitHubCopilotDeviceLoginPollView.model_validate(
+        service(db, context, settings).github_copilot_device_login_poll(
+            device_auth_id=payload.device_auth_id, user_code=payload.user_code
+        )
+    )
 
 
 @router.post("/codex/device-login", response_model=CodexDeviceLoginStartView)

@@ -966,20 +966,14 @@ export function GoalSetupConversation({
   const showPrompt = flow.stage === "capture" && !flow.submittedPrompt;
   return (
     <>
-      {showPrompt ? (
-        hasConversationMessages ? (
-          <section className="goal-flow-assistant goal-flow-assistant--prompt">
-            <p>参考完资料后，告诉我你想达到的学习结果。</p>
-          </section>
-        ) : (
-          <ConversationEmptyState className="chat-empty-state goal-mode-empty">
-            <div className="chat-empty-state__content">
-              <p className="chat-empty-state__eyebrow">目标设定</p>
-              <h2>你想学什么？</h2>
-              <p>可以从结果、时间或已有基础说起。</p>
-            </div>
-          </ConversationEmptyState>
-        )
+      {showPrompt && !hasConversationMessages ? (
+        <ConversationEmptyState className="chat-empty-state goal-mode-empty">
+          <div className="chat-empty-state__content">
+            <p className="chat-empty-state__eyebrow">目标设定</p>
+            <h2>你想学什么？</h2>
+            <p>可以从结果、时间或已有基础说起。</p>
+          </div>
+        </ConversationEmptyState>
       ) : null}
       {flow.submittedPrompt ? (
         <div className="goal-flow-user">

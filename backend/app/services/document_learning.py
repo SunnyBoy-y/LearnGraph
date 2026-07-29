@@ -36,6 +36,7 @@ from app.domain.schemas.files import (
     DocumentQueryHitView,
     DocumentQueryPreviewRequest,
     DocumentQueryPreviewView,
+    DocumentSelectionStatus,
 )
 from app.providers.storage_factory import object_storage_provider
 from app.repositories.audit import AuditRepository
@@ -743,7 +744,6 @@ class DocumentLearningService:
         scoped_chunk_ids = self._scoped_chunk_ids(
             payload,
             file_ids,
-            selected_chunk,
         )
         repaired_index_file_ids = self._repair_sparse_index_if_needed(file_ids)
         rows = self._fts_rows(
@@ -758,7 +758,7 @@ class DocumentLearningService:
         # made an indexed file look unavailable to ChatService.  The fallback
         # remains scoped to the files explicitly authorized by the caller and
         # is recorded on the retrieval trace; it is not a synthetic answer.
-        if not rows and payload.scope in {"file", "files"}:
+        if not rows and payload.scope in {"file", "files", "selection"}:
             rows = self._head_rows(
                 file_ids,
                 payload.max_results,
@@ -783,6 +783,12 @@ class DocumentLearningService:
                 },
             )
         rows = rows[: payload.max_results]
+        if selected_chunk is not None:
+            selection_status: DocumentSelectionStatus = "verified"
+        elif payload.selected_text:
+            selection_status = "unverified_degraded"
+        else:
+            selection_status = "none"
         trace = RetrievalTrace(
             workspace_id=self.workspace_id,
             actor_id=self.actor_id,
@@ -800,6 +806,7 @@ class DocumentLearningService:
                 "locator": payload.locator,
                 "collection_ids": payload.collection_ids,
                 "selected_text_verified": selected_chunk is not None,
+                "selection_status": selection_status,
                 "dense_retrieval": False,
                 "rerank": False,
                 "sparse_index_repaired_file_ids": repaired_index_file_ids,
@@ -862,6 +869,7 @@ class DocumentLearningService:
                     else []
                 ),
             ],
+            selection_status=selection_status,
         )
 
     def _repair_sparse_index_if_needed(self, file_ids: list[str]) -> list[str]:
@@ -1076,9 +1084,13 @@ class DocumentLearningService:
         self,
         payload: DocumentQueryPreviewRequest,
         file_ids: list[str],
-        selected_chunk: FileTextChunk | None,
     ) -> list[str] | None:
         if payload.scope in {"file", "files"}:
+            return None
+        if payload.scope == "selection":
+            # The selection is a hint, not a retrieval hard-boundary.  Return
+            # None so FTS retrieves the whole file; the verified chunk (when
+            # present) is force-inserted into rows by the caller.
             return None
         chunks = list(
             self.db.scalars(
@@ -1087,15 +1099,6 @@ class DocumentLearningService:
                 .order_by(FileTextChunk.file_id, FileTextChunk.ordinal)
             ).all()
         )
-        if payload.scope == "selection":
-            if selected_chunk is None:
-                return []
-            return [
-                chunk.id
-                for chunk in chunks
-                if chunk.file_id == selected_chunk.file_id
-                and abs(chunk.ordinal - selected_chunk.ordinal) <= 1
-            ]
         if payload.scope == "page":
             page = payload.locator.get("page")
             return [
@@ -1119,8 +1122,18 @@ class DocumentLearningService:
 
     def _verify_selection(
         self, payload: DocumentQueryPreviewRequest, file_ids: list[str]
-    ) -> FileTextChunk:
+    ) -> FileTextChunk | None:
+        """Best-effort selection verification.
+
+        Returns the chunk anchor when the selection still matches the current
+        index, and ``None`` when it does not (stale revision, cross-chunk
+        selection, hash mismatch).  Callers must treat ``None`` as a signal to
+        degrade to whole-file context with the selection attached as an
+        unverified hint, rather than rejecting the request.
+        """
         chunk_id = str(payload.locator.get("chunk_id") or "")
+        if not chunk_id:
+            return None
         chunk = self.db.scalar(
             self.chunks.query().where(
                 FileTextChunk.id == chunk_id,
@@ -1141,17 +1154,9 @@ class DocumentLearningService:
             or normalized_selection
             not in _normalize_selection_text(chunk.content)
         ):
-            raise AppError(
-                409,
-                "selection_stale",
-                "The selected text no longer matches the authorized document revision",
-            )
+            return None
         if payload.selected_text_hash and _hash(payload.selected_text) != payload.selected_text_hash:
-            raise AppError(
-                409,
-                "selection_hash_mismatch",
-                "The selected text hash does not match the submitted selection",
-            )
+            return None
         return chunk
 
     def _sync_fts(self, file_id: str) -> None:

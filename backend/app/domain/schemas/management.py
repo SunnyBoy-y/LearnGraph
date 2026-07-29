@@ -633,6 +633,23 @@ class ProviderBalanceQueryResultView(ProviderBalanceQueryResultRequest):
     queried_at: datetime
 
 
+class GitHubCopilotDeviceLoginStartView(BaseModel):
+    device_auth_id: str
+    user_code: str
+    verification_url: str
+    interval_seconds: int
+
+
+class GitHubCopilotDeviceLoginPollRequest(BaseModel):
+    device_auth_id: str = Field(min_length=1, max_length=200)
+    user_code: str = Field(min_length=1, max_length=64)
+
+
+class GitHubCopilotDeviceLoginPollView(BaseModel):
+    status: Literal["pending", "authorized"]
+    api_key: str | None = None
+
+
 class CodexDeviceLoginStartView(BaseModel):
     device_auth_id: str
     user_code: str
@@ -716,13 +733,15 @@ class ProviderModelCapabilityUpdateRequest(BaseModel):
     context_window_tokens: int = Field(default=256_000, ge=8_000, le=10_000_000)
     context_limit_tokens: int = Field(default=256_000, ge=8_000, le=10_000_000)
     max_output_tokens: int = Field(default=4_096, ge=1, le=1_000_000)
+    chat_compaction_ratio: float = Field(default=0.8, ge=0.1, le=1.0)
+    agent_compaction_ratio: float = Field(default=1 / 3, ge=0.1, le=1.0)
 
     @model_validator(mode="after")
     def validate_context_limits(self) -> "ProviderModelCapabilityUpdateRequest":
         if self.context_limit_tokens > self.context_window_tokens:
             raise ValueError("context_limit_tokens cannot exceed context_window_tokens")
-        if self.max_output_tokens >= self.context_limit_tokens:
-            raise ValueError("max_output_tokens must be below context_limit_tokens")
+        if self.max_output_tokens > 1_000_000:
+            raise ValueError("max_output_tokens cannot exceed 1,000,000")
         return self
 
 
@@ -813,6 +832,7 @@ class UsageSummary(BaseModel):
     workspace_id: str
     input_tokens: int
     cached_input_tokens: int
+    cache_creation_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
     total_tokens: int
@@ -831,6 +851,7 @@ class UsageEventView(ORMModel):
     feature: str
     input_tokens: int
     cached_input_tokens: int
+    cache_creation_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
     total_tokens: int
@@ -842,6 +863,7 @@ class UsageEventView(ORMModel):
     exchange_rate_version_id: str | None
     input_usd_per_million: float
     cached_input_usd_per_million: float
+    cache_write_usd_per_million: float
     price_multiplier: float
     output_usd_per_million: float
     fixed_usd_per_call: float
@@ -952,6 +974,7 @@ class BudgetPolicyCreateRequest(BaseModel):
     )
     soft_limit_cny: float | None = Field(default=None, ge=0)
     hard_limit_cny: float | None = Field(default=None, ge=0)
+    limit_currency: Literal["CNY", "USD"] = "CNY"
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -971,6 +994,7 @@ class BudgetPolicyUpdateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     soft_limit_cny: float | None = Field(default=None, ge=0)
     hard_limit_cny: float | None = Field(default=None, ge=0)
+    limit_currency: Literal["CNY", "USD"] = "CNY"
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -996,6 +1020,7 @@ class BudgetPolicyView(ORMModel):
     period: str
     soft_limit_cny: float | None
     hard_limit_cny: float | None
+    limit_currency: str
     enabled: bool
     created_at: datetime
     updated_at: datetime
@@ -1013,6 +1038,11 @@ class BudgetStatusView(BaseModel):
     spent_cny: float
     soft_limit_cny: float | None
     hard_limit_cny: float | None
+    soft_limit_cny_effective: float | None
+    hard_limit_cny_effective: float | None
+    spent_usd: float
+    soft_limit_usd: float | None
+    hard_limit_usd: float | None
     soft_exceeded: bool
     hard_exceeded: bool
     enabled: bool
