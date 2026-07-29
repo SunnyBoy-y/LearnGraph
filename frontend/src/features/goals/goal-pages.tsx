@@ -19,7 +19,6 @@ import { toast } from "sonner";
 import {
   deleteGraphNode,
   getRoadmap,
-  publishRoadmap,
   replanRoadmap,
   retryGraphNode,
   updateGraphNode,
@@ -589,15 +588,7 @@ export function GraphReviewPage() {
   const replan = useMutation({
     mutationFn: () => replanRoadmap(goalId),
     onSuccess: () => {
-      toast.success("路线草稿已按当前候选图谱重新生成");
-      void queryClient.invalidateQueries({ queryKey: ["roadmap", goalId] });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const publishRoadmapDraft = useMutation({
-    mutationFn: (roadmapId: string) => publishRoadmap(roadmapId),
-    onSuccess: () => {
-      toast.success("路线草稿已单独发布");
+      toast.success("学习路线已按当前图谱重新生成并立即生效");
       void queryClient.invalidateQueries({ queryKey: ["roadmap", goalId] });
     },
     onError: (error) => toast.error(error.message),
@@ -676,12 +667,12 @@ export function GraphReviewPage() {
 
       <Surface className="p-5">
         <SectionHeading
-          description="路线草稿与候选图谱在同一审核界面展示。发布其中一项不会自动发布另一项；已发布图谱之后才允许单独发布路线。"
-          title="初始路线草稿"
+          description="路线与候选图谱一起展示；重新规划后立即生效，无需草稿发布。"
+          title="学习路线预览"
         />
         {roadmap.isPending ? (
           <p className="mt-4 text-sm text-muted-foreground">
-            正在读取持久路线草稿…
+            正在读取学习路线…
           </p>
         ) : null}
         {roadmap.isError ? (
@@ -695,7 +686,7 @@ export function GraphReviewPage() {
               size="sm"
               variant="outline"
             >
-              {replan.isPending ? "生成中…" : "生成路线草稿"}
+              {replan.isPending ? "生成中…" : "生成学习路线"}
             </Button>
           </div>
         ) : null}
@@ -704,8 +695,10 @@ export function GraphReviewPage() {
             <div className="rounded-xl border bg-muted/20 p-4 text-sm">
               <p className="font-medium">{roadmap.data.rationale}</p>
               <p className="mt-2 text-muted-foreground">
-                路线 v{roadmap.data.version} · 图谱修订 v
-                {roadmap.data.graph_revision ?? "—"} · {roadmap.data.status}
+                图谱修订 v{roadmap.data.graph_revision ?? "—"} ·{" "}
+                {roadmap.data.status === "published" ? "已生效" : roadmap.data.status}
+                {" · "}
+                {roadmap.data.items.length} 项任务
               </p>
             </div>
             <ol className="grid gap-3 md:grid-cols-2">
@@ -716,13 +709,22 @@ export function GraphReviewPage() {
                   | undefined;
                 const prerequisites = metadata.prerequisites as
                   | {
+                      items?: Array<
+                        string | { label?: string; node_id?: string; satisfied?: boolean }
+                      >;
                       blocked_by?: Array<
                         string | { label?: string; node_id?: string }
                       >;
                     }
                   | undefined;
-                const blockedBy = (prerequisites?.blocked_by ?? []).map((item) =>
-                  typeof item === "string" ? item : item.label ?? item.node_id ?? "未知节点",
+                const source =
+                  prerequisites?.items?.length
+                    ? prerequisites.items
+                    : prerequisites?.blocked_by ?? [];
+                const prereqLabels = source.map((entry) =>
+                  typeof entry === "string"
+                    ? entry
+                    : entry.label ?? entry.node_id ?? "未知节点",
                 );
                 return (
                   <li className="rounded-xl border p-4" key={item.id}>
@@ -730,21 +732,21 @@ export function GraphReviewPage() {
                       <div>
                         <p className="font-medium">{item.title}</p>
                         <p className="mt-1 text-sm text-muted-foreground">
-                          {item.duration_minutes} 分钟 · {item.action_type} · 优先级 {item.priority}
+                          第 {item.day_index || "—"} 天 · {item.duration_minutes} 分钟 ·{" "}
+                          {item.action_type}
                         </p>
                         <p className="mt-2 text-xs leading-5 text-muted-foreground">
                           权重 {Math.round((scoreBreakdown?.importance ?? 0) * 100)}%
                           {" · "}掌握缺口 {Math.round((scoreBreakdown?.mastery_gap ?? 0) * 100)}%
                           {" · "}证据缺口 {Math.round((scoreBreakdown?.evidence_gap ?? 0) * 100)}%
                           {" · "}期限 {Math.round((scoreBreakdown?.deadline_urgency ?? 0) * 100)}%
-                          {" · "}偏好{(scoreBreakdown?.preference_match ?? 0) > 0 ? "命中" : "未命中"}
                         </p>
                       </div>
                       <StatePill status={item.status} />
                     </div>
-                    {blockedBy.length ? (
-                      <p className="mt-3 text-xs text-amber-700 dark:text-amber-300">
-                        前置未满足：{blockedBy.join("、")}
+                    {prereqLabels.length ? (
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        前置：{prereqLabels.join("、")}
                       </p>
                     ) : null}
                   </li>
@@ -758,25 +760,12 @@ export function GraphReviewPage() {
                 size="sm"
                 variant="outline"
               >
-                {replan.isPending ? "重排中…" : "按当前候选重排"}
+                {replan.isPending ? "重排中…" : "按当前图谱重排"}
               </Button>
-              {roadmap.data.status !== "published" ? (
-                <Button
-                  disabled={
-                    publishRoadmapDraft.isPending || graph.data.status !== "published"
-                  }
-                  onClick={() => publishRoadmapDraft.mutate(roadmap.data.id)}
-                  size="sm"
-                >
-                  {publishRoadmapDraft.isPending
-                    ? "发布中…"
-                    : graph.data.status === "published"
-                      ? "单独发布路线"
-                      : "先单独发布图谱后再发布路线"}
-                </Button>
-              ) : (
-                <StatePill status="published" />
-              )}
+              <StatePill
+                status={roadmap.data.status === "published" ? "published" : "pending"}
+                label={roadmap.data.status === "published" ? "已生效" : roadmap.data.status}
+              />
             </div>
           </div>
         ) : null}

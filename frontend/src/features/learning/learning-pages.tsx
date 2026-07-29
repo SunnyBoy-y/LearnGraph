@@ -801,6 +801,74 @@ export function PracticePage() {
           },
         ]}
       />
+
+      {batchItems.length ? (
+        <Surface className="p-5">
+          <SectionHeading
+            description={`批次 ${activeBatchId} · 按题型卡片同屏作答与批改`}
+            title="本批自测"
+          />
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            {batchItems.map((exercise) => (
+              <div className="space-y-3" key={exercise.id}>
+                <ExerciseAnswerCard
+                  answer={
+                    batchAnswers[exercise.id] ??
+                    (exercise.question_type === "multiple_choice" ? [] : "")
+                  }
+                  disabled={Boolean(batchResults[exercise.id])}
+                  exercise={exercise}
+                  onAnswerChange={(value) =>
+                    setBatchAnswers((current) => ({
+                      ...current,
+                      [exercise.id]: value,
+                    }))
+                  }
+                  result={batchResults[exercise.id]}
+                />
+                {!batchResults[exercise.id] ? (
+                  <Button
+                    disabled={submittingId === exercise.id}
+                    onClick={() => void submitOne(exercise)}
+                    size="sm"
+                  >
+                    {submittingId === exercise.id ? "评分中…" : "提交本题"}
+                  </Button>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </Surface>
+      ) : null}
+
+      {bankItems.length ? (
+        <Surface className="p-5">
+          <SectionHeading title="题库" />
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            {bankItems.map((exercise) => (
+              <ExerciseBankCard
+                exercise={exercise}
+                href={`/w/${workspaceId}/practice/${
+                  exercise.generation_batch_id || "default"
+                }/${exercise.id}`}
+                key={exercise.id}
+                nodeLabel={
+                  mastery.data.find((node) => node.node_id === exercise.node_id)
+                    ?.label
+                }
+              />
+            ))}
+          </div>
+        </Surface>
+      ) : wrongOnly ? (
+        <Surface className="border-dashed p-8 text-center">
+          <p className="text-sm font-medium">当前没有持久化的错题记录</p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            提交错误答案后，对应 AnswerRecord 会出现在这里。
+          </p>
+        </Surface>
+      ) : null}
+
       <div className="grid gap-5 xl:grid-cols-[1fr_1fr]">
         <Surface className="p-5">
           <SectionHeading
@@ -991,73 +1059,6 @@ export function PracticePage() {
           </div>
         </Surface>
       </div>
-
-      {batchItems.length ? (
-        <Surface className="p-5">
-          <SectionHeading
-            description={`批次 ${activeBatchId} · 按题型卡片同屏作答与批改`}
-            title="本批自测"
-          />
-          <div className="mt-4 grid gap-4 lg:grid-cols-2">
-            {batchItems.map((exercise) => (
-              <div className="space-y-3" key={exercise.id}>
-                <ExerciseAnswerCard
-                  answer={
-                    batchAnswers[exercise.id] ??
-                    (exercise.question_type === "multiple_choice" ? [] : "")
-                  }
-                  disabled={Boolean(batchResults[exercise.id])}
-                  exercise={exercise}
-                  onAnswerChange={(value) =>
-                    setBatchAnswers((current) => ({
-                      ...current,
-                      [exercise.id]: value,
-                    }))
-                  }
-                  result={batchResults[exercise.id]}
-                />
-                {!batchResults[exercise.id] ? (
-                  <Button
-                    disabled={submittingId === exercise.id}
-                    onClick={() => void submitOne(exercise)}
-                    size="sm"
-                  >
-                    {submittingId === exercise.id ? "评分中…" : "提交本题"}
-                  </Button>
-                ) : null}
-              </div>
-            ))}
-          </div>
-        </Surface>
-      ) : null}
-
-      {bankItems.length ? (
-        <Surface className="p-5">
-          <SectionHeading title="题库" />
-          <div className="mt-4 grid gap-3 md:grid-cols-2">
-            {bankItems.map((exercise) => (
-              <ExerciseBankCard
-                exercise={exercise}
-                href={`/w/${workspaceId}/practice/${
-                  exercise.generation_batch_id || "default"
-                }/${exercise.id}`}
-                key={exercise.id}
-                nodeLabel={
-                  mastery.data.find((node) => node.node_id === exercise.node_id)
-                    ?.label
-                }
-              />
-            ))}
-          </div>
-        </Surface>
-      ) : wrongOnly ? (
-        <Surface className="border-dashed p-8 text-center">
-          <p className="text-sm font-medium">当前没有持久化的错题记录</p>
-          <p className="mt-2 text-xs text-muted-foreground">
-            提交错误答案后，对应 AnswerRecord 会出现在这里。
-          </p>
-        </Surface>
-      ) : null}
     </PageFrame>
   );
 }

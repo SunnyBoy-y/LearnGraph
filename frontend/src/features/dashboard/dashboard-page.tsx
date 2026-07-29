@@ -96,9 +96,10 @@ export function DashboardPage() {
   const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
   const recentSession = sessions.data?.[0];
   const recentMessages = useQuery({
-    queryKey: ["messages", recentSession?.id],
-    queryFn: () => listSessionMessages(recentSession!.id),
+    queryKey: ["messages", recentSession?.id, "dashboard-preview"],
+    queryFn: () => listSessionMessages(recentSession!.id, { limit: 8 }),
     enabled: Boolean(recentSession),
+    gcTime: 30_000,
   });
   const recentAssistant = recentMessages.data
     ?.filter((item) => item.role === "assistant")

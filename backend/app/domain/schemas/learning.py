@@ -155,6 +155,26 @@ class ModelGeneratedExerciseSet(BaseModel):
     items: list[ModelGeneratedExerciseItem] = Field(min_length=1, max_length=10)
 
 
+class ModelShortAnswerGrade(BaseModel):
+    """Structured model output for short-answer auto-grading. Server-only."""
+
+    covered_points: list[str] = Field(default_factory=list, max_length=12)
+    missing_points: list[str] = Field(default_factory=list, max_length=12)
+    is_correct: bool
+    score_ratio: float = Field(default=0.0, ge=0, le=1)
+    feedback: str = Field(default="", max_length=2_000)
+
+    @field_validator("covered_points", "missing_points")
+    @classmethod
+    def normalize_point_lists(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if item and str(item).strip()][:12]
+
+    @field_validator("feedback")
+    @classmethod
+    def normalize_feedback(cls, value: str) -> str:
+        return value.strip()[:2_000]
+
+
 class ExerciseView(ORMModel):
     id: str
     workspace_id: str

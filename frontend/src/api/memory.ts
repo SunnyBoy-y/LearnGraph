@@ -11,6 +11,9 @@ import type {
   MemoryNamespace,
   MemoryPolicy,
   MemoryPolicyUpdateRequest,
+  MemoryProfile,
+  MemoryProfileIntentRequest,
+  MemoryProfileIntentResult,
   MemoryProviderMigrationResult,
   MemoryProviderStatus,
   MemoryPurgeResult,
@@ -114,6 +117,40 @@ export function getEffectiveMemoryPackage(params: {
   goal_id?: string
 } = {}): Promise<EffectiveMemoryPackage> {
   return apiClient.get<EffectiveMemoryPackage>('/memory/package', { query: params })
+}
+
+export function getMemoryProfile(): Promise<MemoryProfile> {
+  return apiClient.get<MemoryProfile>('/memory/profile')
+}
+
+export function refreshMemoryProfile(): Promise<MemoryProfile> {
+  return apiClient.post<MemoryProfile>('/memory/profile/refresh')
+}
+
+export function applyMemoryProfileIntent(
+  payload: MemoryProfileIntentRequest,
+): Promise<MemoryProfileIntentResult> {
+  return apiClient.post<MemoryProfileIntentResult, MemoryProfileIntentRequest>(
+    '/memory/profile/intents',
+    payload,
+  )
+}
+
+export function reconcileMemoryTime(): Promise<{ reviewed: number; lapsed: number }> {
+  return apiClient.post<{ reviewed: number; lapsed: number }>(
+    '/memory/maintenance/reconcile-time',
+  )
+}
+
+export function migrateLegacyMemoryAtoms(
+  limit = 20,
+): Promise<{ reviewed: number; migrated: number; created: number; deferred: number }> {
+  return apiClient.post<{
+    reviewed: number
+    migrated: number
+    created: number
+    deferred: number
+  }>('/memory/maintenance/migrate-atoms', undefined, { query: { limit } })
 }
 
 export function getMemoryEnhancement(): Promise<MemoryEnhancement> {

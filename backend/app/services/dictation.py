@@ -100,14 +100,30 @@ def dashscope_realtime_ws_url(base_url: str | None) -> str | None:
 
     The configured Provider row stores the compatible-mode HTTP origin; the
     realtime ASR service lives at ``/api-ws/v1/inference`` on the same host.
-    Non-DashScope gateways have no known realtime endpoint and return None.
+
+    Both the public DashScope gateway (``dashscope*.aliyuncs.com``) and the
+    dedicated per-tenant deployments (``*.maas.aliyuncs.com``) advertise the
+    realtime ASR models on their compatible-mode ``/models`` list, so the WS
+    endpoint is derived from whichever origin the Provider row stores.  This
+    mirrors ``dashscope_native_generation_url`` (image generation): private MaaS
+    tenants route neither the OpenAI path nor DashScope-flavoured HTTP, only the
+    WS inference path of the same host.
     """
 
-    if not base_url or not is_dashscope_api_base_url(base_url):
+    if not base_url:
         return None
     try:
         parsed = urlsplit(base_url.strip())
     except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() != "https" or not host:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if not is_dashscope_api_base_url(base_url) and not host.endswith(
+        ".maas.aliyuncs.com"
+    ):
         return None
     return f"wss://{parsed.netloc}/api-ws/v1/inference"
 

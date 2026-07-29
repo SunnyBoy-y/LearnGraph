@@ -27,7 +27,7 @@ import hashlib
 import logging
 import math
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func as sql_func, select
@@ -41,6 +41,7 @@ from app.domain.models import (
     ContextSummary,
     MemoryDraft,
     MemoryEmbedding,
+    MemoryEvidence,
     MemoryExtractionState,
     MemoryRecord,
     MemoryRevision,
@@ -83,6 +84,18 @@ _TRANSCRIPT_MESSAGE_CAP = 40
 _TRANSCRIPT_CHARS_PER_MESSAGE = 600
 _EXTRACTION_MAX_PROPOSALS = 5
 _EXISTING_MEMORY_CONTEXT_CAP = 30
+
+
+def _parse_extraction_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def default_enhancement_config() -> dict[str, Any]:
@@ -183,7 +196,10 @@ def _workspace_memory_enabled(db: Session, workspace_id: str) -> bool:
     )
     if setting is None or not isinstance(setting.value, dict):
         return False
-    return bool(setting.value.get("workspace_enabled"))
+    return bool(
+        setting.value.get("workspace_enabled")
+        and setting.value.get("workspace_learning_enabled", True)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +507,21 @@ def _extraction_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "operation": {"type": "string", "enum": ["CREATE", "UPDATE"]},
+                        "operation": {
+                            "type": "string",
+                            "enum": [
+                                "CREATE",
+                                "UPDATE",
+                                "CORRECT",
+                                "CONFIRM",
+                                "COMPLETE",
+                                "CANCEL",
+                                "RESCHEDULE",
+                                "SUPERSEDE",
+                                "RETRACT",
+                                "NOOP",
+                            ],
+                        },
                         "target_memory_id": {"type": "string"},
                         "memory_type": {
                             "type": "string",
@@ -499,10 +529,33 @@ def _extraction_schema() -> dict[str, Any]:
                         },
                         "title": {"type": "string"},
                         "content": {"type": "string"},
+                        "atom_kind": {"type": "string"},
+                        "canonical_key": {"type": "string"},
+                        "temporal_status": {"type": "string"},
+                        "summary_eligibility": {"type": "string"},
+                        "event_at": {"type": ["string", "null"]},
+                        "valid_from": {"type": ["string", "null"]},
+                        "valid_until": {"type": ["string", "null"]},
+                        "next_review_at": {"type": ["string", "null"]},
+                        "evidence_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
                         "confidence": {"type": "number"},
                         "importance": {"type": "number"},
                     },
-                    "required": ["memory_type", "title", "content", "confidence"],
+                    "required": [
+                        "operation",
+                        "memory_type",
+                        "title",
+                        "content",
+                        "atom_kind",
+                        "canonical_key",
+                        "temporal_status",
+                        "summary_eligibility",
+                        "evidence_ids",
+                        "confidence",
+                    ],
                 },
             }
         },
@@ -523,20 +576,26 @@ def _extraction_prompt(
 ) -> str:
     scope_hint = "该会话关联了一个学习目标。" if session.goal_id else "该会话没有关联学习目标。"
     return (
-        "你是 LearnGraph 的记忆整理器。阅读下面这段学习对话的新增内容，"
-        "抽取值得跨会话长期记住的信息（类似 ChatGPT 的记忆功能）。\n\n"
+        "你是 LearnGraph 的原子记忆整理器。输入只包含经过来源过滤的用户陈述；"
+        "助手回答、文件原文、网页和工具结果没有资格出现在这里。请把用户陈述"
+        "提炼为最小、规范化、可验证的原子，而不是复制聊天原文。\n\n"
         "只抽取对未来教学持续有用的稳定信息：学习偏好、稳定的个人事实、"
         "暴露出的错误概念、被验证有效/无效的教学策略、重要决定、阶段性事件总结。\n"
-        "不要抽取：一次性的问答内容、当前任务细节、可以从图谱/掌握度中查到的权威状态"
-        "（掌握分数、路线版本、文件路径等）、以及任何未经用户表达的臆测。\n\n"
+        "不要抽取：一次性的问答内容、当前任务细节、上传/解析文件这个动作、文件中的"
+        "人物事实、可以从图谱/掌握度中查到的权威状态（掌握分数、路线版本、文件路径等）、"
+        "以及任何未经用户明确表达的臆测。一次事件绝不能推断成习惯。\n"
+        f"可信当前时间：{utc_now().isoformat()}；默认时区：Asia/Shanghai。"
+        "相对时间必须转成绝对 ISO 时间。计划过去不代表已经完成；取消用 CANCEL，"
+        "改期用 RESCHEDULE，没有足够证据用 NOOP。\n\n"
         f"可用的记忆类型：\n{_type_catalog_lines()}\n\n"
         f"{scope_hint}\n\n"
         f"已有记忆（避免重复；如需修正请用 operation=UPDATE 并给出 target_memory_id）：\n"
         f"{existing_lines or '（无）'}\n\n"
-        f"对话新增内容：\n{transcript}\n\n"
+        f"<eligible_user_evidence>\n{transcript}\n</eligible_user_evidence>\n\n"
         f"要求：最多提出 {_EXTRACTION_MAX_PROPOSALS} 条；标题不超过 60 字；"
         "内容用中文、单条不超过 300 字；confidence 取 0-1 并保守估计"
-        "（仅当用户明确表达时才 >= 0.75）；没有值得记住的内容时返回空数组。"
+        "（仅当用户明确表达时才 >= 0.75）；每条非 NOOP 原子必须引用输入中的"
+        " evidence_id；没有值得记住的内容时返回空数组。"
     )
 
 
@@ -551,7 +610,7 @@ def _new_messages_since(
         .where(
             Message.workspace_id == workspace_id,
             Message.session_id == session_id,
-            Message.role.in_(["user", "assistant"]),
+            Message.role == "user",
             Message.status == "completed",
         )
         .order_by(Message.created_at, Message.id)
@@ -574,6 +633,41 @@ def _new_messages_since(
     return messages[-_TRANSCRIPT_MESSAGE_CAP:]
 
 
+def _user_evidence_for_messages(
+    db: Session,
+    workspace_id: str,
+    messages: list[Message],
+) -> dict[str, MemoryEvidence]:
+    by_message: dict[str, MemoryEvidence] = {}
+    for message in messages:
+        evidence = db.scalar(
+            select(MemoryEvidence).where(
+                MemoryEvidence.workspace_id == workspace_id,
+                MemoryEvidence.source_kind == "user_statement",
+                MemoryEvidence.source_id == message.id,
+                MemoryEvidence.deleted_at.is_(None),
+            )
+        )
+        if evidence is None:
+            content = (message.content or "").strip()
+            evidence = MemoryEvidence(
+                workspace_id=workspace_id,
+                source_kind="user_statement",
+                source_id=message.id,
+                message_id=message.id,
+                authorship="user",
+                observed_at=message.created_at,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                excerpt=content[:1_200],
+                profile_eligible=True,
+                eligibility_reason="direct_user_message",
+            )
+            db.add(evidence)
+            db.flush()
+        by_message[message.id] = evidence
+    return by_message
+
+
 def _existing_memory_context(
     db: Session, workspace_id: str, session_id: str
 ) -> tuple[list[MemoryRecord], str]:
@@ -594,7 +688,14 @@ def _existing_memory_context(
         ).all()
     )
     lines = "\n".join(
-        f"- id={record.id} type={record.record_kind} title={record.title}"
+        (
+            f"- id={record.id} type={record.record_kind} "
+            f"atom_kind={getattr(record, 'atom_kind', 'fact')} "
+            f"canonical_key={getattr(record, 'canonical_key', '') or '-'} "
+            f"ledger={getattr(record, 'ledger_status', 'active')} "
+            f"temporal={getattr(record, 'temporal_status', 'timeless')} "
+            f"title={record.title}"
+        )
         for record in records
     )
     return records, lines
@@ -648,7 +749,11 @@ def extract_session_memories(
     )
     if session is None:
         raise AppError(404, "session_not_found", "session not found")
-    if not _workspace_memory_enabled(db, workspace.id) or not session.memory_enabled:
+    if (
+        not _workspace_memory_enabled(db, workspace.id)
+        or not session.memory_enabled
+        or not bool(getattr(session, "memory_learning_enabled", True))
+    ):
         if force:
             raise AppError(
                 409,
@@ -664,7 +769,7 @@ def extract_session_memories(
         )
     )
     messages = _new_messages_since(db, workspace.id, session_id, state)
-    if len(messages) < 2:
+    if not messages:
         return {"status": "no_new_messages", "drafts_created": 0}
 
     if state is None:
@@ -691,8 +796,20 @@ def extract_session_memories(
             )
         return {"status": "provider_unavailable", "drafts_created": 0}
 
+    evidence_by_message = _user_evidence_for_messages(
+        db, workspace.id, messages
+    )
+    eligible_evidence_ids = {
+        evidence.id for evidence in evidence_by_message.values()
+    }
     transcript = "\n".join(
-        f"[{item.role}] {item.content[:_TRANSCRIPT_CHARS_PER_MESSAGE]}" for item in messages
+        (
+            f"<evidence id=\"{evidence_by_message[item.id].id}\" "
+            f"message_id=\"{item.id}\">"
+            f"{item.content[:_TRANSCRIPT_CHARS_PER_MESSAGE]}"
+            "</evidence>"
+        )
+        for item in messages
     )
     existing_records, existing_lines = _existing_memory_context(
         db, workspace.id, session_id
@@ -789,14 +906,69 @@ def extract_session_memories(
         except (TypeError, ValueError):
             importance = 0.5
         operation = str(proposal.get("operation") or "CREATE").strip().upper()
+        if operation == "NOOP":
+            continue
         target_memory_id = str(proposal.get("target_memory_id") or "").strip() or None
-        if operation == "UPDATE" and target_memory_id not in known_ids:
+        if operation != "CREATE" and target_memory_id not in known_ids:
             operation = "CREATE"
             target_memory_id = None
         if operation == "CREATE":
             if _content_hash(title, content) in known_hashes or title in pending_titles:
                 skipped += 1
                 continue
+        evidence_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in (proposal.get("evidence_ids") or [])
+                if str(value) in eligible_evidence_ids
+            )
+        )
+        if not evidence_ids:
+            skipped += 1
+            continue
+        temporal_status = str(
+            proposal.get("temporal_status") or "timeless"
+        ).strip()
+        summary_eligibility = str(
+            proposal.get("summary_eligibility") or "durable"
+        ).strip()
+        event_at = proposal.get("event_at")
+        valid_until = proposal.get("valid_until")
+        next_review_at = proposal.get("next_review_at")
+        temporal_anchor = (
+            _parse_extraction_time(valid_until)
+            or _parse_extraction_time(event_at)
+        )
+        if temporal_status == "planned" and temporal_anchor is not None:
+            if temporal_anchor <= utc_now():
+                # A past plan is evidence that a plan existed, never evidence
+                # that the event happened. Keep it out of the current profile
+                # until the user confirms, cancels, or reschedules it.
+                temporal_status = "lapsed_unverified"
+                summary_eligibility = "historical"
+                next_review_at = None
+            elif _parse_extraction_time(next_review_at) is None:
+                next_review_at = (temporal_anchor + timedelta(days=1)).isoformat()
+        structured_payload = {
+            "atom_schema_version": 1,
+            "atom_kind": str(proposal.get("atom_kind") or "fact")[:64],
+            "canonical_key": str(proposal.get("canonical_key") or "")[:240],
+            "ledger_status": "active",
+            "temporal_status": temporal_status,
+            "summary_eligibility": summary_eligibility,
+            "event_at": event_at,
+            "valid_from": proposal.get("valid_from"),
+            "valid_until": valid_until,
+            "next_review_at": next_review_at,
+            "last_verified_at": utc_now().isoformat(),
+            "timezone_name": "Asia/Shanghai",
+            "evidence_ids": evidence_ids,
+            "provenance": {
+                "authorship": "user",
+                "source_kinds": ["user_statement"],
+                "profile_eligible": True,
+            },
+        }
         try:
             draft = memory_service.create_draft(
                 MemoryDraftCreateRequest(
@@ -805,6 +977,7 @@ def extract_session_memories(
                     target_memory_id=target_memory_id,
                     title=title,
                     content=content,
+                    structured_payload=structured_payload,
                     proposed_scope_type=_proposal_scope(memory_type, session),
                     goal_id=session.goal_id,
                     session_id=session.id,
@@ -813,7 +986,14 @@ def extract_session_memories(
                     # UPDATE rewrites an existing memory: always human-reviewed.
                     auto_commit=bool(extraction_cfg["auto_commit"]) and operation == "CREATE",
                     created_by="memory_extraction",
-                    source_refs=[{"type": "session", "id": session.id}],
+                    source_refs=[
+                        {
+                            "type": "memory_evidence",
+                            "id": evidence_id,
+                            "source_kind": "user_statement",
+                        }
+                        for evidence_id in evidence_ids
+                    ],
                 )
             )
         except AppError as exc:

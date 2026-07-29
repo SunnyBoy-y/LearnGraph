@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   ArchiveRestore,
   ArrowRight,
+  Bot,
   Brain,
   Building2,
   Check,
@@ -26,6 +27,7 @@ import {
   RotateCcw,
   Search,
   Settings2,
+  Share2,
   ShieldAlert,
   Sun,
   Trash2,
@@ -114,14 +116,17 @@ import {
   areChatSuggestedPromptsEnabled,
   CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
   CHAT_CONTEXT_USAGE_SETTING_KEY,
+  CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
   isChatContextUsageEnabled,
   isChatDictationCleanupEnabled,
+  readChatDefaultResponseMode,
   readChatFeatureModelSetting,
 } from "@/lib/workspace-settings";
+import type { ResponseMode } from "@/lib/session-composer-prefs";
 import { cn } from "@/lib/utils";
 import { DatabaseConfigurationSheet } from "@/features/settings/database-configuration-sheet";
 import type { AuditEvent } from "@/types/audit";
@@ -139,6 +144,7 @@ const MODEL_PROVIDER_TYPES = new Set([
   "openai_responses",
   "openai_compatible_chat",
   "qwen",
+  "codex_chatgpt",
   "deepseek_chat",
   "anthropic_messages",
 ]);
@@ -2217,6 +2223,18 @@ export function WorkspaceSettingsPage() {
       toast.success("上下文用量显示设置已更新");
     },
   });
+  const saveDefaultResponseMode = useMutation({
+    mutationFn: (response_mode: ResponseMode) =>
+      updateSetting(CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY, { response_mode }),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("默认响应模式已更新");
+    },
+  });
   const memoryEnhancement = useQuery({
     queryKey: ["memory-enhancement"],
     queryFn: getMemoryEnhancement,
@@ -2349,6 +2367,7 @@ export function WorkspaceSettingsPage() {
   );
   const dictationCleanupEnabled = isChatDictationCleanupEnabled(settings.data);
   const contextUsageEnabled = isChatContextUsageEnabled(settings.data);
+  const defaultResponseMode = readChatDefaultResponseMode(settings.data);
   const dictationCleanupModel = useMemo(
     () =>
       readChatFeatureModelSetting(
@@ -2595,6 +2614,36 @@ export function WorkspaceSettingsPage() {
           </div>
           <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
             <div className="flex min-w-0 items-center gap-3">
+              <Bot className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">默认响应模式</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  新建对话时的默认状态：极速 / 思考 / 智能体；已有会话仍记住各自上次选择
+                </p>
+              </div>
+            </div>
+            <Select
+              disabled={saveDefaultResponseMode.isPending}
+              onValueChange={(value) =>
+                saveDefaultResponseMode.mutate(value as ResponseMode)
+              }
+              value={defaultResponseMode}
+            >
+              <SelectTrigger
+                aria-label="默认响应模式"
+                className="w-[8.5rem] shrink-0"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="fast">极速</SelectItem>
+                <SelectItem value="thinking">思考</SelectItem>
+                <SelectItem value="agentic">智能体</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
               <Brain className="size-5 shrink-0 text-primary" />
               <div className="min-w-0">
                 <p className="text-sm font-medium">记忆整理</p>
@@ -2661,31 +2710,65 @@ export function WorkspaceSettingsPage() {
 
       <Surface className="p-5">
         <SectionHeading
-          description="工作区总开关与 Session 开关必须同时启用，记忆才能跨会话注入"
+          description="分别控制是否读取已有记忆、是否从当前会话学习；临时会话可同时关闭"
           title="共同记忆策略"
         />
         <div className="mt-5 grid gap-3 lg:grid-cols-2">
-          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">工作区共同记忆</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                关闭后任何 Session 都不能跨会话注入
-              </p>
+          <div className="rounded-xl border p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex min-w-0 items-center gap-3">
+                <Share2 className="size-5 shrink-0 text-primary" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium">工作区共同记忆</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    总开关关闭后，读取与学习都会停止
+                  </p>
+                </div>
+              </div>
+              <Switch
+                aria-label="工作区共同记忆"
+                checked={memoryPolicy.data?.workspace_enabled ?? false}
+                disabled={memoryPolicy.isPending || savePolicy.isPending}
+                onCheckedChange={(workspace_enabled) =>
+                  savePolicy.mutate({ workspace_enabled })
+                }
+              />
             </div>
-            <Switch
-              aria-label="工作区共同记忆"
-              checked={memoryPolicy.data?.workspace_enabled ?? false}
-              disabled={memoryPolicy.isPending || savePolicy.isPending}
-              onCheckedChange={(workspace_enabled) =>
-                savePolicy.mutate({ workspace_enabled })
-              }
-            />
+            <div className="mt-4 space-y-3 border-t pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs text-muted-foreground">在回答中读取已有记忆</span>
+                <Switch
+                  aria-label="工作区读取记忆"
+                  checked={memoryPolicy.data?.workspace_recall_enabled ?? true}
+                  disabled={memoryPolicy.isPending || savePolicy.isPending}
+                  onCheckedChange={(workspace_recall_enabled) =>
+                    savePolicy.mutate({ workspace_recall_enabled })
+                  }
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs text-muted-foreground">从新对话中整理记忆</span>
+                <Switch
+                  aria-label="工作区学习记忆"
+                  checked={memoryPolicy.data?.workspace_learning_enabled ?? true}
+                  disabled={memoryPolicy.isPending || savePolicy.isPending}
+                  onCheckedChange={(workspace_learning_enabled) =>
+                    savePolicy.mutate({ workspace_learning_enabled })
+                  }
+                />
+              </div>
+            </div>
           </div>
           <div className="rounded-xl border p-4">
-            <p className="text-sm font-medium">Session 策略</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              为单个会话单独开启或关闭共同记忆
-            </p>
+            <div className="flex items-center gap-3">
+              <Share2 className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">Session 策略</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  为单个会话单独开启或关闭共同记忆
+                </p>
+              </div>
+            </div>
             {sessions.data?.length ? (
               <>
                 <SessionCombobox
@@ -2717,6 +2800,36 @@ export function WorkspaceSettingsPage() {
                       })
                     }
                   />
+                </div>
+                <div className="mt-3 space-y-3 border-t pt-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs text-muted-foreground">读取已有记忆</span>
+                    <Switch
+                      aria-label="Session 读取记忆"
+                      checked={sessionPolicy.data?.session_recall_enabled ?? true}
+                      disabled={!policySessionId || sessionPolicy.isPending || savePolicy.isPending}
+                      onCheckedChange={(session_recall_enabled) =>
+                        savePolicy.mutate({
+                          session_id: policySessionId,
+                          session_recall_enabled,
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-xs text-muted-foreground">贡献新的记忆</span>
+                    <Switch
+                      aria-label="Session 学习记忆"
+                      checked={sessionPolicy.data?.session_learning_enabled ?? true}
+                      disabled={!policySessionId || sessionPolicy.isPending || savePolicy.isPending}
+                      onCheckedChange={(session_learning_enabled) =>
+                        savePolicy.mutate({
+                          session_id: policySessionId,
+                          session_learning_enabled,
+                        })
+                      }
+                    />
+                  </div>
                 </div>
               </>
             ) : (

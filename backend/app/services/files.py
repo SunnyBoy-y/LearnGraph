@@ -21,6 +21,9 @@ from app.domain.models import (
     FileReference,
     FileTextChunk,
     Goal,
+    MemoryEvidence,
+    MemoryProfileSnapshot,
+    MemoryRecord,
     Message,
     MessagePartRecord,
     MessageVersion,
@@ -736,6 +739,75 @@ class FileService:
         """Same cleanup as `_delete` but leaves the final commit to the caller."""
 
         self._detach_json_references(record)
+        now = utc_now()
+        file_evidence = list(
+            self.db.scalars(
+                select(MemoryEvidence).where(
+                    MemoryEvidence.workspace_id == self.workspace_id,
+                    MemoryEvidence.file_id == record.id,
+                    MemoryEvidence.deleted_at.is_(None),
+                )
+            ).all()
+        )
+        file_evidence_ids = {item.id for item in file_evidence}
+        for item in file_evidence:
+            item.profile_eligible = False
+            item.eligibility_reason = "source_file_deleted"
+            item.deleted_at = now
+        invalidated_atoms: list[str] = []
+        if file_evidence_ids:
+            active_evidence_ids = set(
+                self.db.scalars(
+                    select(MemoryEvidence.id).where(
+                        MemoryEvidence.workspace_id == self.workspace_id,
+                        MemoryEvidence.profile_eligible.is_(True),
+                        MemoryEvidence.deleted_at.is_(None),
+                    )
+                ).all()
+            )
+            atoms = list(
+                self.db.scalars(
+                    select(MemoryRecord).where(
+                        MemoryRecord.workspace_id == self.workspace_id,
+                        MemoryRecord.state == "active",
+                        MemoryRecord.ledger_status == "active",
+                    )
+                ).all()
+            )
+            for atom in atoms:
+                evidence_ids = set(atom.evidence_ids or [])
+                if not evidence_ids.intersection(file_evidence_ids):
+                    continue
+                if evidence_ids.intersection(active_evidence_ids):
+                    # An independent user confirmation survives file deletion.
+                    atom.evidence_ids = sorted(
+                        evidence_ids.difference(file_evidence_ids)
+                    )
+                    continue
+                atom.ledger_status = "retracted"
+                atom.temporal_status = "expired"
+                atom.summary_eligibility = "excluded"
+                structured = dict(atom.structured_payload or {})
+                structured.update(
+                    {
+                        "ledger_status": "retracted",
+                        "temporal_status": "expired",
+                        "summary_eligibility": "excluded",
+                        "retraction_reason": "sole_source_file_deleted",
+                    }
+                )
+                atom.structured_payload = structured
+                invalidated_atoms.append(atom.id)
+            if invalidated_atoms:
+                for snapshot in self.db.scalars(
+                    select(MemoryProfileSnapshot).where(
+                        MemoryProfileSnapshot.workspace_id
+                        == self.workspace_id,
+                        MemoryProfileSnapshot.status == "ready",
+                    )
+                ).all():
+                    snapshot.status = "stale"
+                    snapshot.stale_reason = "source_file_deleted"
         references = list(
             self.db.scalars(
                 self.references.query().where(FileReference.file_id == record.id)
@@ -773,6 +845,8 @@ class FileService:
             details={
                 "impacts": [item.model_dump() for item in impact.impacts],
                 "detached_references": reference_snapshots,
+                "memory_evidence_invalidated": sorted(file_evidence_ids),
+                "memory_atoms_retracted": invalidated_atoms,
             },
         )
         self.files.delete(record)

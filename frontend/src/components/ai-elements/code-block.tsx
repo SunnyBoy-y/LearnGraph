@@ -129,39 +129,90 @@ const CodeBlockContext = createContext<CodeBlockContextType>({
   code: "",
 });
 
-// Highlighter cache (singleton per language)
-const highlighterCache = new Map<
-  string,
-  Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
->();
+// One shared highlighter instance for the whole app. Shiki engines are large
+// (per-language grammars + theme state), so creating a fresh `createHighlighter`
+// per language used to leak dozens of MB per distinct language seen across
+// every agent session. Now we keep a single engine and load languages lazily.
+const THEMES = ["github-light", "github-dark"] as const;
+let sharedHighlighterPromise:
+  | Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
+  | undefined;
 
-// Token cache
+// Tracks languages currently loading (or already loaded) so concurrent
+// CodeBlocks for the same language share one load() call instead of racing.
+const loadingLanguages = new Map<BundledLanguage, Promise<void>>();
+
+const getHighlighter = (
+  language: BundledLanguage
+): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
+  if (sharedHighlighterPromise) return sharedHighlighterPromise;
+  sharedHighlighterPromise = createHighlighter({
+    langs: [language],
+    themes: [...THEMES],
+  });
+  return sharedHighlighterPromise;
+};
+
+const ensureLanguageLoaded = (
+  highlighter: HighlighterGeneric<BundledLanguage, BundledTheme>,
+  language: BundledLanguage
+): Promise<void> => {
+  if (highlighter.getLoadedLanguages().includes(language)) {
+    return Promise.resolve();
+  }
+  const pending = loadingLanguages.get(language);
+  if (pending) return pending;
+  const load = highlighter.loadLanguage(language).then(() => {
+    loadingLanguages.delete(language);
+  });
+  loadingLanguages.set(language, load);
+  return load;
+};
+
+// Bounded LRU token cache. The previous unbounded Map kept tokenized AST for
+// every distinct code block across every conversation forever — the dominant
+// source of the idle-memory baseline. A 128-entry window covers realistic
+// visible-history working sets while bounding worst-case footprint.
+const TOKENS_CACHE_MAX = 128;
+
+// Token cache (LRU-bounded)
 const tokensCache = new Map<string, TokenizedCode>();
 
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
 
+function evictTokensCache(key: string) {
+  if (tokensCache.size < TOKENS_CACHE_MAX) return;
+  // Map preserves insertion order; drop the oldest entry. Skip the freshly
+  // written key itself (it will be re-set right after by the caller).
+  for (const oldest of tokensCache.keys()) {
+    if (oldest === key) continue;
+    tokensCache.delete(oldest);
+    subscribers.delete(oldest);
+    break;
+  }
+}
+
+function setTokensCache(key: string, value: TokenizedCode) {
+  // Refresh recency on re-touch (delete then re-insert keeps order = LRU).
+  if (tokensCache.has(key)) tokensCache.delete(key);
+  else evictTokensCache(key);
+  tokensCache.set(key, value);
+}
+
+function getTokensCache(key: string): TokenizedCode | undefined {
+  const value = tokensCache.get(key);
+  if (value === undefined) return undefined;
+  // Refresh recency: move to most-recent.
+  tokensCache.delete(key);
+  tokensCache.set(key, value);
+  return value;
+}
+
 const getTokensCacheKey = (code: string, language: BundledLanguage) => {
   const start = code.slice(0, 100);
   const end = code.length > 100 ? code.slice(-100) : "";
   return `${language}:${code.length}:${start}:${end}`;
-};
-
-const getHighlighter = (
-  language: BundledLanguage
-): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
-  const cached = highlighterCache.get(language);
-  if (cached) {
-    return cached;
-  }
-
-  const highlighterPromise = createHighlighter({
-    langs: [language],
-    themes: ["github-light", "github-dark"],
-  });
-
-  highlighterCache.set(language, highlighterPromise);
-  return highlighterPromise;
 };
 
 // Create raw tokens for immediate display while highlighting loads
@@ -190,7 +241,7 @@ const highlightCode = (
   const tokensCacheKey = getTokensCacheKey(code, language);
 
   // Return cached result if available
-  const cached = tokensCache.get(tokensCacheKey);
+  const cached = getTokensCache(tokensCacheKey);
   if (cached) {
     return cached;
   }
@@ -206,7 +257,10 @@ const highlightCode = (
   // Start highlighting in background - fire-and-forget async pattern
   getHighlighter(language)
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
-    .then((highlighter) => {
+    .then(async (highlighter) => {
+      // Lazily load this language into the shared single-instance engine.
+      // Avoids creating a whole new highlighter per distinct language.
+      await ensureLanguageLoaded(highlighter, language);
       const availableLangs = highlighter.getLoadedLanguages();
       const langToUse = availableLangs.includes(language) ? language : "text";
 
@@ -225,7 +279,7 @@ const highlightCode = (
       };
 
       // Cache the result
-      tokensCache.set(tokensCacheKey, tokenized);
+      setTokensCache(tokensCacheKey, tokenized);
 
       // Notify all subscribers
       const subs = subscribers.get(tokensCacheKey);

@@ -54,6 +54,7 @@ import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
 import { downloadFile } from "@/api/files";
 import { confirmSkillDeletion } from "@/api/extensions";
+import { approveResearch } from "@/api/research";
 import {
   TrustedComponentRenderer,
   type TrustedComponentAction,
@@ -70,6 +71,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { toast } from "sonner";
 import {
   documentHref,
   isDocumentCitationHref,
@@ -1125,6 +1127,12 @@ function toolDisplayTitle(
   if (toolName === "sandbox_exec" || toolName === "sandbox_run") {
     return "沙箱执行";
   }
+  if (toolName === "start_deep_research") {
+    return "启动深度研究";
+  }
+  if (toolName === "get_deep_research") {
+    return "查询深度研究";
+  }
   return toolName ?? "工具调用";
 }
 
@@ -1224,30 +1232,158 @@ function ToolCallPart({
         type="dynamic-tool"
       />
       <ToolContent>
-        <ToolInput input={toolInput} />
-        {isAwaitingResult ? (
-          <p
-            aria-live="polite"
-            className="text-xs text-muted-foreground"
-            role="status"
-          >
-            正在等待工具结果…
-          </p>
-        ) : (
-          <ToolOutput
-            errorText={
-              part.status === "failed" ? content || "工具调用失败" : undefined
-            }
-            output={
-              part.status === "failed"
-                ? part.data?.output
-                : (part.data?.output ??
-                  (content || "未返回可展示的工具输出"))
-            }
-          />
-        )}
+        {/*
+          Only mount I/O bodies while expanded. Collapsed tools used to keep
+          full JSON + Shiki trees for every agent step in long sessions.
+        */}
+        {open ? (
+          <>
+            <ToolInput input={toolInput} />
+            {isAwaitingResult ? (
+              <p
+                aria-live="polite"
+                className="text-xs text-muted-foreground"
+                role="status"
+              >
+                正在等待工具结果…
+              </p>
+            ) : (
+              <ToolOutput
+                errorText={
+                  part.status === "failed"
+                    ? content || "工具调用失败"
+                    : undefined
+                }
+                output={
+                  part.status === "failed"
+                    ? part.data?.output
+                    : (part.data?.output ??
+                      (content || "未返回可展示的工具输出"))
+                }
+              />
+            )}
+          </>
+        ) : null}
       </ToolContent>
     </Tool>
+  );
+}
+
+type DeepResearchApprovalData = {
+  user_approval_required?: boolean;
+  research_job_id?: string;
+  estimated_cost_cny?: number | string;
+  budget_cny?: number | string;
+  question?: string;
+};
+
+/**
+ * Budget-approval card for an agent-initiated Deep Research job.
+ * Rendered outside the thinking chain so the user can approve without expanding
+ * the fold; approval auto-re-drives the agent.
+ */
+export function DeepResearchApprovalFromPart({ part }: { part: MessagePart }) {
+  const output = part.data?.output as DeepResearchApprovalData | undefined;
+  if (
+    part.data?.tool_name !== "start_deep_research" ||
+    output?.user_approval_required !== true
+  ) {
+    return null;
+  }
+  return <DeepResearchApprovalCard data={output} />;
+}
+
+function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) {
+  const jobId = typeof data.research_job_id === "string" ? data.research_job_id : "";
+  const estimated =
+    typeof data.estimated_cost_cny === "number"
+      ? data.estimated_cost_cny
+      : Number(data.estimated_cost_cny) || 0;
+  const budget =
+    typeof data.budget_cny === "number"
+      ? data.budget_cny
+      : Number(data.budget_cny) || 0;
+  const displayCost = estimated > 0 ? estimated : budget;
+  const [status, setStatus] = useState<"pending" | "submitting" | "approved">(
+    "pending",
+  );
+  const [error, setError] = useState("");
+
+  if (!jobId) {
+    return (
+      <section className="mt-3 rounded-xl border border-amber-300 p-4">
+        <p className="text-sm text-muted-foreground">
+          研究任务等待预算确认，但缺少任务标识。
+        </p>
+      </section>
+    );
+  }
+  if (status === "approved") {
+    return (
+      <section className="mt-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:bg-emerald-950/30">
+        <strong className="text-emerald-700 dark:text-emerald-400">
+          预算已确认并启动，等待智能体续跑取回研究结果。
+        </strong>
+      </section>
+    );
+  }
+  return (
+    <section
+      aria-label="研究任务预算确认"
+      className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20"
+    >
+      <div>
+        <strong className="text-amber-700 dark:text-amber-400">
+          需要确认研究预算
+        </strong>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {displayCost > 0
+            ? `远程 Provider 预计费用 ¥${displayCost.toFixed(2)}。批准后才会调用远程研究 Provider。`
+            : "批准后才会调用远程研究 Provider。"}
+        </p>
+        {typeof data.question === "string" && data.question.trim() ? (
+          <p className="mt-2 text-sm text-foreground/80">
+            研究问题：{data.question.trim()}
+          </p>
+        ) : null}
+      </div>
+      {error ? (
+        <p className="text-sm text-destructive" role="alert">
+          {error}
+        </p>
+      ) : null}
+      <Button
+        disabled={status === "submitting"}
+        size="sm"
+        onClick={async () => {
+          setStatus("submitting");
+          setError("");
+          try {
+            await approveResearch(jobId);
+            setStatus("approved");
+            toast.success("预算已确认，研究任务已启动");
+            // Re-drive the agent to fetch the approved job's results via the
+            // existing composer auto-send path in chat-pages.
+            window.dispatchEvent(
+              new CustomEvent("learngraph:compose", {
+                detail: {
+                  content: `已批准研究任务 ${jobId}，请使用 get_deep_research 工具查询结果。`,
+                  autoSend: true,
+                },
+              }),
+            );
+          } catch (fetchError) {
+            setStatus("pending");
+            const message =
+              fetchError instanceof Error ? fetchError.message : "预算确认失败";
+            setError(message);
+            toast.error(message);
+          }
+        }}
+      >
+        {status === "submitting" ? "确认中…" : "确认预算并启动"}
+      </Button>
+    </section>
   );
 }
 

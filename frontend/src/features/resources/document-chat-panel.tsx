@@ -236,8 +236,9 @@ export function DocumentChatPanel({
   const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
   const history = useQuery({
     queryKey: ["messages", sessionId],
-    queryFn: () => listSessionMessages(sessionId),
+    queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
     enabled: Boolean(sessionId),
+    gcTime: 15_000,
   });
   const modelProviders = useMemo(
     () =>

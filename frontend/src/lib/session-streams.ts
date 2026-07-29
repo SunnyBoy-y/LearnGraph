@@ -23,6 +23,11 @@ export function isSessionStreaming(
   return Boolean(getSessionStream(sessionId));
 }
 
+/** Session ids that currently own an in-flight generation controller. */
+export function listStreamingSessionIds(): string[] {
+  return Array.from(streams.keys());
+}
+
 /**
  * Register a new stream for the session. Aborts any previous controller for the
  * same session only (same-session re-send), never other sessions.

@@ -1,9 +1,11 @@
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AnimatePresence, motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
 import {
   Archive,
   ArrowUp,
+  BookOpenText,
   Clock3,
   Download,
   Eye,
@@ -21,6 +23,7 @@ import {
 import { toast } from 'sonner'
 
 import {
+  applyMemoryProfileIntent,
   createMemory,
   deleteMemory,
   exportMemoryMarkdown,
@@ -29,6 +32,7 @@ import {
   getEffectiveMemoryPackage,
   getGraph,
   getMemory,
+  getMemoryProfile,
   listGoals,
   listGraphs,
   listMemoryBindings,
@@ -36,9 +40,11 @@ import {
   listMemoryRevisions,
   listMemoryTypes,
   listSessions,
+  migrateLegacyMemoryAtoms,
   purgeExpiredMemoryContent,
   restoreDeletedMemory,
   restoreMemoryRevision,
+  refreshMemoryProfile,
   summarizeSessionContext,
   updateMemory,
 } from '@/api'
@@ -93,6 +99,7 @@ import type {
   MemoryCreateRequest,
   MemoryEntry,
   MemoryNamespace,
+  MemoryProfile,
   MemoryRevision,
   MemoryScopeType,
   MemoryZone,
@@ -113,8 +120,6 @@ const zoneDefinitions: Array<{
   { zone: 'archive', title: '冷区归档', description: '已闭环事件与完整来源', icon: Archive },
 ]
 
-const zoneRank: Record<MemoryZone, number> = { hot: 0, recent: 1, topics: 2, archive: 3 }
-
 function memoryBody(markdown: string | null): string {
   if (!markdown) return ''
   const lines = markdown.split('\n')
@@ -127,18 +132,7 @@ function formatTime(value: string | null): string {
   return value ? new Date(value).toLocaleString() : '—'
 }
 
-function deriveQuickTitle(text: string): string {
-  const firstLine = text.split('\n').map((line) => line.trim()).find(Boolean) ?? ''
-  const cleaned = firstLine.replace(/^[#>\-*\s]+/, '').replace(/[。．.!！?？]+$/, '')
-  if (!cleaned) return '用户补充记忆'
-  return cleaned.length > 24 ? `${cleaned.slice(0, 24)}…` : cleaned
-}
-
-function summaryUpdatedHint(items: MemoryEntry[]): string | null {
-  let latest: string | null = null
-  for (const item of items) {
-    if (!latest || item.updated_at > latest) latest = item.updated_at
-  }
+function profileUpdatedHint(latest: string | null): string | null {
   if (!latest) return null
   const elapsedMinutes = Math.max(
     0,
@@ -170,6 +164,10 @@ export function MemoryPage() {
     queryKey: ['memory', 'active'],
     queryFn: () => listMemories({ include_content: true }),
   })
+  const profile = useQuery({
+    queryKey: ['memory-profile'],
+    queryFn: getMemoryProfile,
+  })
   const memoryTypes = useQuery({ queryKey: ['memory', 'types'], queryFn: listMemoryTypes })
   const goals = useQuery({ queryKey: ['goals'], queryFn: listGoals })
   const graphs = useQuery({ queryKey: ['graphs'], queryFn: listGraphs })
@@ -185,6 +183,7 @@ export function MemoryPage() {
 
   const refreshMemory = async () => {
     await queryClient.invalidateQueries({ queryKey: ['memory'] })
+    await queryClient.invalidateQueries({ queryKey: ['memory-profile'] })
   }
   const create = useMutation({
     mutationFn: createMemory,
@@ -240,11 +239,46 @@ export function MemoryPage() {
     },
     onError: (error) => toast.error(error.message),
   })
+  const editProfile = useMutation({
+    mutationFn: applyMemoryProfileIntent,
+    onSuccess: async (result) => {
+      if (result.status === 'no_change') {
+        toast.info('没有识别到需要长期保存的变化')
+      } else if (result.auto_committed) {
+        toast.success(`已整理并更新 ${result.auto_committed} 条原子记忆`)
+      } else {
+        toast.info('修改已进入待确认记忆')
+      }
+      await refreshMemory()
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const regenerateProfile = useMutation({
+    mutationFn: refreshMemoryProfile,
+    onSuccess: async () => {
+      toast.success('记忆摘要已整篇重写')
+      await queryClient.invalidateQueries({ queryKey: ['memory-profile'] })
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const migrateAtoms = useMutation({
+    mutationFn: () => migrateLegacyMemoryAtoms(20),
+    onSuccess: async (result) => {
+      toast.success(
+        `旧记忆整理完成：迁移 ${result.migrated} 条，拆分新增 ${result.created} 条`,
+      )
+      await refreshMemory()
+      if (result.migrated || result.created) {
+        await regenerateProfile.mutateAsync()
+      }
+    },
+    onError: (error) => toast.error(error.message),
+  })
 
-  if (memories.isPending || deleted.isPending || sessions.isPending) {
+  if (memories.isPending || profile.isPending || deleted.isPending || sessions.isPending) {
     return <PageFrame><LoadingState /></PageFrame>
   }
-  const firstError = memories.error ?? deleted.error ?? sessions.error
+  const firstError = memories.error ?? profile.error ?? deleted.error ?? sessions.error
   if (firstError) return <PageFrame><ErrorState message={firstError.message} /></PageFrame>
 
   const activeMemories = memories.data ?? []
@@ -259,16 +293,17 @@ export function MemoryPage() {
 
   const recoverableCount = deletedMemories.filter((item) => item.restore_available).length
   const zoneBusy = remove.isPending || update.isPending || restoreRevision.isPending
-  const quickAdd = (content: string) =>
-    create
+  const quickAdd = (
+    content: string,
+    selectedText?: string,
+    selectedAtomIds?: string[],
+  ) =>
+    editProfile
       .mutateAsync({
-        title: deriveQuickTitle(content),
-        content,
-        zone: 'topics',
-        namespace: 'workspace',
-        scope_type: 'workspace',
-        record_kind: 'semantic_memory',
-        source: 'user_confirmed',
+        text: content,
+        selected_text: selectedText,
+        selected_atom_ids: selectedAtomIds,
+        timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
       })
       .then(() => undefined)
 
@@ -302,7 +337,7 @@ export function MemoryPage() {
             />
           </div>
         }
-        description="记忆摘要基于服务端 Active Memory 实时汇总；记忆 ID、Revision、来源与删除恢复状态都由服务端持久化。"
+        description="原始消息先被整理为可追溯原子，再由模型持续重写成一篇当前有效的记忆摘要。"
         eyebrow="Workspace memory"
         title="工作区记忆中心"
       />
@@ -361,10 +396,14 @@ export function MemoryPage() {
 
         <TabsContent className="mt-0 outline-none" value="summary">
           <MemorySummaryCard
-            busy={create.isPending}
-            memories={activeMemories}
-            onOpen={setSelectedId}
+            busy={editProfile.isPending || regenerateProfile.isPending || migrateAtoms.isPending}
+            legacyCount={
+              activeMemories.filter((item) => (item.atom_schema_version ?? 0) === 0).length
+            }
+            onMigrate={() => migrateAtoms.mutateAsync().then(() => undefined)}
+            onRefresh={() => regenerateProfile.mutateAsync().then(() => undefined)}
             onQuickAdd={quickAdd}
+            profile={profile.data}
           />
         </TabsContent>
 
@@ -482,75 +521,191 @@ export function MemoryPage() {
 }
 
 function MemorySummaryCard({
-  memories,
   busy,
-  onOpen,
+  legacyCount,
+  profile,
+  onMigrate,
+  onRefresh,
   onQuickAdd,
 }: {
-  memories: MemoryEntry[]
   busy: boolean
-  onOpen: (id: string) => void
-  onQuickAdd: (content: string) => Promise<void>
+  legacyCount: number
+  profile: MemoryProfile | undefined
+  onMigrate: () => Promise<void>
+  onRefresh: () => Promise<void>
+  onQuickAdd: (
+    content: string,
+    selectedText?: string,
+    selectedAtomIds?: string[],
+  ) => Promise<void>
 }) {
   const [draft, setDraft] = useState('')
-  const sections = [...memories].sort((a, b) => zoneRank[a.zone] - zoneRank[b.zone])
-  const hint = summaryUpdatedHint(memories)
+  const [selection, setSelection] = useState<{
+    text: string
+    atomIds: string[]
+  } | null>(null)
+  const documentRef = useRef<HTMLDivElement>(null)
+  const hint = profileUpdatedHint(profile?.generated_at ?? null)
 
   async function submit(event: FormEvent) {
     event.preventDefault()
     const content = draft.trim()
     if (!content || busy) return
     try {
-      await onQuickAdd(content)
+      await onQuickAdd(content, selection?.text, selection?.atomIds)
     } catch {
       return
     }
     setDraft('')
+    setSelection(null)
+    window.getSelection()?.removeAllRanges()
+  }
+
+  function captureSelection() {
+    const selected = window.getSelection()
+    const text = selected?.toString().trim() ?? ''
+    const anchor = selected?.anchorNode
+    if (!text || !anchor || !documentRef.current?.contains(anchor)) {
+      setSelection(null)
+      return
+    }
+    const element = anchor instanceof Element ? anchor : anchor.parentElement
+    const paragraph = element?.closest<HTMLElement>('[data-memory-atom-ids]')
+    const atomIds = paragraph?.dataset.memoryAtomIds?.split(',').filter(Boolean) ?? []
+    if (!atomIds.length) {
+      setSelection(null)
+      return
+    }
+    setSelection({ text, atomIds })
   }
 
   return (
-    <Surface className="flex flex-col overflow-hidden p-0">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-6 pt-5">
-        <h2 className="text-lg font-semibold tracking-tight">记忆摘要</h2>
-        {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
+    <Surface className="mx-auto flex w-full max-w-4xl flex-col overflow-hidden p-0 shadow-sm">
+      <div className="flex items-center gap-3 border-b px-6 py-4">
+        <div className="grid size-9 place-items-center rounded-full bg-primary/10 text-primary">
+          <BookOpenText className="size-4.5" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+            <h2 className="text-lg font-semibold tracking-tight">记忆摘要</h2>
+            {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            由当前有效原子整篇重写；文件原文和助手回答不会直接成为用户记忆
+          </p>
+        </div>
+        <Button
+          aria-label="刷新记忆摘要"
+          disabled={busy}
+          onClick={() => void onRefresh()}
+          size="icon-sm"
+          variant="ghost"
+        >
+          <RefreshCw className={busy ? 'size-4 animate-spin' : 'size-4'} />
+        </Button>
       </div>
-      {sections.length ? (
-        <div className="space-y-1 px-3 py-4">
-          {sections.map((item) => {
-            const body = memoryBody(item.content)
-            return (
-              <article
-                className="cursor-pointer rounded-xl px-3 py-3 transition-colors hover:bg-muted/40"
-                key={item.id}
-                onClick={() => onOpen(item.id)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' && event.target === event.currentTarget) onOpen(item.id)
-                }}
-                role="button"
-                tabIndex={0}
+
+      <div
+        className="min-h-[420px] max-h-[68vh] overflow-y-auto px-7 py-7 sm:px-10 sm:py-9"
+        onMouseUp={captureSelection}
+        ref={documentRef}
+      >
+        {profile?.status === 'stale' ? (
+          <div className="mb-6 flex items-center justify-between gap-3 border-b border-amber-500/20 pb-3 text-xs text-amber-700 dark:text-amber-300">
+            <span>原子记忆已变化，旧摘要不会注入对话。请刷新生成当前版本。</span>
+            <Button disabled={busy} onClick={() => void onRefresh()} size="xs" variant="outline">
+              立即刷新
+            </Button>
+          </div>
+        ) : null}
+
+        <AnimatePresence mode="wait">
+          {profile?.structured_sections.length ? (
+            <motion.article
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-8"
+              exit={{ opacity: 0, y: -6 }}
+              initial={{ opacity: 0, y: 8 }}
+              key={profile.version}
+              transition={{ duration: 0.22, ease: 'easeOut' }}
+            >
+              {profile.structured_sections.map((section, sectionIndex) => (
+                <section key={`${section.heading}-${sectionIndex}`}>
+                  <h3 className="mb-2.5 text-[17px] font-semibold tracking-tight">
+                    {section.heading}
+                  </h3>
+                  <div className="space-y-3">
+                    {section.paragraphs.map((paragraph, paragraphIndex) => (
+                      <p
+                        className="selection:bg-primary/20 text-[15px] leading-7 text-foreground/88"
+                        data-memory-atom-ids={paragraph.atom_ids.join(',')}
+                        key={paragraph.id ?? `${sectionIndex}-${paragraphIndex}`}
+                      >
+                        {paragraph.text}
+                      </p>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </motion.article>
+          ) : profile?.markdown ? (
+            <motion.div
+              animate={{ opacity: 1 }}
+              initial={{ opacity: 0 }}
+              key={profile.version}
+            >
+              <MessageResponse className="text-[15px] leading-7 text-foreground/88">
+                {profile.markdown}
+              </MessageResponse>
+            </motion.div>
+          ) : (
+            <motion.div animate={{ opacity: 1 }} initial={{ opacity: 0 }}>
+              <EmptyState
+                description="在下方告诉我值得长期记住的事实、偏好或变化。内容会先被整理为原子，再写入这篇摘要。"
+                title="还没有可生成摘要的原子记忆"
+              />
+              {legacyCount ? (
+                <div className="mt-4 flex justify-center">
+                  <Button
+                    disabled={busy}
+                    onClick={() => void onMigrate()}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <Sparkles className="size-3.5" />
+                    整理 {legacyCount} 条旧记忆
+                  </Button>
+                </div>
+              ) : null}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      <form className="border-t bg-muted/15 px-4 py-3.5" onSubmit={(event) => void submit(event)}>
+        <AnimatePresence initial={false}>
+          {selection ? (
+            <motion.div
+              animate={{ height: 'auto', opacity: 1, y: 0 }}
+              className="mx-2 mb-2 flex items-center gap-2 overflow-hidden text-xs text-muted-foreground"
+              exit={{ height: 0, opacity: 0, y: 4 }}
+              initial={{ height: 0, opacity: 0, y: 4 }}
+            >
+              <Pencil className="size-3.5 text-primary" />
+              <span className="min-w-0 flex-1 truncate">
+                正在纠正：“{selection.text}”
+              </span>
+              <button
+                className="shrink-0 hover:text-foreground"
+                onClick={() => setSelection(null)}
+                type="button"
               >
-                <h3 className="text-base font-semibold tracking-tight">{item.title}</h3>
-                {body ? (
-                  <MessageResponse className="mt-1.5 text-sm leading-6 text-foreground/90">
-                    {body}
-                  </MessageResponse>
-                ) : (
-                  <p className="mt-1.5 text-sm text-muted-foreground">正文不可用。</p>
-                )}
-              </article>
-            )
-          })}
-        </div>
-      ) : (
-        <div className="px-6 py-5">
-          <EmptyState
-            description="在下方输入关于你的事实或偏好，确认后会像个人档案一样汇总在这里。"
-            title="当前工作区还没有 Active 记忆"
-          />
-        </div>
-      )}
-      <form className="border-t bg-muted/20 px-4 py-3.5" onSubmit={(event) => void submit(event)}>
-        <div className="flex items-center gap-2 rounded-full border bg-background py-1.5 pl-5 pr-1.5 shadow-sm transition-colors focus-within:border-primary/40">
+                取消
+              </button>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+        <div className="flex items-center gap-2 rounded-[1.4rem] border bg-background py-1.5 pl-5 pr-1.5 shadow-sm transition-[border-color,box-shadow] focus-within:border-primary/40 focus-within:shadow-md">
           <input
             aria-label="添加或更新记忆"
             className="h-9 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
@@ -559,15 +714,20 @@ function MemorySummaryCard({
             placeholder="添加或更新"
             value={draft}
           />
-          <Button
-            aria-label="提交记忆"
-            className="size-9 rounded-full"
-            disabled={busy || !draft.trim()}
-            size="icon"
-            type="submit"
+          <motion.div
+            whileHover={busy || !draft.trim() ? undefined : { scale: 1.04 }}
+            whileTap={busy || !draft.trim() ? undefined : { scale: 0.96 }}
           >
-            <ArrowUp className="size-4" />
-          </Button>
+            <Button
+              aria-label="提交记忆"
+              className="size-9 rounded-full"
+              disabled={busy || !draft.trim()}
+              size="icon"
+              type="submit"
+            >
+              <ArrowUp className="size-4" />
+            </Button>
+          </motion.div>
         </div>
       </form>
     </Surface>

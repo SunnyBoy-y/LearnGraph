@@ -9,8 +9,10 @@ import type {
   MessageVersion,
   MessageCreateRequest,
   MessageRetryRequest,
+  MessageListPage,
   Session,
   SessionAutoTitleRequest,
+  SessionActivitySummaryRequest,
   SessionContextUsage,
   SessionCreateRequest,
   SessionUpdateRequest,
@@ -39,6 +41,21 @@ export function autoTitleSession(
 ): Promise<Session> {
   return apiClient.post<Session, SessionAutoTitleRequest>(
     `/sessions/${encodeURIComponent(sessionId)}/auto-title`,
+    payload,
+  )
+}
+
+/**
+ * Generate a one-line "learning event" summary for the dashboard activity view.
+ * On provider-unavailable the backend degrades gracefully and returns the
+ * session with `activity_summary` still null — the caller keeps the title.
+ */
+export function renderSessionActivitySummary(
+  sessionId: string,
+  payload: SessionActivitySummaryRequest,
+): Promise<Session> {
+  return apiClient.post<Session, SessionActivitySummaryRequest>(
+    `/sessions/${encodeURIComponent(sessionId)}/activity-summary`,
     payload,
   )
 }
@@ -118,8 +135,41 @@ export function deleteSessionsBatch(
   })
 }
 
-export function listSessionMessages(sessionId: string): Promise<Message[]> {
-  return apiClient.get<Message[]>(`/sessions/${encodeURIComponent(sessionId)}/messages`)
+export type ListSessionMessagesOptions = {
+  /** Newest-window size. Omit for the full timeline (still compact by default). */
+  limit?: number
+  /** Load the page ending just before this message id (scroll-up). */
+  beforeId?: string
+  /** When false, return full durable parts/provider_trace (rare). Default true. */
+  compact?: boolean
+}
+
+/**
+ * Session timeline for the chat UI. Backend returns a page envelope; callers that
+ * only need the items array can keep using this helper. Use
+ * {@link listSessionMessagesPage} when you need `has_more_before` / cursors.
+ */
+export function listSessionMessages(
+  sessionId: string,
+  options: ListSessionMessagesOptions = {},
+): Promise<Message[]> {
+  return listSessionMessagesPage(sessionId, options).then((page) => page.items)
+}
+
+export function listSessionMessagesPage(
+  sessionId: string,
+  options: ListSessionMessagesOptions = {},
+): Promise<MessageListPage> {
+  return apiClient.get<MessageListPage>(
+    `/sessions/${encodeURIComponent(sessionId)}/messages`,
+    {
+      query: {
+        limit: options.limit,
+        before_id: options.beforeId,
+        compact: options.compact === false ? 'false' : undefined,
+      },
+    },
+  )
 }
 
 export function getSessionContextUsage(

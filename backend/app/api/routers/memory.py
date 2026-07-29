@@ -19,6 +19,9 @@ from app.domain.schemas.management import (
     MemoryJournalView,
     MemoryPolicyUpdateRequest,
     MemoryPolicyView,
+    MemoryProfileIntentRequest,
+    MemoryProfileIntentResult,
+    MemoryProfileView,
     MemoryProviderStatusView,
     MemoryRevisionRestoreRequest,
     MemoryRevisionView,
@@ -37,6 +40,10 @@ from app.services.memory_enhancement import (
     save_enhancement_config,
     summarize_session_context,
 )
+from app.services.memory_profile import (
+    MemoryProfileService,
+    reconcile_workspace_temporal_atoms,
+)
 
 
 router = APIRouter(prefix="/memory", tags=["memory"])
@@ -54,6 +61,17 @@ def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> MemoryS
             settings,
         ),
         settings.memory_root,
+    )
+
+
+def profile_service(
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> MemoryProfileService:
+    return MemoryProfileService(
+        db,
+        context.workspace,
+        context.principal.user_id,
+        settings,
     )
 
 
@@ -160,6 +178,68 @@ def migrate_memory_provider_generation(
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
 ) -> dict[str, int]:
     return service(db, context, settings).migrate_provider_generation(limit=limit)
+
+
+@router.post("/maintenance/reconcile-time")
+def reconcile_memory_time(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict[str, int]:
+    return reconcile_workspace_temporal_atoms(
+        db,
+        context.workspace,
+        settings,
+    )
+
+
+@router.post("/maintenance/migrate-atoms")
+def migrate_legacy_memory_atoms(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> dict[str, int]:
+    return profile_service(db, context, settings).migrate_legacy_atoms(
+        limit=limit
+    )
+
+
+@router.get("/profile", response_model=MemoryProfileView)
+def get_memory_profile(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryProfileView:
+    return profile_service(db, context, settings).get_profile()
+
+
+@router.get("/profile/sources")
+def get_memory_profile_sources(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    return profile_service(db, context, settings).profile_sources()
+
+
+@router.post("/profile/refresh", response_model=MemoryProfileView)
+def refresh_memory_profile(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryProfileView:
+    return profile_service(db, context, settings).refresh_profile(force=True)
+
+
+@router.post("/profile/intents", response_model=MemoryProfileIntentResult)
+def apply_memory_profile_intent(
+    payload: MemoryProfileIntentRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryProfileIntentResult:
+    return profile_service(db, context, settings).apply_intent(payload)
 
 
 @router.get("/package", response_model=EffectiveMemoryPackageView)

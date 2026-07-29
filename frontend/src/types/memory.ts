@@ -68,6 +68,19 @@ export interface MemoryEntry {
   source: string
   source_ids: string[]
   structured_payload?: Record<string, unknown>
+  atom_schema_version?: number
+  canonical_key?: string
+  atom_kind?: string
+  ledger_status?: string
+  temporal_status?: string
+  summary_eligibility?: string
+  valid_from?: IsoDateTime | null
+  valid_until?: IsoDateTime | null
+  event_at?: IsoDateTime | null
+  next_review_at?: IsoDateTime | null
+  last_verified_at?: IsoDateTime | null
+  timezone_name?: string
+  evidence_ids?: string[]
   confidence?: number
   importance?: number
   strength?: number
@@ -155,12 +168,59 @@ export interface MemoryPolicy {
   session_id: string | null
   session_enabled: boolean | null
   effective_enabled: boolean
+  workspace_recall_enabled?: boolean
+  workspace_learning_enabled?: boolean
+  session_recall_enabled?: boolean | null
+  session_learning_enabled?: boolean | null
+  effective_recall_enabled?: boolean
+  effective_learning_enabled?: boolean
 }
 
 export interface MemoryPolicyUpdateRequest {
   workspace_enabled?: boolean
+  workspace_recall_enabled?: boolean
+  workspace_learning_enabled?: boolean
   session_id?: string
   session_enabled?: boolean
+  session_recall_enabled?: boolean
+  session_learning_enabled?: boolean
+}
+
+export interface MemoryProfile {
+  id: string | null
+  workspace_id: string
+  owner_subject_id: string
+  version: number
+  status: 'empty' | 'ready' | 'stale' | 'building' | 'failed'
+  markdown: string
+  structured_sections: Array<{
+    heading: string
+    paragraphs: Array<{
+      id?: string
+      text: string
+      atom_ids: string[]
+    }>
+  }>
+  source_atom_ids: string[]
+  source_fingerprint: string
+  generated_at: IsoDateTime | null
+  updated_at: IsoDateTime | null
+  stale_reason: string
+}
+
+export interface MemoryProfileIntentRequest {
+  text: string
+  selected_text?: string
+  selected_atom_ids?: string[]
+  timezone_name?: string
+}
+
+export interface MemoryProfileIntentResult {
+  status: string
+  drafts_created: number
+  auto_committed: number
+  affected_memory_ids: string[]
+  profile_status: string
 }
 
 export interface MemoryProviderStatus {

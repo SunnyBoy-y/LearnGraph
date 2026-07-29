@@ -24,6 +24,7 @@ from app.domain.models import (
 from app.domain.settings import (
     CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
     CHAT_CONTEXT_USAGE_SETTING_KEY,
+    CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY,
     CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
     CHAT_DICTATION_CLEANUP_SETTING_KEY,
     CHAT_RESPONSE_STYLE_SETTING_KEY,
@@ -33,6 +34,7 @@ from app.domain.settings import (
 )
 from app.domain.schemas.management import (
     ChatContextUsageSettingValue,
+    ChatDefaultResponseModeSettingValue,
     ChatDictationCleanupSettingValue,
     ChatFeatureModelSettingValue,
     ChatResponseStyleSettingValue,
@@ -90,6 +92,9 @@ from app.providers.remote.deepseek import (
     is_official_deepseek_api_base_url,
 )
 from app.providers.remote.codex import (
+    CODEX_DEFAULT_MODEL,
+    CODEX_KNOWN_MODELS,
+    CODEX_UNSUPPORTED_CHATGPT_MODELS,
     CodexAuthError,
     ensure_fresh_codex_credentials,
     fetch_codex_usage,
@@ -97,6 +102,7 @@ from app.providers.remote.codex import (
     poll_codex_device_login,
     start_codex_device_login,
 )
+from app.providers.remote.research_vendors import QwenDeepResearchProvider
 from app.providers.remote.custom_balance import (
     API_KEY_PLACEHOLDER as CUSTOM_BALANCE_API_KEY_PLACEHOLDER,
     BASE_URL_PLACEHOLDER as CUSTOM_BALANCE_BASE_URL_PLACEHOLDER,
@@ -272,6 +278,30 @@ class ProviderService:
                     "video_understanding",
                 ],
             }
+        codex_defaults: dict[str, object] = {}
+        if payload.provider_type == "codex_chatgpt":
+            codex_defaults = {
+                "brand_id": "openai",
+                "model_family": "codex",
+                "capability_source": "official_catalog",
+                "supports_agent_tools": True,
+                "discovered_model_ids": list(CODEX_KNOWN_MODELS),
+                "discovered_model_count": len(CODEX_KNOWN_MODELS),
+                "model_states": {model_id: True for model_id in CODEX_KNOWN_MODELS},
+                "default_model": CODEX_DEFAULT_MODEL,
+            }
+        qwen_research_defaults: dict[str, object] = {}
+        if payload.provider_type == "qwen_deep_research":
+            known = list(QwenDeepResearchProvider.KNOWN_MODELS)
+            qwen_research_defaults = {
+                "brand_id": "qwen",
+                "capability_source": "official_catalog",
+                "discovered_model_ids": known,
+                "discovered_model_count": len(known),
+                "model_states": {model_id: True for model_id in known},
+                "default_model": QwenDeepResearchProvider.DEFAULT_MODEL,
+                "deep_research_model": QwenDeepResearchProvider.DEFAULT_MODEL,
+            }
         # Sanitize optional custom headers used by proxy / relay stations.
         incoming_capabilities = dict(payload.capabilities or {})
         if "extra_headers" in incoming_capabilities:
@@ -282,6 +312,8 @@ class ProviderService:
             **deepseek_defaults,
             **anthropic_defaults,
             **qwen_defaults,
+            **codex_defaults,
+            **qwen_research_defaults,
             **incoming_capabilities,
             "provider_role": spec.role,
             "declaration_status": "unverified_user_input",
@@ -537,6 +569,10 @@ class ProviderService:
                     "A disabled model cannot be selected as the default model",
                 )
             capabilities["default_model"] = payload.default_model
+            if provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
+                capabilities["deep_research_model"] = payload.default_model
+            if provider.provider_type in EMBEDDING_PROVIDER_TYPES:
+                capabilities["default_embedding_model_id"] = payload.default_model
         if payload.default_image_generation_model_id is not None:
             capabilities["default_image_generation_model_id"] = (
                 payload.default_image_generation_model_id
@@ -1542,6 +1578,7 @@ class ProviderService:
             *VISION_PROVIDER_TYPES,
             *TRANSCRIPTION_PROVIDER_TYPES,
             *EMBEDDING_PROVIDER_TYPES,
+            "qwen_deep_research",
         }:
             raise AppError(
                 409,
@@ -1549,7 +1586,6 @@ class ProviderService:
                 "This provider does not expose a model discovery endpoint",
             )
         model_ids = self._discover(provider)
-        configured_models = dict((provider.capabilities or {}).get("models") or {})
         capabilities = dict(provider.capabilities or {})
         is_deepseek = is_deepseek_chat_configuration(
             provider.provider_type,
@@ -1559,6 +1595,50 @@ class ProviderService:
             or capabilities.get("brand_id") == "deepseek"
             or provider.provider_type == "deepseek_chat"
         )
+        # Persist static catalogues (Codex / Qwen Deep Research) so the list
+        # UI can render without another discover click after reload.
+        if provider.provider_type in {"codex_chatgpt", "qwen_deep_research"}:
+            capabilities["discovered_model_ids"] = list(model_ids)
+            capabilities["discovered_model_count"] = len(model_ids)
+            states = {
+                str(key): value is not False
+                for key, value in dict(capabilities.get("model_states") or {}).items()
+            }
+            for model_id in model_ids:
+                states.setdefault(model_id, True)
+            if provider.provider_type == "codex_chatgpt":
+                # Drop ChatGPT-auth rejects from older static catalogues so the
+                # model picker no longer offers ids the backend will 400 on.
+                for stale_id in list(states):
+                    if (
+                        stale_id not in model_ids
+                        and stale_id in CODEX_UNSUPPORTED_CHATGPT_MODELS
+                    ):
+                        states.pop(stale_id, None)
+            capabilities["model_states"] = states
+            configured_default = str(capabilities.get("default_model") or "").strip()
+            if (
+                not configured_default
+                or configured_default not in model_ids
+                or states.get(configured_default, True) is False
+            ):
+                capabilities["default_model"] = next(
+                    (
+                        model_id
+                        for model_id in model_ids
+                        if states.get(model_id, True)
+                    ),
+                    CODEX_DEFAULT_MODEL if provider.provider_type == "codex_chatgpt" else "",
+                )
+            if provider.provider_type == "qwen_deep_research":
+                capabilities.setdefault(
+                    "deep_research_model",
+                    capabilities.get("default_model")
+                    or QwenDeepResearchProvider.DEFAULT_MODEL,
+                )
+            provider.capabilities = capabilities
+            self.db.commit()
+            self.db.refresh(provider)
         return {
             "provider_id": provider.id,
             "status": "discovered",
@@ -1574,6 +1654,8 @@ class ProviderService:
                         if provider.provider_type in TRANSCRIPTION_PROVIDER_TYPES
                         else ["embedding"]
                         if provider.provider_type in EMBEDDING_PROVIDER_TYPES
+                        else ["deep_research"]
+                        if provider.provider_type == "qwen_deep_research"
                         else ["llm"]
                     ),
                     "streaming": True,
@@ -1868,6 +1950,11 @@ class ProviderService:
             raise AppError(502, "provider_probe_failed", str(exc)) from exc
 
     def _discover(self, provider: ProviderConfig) -> list[str]:
+        # Static catalogues for endpoints without a public model list.
+        if provider.provider_type == "codex_chatgpt":
+            return list(CODEX_KNOWN_MODELS)
+        if provider.provider_type == "qwen_deep_research":
+            return list(QwenDeepResearchProvider.KNOWN_MODELS)
         if not provider.base_url:
             raise AppError(409, "provider_not_configured", "Provider base URL is missing")
         api_key = self._decrypt_secret(provider.id)
@@ -2423,6 +2510,11 @@ class SettingsService:
             },
             "risk": "low",
         },
+        CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY: {
+            "description": "Default chat response mode for new conversations (fast / thinking / agentic)",
+            "default": {"response_mode": "agentic"},
+            "risk": "low",
+        },
         "usage.display_currency": {
             "description": "Display currency for usage views",
             "default": "CNY",
@@ -2588,6 +2680,21 @@ class SettingsService:
                         "chat.response_style must contain base_style and integer "
                         "levels in [-2, 2] for warmth, enthusiasm, "
                         "headings_and_lists, emoji, and verbosity"
+                    ),
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key == CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY:
+            try:
+                value = ChatDefaultResponseModeSettingValue.model_validate(
+                    value
+                ).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    (
+                        "chat.default_response_mode must contain response_mode "
+                        "as one of: fast, thinking, agentic"
                     ),
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc

@@ -28,7 +28,9 @@ from app.domain.models import (
     GraphNode,
     MemoryDeletionRecovery,
     MemoryDraft,
+    MemoryEvidence,
     MemoryJournalEntry,
+    MemoryProfileSnapshot,
     MemoryProviderBinding,
     MemoryRecord,
     MemoryRevision,
@@ -82,6 +84,25 @@ DELETION_AUDIT_RETENTION = timedelta(days=7)
 MEMORY_POLICY_KEY = "memory.shared_policy"
 MEMORY_PROVIDER_EPOCH_KEY = "memory.provider_epoch"
 
+_LEDGER_STATUSES = {"active", "superseded", "retracted", "deleted"}
+_TEMPORAL_STATUSES = {
+    "timeless",
+    "planned",
+    "ongoing",
+    "completed",
+    "cancelled",
+    "rescheduled",
+    "lapsed_unverified",
+    "expired",
+}
+_SUMMARY_ELIGIBILITY = {
+    "durable",
+    "current",
+    "historical",
+    "excluded",
+    "legacy_review",
+}
+
 
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
@@ -106,6 +127,63 @@ def _legacy_body(markdown: str) -> str:
     while lines and not lines[0].strip():
         lines.pop(0)
     return "\n".join(lines).rstrip()
+
+
+def _structured_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _as_utc(parsed)
+
+
+def _atomic_fields(structured: dict, source_ids: list[str]) -> dict:
+    """Normalize indexable atom lifecycle fields from validated LLM output."""
+
+    version = int(structured.get("atom_schema_version") or 0)
+    ledger_status = str(structured.get("ledger_status") or "active")
+    temporal_status = str(structured.get("temporal_status") or "timeless")
+    summary_eligibility = str(
+        structured.get("summary_eligibility")
+        or ("durable" if version >= 1 and source_ids else "excluded")
+    )
+    return {
+        "atom_schema_version": max(0, version),
+        "canonical_key": str(structured.get("canonical_key") or "")[:240],
+        "atom_kind": str(structured.get("atom_kind") or "fact")[:64],
+        "ledger_status": (
+            ledger_status if ledger_status in _LEDGER_STATUSES else "active"
+        ),
+        "temporal_status": (
+            temporal_status
+            if temporal_status in _TEMPORAL_STATUSES
+            else "timeless"
+        ),
+        "summary_eligibility": (
+            summary_eligibility
+            if summary_eligibility in _SUMMARY_ELIGIBILITY
+            else "excluded"
+        ),
+        "valid_from": _structured_datetime(structured.get("valid_from")),
+        "valid_until": _structured_datetime(structured.get("valid_until")),
+        "event_at": _structured_datetime(structured.get("event_at")),
+        "next_review_at": _structured_datetime(structured.get("next_review_at")),
+        "last_verified_at": _structured_datetime(
+            structured.get("last_verified_at")
+        ),
+        "timezone_name": str(
+            structured.get("timezone_name") or "Asia/Shanghai"
+        )[:80],
+        "evidence_ids": list(
+            dict.fromkeys(
+                str(value)
+                for value in (structured.get("evidence_ids") or source_ids)
+                if value
+            )
+        ),
+    }
 
 
 class MemoryService:
@@ -218,7 +296,31 @@ class MemoryService:
             "source_ids": list(record.source_ids or []),
             "structured_payload": dict(getattr(record, "structured_payload", None) or {}),
             "resolution_status": getattr(record, "resolution_status", "none") or "none",
+            "atom_schema_version": int(
+                getattr(record, "atom_schema_version", 0) or 0
+            ),
+            "canonical_key": getattr(record, "canonical_key", "") or "",
+            "atom_kind": getattr(record, "atom_kind", "fact") or "fact",
+            "ledger_status": getattr(record, "ledger_status", "active") or "active",
+            "temporal_status": getattr(record, "temporal_status", "timeless")
+            or "timeless",
+            "summary_eligibility": getattr(
+                record, "summary_eligibility", "legacy_review"
+            )
+            or "legacy_review",
+            "evidence_ids": list(getattr(record, "evidence_ids", None) or []),
         }
+
+    def _mark_profile_stale(self, reason: str) -> None:
+        snapshots = self.db.scalars(
+            select(MemoryProfileSnapshot).where(
+                MemoryProfileSnapshot.workspace_id == self.workspace_id,
+                MemoryProfileSnapshot.status == "ready",
+            )
+        ).all()
+        for snapshot in snapshots:
+            snapshot.status = "stale"
+            snapshot.stale_reason = reason[:240]
 
     def _apply_type_defaults(self, record: MemoryRecord) -> None:
         type_def = get_memory_type(record.record_kind)
@@ -285,6 +387,26 @@ class MemoryService:
             "node_id": getattr(record, "node_id", None),
             "merge_strategy": getattr(record, "merge_strategy", None) or "UNION",
             "structured_payload": dict(getattr(record, "structured_payload", None) or {}),
+            "atom_schema_version": int(
+                getattr(record, "atom_schema_version", 0) or 0
+            ),
+            "canonical_key": getattr(record, "canonical_key", "") or "",
+            "atom_kind": getattr(record, "atom_kind", "fact") or "fact",
+            "ledger_status": getattr(record, "ledger_status", "active") or "active",
+            "temporal_status": getattr(record, "temporal_status", "timeless")
+            or "timeless",
+            "summary_eligibility": getattr(
+                record, "summary_eligibility", "legacy_review"
+            )
+            or "legacy_review",
+            "valid_from": getattr(record, "valid_from", None),
+            "valid_until": getattr(record, "valid_until", None),
+            "event_at": getattr(record, "event_at", None),
+            "next_review_at": getattr(record, "next_review_at", None),
+            "last_verified_at": getattr(record, "last_verified_at", None),
+            "timezone_name": getattr(record, "timezone_name", "Asia/Shanghai")
+            or "Asia/Shanghai",
+            "evidence_ids": list(getattr(record, "evidence_ids", None) or []),
             "confidence": float(getattr(record, "confidence", 0.7) or 0.7),
             "importance": float(getattr(record, "importance", 0.5) or 0.5),
             "strength": float(getattr(record, "strength", 0.5) or 0.5),
@@ -713,6 +835,7 @@ class MemoryService:
         elif scope_type == "node":
             scope_id = node_id
         now = utc_now()
+        atomic = _atomic_fields(structured, list(payload.source_ids))
         importance = float(payload.importance)
         strength = compute_memory_strength(
             base_importance=importance,
@@ -743,6 +866,7 @@ class MemoryService:
             source=payload.source,
             source_ids=list(dict.fromkeys(payload.source_ids)),
             structured_payload=structured,
+            **atomic,
             confidence=float(payload.confidence),
             importance=importance,
             strength=strength,
@@ -818,6 +942,7 @@ class MemoryService:
                 "provider_id": record.provider_id,
             },
         )
+        self._mark_profile_stale("memory_created")
         self.db.commit()
         self.db.refresh(record)
         return self._view(record, include_content=True)
@@ -843,6 +968,43 @@ class MemoryService:
             if payload.structured_payload is not None
             else dict(getattr(record, "structured_payload", None) or {})
         )
+        if (
+            payload.reason == "user_edit"
+            and int(getattr(record, "atom_schema_version", 0) or 0) >= 1
+            and (title != current.title or content != current.content)
+        ):
+            evidence = MemoryEvidence(
+                workspace_id=self.workspace_id,
+                source_kind="user_memory_edit",
+                source_id=f"{record.id}:revision:{record.revision + 1}",
+                authorship="user",
+                observed_at=utc_now(),
+                content_hash=_content_hash(title, content),
+                excerpt=content[:1_200],
+                profile_eligible=True,
+                eligibility_reason="explicit_user_memory_edit",
+            )
+            self.db.add(evidence)
+            self.db.flush()
+            source_ids = list(dict.fromkeys([*source_ids, evidence.id]))
+            structured = {
+                **structured,
+                "evidence_ids": list(
+                    dict.fromkeys(
+                        [
+                            *list(structured.get("evidence_ids") or []),
+                            evidence.id,
+                        ]
+                    )
+                ),
+                "last_verified_at": evidence.observed_at.isoformat(),
+                "provenance": {
+                    "authorship": "user",
+                    "source_kinds": ["user_memory_edit"],
+                    "profile_eligible": True,
+                },
+            }
+        atomic = _atomic_fields(structured, source_ids)
         if payload.scope_type is not None or payload.scope_id is not None or payload.goal_id is not None or payload.node_id is not None:
             scope_type, scope_id, goal_id, node_id = normalize_scope(
                 scope_type=payload.scope_type or record.scope_type,
@@ -916,6 +1078,7 @@ class MemoryService:
                 zone=zone,
                 source_ids=source_ids,
                 structured_payload=structured,
+                **atomic,
                 confidence=confidence,
                 importance=importance,
                 strength=strength,
@@ -978,6 +1141,8 @@ class MemoryService:
         record.zone = zone
         record.source_ids = source_ids
         record.structured_payload = structured
+        for field, value in atomic.items():
+            setattr(record, field, value)
         record.confidence = confidence
         record.importance = importance
         record.strength = strength
@@ -1035,6 +1200,7 @@ class MemoryService:
                 "zone": zone,
             },
         )
+        self._mark_profile_stale("memory_updated")
         self.db.commit()
         self.db.refresh(record)
         return self._view(record, include_content=True)
@@ -1244,6 +1410,7 @@ class MemoryService:
                 "orphaned_remote_projection": orphaned_remote_projection,
             },
         )
+        self._mark_profile_stale("memory_deleted")
         self.db.commit()
         self.db.refresh(record)
         return self._view(record)
@@ -1365,6 +1532,7 @@ class MemoryService:
             resource_id=record.id,
             details={"new_revision": next_revision, "provider_id": self.provider.provider_id},
         )
+        self._mark_profile_stale("memory_restored")
         self.db.commit()
         self.db.refresh(record)
         return self._view(record, include_content=True)
@@ -1388,25 +1556,68 @@ class MemoryService:
         ).all()
         return [MemoryBindingView.model_validate(item) for item in bindings]
 
-    def _workspace_policy(self) -> bool:
+    def _workspace_policy_values(self) -> dict[str, bool]:
         setting = self.db.scalar(
             self.settings.query().where(WorkspaceSetting.key == MEMORY_POLICY_KEY)
         )
         value = setting.value if setting is not None else {}
-        return bool(value.get("workspace_enabled", False)) if isinstance(value, dict) else False
+        data = value if isinstance(value, dict) else {}
+        return {
+            "workspace_enabled": bool(data.get("workspace_enabled", False)),
+            "workspace_recall_enabled": bool(
+                data.get("workspace_recall_enabled", True)
+            ),
+            "workspace_learning_enabled": bool(
+                data.get("workspace_learning_enabled", True)
+            ),
+        }
+
+    def _workspace_policy(self) -> bool:
+        return self._workspace_policy_values()["workspace_enabled"]
 
     def policy(self, session_id: str | None = None) -> MemoryPolicyView:
-        workspace_enabled = self._workspace_policy()
+        workspace_policy = self._workspace_policy_values()
+        workspace_enabled = workspace_policy["workspace_enabled"]
         session_enabled: bool | None = None
+        session_recall_enabled: bool | None = None
+        session_learning_enabled: bool | None = None
         if session_id is not None:
             session = self.sessions.require(session_id, "session")
             session_enabled = bool(session.memory_enabled)
+            session_recall_enabled = bool(
+                getattr(session, "memory_recall_enabled", True)
+            )
+            session_learning_enabled = bool(
+                getattr(session, "memory_learning_enabled", True)
+            )
+        effective_recall = bool(
+            workspace_enabled
+            and workspace_policy["workspace_recall_enabled"]
+            and session_enabled
+            and session_recall_enabled
+        )
+        effective_learning = bool(
+            workspace_enabled
+            and workspace_policy["workspace_learning_enabled"]
+            and session_enabled
+            and session_learning_enabled
+        )
         return MemoryPolicyView(
             workspace_id=self.workspace_id,
             workspace_enabled=workspace_enabled,
             session_id=session_id,
             session_enabled=session_enabled,
-            effective_enabled=workspace_enabled and bool(session_enabled),
+            effective_enabled=effective_recall,
+            workspace_recall_enabled=workspace_policy[
+                "workspace_recall_enabled"
+            ],
+            workspace_learning_enabled=workspace_policy[
+                "workspace_learning_enabled"
+            ],
+            session_recall_enabled=session_recall_enabled,
+            session_learning_enabled=session_learning_enabled,
+            effective_recall_enabled=effective_recall,
+            effective_learning_enabled=effective_learning,
         )
 
     def update_policy(self, payload: MemoryPolicyUpdateRequest) -> MemoryPolicyView:
@@ -1416,6 +1627,22 @@ class MemoryService:
         current = dict(setting.value or {}) if setting is not None and isinstance(setting.value, dict) else {}
         if payload.workspace_enabled is not None:
             current["workspace_enabled"] = payload.workspace_enabled
+        if payload.workspace_recall_enabled is not None:
+            current["workspace_recall_enabled"] = (
+                payload.workspace_recall_enabled
+            )
+        if payload.workspace_learning_enabled is not None:
+            current["workspace_learning_enabled"] = (
+                payload.workspace_learning_enabled
+            )
+        if any(
+            value is not None
+            for value in (
+                payload.workspace_enabled,
+                payload.workspace_recall_enabled,
+                payload.workspace_learning_enabled,
+            )
+        ):
             if setting is None:
                 setting = self.settings.add(
                     WorkspaceSetting(
@@ -1429,6 +1656,17 @@ class MemoryService:
         if payload.session_enabled is not None:
             session = self.sessions.require(payload.session_id or "", "session")
             session.memory_enabled = payload.session_enabled
+        elif (
+            payload.session_recall_enabled is not None
+            or payload.session_learning_enabled is not None
+        ):
+            session = self.sessions.require(payload.session_id or "", "session")
+        else:
+            session = None
+        if session is not None and payload.session_recall_enabled is not None:
+            session.memory_recall_enabled = payload.session_recall_enabled
+        if session is not None and payload.session_learning_enabled is not None:
+            session.memory_learning_enabled = payload.session_learning_enabled
         self.audit.record(
             actor_id=self.actor_id,
             action="memory.policy_update",
@@ -1436,8 +1674,16 @@ class MemoryService:
             resource_id=payload.session_id or self.workspace_id,
             details={
                 "workspace_enabled": current.get("workspace_enabled", False),
+                "workspace_recall_enabled": current.get(
+                    "workspace_recall_enabled", True
+                ),
+                "workspace_learning_enabled": current.get(
+                    "workspace_learning_enabled", True
+                ),
                 "session_id": payload.session_id,
                 "session_enabled": payload.session_enabled,
+                "session_recall_enabled": payload.session_recall_enabled,
+                "session_learning_enabled": payload.session_learning_enabled,
             },
         )
         self.db.commit()
@@ -1669,6 +1915,19 @@ class MemoryService:
         # Filter by knowledge scope inheritance: workspace always; goal/node when matching or broader.
         eligible: list[MemoryRecord] = []
         for record in records:
+            if (getattr(record, "ledger_status", None) or "active") != "active":
+                continue
+            if (getattr(record, "temporal_status", None) or "timeless") in {
+                "cancelled",
+                "rescheduled",
+                "lapsed_unverified",
+                "expired",
+            }:
+                continue
+            if int(getattr(record, "atom_schema_version", 0) or 0) >= 1 and (
+                getattr(record, "summary_eligibility", None) or "excluded"
+            ) in {"historical", "excluded"}:
+                continue
             scope_type = getattr(record, "scope_type", None) or "workspace"
             if scope_type == "workspace":
                 eligible.append(record)
@@ -1760,6 +2019,15 @@ class MemoryService:
         query_text: str | None = None,
         prompt_token_budget: int | None = None,
     ) -> str:
+        from app.services.memory_profile import current_profile_prompt
+
+        if not self.policy(session_id).effective_recall_enabled:
+            return ""
+        profile_prompt = current_profile_prompt(
+            self.db,
+            self.workspace_id,
+            self.actor_id,
+        )
         package = self.effective_memory_package(
             session_id=session_id,
             goal_id=goal_id,
@@ -1769,7 +2037,19 @@ class MemoryService:
             query_text=query_text,
             prompt_token_budget=prompt_token_budget,
         )
-        return package.prompt_block
+        if not profile_prompt:
+            return package.prompt_block
+        if not package.prompt_block:
+            return profile_prompt
+        combined = f"{profile_prompt}\n\n{package.prompt_block}"
+        if prompt_token_budget is None or estimate_tokens(combined) <= prompt_token_budget:
+            return combined
+        # The profile is the dense default. When the combined package exceeds
+        # the caller's budget, keep it and let relevant atoms fill remaining
+        # space only if there is room.
+        if estimate_tokens(profile_prompt) >= prompt_token_budget:
+            return profile_prompt[: max(800, prompt_token_budget * 3)]
+        return profile_prompt
 
     def list_memory_types(self) -> list[MemoryTypeDefinitionView]:
         return [
@@ -1788,7 +2068,46 @@ class MemoryService:
     def create_draft(self, payload: MemoryDraftCreateRequest) -> MemoryDraftView:
         self.purge_expired()
         structured = self._validate_structured_payload(payload.structured_payload)
-        if payload.operation in {"UPDATE", "MERGE", "SUPERSEDE", "RETRACT", "PROMOTE", "DEMOTE", "ARCHIVE"}:
+        auto_commit_allowed = bool(payload.auto_commit)
+        if payload.created_by == "learning_agent":
+            # The live agent can see assistant output, tool results, and parsed
+            # files. Those mixed-authority inputs must never become user memory
+            # by implication. Explicit user statements are handled separately
+            # by the evidence-bound background extractor/profile intent flow.
+            structured = {
+                **structured,
+                "atom_schema_version": 1,
+                "atom_kind": str(
+                    structured.get("atom_kind") or "ai_observation"
+                )[:64],
+                "ledger_status": "active",
+                "temporal_status": str(
+                    structured.get("temporal_status") or "timeless"
+                ),
+                "summary_eligibility": "excluded",
+                "evidence_ids": [],
+                "provenance": {
+                    "authorship": "assistant",
+                    "derived_from": "mixed_agent_context",
+                    "profile_eligible": False,
+                    "ineligible_reason": "untrusted_agent_context",
+                },
+            }
+            auto_commit_allowed = False
+        if payload.operation in {
+            "UPDATE",
+            "CORRECT",
+            "CONFIRM",
+            "COMPLETE",
+            "CANCEL",
+            "RESCHEDULE",
+            "MERGE",
+            "SUPERSEDE",
+            "RETRACT",
+            "PROMOTE",
+            "DEMOTE",
+            "ARCHIVE",
+        }:
             if not payload.target_memory_id:
                 raise AppError(
                     422,
@@ -1797,7 +2116,24 @@ class MemoryService:
                 )
             self.memories.require(payload.target_memory_id, "memory")
         if payload.session_id:
-            self.sessions.require(payload.session_id, "session")
+            source_session = self.sessions.require(payload.session_id, "session")
+            if payload.created_by in {"learning_agent", "memory_extraction"}:
+                workspace_policy = self._workspace_policy_values()
+                if (
+                    not workspace_policy["workspace_enabled"]
+                    or not workspace_policy["workspace_learning_enabled"]
+                    or not bool(source_session.memory_enabled)
+                    or not bool(
+                        getattr(
+                            source_session, "memory_learning_enabled", True
+                        )
+                    )
+                ):
+                    raise AppError(
+                        409,
+                        "memory_learning_disabled",
+                        "This session is not allowed to contribute new memory",
+                    )
         if payload.branch_session_id:
             self.sessions.require(payload.branch_session_id, "branch session")
         type_def = get_memory_type(payload.memory_type)
@@ -1845,12 +2181,13 @@ class MemoryService:
             details={
                 "operation": draft.operation,
                 "memory_type": draft.memory_type,
-                "auto_commit": payload.auto_commit,
+                "auto_commit_requested": payload.auto_commit,
+                "auto_commit_allowed": auto_commit_allowed,
             },
         )
         self.db.commit()
         self.db.refresh(draft)
-        if payload.auto_commit and not type_def.requires_confirmation and draft.confidence >= 0.75:
+        if auto_commit_allowed and not type_def.requires_confirmation and draft.confidence >= 0.75:
             return self.decide_draft(
                 draft.id,
                 MemoryDraftDecisionRequest(decision="commit", reason="auto_commit_threshold"),
@@ -1941,14 +2278,34 @@ class MemoryService:
             )
             draft.result_memory_id = created.id
             draft.result_revision = created.revision
-        elif draft.operation in {"UPDATE", "MERGE"}:
+        elif draft.operation in {
+            "UPDATE",
+            "CORRECT",
+            "CONFIRM",
+            "COMPLETE",
+            "CANCEL",
+            "MERGE",
+        }:
             assert draft.target_memory_id
+            structured_payload = dict(draft.structured_payload or {})
+            if draft.operation == "COMPLETE":
+                structured_payload["temporal_status"] = "completed"
+                structured_payload.setdefault(
+                    "summary_eligibility", "historical"
+                )
+                structured_payload["last_verified_at"] = now.isoformat()
+            elif draft.operation == "CANCEL":
+                structured_payload["temporal_status"] = "cancelled"
+                structured_payload["summary_eligibility"] = "excluded"
+                structured_payload["last_verified_at"] = now.isoformat()
+            elif draft.operation == "CONFIRM":
+                structured_payload["last_verified_at"] = now.isoformat()
             updated = self.update(
                 draft.target_memory_id,
                 MemoryUpdateRequest(
                     content=draft.content or None,
                     title=draft.title or None,
-                    structured_payload=dict(draft.structured_payload or {}) or None,
+                    structured_payload=structured_payload or None,
                     source_ids=source_ids or None,
                     scope_type=draft.proposed_scope_type,  # type: ignore[arg-type]
                     scope_id=draft.proposed_scope_id,
@@ -1961,7 +2318,7 @@ class MemoryService:
             )
             draft.result_memory_id = updated.id
             draft.result_revision = updated.revision
-        elif draft.operation == "SUPERSEDE":
+        elif draft.operation in {"SUPERSEDE", "RESCHEDULE"}:
             # A supersession keeps the old record as auditable history: the
             # draft content becomes a NEW memory that records its lineage via
             # ``supersedes_id`` while the superseded record moves to the cold
@@ -1988,9 +2345,19 @@ class MemoryService:
             )
             successor = self.memories.require(created.id, "memory")
             successor.supersedes_id = draft.target_memory_id
+            target = self.memories.require(draft.target_memory_id, "memory")
+            target_structured = dict(target.structured_payload or {})
+            target_structured["ledger_status"] = "superseded"
+            target_structured["summary_eligibility"] = "historical"
+            if draft.operation == "RESCHEDULE":
+                target_structured["temporal_status"] = "rescheduled"
             self.update(
                 draft.target_memory_id,
-                MemoryUpdateRequest(zone="archive", reason=f"superseded_by:{created.id}"),
+                MemoryUpdateRequest(
+                    zone="archive",
+                    structured_payload=target_structured,
+                    reason=f"superseded_by:{created.id}",
+                ),
             )
             draft.result_memory_id = created.id
             draft.result_revision = created.revision
@@ -2280,6 +2647,28 @@ class MemoryService:
         revision = self._ensure_revision(record) if record.state == "active" else self._latest_revision(record.id)
         evidence: list[dict] = []
         for source_id in list(record.source_ids or []):
+            typed = self.db.scalar(
+                select(MemoryEvidence).where(
+                    MemoryEvidence.workspace_id == self.workspace_id,
+                    MemoryEvidence.id == source_id,
+                )
+            )
+            if typed is not None:
+                evidence.append(
+                    {
+                        "type": typed.source_kind,
+                        "id": typed.id,
+                        "source_id": typed.source_id,
+                        "message_id": typed.message_id,
+                        "file_id": typed.file_id,
+                        "authorship": typed.authorship,
+                        "profile_eligible": typed.profile_eligible,
+                        "eligibility_reason": typed.eligibility_reason,
+                        "snippet": typed.excerpt[:500],
+                        "derived_from": list(typed.derived_from or []),
+                    }
+                )
+                continue
             message = self.db.get(Message, source_id)
             if message is not None and message.workspace_id == self.workspace_id:
                 evidence.append(

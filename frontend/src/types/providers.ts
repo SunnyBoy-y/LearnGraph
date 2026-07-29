@@ -82,6 +82,7 @@ export const MODEL_PROVIDER_TYPES = [
   "openai_responses",
   "openai_compatible_chat",
   "qwen",
+  "codex_chatgpt",
   "deepseek_chat",
   "anthropic_messages",
 ] as const;

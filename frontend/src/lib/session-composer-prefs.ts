@@ -24,9 +24,12 @@ export interface SessionComposerPrefs {
 
 const STORAGE_KEY = "learngraph:session-composer-prefs";
 
+/** Product fallback when no workspace setting is available. */
+const PRODUCT_DEFAULT_RESPONSE_MODE: ResponseMode = "agentic";
+
 /** New-session defaults: 智能体 + 联网 + 中等思维度 (D-CHAT composer). */
 const DEFAULT_PREFS: SessionComposerPrefs = {
-  responseMode: "agentic",
+  responseMode: PRODUCT_DEFAULT_RESPONSE_MODE,
   thinkingMode: "medium",
   searchRoute: "auto",
   generationMode: "text",
@@ -129,6 +132,15 @@ export function getSessionComposerPrefs(
   return normalizeComposerPrefs(map[sessionId]);
 }
 
+/** True when this session has an explicit localStorage prefs entry. */
+export function hasSessionComposerPrefs(
+  sessionId: string | null | undefined,
+): boolean {
+  if (!sessionId || sessionId === "new") return false;
+  const map = readAll();
+  return Boolean(map[sessionId] && typeof map[sessionId] === "object");
+}
+
 export function setSessionComposerPrefs(
   sessionId: string | null | undefined,
   prefs: Partial<SessionComposerPrefs>,
@@ -184,19 +196,41 @@ export function prefsFromModelSnapshot(
   return result;
 }
 
-export function defaultComposerPrefs(): SessionComposerPrefs {
-  return { ...DEFAULT_PREFS };
+export function defaultComposerPrefs(
+  overrides: Partial<SessionComposerPrefs> = {},
+): SessionComposerPrefs {
+  return normalizeComposerPrefs({ ...DEFAULT_PREFS, ...overrides });
 }
 
-/** True when prefs still match the new-session defaults (no user override). */
+/**
+ * Build new-session defaults, optionally applying a workspace-level response
+ * mode override (极速 / 思考 / 智能体).
+ */
+export function defaultComposerPrefsForResponseMode(
+  responseMode: ResponseMode | null | undefined,
+): SessionComposerPrefs {
+  const mode = isResponseMode(responseMode)
+    ? responseMode
+    : PRODUCT_DEFAULT_RESPONSE_MODE;
+  return defaultComposerPrefs({
+    responseMode: mode,
+    thinkingMode: mode === "fast" ? "off" : DEFAULT_PREFS.thinkingMode,
+  });
+}
+
+/** True when prefs still match the product new-session defaults (no user override). */
 export function isDefaultComposerPrefs(
   prefs: SessionComposerPrefs | null | undefined,
+  workspaceDefaultResponseMode?: ResponseMode | null,
 ): boolean {
   if (!prefs) return true;
+  const baseline = defaultComposerPrefsForResponseMode(
+    workspaceDefaultResponseMode,
+  );
   return (
-    prefs.responseMode === DEFAULT_PREFS.responseMode &&
-    prefs.thinkingMode === DEFAULT_PREFS.thinkingMode &&
-    prefs.searchRoute === DEFAULT_PREFS.searchRoute &&
-    prefs.generationMode === DEFAULT_PREFS.generationMode
+    prefs.responseMode === baseline.responseMode &&
+    prefs.thinkingMode === baseline.thinkingMode &&
+    prefs.searchRoute === baseline.searchRoute &&
+    prefs.generationMode === baseline.generationMode
   );
 }

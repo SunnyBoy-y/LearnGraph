@@ -5,15 +5,22 @@ reasoning-continuation logic is inherited unchanged.  What differs is the
 credential (a rotating ChatGPT OAuth access token instead of an API key), the
 Codex-specific request headers, and the base instructions the ChatGPT Codex
 backend requires on every turn.
+
+The ChatGPT Codex backend also rejects ``role: system`` items inside
+``input`` with HTTP 400 ``System messages are not allowed``.  System content is
+therefore folded into the top-level ``instructions`` field, matching how the
+Codex CLI itself ships operating policy.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 import httpx
 
+from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
 from app.providers.remote.codex import (
     CodexCredentials,
     codex_request_headers,
@@ -64,6 +71,34 @@ class CodexResponsesProvider(OpenAIResponsesProvider):
             transport=self.transport,
         )
 
+    @staticmethod
+    def _split_system_messages(
+        messages: list[ProviderChatMessage],
+    ) -> tuple[str | None, list[ProviderChatMessage]]:
+        """Move system turns out of ``input`` and into ``instructions``.
+
+        The ChatGPT Codex backend rejects ``role: system`` items in the
+        Responses ``input`` array. LearnGraph still builds ordinary system
+        messages for style/policy/context, so this adapter folds them into
+        the top-level ``instructions`` field and keeps only non-system turns
+        as ``input``.
+        """
+
+        system_parts: list[str] = []
+        body: list[ProviderChatMessage] = []
+        for message in messages:
+            if message.role == "system":
+                if message.content:
+                    system_parts.append(message.content)
+                continue
+            body.append(message)
+        combined = "\n\n".join(system_parts) if system_parts else None
+        return combined, body
+
+    def _compose_instructions(self, system_text: str | None) -> str:
+        parts = [part for part in (self.instructions, system_text) if part]
+        return "\n\n".join(parts)
+
     def _apply_call_options(
         self,
         payload: dict[str, Any],
@@ -83,6 +118,28 @@ class CodexResponsesProvider(OpenAIResponsesProvider):
             elif "reasoning.encrypted_content" not in include:
                 payload["include"] = [*include, "reasoning.encrypted_content"]
         return payload
+
+    def stream_chat(
+        self,
+        messages: list[ProviderChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Iterable[ProviderStreamEvent]:
+        """Stream one Codex Responses turn without system roles in ``input``.
+
+        LearnGraph's chat service builds ordinary ``role=system`` turns for
+        style, tool policy, and authorized context. The ChatGPT Codex backend
+        rejects those in ``input``, so they are folded into ``instructions``
+        before the shared Responses stream path runs.
+        """
+
+        system_text, body_messages = self._split_system_messages(messages)
+        previous_instructions = self.instructions
+        self.instructions = self._compose_instructions(system_text)
+        try:
+            yield from super().stream_chat(body_messages, tools=tools)
+        finally:
+            self.instructions = previous_instructions
 
     @staticmethod
     def _rate_limit_number(value: str | None) -> float | None:

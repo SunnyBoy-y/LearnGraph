@@ -34,6 +34,7 @@ from app.domain.models import (
     Message,
     MessagePartRecord,
 )
+from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.image_generation import (
     ImageGenerationProviderPort,
     ImageGenerationRequest,
@@ -98,6 +99,7 @@ class AgentToolRuntime:
         ) = None,
         settings: Settings | None = None,
         can_manage_providers: bool = False,
+        fetch_provider: FetchProviderPort | None = None,
     ) -> None:
         self.workspace_id = workspace_id
         self.actor_id = actor_id
@@ -111,6 +113,7 @@ class AgentToolRuntime:
         self.image_provider_resolver = image_provider_resolver
         self.settings = settings
         self.can_manage_providers = bool(can_manage_providers)
+        self.fetch_provider = fetch_provider
         self.audit = AuditRepository(extensions.db, workspace_id)
 
     def definitions(
@@ -137,8 +140,18 @@ class AgentToolRuntime:
         # or reference an image from an earlier turn.
         definitions.extend(self._session_file_tool_definitions())
         definitions.extend(self.extensions.agent_tool_definitions())
+        # search_web / parallel_web_research / search_images follow the explicit
+        # "联网" search toggle — they need an authorized SearchProvider and the
+        # user's web_search flag. fetch_web_page is decoupled: a Firecrawl-style
+        # FetchProvider (or a Qwen companion with .fetch) makes it available even
+        # when "联网" is off, since fetching a single authorized URL is not a
+        # blanket web-search action and the URL is always SSRF/allow-list gated.
         if web_search_enabled and self._search_available:
             definitions.extend(self._web_tool_definitions())
+        if self._fetch_available or callable(
+            getattr(self.search_provider, "fetch", None)
+        ):
+            definitions.extend(self._fetch_tool_definitions())
         if self._image_available:
             definitions.extend(self._image_tool_definitions())
         if self.sandbox is not None and self.sandbox_authorized:
@@ -282,6 +295,12 @@ class AgentToolRuntime:
     def _search_available(self) -> bool:
         return self.search_provider is not None and bool(
             getattr(self.search_provider, "available", True)
+        )
+
+    @property
+    def _fetch_available(self) -> bool:
+        return self.fetch_provider is not None and bool(
+            getattr(self.fetch_provider, "available", True)
         )
 
     @staticmethod
@@ -1094,7 +1113,7 @@ class AgentToolRuntime:
             ),
             self._function_definition(
                 "start_deep_research",
-                "Create a Deep Research job. Cost-bearing remote jobs remain awaiting explicit user approval.",
+                "Create a Deep Research job. Cost-bearing remote jobs remain awaiting explicit user approval. When the result contains user_approval_required=true, STOP and do not call get_deep_research again until the user approves the budget in chat; the host injects a confirmation card the user must click.",
                 {
                     "question": {"type": "string", "minLength": 3, "maxLength": 4000},
                     "budget_cny": {"type": "number", "minimum": 0, "maximum": 10000},
@@ -1365,6 +1384,32 @@ class AgentToolRuntime:
             },
         ]
 
+    def _fetch_tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "fetch_web_page",
+                    "description": (
+                        "Read the full content of a user-authorized public URL. "
+                        "Uses the configured Firecrawl-style FetchProvider when "
+                        "available, automatically falling back to the Qwen web "
+                        "extractor companion if the primary fetcher fails. The "
+                        "URL's host must be inside the explicitly authorized "
+                        "domain set for this session."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "format": "uri"},
+                        },
+                        "required": ["url"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
     def _web_tool_definitions(self) -> list[dict[str, Any]]:
         definitions = [
             {
@@ -1416,27 +1461,6 @@ class AgentToolRuntime:
                 },
             },
         ]
-        if callable(getattr(self.search_provider, "fetch", None)):
-            definitions.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "fetch_web_page",
-                        "description": (
-                            "Read the full content of a user-authorized public URL "
-                            "through the configured Qwen web extractor companion."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "url": {"type": "string", "format": "uri"},
-                            },
-                            "required": ["url"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
         if callable(getattr(self.search_provider, "image_search", None)):
             definitions.append(
                 {
@@ -2683,6 +2707,8 @@ class AgentToolRuntime:
                     "tool": name,
                     "research_job_id": job.id,
                     "status": job.status,
+                    "user_approval_required": payload["user_approval_required"],
+                    "estimated_cost_cny": payload.get("estimated_cost_cny", 0.0),
                 },
                 [],
             )
@@ -3170,16 +3196,18 @@ class AgentToolRuntime:
         allowed_domains: list[str],
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         url = arguments.get("url")
+        search_has_fetch = callable(getattr(self.search_provider, "fetch", None))
+        fetch_available = self._fetch_available
         if (
             set(arguments) != {"url"}
             or not isinstance(url, str)
             or not url.strip()
-            or not callable(getattr(self.search_provider, "fetch", None))
+            or (not search_has_fetch and not fetch_available)
         ):
             raise AppError(
                 422,
                 "invalid_tool_arguments",
-                "fetch_web_page requires one URL and a compatible Qwen companion",
+                "fetch_web_page requires one URL and a configured web fetcher",
             )
         domains = {
             item.strip().casefold()
@@ -3192,32 +3220,75 @@ class AgentToolRuntime:
                 "fetch_domain_not_authorized",
                 "Full-page extraction requires an explicitly authorized domain",
             )
+        target_url = url.strip()
+        # The requested URL's host must sit inside the authorized domain set
+        # for *every* fetcher we might route to; this is a hard SSRF/authorization
+        # gate and is never bypassed by the Firecrawl→Qwen fallback below.
         try:
-            require_public_http_url(url.strip(), domains)
-            document = self.search_provider.fetch(url.strip())
-            require_public_http_url(document.final_url, domains)
+            require_public_http_url(target_url, domains)
         except UnsafeFetchURL as exc:
             raise AppError(
                 422,
                 "fetch_url_blocked",
                 "The requested URL is outside the authorized public domains",
             ) from exc
-        except FetchProviderTimeout as exc:
-            raise AppError(504, "fetch_provider_timeout", "Web extractor timed out") from exc
-        except FetchProviderError as exc:
-            raise AppError(502, "fetch_provider_failed", "Web extractor failed") from exc
+
+        document: Any | None = None
+        fetch_provider_id: str | None = None
+        # Firecrawl-style FetchProvider is preferred. A soft transport/content
+        # failure degrades to the Qwen companion when one is available; an
+        # UnsafeFetchURL on the final URL remains a hard gate (no fallback).
+        if fetch_available:
+            try:
+                document = self.fetch_provider.fetch(target_url)
+                require_public_http_url(document.final_url, domains)
+                fetch_provider_id = self.fetch_provider.provider_id
+            except UnsafeFetchURL as exc:
+                raise AppError(
+                    422,
+                    "fetch_url_blocked",
+                    "The fetched page is outside the authorized public domains",
+                ) from exc
+            except FetchProviderTimeout:
+                document = None
+            except FetchProviderError:
+                document = None
+        if document is None and search_has_fetch:
+            try:
+                document = self.search_provider.fetch(target_url)
+                require_public_http_url(document.final_url, domains)
+                fetch_provider_id = self.search_provider.provider_id
+            except UnsafeFetchURL as exc:
+                raise AppError(
+                    422,
+                    "fetch_url_blocked",
+                    "The fetched page is outside the authorized public domains",
+                ) from exc
+            except FetchProviderTimeout as exc:
+                raise AppError(504, "fetch_provider_timeout", "Web extractor timed out") from exc
+            except FetchProviderError as exc:
+                raise AppError(502, "fetch_provider_failed", "Web extractor failed") from exc
+        if document is None:
+            raise AppError(
+                502,
+                "fetch_provider_failed",
+                "Configured web fetcher is unavailable or failed",
+            )
         result = {
             "url": document.final_url,
             "title": document.title,
             "content": document.content,
             "content_type": document.content_type,
         }
+        served_by = fetch_provider_id or getattr(
+            self.search_provider, "provider_id", "fetch_provider"
+        )
         return self._success(
             result,
             {
                 "url": document.final_url,
                 "content_chars": len(document.content),
-                "provider_id": self.search_provider.provider_id,
+                "provider_id": served_by,
             },
             [],
         )

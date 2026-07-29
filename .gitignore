@@ -142,9 +142,13 @@ temp/
 
 # Test sources are intentionally excluded from the public code-only tree
 /backend/tests/
+/backend/test_*.py
 /frontend/e2e/
 /frontend/playwright.config.*
 **/__tests__/
+**/tests/
+**/*_test.py
+**/test_*.py
 **/*.test.*
 **/*.spec.*
 
@@ -171,5 +175,6 @@ Desktop.ini
 /frontend/README.md
 /backend/README.md
 /image/
+/doc/
 
 

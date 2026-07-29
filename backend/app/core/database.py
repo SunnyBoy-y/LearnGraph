@@ -256,6 +256,9 @@ def _apply_sqlite_additive_migrations() -> None:
             "session_kind": "VARCHAR(32) NOT NULL DEFAULT 'main'",
             "writeback_policy": "VARCHAR(32) NOT NULL DEFAULT 'normal'",
             "context_capsule": "JSON NOT NULL DEFAULT '{}'",
+            "activity_summary": "VARCHAR(240)",
+            "memory_recall_enabled": "BOOLEAN NOT NULL DEFAULT 1",
+            "memory_learning_enabled": "BOOLEAN NOT NULL DEFAULT 1",
         },
         "graph_nodes": {
             "external_concept_id": "VARCHAR(255)",
@@ -336,6 +339,21 @@ def _apply_sqlite_additive_migrations() -> None:
             "state": "VARCHAR(24) NOT NULL DEFAULT 'active'",
             "source_ids": "JSON NOT NULL DEFAULT '[]'",
             "structured_payload": "JSON NOT NULL DEFAULT '{}'",
+            # Existing rows predate atomic provenance and remain excluded from
+            # the new profile until a migration/review promotes them.
+            "atom_schema_version": "INTEGER NOT NULL DEFAULT 0",
+            "canonical_key": "VARCHAR(240) NOT NULL DEFAULT ''",
+            "atom_kind": "VARCHAR(64) NOT NULL DEFAULT 'fact'",
+            "ledger_status": "VARCHAR(32) NOT NULL DEFAULT 'active'",
+            "temporal_status": "VARCHAR(32) NOT NULL DEFAULT 'timeless'",
+            "summary_eligibility": "VARCHAR(32) NOT NULL DEFAULT 'legacy_review'",
+            "valid_from": "DATETIME",
+            "valid_until": "DATETIME",
+            "event_at": "DATETIME",
+            "next_review_at": "DATETIME",
+            "last_verified_at": "DATETIME",
+            "timezone_name": "VARCHAR(80) NOT NULL DEFAULT 'Asia/Shanghai'",
+            "evidence_ids": "JSON NOT NULL DEFAULT '[]'",
             "confidence": "FLOAT NOT NULL DEFAULT 0.7",
             "importance": "FLOAT NOT NULL DEFAULT 0.5",
             "strength": "FLOAT NOT NULL DEFAULT 0.5",
@@ -456,6 +474,23 @@ def _apply_sqlite_additive_migrations() -> None:
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_memory_records_node_id "
             "ON memory_records(workspace_id, node_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_records_profile_effective "
+            "ON memory_records(workspace_id, state, ledger_status, "
+            "summary_eligibility, temporal_status)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_records_next_review "
+            "ON memory_records(workspace_id, next_review_at)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_evidence_source "
+            "ON memory_evidence(workspace_id, source_kind, source_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_profile_current "
+            "ON memory_profile_snapshots(workspace_id, owner_subject_id, status, version)"
         )
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_memory_drafts_status "

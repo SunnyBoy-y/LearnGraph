@@ -344,6 +344,10 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
     parent_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     source_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     memory_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Separate "use existing memory" from "contribute new memory". The legacy
+    # switch remains the master per-session gate for compatibility.
+    memory_recall_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    memory_learning_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     model_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
@@ -352,6 +356,9 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
     session_kind: Mapped[str] = mapped_column(String(32), default="main", index=True)
     writeback_policy: Mapped[str] = mapped_column(String(32), default="normal")
     context_capsule: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # LLM-generated "learning event" description for the dashboard activity view.
+    # Falls back to ``title`` when absent or when the provider is unavailable.
+    activity_summary: Mapped[str | None] = mapped_column(String(240), nullable=True)
 
 
 class Message(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -1124,6 +1131,33 @@ class MemoryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     source: Mapped[str] = mapped_column(String(120), default="user")
     source_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     structured_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Processed atomic fact lifecycle. Raw chat/file text remains in its own
+    # source tables and is referenced through MemoryEvidence.
+    atom_schema_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    canonical_key: Mapped[str] = mapped_column(String(240), default="", index=True)
+    atom_kind: Mapped[str] = mapped_column(String(64), default="fact", index=True)
+    ledger_status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    temporal_status: Mapped[str] = mapped_column(String(32), default="timeless", index=True)
+    summary_eligibility: Mapped[str] = mapped_column(
+        String(32), default="durable", index=True
+    )
+    valid_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    event_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_review_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    timezone_name: Mapped[str] = mapped_column(String(80), default="Asia/Shanghai")
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     confidence: Mapped[float] = mapped_column(Float, default=0.7)
     importance: Mapped[float] = mapped_column(Float, default=0.5)
     strength: Mapped[float] = mapped_column(Float, default=0.5)
@@ -1151,6 +1185,71 @@ class MemoryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     content_destroyed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class MemoryEvidence(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Typed provenance for memory atoms, separate from the atom ledger."""
+
+    __tablename__ = "memory_evidence"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source_kind: Mapped[str] = mapped_column(String(40), index=True)
+    source_id: Mapped[str] = mapped_column(String(160), index=True)
+    message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    message_part_id: Mapped[str | None] = mapped_column(
+        ForeignKey("message_parts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    tool_call_id: Mapped[str | None] = mapped_column(
+        String(160), nullable=True, index=True
+    )
+    authorship: Mapped[str] = mapped_column(String(32), index=True)
+    derived_from: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    excerpt: Mapped[str] = mapped_column(Text, default="")
+    profile_eligible: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    eligibility_reason: Mapped[str] = mapped_column(String(240), default="")
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+
+class MemoryProfileSnapshot(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Versioned, fully rewritten user-facing memory summary."""
+
+    __tablename__ = "memory_profile_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "owner_subject_id",
+            "version",
+            name="uq_memory_profile_snapshot_version",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_subject_id: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24), default="ready", index=True)
+    markdown: Mapped[str] = mapped_column(Text, default="")
+    structured_sections: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    source_atom_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    claim_atom_map: Mapped[dict[str, list[str]]] = mapped_column(JSON, default=dict)
+    prompt_version: Mapped[str] = mapped_column(String(40), default="memory-profile-v1")
+    model_id: Mapped[str] = mapped_column(String(200), default="")
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stale_reason: Mapped[str] = mapped_column(String(240), default="")
 
 
 class MemoryDraft(Base, TimestampMixin, WorkspaceScopedMixin):

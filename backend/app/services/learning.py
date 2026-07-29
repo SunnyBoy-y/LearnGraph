@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from typing import Any
 
@@ -36,6 +37,7 @@ from app.domain.schemas.learning import (
     MasteryNodeView,
     ModelGeneratedExerciseItem,
     ModelGeneratedExerciseSet,
+    ModelShortAnswerGrade,
 )
 from app.providers.ports.model import ModelProviderPort
 from app.repositories.audit import AuditRepository
@@ -828,11 +830,337 @@ class ExerciseService:
             )
             return correct, answer_text, feedback
 
+        return self._grade_short_answer(exercise, answer_text)
+
+    def _grade_short_answer(
+        self, exercise: Exercise, answer_text: str
+    ) -> tuple[bool, str, str]:
         rubric = dict(exercise.rubric_json or {})
-        points = [str(point).strip() for point in (rubric.get("points") or []) if str(point).strip()]
-        answer_folded = answer_text.casefold()
+        points = [
+            str(point).strip()
+            for point in (rubric.get("points") or [])
+            if str(point).strip()
+        ]
+        model_grade = self._model_grade_short_answer(exercise, answer_text, points)
+        if model_grade is not None:
+            return model_grade.is_correct, answer_text, model_grade.feedback
+
+        return self._heuristic_grade_short_answer(exercise, answer_text, points)
+
+    def _model_grade_short_answer(
+        self,
+        exercise: Exercise,
+        answer_text: str,
+        points: list[str],
+    ) -> ModelShortAnswerGrade | None:
+        provider = self.model_provider
+        if provider is None or not getattr(provider, "available", False):
+            return None
+        if not getattr(provider, "remote_capability", False):
+            return None
+
+        points_block = (
+            "\n".join(f"- {point}" for point in points)
+            if points
+            else f"- {exercise.answer_key.strip()}"
+        )
+        prompt = (
+            "你是 LearnGraph 的简答题自动批改器。根据题干、参考答案与评分要点，"
+            "判断学生回答是否覆盖关键概念。允许同义改写与不同表述顺序，"
+            "不要要求逐字匹配。\n"
+            "判分规则：\n"
+            "1. covered_points / missing_points 只能来自给定要点（或参考答案拆出的要点），"
+            "不要新增要点。\n"
+            "2. score_ratio = 已覆盖要点数 / 总要点数，范围 0～1。\n"
+            "3. is_correct 在 score_ratio >= 0.5 时为 true，否则 false；"
+            "若学生明确表示不知道/空白/拒答，则为 false。\n"
+            "4. feedback 用中文，1～3 句：先给覆盖情况，再点出缺失要点或改进建议。"
+            "不要复述整段学生原文。\n"
+            f"题干：{exercise.prompt.strip()}\n"
+            f"参考答案：{exercise.answer_key.strip()}\n"
+            f"评分要点：\n{points_block}\n"
+            f"学生回答：{answer_text.strip()}\n"
+        )
+        errors: list[str] = []
+        for attempt in range(1, 3):
+            try:
+                quote = self.billing.preflight_model_call(
+                    provider_id=provider.provider_id,
+                    model_id=getattr(provider, "model_id", "unknown"),
+                    feature="exercise_grade",
+                    estimated_input_tokens=max(1, (len(prompt) + 3) // 4),
+                    estimated_output_tokens=min(
+                        512,
+                        max(64, int(getattr(provider, "max_output_tokens", 0) or 512)),
+                    ),
+                    remote_capability=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back to heuristic grading
+                errors.append(type(exc).__name__)
+                break
+
+            provider_returned = False
+            result: ModelShortAnswerGrade | None = None
+            try:
+                raw = provider.generate_json(
+                    prompt,
+                    "exercise_grade",
+                    ModelShortAnswerGrade.model_json_schema(),
+                )
+                provider_returned = True
+                result = ModelShortAnswerGrade.model_validate(raw)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(type(exc).__name__)
+            if provider_returned:
+                usage = dict(getattr(provider, "last_usage", {}) or {})
+                try:
+                    self.billing.record_usage(
+                        quote,
+                        input_tokens=int(usage.get("input_tokens") or 0),
+                        output_tokens=int(usage.get("output_tokens") or 0),
+                        cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                        reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+                        attempt=attempt,
+                        usage_reported=bool(usage),
+                    )
+                    # Keep billing durable even if the outer answer transaction later rolls back.
+                    self.db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(type(exc).__name__)
+            if result is None:
+                continue
+            return self._normalize_model_short_answer_grade(result, points, exercise)
+        return None
+
+    def _normalize_model_short_answer_grade(
+        self,
+        result: ModelShortAnswerGrade,
+        points: list[str],
+        exercise: Exercise,
+    ) -> ModelShortAnswerGrade:
+        total = max(1, len(points) if points else 1)
+        covered = list(result.covered_points)
+        missing = list(result.missing_points)
+        hits: int
+        ratio: float
+
         if points:
-            hits = sum(1 for point in points if point.casefold() in answer_folded)
+            point_lookup = {point.casefold(): point for point in points}
+
+            def resolve_point(item: str) -> str | None:
+                folded = item.casefold().strip()
+                if folded in point_lookup:
+                    return point_lookup[folded]
+                # Models often paraphrase the point label; map by keyword overlap.
+                best: str | None = None
+                best_ratio = 0.0
+                for point in points:
+                    r = self._point_match_ratio(point, folded)
+                    # Also try reverse containment of content keywords.
+                    if point.casefold() in folded or folded in point.casefold():
+                        r = max(r, 0.9)
+                    if r > best_ratio:
+                        best_ratio = r
+                        best = point
+                return best if best is not None and best_ratio >= 0.25 else None
+
+            covered_resolved = []
+            for item in covered:
+                mapped = resolve_point(item)
+                if mapped is not None and mapped not in covered_resolved:
+                    covered_resolved.append(mapped)
+            missing_resolved = []
+            for item in missing:
+                mapped = resolve_point(item)
+                if mapped is not None and mapped not in missing_resolved:
+                    missing_resolved.append(mapped)
+
+            covered = covered_resolved
+            missing = missing_resolved
+
+            if not covered and not missing:
+                # Model gave a verdict but no usable point lists — trust ratio/flag.
+                ratio = max(0.0, min(1.0, float(result.score_ratio)))
+                if result.is_correct and ratio < 0.5:
+                    ratio = max(ratio, 0.5)
+                if not result.is_correct and ratio >= 0.5:
+                    ratio = min(ratio, 0.49)
+                hits = int(round(ratio * total))
+                # Reconstruct covered/missing proportionally for feedback only.
+                if hits >= total:
+                    covered = list(points)
+                    missing = []
+                elif hits <= 0:
+                    covered = []
+                    missing = list(points)
+            else:
+                if not covered and missing:
+                    missing_folded = {item.casefold() for item in missing}
+                    covered = [point for point in points if point.casefold() not in missing_folded]
+                if not missing:
+                    covered_folded = {item.casefold() for item in covered}
+                    missing = [point for point in points if point.casefold() not in covered_folded]
+                hits = len({item.casefold() for item in covered})
+                ratio = hits / total
+        else:
+            hits = 1 if result.is_correct else 0
+            ratio = max(0.0, min(1.0, float(result.score_ratio)))
+            if result.is_correct and ratio < 0.5:
+                ratio = 1.0
+            if not result.is_correct and ratio >= 0.5:
+                ratio = min(ratio, 0.49)
+
+        correct = ratio >= 0.5
+        # If the model is decisive and we could not map points, prefer its flag.
+        if points and not result.covered_points and not result.missing_points:
+            correct = bool(result.is_correct) if abs(ratio - 0.5) < 1e-9 else correct
+        elif abs(ratio - 0.5) < 1e-9:
+            correct = bool(result.is_correct)
+
+        feedback = (result.feedback or "").strip()
+        if not feedback:
+            if points:
+                feedback = (
+                    f"覆盖了 {hits}/{total} 个要点。"
+                    if correct
+                    else f"仅覆盖 {hits}/{total} 个要点，请补充关键概念后再答。"
+                )
+            else:
+                feedback = (
+                    exercise.explanation
+                    or ("回答正确。" if correct else "回答未覆盖参考要点，请结合资料再组织答案。")
+                )
+            if missing and not correct:
+                feedback = f"{feedback.rstrip('。')}；可补充：{'；'.join(missing[:3])}。"
+        return ModelShortAnswerGrade(
+            covered_points=covered,
+            missing_points=missing,
+            is_correct=correct,
+            score_ratio=ratio,
+            feedback=feedback,
+        )
+
+    @staticmethod
+    def _strip_rubric_instruction_prefix(text: str) -> str:
+        folded = text.casefold().strip()
+        return re.sub(
+            r"^(正确|准确|简要|请|需要|应当|应该|能够|可以|要求)?"
+            r"(说明|描述|解释|阐述|指出|写出|回答|答出|理解|掌握|运用|使用)?"
+            r"[:：、，,\s]*",
+            "",
+            folded,
+            count=1,
+        ).strip(" 。.;；,，")
+
+    @classmethod
+    def _content_keywords(cls, text: str) -> list[str]:
+        """Extract content keywords from a rubric point or answer key."""
+        content = cls._strip_rubric_instruction_prefix(text)
+        if not content:
+            return []
+        parts = [
+            part.strip()
+            for part in re.split(r"[并与和且、，,/]|以及|并以|并且", content)
+            if part and part.strip()
+        ]
+        if not parts:
+            parts = [content]
+        keywords: list[str] = []
+        for part in parts:
+            part = re.sub(r"^(可|能|要|应|需)", "", part)
+            if len(part) < 2:
+                continue
+            if 2 <= len(part) <= 8:
+                keywords.append(part)
+            keywords.append(part[:2])
+            keywords.append(part[-2:])
+            if len(part) >= 4:
+                keywords.append(part[:4])
+                keywords.append(part[-4:])
+            for i in range(0, len(part) - 1, 2):
+                keywords.append(part[i : i + 2])
+            keywords.extend(re.findall(r"[a-z0-9_]{2,}", part))
+        stop = {
+            "并且",
+            "以及",
+            "或者",
+            "进行",
+            "通过",
+            "可以",
+            "能够",
+            "一个",
+            "一种",
+            "相关",
+            "内容",
+            "方面",
+            "问题",
+            "如下",
+            "上述",
+            "以下",
+            "正确",
+            "说明",
+            "描述",
+            "解释",
+        }
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for token in keywords:
+            token = token.strip()
+            if len(token) < 2 or token in stop or token in seen:
+                continue
+            seen.add(token)
+            ordered.append(token)
+        return ordered
+
+    # Backwards-compatible alias.
+    _tokenize_for_match = _content_keywords
+
+    def _point_match_ratio(self, point: str, answer_folded: str) -> float:
+        if point.casefold() in answer_folded:
+            return 1.0
+        keywords = self._content_keywords(point)
+        if not keywords:
+            return 0.0
+        weight_total = 0.0
+        weight_hit = 0.0
+        for keyword in keywords:
+            weight = 1.5 if len(keyword) >= 4 else 1.0
+            weight_total += weight
+            if keyword in answer_folded:
+                weight_hit += weight
+        return weight_hit / weight_total if weight_total else 0.0
+
+    def _heuristic_grade_short_answer(
+        self,
+        exercise: Exercise,
+        answer_text: str,
+        points: list[str],
+    ) -> tuple[bool, str, str]:
+        answer_folded = answer_text.casefold()
+        refusal = re.fullmatch(
+            r"(不知道|不太清楚|不会|无|无解|不会做|skip|n/?a|idk|i\s*don'?t\s*know)[。.!！?？]*",
+            answer_text.strip(),
+            flags=re.IGNORECASE,
+        )
+        if refusal:
+            total = max(1, len(points) if points else 1)
+            feedback = (
+                exercise.explanation
+                or f"仅覆盖 0/{total} 个要点，请补充关键概念后再答。"
+            )
+            return False, answer_text, feedback
+
+        if points:
+            hits = 0
+            missing: list[str] = []
+            for point in points:
+                ratio = self._point_match_ratio(point, answer_folded)
+                # Heuristic is a fallback for when the model is unavailable; keep
+                # the bar low enough that common paraphrases still hit.
+                if ratio >= 0.25:
+                    hits += 1
+                else:
+                    missing.append(point)
             ratio = hits / max(1, len(points))
             correct = ratio >= 0.5
             feedback = (
@@ -843,8 +1171,17 @@ class ExerciseService:
                     or f"仅覆盖 {hits}/{len(points)} 个要点，请补充关键概念后再答。"
                 )
             )
+            if missing and not correct and not exercise.explanation:
+                feedback = f"{feedback.rstrip('。')}；可补充：{'；'.join(missing[:3])}。"
             return correct, answer_text, feedback
-        correct = exercise.answer_key.casefold() in answer_folded
+
+        key = exercise.answer_key.strip()
+        if not key:
+            return False, answer_text, exercise.explanation or "缺少参考答案，无法自动批改。"
+        if key.casefold() in answer_folded or answer_folded in key.casefold():
+            return True, answer_text, exercise.explanation or "回答正确。"
+        ratio = self._point_match_ratio(key, answer_folded)
+        correct = ratio >= 0.25
         feedback = (
             (exercise.explanation or "回答正确。")
             if correct

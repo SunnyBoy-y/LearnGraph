@@ -118,13 +118,42 @@ export type ToolInputProps = ComponentProps<"div"> & {
   input: ToolPart["input"];
 };
 
+// Large tool payloads used to always go through Shiki. That is expensive for
+// agent sessions with many tools; keep a plain-text path for bulky JSON and only
+// highlight moderate payloads.
+const TOOL_HIGHLIGHT_MAX_CHARS = 12_000;
+const TOOL_PREVIEW_MAX_CHARS = 80_000;
+
+function formatToolJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function ToolCode({ code }: { code: string }) {
+  if (code.length > TOOL_HIGHLIGHT_MAX_CHARS) {
+    const truncated =
+      code.length > TOOL_PREVIEW_MAX_CHARS
+        ? `${code.slice(0, TOOL_PREVIEW_MAX_CHARS)}\n…（已截断 ${code.length - TOOL_PREVIEW_MAX_CHARS} 字符）`
+        : code;
+    return (
+      <pre className="m-0 max-h-96 overflow-auto p-4 font-mono text-xs whitespace-pre-wrap break-words">
+        {truncated}
+      </pre>
+    );
+  }
+  return <CodeBlock code={code} language="json" />;
+}
+
 export const ToolInput = ({ className, input, ...props }: ToolInputProps) => (
   <div className={cn("space-y-2 overflow-hidden", className)} {...props}>
     <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
       参数
     </h4>
     <div className="rounded-md bg-muted/50">
-      <CodeBlock code={JSON.stringify(input, null, 2)} language="json" />
+      <ToolCode code={formatToolJson(input)} />
     </div>
   </div>
 );
@@ -147,11 +176,9 @@ export const ToolOutput = ({
   let Output = <div>{output as ReactNode}</div>;
 
   if (typeof output === "object" && !isValidElement(output)) {
-    Output = (
-      <CodeBlock code={JSON.stringify(output, null, 2)} language="json" />
-    );
+    Output = <ToolCode code={formatToolJson(output)} />;
   } else if (typeof output === "string") {
-    Output = <CodeBlock code={output} language="json" />;
+    Output = <ToolCode code={output} />;
   }
 
   return (

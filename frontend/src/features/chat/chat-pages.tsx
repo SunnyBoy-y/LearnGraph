@@ -1,10 +1,12 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useId,
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { createUuid } from "@/lib/uuid";
@@ -24,6 +26,7 @@ import {
   ChevronRight,
   Copy,
   FilePlus2,
+  FileSearch,
   FileText,
   GitBranch,
   GitCompareArrows,
@@ -72,6 +75,7 @@ import {
   listGraphs,
   listMemories,
   listSessionMessages,
+  listSessionMessagesPage,
   listSettings,
   listSessions,
   listFiles,
@@ -144,6 +148,7 @@ import {
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
+import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
   locateSelectionInContent,
@@ -160,6 +165,7 @@ import {
   clearSessionStream,
   getSessionStream,
   isSessionStreaming,
+  listStreamingSessionIds,
   registerSessionStream,
   setSessionStreamMessageId,
 } from "@/lib/session-streams";
@@ -215,7 +221,9 @@ import {
 } from "@/lib/draft-session";
 import {
   defaultComposerPrefs,
+  defaultComposerPrefsForResponseMode,
   getSessionComposerPrefs,
+  hasSessionComposerPrefs,
   inheritSessionComposerPrefs,
   isDefaultComposerPrefs,
   prefsFromModelSnapshot,
@@ -235,12 +243,22 @@ import {
   providerModelOptions,
   thinkingLabels,
 } from "@/lib/model-choices";
-import { areChatSuggestedPromptsEnabled, isChatContextUsageEnabled, isChatDictationCleanupEnabled, readChatFeatureModelSetting, CHAT_AUTO_TITLE_MODEL_SETTING_KEY, CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY, CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY } from "@/lib/workspace-settings";
+import {
+  areChatSuggestedPromptsEnabled,
+  isChatContextUsageEnabled,
+  isChatDictationCleanupEnabled,
+  readChatDefaultResponseMode,
+  readChatFeatureModelSetting,
+  CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
+  CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+  CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
+} from "@/lib/workspace-settings";
 import { ContextUsageRing } from "@/components/chat/context-usage-ring";
 import { shouldShowSuggestedPromptError } from "@/lib/suggested-prompts";
 import { cn } from "@/lib/utils";
 import {
   groupPartsForDisplay,
+  isDeepResearchApprovalPart,
   orderedMessageParts,
   shouldShowThinkingPlaceholder,
   thinkingDurationSeconds,
@@ -536,7 +554,17 @@ type ComposerCommandId =
   | "usage";
 
 const LEARNING_NODE_CONTEXT_STORAGE_KEY = "learngraph:active-learning-node";
-const TERMINAL_MESSAGE_STATUSES = ["completed", "failed", "cancelled"] as const;
+const TERMINAL_MESSAGE_STATUSES = [
+  "completed",
+  "failed",
+  "cancelled",
+  // A non-terminal-yet-parked state: the backend process restarted after a
+  // checkpoint, the durable partial is preserved, and the task can be resumed
+  // (batch 2) or retried. It is treated as terminal for stream polling so a
+  // parked `interrupted` message does not trigger phantom 400ms replay, but the
+  // UI renders a "已中断（后端重启）" affordance + retry button instead of error.
+  "interrupted",
+] as const;
 const IN_FLIGHT_MESSAGE_STATUSES = ["pending", "streaming"] as const;
 
 /** Sidebar/top-bar title for sessions created by edit/branch. */
@@ -574,15 +602,30 @@ async function confirmedSessionMessages(
   statuses: readonly string[],
   minimumVersion = 0,
 ) {
-  const persisted = await listSessionMessages(sessionId);
-  const message = persisted.find((item) => item.id === messageId);
+  // Snapshot one message instead of re-downloading the entire timeline just to
+  // confirm a terminal status — the old path re-materialized multi-MB agent
+  // histories on every stream completion.
+  const snapshot = await getMessageSnapshot(sessionId, messageId);
   if (
-    !message ||
-    !statuses.includes(message.status) ||
-    message.version < minimumVersion
+    !statuses.includes(snapshot.status) ||
+    snapshot.version < minimumVersion
   )
     throw new Error("持久消息尚未同步到预期终态。");
-  return persisted;
+  return snapshot;
+}
+
+function mergeMessageIntoCache(
+  current: Message[] | undefined,
+  message: Message,
+): Message[] {
+  if (!current?.length) return [message];
+  let found = false;
+  const next = current.map((item) => {
+    if (item.id !== message.id) return item;
+    found = true;
+    return message;
+  });
+  return found ? next : [...next, message];
 }
 
 type BrowserSpeechRecognitionResult = {
@@ -736,8 +779,15 @@ function streamEventType(data: Record<string, unknown>): string {
 
 
 const STREAM_EVENTS_PER_FRAME = 3;
-const STREAM_DELTA_CHARS = 28;
+// Larger chunks cut per-frame string/array clones during long agent streams.
+// Typing animation still looks smooth; 28-char micro-slices were mostly RAM churn.
+const STREAM_DELTA_CHARS = 180;
 const DEFAULT_STREAM_RECONNECTS = 5;
+/** Newest-window size for the initial chat hydrate. Older turns load on scroll-up. */
+const INITIAL_MESSAGE_PAGE = 50;
+const OLDER_MESSAGE_PAGE = 40;
+/** Keep the active session plus a short recent window; drop the rest on switch. */
+const MESSAGE_CACHE_KEEP_RECENT = 1;
 const STREAM_RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
 
 type StreamConnectionNotice = {
@@ -841,10 +891,16 @@ function StreamConnectionFeedback({
   );
 }
 
-function expandStreamUpdate(data: Record<string, unknown>) {
+function expandStreamUpdate(
+  data: Record<string, unknown>,
+  options: { animate?: boolean } = {},
+) {
   const part = isMessagePart(data.part) ? data.part : undefined;
   const eventType = streamEventType(data);
   const delta = part?.content_delta;
+  // Skip character micro-slicing for off-screen / background streams — those
+  // intermediate clones only inflate RAM and never paint.
+  if (options.animate === false) return [data];
   if (
     !part ||
     typeof delta !== "string" ||
@@ -1209,7 +1265,87 @@ function UserMessage({
   );
 }
 
-function AssistantMessage({
+/**
+ * Defer heavy Streamdown/Shiki trees until the row nears the viewport, and
+ * release them again once the user scrolls far away. Once-visible-always-mounted
+ * was the previous behaviour and kept every revealed agent answer resident for
+ * the rest of the session.
+ */
+function LazyMessageMount({
+  children,
+  eager = false,
+  minHeight = 96,
+}: {
+  children: ReactNode;
+  eager?: boolean;
+  minHeight?: number;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const [visible, setVisible] = useState(eager);
+  const measuredHeightRef = useRef(minHeight);
+
+  useEffect(() => {
+    if (eager) {
+      setVisible(true);
+      return;
+    }
+    const node = hostRef.current;
+    if (!node) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        if (entry.isIntersecting) {
+          measuredHeightRef.current = Math.max(
+            minHeight,
+            Math.round(node.getBoundingClientRect().height) || minHeight,
+          );
+          setVisible(true);
+        } else {
+          // Keep a stable placeholder height so stick-to-bottom / scroll
+          // position does not jump when far-above rows unmount.
+          measuredHeightRef.current = Math.max(
+            minHeight,
+            Math.round(node.getBoundingClientRect().height) ||
+              measuredHeightRef.current,
+          );
+          setVisible(false);
+        }
+      },
+      {
+        // Prefetch a screenful above/below; unmount well outside that band.
+        rootMargin: "900px 0px",
+        threshold: 0,
+      },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [eager, minHeight]);
+
+  return (
+    <div
+      ref={hostRef}
+      className="chat-message-mount"
+      style={
+        visible
+          ? undefined
+          : {
+              minHeight: measuredHeightRef.current,
+              contentVisibility: "auto",
+              containIntrinsicSize: `auto ${measuredHeightRef.current}px`,
+            }
+      }
+    >
+      {visible ? children : null}
+    </div>
+  );
+}
+
+function AssistantMessageInner({
   message,
   sessionId,
   onRetry,
@@ -1232,10 +1368,17 @@ function AssistantMessage({
 }) {
   const persisted =
     !message.id.startsWith("temp") && message.id !== "welcome-local";
+  // Lazily fetch message versions only after the user shows interest in the
+  // message's action area (hover/focus), instead of firing a query for every
+  // persisted assistant message on mount. Most messages have a single version
+  // (the version row never renders), so eager fetching was pure overhead: N
+  // messages ⇒ N subscriptions + N effects. The snapshot query below was
+  // already gated on `selectedVersionId`; this gates its prerequisite too.
+  const [versionsRequested, setVersionsRequested] = useState(false);
   const versions = useQuery({
     queryKey: ["message-versions", sessionId, message.id],
     queryFn: () => listMessageVersions(sessionId, message.id),
-    enabled: persisted,
+    enabled: persisted && versionsRequested,
   });
   const [selectedVersionId, setSelectedVersionId] = useState<
     string | undefined
@@ -1252,6 +1395,8 @@ function AssistantMessage({
   const orderedParts = orderedMessageParts(shown.parts);
   // Thinking chain (reasoning + tools) is always rendered above the final body.
   const displaySegments = groupPartsForDisplay(shown.parts);
+  // Budget approval needs a clickable card outside the collapsed thinking fold.
+  const deepResearchApprovalParts = orderedParts.filter(isDeepResearchApprovalPart);
   const fullText = shown.parts
     .filter((part) => part.type === "text" || part.type === "acknowledgement")
     .map((part) => part.content ?? "")
@@ -1280,6 +1425,9 @@ function AssistantMessage({
       data-message-id={message.id}
       data-selection-disabled={selectedVersionId ? "true" : undefined}
       from="assistant"
+      // Lazy versions trigger — see `versionsRequested` above.
+      onMouseEnter={() => setVersionsRequested(true)}
+      onFocus={() => setVersionsRequested(true)}
     >
       {versions.data && versions.data.length > 1 ? (
         <div className="mb-2 flex items-center gap-1 text-[10px] text-muted-foreground">
@@ -1310,21 +1458,32 @@ function AssistantMessage({
         ) : null}
         {displaySegments.map((segment, index) =>
           segment.kind === "chain" ? (
-            <ThinkingChain
-              key={`chain-${message.id}-${index}`}
-              chainParts={segment.parts}
-              completedDurationSec={thinkingDurationSeconds(
-                shown.provider_trace,
-              )}
-              messageStatus={shown.status}
-              startedAt={
-                typeof shown.provider_trace.generation_started_at === "string"
-                  ? shown.provider_trace.generation_started_at
-                  : shown.created_at
-              }
-            >
-              {segment.parts.map(renderPart)}
-            </ThinkingChain>
+            <div className="space-y-2" key={`chain-wrap-${message.id}-${index}`}>
+              <ThinkingChain
+                chainParts={segment.parts}
+                completedDurationSec={thinkingDurationSeconds(
+                  shown.provider_trace,
+                )}
+                messageStatus={shown.status}
+                startedAt={
+                  typeof shown.provider_trace.generation_started_at === "string"
+                    ? shown.provider_trace.generation_started_at
+                    : shown.created_at
+                }
+              >
+                {segment.parts.map(renderPart)}
+              </ThinkingChain>
+              {index === 0 && deepResearchApprovalParts.length ? (
+                <div className="message-deep-research-approvals space-y-3">
+                  {deepResearchApprovalParts.map((part) => (
+                    <DeepResearchApprovalFromPart
+                      key={`approval-${part.id}`}
+                      part={part}
+                    />
+                  ))}
+                </div>
+              ) : null}
+            </div>
           ) : (
             <div
               className="message-answer-segment"
@@ -1334,6 +1493,14 @@ function AssistantMessage({
             </div>
           ),
         )}
+        {!displaySegments.some((segment) => segment.kind === "chain") &&
+        deepResearchApprovalParts.length ? (
+          <div className="message-deep-research-approvals space-y-3 pt-1">
+            {deepResearchApprovalParts.map((part) => (
+              <DeepResearchApprovalFromPart key={`approval-${part.id}`} part={part} />
+            ))}
+          </div>
+        ) : null}
       </MessageContent>
       <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
         <MessageAction
@@ -1373,6 +1540,42 @@ function AssistantMessage({
     </AiMessage>
   );
 }
+
+/**
+ * Memoized AssistantMessage.
+ *
+ * Why a custom comparator: the call site passes `onRetry` / `onBranch` as
+ * inline closures (intentionally — they capture the latest volatile state such
+ * as selected model/response mode at click time, avoiding stale closures).
+ * Those closures change identity every render, which would defeat a default
+ * shallow `memo`. The comparator deliberately ignores the callback identities
+ * and compares only the props that drive the rendered output: the `message`
+ * object reference, `sessionId`, and the disabled/state-reason flags. When a
+ * streaming frame mutates only the in-flight message, every other assistant
+ * message keeps a stable `message` reference and (during streaming) stable
+ * disabled flags, so they short-circuit and skip re-parsing Streamdown
+ * markdown — the dominant per-frame cost in long multi-agent threads.
+ *
+ * Inline callbacks are fine here: a skipped render never calls them, and a
+ * rendered render always re-creates them with the freshest captured state.
+ */
+const areEqualAssistantMessage = (
+  prev: AssistantMessageMemoProps,
+  next: AssistantMessageMemoProps,
+): boolean =>
+  prev.message === next.message &&
+  prev.sessionId === next.sessionId &&
+  prev.retryDisabled === next.retryDisabled &&
+  prev.branchDisabled === next.branchDisabled &&
+  prev.retryDisabledReason === next.retryDisabledReason &&
+  prev.branchDisabledReason === next.branchDisabledReason;
+
+type AssistantMessageMemoProps = Parameters<typeof AssistantMessageInner>[0];
+
+const AssistantMessage = memo(
+  AssistantMessageInner,
+  areEqualAssistantMessage,
+);
 
 function EmptySessionPrompts({
   prompts,
@@ -1596,6 +1799,7 @@ function ConversationQuickActions({
   agentActive,
   agentDisabled,
   attachDisabled,
+  deepResearchDisabled,
   goalActive,
   goalDisabled,
   graphActive,
@@ -1603,6 +1807,7 @@ function ConversationQuickActions({
   imageActive,
   imageDisabled,
   onAttach,
+  onDeepResearch,
   onGoal,
   onGraph,
   onImage,
@@ -1616,6 +1821,7 @@ function ConversationQuickActions({
   agentActive: boolean;
   agentDisabled: boolean;
   attachDisabled: boolean;
+  deepResearchDisabled: boolean;
   goalActive: boolean;
   goalDisabled: boolean;
   graphActive: boolean;
@@ -1623,6 +1829,7 @@ function ConversationQuickActions({
   imageActive: boolean;
   imageDisabled: boolean;
   onAttach: () => void;
+  onDeepResearch: () => void;
   onGoal: () => void;
   onGraph: () => void;
   onImage: () => void;
@@ -1686,6 +1893,20 @@ function ConversationQuickActions({
         >
           <Bot aria-hidden="true" />
           智能体
+        </button>
+        <button
+          className="chat-workbench-toolbar__action"
+          disabled={deepResearchDisabled}
+          onClick={onDeepResearch}
+          title={
+            deepResearchDisabled
+              ? "请先启用 Deep Research Provider，并使用支持工具调用的模型"
+              : "快捷启动深度研究：启用智能体并预填 start_deep_research 任务"
+          }
+          type="button"
+        >
+          <FileSearch aria-hidden="true" />
+          深度研究
         </button>
         <button
           aria-pressed={graphActive}
@@ -1756,6 +1977,8 @@ export function ChatCanvasPage() {
   const [pendingFiles, setPendingFiles] = useState<FileRecord[]>([]);
   const [composerText, setComposerText] = useState("");
   const [graphAction, setGraphAction] = useState<GraphAction>("none");
+  // Settings load after mount; initial seed uses product defaults, then
+  // the session restore effect below adopts the workspace default.
   const initialComposerPrefs = useMemo(
     () =>
       sessionId && sessionId !== "new"
@@ -1890,26 +2113,192 @@ export function ChatCanvasPage() {
     setGenerationMode("text");
   }, [goalMode]);
 
+  const [historyHasMoreBefore, setHistoryHasMoreBefore] = useState(false);
+  const [historyTotalCount, setHistoryTotalCount] = useState(0);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const loadingOlderRef = useRef(false);
+
   const history = useQuery({
     queryKey: ["messages", sessionId],
-    queryFn: () => listSessionMessages(sessionId),
+    queryFn: async () => {
+      const page = await listSessionMessagesPage(sessionId, {
+        limit: INITIAL_MESSAGE_PAGE,
+      });
+      setHistoryTotalCount(page.total_count);
+      const previous =
+        queryClient.getQueryData<Message[]>(["messages", sessionId]) ?? [];
+      const pageIds = new Set(page.items.map((item) => item.id));
+      const oldestPageId = page.items[0]?.id;
+      const oldestIndex = oldestPageId
+        ? previous.findIndex((item) => item.id === oldestPageId)
+        : -1;
+      // Preserve any older turns the user already scrolled into view. A plain
+      // replace would drop them whenever React Query refetches the newest window.
+      const retainedOlder =
+        oldestIndex > 0
+          ? previous
+              .slice(0, oldestIndex)
+              .filter((item) => !pageIds.has(item.id))
+          : [];
+      if (retainedOlder.length === 0) {
+        setHistoryHasMoreBefore(page.has_more_before);
+      }
+      return retainedOlder.length
+        ? [...retainedOlder, ...page.items]
+        : page.items;
+    },
     enabled: sessionId !== "new",
     // Incomplete streams need a fresh read after refresh so we can resume.
     refetchOnMount: "always",
+    // Evict inactive session histories quickly; active eviction below is the
+    // primary bound, this is the safety net for unobserved caches.
+    gcTime: 15_000,
   });
   const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+
+  // Reset older-page cursor state when the active session changes.
+  useEffect(() => {
+    setHistoryHasMoreBefore(false);
+    setHistoryTotalCount(0);
+    setLoadingOlderMessages(false);
+    loadingOlderRef.current = false;
+  }, [sessionId]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (
+      !sessionId ||
+      sessionId === "new" ||
+      !historyHasMoreBefore ||
+      loadingOlderRef.current
+    ) {
+      return;
+    }
+    const oldestId = history.data?.[0]?.id;
+    if (!oldestId) return;
+    loadingOlderRef.current = true;
+    setLoadingOlderMessages(true);
+    try {
+      const page = await listSessionMessagesPage(sessionId, {
+        limit: OLDER_MESSAGE_PAGE,
+        beforeId: oldestId,
+      });
+      setHistoryHasMoreBefore(page.has_more_before);
+      setHistoryTotalCount(page.total_count);
+      if (page.items.length) {
+        // Preserve scroll position when prepending older turns.
+        const scroller =
+          document.querySelector<HTMLElement>(
+            ".chat-canvas-page [role='log'] > div",
+          ) ?? null;
+        const previousHeight = scroller?.scrollHeight ?? 0;
+        const previousTop = scroller?.scrollTop ?? 0;
+        queryClient.setQueryData<Message[]>(["messages", sessionId], (current) => {
+          const existing = current ?? [];
+          const seen = new Set(existing.map((item) => item.id));
+          const older = page.items.filter((item) => !seen.has(item.id));
+          return older.length ? [...older, ...existing] : existing;
+        });
+        if (scroller) {
+          requestAnimationFrame(() => {
+            const delta = scroller.scrollHeight - previousHeight;
+            scroller.scrollTop = previousTop + delta;
+          });
+        }
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "加载更早消息失败",
+      );
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlderMessages(false);
+    }
+  }, [history.data, historyHasMoreBefore, queryClient, sessionId]);
+
+  // Near the top of the conversation scroller, pull older turns automatically.
+  useEffect(() => {
+    if (!historyHasMoreBefore) return;
+    const scroller = document.querySelector<HTMLElement>(
+      ".chat-canvas-page [role='log'] > div",
+    );
+    if (!scroller) return;
+    const onScroll = () => {
+      if (scroller.scrollTop < 120) void loadOlderMessages();
+    };
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
+  }, [historyHasMoreBefore, loadOlderMessages, sessionId]);
+
+  // Track recently viewed sessions so we keep a tiny warm cache window without
+  // retaining every visited agent thread's full message history.
+  const recentMessageSessionIdsRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (!sessionId || sessionId === "new") return;
+    const previous = recentMessageSessionIdsRef.current.filter(
+      (id) => id !== sessionId,
+    );
+    recentMessageSessionIdsRef.current = [sessionId, ...previous].slice(
+      0,
+      MESSAGE_CACHE_KEEP_RECENT + 1,
+    );
+    const keep = new Set([
+      ...recentMessageSessionIdsRef.current,
+      ...listStreamingSessionIds(),
+    ]);
+    // Drop full histories for sessions the user left and that are not still
+    // generating in the background — the dominant multi-session RAM cost.
+    queryClient.removeQueries({
+      predicate: (query) => {
+        const key = query.queryKey;
+        if (!Array.isArray(key) || key.length < 2) return false;
+        const root = key[0];
+        if (
+          root !== "messages" &&
+          root !== "message-versions" &&
+          root !== "message-snapshot"
+        ) {
+          return false;
+        }
+        const cachedSessionId = key[1];
+        return (
+          typeof cachedSessionId === "string" &&
+          cachedSessionId !== "new" &&
+          !keep.has(cachedSessionId)
+        );
+      },
+    });
+    // Keep only optimistic/streaming rows for active + background streams.
+    setLocalMessages((current) => {
+      const next = current.filter((message) => {
+        const owner = message.session_id;
+        if (!owner || owner === sessionId) return true;
+        return isSessionStreaming(owner);
+      });
+      return next.length === current.length ? current : next;
+    });
+  }, [queryClient, sessionId]);
+
+  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
+  const workspaceDefaultResponseMode = useMemo(
+    () => readChatDefaultResponseMode(settings.data),
+    [settings.data],
+  );
 
   // Restore per-session composer prefs whenever the active session changes.
   useEffect(() => {
     if (!sessionId || sessionId === "new") {
-      const defaults = defaultComposerPrefs();
+      const defaults = defaultComposerPrefsForResponseMode(
+        workspaceDefaultResponseMode,
+      );
       setResponseMode(defaults.responseMode);
       setThinkingMode(defaults.thinkingMode);
       setSearchRoute(defaults.searchRoute);
       setGenerationMode(defaults.generationMode);
       return;
     }
-    const stored = getSessionComposerPrefs(sessionId);
+    const stored = hasSessionComposerPrefs(sessionId)
+      ? getSessionComposerPrefs(sessionId)
+      : defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode);
     const session = sessions.data?.find((item) => item.id === sessionId);
     const fromSnapshot = prefsFromModelSnapshot(
       session?.model_snapshot as Record<string, unknown> | undefined,
@@ -1923,9 +2312,9 @@ export function ChatCanvasPage() {
       ...(!stored.modelId && fromSnapshot.modelId
         ? { modelId: fromSnapshot.modelId }
         : {}),
-      // If prefs are still product defaults and snapshot has a different mode,
-      // adopt the durable snapshot (e.g. first open after refresh).
-      ...(isDefaultComposerPrefs(stored) &&
+      // If prefs are still workspace/product defaults and snapshot has a
+      // different mode, adopt the durable snapshot (e.g. first open after refresh).
+      ...(isDefaultComposerPrefs(stored, workspaceDefaultResponseMode) &&
       fromSnapshot.responseMode &&
       fromSnapshot.responseMode !== stored.responseMode
         ? {
@@ -1942,7 +2331,7 @@ export function ChatCanvasPage() {
     setSelectedModelId(merged.modelId ?? "");
     setSelectedImageProviderId(merged.imageProviderId ?? "");
     setSelectedImageModelId(merged.imageModelId ?? "");
-  }, [sessionId, sessions.data]);
+  }, [sessionId, sessions.data, workspaceDefaultResponseMode]);
 
   // Clear the in-flight resume latch when switching sessions so a new session
   // can auto-resume independently. Do NOT abort background streams — concurrent
@@ -1978,7 +2367,6 @@ export function ChatCanvasPage() {
     sessionId,
     thinkingMode,
   ]);
-  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
   const providers = useQuery({
     queryKey: ["providers"],
     queryFn: listProviders,
@@ -2221,6 +2609,16 @@ export function ChatCanvasPage() {
             Array.isArray(provider.capabilities.companion_capabilities) &&
             provider.capabilities.companion_capabilities.includes("web_search"))),
     ),
+  );
+  const hasDeepResearchProvider = Boolean(
+    providers.data?.some((provider) => {
+      if (!provider.enabled || !provider.remote_capability) return false;
+      const role = providerCapabilityString(provider, "provider_role");
+      return (
+        role === "deep_research" ||
+        provider.provider_type.includes("deep_research")
+      );
+    }),
   );
   const hasQwenCompanionSearchProvider = Boolean(
     providers.data?.some(
@@ -2622,16 +3020,31 @@ export function ChatCanvasPage() {
         if (type === "message.failed")
           terminalFailure = streamEventFailure(data);
         if (type === "message.cancelled") terminalFailure = "生成已取消。";
+        // A resumable interruption parks the message as `interrupted`. Treat it
+        // as a finished generation (stop polling, refresh persisted state) so
+        // the durable message reflected from the server can render its
+        // "已中断（可重试）" affordance; it is not an error.
+        if (type === "message.interrupted") completed = true;
         if ((type || isMessagePart(data.part)) && isViewing()) {
           setStatus("streaming");
           setStreamConnectionNotice(null);
         }
-        expandStreamUpdate(data).forEach((update) => frameQueue.push(update));
+        expandStreamUpdate(data, { animate: isViewing() }).forEach((update) =>
+          frameQueue.push(update),
+        );
       };
       try {
         let consecutiveFailures = 0;
+        // Exponential back-off for the replay poll: a steady in-flight stream
+        // whose generator is momentarily idle (between agent steps) should not
+        // hammer the GET events endpoint at a flat 400ms cadence. Each round
+        // that does NOT advance the durable cursor doubles the wait up to 4s;
+        // any new replay event resets it, restoring near-instant delivery when
+        // the stream is productive.
+        let pollDelayMs = 400;
         while (!controller.signal.aborted) {
           if (controller.signal.aborted) break;
+          const lastEventIdBefore = lastEventId;
           try {
             const replay = await listSessionMessageEvents(
               streamSessionId,
@@ -2644,8 +3057,13 @@ export function ChatCanvasPage() {
               consume(event as Record<string, unknown>),
             );
             consecutiveFailures = 0;
+            pollDelayMs =
+              lastEventId !== lastEventIdBefore
+                ? 400
+                : Math.min(pollDelayMs * 2, 4_000);
           } catch (error) {
             consecutiveFailures += 1;
+            pollDelayMs = Math.min(pollDelayMs * 2, 4_000);
             if (isViewing()) {
               setStreamConnectionNotice({
                 phase:
@@ -2664,23 +3082,39 @@ export function ChatCanvasPage() {
           if (completed || terminalFailure) break;
           // Also re-check persisted status in case the generator finished
           // without more events (e.g. process restarted mid-stream).
+          // Snapshot only the in-flight message — re-downloading the entire
+          // history on every poll tick was a major multi-session RAM spike.
           try {
-            const latest = await listSessionMessages(streamSessionId);
-            const refreshed = latest.find((item) => item.id === inFlight.id);
+            const refreshed = await getMessageSnapshot(
+              streamSessionId,
+              inFlight.id,
+            );
             if (
               refreshed &&
               TERMINAL_MESSAGE_STATUSES.includes(
                 refreshed.status as (typeof TERMINAL_MESSAGE_STATUSES)[number],
               )
             ) {
-              queryClient.setQueryData(["messages", streamSessionId], latest);
+              queryClient.setQueryData<Message[]>(
+                ["messages", streamSessionId],
+                (current) => {
+                  if (!current?.length) return [refreshed];
+                  let found = false;
+                  const next = current.map((item) => {
+                    if (item.id !== refreshed.id) return item;
+                    found = true;
+                    return refreshed;
+                  });
+                  return found ? next : [...next, refreshed];
+                },
+              );
               completed = true;
               break;
             }
           } catch {
             // ignore and keep polling events
           }
-          await new Promise((resolve) => window.setTimeout(resolve, 400));
+          await new Promise((resolve) => window.setTimeout(resolve, pollDelayMs));
         }
         await frameQueue.drain();
         if (terminalFailure) {
@@ -2703,10 +3137,12 @@ export function ChatCanvasPage() {
             queryKey: ["messages", streamSessionId],
           });
           void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+          // Always drop the optimistic row once the durable message is terminal,
+          // even if the user is currently looking at another session.
+          setLocalMessages((current) =>
+            current.filter((message) => message.id !== inFlight.id),
+          );
           if (isViewing()) {
-            setLocalMessages((current) =>
-              current.filter((message) => message.id !== inFlight.id),
-            );
             setStatus("ready");
             setStreamConnectionNotice(null);
             markSessionGenerationFinished(streamSessionId, { viewing: true });
@@ -3289,9 +3725,24 @@ export function ChatCanvasPage() {
       setCloseDialogOpen(false);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["sessions"] }),
-        queryClient.invalidateQueries({
-          queryKey: ["messages", closedSession.id],
-        }),
+        // The session is closed — evict its message history and per-message
+        // derived caches rather than just marking them stale. invalidate keeps
+        // the (potentially large) cached message array resident; remove drops
+        // it so a closed session stops holding memory, while re-opening simply
+        // re-fetches. removeQueries returns void; wrap so Promise.all is uniform.
+        Promise.resolve(
+          queryClient.removeQueries({ queryKey: ["messages", closedSession.id] }),
+        ),
+        Promise.resolve(
+          queryClient.removeQueries({
+            queryKey: ["message-versions", closedSession.id],
+          }),
+        ),
+        Promise.resolve(
+          queryClient.removeQueries({
+            queryKey: ["message-snapshot", closedSession.id],
+          }),
+        ),
         queryClient.invalidateQueries({ queryKey: ["evidence"] }),
         queryClient.invalidateQueries({ queryKey: ["mastery"] }),
         queryClient.invalidateQueries({ queryKey: ["mastery-review-jobs"] }),
@@ -3769,7 +4220,10 @@ export function ChatCanvasPage() {
           persistedAssistantId,
           statuses,
         );
-        queryClient.setQueryData(["messages", targetSessionId], persisted);
+        queryClient.setQueryData<Message[]>(
+          ["messages", targetSessionId],
+          (current) => mergeMessageIntoCache(current, persisted),
+        );
         if (isViewingStream()) {
           optimisticSessionId.current = null;
         }
@@ -3950,9 +4404,9 @@ export function ChatCanvasPage() {
               }
               if (type === "message.cancelled")
                 terminalFailure = "生成已取消。";
-              expandStreamUpdate(data).forEach((update) =>
-                frameQueue.push(update),
-              );
+              expandStreamUpdate(data, {
+                animate: isViewingStream(),
+              }).forEach((update) => frameQueue.push(update));
             }
           } catch (error) {
             if (controller.signal.aborted) throw error;
@@ -4620,10 +5074,14 @@ export function ChatCanvasPage() {
     setPendingFiles([]);
     setLongPaste(null);
     setGraphAction("none");
-    // Keep product defaults for a fresh /chat/new canvas; existing sessions
+    // Keep workspace defaults for a fresh /chat/new canvas; existing sessions
     // restore their own prefs via the sessionId effect above.
     if (sessionId === "new") {
-      const defaults = defaultComposerPrefs();
+      const defaults = defaultComposerPrefsForResponseMode(
+        workspaceDefaultResponseMode,
+      );
+      setResponseMode(defaults.responseMode);
+      setThinkingMode(defaults.thinkingMode);
       setSearchRoute(defaults.searchRoute);
       setGenerationMode(defaults.generationMode);
     } else {
@@ -4652,7 +5110,7 @@ export function ChatCanvasPage() {
     learningNodeRef.current = undefined;
     setLearningNode(undefined);
     clearLearningNodeContext();
-  }, [conversationResetKey, sessionId]);
+  }, [conversationResetKey, sessionId, workspaceDefaultResponseMode]);
 
   useEffect(() => {
     const routeState = location.state as {
@@ -5180,21 +5638,20 @@ export function ChatCanvasPage() {
     minimumVersion: number,
     statuses: readonly string[],
   ) => {
-    const sourceMessages = await confirmedSessionMessages(
+    const sourceMessage = await confirmedSessionMessages(
       sourceSessionId,
       messageId,
       statuses,
       minimumVersion,
     );
-    queryClient.setQueryData(["messages", sourceSessionId], sourceMessages);
+    queryClient.setQueryData<Message[]>(
+      ["messages", sourceSessionId],
+      (current) => mergeMessageIntoCache(current, sourceMessage),
+    );
     if (sessionId !== sourceSessionId) {
-      const currentMessages = await confirmedSessionMessages(
-        sessionId,
-        messageId,
-        statuses,
-        minimumVersion,
-      );
-      queryClient.setQueryData(["messages", sessionId], currentMessages);
+      // Retry versions live on the source session; just invalidate the viewing
+      // session cache rather than re-fetching a full timeline.
+      void queryClient.invalidateQueries({ queryKey: ["messages", sessionId] });
     }
   };
   const retry = useMutation<
@@ -5283,7 +5740,9 @@ export function ChatCanvasPage() {
         if (type === "message.cancelled") terminalFailure = "生成已取消。";
         if ((type || isMessagePart(data.part)) && isViewingRetry())
           setStatus("streaming");
-        expandStreamUpdate(data).forEach((update) => frameQueue.push(update));
+        expandStreamUpdate(data, { animate: isViewingRetry() }).forEach(
+          (update) => frameQueue.push(update),
+        );
       };
       try {
         let streamError: unknown;
@@ -5422,12 +5881,14 @@ export function ChatCanvasPage() {
         return;
       }
       if (viewingSessionIdRef.current === variables.sourceSessionId) {
-        setLocalMessages((current) =>
-          current.filter((message) => message.id !== result.tempId),
-        );
         setRetryTarget(null);
         setStatus("ready");
       }
+      // Drop the optimistic retry row whether or not the user is still viewing
+      // this session — otherwise concurrent retries accumulate in localMessages.
+      setLocalMessages((current) =>
+        current.filter((message) => message.id !== result.tempId),
+      );
       void queryClient.invalidateQueries({
         queryKey: ["message-versions", variables.sourceSessionId],
       });
@@ -5444,15 +5905,13 @@ export function ChatCanvasPage() {
           retryExpectedVersionRef.current,
           TERMINAL_MESSAGE_STATUSES,
         );
-        if (viewingSessionIdRef.current === variables.sourceSessionId) {
-          setLocalMessages((current) =>
-            current.filter(
-              (message) =>
-                message.provider_trace?.optimistic_target_message_id !==
-                variables.messageId,
-            ),
-          );
-        }
+        setLocalMessages((current) =>
+          current.filter(
+            (message) =>
+              message.provider_trace?.optimistic_target_message_id !==
+              variables.messageId,
+          ),
+        );
       } catch {
         void Promise.all([
           queryClient.invalidateQueries({
@@ -5596,6 +6055,13 @@ export function ChatCanvasPage() {
       { agent: true },
     );
   }, [currentSession?.graph_id, graphCommandAvailable, prepareTaskPrompt]);
+  const startDeepResearch = useCallback(() => {
+    if (!supportsAgentMode || !hasDeepResearchProvider) return;
+    prepareTaskPrompt(
+      "请使用 start_deep_research 工具启动深度研究。研究问题请根据当前对话上下文提炼；若用户已给出预算则使用该预算，否则先询问预算（单位：元 / budget_cny）。提交后若返回 user_approval_required=true，请停止并等待用户在界面上确认预算，不要重复调用 get_deep_research。",
+      { agent: true },
+    );
+  }, [hasDeepResearchProvider, prepareTaskPrompt, supportsAgentMode]);
   const toggleNetworkSearch = useCallback(() => {
     setGenerationMode("text");
     setSearchRoute((current) => {
@@ -5691,11 +6157,14 @@ export function ChatCanvasPage() {
     },
     {
       id: "research" as const,
-      label: "联网研究",
-      description: "预填并行研究任务，由你确认发送",
-      keywords: "研究 调研 research web",
-      disabled: sessionIsClosed || !supportsAgentMode || !canUseNetworkSearch,
-      Icon: Search,
+      label: "深度研究",
+      description: hasDeepResearchProvider
+        ? "预填 start_deep_research 任务，确认预算后启动"
+        : "请先在 Provider 管理中启用 Deep Research Provider",
+      keywords: "研究 调研 深度研究 deep research",
+      disabled:
+        sessionIsClosed || !supportsAgentMode || !hasDeepResearchProvider,
+      Icon: FileSearch,
     },
     {
       id: "roadmap" as const,
@@ -5843,10 +6312,7 @@ export function ChatCanvasPage() {
         return;
       }
       if (action === "research") {
-        prepareTaskPrompt(
-          "请使用已授权的联网搜索与并行研究工具，调研这个问题并给出可追溯来源、不同观点和下一步建议。",
-          { agent: true, enableSearch: true },
-        );
+        startDeepResearch();
         return;
       }
       if (action === "roadmap") {
@@ -5888,6 +6354,7 @@ export function ChatCanvasPage() {
       hasAuthorizedAgentSearchProvider,
       prepareTaskPrompt,
       setGraphProposal,
+      startDeepResearch,
     ],
   );
   const clearSelectedLearningNode = useCallback(() => {
@@ -6075,140 +6542,187 @@ export function ChatCanvasPage() {
             />
           ) : (
             <>
-              {messages.map((message) => {
+              {historyHasMoreBefore || loadingOlderMessages ? (
+                <div className="flex flex-col items-center gap-1 pb-2">
+                  <Button
+                    disabled={loadingOlderMessages}
+                    onClick={() => void loadOlderMessages()}
+                    size="sm"
+                    type="button"
+                    variant="ghost"
+                  >
+                    {loadingOlderMessages ? (
+                      <>
+                        <LoaderCircle className="size-3.5 animate-spin" />
+                        正在加载更早消息…
+                      </>
+                    ) : (
+                      <>
+                        加载更早消息
+                        {historyTotalCount > 0
+                          ? `（已显示 ${messages.length}/${historyTotalCount}）`
+                          : null}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              ) : null}
+              {messages.map((message, messageIndex) => {
                 const persisted =
                   !message.id.startsWith("temp") &&
                   message.id !== "welcome-local";
                 const imageAnswer = message.parts.some(
                   (part) => part.type === "image",
                 );
+                // Always mount the latest few turns (composer context) and the
+                // in-flight answer; older history mounts only near the viewport.
+                // User messages stay eager so conversation-jump anchors remain
+                // addressable for the left question rail.
+                const eagerMount =
+                  message.role === "user" ||
+                  messageIndex >= messages.length - 6 ||
+                  message.status === "streaming" ||
+                  message.status === "pending" ||
+                  editingMessageId === message.id;
                 if (message.role === "user")
                   return (
-                    <UserMessage
-                      disabled={
-                        status !== "ready" || branchEdit.isPending || !persisted
-                      }
-                      editing={editingMessageId === message.id}
-                      editValue={
-                        editingMessageId === message.id
-                          ? editingMessageContent
-                          : message.content
-                      }
+                    <LazyMessageMount
+                      eager={eagerMount}
                       key={message.id}
+                      minHeight={72}
+                    >
+                      <UserMessage
+                        disabled={
+                          status !== "ready" ||
+                          branchEdit.isPending ||
+                          !persisted
+                        }
+                        editing={editingMessageId === message.id}
+                        editValue={
+                          editingMessageId === message.id
+                            ? editingMessageContent
+                            : message.content
+                        }
+                        message={message}
+                        onCancelEdit={() => {
+                          setEditingMessageId(null);
+                          setEditingMessageContent("");
+                        }}
+                        onEditValueChange={setEditingMessageContent}
+                        onSaveEdit={() => {
+                          const content = editingMessageContent.trim();
+                          if (!content) return;
+                          branchEdit.mutate({
+                            content,
+                            messageId: message.id,
+                            sourceSessionId: message.session_id,
+                          });
+                        }}
+                        onStartEdit={() => {
+                          setEditingMessageId(message.id);
+                          setEditingMessageContent(message.content);
+                        }}
+                        versionNavigation={userVersionNavigation(message)}
+                      />
+                    </LazyMessageMount>
+                  );
+                return (
+                  <LazyMessageMount
+                    eager={eagerMount}
+                    key={message.id}
+                    minHeight={140}
+                  >
+                    <AssistantMessage
+                      branchDisabled={
+                        !persisted ||
+                        message.session_id !== sessionId ||
+                        status !== "ready" ||
+                        branch.isPending
+                      }
+                      branchDisabledReason={
+                        !persisted
+                          ? "回答持久化后才能创建分支"
+                          : message.session_id !== sessionId
+                            ? "请先切换到该回答所属的会话版本"
+                            : status !== "ready" || branch.isPending
+                              ? "当前操作完成后才能创建分支"
+                              : undefined
+                      }
                       message={message}
-                      onCancelEdit={() => {
-                        setEditingMessageId(null);
-                        setEditingMessageContent("");
+                      onComponentAction={handleComponentAction}
+                      onBranch={() => {
+                        if (persisted && message.session_id === sessionId)
+                          branch.mutate(message.id);
                       }}
-                      onEditValueChange={setEditingMessageContent}
-                      onSaveEdit={() => {
-                        const content = editingMessageContent.trim();
-                        if (!content) return;
-                        branchEdit.mutate({
-                          content,
+                      onRetry={() => {
+                        if (!persisted) return;
+                        if (imageAnswer) {
+                          const prompt =
+                            messages
+                              .find(
+                                (item) =>
+                                  item.id === message.parent_message_id &&
+                                  item.role === "user",
+                              )
+                              ?.content?.trim() ?? "";
+                          if (!prompt) {
+                            toast.error("未找到原始绘图提示词，无法重试。");
+                            return;
+                          }
+                          setImageRetryChoice(
+                            activeImageProvider && selectedImageModel
+                              ? modelChoiceValue(
+                                  activeImageProvider.id,
+                                  selectedImageModel.id,
+                                )
+                              : "",
+                          );
+                          setImageRetryTarget({
+                            messageId: message.id,
+                            prompt,
+                          });
+                          return;
+                        }
+                        setRetryProviderId(
+                          activeModelProvider?.id ?? modelProviders[0]?.id ?? "",
+                        );
+                        setRetryModelId(selectedModelId);
+                        setRetryResponseMode(responseMode);
+                        setRetryThinkingMode(effectiveThinkingMode);
+                        setRetryWebSearch(searchRoute !== "disabled");
+                        setRetryAllowedDomains("");
+                        setRetryTarget({
                           messageId: message.id,
                           sourceSessionId: message.session_id,
                         });
                       }}
-                      onStartEdit={() => {
-                        setEditingMessageId(message.id);
-                        setEditingMessageContent(message.content);
-                      }}
-                      versionNavigation={userVersionNavigation(message)}
-                    />
-                  );
-                return (
-                  <AssistantMessage
-                    branchDisabled={
-                      !persisted ||
-                      message.session_id !== sessionId ||
-                      status !== "ready" ||
-                      branch.isPending
-                    }
-                    branchDisabledReason={
-                      !persisted
-                        ? "回答持久化后才能创建分支"
-                        : message.session_id !== sessionId
-                          ? "请先切换到该回答所属的会话版本"
-                          : status !== "ready" || branch.isPending
-                            ? "当前操作完成后才能创建分支"
-                            : undefined
-                    }
-                    key={message.id}
-                    message={message}
-                    onComponentAction={handleComponentAction}
-                    onBranch={() => {
-                      if (persisted && message.session_id === sessionId)
-                        branch.mutate(message.id);
-                    }}
-                    onRetry={() => {
-                      if (!persisted) return;
-                      if (imageAnswer) {
-                        const prompt =
-                          messages
-                            .find(
-                              (item) =>
-                                item.id === message.parent_message_id &&
-                                item.role === "user",
-                            )
-                            ?.content?.trim() ?? "";
-                        if (!prompt) {
-                          toast.error("未找到原始绘图提示词，无法重试。");
-                          return;
-                        }
-                        setImageRetryChoice(
-                          activeImageProvider && selectedImageModel
-                            ? modelChoiceValue(
-                                activeImageProvider.id,
-                                selectedImageModel.id,
-                              )
-                            : "",
-                        );
-                        setImageRetryTarget({
-                          messageId: message.id,
-                          prompt,
-                        });
-                        return;
+                      retryDisabled={
+                        !persisted ||
+                        sessionIsClosed ||
+                        status !== "ready" ||
+                        retry.isPending ||
+                        (imageAnswer &&
+                          (message.session_id !== sessionId ||
+                            !imageProviders.length))
                       }
-                      setRetryProviderId(activeModelProvider?.id ?? modelProviders[0]?.id ?? "");
-                      setRetryModelId(selectedModelId);
-                      setRetryResponseMode(
-                        responseMode,
-                      );
-                      setRetryThinkingMode(effectiveThinkingMode);
-                      setRetryWebSearch(searchRoute !== "disabled");
-                      setRetryAllowedDomains("");
-                      setRetryTarget({
-                        messageId: message.id,
-                        sourceSessionId: message.session_id,
-                      });
-                    }}
-                    retryDisabled={
-                      !persisted ||
-                      sessionIsClosed ||
-                      status !== "ready" ||
-                      retry.isPending ||
-                      (imageAnswer &&
-                        (message.session_id !== sessionId ||
-                          !imageProviders.length))
-                    }
-                    retryDisabledReason={
-                      !persisted
-                        ? "回答持久化后才能重试"
-                        : sessionIsClosed
-                          ? "会话已结束；请创建分支或新会话继续学习"
-                          : status !== "ready" || retry.isPending
-                            ? "当前操作完成后才能重试"
-                            : imageAnswer && message.session_id !== sessionId
-                              ? "请先切换到该回答所属的会话版本"
-                              : imageAnswer && !imageProviders.length
-                                ? "当前工作区没有已启用的绘图 Provider"
-                                : imageAnswer
-                                  ? "重试绘图（可切换绘图模型）"
-                                  : undefined
-                    }
-                    sessionId={message.session_id}
-                  />
+                      retryDisabledReason={
+                        !persisted
+                          ? "回答持久化后才能重试"
+                          : sessionIsClosed
+                            ? "会话已结束；请创建分支或新会话继续学习"
+                            : status !== "ready" || retry.isPending
+                              ? "当前操作完成后才能重试"
+                              : imageAnswer && message.session_id !== sessionId
+                                ? "请先切换到该回答所属的会话版本"
+                                : imageAnswer && !imageProviders.length
+                                  ? "当前工作区没有已启用的绘图 Provider"
+                                  : imageAnswer
+                                    ? "重试绘图（可切换绘图模型）"
+                                    : undefined
+                      }
+                      sessionId={message.session_id}
+                    />
+                  </LazyMessageMount>
                 );
               })}
               {streamConnectionNotice ? (
@@ -6336,6 +6850,13 @@ export function ChatCanvasPage() {
             sessionIsClosed || goalFlow.busy || !supportsAgentMode
           }
           attachDisabled={sessionIsClosed || goalFlow.busy}
+          deepResearchDisabled={
+            sessionIsClosed ||
+            goalMode ||
+            goalFlow.busy ||
+            !supportsAgentMode ||
+            !hasDeepResearchProvider
+          }
           goalActive={goalMode}
           goalDisabled={goalFlow.busy || (!goalMode && sessionIsClosed)}
           graphActive={graphAction !== "none"}
@@ -6355,6 +6876,7 @@ export function ChatCanvasPage() {
           }
           onAgent={toggleAgentMode}
           onAttach={openAttachmentPicker}
+          onDeepResearch={startDeepResearch}
           onGoal={toggleGoalMode}
           onGraph={setGraphProposal}
           onImage={toggleImageMode}
@@ -7552,8 +8074,9 @@ export function VersionsPage() {
   const [draftContent, setDraftContent] = useState("");
   const messages = useQuery({
     queryKey: ["messages", sessionId],
-    queryFn: () => listSessionMessages(sessionId),
+    queryFn: () => listSessionMessages(sessionId, { limit: 100 }),
     enabled: Boolean(sessionId),
+    gcTime: 15_000,
   });
   const assistants = (messages.data ?? []).filter(
     (item) => item.role === "assistant",

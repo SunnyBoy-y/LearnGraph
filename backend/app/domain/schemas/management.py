@@ -97,6 +97,19 @@ class MemoryView(ORMModel):
     source: str
     source_ids: list[str]
     structured_payload: dict[str, Any] = Field(default_factory=dict)
+    atom_schema_version: int = 0
+    canonical_key: str = ""
+    atom_kind: str = "fact"
+    ledger_status: str = "active"
+    temporal_status: str = "timeless"
+    summary_eligibility: str = "legacy_review"
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    event_at: datetime | None = None
+    next_review_at: datetime | None = None
+    last_verified_at: datetime | None = None
+    timezone_name: str = "Asia/Shanghai"
+    evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = 0.7
     importance: float = 0.5
     strength: float = 0.5
@@ -123,6 +136,11 @@ class MemoryDraftCreateRequest(BaseModel):
     operation: Literal[
         "CREATE",
         "UPDATE",
+        "CORRECT",
+        "CONFIRM",
+        "COMPLETE",
+        "CANCEL",
+        "RESCHEDULE",
         "MERGE",
         "SUPERSEDE",
         "RETRACT",
@@ -236,14 +254,38 @@ class MemoryRevisionRestoreRequest(BaseModel):
 
 class MemoryPolicyUpdateRequest(BaseModel):
     workspace_enabled: bool | None = None
+    workspace_recall_enabled: bool | None = None
+    workspace_learning_enabled: bool | None = None
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
     session_enabled: bool | None = None
+    session_recall_enabled: bool | None = None
+    session_learning_enabled: bool | None = None
 
     @model_validator(mode="after")
     def require_policy_change(self) -> "MemoryPolicyUpdateRequest":
-        if self.workspace_enabled is None and self.session_enabled is None:
+        if all(
+            value is None
+            for value in (
+                self.workspace_enabled,
+                self.workspace_recall_enabled,
+                self.workspace_learning_enabled,
+                self.session_enabled,
+                self.session_recall_enabled,
+                self.session_learning_enabled,
+            )
+        ):
             raise ValueError("A workspace or session policy change is required")
-        if self.session_enabled is not None and self.session_id is None:
+        if (
+            any(
+                value is not None
+                for value in (
+                    self.session_enabled,
+                    self.session_recall_enabled,
+                    self.session_learning_enabled,
+                )
+            )
+            and self.session_id is None
+        ):
             raise ValueError("session_id is required for session policy changes")
         return self
 
@@ -254,6 +296,62 @@ class MemoryPolicyView(BaseModel):
     session_id: str | None
     session_enabled: bool | None
     effective_enabled: bool
+    workspace_recall_enabled: bool = True
+    workspace_learning_enabled: bool = True
+    session_recall_enabled: bool | None = None
+    session_learning_enabled: bool | None = None
+    effective_recall_enabled: bool = False
+    effective_learning_enabled: bool = False
+
+
+class MemoryEvidenceView(ORMModel):
+    id: str
+    source_kind: str
+    source_id: str
+    message_id: str | None
+    message_part_id: str | None
+    file_id: str | None
+    tool_call_id: str | None
+    authorship: str
+    derived_from: list[dict[str, Any]]
+    observed_at: datetime
+    content_hash: str
+    excerpt: str
+    profile_eligible: bool
+    eligibility_reason: str
+    created_at: datetime
+
+
+class MemoryProfileView(BaseModel):
+    id: str | None = None
+    workspace_id: str
+    owner_subject_id: str
+    version: int = 0
+    status: Literal["empty", "ready", "stale", "building", "failed"] = "empty"
+    markdown: str = ""
+    structured_sections: list[dict[str, Any]] = Field(default_factory=list)
+    source_atom_ids: list[str] = Field(default_factory=list)
+    source_fingerprint: str = ""
+    generated_at: datetime | None = None
+    updated_at: datetime | None = None
+    stale_reason: str = ""
+
+
+class MemoryProfileIntentRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4_000)
+    selected_text: str | None = Field(default=None, max_length=4_000)
+    selected_atom_ids: list[str] = Field(default_factory=list, max_length=50)
+    timezone_name: str = Field(
+        default="Asia/Shanghai", min_length=1, max_length=80
+    )
+
+
+class MemoryProfileIntentResult(BaseModel):
+    status: str
+    drafts_created: int = 0
+    auto_committed: int = 0
+    affected_memory_ids: list[str] = Field(default_factory=list)
+    profile_status: str = "stale"
 
 
 class MemoryExtractionSettingsView(BaseModel):
@@ -1045,6 +1143,14 @@ class ChatResponseStyleSettingValue(BaseModel):
     headings_and_lists: Literal[-2, -1, 0, 1, 2] = 0
     emoji: Literal[-2, -1, 0, 1, 2] = 0
     verbosity: Literal[-2, -1, 0, 1, 2] = 0
+
+
+class ChatDefaultResponseModeSettingValue(BaseModel):
+    """Workspace default for the chat composer response mode."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    response_mode: Literal["fast", "thinking", "agentic"] = "agentic"
 
 
 class SettingUpdateRequest(BaseModel):

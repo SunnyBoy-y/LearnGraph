@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClock,
   CalendarDays,
@@ -8,8 +8,9 @@ import {
   MessageSquare,
 } from "lucide-react";
 
-import { listActions, listSessions } from "@/api";
+import { listActions, listSessions, renderSessionActivitySummary } from "@/api";
 import { SectionHeading } from "@/components/shared/page-elements";
+import type { Session } from "@/types/sessions";
 
 const HEATMAP_WEEKS = 53;
 const HEATMAP_GAP = 3;
@@ -17,13 +18,51 @@ const MIN_CELL = 11;
 const MAX_CELL = 22;
 const DAY_VISIBLE_LIMIT = 5;
 
+/**
+ * One row in a day's activity list. ``text`` is the human-facing event
+ * description shown directly (no mechanical prefix); ``kind`` keeps the
+ * behaviour category so "活动构成" can still break out the three types.
+ */
+type ActivityKind = "session" | "completed" | "planned";
+
+interface DayActivityItem {
+  text: string;
+  kind: ActivityKind;
+}
+
+const DEFAULT_TITLES = new Set([
+  "新会话",
+  "新学习会话",
+]);
+
+/**
+ * Mechanical/placeholder session titles that should not surface as a learning
+ * event on their own. We frame these as "the activity view has no real event
+ * text yet"; the parent component may lazily request an LLM summary for them.
+ * A short title that is only digits or greeting words ("你好", "123", "问候")
+ * is treated as placeholder content, not a learning event.
+ */
+export function isPlaceholderSessionTitle(title: string | null | undefined) {
+  const value = title?.trim();
+  if (!value) return true;
+  if (DEFAULT_TITLES.has(value)) return true;
+  return /^[\d\s你好问候打招呼哈嗨嗨嗨嗨嗨]+$/.test(value) && value.length <= 6;
+}
+
+/** Choose the label text a day's activity row should display. */
+function sessionActivityText(session: Session) {
+  // Prefer the LLM-generated learning-event description; fall back to the
+  // (possibly mechanical) title when no summary exists yet.
+  return session.activity_summary?.trim() || session.title;
+}
+
 function formatDayKey(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-function activityIcon(label: string) {
-  if (label.startsWith("完成行动")) return CheckCircle2;
-  if (label.startsWith("计划行动")) return CalendarClock;
+function activityIcon(kind: ActivityKind) {
+  if (kind === "completed") return CheckCircle2;
+  if (kind === "planned") return CalendarClock;
   return MessageSquare;
 }
 
@@ -34,7 +73,11 @@ export function ActivityHeatmap({
 }) {
   const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
   const actions = useQuery({ queryKey: ["actions"], queryFn: listActions });
+  const queryClient = useQueryClient();
   const scrollRef = useRef<HTMLDivElement>(null);
+  // In-flight session IDs so we never request the same summary twice
+  // (component re-renders, day selection changes, resonance queries).
+  const inflightSummaries = useRef<Set<string>>(new Set());
 
   const { today, weeks, monthLabels } = useMemo(() => {
     const todayDate = new Date();
@@ -70,22 +113,60 @@ export function ActivityHeatmap({
 
   const [selectedKey, setSelectedKey] = useState(() => formatDayKey(today));
 
+  // Lazily enrich mechanical placeholder titles into real learning-event
+  // descriptions. Only sessions shown on the currently-selected day and only
+  // those without a summary request the (billable) LLM call. Provider
+  // unavailable degrades silently — the row keeps showing the title.
+  useEffect(() => {
+    const list = sessions.data;
+    if (!list) return;
+    const pending = list.filter(
+      (session) =>
+        formatDayKey(new Date(session.created_at)) === selectedKey &&
+        !session.activity_summary &&
+        !inflightSummaries.current.has(session.id),
+    );
+    if (!pending.length) return;
+    for (const session of pending) inflightSummaries.current.add(session.id);
+    for (const session of pending) {
+      void renderSessionActivitySummary(session.id, {
+        expected_title: session.title,
+      })
+        .then((updated) => {
+          queryClient.setQueryData<Session[]>(["sessions"], (current) => {
+            if (!current) return [updated];
+            return current.map((item) =>
+              item.id === updated.id
+                ? { ...item, activity_summary: updated.activity_summary }
+                : item,
+            );
+          });
+        })
+        .catch(() => {
+          // Degrade gracefully; the existing title-based label stays.
+        })
+        .finally(() => {
+          inflightSummaries.current.delete(session.id);
+        });
+    }
+  }, [queryClient, selectedKey, sessions.data]);
+
   const dayActivity = useMemo(() => {
-    const result: Record<string, string[]> = {};
-    const add = (value: string | null, label: string) => {
+    const result: Record<string, DayActivityItem[]> = {};
+    const add = (value: string | null, text: string, kind: ActivityKind) => {
       if (!value) return;
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return;
       const key = formatDayKey(date);
-      result[key] = [...(result[key] ?? []), label];
+      result[key] = [...(result[key] ?? []), { text, kind }];
     };
     sessions.data?.forEach((session) =>
-      add(session.created_at, `创建会话：${session.title}`),
+      add(session.created_at, sessionActivityText(session), "session"),
     );
     actions.data?.forEach((action) => {
       if (action.completed_at)
-        add(action.completed_at, `完成行动：${action.title}`);
-      else if (action.due_at) add(action.due_at, `计划行动：${action.title}`);
+        add(action.completed_at, action.title, "completed");
+      else if (action.due_at) add(action.due_at, action.title, "planned");
     });
     return result;
   }, [actions.data, sessions.data]);
@@ -134,9 +215,9 @@ export function ActivityHeatmap({
       if (date < rangeStart || date > today) return;
       const bucket = byMonth.get(`${year}-${month - 1}`);
       if (bucket) bucket.count += items.length;
-      items.forEach((label) => {
-        if (label.startsWith("完成行动")) completedCount += 1;
-        else if (label.startsWith("计划行动")) plannedCount += 1;
+      items.forEach((item) => {
+        if (item.kind === "completed") completedCount += 1;
+        else if (item.kind === "planned") plannedCount += 1;
         else sessionCount += 1;
       });
     });
@@ -372,16 +453,16 @@ export function ActivityHeatmap({
             <>
               <ul className="ml-2 mt-4 space-y-4 border-l pl-6">
                 {visibleActivities.map((activity, index) => {
-                  const Icon = activityIcon(activity);
+                  const Icon = activityIcon(activity.kind);
                   return (
                     <li
                       className="relative text-sm leading-5 text-muted-foreground"
-                      key={`${activity}-${index}`}
+                      key={`${activity.kind}-${index}-${activity.text}`}
                     >
                       <span className="absolute -left-8 top-0 grid size-4 place-items-center rounded-full bg-background">
                         <Icon className="size-3.5" />
                       </span>
-                      <span className="min-w-0 break-words">{activity}</span>
+                      <span className="min-w-0 break-words">{activity.text}</span>
                     </li>
                   );
                 })}
@@ -421,9 +502,11 @@ export function ActivityHeatmap({
         <ul>
           {(visibleActivities.length
             ? visibleActivities
-            : ["当天没有记录的学习活动"]
+            : [{ text: "当天没有记录的学习活动", kind: "session" as const }]
           ).map((activity, index) => (
-            <li key={`${activity}-${index}`}>{activity}</li>
+            <li key={`${activity.kind}-${index}-${activity.text}`}>
+              {activity.text}
+            </li>
           ))}
         </ul>
         {dayToggleButton}

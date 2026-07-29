@@ -36,7 +36,7 @@ MessagePartType = Literal[
 class MessagePart(BaseModel):
     id: str
     type: MessagePartType
-    status: Literal["pending", "streaming", "completed", "failed"]
+    status: Literal["pending", "streaming", "completed", "failed", "interrupted"]
     content: str | None = None
     content_delta: str | None = None
     # Stream / storage ordinal used by the client to interleave text with tools.
@@ -75,6 +75,31 @@ class ModelSessionTitle(BaseModel):
         normalized = " ".join(value.split())
         if not normalized:
             raise ValueError("The generated session title cannot be blank")
+        return normalized
+
+
+class SessionActivitySummaryRequest(BaseModel):
+    # Optimistic-lock guard: the caller's view of the title must still match the
+    # the persisted title when the summary is committed, so a concurrent rename or
+    # auto-title does not silently overwrite a learning intent that already moved.
+    expected_title: str = Field(min_length=1, max_length=240)
+    # Optional; lets the frontend pin the source of intent (e.g. the first user
+    # message). The summary still considers the first few user messages.
+    source_message_id: str | None = Field(default=None, min_length=1, max_length=36)
+    provider_id: str | None = Field(default=None, min_length=1, max_length=36)
+    model_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ModelSessionActivitySummary(BaseModel):
+    # A learning-event description ("弄懂数据库中范式的意义"), not a behavior log.
+    summary: str = Field(min_length=4, max_length=80)
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_summary(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("The generated activity summary cannot be blank")
         return normalized
 
 
@@ -125,6 +150,9 @@ class SessionView(ORMModel):
     session_kind: str
     writeback_policy: str
     context_capsule: dict[str, Any]
+    # LLM-generated "learning event" description; null when the provider is
+    # unavailable or the session predates summary generation.
+    activity_summary: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -428,6 +456,22 @@ class MessageView(ORMModel):
     parts: list[dict[str, Any]]
     provider_trace: dict[str, Any]
     created_at: datetime
+
+
+class MessageListPageView(BaseModel):
+    """Windowed session timeline for the chat UI.
+
+    Items are chronological (oldest → newest). When ``limit`` is omitted the
+    backend still returns the full timeline, but parts / provider_trace are
+    compact by default so multi-session agent histories do not ship multi-MB
+    tool dumps on every open.
+    """
+
+    items: list[MessageView]
+    has_more_before: bool = False
+    oldest_id: str | None = None
+    newest_id: str | None = None
+    total_count: int = 0
 
 
 class MessageSnapshotView(BaseModel):

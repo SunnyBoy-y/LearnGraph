@@ -810,6 +810,11 @@ class QwenDeepResearchProvider(_StreamingResearchAdapter):
     vendor = "qwen_deep_research"
     DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
     DEFAULT_MODEL = "qwen-deep-research"
+    # Official mainline + dated snapshot (MCP tools on the snapshot only).
+    KNOWN_MODELS: tuple[str, ...] = (
+        "qwen-deep-research",
+        "qwen-deep-research-2025-12-15",
+    )
     _PATH = "/api/v1/services/aigc/text-generation/generation"
 
     def _stream_headers(self) -> dict[str, str]:

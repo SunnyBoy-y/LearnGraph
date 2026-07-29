@@ -116,12 +116,17 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         ),
         requires_base_url=True,
         requires_secret=True,
-        supports_model_discovery=False,
+        # Codex has no public GET /models; discovery returns the reviewed
+        # ChatGPT-auth catalog bundled with the adapter (terra/luna/5.5/…).
+        supports_model_discovery=True,
         supports_probe=False,
         default_base_url="https://chatgpt.com/backend-api/codex",
         probe_notice=(
             "该接入使用 Codex CLI 的 OAuth 令牌，属于 OpenAI 未公开的内部端点，"
             "接口形态可能随 Codex 版本变化；请确认你的账号计划允许此用法。"
+            "「发现模型」会载入内置的 ChatGPT 直登可用目录（默认 gpt-5.6-terra），"
+            "不会向 Codex 后端发探测请求。部分文档中的模型（如 gpt-5.6-sol）"
+            "在免费 ChatGPT 账号上会被后端拒绝。"
         ),
         brand_id="openai",
         documentation_url="https://learn.chatgpt.com/docs/auth",
@@ -455,13 +460,18 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         label="通义千问 Deep Research",
         description=(
             "阿里云百炼 qwen-deep-research：自主制定研究计划并多轮检索，"
-            "输出带参考文献的研究报告。该接口仅支持流式，任务在独立执行器中运行。"
+            "输出带参考文献的研究报告。可选主线 qwen-deep-research 或快照 "
+            "qwen-deep-research-2025-12-15（支持 MCP 工具）。该接口仅支持流式，"
+            "任务在独立执行器中运行。"
         ),
         requires_base_url=True,
         requires_secret=True,
+        # Static catalogue: mainline + snapshot; not an OpenAI /models list.
+        supports_model_discovery=True,
         default_base_url="https://dashscope.aliyuncs.com",
         probe_notice=(
             "探测仅调用 GET /compatible-mode/v1/models 校验密钥，不会发起研究任务。"
+            "「发现模型」会载入官方 qwen-deep-research 主线与快照模型列表。"
         ),
         brand_id="qwen",
         brand_icon_url="https://models.dev/logos/alibaba.svg",
@@ -489,7 +499,10 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         provider_type="openai_compatible_transcription",
         role="transcription",
         label="OpenAI-compatible ASR",
-        description="OpenAI-compatible Audio Transcriptions endpoint for stored audio files.",
+        description=(
+            "OpenAI-compatible Audio Transcriptions endpoint for stored audio "
+            "files. 通义千问 / DashScope 兼容模式可用 qwen3-asr-flash 等模型。"
+        ),
         requires_base_url=True,
         requires_secret=True,
         # Discovery lists GET {base_url}/models like every OpenAI-compatible
@@ -510,8 +523,7 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         label="OpenAI-compatible Embedding",
         description=(
             "OpenAI-compatible /embeddings endpoint used by the semantic memory "
-            "recall plugin (for example Qwen text-embedding-v4 via DashScope "
-            "compatible mode)."
+            "recall plugin. 通义千问推荐 text-embedding-v4（DashScope 兼容模式）。"
         ),
         requires_base_url=True,
         requires_secret=True,

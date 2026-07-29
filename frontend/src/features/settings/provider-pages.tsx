@@ -390,7 +390,13 @@ export function ProvidersPage() {
             : configuredProviderRole === "vision"
               ? configuredProvider?.capabilities.default_vision_model_id
                 ?? configuredProvider?.capabilities.default_model
-              : configuredProvider?.capabilities.default_model;
+              : configuredProviderRole === "deep_research"
+                ? configuredProvider?.capabilities.deep_research_model
+                  ?? configuredProvider?.capabilities.default_model
+                : configuredProviderRole === "embedding"
+                  ? configuredProvider?.capabilities.default_embedding_model_id
+                    ?? configuredProvider?.capabilities.default_model
+                  : configuredProvider?.capabilities.default_model;
       setDefaultModels((current) =>
         current[result.provider_id] ||
         (typeof configuredModel === "string" && configuredModel.trim()) ||
@@ -617,11 +623,16 @@ export function ProvidersPage() {
                 const isVisionProvider = providerSpec?.role === "vision";
                 const isTranscriptionProvider =
                   providerSpec?.role === "transcription";
+                const isDeepResearchProvider =
+                  providerSpec?.role === "deep_research";
+                const isEmbeddingProvider = providerSpec?.role === "embedding";
                 const hasConfigurableDefaultModel =
                   isModelProvider ||
                   isImageGenerationProvider ||
                   isTranscriptionProvider ||
-                  isVisionProvider;
+                  isVisionProvider ||
+                  isDeepResearchProvider ||
+                  isEmbeddingProvider;
                 const supportsModelDiscovery =
                   providerSpec?.supports_model_discovery === true;
                 const supportsProbe = providerSpec?.supports_probe === true;
@@ -646,7 +657,13 @@ export function ProvidersPage() {
                     : isVisionProvider
                       ? provider.capabilities.default_vision_model_id
                         ?? provider.capabilities.default_model
-                      : provider.capabilities.default_model;
+                      : isEmbeddingProvider
+                        ? provider.capabilities.default_embedding_model_id
+                          ?? provider.capabilities.default_model
+                        : isDeepResearchProvider
+                          ? provider.capabilities.deep_research_model
+                            ?? provider.capabilities.default_model
+                          : provider.capabilities.default_model;
                 const configuredModel =
                   typeof configuredModelValue === "string"
                     ? configuredModelValue
@@ -801,7 +818,12 @@ export function ProvidersPage() {
                             update.mutate({
                               id: provider.id,
                               enabled: provider.enabled,
-                              default_model: isModelProvider ? value : undefined,
+                              default_model:
+                                isModelProvider ||
+                                isDeepResearchProvider ||
+                                isEmbeddingProvider
+                                  ? value
+                                  : undefined,
                               default_image_generation_model_id: isImageGenerationProvider ? value : undefined,
                               default_transcription_model_id: isTranscriptionProvider ? value : undefined,
                               default_vision_model_id: isVisionProvider ? value : undefined,
@@ -979,9 +1001,12 @@ export function ProvidersPage() {
                             update.mutate({
                               id: provider.id,
                               enabled: !provider.enabled,
-                              default_model: isModelProvider
-                                ? modelValue.trim() || undefined
-                                : undefined,
+                              default_model:
+                                isModelProvider ||
+                                isDeepResearchProvider ||
+                                isEmbeddingProvider
+                                  ? modelValue.trim() || undefined
+                                  : undefined,
                               default_image_generation_model_id:
                                 isImageGenerationProvider
                                   ? modelValue.trim() || undefined
@@ -1736,6 +1761,9 @@ function roleQuickProviders(
   const openAiVision = findType("openai_responses_vision");
   const compatibleVision = findType("openai_compatible_vision");
   const openAiImages = findType("openai_images");
+  const compatibleTranscription = findType("openai_compatible_transcription");
+  const compatibleEmbedding = findType("openai_compatible_embedding");
+  const qwenDeepResearch = findType("qwen_deep_research");
 
   if (role === "model") {
     return QUICK_PROVIDERS.flatMap((preset) => {
@@ -1768,6 +1796,87 @@ function roleQuickProviders(
     return QUICK_PROVIDERS.filter((preset) => imageBrands.has(preset.id)).map(
       (preset) => ({ ...preset, providerType: openAiImages.provider_type }),
     );
+  }
+
+  // Embedding / transcription: expose 通义千问 as a first-class quick brand
+  // alongside OpenAI, both on the OpenAI-compatible wire protocol.
+  if (role === "transcription" && compatibleTranscription) {
+    return [
+      {
+        id: "qwen",
+        name: "通义千问",
+        description: "DashScope ASR（qwen3-asr-flash）",
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        brandId: "qwen",
+        iconUrl: "https://cdn.simpleicons.org/qwen",
+        keyUrl:
+          "https://bailian.console.aliyun.com/?tab=model#/api-key",
+        providerType: compatibleTranscription.provider_type,
+      },
+      {
+        id: "openai",
+        name: "OpenAI",
+        description: "官方 Audio Transcriptions",
+        baseUrl: "https://api.openai.com/v1",
+        brandId: "openai",
+        iconUrl: openAiMark,
+        keyUrl: "https://platform.openai.com/api-keys",
+        providerType: compatibleTranscription.provider_type,
+      },
+    ];
+  }
+
+  if (role === "embedding" && compatibleEmbedding) {
+    return [
+      {
+        id: "qwen",
+        name: "通义千问",
+        description: "text-embedding-v4（DashScope）",
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        brandId: "qwen",
+        iconUrl: "https://cdn.simpleicons.org/qwen",
+        keyUrl:
+          "https://bailian.console.aliyun.com/?tab=model#/api-key",
+        providerType: compatibleEmbedding.provider_type,
+      },
+      {
+        id: "openai",
+        name: "OpenAI",
+        description: "官方 Embeddings",
+        baseUrl: "https://api.openai.com/v1",
+        brandId: "openai",
+        iconUrl: openAiMark,
+        keyUrl: "https://platform.openai.com/api-keys",
+        providerType: compatibleEmbedding.provider_type,
+      },
+    ];
+  }
+
+  // Deep Research: promote 通义千问 to the front of the quick list.
+  if (role === "deep_research") {
+    const items = catalog
+      .filter((item) => item.create_allowed && item.role === role)
+      .map((item) => ({
+        id: item.provider_type,
+        name: item.label,
+        description: item.description,
+        baseUrl: item.default_base_url ?? "",
+        brandId: item.brand_id ?? undefined,
+        iconUrl:
+          item.brand_id === "openai" || item.brand_id === "openai_compatible"
+            ? openAiMark
+            : (item.brand_icon_url ?? undefined),
+        keyUrl: item.key_management_url ?? undefined,
+        providerType: item.provider_type,
+      }));
+    if (qwenDeepResearch) {
+      items.sort((a, b) => {
+        if (a.providerType === "qwen_deep_research") return -1;
+        if (b.providerType === "qwen_deep_research") return 1;
+        return 0;
+      });
+    }
+    return items;
   }
 
   return catalog
@@ -2142,6 +2251,26 @@ function ProviderDialog({
     }
     if (activeQuickProvider?.brandId) {
       capabilities.brand_id = activeQuickProvider.brandId;
+    }
+    // Seed recommended default model IDs for 通义千问 embedding / ASR presets
+    // so the row can be enabled without a second manual step.
+    if (role === "transcription" && activeQuickProvider?.brandId === "qwen") {
+      capabilities.default_transcription_model_id = "qwen3-asr-flash";
+    }
+    if (role === "embedding" && activeQuickProvider?.brandId === "qwen") {
+      capabilities.default_model = "text-embedding-v4";
+      capabilities.default_embedding_model_id = "text-embedding-v4";
+    }
+    if (role === "transcription" && activeQuickProvider?.brandId === "openai") {
+      capabilities.default_transcription_model_id = "whisper-1";
+    }
+    if (role === "embedding" && activeQuickProvider?.brandId === "openai") {
+      capabilities.default_model = "text-embedding-3-small";
+      capabilities.default_embedding_model_id = "text-embedding-3-small";
+    }
+    if (selected.provider_type === "qwen_deep_research") {
+      capabilities.default_model = "qwen-deep-research";
+      capabilities.deep_research_model = "qwen-deep-research";
     }
     onCreate({
       display_name: name.trim(),

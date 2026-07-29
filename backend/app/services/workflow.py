@@ -846,18 +846,20 @@ class WorkflowService:
                     Roadmap.id == item.roadmap_id,
                 )
             )
+            # Versionless mode: the active roadmap is always `published`.
+            # Legacy draft rows remain non-actionable until regenerated.
             if roadmap is None or roadmap.status != "published":
                 raise AppError(
                     409,
-                    "action_roadmap_not_published",
-                    "Only actions from the active published roadmap can be updated",
+                    "action_roadmap_not_active",
+                    "Only actions from the active roadmap can be updated",
                 )
             plan_fields = sorted(set(values) - {"status"})
             if plan_fields:
                 raise AppError(
                     409,
                     "roadmap_action_plan_immutable",
-                    "Roadmap action content and schedule must be changed through a new roadmap revision",
+                    "Roadmap action content and schedule must be changed through roadmap reschedule/replan",
                     {"fields": plan_fields, "roadmap_id": item.roadmap_id},
                 )
             target_status = values.get("status")
@@ -875,7 +877,7 @@ class WorkflowService:
                 raise AppError(
                     409,
                     "roadmap_action_invalid_transition",
-                    "Roadmap actions only allow forward progress after publication",
+                    "Roadmap actions only allow forward progress on the active plan",
                     {
                         "current_status": item.status,
                         "requested_status": target_status,
@@ -1107,26 +1109,41 @@ class WorkflowService:
             and node.retrieval_state != "relearning"
         )
 
-    def _prerequisite_blockers(
+    def _prerequisite_entries(
         self,
         node: GraphNode,
         prerequisites: dict[str, list[GraphNode]],
     ) -> list[dict[str, Any]]:
-        blockers: list[dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
         for prerequisite in prerequisites.get(node.id, []):
-            if self._prerequisite_satisfied(prerequisite):
-                continue
-            blockers.append(
+            satisfied = self._prerequisite_satisfied(prerequisite)
+            entries.append(
                 {
                     "node_id": prerequisite.id,
                     "label": prerequisite.label,
                     "mastery_stars": max(0, int(prerequisite.mastery_stars)),
                     "retrieval_state": prerequisite.retrieval_state,
                     "evidence_state": prerequisite.evidence_state,
-                    "reason": "needs_verified_prerequisite",
+                    "satisfied": satisfied,
+                    "reason": (
+                        "prerequisite_satisfied"
+                        if satisfied
+                        else "needs_verified_prerequisite"
+                    ),
                 }
             )
-        return blockers
+        return entries
+
+    def _prerequisite_blockers(
+        self,
+        node: GraphNode,
+        prerequisites: dict[str, list[GraphNode]],
+    ) -> list[dict[str, Any]]:
+        return [
+            entry
+            for entry in self._prerequisite_entries(node, prerequisites)
+            if not entry.get("satisfied")
+        ]
 
     def _score_action(
         self,
@@ -1301,26 +1318,43 @@ class WorkflowService:
 
     def roadmap(self, goal_id: str) -> dict[str, Any]:
         self._goal(goal_id)
+        # Prefer the active roadmap; fall back to the latest row for legacy data.
         roadmap = self.db.scalar(
             select(Roadmap)
             .where(
                 Roadmap.workspace_id == self.workspace_id,
                 Roadmap.goal_id == goal_id,
+                Roadmap.status == "published",
             )
             .order_by(Roadmap.version.desc())
         )
         if roadmap is None:
-            # A read must not manufacture a draft.  Initial candidate-graph and
-            # RoadmapDraft review starts only from the explicit re-plan action.
+            roadmap = self.db.scalar(
+                select(Roadmap)
+                .where(
+                    Roadmap.workspace_id == self.workspace_id,
+                    Roadmap.goal_id == goal_id,
+                )
+                .order_by(Roadmap.version.desc())
+            )
+        if roadmap is None:
+            # A read must not manufacture a plan. Explicit replan creates it.
             raise AppError(
                 404,
                 "roadmap_not_found",
-                "No roadmap draft exists; explicitly create one before reading it",
+                "No roadmap exists; explicitly create one before reading it",
             )
         if not self.authz.can_access_roadmap_record(
             self.workspace, roadmap, "read"
         ):
             raise AppError(404, "roadmap_not_found", "Roadmap was not found")
+        # Versionless migration: promote leftover draft rows so actions and
+        # dashboard immediately treat them as the active plan.
+        if roadmap.status == "draft":
+            roadmap.status = "published"
+            roadmap.published_at = roadmap.published_at or now()
+            self.db.commit()
+            self.db.refresh(roadmap)
         return self._roadmap_data(roadmap)
 
     def replan_roadmap(self, goal_id: str) -> Roadmap:
@@ -1400,14 +1434,16 @@ class WorkflowService:
             ],
         }
         latest = self.db.scalar(select(func.max(Roadmap.version)).where(Roadmap.workspace_id == self.workspace_id, Roadmap.goal_id == goal_id)) or 0
-        for prior_draft in self.db.scalars(
+        # Versionless mode: replan immediately becomes the active roadmap.
+        # Prior active/draft rows are superseded so only one plan is actionable.
+        for prior in self.db.scalars(
             select(Roadmap).where(
                 Roadmap.workspace_id == self.workspace_id,
                 Roadmap.goal_id == goal_id,
-                Roadmap.status == "draft",
+                Roadmap.status.in_(("draft", "published")),
             )
         ):
-            prior_draft.status = "superseded"
+            prior.status = "superseded"
         roadmap = Roadmap(
             workspace_id=self.workspace_id,
             goal_id=goal_id,
@@ -1415,11 +1451,13 @@ class WorkflowService:
             graph_revision=graph.revision,
             title=f"{goal.title}路线",
             version=latest + 1,
-            rationale="基于版本化的目标权重、掌握缺口、期限、可用时间、偏好和已满足前置条件生成；本版本等待用户审核。",
+            status="published",
+            published_at=plan_started_at,
+            rationale="基于目标权重、掌握缺口、期限、可用时间、偏好和前置条件生成；路线即生效，无需单独发布。",
             planning_snapshot=planning_snapshot,
         )
         self.db.add(roadmap); self.db.flush()
-        ranked: list[tuple[GraphNode, str, int, dict[str, float]]] = []
+        ranked: list[tuple[GraphNode, str, int, dict[str, float], list[dict[str, Any]]]] = []
         blocked: list[tuple[GraphNode, str, int, dict[str, float], list[dict[str, Any]]]] = []
         excluded: list[dict[str, str]] = []
         completed_node_ids = set(
@@ -1459,18 +1497,19 @@ class WorkflowService:
                 plan_started_at,
                 preferred_action_types,
             )
-            blockers = self._prerequisite_blockers(node, prerequisites)
+            prereq_entries = self._prerequisite_entries(node, prerequisites)
+            blockers = [entry for entry in prereq_entries if not entry.get("satisfied")]
             if blockers:
-                blocked.append((node, action_type, score, score_breakdown, blockers))
+                blocked.append((node, action_type, score, score_breakdown, prereq_entries))
             else:
-                ranked.append((node, action_type, score, score_breakdown))
+                ranked.append((node, action_type, score, score_breakdown, prereq_entries))
 
         ranked.sort(key=lambda item: (-item[2], -item[0].target_weight, item[0].created_at, item[0].id))
         minutes_on_day = 0
         day_index = 1
         position = 0
         scheduled_after_deadline_count = 0
-        for node, action_type, score, score_breakdown in ranked:
+        for node, action_type, score, score_breakdown, prereq_entries in ranked:
             if minutes_on_day and minutes_on_day + duration_minutes > available_minutes_per_day:
                 day_index += 1
                 minutes_on_day = 0
@@ -1503,7 +1542,10 @@ class WorkflowService:
                         "score_breakdown": score_breakdown,
                         "ranking_reason": "eligible_after_prerequisite_check",
                         "acceptance_criteria": self._acceptance_criteria(node, action_type),
-                        "prerequisites": {"blocked_by": []},
+                        "prerequisites": {
+                            "items": prereq_entries,
+                            "blocked_by": [],
+                        },
                         "schedule": {
                             "available_minutes_per_day": available_minutes_per_day,
                             "days_per_week": days_per_week,
@@ -1516,14 +1558,22 @@ class WorkflowService:
             minutes_on_day += duration_minutes
             position += 1
 
-        for node, action_type, score, score_breakdown, blockers in sorted(
-            blocked,
-            key=lambda item: (-item[2], -item[0].target_weight, item[0].created_at, item[0].id),
+        # Keep blocked items visible inside the plan timeline rather than a
+        # detached queue: place them after scheduled work so each day can show
+        # prerequisite context next to actionable tasks.
+        blocked_start_day = day_index if ranked else 1
+        for offset, (node, action_type, score, score_breakdown, prereq_entries) in enumerate(
+            sorted(
+                blocked,
+                key=lambda item: (-item[2], -item[0].target_weight, item[0].created_at, item[0].id),
+            )
         ):
+            blocked_day = blocked_start_day + (offset // max(1, available_minutes_per_day // max(duration_minutes, 1)))
+            blockers = [entry for entry in prereq_entries if not entry.get("satisfied")]
             self.db.add(
                 ActionItem(
                     workspace_id=self.workspace_id,
-                    title=f"前置未满足：{node.label}",
+                    title=f"待解锁：{node.label}",
                     description=node.description,
                     status="blocked",
                     source="roadmap",
@@ -1532,9 +1582,9 @@ class WorkflowService:
                     graph_id=graph.id,
                     node_id=node.id,
                     roadmap_id=roadmap.id,
-                    day_index=0,
+                    day_index=blocked_day,
                     duration_minutes=duration_minutes,
-                    due_at=None,
+                    due_at=self._scheduled_due_at(plan_started_at, blocked_day, days_per_week),
                     priority=0,
                     position=position,
                     metadata_json={
@@ -1546,7 +1596,10 @@ class WorkflowService:
                         "score_breakdown": score_breakdown,
                         "ranking_reason": "blocked_by_prerequisite",
                         "acceptance_criteria": self._acceptance_criteria(node, action_type),
-                        "prerequisites": {"blocked_by": blockers},
+                        "prerequisites": {
+                            "items": prereq_entries,
+                            "blocked_by": blockers,
+                        },
                         "schedule": {
                             "available_minutes_per_day": available_minutes_per_day,
                             "days_per_week": days_per_week,
@@ -1557,10 +1610,21 @@ class WorkflowService:
             )
             position += 1
         updated_snapshot = dict(roadmap.planning_snapshot or {})
+        scheduled_day_candidates = [0]
+        if ranked:
+            scheduled_day_candidates.append(day_index)
+        if blocked:
+            last_blocked_day = blocked_start_day + max(
+                0,
+                (len(blocked) - 1)
+                // max(1, available_minutes_per_day // max(duration_minutes, 1)),
+            )
+            scheduled_day_candidates.append(last_blocked_day)
+        scheduled_days = max(scheduled_day_candidates)
         updated_snapshot["capacity_summary"] = {
             "scheduled_item_count": len(ranked),
             "blocked_item_count": len(blocked),
-            "scheduled_days": day_index if ranked else 0,
+            "scheduled_days": scheduled_days if (ranked or blocked) else 0,
             "total_minutes": len(ranked) * duration_minutes,
             "available_minutes_per_day": available_minutes_per_day,
             "scheduled_after_deadline_count": scheduled_after_deadline_count,
@@ -1568,7 +1632,7 @@ class WorkflowService:
         updated_snapshot["excluded_nodes"] = excluded
         updated_snapshot["unresolved_gaps"] = (
             [
-                f"{scheduled_after_deadline_count} 个行动超出目标截止时间；发布前请调整约束或路线"
+                f"{scheduled_after_deadline_count} 个行动超出目标截止时间；请调整约束或重新规划"
             ]
             if scheduled_after_deadline_count
             else []
@@ -1590,6 +1654,7 @@ class WorkflowService:
                 "blocked_item_count": len(blocked),
                 "excluded_node_count": len(excluded),
                 "scheduled_after_deadline_count": scheduled_after_deadline_count,
+                "mode": "versionless_active",
             },
         )
         self.db.commit(); self.db.refresh(roadmap); return roadmap
@@ -1600,37 +1665,51 @@ class WorkflowService:
         action_id: str,
         payload: RoadmapItemReschedule,
     ) -> Roadmap:
-        parent = self._roadmap_record(roadmap_id, "write")
-        if payload.base_version != parent.version:
+        roadmap = self._roadmap_record(roadmap_id, "write")
+        if payload.base_version != roadmap.version:
             raise AppError(
                 409,
                 "roadmap_version_conflict",
                 "The roadmap changed after this editor was opened",
-                {"expected_version": payload.base_version, "current_version": parent.version},
+                {"expected_version": payload.base_version, "current_version": roadmap.version},
             )
         latest_version = self.db.scalar(
             select(func.max(Roadmap.version)).where(
                 Roadmap.workspace_id == self.workspace_id,
-                Roadmap.goal_id == parent.goal_id,
+                Roadmap.goal_id == roadmap.goal_id,
             )
         )
-        if latest_version is not None and parent.version != latest_version:
+        if latest_version is not None and roadmap.version != latest_version:
             raise AppError(
                 409,
                 "roadmap_not_latest",
-                "Only the latest roadmap can be revised",
-                {"requested_version": parent.version, "latest_version": latest_version},
+                "Only the active roadmap can be revised",
+                {"requested_version": roadmap.version, "latest_version": latest_version},
             )
-        if parent.status not in {"draft", "published"}:
-            raise AppError(
-                409,
-                "roadmap_not_revisionable",
-                "Only the latest draft or active published roadmap can be revised",
-                {"status": parent.status},
-            )
+        if roadmap.status != "published":
+            # Auto-activate legacy draft rows so reschedule stays versionless.
+            if roadmap.status == "draft":
+                for prior in self.db.scalars(
+                    select(Roadmap).where(
+                        Roadmap.workspace_id == self.workspace_id,
+                        Roadmap.goal_id == roadmap.goal_id,
+                        Roadmap.status == "published",
+                        Roadmap.id != roadmap.id,
+                    )
+                ):
+                    prior.status = "superseded"
+                roadmap.status = "published"
+                roadmap.published_at = roadmap.published_at or now()
+            else:
+                raise AppError(
+                    409,
+                    "roadmap_not_revisionable",
+                    "Only the active roadmap can be revised",
+                    {"status": roadmap.status},
+                )
 
-        parent_items = self._roadmap_items(parent.id)
-        moving = next((item for item in parent_items if item.id == action_id), None)
+        items = self._roadmap_items(roadmap.id)
+        moving = next((item for item in items if item.id == action_id), None)
         if moving is None:
             raise AppError(404, "roadmap_item_not_found", "Roadmap item was not found")
         if moving.status == "blocked":
@@ -1649,7 +1728,7 @@ class WorkflowService:
 
         scheduled_by_day: dict[int, list[ActionItem]] = {}
         blocked_items: list[ActionItem] = []
-        for item in parent_items:
+        for item in items:
             if item.status == "blocked":
                 blocked_items.append(item)
             elif item.id != moving.id:
@@ -1663,8 +1742,8 @@ class WorkflowService:
             for item in scheduled_by_day[day]
         ]
 
-        snapshot = copy.deepcopy(parent.planning_snapshot or {})
-        plan_started_at = self._as_utc(parent.created_at) or now()
+        snapshot = copy.deepcopy(roadmap.planning_snapshot or {})
+        plan_started_at = self._as_utc(roadmap.created_at) or now()
         raw_plan_started_at = snapshot.get("plan_started_at")
         if isinstance(raw_plan_started_at, str):
             try:
@@ -1686,40 +1765,27 @@ class WorkflowService:
             except ValueError:
                 deadline_at = None
 
-        new_version = int(latest_version or parent.version) + 1
-        revision = Roadmap(
-            workspace_id=self.workspace_id,
-            goal_id=parent.goal_id,
-            graph_id=parent.graph_id,
-            graph_revision=parent.graph_revision,
-            title=parent.title,
-            version=new_version,
-            status="draft",
-            rationale=payload.rationale,
-            planning_snapshot={},
-        )
-        self.db.add(revision)
-        self.db.flush()
-
         duration_by_source_id = {
             item.id: (
                 payload.duration_minutes
                 if item.id == moving.id and payload.duration_minutes is not None
                 else item.duration_minutes
             )
-            for item in parent_items
+            for item in items
         }
         day_total_minutes = {
-            day: sum(duration_by_source_id[item.id] for item in items)
-            for day, items in scheduled_by_day.items()
+            day: sum(duration_by_source_id[item.id] for item in day_items)
+            for day, day_items in scheduled_by_day.items()
         }
         scheduled_after_deadline_count = 0
         scheduled_position = 0
         new_day_by_source_id = {
             item.id: day
-            for day, items in scheduled_by_day.items()
-            for item in items
+            for day, day_items in scheduled_by_day.items()
+            for item in day_items
         }
+        from_day_index = moving.day_index
+        from_duration = moving.duration_minutes
         for item in ordered_scheduled:
             day_index = new_day_by_source_id[item.id]
             duration_minutes = duration_by_source_id[item.id]
@@ -1728,7 +1794,7 @@ class WorkflowService:
             if scheduled_after_deadline:
                 scheduled_after_deadline_count += 1
             metadata = copy.deepcopy(item.metadata_json or {})
-            metadata["roadmap_version"] = new_version
+            metadata["roadmap_version"] = roadmap.version
             metadata["ranking_reason"] = (
                 "user_rescheduled" if item.id == moving.id else metadata.get("ranking_reason")
             )
@@ -1748,73 +1814,41 @@ class WorkflowService:
             if item.id == moving.id:
                 metadata["manual_adjustment"] = {
                     "source_action_id": item.id,
-                    "from_day_index": item.day_index,
+                    "from_day_index": from_day_index,
                     "to_day_index": day_index,
-                    "from_duration_minutes": item.duration_minutes,
+                    "from_duration_minutes": from_duration,
                     "to_duration_minutes": duration_minutes,
                     "rationale": payload.rationale,
                 }
-            self.db.add(
-                ActionItem(
-                    workspace_id=self.workspace_id,
-                    title=item.title,
-                    description=item.description,
-                    status=item.status,
-                    source=item.source,
-                    action_type=item.action_type,
-                    project_id=item.project_id,
-                    goal_id=item.goal_id,
-                    graph_id=item.graph_id,
-                    node_id=item.node_id,
-                    roadmap_id=revision.id,
-                    day_index=day_index,
-                    duration_minutes=duration_minutes,
-                    due_at=due_at,
-                    priority=item.priority,
-                    position=scheduled_position,
-                    completed_at=item.completed_at,
-                    metadata_json=metadata,
-                )
-            )
+            item.day_index = day_index
+            item.duration_minutes = duration_minutes
+            item.due_at = due_at
+            item.position = scheduled_position
+            item.metadata_json = metadata
             scheduled_position += 1
 
+        # Keep blocked items attached to their existing day (or after schedule).
+        fallback_day = max(scheduled_by_day.keys(), default=1)
         for item in blocked_items:
             metadata = copy.deepcopy(item.metadata_json or {})
-            metadata["roadmap_version"] = new_version
-            self.db.add(
-                ActionItem(
-                    workspace_id=self.workspace_id,
-                    title=item.title,
-                    description=item.description,
-                    status=item.status,
-                    source=item.source,
-                    action_type=item.action_type,
-                    project_id=item.project_id,
-                    goal_id=item.goal_id,
-                    graph_id=item.graph_id,
-                    node_id=item.node_id,
-                    roadmap_id=revision.id,
-                    day_index=0,
-                    duration_minutes=item.duration_minutes,
-                    due_at=None,
-                    priority=0,
-                    position=scheduled_position,
-                    completed_at=item.completed_at,
-                    metadata_json=metadata,
-                )
-            )
+            metadata["roadmap_version"] = roadmap.version
+            day_index = item.day_index if item.day_index > 0 else fallback_day
+            item.day_index = day_index
+            item.due_at = self._scheduled_due_at(plan_started_at, day_index, days_per_week)
+            item.position = scheduled_position
+            item.metadata_json = metadata
             scheduled_position += 1
 
         adjustments = list(snapshot.get("manual_adjustments") or [])
         adjustments.append(
             {
-                "source_roadmap_id": parent.id,
-                "source_version": parent.version,
+                "source_roadmap_id": roadmap.id,
+                "source_version": roadmap.version,
                 "source_action_id": moving.id,
                 "node_id": moving.node_id,
-                "from_day_index": moving.day_index,
+                "from_day_index": from_day_index,
                 "to_day_index": payload.day_index,
-                "from_duration_minutes": moving.duration_minutes,
+                "from_duration_minutes": from_duration,
                 "to_duration_minutes": duration_by_source_id[moving.id],
                 "rationale": payload.rationale,
                 "actor_id": self.actor_id,
@@ -1823,15 +1857,20 @@ class WorkflowService:
         )
         snapshot.update(
             {
-                "parent_roadmap_id": parent.id,
-                "parent_version": parent.version,
                 "revision_kind": "manual_reschedule",
                 "manual_adjustments": adjustments,
                 "capacity_summary": {
                     "scheduled_item_count": len(ordered_scheduled),
                     "blocked_item_count": len(blocked_items),
-                    "scheduled_days": len(scheduled_by_day),
-                    "total_minutes": sum(duration_by_source_id[item.id] for item in ordered_scheduled),
+                    "scheduled_days": len(
+                        {
+                            *scheduled_by_day.keys(),
+                            *(item.day_index for item in blocked_items if item.day_index > 0),
+                        }
+                    ),
+                    "total_minutes": sum(
+                        duration_by_source_id[item.id] for item in ordered_scheduled
+                    ),
                     "available_minutes_per_day": available_minutes_per_day,
                     "over_capacity_days": sorted(
                         day
@@ -1852,30 +1891,33 @@ class WorkflowService:
                 f"{scheduled_after_deadline_count} 个行动超出目标截止时间"
             )
         snapshot["unresolved_gaps"] = unresolved_gaps
-        revision.planning_snapshot = snapshot
-        if parent.status == "draft":
-            parent.status = "superseded"
+        roadmap.planning_snapshot = snapshot
+        roadmap.rationale = payload.rationale or roadmap.rationale
         self.audit.record(
             actor_id=self.actor_id,
             action="roadmap.item_reschedule",
             resource_type="roadmap",
-            resource_id=revision.id,
+            resource_id=roadmap.id,
             details={
-                "parent_roadmap_id": parent.id,
-                "parent_version": parent.version,
-                "version": new_version,
+                "version": roadmap.version,
                 "source_action_id": moving.id,
                 "node_id": moving.node_id,
-                "from_day_index": moving.day_index,
+                "from_day_index": from_day_index,
                 "to_day_index": payload.day_index,
                 "duration_minutes": duration_by_source_id[moving.id],
+                "mode": "versionless_inplace",
             },
         )
         self.db.commit()
-        self.db.refresh(revision)
-        return revision
+        self.db.refresh(roadmap)
+        return roadmap
 
     def reject_roadmap(self, roadmap_id: str, payload: RoadmapReject) -> Roadmap:
+        """Compatibility shim: versionless mode has no reject-review step.
+
+        Legacy clients may still call this endpoint. Replan remains the way to
+        replace an unwanted plan.
+        """
         roadmap = self._roadmap_record(roadmap_id, "write")
         if payload.base_version != roadmap.version:
             raise AppError(
@@ -1884,44 +1926,18 @@ class WorkflowService:
                 "The roadmap changed after this review was opened",
                 {"expected_version": payload.base_version, "current_version": roadmap.version},
             )
-        latest_version = self.db.scalar(
-            select(func.max(Roadmap.version)).where(
-                Roadmap.workspace_id == self.workspace_id,
-                Roadmap.goal_id == roadmap.goal_id,
-            )
+        raise AppError(
+            409,
+            "roadmap_versionless_mode",
+            "Roadmaps are active without draft review; replan instead of rejecting",
+            {"status": roadmap.status, "rationale": payload.rationale},
         )
-        if latest_version is not None and roadmap.version != latest_version:
-            raise AppError(409, "roadmap_not_latest", "Only the latest roadmap draft can be rejected")
-        if roadmap.status == "rejected":
-            return roadmap
-        if roadmap.status != "draft":
-            raise AppError(
-                409,
-                "roadmap_not_rejectable",
-                "Only a roadmap draft awaiting review can be rejected",
-                {"status": roadmap.status},
-            )
-        snapshot = copy.deepcopy(roadmap.planning_snapshot or {})
-        snapshot["review_decision"] = {
-            "decision": "rejected",
-            "rationale": payload.rationale,
-            "actor_id": self.actor_id,
-            "decided_at": now().isoformat(),
-        }
-        roadmap.planning_snapshot = snapshot
-        roadmap.status = "rejected"
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="roadmap.reject",
-            resource_type="roadmap",
-            resource_id=roadmap.id,
-            details={"version": roadmap.version, "rationale": payload.rationale},
-        )
-        self.db.commit()
-        self.db.refresh(roadmap)
-        return roadmap
 
     def publish_roadmap(self, roadmap_id: str) -> Roadmap:
+        """Compatibility shim: replan already activates the roadmap.
+
+        Existing draft rows are promoted in place so older clients keep working.
+        """
         roadmap = self._roadmap_record(roadmap_id, "write")
         if roadmap.status == "published":
             return roadmap
@@ -1935,87 +1951,16 @@ class WorkflowService:
             raise AppError(
                 409,
                 "roadmap_not_latest",
-                "Only the latest roadmap draft can be published; review the current version",
+                "Only the latest roadmap can become active",
                 {"requested_version": roadmap.version, "latest_version": latest_version},
             )
-        if roadmap.status != "draft":
+        if roadmap.status not in {"draft", "published"}:
             raise AppError(
                 409,
                 "roadmap_not_publishable",
-                "Only the latest roadmap draft can be published",
+                "Only a draft or active roadmap can be activated",
                 {"status": roadmap.status},
             )
-        if roadmap.graph_id is None or roadmap.graph_revision is None:
-            raise AppError(409, "roadmap_snapshot_missing", "Replan before publishing this legacy roadmap")
-        graph = self.db.scalar(
-            select(Graph).where(
-                Graph.workspace_id == self.workspace_id,
-                Graph.id == roadmap.graph_id,
-                Graph.goal_id == roadmap.goal_id,
-            )
-        )
-        if graph is None:
-            raise AppError(409, "roadmap_graph_missing", "The graph used by this roadmap no longer exists")
-        goal = self.db.scalar(
-            select(Goal).where(
-                Goal.workspace_id == self.workspace_id,
-                Goal.id == roadmap.goal_id,
-            )
-        )
-        if goal is None:
-            raise AppError(409, "roadmap_goal_missing", "The goal used by this roadmap no longer exists")
-        if graph.revision != roadmap.graph_revision:
-            raise AppError(
-                409,
-                "roadmap_graph_revision_conflict",
-                "The graph changed after this roadmap was generated; replan before publishing",
-                {"expected_revision": roadmap.graph_revision, "current_revision": graph.revision},
-            )
-        nodes = list(
-            self.db.scalars(
-                select(GraphNode).where(
-                    GraphNode.workspace_id == self.workspace_id,
-                    GraphNode.graph_id == graph.id,
-                )
-            )
-        )
-        edges = list(
-            self.db.scalars(
-                select(GraphEdge).where(
-                    GraphEdge.workspace_id == self.workspace_id,
-                    GraphEdge.graph_id == graph.id,
-                    GraphEdge.relation == "prerequisite",
-                )
-            )
-        )
-        expected_hash = str((roadmap.planning_snapshot or {}).get("graph_snapshot_hash") or "")
-        if not expected_hash:
-            raise AppError(409, "roadmap_snapshot_missing", "Replan before publishing this legacy roadmap")
-        if self._graph_planning_hash(graph, nodes, edges) != expected_hash:
-            raise AppError(
-                409,
-                "roadmap_graph_snapshot_conflict",
-                "The graph or planning inputs changed after this roadmap was generated; replan before publishing",
-            )
-        current_goal_inputs, *_ = self._normalized_goal_planning_inputs(goal)
-        if current_goal_inputs != (roadmap.planning_snapshot or {}).get("goal"):
-            raise AppError(
-                409,
-                "roadmap_planning_input_conflict",
-                "Goal deadline, availability, or preferences changed after this roadmap was generated; replan before publishing",
-            )
-        # A candidate roadmap can be reviewed next to a candidate graph, but it
-        # cannot become active before the user separately publishes the graph.
-        # Publishing this roadmap never publishes that graph on the user's
-        # behalf.
-        if graph.status != "published":
-            raise AppError(
-                409,
-                "roadmap_requires_published_graph",
-                "Publish the reviewed graph separately before publishing its roadmap",
-                {"review_scope": (roadmap.planning_snapshot or {}).get("review_scope")},
-            )
-        superseded_roadmap_ids: list[str] = []
         for prior in self.db.scalars(
             select(Roadmap).where(
                 Roadmap.workspace_id == self.workspace_id,
@@ -2025,19 +1970,18 @@ class WorkflowService:
             )
         ):
             prior.status = "superseded"
-            superseded_roadmap_ids.append(prior.id)
-        roadmap.status = "published"; roadmap.published_at = now()
+        roadmap.status = "published"
+        roadmap.published_at = now()
         self.audit.record(
             actor_id=self.actor_id,
-            action="roadmap.publish",
+            action="roadmap.activate",
             resource_type="roadmap",
             resource_id=roadmap.id,
             details={
                 "version": roadmap.version,
-                "graph_id": graph.id,
-                "graph_revision": graph.revision,
-                "review_scope": (roadmap.planning_snapshot or {}).get("review_scope"),
-                "superseded_roadmap_ids": superseded_roadmap_ids,
+                "mode": "versionless_compat_publish",
             },
         )
-        self.db.commit(); self.db.refresh(roadmap); return roadmap
+        self.db.commit()
+        self.db.refresh(roadmap)
+        return roadmap

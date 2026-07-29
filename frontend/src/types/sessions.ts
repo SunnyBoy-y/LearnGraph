@@ -59,6 +59,15 @@ export interface SessionAutoTitleRequest {
   model_id?: string
 }
 
+export interface SessionActivitySummaryRequest {
+  /** Optimistic-lock: the title the caller believes is currently persisted. */
+  expected_title: string
+  /** Optional; points at the first completed local user message. */
+  source_message_id?: string
+  provider_id?: string
+  model_id?: string
+}
+
 export interface DictationCleanupRequest {
   text: string
   context?: string
@@ -88,6 +97,13 @@ export interface Session {
   session_kind: 'main' | 'concept_branch' | 'side' | 'standalone'
   writeback_policy: 'normal' | 'manual_only'
   context_capsule: UnknownRecord
+  /**
+   * LLM-generated one-line "learning event" description for the dashboard
+   * activity view (e.g. "弄懂数据库中范式的意义"). Null when the model
+   * provider was unavailable or the session predates summary generation.
+   * The activity view falls back to {@link Session.title} when this is null.
+   */
+  activity_summary: string | null
   created_at: IsoDateTime
   /** Last activity (message / rename / pin). Used for sidebar recency sort. */
   updated_at: IsoDateTime
@@ -250,6 +266,15 @@ export interface Message {
   parts: MessagePart[]
   provider_trace: UnknownRecord
   created_at: IsoDateTime
+}
+
+/** Windowed list response from GET /sessions/{id}/messages. */
+export interface MessageListPage {
+  items: Message[]
+  has_more_before: boolean
+  oldest_id: string | null
+  newest_id: string | null
+  total_count: number
 }
 
 export interface MessageVersion {

@@ -55,6 +55,7 @@ from app.providers.remote.codex import (
     CodexAuthError,
     ensure_fresh_codex_credentials,
     parse_codex_credentials,
+    resolve_codex_model_for_plan,
 )
 from app.providers.remote.codex_provider import CodexResponsesProvider
 from app.providers.remote.images import (
@@ -335,6 +336,20 @@ def model_provider_for_workspace(
                     provider_id=provider.id,
                     model_id=resolved_model_id,
                 )
+            # Free ChatGPT plans reject several documented Codex slugs
+            # (notably gpt-5.6-sol). Remap before the first stream request.
+            plan_model_id = resolve_codex_model_for_plan(
+                resolved_model_id,
+                credentials.plan_type,
+            )
+            if plan_model_id != resolved_model_id:
+                common["model_id"] = plan_model_id
+                common["capabilities"] = {
+                    **common["capabilities"],
+                    "requested_model_id": resolved_model_id,
+                    "resolved_model_id": plan_model_id,
+                    "codex_plan_type": credentials.plan_type,
+                }
             return CodexResponsesProvider(**common, credentials=credentials)
         if provider.provider_type == "openai_responses":
             return OpenAIResponsesProvider(**common)

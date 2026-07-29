@@ -642,7 +642,7 @@ export function GraphWorkspacePage() {
       ? saved!
       : "all";
   });
-  const [depthLimit, setDepthLimit] = useState(2);
+  const [depthLimit, setDepthLimit] = useState(Number.MAX_SAFE_INTEGER);
   const [editingNode, setEditingNode] = useState(false);
   /** Workbench "edit mode": unlocks manual node edits across the inspector. */
   const [editMode, setEditMode] = useState(false);
@@ -778,6 +778,8 @@ export function GraphWorkspacePage() {
   const maximumDepth = workbenchGraph
     ? getKnowledgeGraphTreeDepth(workbenchGraph.nodes, workbenchGraph.edges)
     : 0;
+  // Clamp so the initial "show all" sentinel never flashes as a huge fraction.
+  const effectiveDepthLimit = Math.min(depthLimit, maximumDepth);
   const requestedNodeDepth =
     workbenchGraph && requestedNodeId
       ? (getKnowledgeGraphTreeDepths(
@@ -820,8 +822,9 @@ export function GraphWorkspacePage() {
       maximumDepth > 0;
     depthStateRef.current = { graphId: activeGraphId, maximumDepth };
     setDepthLimit((current) => {
+      // Default: show the full tree when a graph first loads or becomes available.
       if (graphChanged || graphBecameAvailable) {
-        return Math.min(2, maximumDepth);
+        return maximumDepth;
       }
       return Math.max(0, Math.min(current, maximumDepth));
     });
@@ -1460,20 +1463,26 @@ export function GraphWorkspacePage() {
                 <div className="graph-depth-control" role="group" aria-label="展开层级">
                   <Button
                     aria-label="减少展开层级"
-                    disabled={depthLimit <= 0}
-                    onClick={() => setDepthLimit((current) => Math.max(0, current - 1))}
+                    disabled={effectiveDepthLimit <= 0}
+                    onClick={() =>
+                      setDepthLimit(Math.max(0, effectiveDepthLimit - 1))
+                    }
                     size="icon-sm"
                     title="减少展开层级"
                     variant="ghost"
                   >
                     <ZoomOut />
                   </Button>
-                  <span>{depthLimit}/{maximumDepth} 层</span>
+                  <span>
+                    {effectiveDepthLimit}/{maximumDepth} 层
+                  </span>
                   <Button
                     aria-label="增加展开层级"
-                    disabled={depthLimit >= maximumDepth}
+                    disabled={effectiveDepthLimit >= maximumDepth}
                     onClick={() =>
-                      setDepthLimit((current) => Math.min(maximumDepth, current + 1))
+                      setDepthLimit(
+                        Math.min(maximumDepth, effectiveDepthLimit + 1),
+                      )
                     }
                     size="icon-sm"
                     title="增加展开层级"
@@ -1556,7 +1565,7 @@ export function GraphWorkspacePage() {
                   <KnowledgeGraph
                     edges={filteredWorkbenchGraph.edges}
                     layout="tree"
-                    maxDepth={depthLimit}
+                    maxDepth={effectiveDepthLimit}
                     multiple={multiSelect}
                     nodes={filteredWorkbenchGraph.nodes}
                     onSelect={selectWorkbenchNode}

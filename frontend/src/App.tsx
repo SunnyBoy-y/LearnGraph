@@ -41,7 +41,15 @@ const AccessManagementPage = lazy(() => import('@/features/settings/control-page
 
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { retry: 1, staleTime: 15_000, refetchOnWindowFocus: false },
+    queries: {
+      retry: 1,
+      staleTime: 15_000,
+      // Drop inactive query data quickly. Per-session message history and
+      // derived message caches are the main multi-session RAM cost; chat also
+      // actively evicts non-active/non-streaming session caches on switch.
+      gcTime: 30_000,
+      refetchOnWindowFocus: false,
+    },
     mutations: { retry: 0 },
   },
 })

@@ -3167,3 +3167,593 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 }
 @keyframes graph-drawer-in { from { transform: translateX(36px); opacity: 0.4; } }
 @keyframes graph-drawer-fade { from { opacity: 0; } }
+
+/* ===========================================================================
+   LearnGraph roadmap page — redesigned layout (lg-roadmap-*).
+   Self-contained scope; does not touch the legacy .roadmap-* rules above.
+   =========================================================================== */
+.lg-roadmap-page { gap: 14px; }
+
+/* Page tabs: list / chart / calendar --------------------------------------- */
+.lg-roadmap-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--background) 70%, var(--card));
+  padding: 6px;
+}
+.lg-roadmap-tabs__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  font-weight: 650;
+  transition: background .14s ease, color .14s ease, border-color .14s ease;
+}
+.lg-roadmap-tabs__item:hover {
+  background: color-mix(in srgb, var(--muted) 45%, transparent);
+  color: var(--foreground);
+}
+.lg-roadmap-tabs__item.is-active {
+  border-color: color-mix(in srgb, var(--primary) 25%, var(--border));
+  background: color-mix(in srgb, var(--primary) 10%, var(--background));
+  color: var(--foreground);
+}
+.lg-roadmap-tabs__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  padding-right: 6px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+/* Chart preview ------------------------------------------------------------ */
+.lg-roadmap-chart {
+  display: grid;
+  gap: 14px;
+  padding: 14px 16px 16px;
+}
+.lg-roadmap-chart__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.lg-roadmap-chart__kpis {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--border);
+}
+.lg-roadmap-chart__kpis > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px;
+  background: color-mix(in srgb, var(--background) 72%, var(--card));
+}
+.lg-roadmap-chart__kpis span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 600;
+}
+.lg-roadmap-chart__kpis strong {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 20px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.lg-roadmap-chart__kpis small,
+.lg-roadmap-chart__kpis strong.is-text {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 650;
+}
+.lg-roadmap-chart__kpis strong.is-text {
+  font-size: 14px;
+  color: var(--foreground);
+}
+.lg-roadmap-chart__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 12px;
+}
+.lg-roadmap-chart__panel {
+  display: grid;
+  grid-template-rows: auto minmax(220px, 1fr);
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--background) 70%, var(--card));
+  padding: 12px;
+}
+.lg-roadmap-chart__panel--wide {
+  grid-column: 1 / -1;
+  min-height: 280px;
+}
+.lg-roadmap-chart__panel > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.lg-roadmap-chart__panel > header strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+.lg-roadmap-chart__panel > header span {
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+}
+.lg-roadmap-chart__canvas {
+  min-height: 210px;
+}
+.lg-roadmap-chart__canvas--pie {
+  min-height: 240px;
+}
+.lg-roadmap-chart__empty {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.lg-roadmap-gaps {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 12px;
+  border-left: 3px solid var(--ring);
+  background: color-mix(in srgb, var(--ring) 8%, var(--background));
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.lg-roadmap-gaps strong { font-size: 12px; align-self: center; }
+.lg-roadmap-gaps ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+/* Learning board — collapsible day list ------------------------------------ */
+.lg-roadmap-board { overflow: hidden; }
+.lg-roadmap-board__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 14px 16px;
+}
+.lg-roadmap-board__header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.lg-roadmap-list { display: grid; gap: 0; }
+.lg-roadmap-list-day {
+  border-bottom: 1px solid var(--border);
+}
+.lg-roadmap-list-day:last-child { border-bottom: 0; }
+.lg-roadmap-list-day__toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  text-align: left;
+  transition: background .14s ease;
+}
+.lg-roadmap-list-day__toggle:hover {
+  background: color-mix(in srgb, var(--muted) 45%, transparent);
+}
+.lg-roadmap-list-day.is-open > .lg-roadmap-list-day__toggle {
+  background: color-mix(in srgb, var(--muted) 30%, transparent);
+}
+.lg-roadmap-list-day__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.lg-roadmap-list-day__chevron {
+  color: var(--muted-foreground);
+  transition: transform .16s ease;
+  flex: none;
+}
+.lg-roadmap-list-day__chevron.is-open {
+  transform: rotate(180deg);
+}
+.lg-roadmap-list-day__title strong {
+  font-size: 13px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+.lg-roadmap-list-day__title span,
+.lg-roadmap-list-day__meta {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.lg-roadmap-list-day__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.lg-roadmap-list-day__meta em {
+  font-style: normal;
+  font-weight: 650;
+}
+.lg-roadmap-list-day__meta em[data-marker='completed'] { color: #15803d; }
+.lg-roadmap-list-day__meta em[data-marker='blocked'] { color: #b45309; }
+.lg-roadmap-list-day__meta em[data-marker='in-progress'] { color: #2563eb; }
+.lg-roadmap-list-day__meta em[data-marker='mixed'] { color: #7c3aed; }
+.lg-roadmap-list-day__meta em[data-marker='has-tasks'] { color: var(--foreground); }
+.lg-roadmap-list-day__body {
+  display: grid;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
+.lg-roadmap-list-day__items {
+  display: grid;
+  gap: 6px;
+}
+.lg-roadmap-list-day__more {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--muted) 35%, transparent);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background .14s ease, color .14s ease;
+}
+.lg-roadmap-list-day__more:hover {
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+  color: var(--foreground);
+}
+.lg-roadmap-list-day__preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 0 16px 12px 40px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.lg-roadmap-list-day__preview span {
+  position: relative;
+  padding-left: 10px;
+}
+.lg-roadmap-list-day__preview span::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: .55em;
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted-foreground) 55%, transparent);
+}
+
+/* Compact task rows -------------------------------------------------------- */
+.lg-roadmap-task {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background) 70%, var(--card));
+  padding: 10px 12px;
+}
+.lg-roadmap-task.is-blocked {
+  border-color: color-mix(in srgb, #d97706 28%, var(--border));
+  background: color-mix(in srgb, #d97706 6%, var(--background));
+}
+.lg-roadmap-task.is-completed {
+  border-color: color-mix(in srgb, #16a34a 24%, var(--border));
+}
+.lg-roadmap-task__main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px 12px;
+  align-items: start;
+}
+.lg-roadmap-task__lead {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 72px;
+}
+.lg-roadmap-task__meta {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.lg-roadmap-task__content {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.lg-roadmap-task__title {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.35;
+  font-weight: 650;
+}
+.lg-roadmap-task__desc {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+}
+.lg-roadmap-task__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.lg-roadmap-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--muted-foreground);
+  background: color-mix(in srgb, var(--background) 70%, var(--card));
+  font-size: 10.5px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lg-roadmap-chip.is-ok {
+  color: #15803d;
+  border-color: color-mix(in srgb, #16a34a 28%, var(--border));
+  background: color-mix(in srgb, #16a34a 8%, var(--background));
+}
+.lg-roadmap-chip.is-blocked {
+  color: #b45309;
+  border-color: color-mix(in srgb, #d97706 30%, var(--border));
+  background: color-mix(in srgb, #d97706 10%, var(--background));
+}
+.lg-roadmap-chip.is-accept {
+  color: color-mix(in srgb, var(--primary) 80%, var(--foreground));
+  border-color: color-mix(in srgb, var(--primary) 24%, var(--border));
+}
+.lg-roadmap-chip.is-warn {
+  color: #b45309;
+  border-color: color-mix(in srgb, #d97706 30%, var(--border));
+}
+.lg-roadmap-task__score summary {
+  cursor: pointer;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.lg-roadmap-task__score p {
+  margin: 4px 0 0;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.lg-roadmap-task__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+/* Calendar detail reuses compact task rows */
+.lg-roadmap-day__items {
+  display: grid;
+  gap: 6px;
+}
+
+/* Calendar view ------------------------------------------------------------ */
+.lg-roadmap-calendar { display: grid; gap: 16px; padding: 18px 20px 20px; }
+.lg-roadmap-calendar__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.lg-roadmap-calendar__nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.lg-roadmap-calendar__nav strong {
+  min-width: 112px;
+  text-align: center;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.lg-roadmap-calendar__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+.lg-roadmap-calendar__legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.lg-roadmap-calendar__legend span::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--border);
+}
+.lg-roadmap-calendar__legend span[data-marker='has-tasks']::before { background: #64748b; }
+.lg-roadmap-calendar__legend span[data-marker='in-progress']::before { background: #2563eb; }
+.lg-roadmap-calendar__legend span[data-marker='completed']::before { background: #16a34a; }
+.lg-roadmap-calendar__legend span[data-marker='blocked']::before { background: #d97706; }
+.lg-roadmap-calendar__legend span[data-marker='mixed']::before { background: #7c3aed; }
+
+.lg-roadmap-calendar__weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 650;
+  text-align: center;
+}
+.lg-roadmap-calendar__grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+.lg-roadmap-calendar__cell {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 4px;
+  min-height: 78px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background) 72%, var(--card));
+  padding: 8px;
+  text-align: left;
+  transition: border-color .14s ease, box-shadow .14s ease, background .14s ease;
+}
+.lg-roadmap-calendar__cell:hover {
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+}
+.lg-roadmap-calendar__cell.is-outside {
+  opacity: .45;
+}
+.lg-roadmap-calendar__cell.is-today {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 45%, transparent);
+}
+.lg-roadmap-calendar__cell.is-selected {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+  background: color-mix(in srgb, var(--primary) 8%, var(--background));
+}
+.lg-roadmap-calendar__date {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.lg-roadmap-calendar__dot {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #64748b;
+}
+.lg-roadmap-calendar__cell.marker-has-tasks .lg-roadmap-calendar__dot { background: #64748b; }
+.lg-roadmap-calendar__cell.marker-in-progress .lg-roadmap-calendar__dot { background: #2563eb; }
+.lg-roadmap-calendar__cell.marker-completed .lg-roadmap-calendar__dot { background: #16a34a; }
+.lg-roadmap-calendar__cell.marker-blocked .lg-roadmap-calendar__dot { background: #d97706; }
+.lg-roadmap-calendar__cell.marker-mixed .lg-roadmap-calendar__dot { background: #7c3aed; }
+.lg-roadmap-calendar__cell.marker-completed {
+  background: color-mix(in srgb, #16a34a 8%, var(--background));
+}
+.lg-roadmap-calendar__cell.marker-blocked {
+  background: color-mix(in srgb, #d97706 8%, var(--background));
+}
+.lg-roadmap-calendar__cell.marker-in-progress {
+  background: color-mix(in srgb, #2563eb 8%, var(--background));
+}
+.lg-roadmap-calendar__cell.marker-mixed {
+  background: color-mix(in srgb, #7c3aed 8%, var(--background));
+}
+.lg-roadmap-calendar__meta {
+  align-self: end;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.3;
+}
+.lg-roadmap-calendar__meta.is-muted { opacity: .55; }
+
+.lg-roadmap-calendar__detail {
+  display: grid;
+  gap: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.lg-roadmap-calendar__detail > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.lg-roadmap-calendar__detail > header > div {
+  display: grid;
+  gap: 3px;
+}
+.lg-roadmap-calendar__detail > header strong { font-size: 14px; }
+.lg-roadmap-calendar__detail > header span {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.lg-roadmap-calendar__empty {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+@media (max-width: 1100px) {
+  .lg-roadmap-chart__kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .lg-roadmap-chart__grid { grid-template-columns: 1fr; }
+  .lg-roadmap-chart__panel--wide { grid-column: auto; }
+}
+
+@media (max-width: 760px) {
+  .lg-roadmap-tabs__meta { width: 100%; margin-left: 0; padding: 4px 6px 2px; }
+  .lg-roadmap-chart__kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lg-roadmap-task__main { grid-template-columns: minmax(0, 1fr); }
+  .lg-roadmap-task__lead {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .lg-roadmap-task__actions { justify-content: flex-start; }
+  .lg-roadmap-gaps { grid-template-columns: 1fr; }
+  .lg-roadmap-calendar__cell { min-height: 64px; padding: 6px; }
+  .lg-roadmap-calendar__meta { display: none; }
+}
+

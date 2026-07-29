@@ -33,11 +33,13 @@ from app.domain.schemas.chat import (
     DictationCleanupView,
     DictationTranscriptionView,
     MessageCreateRequest,
+    MessageListPageView,
     MessageRetryRequest,
     MessageSnapshotView,
     MessageView,
     MessageVersionView,
     SSEEventEnvelope,
+    SessionActivitySummaryRequest,
     SessionAutoTitleRequest,
     SessionContextUsageView,
     SessionCreateRequest,
@@ -48,6 +50,7 @@ from app.domain.schemas.chat import (
 from app.domain.schemas.common import ActionResponse
 from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRequest
 from app.providers.factory import (
+    fetch_provider_for_workspace,
     image_provider_for_workspace,
     memory_provider_for_workspace,
     model_provider_for_workspace,
@@ -356,6 +359,7 @@ def service(
         ),
         settings=settings,
         can_manage_providers="workspace.manage" in context.permissions,
+        fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
     )
     return ChatService(
         db,
@@ -794,6 +798,26 @@ def auto_title_session(
     return SessionView.model_validate(session)
 
 
+@router.post("/{session_id}/activity-summary", response_model=SessionView)
+def activity_summary_session(
+    session_id: str,
+    payload: SessionActivitySummaryRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SessionView:
+    require_session_access(session_id, "write", db, context)
+    session = service(
+        db,
+        context,
+        settings,
+        model_id=payload.model_id,
+        provider_id=payload.provider_id,
+        thinking_mode="off",
+    ).activity_summary_session(session_id, payload)
+    return SessionView.model_validate(session)
+
+
 @router.get(
     "/{session_id}/suggested-prompts",
     response_model=SuggestedPromptBatchView,
@@ -940,9 +964,33 @@ def reject_graph_change_set(
     )
 
 
-@router.get("/{session_id}/messages", response_model=list[MessageView])
-def list_messages(session_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[MessageView]:
-    return [MessageView.model_validate(item) for item in service(db, context, settings).list_messages(session_id)]
+@router.get("/{session_id}/messages", response_model=MessageListPageView)
+def list_messages(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    limit: Annotated[int | None, Query(ge=1, le=200)] = None,
+    before_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    compact: bool = True,
+) -> MessageListPageView:
+    """Return the session timeline, optionally windowed and compact.
+
+    - Default: full timeline with compact parts/provider_trace (list UI).
+    - ``limit``: newest N messages (or the window ending just before ``before_id``).
+    - ``compact=false``: full durable parts/provider_trace (debug / rare callers).
+    Full fidelity for a single message remains on
+    ``GET /messages/{message_id}``.
+    """
+
+    return MessageListPageView.model_validate(
+        service(db, context, settings).list_messages_page(
+            session_id,
+            limit=limit,
+            before_id=before_id,
+            compact=compact,
+        )
+    )
 
 
 @router.get("/{session_id}/context-usage", response_model=SessionContextUsageView)

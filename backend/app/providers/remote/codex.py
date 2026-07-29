@@ -39,6 +39,73 @@ _AUTH_CLAIM = "https://api.openai.com/auth"
 # Codex refreshes when the access token is within five minutes of expiry.
 _REFRESH_WINDOW_SECONDS = 300
 
+# The ChatGPT Codex backend does not expose a public GET /models endpoint, so
+# discovery falls back to this reviewed ChatGPT-account catalog. Several API /
+# docs slugs (including the Power default ``gpt-5.6-sol`` and older 5.2/5.3
+# ids) are rejected by the ChatGPT-auth path with HTTP 400. Users can still
+# type an unlisted model id manually if their plan later unlocks it.
+#
+# Verified against the free ChatGPT Codex backend with stream=true (2026-07-29):
+# terra / luna / gpt-5.5 / gpt-5.4-mini succeed; sol / pro / nano / 5.2–5.3 fail.
+CODEX_KNOWN_MODELS: tuple[str, ...] = (
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4-mini",
+    # Plan-gated / Power flagship: listed for paid accounts that can select it,
+    # but not used as the default because free ChatGPT accounts reject it.
+    "gpt-5.6-sol",
+)
+CODEX_DEFAULT_MODEL = "gpt-5.6-terra"
+# Models that OpenAI still documents for Codex but the ChatGPT-auth backend
+# currently rejects. Kept for migration of older provider rows / UI cleanup.
+CODEX_UNSUPPORTED_CHATGPT_MODELS: frozenset[str] = frozenset(
+    {
+        "gpt-5.5-pro",
+        "gpt-5.4",
+        "gpt-5.4-nano",
+        "gpt-5.4-pro",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-xhigh",
+        "gpt-5.3-codex-spark",
+        "gpt-5.3-chat-latest",
+        "gpt-5.2",
+        "gpt-5.2-codex",
+        "gpt-5.2-pro",
+        "gpt-5.2-chat-latest",
+        "gpt-5.6",
+        "codex-mini-latest",
+    }
+)
+# Free ChatGPT accounts accept only a subset of the documented Codex catalog.
+# When the selected slug is known-unsupported on free, remap to a working
+# default instead of surfacing a hard 400 from the backend.
+CODEX_FREE_SUPPORTED_MODELS: frozenset[str] = frozenset(
+    {
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4-mini",
+    }
+)
+
+
+def resolve_codex_model_for_plan(model_id: str, plan_type: str | None) -> str:
+    """Return a ChatGPT-auth model slug that the caller's plan can use.
+
+    Paid plans keep the requested id (including ``gpt-5.6-sol``). Free plans
+    fall back to :data:`CODEX_DEFAULT_MODEL` when the selection is outside the
+    free-supported subset.
+    """
+
+    requested = (model_id or "").strip() or CODEX_DEFAULT_MODEL
+    plan = (plan_type or "").strip().casefold()
+    if plan and plan != "free":
+        return requested
+    if requested in CODEX_FREE_SUPPORTED_MODELS:
+        return requested
+    return CODEX_DEFAULT_MODEL
+
 
 class CodexAuthError(RuntimeError):
     """A safe, credential-free Codex authentication failure."""

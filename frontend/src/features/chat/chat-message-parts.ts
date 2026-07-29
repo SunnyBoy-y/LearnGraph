@@ -46,6 +46,19 @@ export function isChainPart(part: MessagePart): boolean {
   return CHAIN_PART_TYPES.has(part.type);
 }
 
+/**
+ * Agent tool result that needs an explicit budget confirmation card.
+ * The tool row itself still belongs in the thinking chain; the approval UI is
+ * hoisted outside so the user can act without expanding the fold.
+ */
+export function isDeepResearchApprovalPart(part: MessagePart): boolean {
+  if (part.type !== "tool_call") return false;
+  if (part.data?.tool_name !== "start_deep_research") return false;
+  const output = part.data?.output;
+  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+  return (output as { user_approval_required?: unknown }).user_approval_required === true;
+}
+
 export function isReasoningTextPart(part: MessagePart): boolean {
   return REASONING_TEXT_PART_TYPES.has(part.type);
 }

@@ -9,7 +9,12 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
-from app.domain.models import SandboxSession, Workspace, utc_now
+from app.domain.models import (
+    MemoryProfileSnapshot,
+    SandboxSession,
+    Workspace,
+    utc_now,
+)
 from app.domain.schemas.learning import MasterySchedulerTickView
 from app.providers.local.memory import LocalWorkspaceMemoryProvider
 from app.services.mastery import MasteryService
@@ -88,7 +93,7 @@ def run_workspace_memory_retention(
     *,
     now: datetime | None = None,
 ) -> dict[str, int]:
-    """Destroy expired recovery keys without contacting the active semantic Provider."""
+    """Destroy expired keys and reconcile due temporal memory atoms."""
 
     settings = get_settings()
     with SessionLocal() as db:
@@ -96,19 +101,33 @@ def run_workspace_memory_retention(
         if workspace is None:
             return {"content_keys_destroyed": 0, "journal_entries_removed": 0}
         provider = LocalWorkspaceMemoryProvider(settings.memory_root, workspace.id)
-        return MemoryService(
+        retention = MemoryService(
             db,
             workspace,
             "system:memory-retention",
             provider,
             settings.memory_root,
         ).purge_expired(now=now)
+        from app.services.memory_profile import reconcile_workspace_temporal_atoms
+
+        temporal = reconcile_workspace_temporal_atoms(
+            db,
+            workspace,
+            settings,
+            now=now,
+        )
+        return {**retention, **temporal}
 
 
 def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int]:
     with SessionLocal() as db:
         workspace_ids = list(db.scalars(select(Workspace.id)))
-    totals = {"content_keys_destroyed": 0, "journal_entries_removed": 0}
+    totals = {
+        "content_keys_destroyed": 0,
+        "journal_entries_removed": 0,
+        "reviewed": 0,
+        "lapsed": 0,
+    }
     for workspace_id in workspace_ids:
         try:
             result = run_workspace_memory_retention(workspace_id, now=now)
@@ -160,6 +179,7 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
         "drafts_created": 0,
         "auto_committed": 0,
         "sessions_summarized": 0,
+        "profiles_rewritten": 0,
     }
     with SessionLocal() as db:
         workspace_ids = list(db.scalars(select(Workspace.id)))
@@ -183,7 +203,69 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
                     idle_seconds=settings.memory_extraction_idle_seconds,
                     sessions_per_sweep=settings.memory_extraction_sessions_per_sweep,
                 )
-                result = {**result, **summarized}
+                profiles_rewritten = 0
+                from app.services.memory_enhancement import load_enhancement_config
+                from app.services.memory_profile import (
+                    MemoryProfileService,
+                    _eligible_profile_records,
+                )
+
+                config = load_enhancement_config(db, workspace.id)
+                if config["summarization"]["enabled"]:
+                    owner_ids = list(
+                        dict.fromkeys(
+                            db.scalars(
+                                select(MemoryProfileSnapshot.owner_subject_id)
+                                .where(
+                                    MemoryProfileSnapshot.workspace_id
+                                    == workspace.id,
+                                    MemoryProfileSnapshot.status == "stale",
+                                )
+                                .order_by(
+                                    MemoryProfileSnapshot.updated_at.desc()
+                                )
+                                .limit(3)
+                            ).all()
+                        )
+                    )
+                    owner_has_snapshot = db.scalar(
+                        select(MemoryProfileSnapshot.id)
+                        .where(
+                            MemoryProfileSnapshot.workspace_id == workspace.id,
+                            MemoryProfileSnapshot.owner_subject_id
+                            == workspace.owner_user_id,
+                        )
+                        .limit(1)
+                    )
+                    owner_has_profile_atoms = bool(
+                        _eligible_profile_records(db, workspace.id)
+                    )
+                    if (
+                        workspace.owner_user_id
+                        and owner_has_snapshot is None
+                        and owner_has_profile_atoms
+                    ):
+                        owner_ids.insert(0, workspace.owner_user_id)
+                    for owner_id in owner_ids:
+                        try:
+                            view = MemoryProfileService(
+                                db,
+                                workspace,
+                                owner_id,
+                                settings,
+                            ).refresh_profile()
+                            profiles_rewritten += int(view.status == "ready")
+                        except Exception:
+                            logger.exception(
+                                "Memory profile rewrite failed for workspace %s owner %s",
+                                workspace.id,
+                                owner_id,
+                            )
+                result = {
+                    **result,
+                    **summarized,
+                    "profiles_rewritten": profiles_rewritten,
+                }
         except Exception:
             logger.exception(
                 "Memory extraction sweep failed for workspace %s", workspace_id
