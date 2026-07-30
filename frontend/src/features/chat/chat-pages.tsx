@@ -1897,29 +1897,80 @@ function ConversationContextBar({
 }) {
   if (!goalBound && !graphTitle && !learningNode) return null;
 
+  const itemCount =
+    (goalBound ? 1 : 0) + (graphTitle ? 1 : 0) + (learningNode ? 1 : 0);
+  const primaryLabel = learningNode
+    ? (learningNode.nodeLabel ?? "学习节点")
+    : graphTitle
+      ? graphTitle
+      : "已绑定目标";
+  const triggerTitle = learningNode
+    ? `节点 · ${learningNode.nodeLabel ?? "已选择学习节点"}`
+    : graphTitle
+      ? `图谱 · ${graphTitle}`
+      : "已绑定目标";
+
   return (
-    <section aria-label="本轮对话上下文" className="chat-context-bar">
-      <span className="chat-context-bar__label">上下文</span>
-      {goalBound ? <span className="chat-context-bar__item">已绑定目标</span> : null}
-      {graphTitle ? (
-        <span className="chat-context-bar__item" title={graphTitle}>
-          图谱 · {graphTitle}
-        </span>
-      ) : null}
-      {learningNode ? (
-        <span className="chat-context-bar__item chat-context-bar__item--node">
-          节点 · {learningNode.nodeLabel ?? "已选择学习节点"}
-          <button
-            aria-label="移除当前学习节点上下文"
-            onClick={onClearLearningNode}
-            title="本轮后续消息不再绑定此节点"
-            type="button"
-          >
-            <X aria-hidden="true" />
-          </button>
-        </span>
-      ) : null}
-    </section>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          aria-label={`本轮对话上下文，共 ${itemCount} 项`}
+          className="chat-context-menu-trigger"
+          size="sm"
+          title={triggerTitle}
+          variant="ghost"
+        >
+          <span className="chat-context-menu-trigger__label">上下文</span>
+          <span className="chat-context-menu-trigger__value" title={primaryLabel}>
+            {primaryLabel}
+          </span>
+          {itemCount > 1 ? (
+            <span className="chat-context-menu-trigger__count">+{itemCount - 1}</span>
+          ) : null}
+          <ChevronDown aria-hidden="true" className="chat-context-menu-trigger__chevron" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="chat-context-menu w-64"
+        sideOffset={6}
+      >
+        <DropdownMenuLabel>本轮对话上下文</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {goalBound ? (
+          <div className="chat-context-menu__row">
+            <Target className="size-3.5" />
+            <span className="min-w-0 flex-1 truncate">已绑定目标</span>
+          </div>
+        ) : null}
+        {graphTitle ? (
+          <div className="chat-context-menu__row" title={graphTitle}>
+            <Network className="size-3.5" />
+            <span className="min-w-0 flex-1 truncate">图谱 · {graphTitle}</span>
+          </div>
+        ) : null}
+        {learningNode ? (
+          <div className="chat-context-menu__row chat-context-menu__row--node">
+            <GitBranch className="size-3.5" />
+            <span
+              className="min-w-0 flex-1 truncate"
+              title={learningNode.nodeLabel ?? "已选择学习节点"}
+            >
+              节点 · {learningNode.nodeLabel ?? "已选择学习节点"}
+            </span>
+            <button
+              aria-label="移除当前学习节点上下文"
+              className="chat-context-menu__clear"
+              onClick={onClearLearningNode}
+              title="本轮后续消息不再绑定此节点"
+              type="button"
+            >
+              <X aria-hidden="true" className="size-3" />
+            </button>
+          </div>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

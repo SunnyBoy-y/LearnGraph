@@ -401,18 +401,14 @@ h1, h2, h3, p { margin-top: 0; }
 .text-button { border: 0; background: transparent; color: var(--lg-green-dark); font-size: 11px; }
 
 /* Graph */
-.graph-canvas { width: 100%; height: 470px; border-radius: 14px; overflow: hidden; background: #fcfcfb; cursor: grab; }
+.graph-canvas { width: 100%; height: 470px; border-radius: 14px; overflow: hidden; background: #f7f8f5; cursor: grab; }
 .graph-canvas--compact { height: 100%; min-height: 360px; border-radius: 0; }
-.graph-canvas--tree { background:
-  linear-gradient(rgba(24, 40, 32, 0.035) 1px, transparent 1px),
-  linear-gradient(90deg, rgba(24, 40, 32, 0.035) 1px, transparent 1px),
-  linear-gradient(rgba(24, 40, 32, 0.018) 1px, transparent 1px),
-  linear-gradient(90deg, rgba(24, 40, 32, 0.018) 1px, transparent 1px),
-  #f7f8f5;
-  background-size: 101px 101px, 101px 101px, 20px 20px, 20px 20px, auto;
-}
+/* Base fill only — dot grid is rendered by React Flow <Background>. */
+.graph-canvas--tree { background: #f7f8f5; }
 .graph-canvas .react-flow__pane { cursor: grab; }
 .graph-canvas .react-flow__pane.dragging { cursor: grabbing; }
+.graph-canvas .react-flow__background { opacity: 1; }
+.graph-canvas .react-flow__background pattern circle { fill: rgba(24, 40, 32, 0.22); }
 .knowledge-node { position: relative; width: 142px; min-height: 90px; padding: 12px 14px; display: grid; gap: 3px; border: 1px solid #cfd2ce; border-radius: 22px; background: rgba(255,255,255,.97); box-shadow: 0 5px 15px rgba(31,42,37,.05); transition: border-color .15s, box-shadow .15s, transform .15s; }
 .knowledge-node:hover, .knowledge-node.is-selected { border: 2px solid var(--lg-green); box-shadow: 0 8px 25px rgba(11,143,112,.14); transform: translateY(-2px); }
 .knowledge-node.is-focused { border-color: #b7791f; box-shadow: 0 0 0 3px rgba(183,121,31,.12), 0 8px 25px rgba(183,121,31,.1); }
@@ -889,10 +885,42 @@ h1, h2, h3, p { margin-top: 0; }
   height: 100dvh;
   gap: 0 !important;
   padding: 0 !important;
+  overflow: hidden;
   background: var(--background);
+  transition: grid-template-columns 0.34s cubic-bezier(0.32, 0.72, 0, 1);
 }
 .workspace-shell--no-inspector {
   grid-template-columns: var(--sidebar-width, 268px) minmax(360px, 1fr) !important;
+}
+/* Desktop graph rail: collapse/expand from the right edge without unmounting. */
+.workspace-shell--rail-collapsed {
+  grid-template-columns: var(--sidebar-width, 268px) minmax(360px, 1fr) 0px 0px !important;
+}
+.workspace-shell--rail-collapsed .workspace-resizer {
+  min-width: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.workspace-shell--rail-collapsed .context-rail {
+  overflow: hidden !important;
+  min-width: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  border-left-color: transparent !important;
+  padding-inline: 0 !important;
+  transform: translateX(28px);
+  transition:
+    opacity 0.22s ease,
+    transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+    border-color 0.22s ease,
+    padding 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+    visibility 0.34s step-end;
+}
+body.is-resizing .workspace-shell,
+body.is-resizing .context-rail,
+body.is-resizing .workspace-resizer {
+  transition: none !important;
 }
 .workspace-shell { background: var(--lg-panel-bg); }
 .workspace-shell :where(header):not(.workspace-topbar) {
@@ -916,6 +944,21 @@ h1, h2, h3, p { margin-top: 0; }
 }
 .workspace-sidebar { border-right: 1px solid var(--lg-panel-border) !important; background: var(--lg-panel-bg) !important; }
 .workspace-main { min-width: 0; overflow-y: auto; overscroll-behavior-y: contain; }
+/*
+ * Chat/goal keep the single-cell overlay grid (inner scroll). Other pages
+ * (roadmap, sources, home, …) must not pin Outlet into minmax(0,1fr) — that
+ * clamps tall content so workspace-main never overflows and never scrolls.
+ */
+.workspace-main:not(.workspace-main--chat):not(.workspace-main--goal) {
+  display: block;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+.workspace-main:not(.workspace-main--chat):not(.workspace-main--goal) > :not(.workspace-topbar) {
+  min-height: auto;
+}
 .context-rail {
   position: relative;
   display: flex;
@@ -925,6 +968,15 @@ h1, h2, h3, p { margin-top: 0; }
   padding: 16px !important;
   border-left: 1px solid var(--lg-panel-border);
   background: var(--lg-panel-bg) !important;
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(0);
+  transition:
+    opacity 0.22s ease,
+    transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+    border-color 0.22s ease,
+    padding 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+    visibility 0s linear;
 }
 .selection-explanation-rail {
   display: grid;
@@ -1034,6 +1086,7 @@ h1, h2, h3, p { margin-top: 0; }
   cursor: col-resize;
   touch-action: none;
   background: var(--border);
+  transition: opacity 0.2s ease, background-color 0.15s ease;
 }
 .workspace-resizer::before { content: ''; position: absolute; inset: 0 -7px; }
 .workspace-resizer:hover, .is-resizing .workspace-resizer { background: color-mix(in srgb, var(--foreground) 35%, var(--border)); }
@@ -1050,8 +1103,9 @@ h1, h2, h3, p { margin-top: 0; }
 .sidebar-nav.is-collapsed .sidebar-recent { display: none; }
 .sidebar-nav.is-collapsed .sidebar-user-menu { margin-top: auto; }
 .chat-graph-rail { height: calc(100dvh - 32px); min-height: 0; }
-.chat-graph-rail .graph-canvas { height: 100%; min-height: 0; border-radius: 0; background: var(--lg-panel-bg); }
-.chat-graph-rail .graph-canvas > .pointer-events-none { background: var(--lg-panel-bg); }
+/* Keep the same map-surface fill as standalone graph; dots come from React Flow. */
+.chat-graph-rail .graph-canvas { height: 100%; min-height: 0; border-radius: 0; background: #f7f8f5; }
+.chat-graph-rail .graph-canvas > .pointer-events-none { background: transparent; }
 .chat-graph-rail .react-flow__controls { border-radius: 8px !important; }
 .chat-graph-rail .react-flow__minimap { display: none; }
 .chat-canvas-page { overflow: hidden; }
@@ -1496,13 +1550,43 @@ h1, h2, h3, p { margin-top: 0; }
   flex: none;
   background: var(--sidebar);
 }
+/* No language fence (``` with no tag): drop the empty language row entirely. */
+[data-message-content] [data-streamdown="code-block"][data-language=""] [data-streamdown="code-block-header"],
+[data-message-content] [data-streamdown="code-block"]:not([data-language]) [data-streamdown="code-block-header"] {
+  display: none;
+}
+/* Pin download/copy to the first code line instead of floating on a blank header. */
+[data-message-content] [data-streamdown="code-block"][data-language=""],
+[data-message-content] [data-streamdown="code-block"]:not([data-language]) {
+  position: relative;
+  gap: 0 !important;
+}
+[data-message-content] [data-streamdown="code-block"][data-language=""] > div:has([data-streamdown="code-block-actions"]),
+[data-message-content] [data-streamdown="code-block"]:not([data-language]) > div:has([data-streamdown="code-block-actions"]) {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.45rem;
+  z-index: 10;
+  margin: 0 !important;
+  height: auto;
+  pointer-events: none;
+}
 [data-message-content] [data-streamdown="code-block-body"] {
   border: 0 !important;
   border-radius: 0 !important;
   background: var(--sidebar) !important;
+  /* streamdown defaults to p-4; tighten so the first code line sits closer to the header */
+  padding: 0.5rem 1rem 0.75rem !important;
+}
+/* Leave room on the first line for the action cluster when there is no language header. */
+[data-message-content] [data-streamdown="code-block"][data-language=""] [data-streamdown="code-block-body"],
+[data-message-content] [data-streamdown="code-block"]:not([data-language]) [data-streamdown="code-block-body"] {
+  padding-right: 3.25rem !important;
 }
 [data-message-content] [data-streamdown="code-block-body"] > pre {
   background: transparent !important;
+  margin: 0;
+  padding: 0;
 }
 [data-message-content] [data-streamdown="code-block-body"] > pre > code > span::before {
   display: none;
@@ -1527,10 +1611,8 @@ h1, h2, h3, p { margin-top: 0; }
   gap: 1px !important;
   padding: 2px;
   border-radius: 8px;
-  background: color-mix(in srgb, var(--background) 92%, transparent);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--border) 80%, transparent);
+  background: transparent;
+  box-shadow: none;
 }
 /* Keep the last header cell clear of the in-box controls. */
 [data-streamdown="table-wrapper"]:has(> div:first-child:not(:only-child)) [data-streamdown="table-header-cell"]:last-child {
@@ -2163,7 +2245,7 @@ h1, h2, h3, p { margin-top: 0; }
 .goal-graph-rail__header p { margin: 0; font-size: 14px; font-weight: 680; }
 .goal-graph-rail__header span { display: block; margin-top: 3px; color: #777; font-size: 11px; }
 .goal-graph-rail__header [data-slot='badge'] { margin-top: 1px; }
-.goal-graph-rail .graph-canvas { background: var(--lg-panel-bg); }
+.goal-graph-rail .graph-canvas { background: #f7f8f5; }
 
 @media (max-width: 1040px) {
   .goal-draft-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2372,9 +2454,10 @@ h1, h2, h3, p { margin-top: 0; }
 /* Sidebar projects, contextual rails, and deliberate scrolling */
 .sidebar-nav.is-collapsed > div:first-child { justify-content: center; }
 .sidebar-nav.is-collapsed .sidebar-brand { width: 100%; justify-content: center; padding-inline: 0; }
-/* ChatGPT-style drawer: brand + user chip fixed; nav + sessions share one scroller. */
+/* Drawer: brand + "新对话" + user chip fixed; other nav + sessions scroll. */
 .sidebar-nav { min-height: 0; overflow: hidden; }
 .sidebar-nav__top { flex: none; min-width: 0; }
+.sidebar-nav__primary { flex: none; min-width: 0; }
 .sidebar-nav__scroll {
   min-height: 0;
   flex: 1 1 auto;
@@ -2428,17 +2511,18 @@ h1, h2, h3, p { margin-top: 0; }
 .sidebar-project__heading.is-selecting { padding-left: 2px; }
 .sidebar-project__select { flex: none; margin-left: 8px; }
 .sidebar-sessions__batch-detail { color: #999; }
-.sidebar-project__header { display: grid; grid-template-columns: 15px minmax(0, 1fr) auto 14px; align-items: center; gap: 6px; width: 100%; border: 0; border-radius: 7px; background: transparent; padding: 5px 10px; color: #5f5f5f; font-size: 11px; font-weight: 650; text-align: left; }
+.sidebar-project__header { display: grid; grid-template-columns: 15px minmax(0, 1fr) auto 14px; align-items: center; gap: 6px; width: 100%; border: 0; border-radius: 7px; background: transparent; padding: 6px 10px; color: #4a4a4a; font-size: 14px; font-weight: 400; text-align: left; }
 .sidebar-project__header:hover { background: #f3f3f3; color: #171717; }
-.sidebar-project__header small { color: #999; font-size: 10px; font-weight: 600; }
+.sidebar-project__header small { color: #999; font-size: 11px; font-weight: 400; }
 .sidebar-project__delete-project { flex: none; margin-right: 2px; opacity: 0; color: #777; transition: opacity .16s ease, color .16s ease; }
 .sidebar-project__heading:hover .sidebar-project__delete-project, .sidebar-project__heading:focus-within .sidebar-project__delete-project { opacity: 1; }
 .sidebar-project__delete-project:hover { color: hsl(var(--destructive)); }
 .sidebar-project__sessions { display: grid; gap: 1px; }
 .sidebar-session-tree { display: grid; gap: 1px; min-width: 0; }
-.sidebar-project__session { display: flex; align-items: center; gap: 2px; min-width: 0; border-radius: 8px; padding-left: 26px; color: #6e6e6e; font-size: 12px; }
-.sidebar-project__session--folder { font-weight: 550; }
-.sidebar-project__session--nested { color: #7a7a7a; font-size: 11.5px; }
+/* Session titles: ~ChatGPT sidebar size (13px), regular weight. */
+.sidebar-project__session { display: flex; align-items: center; gap: 2px; min-width: 0; border-radius: 8px; padding-left: 26px; color: #2f2f2f; font-size: 13px; font-weight: 400; line-height: 1.35; }
+.sidebar-project__session--folder { font-size: 13px; font-weight: 400; }
+.sidebar-project__session--nested { color: #444; font-size: 13px; font-weight: 400; }
 .sidebar-project__session--nested .sidebar-project__session-title { padding-block: 5px; }
 .sidebar-session__fold {
   display: inline-flex;
@@ -2463,7 +2547,7 @@ h1, h2, h3, p { margin-top: 0; }
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-.sidebar-project__session-title { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 0; }
+.sidebar-project__session-title { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 7px 0; font-size: inherit; font-weight: inherit; color: inherit; }
 .sidebar-session__unread-dot {
   flex: none;
   width: 7px;
@@ -2475,7 +2559,7 @@ h1, h2, h3, p { margin-top: 0; }
 .sidebar-session__running { color: #716bc5; }
 .sidebar-project__session.is-selecting { padding-left: 10px; }
 .sidebar-project__session.is-selecting > [data-slot='checkbox'] { flex: none; }
-.sidebar-project__session:hover, .sidebar-project__session.is-active { background: #ececec; color: #171717; }
+.sidebar-project__session:hover, .sidebar-project__session.is-active { background: #ececec; color: #111; }
 .sidebar-project__session > button:first-child { min-width: 0; padding: 6px 0; }
 .sidebar-session-rename { display: grid; min-width: 0; flex: 1; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 1px; }
 .sidebar-session-rename input { height: 28px; min-width: 0; border-color: #b7b7b7; border-radius: 6px; padding-inline: 7px; font-size: 11px; }
@@ -2730,8 +2814,13 @@ h1, h2, h3, p { margin-top: 0; }
 
 /* Settings secondary window: tighten PageFrame padding for the modal column. */
 .settings-modal {
-  border-radius: 18px;
   background: var(--popover);
+}
+/* Desktop card chrome; mobile is full-screen (rounded-none via utility). */
+@media (min-width: 640px) {
+  .settings-modal {
+    border-radius: 18px;
+  }
 }
 .settings-modal__body > div {
   max-width: none !important;
@@ -2751,6 +2840,30 @@ h1, h2, h3, p { margin-top: 0; }
 .settings-modal__body > div > header p:last-child {
   font-size: 0.8rem !important;
   line-height: 1.45 !important;
+}
+/* Phone: full-screen surface, denser padding, home-indicator room. */
+@media (max-width: 639px) {
+  .settings-modal {
+    border-radius: 0 !important;
+    max-width: none !important;
+    width: 100% !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+  }
+  /* Full-screen page already covers the viewport — no dim scrim needed.
+     Overlay is the previous sibling of DialogContent in the portal. */
+  [data-slot="dialog-overlay"]:has(+ .settings-modal) {
+    background: var(--popover);
+    backdrop-filter: none;
+  }
+  .settings-modal__body > div {
+    padding-inline: 1rem !important;
+    padding-top: 0.85rem !important;
+    padding-bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px)) !important;
+  }
+  .settings-modal__body > div > header h1 {
+    font-size: 1.25rem !important;
+  }
 }
 
 html[data-density='compact'] .surface { --surface-density: compact; }
@@ -2824,12 +2937,23 @@ html[data-density='compact'] .sidebar-project__session > button:first-child { pa
   box-shadow: 0 5px 14px rgba(91, 82, 174, .14);
 }
 .sidebar-user-avatar { border: 1px solid rgba(31,35,40,.12); }
-.sidebar-nav [data-nav-label] > svg { transition: color .16s ease, transform .16s ease; }
+.sidebar-nav [data-nav-label] > svg {
+  transition: color .16s ease, transform .16s ease;
+  /* Icons sit on the panel — no chip / gray underlay. */
+  background: transparent !important;
+  box-shadow: none !important;
+  border-color: transparent !important;
+}
 .sidebar-nav [data-nav-label]:hover > svg { transform: scale(1.08); }
 .sidebar-nav [data-nav-label='新对话'] > svg { color: #7770d8; }
 .sidebar-nav [data-nav-label='图谱'] > svg { color: #45a88f; }
 .sidebar-nav [data-nav-label='路线'] > svg { color: #6199c9; }
 .sidebar-nav [data-nav-label='资料'] > svg { color: #5b91cf; }
+/* "更多" uses a ghost Button without data-nav-label — keep its glyph bare too. */
+.sidebar-nav__more > button svg {
+  background: transparent !important;
+  box-shadow: none !important;
+}
 .sidebar-sessions__heading > p { font-size: 17px !important; letter-spacing: -.02em; }
 
 .graph-workbench-split {
@@ -3065,7 +3189,14 @@ html[data-color-mode='mono'] .roadmap-task__topline [data-slot='badge'] {
   background: #ededed;
   color: #333;
 }
+/* Sidebar nav glyphs stay bare; only mono-tint their stroke. */
 html[data-color-mode='mono'] .sidebar-nav [data-nav-label] > svg,
+html[data-color-mode='mono'] .sidebar-nav__more > button svg {
+  color: #252525;
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
 html[data-color-mode='mono'] .project-bookshelf__intro > svg,
 html[data-color-mode='mono'] .chat-graph-rail__switch button[aria-selected='true'] {
   color: #252525;
@@ -3478,15 +3609,7 @@ html.dark[data-color-mode='mono'] {
   background: oklch(.18 .004 260);
   color: var(--foreground);
 }
-.dark .graph-canvas--tree {
-  background:
-    linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px),
-    linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px),
-    oklch(.18 .004 260);
-  background-size: 101px 101px, 101px 101px, 20px 20px, 20px 20px, auto;
-}
+.dark .graph-canvas .react-flow__background pattern circle { fill: rgba(255, 255, 255, 0.2); }
 .dark .knowledge-node,
 .dark .knowledge-node.is-tree-card {
   background: color-mix(in srgb, var(--card) 96%, transparent);
@@ -3794,40 +3917,119 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 /* -------------------------------------------------------------------------- */
 .topbar-model-slot { display: flex; min-width: 0; align-items: center; }
 .topbar-model-slot:empty { display: none; }
-.topbar-stats-slot { display: flex; min-width: 0; align-items: center; }
-.topbar-stats-slot:empty { display: none; }
-/* Bound session context chips sit between the title and the right-side actions. */
+/* Compact context secondary menu docks with the right-side topbar actions. */
 .topbar-context-slot {
   display: flex;
   min-width: 0;
-  flex: 1 1 auto;
+  flex: none;
+  max-width: min(220px, 36vw);
   align-items: center;
-  overflow: hidden;
+  overflow: visible;
 }
 .topbar-context-slot:empty { display: none; }
-.topbar-context-slot .chat-context-bar {
-  width: auto;
+.chat-context-menu-trigger {
+  display: inline-flex !important;
   max-width: 100%;
-  margin: 0;
-  padding: 0;
+  min-width: 0;
+  height: 28px !important;
+  gap: 4px !important;
+  border-radius: 999px !important;
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent) !important;
+  background: color-mix(in srgb, var(--muted) 48%, transparent) !important;
+  padding: 0 8px 0 9px !important;
+  color: color-mix(in srgb, var(--muted-foreground) 88%, var(--foreground)) !important;
+  font-size: 11px !important;
+  font-weight: 650 !important;
+  line-height: 1 !important;
+  box-shadow: none !important;
 }
-.topbar-context-slot .chat-context-bar__item {
-  max-width: min(230px, 28vw);
-  border-color: color-mix(in srgb, var(--border) 80%, transparent);
-  background: color-mix(in srgb, var(--muted) 55%, transparent);
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+.chat-context-menu-trigger:hover,
+.chat-context-menu-trigger:focus-visible,
+.chat-context-menu-trigger[data-state='open'] {
+  border-color: color-mix(in srgb, var(--border) 92%, var(--foreground)) !important;
+  background: color-mix(in srgb, var(--muted) 72%, transparent) !important;
+  color: var(--foreground) !important;
 }
-.topbar-context-slot .chat-context-bar__item--node {
-  background: color-mix(in srgb, var(--muted) 72%, transparent);
+.chat-context-menu-trigger__label {
+  flex: none;
+  color: color-mix(in srgb, var(--muted-foreground) 92%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
 }
-.dark .topbar-context-slot .chat-context-bar__item {
-  border-color: rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
+.chat-context-menu-trigger__value {
+  display: block;
+  min-width: 0;
+  max-width: 9.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--foreground);
 }
-.dark .topbar-context-slot .chat-context-bar__item--node {
-  background: rgba(255, 255, 255, 0.1);
+.chat-context-menu-trigger__count {
+  flex: none;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  padding: 1px 5px;
+  color: color-mix(in srgb, var(--muted-foreground) 80%, var(--foreground));
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.chat-context-menu-trigger__chevron {
+  width: 12px !important;
+  height: 12px !important;
+  flex: none;
+  opacity: .72;
+}
+.chat-context-menu {
+  min-width: 220px;
+}
+.chat-context-menu__row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  color: color-mix(in srgb, var(--muted-foreground) 55%, var(--foreground));
+  font-size: 12px;
+  line-height: 1.35;
+}
+.chat-context-menu__row svg {
+  flex: none;
+  color: color-mix(in srgb, var(--muted-foreground) 88%, var(--foreground));
+}
+.chat-context-menu__row--node {
+  color: var(--foreground);
+}
+.chat-context-menu__clear {
+  display: grid;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  margin-left: 2px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--muted-foreground) 88%, var(--foreground));
+  cursor: pointer;
+}
+.chat-context-menu__clear:hover,
+.chat-context-menu__clear:focus-visible {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+  outline: none;
+}
+.dark .chat-context-menu-trigger {
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  background: rgba(255, 255, 255, 0.06) !important;
+}
+.dark .chat-context-menu-trigger:hover,
+.dark .chat-context-menu-trigger:focus-visible,
+.dark .chat-context-menu-trigger[data-state='open'] {
+  border-color: rgba(255, 255, 255, 0.18) !important;
+  background: rgba(255, 255, 255, 0.1) !important;
 }
 .topbar-model-trigger { max-width: 46vw; gap: 3px; border-radius: 999px !important; font-size: 11px; font-weight: 650; }
 .topbar-model-trigger > span:first-child { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3848,29 +4050,76 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 .topbar-rail-toggle { display: inline-flex; }
 .graph-drawer-backdrop, .graph-drawer-close { display: none; }
 @media (max-width: 1120px) {
+  /* Drawer uses transform; grid-width transition is not used here. */
+  .workspace-shell { transition: none; }
   .topbar-graph-toggle { display: inline-flex !important; }
   .topbar-rail-toggle { display: none !important; }
-  .workspace-shell--graph-open .context-rail {
-    display: block !important;
+  /*
+   * Keep the rail mounted off-canvas so open/close can slide both ways.
+   * Pin overlay nodes to the first grid cell so they don't create extra rows
+   * under the 2-column narrow shell template.
+   */
+  .workspace-shell .graph-drawer-backdrop,
+  .workspace-shell .graph-drawer-close,
+  .workspace-shell .context-rail,
+  .workspace-shell--rail-collapsed .context-rail {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .workspace-shell .context-rail,
+  .workspace-shell--rail-collapsed .context-rail {
+    display: flex !important;
     position: fixed;
     top: 0;
     right: 0;
     bottom: 0;
+    left: auto;
     z-index: 70;
     width: min(420px, 94vw);
+    height: 100dvh;
     overflow-y: auto;
     overscroll-behavior: contain;
     border-left: 1px solid var(--border) !important;
     box-shadow: -18px 0 44px rgba(0, 0, 0, 0.22);
-    animation: graph-drawer-in 0.2s ease-out;
+    opacity: 1;
+    pointer-events: none;
+    visibility: hidden;
+    padding: 16px !important;
+    transform: translateX(105%);
+    transition:
+      transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+      visibility 0.34s step-end;
+  }
+  .workspace-shell--graph-open .context-rail {
+    pointer-events: auto;
+    visibility: visible;
+    transform: translateX(0);
+    transition:
+      transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+      visibility 0s linear;
   }
   .graph-drawer-backdrop {
     display: block;
     position: fixed;
     inset: 0;
     z-index: 69;
+    width: auto;
+    height: auto;
     background: rgba(12, 12, 12, 0.38);
-    animation: graph-drawer-fade 0.2s ease-out;
+    opacity: 0;
+    pointer-events: none;
+    visibility: hidden;
+    transition:
+      opacity 0.28s ease,
+      visibility 0.28s step-end;
+  }
+  .workspace-shell--graph-open .graph-drawer-backdrop {
+    opacity: 1;
+    pointer-events: auto;
+    visibility: visible;
+    transition:
+      opacity 0.28s ease,
+      visibility 0s linear;
   }
   .graph-drawer-close {
     display: inline-flex;
@@ -3878,10 +4127,22 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     top: 12px;
     right: 12px;
     z-index: 71;
+    opacity: 0;
+    pointer-events: none;
+    visibility: hidden;
+    transition:
+      opacity 0.2s ease,
+      visibility 0.2s step-end;
+  }
+  .workspace-shell--graph-open .graph-drawer-close {
+    opacity: 1;
+    pointer-events: auto;
+    visibility: visible;
+    transition:
+      opacity 0.2s ease 0.08s,
+      visibility 0s linear;
   }
 }
-@keyframes graph-drawer-in { from { transform: translateX(36px); opacity: 0.4; } }
-@keyframes graph-drawer-fade { from { opacity: 0; } }
 
 /* ===========================================================================
    LearnGraph roadmap page — redesigned layout (lg-roadmap-*).

@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
@@ -203,13 +202,6 @@ export function SourcesPage() {
     useState<SourceRecord | null>(null);
   const [sourceDeleteTarget, setSourceDeleteTarget] =
     useState<SourceRecord | null>(null);
-  // The library stats row renders in the topbar (slot owned by the workspace shell).
-  const [topbarStatsSlot, setTopbarStatsSlot] = useState<HTMLElement | null>(
-    null,
-  );
-  useEffect(() => {
-    setTopbarStatsSlot(document.getElementById("topbar-stats-slot"));
-  }, []);
   const files = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
   const storageSummary = useQuery({
     queryKey: ["files-storage-summary"],
@@ -457,50 +449,48 @@ export function SourcesPage() {
         type="file"
       />
 
-      {topbarStatsSlot
-        ? createPortal(
-            <div className="hidden items-center gap-x-4 whitespace-nowrap text-xs text-muted-foreground lg:flex">
-              <span>
-                <strong className="font-semibold tabular-nums text-foreground">
-                  {files.data.length}
-                </strong>{" "}
-                个文件
-              </span>
-              <span>
-                <strong className="font-semibold tabular-nums text-foreground">
-                  {indexed}
-                </strong>{" "}
-                个可问答
-              </span>
-              <span>
-                <strong className="font-semibold tabular-nums text-foreground">
-                  {pending}
-                </strong>{" "}
-                个待解析或处理中
-              </span>
-              <span>
-                <strong className="font-semibold tabular-nums text-foreground">
-                  {failed}
-                </strong>{" "}
-                个解析失败
-              </span>
-              <span className="inline-flex items-center gap-1.5">
-                <HardDrive className="size-3.5" aria-hidden="true" />
-                总占用{" "}
-                <strong className="font-semibold tabular-nums text-foreground">
-                  {bytes(
-                    storageSummary.data?.total_bytes ??
-                      files.data.reduce(
-                        (sum, file) => sum + (file.size_bytes || 0),
-                        0,
-                      ),
-                  )}
-                </strong>
-              </span>
-            </div>,
-            topbarStatsSlot,
-          )
-        : null}
+      <div
+        aria-label="资料库概况"
+        className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground"
+      >
+        <span>
+          <strong className="font-semibold tabular-nums text-foreground">
+            {files.data.length}
+          </strong>{" "}
+          个文件
+        </span>
+        <span>
+          <strong className="font-semibold tabular-nums text-foreground">
+            {indexed}
+          </strong>{" "}
+          个可问答
+        </span>
+        <span>
+          <strong className="font-semibold tabular-nums text-foreground">
+            {pending}
+          </strong>{" "}
+          个待解析或处理中
+        </span>
+        <span>
+          <strong className="font-semibold tabular-nums text-foreground">
+            {failed}
+          </strong>{" "}
+          个解析失败
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <HardDrive className="size-3.5" aria-hidden="true" />
+          总占用{" "}
+          <strong className="font-semibold tabular-nums text-foreground">
+            {bytes(
+              storageSummary.data?.total_bytes ??
+                files.data.reduce(
+                  (sum, file) => sum + (file.size_bytes || 0),
+                  0,
+                ),
+            )}
+          </strong>
+        </span>
+      </div>
 
       <section
         aria-label="上传资料"

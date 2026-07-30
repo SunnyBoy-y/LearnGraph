@@ -165,8 +165,9 @@ const primaryNav: NavItem[] = [
   {
     label: "新对话",
     icon: MessageSquareText,
+    // Action button only — never stay highlighted when a history session is open.
+    // (Previously aliases ["/chat/", ...] made every chat route look "active".)
     path: "chat/new",
-    aliases: ["/chat/", "/learn/joint"],
   },
   {
     label: "图谱",
@@ -1530,6 +1531,60 @@ function SidebarNav({
     }
   }
 
+  // Pin only "新对话"; remaining primary nav scrolls with the session list.
+  const pinnedNavItem = nav.find((item) => item.label === "新对话");
+  const scrollNav = nav.filter((item) => item.label !== "新对话");
+
+  function renderNavItem(item: NavItem) {
+    const Icon = item.icon;
+    // "新对话" is a create action, not a route section — never keep the
+    // selected chip when the user is browsing a historical session.
+    const active =
+      item.label === "新对话" ? false : isNavActive(pathname, item);
+    const className = cn(
+      "flex w-full items-center gap-3 rounded-xl px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+      collapsed && !mobile && "h-10 px-0",
+      active &&
+        "bg-sidebar-accent font-medium text-sidebar-accent-foreground",
+    );
+    if (item.label === "新对话") {
+      return (
+        <button
+          aria-label="新建对话"
+          className={className}
+          data-nav-label={item.label}
+          disabled={creatingConversation}
+          key={`${item.label}-${item.path}`}
+          onClick={() => void createConversation()}
+          type="button"
+        >
+          <Icon
+            className="size-4.5 shrink-0"
+            strokeWidth={2.25}
+          />
+          <span className="sidebar-text">
+            {creatingConversation ? "创建中…" : item.label}
+          </span>
+        </button>
+      );
+    }
+    return (
+      <NavLink
+        className={className}
+        data-nav-label={item.label}
+        key={`${item.label}-${item.path}`}
+        onClick={onNavigate}
+        to={`${base}/${item.path}`}
+      >
+        <Icon
+          className={cn("size-4.5 shrink-0", active && "text-primary")}
+          strokeWidth={2.25}
+        />
+        <span className="sidebar-text">{item.label}</span>
+      </NavLink>
+    );
+  }
+
   return (
     <div
       className={cn(
@@ -1598,99 +1653,58 @@ function SidebarNav({
         ) : null}
       </div>
 
-      {/* ChatGPT-style drawer: primary nav + sessions scroll together. */}
-      <div className="sidebar-nav__scroll">
-        <nav aria-label="主导航" className="mt-4 space-y-1">
-          {nav.map((item) => {
-            const Icon = item.icon;
-            const active = isNavActive(pathname, item);
-            const className = cn(
-              "flex w-full items-center gap-3 rounded-xl px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-              collapsed && !mobile && "h-10 px-0",
-              active &&
-                "bg-sidebar-accent font-medium text-sidebar-accent-foreground",
-            );
-            if (item.label === "新对话") {
-              return (
-                <button
-                  aria-label="新建对话"
-                  className={className}
-                  data-nav-label={item.label}
-                  disabled={creatingConversation}
-                  key={`${item.label}-${item.path}`}
-                  onClick={() => void createConversation()}
-                  type="button"
-                >
-                  <Icon
-                    className={cn(
-                      "size-4.5 shrink-0",
-                      active && "text-primary",
-                    )}
-                    strokeWidth={2.25}
-                  />
-                  <span className="sidebar-text">
-                    {creatingConversation ? "创建中…" : item.label}
-                  </span>
-                </button>
-              );
-            }
-            return (
-              <NavLink
-                className={className}
-                data-nav-label={item.label}
-                key={`${item.label}-${item.path}`}
-                onClick={onNavigate}
-                to={`${base}/${item.path}`}
-              >
-                <Icon
-                  className={cn(
-                    "size-4.5 shrink-0",
-                    active && "text-primary",
-                  )}
-                  strokeWidth={2.25}
-                />
-                <span className="sidebar-text">{item.label}</span>
-              </NavLink>
-            );
-          })}
-        </nav>
+      {/* Only "新对话" stays pinned; remaining nav + sessions share one scroller. */}
+      {pinnedNavItem ? (
+        <div className="sidebar-nav__primary mt-4">
+          {renderNavItem(pinnedNavItem)}
+        </div>
+      ) : null}
 
-        {moreNav.length ? (
-          <div className="sidebar-nav__more mt-1">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  className={cn(
-                    "w-full justify-start gap-3 rounded-xl px-3",
-                    moreActive &&
-                      "bg-sidebar-accent font-medium text-sidebar-accent-foreground",
-                  )}
-                  size="sm"
-                  variant="ghost"
-                >
-                  <MoreHorizontal className="size-4.5" strokeWidth={2.25} />
-                  <span className="sidebar-text">更多</span>
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="w-52">
-                {moreNav.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <DropdownMenuItem
-                      key={`${item.label}-${item.path}`}
-                      onSelect={() => {
-                        navigate(`${base}/${item.path}`);
-                        onNavigate?.();
-                      }}
+      <div className="sidebar-nav__scroll">
+        {scrollNav.length || moreNav.length ? (
+          <nav
+            aria-label="主导航"
+            className={cn("space-y-1", !pinnedNavItem && "mt-4")}
+          >
+            {scrollNav.map((item) => renderNavItem(item))}
+            {moreNav.length ? (
+              <div className="sidebar-nav__more mt-1">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      className={cn(
+                        "w-full justify-start gap-3 rounded-xl px-3",
+                        moreActive &&
+                          "bg-sidebar-accent font-medium text-sidebar-accent-foreground",
+                      )}
+                      size="sm"
+                      variant="ghost"
                     >
-                      <Icon className="size-4" strokeWidth={2.25} />
-                      {item.label}
-                    </DropdownMenuItem>
-                  );
-                })}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+                      <MoreHorizontal className="size-4.5" strokeWidth={2.25} />
+                      <span className="sidebar-text">更多</span>
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-52">
+                    {moreNav.map((item) => {
+                      const Icon = item.icon;
+                      return (
+                        <DropdownMenuItem
+                          key={`${item.label}-${item.path}`}
+                          onSelect={() => {
+                            navigate(`${base}/${item.path}`);
+                            onNavigate?.();
+                          }}
+                        >
+                          <Icon className="size-4" strokeWidth={2.25} />
+                          {item.label}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            ) : null}
+          </nav>
         ) : null}
 
         <SessionProjects
@@ -2811,17 +2825,15 @@ function TopBar({
       <div className="workspace-topbar__left">
         <MobileNavigation />
         {isChat ? (
-          // Chat page portals the bound goal/graph/node context chips here.
-          <div className="topbar-context-slot" id="topbar-context-slot" />
-        ) : null}
-        {/* Pages portal their compact stats in here (e.g. the sources library). */}
-        <div className="topbar-stats-slot" id="topbar-stats-slot" />
-        {isChat ? (
           // The chat page portals its model picker in here on phone widths.
           <div className="topbar-model-slot" id="topbar-model-slot" />
         ) : null}
       </div>
       <div className="workspace-topbar__actions">
+        {isChat ? (
+          // Compact secondary menu for bound goal/graph/node context.
+          <div className="topbar-context-slot" id="topbar-context-slot" />
+        ) : null}
         {onToggleGraph ? (
           <Button
             aria-expanded={graphOpen}
@@ -3028,8 +3040,10 @@ function SelectionExplanationRail({
 }
 
 function ContextRail({
+  collapsed = false,
   onSelectionExplanationChange,
 }: {
+  collapsed?: boolean;
   onSelectionExplanationChange?: (open: boolean) => void;
 } = {}) {
   const { pathname, search } = useLocation();
@@ -3182,7 +3196,12 @@ function ContextRail({
       : undefined;
 
   return (
-    <aside className="context-rail min-h-svh bg-card px-4 py-5">
+    <aside
+      aria-hidden={collapsed || undefined}
+      className="context-rail min-h-svh bg-card px-4 py-5"
+      // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
+      inert={collapsed || undefined}
+    >
       {selectionExplanation && isChat && sessionId ? (
         <SelectionExplanationRail
           detail={selectionExplanation}
@@ -4539,7 +4558,6 @@ export function WorkspaceShell() {
   // Right rail is available on chat/goal pages; the topbar toggle only appears on pure chat.
   const showContextRail = isChat || isGoalClarify;
   const showRailToggle = isChat && !isGoalClarify;
-  const hideInspector = !showContextRail || isSettings;
   useEffect(() => {
     setGraphDrawerOpen(false);
     setSelectionExplanationOpen(false);
@@ -4624,9 +4642,11 @@ export function WorkspaceShell() {
     "--sidebar-width": collapsed ? "50px" : "268px",
     "--rail-width": `${railWidth}px`,
   } as CSSProperties;
-  const inspectorHidden =
-    hideInspector ||
-    (showRailToggle && railCollapsed && !selectionExplanationOpen);
+  // Keep the rail mounted while collapsing so CSS can animate width / slide.
+  // Only pages without a context rail use --no-inspector (true unmount).
+  const railAvailable = showContextRail && !isSettings;
+  const railCollapsedEffective =
+    Boolean(showRailToggle && railCollapsed && !selectionExplanationOpen);
   const handleSelectionExplanationChange = useCallback((open: boolean) => {
     setSelectionExplanationOpen(open);
     if (!open) {
@@ -4638,7 +4658,10 @@ export function WorkspaceShell() {
       className={cn(
         "workspace-shell",
         collapsed && "workspace-shell--collapsed",
-        inspectorHidden && "workspace-shell--no-inspector",
+        !railAvailable && "workspace-shell--no-inspector",
+        railAvailable &&
+          railCollapsedEffective &&
+          "workspace-shell--rail-collapsed",
         showContextRail && graphDrawerOpen && "workspace-shell--graph-open",
       )}
       style={shellStyle}
@@ -4690,39 +4713,17 @@ export function WorkspaceShell() {
           </>
         )}
       </main>
-      {!inspectorHidden ? (
+      {railAvailable ? (
         <>
           <div
+            aria-hidden={railCollapsedEffective || undefined}
             aria-label="调整图谱栏宽度"
             aria-orientation="vertical"
             className="workspace-resizer"
             onPointerDown={beginRailResize}
             role="separator"
           />
-          {graphDrawerOpen ? (
-            <div
-              aria-hidden="true"
-              className="graph-drawer-backdrop"
-              onClick={() => setGraphDrawerOpen(false)}
-            />
-          ) : null}
-          <ContextRail
-            onSelectionExplanationChange={handleSelectionExplanationChange}
-          />
-          {graphDrawerOpen ? (
-            <Button
-              aria-label="收起图谱面板"
-              className="graph-drawer-close"
-              onClick={() => setGraphDrawerOpen(false)}
-              size="icon-sm"
-              variant="secondary"
-            >
-              <X className="size-4" />
-            </Button>
-          ) : null}
-        </>
-      ) : graphDrawerOpen || selectionExplanationOpen ? (
-        <>
+          {/* Backdrop / close stay mounted so narrow layouts can fade them out. */}
           <div
             aria-hidden="true"
             className="graph-drawer-backdrop"
@@ -4732,6 +4733,8 @@ export function WorkspaceShell() {
             }}
           />
           <ContextRail
+            // Desktop fold, or narrow drawer closed: keep mounted for CSS but not interactive.
+            collapsed={railCollapsedEffective && !graphDrawerOpen}
             onSelectionExplanationChange={handleSelectionExplanationChange}
           />
           <Button

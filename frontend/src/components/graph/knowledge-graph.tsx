@@ -1021,9 +1021,10 @@ export function KnowledgeGraph({
         zoomOnScroll={interactive}
       >
         <Background
-          color={view === "tree" ? "#d5dbd5" : "#dedede"}
-          gap={view === "tree" ? 20 : 22}
-          size={1}
+          // Larger, more spaced dots remain readable around 90% zoom.
+          color="rgba(24, 40, 32, 0.22)"
+          gap={32}
+          size={2.25}
           variant={BackgroundVariant.Dots}
         />
         {interactive && !showZoomControls && (
