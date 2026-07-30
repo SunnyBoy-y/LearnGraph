@@ -346,6 +346,7 @@ class ProviderService:
                 "hosted_web_search": False,
                 "default_search_route": "external",
             }
+        qwen_research_defaults: dict[str, object] = {}
         if payload.provider_type == "qwen_deep_research":
             known = list(QwenDeepResearchProvider.KNOWN_MODELS)
             qwen_research_defaults = {
