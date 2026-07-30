@@ -318,11 +318,33 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
         "properties": {
             "id": {"type": "string", "maxLength": 80},
             "label": {"type": "string", "maxLength": 500},
+            "description": {"type": "string", "maxLength": 2_000},
+            # Optional client-side grading hint. Prefer props.correct_option_ids.
+            "is_correct": {"type": "boolean"},
         },
+    }
+    # Shared optional answer-key fields for interactive question cards.
+    # Frontend grades locally when present so the control can show results
+    # immediately after the learner confirms, without waiting for a model turn.
+    answer_key_props = {
+        "correct_option_ids": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {"type": "string", "maxLength": 80},
+        },
+        "correct_answers": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {"type": "string", "maxLength": 2_000},
+        },
+        "explanation": {"type": "string", "maxLength": 5_000},
+        "feedback_correct": {"type": "string", "maxLength": 2_000},
+        "feedback_incorrect": {"type": "string", "maxLength": 2_000},
     }
     question_base = {
         "prompt": {"type": "string", "maxLength": 5_000},
         "options": {"type": "array", "maxItems": 100, "items": option},
+        **answer_key_props,
     }
     return {
         "weather_card": {
@@ -442,11 +464,17 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
                     "allow_custom": {"type": "boolean"},
                     "allow_skip": {"type": "boolean"},
                     "submit_label": {"type": "string", "maxLength": 80},
+                    **answer_key_props,
                 },
             },
             "example_data": {
                 "title": "请选择",
-                "options": [{"id": "a", "label": "Option A"}],
+                "options": [
+                    {"id": "a", "label": "Option A", "is_correct": True},
+                    {"id": "b", "label": "Option B"},
+                ],
+                "correct_option_ids": ["a"],
+                "explanation": "A 是正确答案。",
                 "allow_custom": True,
                 "allow_skip": True,
             },
@@ -465,12 +493,18 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
                     "allow_custom": {"type": "boolean"},
                     "allow_skip": {"type": "boolean"},
                     "submit_label": {"type": "string", "maxLength": 80},
+                    **answer_key_props,
                 },
             },
             "example_data": {
                 "title": "Choose one",
                 "prompt": "Choose one",
-                "options": [{"id": "a", "label": "A"}],
+                "options": [
+                    {"id": "a", "label": "A", "is_correct": True},
+                    {"id": "b", "label": "B"},
+                ],
+                "correct_option_ids": ["a"],
+                "explanation": "A is correct.",
             },
         },
         "multiple_choice": {
@@ -487,12 +521,19 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
                     "allow_custom": {"type": "boolean"},
                     "allow_skip": {"type": "boolean"},
                     "submit_label": {"type": "string", "maxLength": 80},
+                    **answer_key_props,
                 },
             },
             "example_data": {
                 "title": "Choose any",
                 "prompt": "Choose any",
-                "options": [{"id": "a", "label": "A"}],
+                "options": [
+                    {"id": "a", "label": "A", "is_correct": True},
+                    {"id": "b", "label": "B", "is_correct": True},
+                    {"id": "c", "label": "C"},
+                ],
+                "correct_option_ids": ["a", "b"],
+                "explanation": "A and B are both correct.",
             },
         },
         "fill_blank": {
@@ -513,12 +554,15 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
                         "maxItems": 100,
                         "items": {"type": "string", "maxLength": 80},
                     },
+                    **answer_key_props,
                 },
             },
             "example_data": {
                 "title": "填空",
                 "prompt": "ACID means ____",
                 "blank_ids": ["one"],
+                "correct_answers": ["Atomicity Consistency Isolation Durability"],
+                "explanation": "ACID 四性：原子性、一致性、隔离性、持久性。",
             },
         },
         "short_answer_table": {
@@ -547,12 +591,14 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
                             "items": {"type": "string", "maxLength": 5_000},
                         },
                     },
+                    **answer_key_props,
                 },
             },
             "example_data": {
                 "title": "简答题表",
                 "columns": ["Question", "Answer"],
                 "rows": [["Why?", ""]],
+                "explanation": "回答应覆盖因果链中的关键节点。",
             },
         },
         "image_frame": {

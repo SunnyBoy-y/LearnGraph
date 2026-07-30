@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -85,6 +86,7 @@ import {
   retrySessionMessage,
   startSandboxBootstrap,
   streamSessionMessage,
+  undoGraphChangeSet,
   updateSession,
   uploadFile,
   listAudioTranscriptions,
@@ -149,11 +151,26 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
+import {
+  groupQuestionParts,
+  QuestionSetPager,
+} from "@/components/chat/question-set-pager";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
   locateSelectionInContent,
   selectionToolbarPoint,
 } from "@/features/chat/text-selection";
+import {
+  createSelectionExplanationId,
+  decorateSelectionExplanationMarks,
+  inferSelectionAction,
+  listSelectionExplanations,
+  openSelectionExplanation,
+  selectionExplanationRecordsEventName,
+  splitTextWithSelectionMarks,
+  upsertSelectionExplanation,
+  type SelectionExplanationRecord,
+} from "@/features/chat/selection-explanation";
 import {
   markSessionGenerationFinished,
   markSessionRunning,
@@ -1151,6 +1168,8 @@ function UserMessage({
   editValue,
   disabled,
   versionNavigation,
+  selectionMarks = [],
+  onOpenSelectionExplanation,
   onCancelEdit,
   onEditValueChange,
   onSaveEdit,
@@ -1161,6 +1180,8 @@ function UserMessage({
   editValue: string;
   disabled: boolean;
   versionNavigation?: MessageVersionNavigation;
+  selectionMarks?: SelectionExplanationRecord[];
+  onOpenSelectionExplanation?: (recordId: string) => void;
   onCancelEdit: () => void;
   onEditValueChange: (value: string) => void;
   onSaveEdit: () => void;
@@ -1174,6 +1195,13 @@ function UserMessage({
       toast.error("无法复制消息");
     }
   };
+
+  const markedSegments = useMemo(() => {
+    const marks = selectionMarks
+      .filter((item) => item.sourceMessageId === message.id)
+      .map((item) => ({ id: item.id, selectedText: item.selectedText }));
+    return splitTextWithSelectionMarks(message.content, marks);
+  }, [message.content, message.id, selectionMarks]);
 
   return (
     <AiMessage
@@ -1236,7 +1264,27 @@ function UserMessage({
               className="whitespace-pre-wrap leading-6"
               data-message-selectable-text
             >
-              {message.content}
+              {markedSegments.map((segment, index) =>
+                segment.type === "mark" ? (
+                  <button
+                    aria-label={`打开划词解释：${segment.value.slice(0, 40)}`}
+                    className="selection-explain-mark"
+                    data-selection-explain-id={segment.id}
+                    key={`${segment.id}-${index}`}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onOpenSelectionExplanation?.(segment.id);
+                    }}
+                    title="打开历史划词解释"
+                    type="button"
+                  >
+                    {segment.value}
+                  </button>
+                ) : (
+                  <span key={`text-${index}`}>{segment.value}</span>
+                ),
+              )}
             </p>
           </div>
         )}
@@ -1351,21 +1399,29 @@ function AssistantMessageInner({
   onRetry,
   onBranch,
   onComponentAction,
+  selectionMarks = [],
+  onOpenSelectionExplanation,
   retryDisabled = false,
   retryDisabledReason,
   branchDisabled = false,
   branchDisabledReason,
+  componentsInteractive = true,
 }: {
   message: Message;
   sessionId: string;
   onRetry: () => void;
   onBranch: () => void;
   onComponentAction: (action: TrustedComponentAction) => void | Promise<void>;
+  selectionMarks?: SelectionExplanationRecord[];
+  onOpenSelectionExplanation?: (recordId: string) => void;
   retryDisabled?: boolean;
   retryDisabledReason?: string;
   branchDisabled?: boolean;
   branchDisabledReason?: string;
+  /** False while the assistant turn is still streaming so review cards stay locked. */
+  componentsInteractive?: boolean;
 }) {
+  const messageContentRef = useRef<HTMLDivElement | null>(null);
   const persisted =
     !message.id.startsWith("temp") && message.id !== "welcome-local";
   // Lazily fetch message versions only after the user shows interest in the
@@ -1409,6 +1465,7 @@ function AssistantMessageInner({
   );
   const renderPart = (part: MessagePart) => (
     <ChatStreamPartRenderer
+      interactive={componentsInteractive}
       key={part.id}
       onAction={onComponentAction}
       part={part}
@@ -1419,6 +1476,72 @@ function AssistantMessageInner({
       }
     />
   );
+  const renderAnswerParts = (parts: MessagePart[]) =>
+    groupQuestionParts(parts).map((group) => {
+      if (group.kind === "question_set") {
+        return (
+          <QuestionSetPager
+            key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
+            onSubmit={(submission) =>
+              void onComponentAction?.({
+                componentId: group.questions[0]?.componentId ?? group.parts[0].id,
+                componentType:
+                  group.questions.length > 1
+                    ? "question_set"
+                    : group.questions[0]?.componentType ?? "question_set",
+                event: "submit",
+                payload: {
+                  answer: submission.summaryText,
+                  summaryText: submission.summaryText,
+                  results: submission.results,
+                  labels: submission.results.flatMap((item) => item.labels),
+                  graded_count: submission.gradedCount,
+                  correct_count: submission.correctCount,
+                },
+              })
+            }
+            questions={group.questions}
+          />
+        );
+      }
+      return renderPart(group.part);
+    });
+
+  useEffect(() => {
+    if (selectedVersionId || !messageContentRef.current) return;
+    const marks = selectionMarks
+      .filter((item) => item.sourceMessageId === message.id)
+      .map((item) => ({ id: item.id, selectedText: item.selectedText }));
+    if (!marks.length) return;
+    let dispose: (() => void) | undefined;
+    // Streamdown can replace text nodes after paint; decorate on the next frame
+    // and once more shortly after so marks survive late markdown hydration.
+    const apply = () => {
+      dispose?.();
+      if (!messageContentRef.current) return;
+      dispose = decorateSelectionExplanationMarks(
+        messageContentRef.current,
+        marks,
+        (recordId) => onOpenSelectionExplanation?.(recordId),
+      );
+    };
+    const frame = window.requestAnimationFrame(apply);
+    const timer = window.setTimeout(apply, 120);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+      dispose?.();
+    };
+  }, [
+    message.id,
+    message.content,
+    message.parts,
+    onOpenSelectionExplanation,
+    selectedVersionId,
+    selectionMarks,
+    shown.status,
+  ]);
+
   return (
     <AiMessage
       className="max-w-none"
@@ -1450,6 +1573,7 @@ function AssistantMessageInner({
         </div>
       ) : null}
       <MessageContent className="w-full gap-1" data-message-content>
+        <div ref={messageContentRef} className="contents">
         {isThinkingPlaceholder ? (
           <div className="message-thinking" role="status" aria-live="polite">
             <span className="message-thinking__dot" />
@@ -1489,7 +1613,7 @@ function AssistantMessageInner({
               className="message-answer-segment"
               key={`parts-${message.id}-${index}`}
             >
-              {segment.parts.map(renderPart)}
+              {renderAnswerParts(segment.parts)}
             </div>
           ),
         )}
@@ -1501,6 +1625,7 @@ function AssistantMessageInner({
             ))}
           </div>
         ) : null}
+        </div>
       </MessageContent>
       <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
         <MessageAction
@@ -1568,7 +1693,10 @@ const areEqualAssistantMessage = (
   prev.retryDisabled === next.retryDisabled &&
   prev.branchDisabled === next.branchDisabled &&
   prev.retryDisabledReason === next.retryDisabledReason &&
-  prev.branchDisabledReason === next.branchDisabledReason;
+  prev.branchDisabledReason === next.branchDisabledReason &&
+  prev.componentsInteractive === next.componentsInteractive &&
+  prev.selectionMarks === next.selectionMarks &&
+  prev.onOpenSelectionExplanation === next.onOpenSelectionExplanation;
 
 type AssistantMessageMemoProps = Parameters<typeof AssistantMessageInner>[0];
 
@@ -1963,17 +2091,56 @@ export function ChatCanvasPage() {
   const [topbarModelSlot, setTopbarModelSlot] = useState<HTMLElement | null>(
     null,
   );
+  // Bound goal/graph/node chips live in the page header, not above the composer.
+  const [topbarContextSlot, setTopbarContextSlot] = useState<HTMLElement | null>(
+    null,
+  );
   useEffect(() => {
     setTopbarModelSlot(document.getElementById("topbar-model-slot"));
+    setTopbarContextSlot(document.getElementById("topbar-context-slot"));
   }, []);
   const [localMessages, setLocalMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ChatStatus>("ready");
   const [streamConnectionNotice, setStreamConnectionNotice] =
     useState<StreamConnectionNotice | null>(null);
   const [selectionMenu, setSelectionMenu] = useState<TextSelectionMenu | null>(null);
+  const [selectionExplanationMarks, setSelectionExplanationMarks] = useState<
+    SelectionExplanationRecord[]
+  >(() => listSelectionExplanations(sessionId));
   const [activeConversationQuestionId, setActiveConversationQuestionId] =
     useState<string | null>(null);
   const [longPaste, setLongPaste] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSelectionExplanationMarks(listSelectionExplanations(sessionId));
+    const refresh = (event: Event) => {
+      const detail = (event as CustomEvent<{ parentSessionId?: string }>).detail;
+      if (detail?.parentSessionId && detail.parentSessionId !== sessionId) return;
+      setSelectionExplanationMarks(listSelectionExplanations(sessionId));
+    };
+    window.addEventListener(selectionExplanationRecordsEventName(), refresh);
+    return () =>
+      window.removeEventListener(selectionExplanationRecordsEventName(), refresh);
+  }, [sessionId]);
+
+  const handleOpenSelectionExplanation = useCallback(
+    (recordId: string) => {
+      const record = selectionExplanationMarks.find((item) => item.id === recordId);
+      if (!record) return;
+      openSelectionExplanation({
+        parentSessionId: sessionId,
+        sourceMessageId: record.sourceMessageId,
+        selectedText: record.selectedText,
+        prefix: record.prefix,
+        suffix: record.suffix,
+        contentMatched: record.contentMatched,
+        action: record.action,
+        recordId: record.id,
+        explanationSessionId: record.explanationSessionId,
+      });
+    },
+    [selectionExplanationMarks, sessionId],
+  );
   const [pendingFiles, setPendingFiles] = useState<FileRecord[]>([]);
   const [composerText, setComposerText] = useState("");
   const [graphAction, setGraphAction] = useState<GraphAction>("none");
@@ -2067,6 +2234,7 @@ export function ChatCanvasPage() {
   const optimisticSessionId = useRef<string | null>(null);
   const retryExpectedVersionRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [composerExpanded, setComposerExpanded] = useState(false);
   const openFileDialogRef = useRef<() => void>(() => undefined);
   const pendingHandled = useRef(false);
   const draftSessionCreationRef = useRef<{
@@ -2089,6 +2257,28 @@ export function ChatCanvasPage() {
     openFileDialogRef.current = openFileDialog;
   }, []);
 
+  // Grow the composer with soft wraps (not only hard newlines), ChatGPT-style.
+  // Cap height; once capped, allow overflow so the caret stays reachable.
+  useLayoutEffect(() => {
+    const el = composerTextareaRef.current;
+    if (!el) return;
+
+    const syncHeight = () => {
+      const maxHeight = 210;
+      const minHeight = 52;
+      // Collapse first so scrollHeight reflects full content, including soft wraps.
+      el.style.height = "0px";
+      const contentHeight = el.scrollHeight;
+      const next = Math.min(maxHeight, Math.max(minHeight, contentHeight));
+      el.style.height = `${next}px`;
+      el.style.overflowY = contentHeight > maxHeight + 1 ? "auto" : "hidden";
+      setComposerExpanded(contentHeight > minHeight + 1);
+    };
+
+    syncHeight();
+    window.addEventListener("resize", syncHeight);
+    return () => window.removeEventListener("resize", syncHeight);
+  }, [composerText, composerInstanceKey]);
 
   useEffect(() => {
     if (!selectionMenu) return;
@@ -4958,17 +5148,26 @@ export function ChatCanvasPage() {
       proposalId,
       reason,
     }: {
-      decision: "confirm" | "reject";
+      decision: "confirm" | "reject" | "undo";
       proposalId: string;
       reason?: string;
-    }) =>
-      decision === "confirm"
-        ? confirmGraphChangeSet(sessionId, proposalId)
-        : rejectGraphChangeSet(sessionId, proposalId, reason),
+    }) => {
+      if (decision === "confirm") {
+        return confirmGraphChangeSet(sessionId, proposalId);
+      }
+      if (decision === "undo") {
+        return undoGraphChangeSet(sessionId, proposalId);
+      }
+      return rejectGraphChangeSet(sessionId, proposalId, reason);
+    },
     onSuccess: async (changeSet) => {
       // The server persists the resolved component snapshot, but updating the
       // active message cache first keeps the proposal controls from remaining
       // actionable while the refetch is in flight.
+      const allowedEvents =
+        changeSet.status === "confirmed"
+          ? (["undo"] as string[])
+          : ([] as string[]);
       queryClient.setQueryData<Message[]>(["messages", sessionId], (current) =>
         current?.map((message) => ({
           ...message,
@@ -4987,13 +5186,14 @@ export function ChatCanvasPage() {
               ...part,
               data: {
                 ...component,
-                allowed_events: [],
+                allowed_events: allowedEvents,
                 props: {
                   ...props,
                   graph_id: changeSet.graph_id,
                   status: changeSet.status,
                   confirmed_revision: changeSet.confirmed_revision,
                   confirmation_required: false,
+                  can_undo: changeSet.status === "confirmed",
                   rejection_reason: changeSet.rejection_reason,
                 },
               },
@@ -5001,15 +5201,21 @@ export function ChatCanvasPage() {
           }),
         })),
       );
-      if (changeSet.graph_id) {
-        queryClient.setQueryData<Session[]>(["sessions"], (current) =>
-          current?.map((item) =>
-            item.id === sessionId
-              ? { ...item, graph_id: changeSet.graph_id }
-              : item,
-          ),
-        );
-      }
+      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+        current?.map((item) =>
+          item.id === sessionId
+            ? {
+                ...item,
+                // Undo of a create proposal may clear session.graph_id; keep the
+                // cache consistent with the change-set payload either way.
+                graph_id:
+                  changeSet.status === "undone" && !changeSet.graph_id
+                    ? null
+                    : (changeSet.graph_id ?? item.graph_id),
+              }
+            : item,
+        ),
+      );
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["messages", sessionId] }),
         queryClient.invalidateQueries({
@@ -5029,7 +5235,9 @@ export function ChatCanvasPage() {
       toast.success(
         changeSet.status === "confirmed"
           ? `图谱提案已写入修订 v${changeSet.confirmed_revision}`
-          : "图谱提案已拒绝，正式图谱未被修改",
+          : changeSet.status === "undone"
+            ? "图谱提案写入已撤销"
+            : "图谱提案已拒绝，正式图谱未被修改",
       );
     },
     onError: (error) => toast.error(error.message),
@@ -5048,6 +5256,8 @@ export function ChatCanvasPage() {
         } else if (action.event === "reject") {
           setRejectProposalId(proposalId);
           setRejectReason("");
+        } else if (action.event === "undo") {
+          reviewGraphChange.mutate({ decision: "undo", proposalId });
         }
         return;
       }
@@ -5055,6 +5265,16 @@ export function ChatCanvasPage() {
       if (action.event !== "submit" && action.event !== "create_plan" && action.event !== "open_plan") {
         return;
       }
+      // Multi-question pager already formats a full summary with per-item grading.
+      if (
+        action.event === "submit" &&
+        typeof action.payload.summaryText === "string" &&
+        action.payload.summaryText.trim()
+      ) {
+        void send(action.payload.summaryText.trim(), { graphAction: "none" });
+        return;
+      }
+
       const labels = Array.isArray(action.payload.labels)
         ? action.payload.labels.filter(
             (item): item is string =>
@@ -6647,6 +6867,7 @@ export function ChatCanvasPage() {
                           setEditingMessageContent("");
                         }}
                         onEditValueChange={setEditingMessageContent}
+                        onOpenSelectionExplanation={handleOpenSelectionExplanation}
                         onSaveEdit={() => {
                           const content = editingMessageContent.trim();
                           if (!content) return;
@@ -6660,6 +6881,7 @@ export function ChatCanvasPage() {
                           setEditingMessageId(message.id);
                           setEditingMessageContent(message.content);
                         }}
+                        selectionMarks={selectionExplanationMarks}
                         versionNavigation={userVersionNavigation(message)}
                       />
                     </LazyMessageMount>
@@ -6686,12 +6908,20 @@ export function ChatCanvasPage() {
                               ? "当前操作完成后才能创建分支"
                               : undefined
                       }
+                      componentsInteractive={
+                        message.status !== "streaming" &&
+                        message.status !== "pending" &&
+                        status !== "streaming" &&
+                        status !== "submitted"
+                      }
                       message={message}
                       onComponentAction={handleComponentAction}
                       onBranch={() => {
                         if (persisted && message.session_id === sessionId)
                           branch.mutate(message.id);
                       }}
+                      onOpenSelectionExplanation={handleOpenSelectionExplanation}
+                      selectionMarks={selectionExplanationMarks}
                       onRetry={() => {
                         if (!persisted) return;
                         if (imageAnswer) {
@@ -6845,15 +7075,30 @@ export function ChatCanvasPage() {
               selectionMenu.source_message_id === "welcome-local"
             }
             onClick={() => {
-              window.dispatchEvent(
-                new CustomEvent("learngraph:selection-explanation", {
-                  detail: {
-                    sessionId,
-                    sourceMessageId: selectionMenu.source_message_id,
-                    selectedText: selectionMenu.selected_text,
-                  },
-                }),
-              );
+              const action = inferSelectionAction(selectionMenu.selected_text);
+              const record = upsertSelectionExplanation({
+                id: createSelectionExplanationId(),
+                parentSessionId: sessionId,
+                sourceMessageId: selectionMenu.source_message_id,
+                selectedText: selectionMenu.selected_text,
+                prefix: selectionMenu.prefix,
+                suffix: selectionMenu.suffix,
+                contentMatched: selectionMenu.contentMatched,
+                action,
+                createdAt: new Date().toISOString(),
+              });
+              setSelectionExplanationMarks(listSelectionExplanations(sessionId));
+              openSelectionExplanation({
+                parentSessionId: sessionId,
+                sourceMessageId: record.sourceMessageId,
+                selectedText: record.selectedText,
+                prefix: record.prefix,
+                suffix: record.suffix,
+                contentMatched: record.contentMatched,
+                action: record.action,
+                recordId: record.id,
+                explanationSessionId: record.explanationSessionId,
+              });
               setSelectionMenu(null);
             }}
             size="xs"
@@ -6876,12 +7121,17 @@ export function ChatCanvasPage() {
         {responseMode === "agentic" ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
-        <ConversationContextBar
-          goalBound={Boolean(currentSession?.goal_id)}
-          graphTitle={graphTitle}
-          learningNode={learningNode}
-          onClearLearningNode={clearSelectedLearningNode}
-        />
+        {topbarContextSlot
+          ? createPortal(
+              <ConversationContextBar
+                goalBound={Boolean(currentSession?.goal_id)}
+                graphTitle={graphTitle}
+                learningNode={learningNode}
+                onClearLearningNode={clearSelectedLearningNode}
+              />,
+              topbarContextSlot,
+            )
+          : null}
         <ConversationQuickActions
           agentActive={responseMode === "agentic"}
           agentDisabled={
@@ -7143,9 +7393,7 @@ export function ChatCanvasPage() {
           key={composerInstanceKey}
           accept={composerFileAccept}
           className={
-            composerText.includes("\n")
-              ? "chat-composer is-expanded"
-              : "chat-composer"
+            composerExpanded ? "chat-composer is-expanded" : "chat-composer"
           }
           multiple
           onError={(error) => {
@@ -7343,9 +7591,6 @@ export function ChatCanvasPage() {
               }
               ref={composerTextareaRef}
               role="combobox"
-              style={{
-                height: `${Math.min(210, 52 + Math.max(0, composerText.split("\n").length - 1) * 23)}px`,
-              }}
               value={composerText}
             />
           </PromptInputBody>

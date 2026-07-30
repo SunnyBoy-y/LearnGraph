@@ -978,8 +978,8 @@ export function HtmlDocumentViewer({
   }, [blob]);
 
   return (
-    <div className="flex min-h-[36rem] flex-col">
-      <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b bg-background/95 p-2 backdrop-blur">
+    <div className="flex h-full min-h-[36rem] flex-col">
+      <div className="sticky top-0 z-10 flex shrink-0 flex-wrap items-center gap-2 border-b bg-background/95 p-2 backdrop-blur">
         <div className="flex rounded-lg border p-0.5" role="group" aria-label="HTML 查看模式">
           <button
             aria-pressed={mode === "preview"}
@@ -1022,7 +1022,7 @@ export function HtmlDocumentViewer({
         <ViewerState>正在读取 HTML…</ViewerState>
       ) : null}
       {mode === "source" && sourceText ? (
-        <pre className="m-0 max-h-[calc(100svh-12rem)] overflow-auto bg-muted/20 p-4 text-xs leading-5 text-foreground">
+        <pre className="m-0 min-h-0 flex-1 overflow-auto bg-muted/20 p-4 text-xs leading-5 text-foreground">
           <code>{sourceText}</code>
         </pre>
       ) : null}

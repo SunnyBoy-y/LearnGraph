@@ -230,6 +230,15 @@ export function rejectGraphChangeSet(
   )
 }
 
+export function undoGraphChangeSet(
+  sessionId: string,
+  changeSetId: string,
+): Promise<GraphChangeSet> {
+  return apiClient.post<GraphChangeSet>(
+    `/sessions/${encodeURIComponent(sessionId)}/graph-change-sets/${encodeURIComponent(changeSetId)}/undo`,
+  )
+}
+
 export function listMessageVersions(sessionId: string, messageId: string): Promise<MessageVersion[]> {
   return apiClient.get<MessageVersion[]>(`/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/versions`)
 }

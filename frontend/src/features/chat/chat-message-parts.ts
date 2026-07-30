@@ -131,13 +131,28 @@ export function partitionMessageParts(parts: MessagePart[]): {
   const ordered = orderedMessageParts(parts);
   const chainParts: MessagePart[] = [];
   const answerParts: MessagePart[] = [];
+  const deferredGraphProposals: MessagePart[] = [];
   for (const part of ordered) {
     if (isPlaceholderAcknowledgement(part) || isHostAgentBoilerplate(part)) {
       continue;
     }
-    if (isChainPart(part)) chainParts.push(part);
-    else answerParts.push(part);
+    if (isChainPart(part)) {
+      chainParts.push(part);
+      continue;
+    }
+    // Graph review cards stay at the end of the answer body so mid-turn tool
+    // emission does not interrupt narration; actions are also locked while
+    // the assistant message is still streaming.
+    if (
+      part.type === "component" &&
+      part.data?.component_type === "graph_update_proposal"
+    ) {
+      deferredGraphProposals.push(part);
+      continue;
+    }
+    answerParts.push(part);
   }
+  answerParts.push(...deferredGraphProposals);
   return { chainParts, answerParts };
 }
 

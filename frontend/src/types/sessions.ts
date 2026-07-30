@@ -242,7 +242,7 @@ export interface GraphChangeSet {
   source_user_message_id: string
   source_assistant_message_id: string
   mode: 'create' | 'update'
-  status: 'proposed' | 'confirmed' | 'rejected'
+  status: 'proposed' | 'confirmed' | 'rejected' | 'undone'
   base_revision: number
   confirmed_revision: number | null
   proposal: ConversationGraphProposal

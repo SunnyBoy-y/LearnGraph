@@ -246,9 +246,15 @@ class AgentToolRuntime:
                         "Create a reviewable target-graph proposal for the Goal "
                         "bound to this session, or update the Graph bound to this "
                         "session. This tool never publishes or mutates the formal "
-                        "graph. For a new graph provide at least two added nodes "
-                        "and exactly one root; for an update use existing node IDs "
-                        "when change=update and do not add another root."
+                        "graph. Self-validate before calling: read the current graph "
+                        "with lg_graph_read first when updating; keep exactly one root; "
+                        "never re-add existing concepts (update instead); attach every "
+                        "added node with at least one edge; avoid prerequisite cycles "
+                        "and duplicate/near-duplicate labels. Invalid proposals are "
+                        "rejected by the host and no review card is shown. For a new "
+                        "graph provide at least two added nodes and exactly one root; "
+                        "for an update use existing node IDs when change=update and do "
+                        "not add another root."
                     ),
                     "parameters": {
                         "type": "object",
@@ -554,7 +560,12 @@ class AgentToolRuntime:
                         "Option cards need non-empty options[{id,label}]; "
                         "single/multiple choice need title or prompt; "
                         "fill_blank needs title/prompt (blank_ids default to [answer]); "
-                        "weather_card requires location, condition, temperature_c."
+                        "weather_card requires location, condition, temperature_c. "
+                        "For graded practice, include correct_option_ids (or option.is_correct) "
+                        "and optional explanation so the UI can grade after the learner confirms. "
+                        "When emitting multiple practice questions in one turn, emit them "
+                        "as consecutive trusted components so the client stacks them into "
+                        "one paged exercise control."
                     ),
                     "parameters": {
                         "type": "object",
@@ -576,8 +587,10 @@ class AgentToolRuntime:
                                 "type": "object",
                                 "description": (
                                     "Component data. Examples: "
-                                    'single_choice → {title, options:[{id,label}]}; '
-                                    'fill_blank → {title, prompt, blank_ids:["answer"]}; '
+                                    'single_choice → {title, options:[{id,label}], '
+                                    'correct_option_ids:["a"], explanation:"..."}; '
+                                    'fill_blank → {title, prompt, blank_ids:["answer"], '
+                                    'correct_answers:["..."]}; '
                                     'weather_card → {location, condition, temperature_c}. '
                                     "Do not include null values."
                                 ),
@@ -4445,6 +4458,15 @@ class AgentToolRuntime:
                     "source_file_ids": source_file_ids,
                 },
             )
+            image_width: int | None = None
+            image_height: int | None = None
+            try:
+                with Image.open(BytesIO(final_event.image_bytes)) as image:
+                    image_width, image_height = image.size
+            except Exception:
+                # Dimensions are presentation-only; never fail the tool over them.
+                image_width = None
+                image_height = None
         except AppError as exc:
             images.fail(task, exc.code, exc.message)
             return self._failure(exc.code, exc.message, data=exc.details or {})
@@ -4464,25 +4486,30 @@ class AgentToolRuntime:
                 ),
             )
 
+        part_data: dict[str, Any] = {
+            "generation_id": task.id,
+            "provider_id": image_provider.provider_id,
+            "model_id": image_provider.model_id,
+            "file_id": file.id,
+            "mime_type": file.mime_type,
+            "title": title,
+            "alt": prompt[:240],
+            "prompt": prompt,
+            "source_file_ids": source_file_ids,
+            "progress_mode": "completed",
+            "preview_revision": 1,
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        }
+        if image_width and image_height:
+            part_data["width"] = int(image_width)
+            part_data["height"] = int(image_height)
+            part_data["aspect_ratio"] = f"{int(image_width)} / {int(image_height)}"
         part = {
             "type": "image",
             "status": "completed",
             "content": title,
-            "data": {
-                "generation_id": task.id,
-                "provider_id": image_provider.provider_id,
-                "model_id": image_provider.model_id,
-                "file_id": file.id,
-                "mime_type": file.mime_type,
-                "title": title,
-                "alt": prompt[:240],
-                "prompt": prompt,
-                "source_file_ids": source_file_ids,
-                "progress_mode": "completed",
-                "preview_revision": 1,
-                "input_tokens": int(usage.get("input_tokens") or 0),
-                "output_tokens": int(usage.get("output_tokens") or 0),
-            },
+            "data": part_data,
         }
         self.audit.record(
             actor_id=self.actor_id,

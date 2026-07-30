@@ -160,7 +160,8 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
         <DialogContent
           className={cn(
             "flex max-h-[min(92svh,58rem)] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl",
-            isFullscreen && "top-0 left-0 h-svh max-h-svh w-screen max-w-none translate-x-0 translate-y-0 rounded-none sm:max-w-none",
+            isFullscreen &&
+              "inset-0 top-0 left-0 h-svh max-h-svh w-screen max-w-none translate-x-0 translate-y-0 rounded-none sm:max-w-none",
           )}
           showCloseButton
         >
@@ -174,13 +175,18 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
           >
             {isFullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
           </Button>
-          <DialogHeader className="border-b px-5 py-4 pr-24">
+          <DialogHeader className="shrink-0 border-b px-5 py-4 pr-24">
             <DialogTitle className="truncate pr-2">{title}</DialogTitle>
             <DialogDescription className="truncate">
               {path || "outputs/*"}{size ? ` · ${size}` : ""}{mime ? ` · ${mime}` : ""}
             </DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-auto bg-muted/15">
+          <div
+            className={cn(
+              "min-h-0 flex-1 bg-muted/15",
+              isFullscreen ? "flex flex-col overflow-hidden" : "overflow-auto",
+            )}
+          >
             {loadingPreview ? (
               <div className="flex min-h-[32rem] items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
                 <LoaderCircle className="size-4 animate-spin" />
@@ -191,13 +197,17 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
             ) : previewBlob ? (
               <FilePreviewCanvas
                 blob={previewBlob}
-                className={isFullscreen ? "min-h-[calc(100svh-8rem)]" : "min-h-[32rem]"}
+                className={
+                  isFullscreen
+                    ? "flex h-full min-h-0 flex-1 flex-col"
+                    : "min-h-[32rem]"
+                }
                 filename={path || title}
                 mimeType={mime || previewBlob.type}
               />
             ) : null}
           </div>
-          <div className="flex flex-col-reverse gap-2 border-t bg-background px-5 py-3 sm:flex-row sm:justify-end">
+          <div className="flex shrink-0 flex-col-reverse gap-2 border-t bg-background px-5 py-3 sm:flex-row sm:justify-end">
             <Button disabled={!fileId || downloading} onClick={() => void onDownload()} size="sm" variant="outline">
               {downloading ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
               下载

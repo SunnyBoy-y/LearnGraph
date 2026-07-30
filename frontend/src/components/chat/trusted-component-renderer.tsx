@@ -8,6 +8,7 @@ import {
   Network,
   ShieldCheck,
   Thermometer,
+  Undo2,
   X,
 } from "lucide-react";
 import { z } from "zod";
@@ -25,7 +26,16 @@ const optionSchema = z.object({
   id: z.string().min(1).max(160),
   label: z.string().min(1).max(500),
   description: z.string().max(2_000).nullish(),
+  is_correct: z.boolean().optional(),
 });
+
+const answerKeyProps = {
+  correct_option_ids: z.array(z.string().min(1).max(80)).max(100).optional(),
+  correct_answers: z.array(z.string().min(1).max(2_000)).max(20).optional(),
+  explanation: z.string().max(5_000).nullish(),
+  feedback_correct: z.string().max(2_000).nullish(),
+  feedback_incorrect: z.string().max(2_000).nullish(),
+};
 
 const optionComponentSchema = z.object({
   component_type: z.enum(["option_group", "single_choice", "multiple_choice"]),
@@ -38,6 +48,7 @@ const optionComponentSchema = z.object({
     allow_custom: z.boolean().default(true),
     allow_skip: z.boolean().default(true),
     submit_label: z.string().min(1).max(80).nullish(),
+    ...answerKeyProps,
   }),
   allowed_events: z.array(z.string()).max(10).default(["submit"]),
 });
@@ -52,6 +63,7 @@ const textComponentSchema = z.object({
     placeholder: z.string().max(500).nullish(),
     multiline: z.boolean().default(false),
     submit_label: z.string().min(1).max(80).nullish(),
+    ...answerKeyProps,
   }),
   allowed_events: z.array(z.string()).max(10).default(["submit"]),
 });
@@ -156,11 +168,12 @@ const graphProposalSchema = z.object({
     nodes: z.array(graphNodeSchema).max(100),
     edges: z.array(graphEdgeSchema).max(200),
     confirmation_required: z.boolean(),
-    status: z.enum(["proposed", "confirmed", "rejected"]),
+    status: z.enum(["proposed", "confirmed", "rejected", "undone"]),
     confirmed_node_ids: z.record(z.string(), z.string()).optional(),
     rejection_reason: z.string().max(2_000).optional(),
+    can_undo: z.boolean().optional(),
   }),
-  allowed_events: z.array(z.enum(["confirm", "reject"])).max(2),
+  allowed_events: z.array(z.enum(["confirm", "reject", "undo"])).max(3),
 });
 
 const trustedComponentSchema = z.union([
@@ -203,10 +216,13 @@ function UnsupportedComponent({
 export function TrustedComponentRenderer({
   data,
   fallbackId,
+  interactive = true,
   onAction,
 }: {
   data: Record<string, unknown>;
   fallbackId: string;
+  /** When false, action buttons render but stay disabled (e.g. mid-stream). */
+  interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
 }) {
   const parsed = useMemo(() => trustedComponentSchema.safeParse(data), [data]);
@@ -461,9 +477,38 @@ export function TrustedComponentRenderer({
   const graphComponent = graphProposalSchema.parse(data);
   const proposal = graphComponent.props;
   const canDecide =
-    proposal.status === "proposed" && proposal.confirmation_required;
+    interactive &&
+    proposal.status === "proposed" &&
+    proposal.confirmation_required;
+  const canUndo =
+    interactive &&
+    proposal.status === "confirmed" &&
+    (proposal.can_undo !== false) &&
+    graphComponent.allowed_events.includes("undo");
+  const statusLabel =
+    proposal.status === "confirmed"
+      ? "已采纳"
+      : proposal.status === "rejected"
+        ? "已拒绝"
+        : proposal.status === "undone"
+          ? "已撤销"
+          : "待审核";
+  const statusVariant =
+    proposal.status === "confirmed"
+      ? "default"
+      : proposal.status === "rejected" || proposal.status === "undone"
+        ? "secondary"
+        : "outline";
   return (
-    <section className="graph-proposal" aria-label={`图谱变更提案：${proposal.title}`}>
+    <section
+      className={
+        interactive
+          ? "graph-proposal"
+          : "graph-proposal graph-proposal--locked"
+      }
+      aria-label={`图谱变更提案：${proposal.title}`}
+      aria-disabled={!interactive || undefined}
+    >
       <div className="graph-proposal__heading">
         <span>
           <Network className="size-4" />
@@ -472,9 +517,7 @@ export function TrustedComponentRenderer({
           <p>图谱变更提案</p>
           <strong>{proposal.title}</strong>
         </div>
-        <Badge variant={proposal.status === "confirmed" ? "default" : "secondary"}>
-          {proposal.status}
-        </Badge>
+        <Badge variant={statusVariant}>{statusLabel}</Badge>
       </div>
       <p className="graph-proposal__summary">{proposal.summary}</p>
       <div className="graph-proposal__stats">
@@ -498,7 +541,12 @@ export function TrustedComponentRenderer({
       {proposal.nodes.length > 8 ? (
         <p className="graph-proposal__more">另有 {proposal.nodes.length - 8} 个节点，确认前可在图谱工作台完整查看。</p>
       ) : null}
-      {canDecide ? (
+      {!interactive && proposal.status === "proposed" ? (
+        <div className="graph-proposal__resolved graph-proposal__resolved--pending">
+          <GitBranch className="size-3.5" />
+          回答生成中，完成后可审核此提案
+        </div>
+      ) : canDecide ? (
         <div className="graph-proposal__actions">
           <Button
             disabled={!graphComponent.allowed_events.includes("reject")}
@@ -516,10 +564,37 @@ export function TrustedComponentRenderer({
             <CheckCircle2 className="size-3.5" />确认写入图谱
           </Button>
         </div>
+      ) : proposal.status === "confirmed" ? (
+        <div className="graph-proposal__resolved graph-proposal__resolved--confirmed">
+          <div className="graph-proposal__resolved-copy">
+            <CheckCircle2 className="size-3.5" />
+            <span>
+              已写入正式图谱
+              {proposal.confirmed_revision != null
+                ? ` 修订 v${proposal.confirmed_revision}`
+                : ""}
+            </span>
+          </div>
+          {canUndo ? (
+            <Button
+              onClick={() => emit("undo", { proposal_id: proposal.proposal_id })}
+              size="sm"
+              variant="ghost"
+            >
+              <Undo2 className="size-3.5" />撤销
+            </Button>
+          ) : null}
+        </div>
       ) : (
         <div className="graph-proposal__resolved">
           <GitBranch className="size-3.5" />
-          {proposal.status === "confirmed" ? "已写入正式图谱修订" : "该提案已结束"}
+          {proposal.status === "rejected"
+            ? proposal.rejection_reason
+              ? `已拒绝：${proposal.rejection_reason}`
+              : "该提案已拒绝，正式图谱未被修改"
+            : proposal.status === "undone"
+              ? "该提案写入已撤销，图谱已恢复"
+              : "该提案已结束"}
         </div>
       )}
     </section>

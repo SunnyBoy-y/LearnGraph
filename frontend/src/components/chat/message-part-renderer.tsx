@@ -1410,11 +1410,14 @@ function AcknowledgementPart({
 }
 
 export function MessagePartRenderer({
+  interactive = true,
   onAction,
   part,
   siblingParts,
   streaming = false,
 }: {
+  /** When false, trusted component actions stay disabled (e.g. mid-stream). */
+  interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
   part: MessagePart;
   /** Sibling parts of the same assistant message (used to resolve citation tooltips). */
@@ -1492,6 +1495,7 @@ export function MessagePartRenderer({
         <TrustedComponentRenderer
           data={part.data ?? {}}
           fallbackId={part.id}
+          interactive={interactive && !streaming}
           onAction={onAction}
         />
       );

@@ -443,7 +443,7 @@ class ImageChatService:
             "model_id": task.model_id,
             "title": "正在绘图",
             "alt": task.prompt_summary,
-            "aspect_ratio": "1 / 1",
+            "aspect_ratio": "4 / 3",
             "progress_mode": "indeterminate",
             "preview_revision": 0,
         }
@@ -689,6 +689,19 @@ class ImageChatService:
                             "title": "图片已生成" if is_final else "正在生成预览",
                         }
                     )
+                    try:
+                        from io import BytesIO
+
+                        from PIL import Image
+
+                        with Image.open(BytesIO(provider_event.image_bytes)) as image:
+                            width, height = image.size
+                        if width > 0 and height > 0:
+                            image_data["width"] = int(width)
+                            image_data["height"] = int(height)
+                            image_data["aspect_ratio"] = f"{int(width)} / {int(height)}"
+                    except Exception:
+                        pass
                     image_record.status = "completed" if is_final else "streaming"
                     image_record.data = dict(image_data)
                     assistant.parts = [

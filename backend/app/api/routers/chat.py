@@ -969,6 +969,21 @@ def reject_graph_change_set(
     )
 
 
+@router.post(
+    "/{session_id}/graph-change-sets/{change_set_id}/undo",
+    response_model=GraphChangeSetView,
+)
+def undo_graph_change_set(
+    session_id: str,
+    change_set_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> GraphChangeSetView:
+    return GraphChangeSetView.model_validate(
+        graph_change_service(db, context).undo(session_id, change_set_id)
+    )
+
+
 @router.get("/{session_id}/messages", response_model=MessageListPageView)
 def list_messages(
     session_id: str,

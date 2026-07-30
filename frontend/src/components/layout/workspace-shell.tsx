@@ -19,7 +19,6 @@ import {
 } from "react-router-dom";
 import {
   Activity,
-  ArrowUp,
   Archive,
   BadgeCheck,
   Bot,
@@ -94,6 +93,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { SelectionExplanationPanel } from "@/features/chat/selection-explanation-panel";
+import {
+  consumePendingSelectionExplanation,
+  selectionExplanationOpenEventName,
+  type SelectionExplanationOpenDetail,
+} from "@/features/chat/selection-explanation";
 import { useAuth } from "@/features/auth/auth-context-value";
 import {
   KnowledgeGraph,
@@ -2666,10 +2671,14 @@ function TopBar({
   graphOpen,
   onOpenActivity,
   onToggleGraph,
+  railCollapsed,
+  onToggleRail,
 }: {
   graphOpen?: boolean;
   onOpenActivity: () => void;
   onToggleGraph?: () => void;
+  railCollapsed?: boolean;
+  onToggleRail?: () => void;
 }) {
   const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
@@ -2747,7 +2756,7 @@ function TopBar({
   return (
     <header className="sticky top-0 z-30 flex min-h-16 items-center gap-3 border-b bg-background/92 px-4 backdrop-blur-xl sm:px-6">
       <MobileNavigation />
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 shrink-0 max-w-[min(42vw,18rem)] sm:max-w-[min(36vw,20rem)]">
         <p className="truncate text-base font-semibold tracking-tight">
           {title}
         </p>
@@ -2755,6 +2764,12 @@ function TopBar({
           {description}
         </p>
       </div>
+      {isChat ? (
+        // Chat page portals the bound goal/graph/node context chips here.
+        <div className="topbar-context-slot" id="topbar-context-slot" />
+      ) : (
+        <div className="min-w-0 flex-1" />
+      )}
       {/* Pages portal their compact stats in here (e.g. the sources library). */}
       <div className="topbar-stats-slot" id="topbar-stats-slot" />
       {isChat ? (
@@ -2828,6 +2843,26 @@ function TopBar({
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+        {onToggleRail ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-expanded={!railCollapsed}
+                aria-label={railCollapsed ? "展开图谱书架" : "折叠图谱书架"}
+                className="topbar-rail-toggle shrink-0"
+                onClick={onToggleRail}
+                size="icon-sm"
+                title={railCollapsed ? "展开图谱书架" : "折叠图谱书架"}
+                variant="ghost"
+              >
+                <Network className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {railCollapsed ? "展开图谱书架" : "折叠图谱书架"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -2942,18 +2977,16 @@ function TopBar({
   );
 }
 
-type SelectionExplanation = {
-  sessionId: string;
-  sourceMessageId: string;
-  selectedText: string;
-};
-
 function SelectionExplanationRail({
-  explanation,
+  detail,
   onClose,
+  parentSessionId,
+  workspaceId,
 }: {
-  explanation: SelectionExplanation;
+  detail: SelectionExplanationOpenDetail;
   onClose: () => void;
+  parentSessionId: string;
+  workspaceId: string;
 }) {
   return (
     <section aria-label="独立解释" className="selection-explanation-rail">
@@ -2966,26 +2999,22 @@ function SelectionExplanationRail({
           <X className="size-3.5" />
         </Button>
       </header>
-      <div className="selection-explanation-rail__canvas">
-        <div className="selection-explanation-rail__quote">
-          <span>选中内容</span>
-          <p>{explanation.selectedText}</p>
-        </div>
-        <div className="selection-explanation-rail__empty">
-          <Sparkles className="size-4" />
-          <p>已创建独立解释上下文</p>
-          <span>这里会保持与主对话分离，便于围绕这段内容继续追问。</span>
-        </div>
+      <div className="selection-explanation-rail__canvas selection-explanation-rail__canvas--live">
+        <SelectionExplanationPanel
+          detail={detail}
+          parentSessionId={parentSessionId}
+          workspaceId={workspaceId}
+        />
       </div>
-      <footer className="selection-explanation-rail__composer">
-        <span>针对这段内容继续提问…</span>
-        <ArrowUp className="size-3.5" />
-      </footer>
     </section>
   );
 }
 
-function ContextRail() {
+function ContextRail({
+  onSelectionExplanationChange,
+}: {
+  onSelectionExplanationChange?: (open: boolean) => void;
+} = {}) {
   const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
   const [projectContext, setProjectContext] = useState<{
@@ -2993,7 +3022,7 @@ function ContextRail() {
     sessionId?: string;
   }>();
   const [selectionExplanation, setSelectionExplanation] =
-    useState<SelectionExplanation | null>(null);
+    useState<SelectionExplanationOpenDetail | null>(null);
   const railProjects = useQuery({
     queryKey: ["projects"],
     queryFn: () => listProjects(),
@@ -3089,26 +3118,61 @@ function ContextRail() {
   }, [sessionId, workspaceId]);
 
   useEffect(() => {
-    const openExplanation = (event: Event) => {
-      const detail = (event as CustomEvent<SelectionExplanation>).detail;
-      if (!detail || detail.sessionId !== sessionId || !detail.selectedText.trim()) return;
-      setSelectionExplanation(detail);
+    setSelectionExplanation(null);
+
+    const applyDetail = (
+      detail: (SelectionExplanationOpenDetail & { sessionId?: string }) | null,
+    ) => {
+      if (!detail) return;
+      const parentSessionId = detail.parentSessionId || detail.sessionId;
+      if (!parentSessionId || parentSessionId !== sessionId) return;
+      if (!detail.selectedText?.trim() && !detail.recordId) return;
+      setSelectionExplanation({
+        ...detail,
+        parentSessionId,
+        sourceMessageId: detail.sourceMessageId || "",
+        selectedText: detail.selectedText?.trim() || "",
+      });
     };
-    window.addEventListener("learngraph:selection-explanation", openExplanation);
+
+    // Claim any open that fired while this rail was unmounted (collapsed).
+    applyDetail(consumePendingSelectionExplanation(sessionId));
+
+    const openExplanation = (event: Event) => {
+      applyDetail(
+        (event as CustomEvent<SelectionExplanationOpenDetail & {
+          sessionId?: string;
+        }>).detail,
+      );
+    };
+    window.addEventListener(
+      selectionExplanationOpenEventName(),
+      openExplanation,
+    );
     return () =>
-      window.removeEventListener("learngraph:selection-explanation", openExplanation);
+      window.removeEventListener(
+        selectionExplanationOpenEventName(),
+        openExplanation,
+      );
   }, [sessionId]);
+
+  useEffect(() => {
+    onSelectionExplanationChange?.(Boolean(selectionExplanation && isChat));
+  }, [isChat, onSelectionExplanationChange, selectionExplanation]);
 
   const activeProject =
     projectContext && projectContext.sessionId === sessionId
       ? projectContext.project
       : undefined;
+
   return (
     <aside className="context-rail min-h-svh bg-card px-4 py-5">
-      {selectionExplanation && isChat ? (
+      {selectionExplanation && isChat && sessionId ? (
         <SelectionExplanationRail
-          explanation={selectionExplanation}
+          detail={selectionExplanation}
           onClose={() => setSelectionExplanation(null)}
+          parentSessionId={sessionId}
+          workspaceId={workspaceId}
         />
       ) : isGoalClarify || isGoalMode ? (
         <GoalGraphPreviewRail />
@@ -3394,6 +3458,7 @@ function BoundGraphRail({
   const [editing, setEditing] = useState(false);
   const draftRef = useRef({ label: "", description: "" });
   const [explorePanelOpen, setExplorePanelOpen] = useState(false);
+  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [validation, setValidation] = useState<{
     errors: string[];
     suggestions: string[];
@@ -3403,6 +3468,7 @@ function BoundGraphRail({
     setSelectedNodeId(requestedNodeId);
     setEditing(false);
     setExplorePanelOpen(false);
+    setDescriptionExpanded(false);
     setValidation(undefined);
   }, [graphId, requestedNodeId]);
 
@@ -3770,6 +3836,7 @@ function BoundGraphRail({
           setSelectedNodeId(node.id);
           setEditing(false);
           setExplorePanelOpen(false);
+          setDescriptionExpanded(false);
           setValidation(undefined);
           rememberLastLearnedNode(graphId, node.id);
           publishLearningNodeContext({
@@ -3889,9 +3956,26 @@ function BoundGraphRail({
             </div>
           ) : (
             <>
-              <p className="bound-graph-rail__description">
-                {selectedNode.description || "还没有补充学习说明。"}
-              </p>
+              <div className="bound-graph-rail__summary">
+                <p
+                  className={cn(
+                    "bound-graph-rail__description",
+                    !descriptionExpanded && "is-clamped",
+                  )}
+                >
+                  {selectedNode.description || "还没有补充学习说明。"}
+                </p>
+                {selectedNode.description &&
+                selectedNode.description.trim().length > 48 ? (
+                  <button
+                    className="bound-graph-rail__text-toggle"
+                    onClick={() => setDescriptionExpanded((open) => !open)}
+                    type="button"
+                  >
+                    {descriptionExpanded ? "收起" : "展开"}
+                  </button>
+                ) : null}
+              </div>
               <div className="bound-graph-rail__actions">
                 <Button onClick={studyNode} size="xs">
                   <Play className="size-3.5" />
@@ -3923,29 +4007,32 @@ function BoundGraphRail({
                       ? "已掌握"
                       : "标为已掌握"}
                 </Button>
-                <Button
-                  onClick={splitNode}
-                  size="xs"
-                  title="调用智能体生成该节点的图谱变更提案（拆分子节点）"
-                  variant="outline"
-                >
-                  <Split className="size-3.5" />
-                  拆分
-                </Button>
-                <Button
-                  onClick={() => focus.mutate(selectedNode.id)}
-                  size="xs"
-                  variant="outline"
-                >
-                  <Focus className="size-3.5" />
-                  {selectedNode.attention_state === "focused"
-                    ? "重点"
-                    : "设为重点"}
-                </Button>
-                <Button onClick={startEditing} size="xs" variant="ghost">
-                  <Pencil className="size-3.5" />
-                  编辑
-                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button size="xs" variant="ghost">
+                      <MoreHorizontal className="size-3.5" />
+                      更多
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-40">
+                    <DropdownMenuItem onSelect={splitNode}>
+                      <Split className="size-3.5" />
+                      拆分节点
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => focus.mutate(selectedNode.id)}
+                    >
+                      <Focus className="size-3.5" />
+                      {selectedNode.attention_state === "focused"
+                        ? "已是重点"
+                        : "设为重点"}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={startEditing}>
+                      <Pencil className="size-3.5" />
+                      编辑
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
               {parentNode || childNodes.length ? (
                 <div className="bound-graph-rail__relations">
@@ -3954,6 +4041,7 @@ function BoundGraphRail({
                       className="bound-graph-rail__chip"
                       onClick={() => {
                         setSelectedNodeId(parentNode.id);
+                        setDescriptionExpanded(false);
                         rememberLastLearnedNode(graphId, parentNode.id);
                       }}
                       type="button"
@@ -3967,6 +4055,7 @@ function BoundGraphRail({
                       key={child.id}
                       onClick={() => {
                         setSelectedNodeId(child.id);
+                        setDescriptionExpanded(false);
                         rememberLastLearnedNode(graphId, child.id);
                       }}
                       type="button"
@@ -3976,63 +4065,70 @@ function BoundGraphRail({
                   ))}
                 </div>
               ) : null}
+              <div className="bound-graph-rail__tools">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button size="xs" variant="secondary">
+                      <Sparkles className="size-3.5" />
+                      学习动作
+                      <ChevronDown className="size-3 opacity-70" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-44">
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        askNode(
+                          `请用百科词条格式解释「${selectedNode.label}」的定义、边界与典型例子。`,
+                        )
+                      }
+                    >
+                      百科讲解
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={compareWithParent}>
+                      对比上级
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        askNode(
+                          `围绕「${selectedNode.label}」出 3 道由浅入深的自测题，并给出参考答案要点。`,
+                        )
+                      }
+                    >
+                      自测题
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        askNode(
+                          `「${selectedNode.label}」常见误区有哪些？各给一个纠正方式。`,
+                        )
+                      }
+                    >
+                      常见误区
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <Button
+                  onClick={() => {
+                    if (!questions.length) {
+                      toast.message("还没有历史提问，先学习或提问后再查看。");
+                      return;
+                    }
+                    setExplorePanelOpen((open) => !open);
+                  }}
+                  size="xs"
+                  variant="outline"
+                >
+                  <MessageSquareText className="size-3.5" />
+                  历史提问
+                  {questions.length ? (
+                    <span className="bound-graph-rail__count">
+                      {questions.length}
+                    </span>
+                  ) : null}
+                </Button>
+              </div>
             </>
           )}
-          <section className="node-question-history">
-            <div>
-              <p>学习动作</p>
-              <span>{questions.length} 条历史提问</span>
-            </div>
-            {questions.length ? (
-              <ol>
-                {questions.slice(0, 4).map((question) => (
-                  <li key={question.id}>{question.content}</li>
-                ))}
-              </ol>
-            ) : (
-              <p className="node-question-history__empty">
-                从「学习此节点」开始百科式讲解；提问会自动归档。
-              </p>
-            )}
-            <div className="node-question-history__actions">
-              <Button
-                onClick={() =>
-                  askNode(
-                    `请用百科词条格式解释「${selectedNode.label}」的定义、边界与典型例子。`,
-                  )
-                }
-                size="xs"
-                variant="secondary"
-              >
-                百科讲解
-              </Button>
-              <Button onClick={compareWithParent} size="xs" variant="outline">
-                对比上级
-              </Button>
-              <Button
-                onClick={() =>
-                  askNode(
-                    `围绕「${selectedNode.label}」出 3 道由浅入深的自测题，并给出参考答案要点。`,
-                  )
-                }
-                size="xs"
-                variant="outline"
-              >
-                自测题
-              </Button>
-              <Button
-                onClick={() =>
-                  askNode(
-                    `「${selectedNode.label}」常见误区有哪些？各给一个纠正方式。`,
-                  )
-                }
-                size="xs"
-                variant="outline"
-              >
-                常见误区
-              </Button>
-            </div>
-          </section>
         </div>
       ) : null}
     </section>
@@ -4137,11 +4233,6 @@ function CapabilityGraphRail() {
               : "暂无已掌握节点"
         }
       />
-      {!mastery.isPending && masteredNodes.length === 0 ? (
-        <p className="capability-graph-rail__empty">
-          在「当前学习」中为节点点击「标为已掌握」后，才会进入能力成长图谱。
-        </p>
-      ) : null}
     </section>
   );
 }
@@ -4404,19 +4495,28 @@ export function WorkspaceShell() {
   const [collapsed, setCollapsed] = useState(
     () => window.localStorage.getItem("lg-sidebar-collapsed") !== "false",
   );
+  const [railCollapsed, setRailCollapsed] = useState(
+    () => window.localStorage.getItem("lg-rail-collapsed") === "true",
+  );
   const [railWidth, setRailWidth] = useState(360);
   const [activityOpen, setActivityOpen] = useState(false);
   // Narrow screens hide the context rail; this re-opens it as a right drawer.
   const [graphDrawerOpen, setGraphDrawerOpen] = useState(false);
+  // Keep the inspector mounted while 划词解释 is open, even if the graph rail
+  // was folded — otherwise the independent canvas cannot appear.
+  const [selectionExplanationOpen, setSelectionExplanationOpen] = useState(false);
   const isChat = pathname.includes("/chat/");
   const isDocumentReader = pathname.includes("/documents/");
   const isGoalClarify =
     pathname.includes("/goals/new/clarify") ||
     (isChat && new URLSearchParams(search).get("mode") === "goal");
+  // Right rail is available on chat/goal pages; the topbar toggle only appears on pure chat.
   const showContextRail = isChat || isGoalClarify;
+  const showRailToggle = isChat && !isGoalClarify;
   const hideInspector = !showContextRail;
   useEffect(() => {
     setGraphDrawerOpen(false);
+    setSelectionExplanationOpen(false);
   }, [pathname]);
   useEffect(() => {
     if (!graphDrawerOpen) return;
@@ -4426,6 +4526,29 @@ export function WorkspaceShell() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [graphDrawerOpen]);
+  useEffect(() => {
+    // Listen at the shell level so a collapsed rail can re-open before ContextRail mounts.
+    const forceOpen = (event: Event) => {
+      const detail = (
+        event as CustomEvent<SelectionExplanationOpenDetail & { sessionId?: string }>
+      ).detail;
+      if (!detail) return;
+      if (!detail.selectedText?.trim() && !detail.recordId) return;
+      if (!isChat) return;
+      setSelectionExplanationOpen(true);
+      if (railCollapsed) {
+        setRailCollapsed(false);
+        window.localStorage.setItem("lg-rail-collapsed", "false");
+      }
+      // Narrow layouts hide the persistent rail and use a drawer instead.
+      if (window.matchMedia("(max-width: 1100px)").matches) {
+        setGraphDrawerOpen(true);
+      }
+    };
+    window.addEventListener(selectionExplanationOpenEventName(), forceOpen);
+    return () =>
+      window.removeEventListener(selectionExplanationOpenEventName(), forceOpen);
+  }, [isChat, railCollapsed]);
   useEffect(() => {
     const value = settings.data?.find(
       (item) => item.key === "ui.preferences",
@@ -4445,7 +4568,15 @@ export function WorkspaceShell() {
       return !current;
     });
   }
+  function toggleRail() {
+    setRailCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem("lg-rail-collapsed", String(next));
+      return next;
+    });
+  }
   function beginRailResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (railCollapsed && !selectionExplanationOpen) return;
     event.preventDefault();
     document.body.classList.add("is-resizing");
     const onMove = (moveEvent: PointerEvent) => {
@@ -4467,12 +4598,21 @@ export function WorkspaceShell() {
     "--sidebar-width": collapsed ? "50px" : "216px",
     "--rail-width": `${railWidth}px`,
   } as CSSProperties;
+  const inspectorHidden =
+    hideInspector ||
+    (showRailToggle && railCollapsed && !selectionExplanationOpen);
+  const handleSelectionExplanationChange = useCallback((open: boolean) => {
+    setSelectionExplanationOpen(open);
+    if (!open) {
+      // Leave graph drawer state alone on desktop; only clear the forced-open flag.
+    }
+  }, []);
   return (
     <div
       className={cn(
         "workspace-shell",
         collapsed && "workspace-shell--collapsed",
-        hideInspector && "workspace-shell--no-inspector",
+        inspectorHidden && "workspace-shell--no-inspector",
         showContextRail && graphDrawerOpen && "workspace-shell--graph-open",
       )}
       style={shellStyle}
@@ -4503,11 +4643,13 @@ export function WorkspaceShell() {
                 ? () => setGraphDrawerOpen((current) => !current)
                 : undefined
             }
+            onToggleRail={showRailToggle ? toggleRail : undefined}
+            railCollapsed={showRailToggle ? railCollapsed : undefined}
           />
         )}
         <Outlet />
       </main>
-      {!hideInspector ? (
+      {!inspectorHidden ? (
         <>
           <div
             aria-label="调整图谱栏宽度"
@@ -4523,7 +4665,9 @@ export function WorkspaceShell() {
               onClick={() => setGraphDrawerOpen(false)}
             />
           ) : null}
-          <ContextRail />
+          <ContextRail
+            onSelectionExplanationChange={handleSelectionExplanationChange}
+          />
           {graphDrawerOpen ? (
             <Button
               aria-label="收起图谱面板"
@@ -4535,6 +4679,32 @@ export function WorkspaceShell() {
               <X className="size-4" />
             </Button>
           ) : null}
+        </>
+      ) : graphDrawerOpen || selectionExplanationOpen ? (
+        <>
+          <div
+            aria-hidden="true"
+            className="graph-drawer-backdrop"
+            onClick={() => {
+              setGraphDrawerOpen(false);
+              setSelectionExplanationOpen(false);
+            }}
+          />
+          <ContextRail
+            onSelectionExplanationChange={handleSelectionExplanationChange}
+          />
+          <Button
+            aria-label="收起图谱面板"
+            className="graph-drawer-close"
+            onClick={() => {
+              setGraphDrawerOpen(false);
+              setSelectionExplanationOpen(false);
+            }}
+            size="icon-sm"
+            variant="secondary"
+          >
+            <X className="size-4" />
+          </Button>
         </>
       ) : null}
       <Sheet onOpenChange={setActivityOpen} open={activityOpen}>

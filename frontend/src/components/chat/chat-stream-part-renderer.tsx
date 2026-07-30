@@ -1,8 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type SyntheticEvent,
+} from "react";
 import {
   CircleAlert,
   Download,
-  ImageIcon,
   LoaderCircle,
   Maximize2,
   X,
@@ -40,39 +46,209 @@ function positiveNumber(value: unknown) {
 }
 
 /**
- * Simulated generation progress: image providers report no true percentage,
- * so the bar advances with variable speed toward 99% and only reaches 100%
- * when the final image is actually delivered.
+ * ChatGPT-style particle field for image generation wait states.
+ *
+ * Layered motion:
+ * 1. Outward radial ring (primary "scan")
+ * 2. Slow whole-field breath (scale + opacity)
+ * 3. Soft secondary counter-wave for depth
+ * Peak dots scale up and get a tiny glow so the field feels premium, not static.
  */
-function useSimulatedImageProgress(active: boolean, done: boolean) {
-  const [progress, setProgress] = useState(0);
+function ImageParticleField({ active }: { active: boolean }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
   useEffect(() => {
-    if (done) {
-      setProgress(100);
-      return;
+    const canvas = canvasRef.current;
+    if (!canvas || !active) return;
+
+    const reducedMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    let raf = 0;
+    let disposed = false;
+    let width = 0;
+    let height = 0;
+    let dpr = 1;
+
+    const resize = () => {
+      const parent = canvas.parentElement;
+      if (!parent) return;
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      // Particle field occupies the remaining grid row under the title.
+      width = parent.clientWidth;
+      height = Math.max(parent.clientHeight, 160);
+      canvas.width = Math.max(1, Math.floor(width * dpr));
+      canvas.height = Math.max(1, Math.floor(height * dpr));
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+
+    const isDark = document.documentElement.classList.contains("dark");
+    // Slightly cooler neutrals; peak dots push toward near-black / near-white.
+    const baseR = isDark ? 168 : 96;
+    const baseG = isDark ? 170 : 98;
+    const baseB = isDark ? 180 : 108;
+    const peakR = isDark ? 236 : 28;
+    const peakG = isDark ? 238 : 30;
+    const peakB = isDark ? 246 : 36;
+
+    const smoothstep = (edge0: number, edge1: number, x: number) => {
+      const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    };
+
+    const draw = (timeMs: number) => {
+      if (disposed) return;
+      const t = timeMs * 0.001;
+      context.clearRect(0, 0, width, height);
+
+      // Keep the field under the title with soft edge breathing room.
+      const padX = Math.max(20, width * 0.07);
+      const padTop = Math.max(44, height * 0.14);
+      const padBottom = Math.max(22, height * 0.1);
+      const fieldW = Math.max(1, width - padX * 2);
+      const fieldH = Math.max(1, height - padTop - padBottom);
+      // Slightly denser grid so scale changes read clearly.
+      const cols = Math.max(22, Math.round(fieldW / 9.5));
+      const rows = Math.max(18, Math.round(fieldH / 9.5));
+      const stepX = fieldW / Math.max(1, cols - 1);
+      const stepY = fieldH / Math.max(1, rows - 1);
+      const cx = width / 2;
+      const cy = padTop + fieldH * 0.5;
+      const maxDist = Math.hypot(fieldW * 0.55, fieldH * 0.55) || 1;
+
+      // Global breath: the whole field gently expands / contracts (~3.4s cycle).
+      const globalBreath = reducedMotion
+        ? 0.55
+        : 0.5 + 0.5 * Math.sin(t * 1.85);
+      // Expanding ring travels from center to edge (~2.6s cycle).
+      const ringPhase = ((t * 0.38) % 1 + 1) % 1;
+      const ringCenter = ringPhase * 1.12;
+      // Secondary slower inward wash for layered depth.
+      const counterPhase = ((t * 0.22 + 0.5) % 1 + 1) % 1;
+      const counterCenter = 1 - counterPhase * 0.95;
+
+      for (let row = 0; row < rows; row += 1) {
+        for (let col = 0; col < cols; col += 1) {
+          const x = padX + col * stepX;
+          const y = padTop + row * stepY;
+          const dx = x - cx;
+          const dy = y - cy;
+          // Mild elliptical squash so the field feels wider than tall.
+          const dist = Math.hypot(dx, dy * 1.08);
+          const norm = Math.min(1.15, dist / maxDist);
+
+          // Deterministic micro-offset so neighbors don't pulse in lockstep.
+          const hash = Math.sin(col * 12.9898 + row * 78.233) * 43758.5453;
+          const jitter = hash - Math.floor(hash);
+
+          // Primary travelling ring: gaussian-ish band around ringCenter.
+          const ringDist = Math.abs(norm - ringCenter);
+          const ring = Math.exp(-((ringDist * 4.6) ** 2));
+
+          // Secondary counter band (softer, broader).
+          const counterDist = Math.abs(norm - counterCenter);
+          const counter = Math.exp(-((counterDist * 3.1) ** 2)) * 0.45;
+
+          // Local breath: slower undulation with spatial phase.
+          const localBreath = reducedMotion
+            ? 0.5
+            : 0.5 +
+              0.5 *
+                Math.sin(
+                  t * 2.05 +
+                    norm * 3.4 +
+                    col * 0.17 -
+                    row * 0.11 +
+                    jitter * 6.28,
+                );
+
+          // Compose excitation 0..1. Ring dominates; breath keeps idle alive.
+          const excitation = reducedMotion
+            ? 0.42
+            : Math.min(
+                1,
+                ring * 0.92 +
+                  counter * 0.55 +
+                  localBreath * 0.28 +
+                  globalBreath * 0.18,
+              );
+
+          // Soft edge vignette — center stays richer, corners dissolve.
+          const falloff = 1 - smoothstep(0.42, 1.08, norm);
+          if (falloff <= 0.02) continue;
+
+          // Scale: resting dots stay tiny; peaks grow ~3× for a clear breath.
+          const baseRadius = 0.75 + (1 - norm) * 0.35;
+          const scale = reducedMotion
+            ? 1
+            : 0.55 + excitation * 1.85 + globalBreath * 0.25;
+          const radius = Math.max(0.35, baseRadius * scale * falloff ** 0.35);
+
+          // Opacity rides the same wave; peaks near opaque, idle still visible.
+          const alpha = Math.max(
+            0.08,
+            Math.min(0.92, (0.16 + excitation * 0.78) * falloff),
+          );
+
+          // Mix base → peak color as intensity rises.
+          const mix = Math.min(1, excitation * 1.15);
+          const r = Math.round(baseR * (1 - mix) + peakR * mix);
+          const g = Math.round(baseG * (1 - mix) + peakG * mix);
+          const b = Math.round(baseB * (1 - mix) + peakB * mix);
+
+          // Soft glow under peak dots (skip on reduced motion for clarity).
+          if (!reducedMotion && excitation > 0.62 && radius > 1.1) {
+            const glow = (excitation - 0.62) * 1.6;
+            context.beginPath();
+            context.fillStyle = `rgba(${r}, ${g}, ${b}, ${(glow * 0.18 * falloff).toFixed(3)})`;
+            context.arc(x, y, radius * (2.4 + glow * 1.4), 0, Math.PI * 2);
+            context.fill();
+          }
+
+          context.beginPath();
+          context.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`;
+          context.arc(x, y, radius, 0, Math.PI * 2);
+          context.fill();
+        }
+      }
+
+      if (!reducedMotion) {
+        raf = window.requestAnimationFrame(draw);
+      }
+    };
+
+    resize();
+    const observer = new ResizeObserver(() => {
+      resize();
+      if (reducedMotion) draw(0);
+    });
+    if (canvas.parentElement) observer.observe(canvas.parentElement);
+
+    if (reducedMotion) {
+      draw(0);
+    } else {
+      raf = window.requestAnimationFrame(draw);
     }
-    if (!active) {
-      setProgress(0);
-      return;
-    }
-    setProgress((current) => (current > 0 && current < 99 ? current : 2));
-    const timer = window.setInterval(() => {
-      setProgress((current) => {
-        if (current >= 99) return 99;
-        const remaining = 99 - current;
-        // Ease toward 99 with jitter and occasional bursts so the motion
-        // reads as "variable speed" rather than a fixed-rate fill.
-        const burst = Math.random() < 0.12 ? remaining * 0.08 : 0;
-        const step = Math.max(
-          0.15,
-          remaining * (0.012 + Math.random() * 0.045) + burst,
-        );
-        return Math.min(99, current + step);
-      });
-    }, 200);
-    return () => window.clearInterval(timer);
-  }, [active, done]);
-  return progress;
+
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, [active]);
+
+  return (
+    <canvas
+      aria-hidden="true"
+      className="chat-generated-image__particles"
+      ref={canvasRef}
+    />
+  );
 }
 
 function ChatImagePart({ part }: { part: MessagePart }) {
@@ -129,8 +305,18 @@ function ChatImagePart({ part }: { part: MessagePart }) {
 
   const width = positiveNumber(data?.width);
   const height = positiveNumber(data?.height);
-  const aspectRatio = width && height ? `${width} / ${height}` : "1 / 1";
+  const declaredAspect =
+    typeof data?.aspect_ratio === "string" && data.aspect_ratio.includes("/")
+      ? data.aspect_ratio
+      : undefined;
+  // Prefer real pixel dimensions; fall back to declared ratio; only use a
+  // neutral wait frame (4/3) while the canvas is still empty. Never force 1/1.
+  const [measuredAspect, setMeasuredAspect] = useState<string | undefined>();
   const source = downloadedSource || directSource;
+  const aspectRatio =
+    width && height
+      ? `${width} / ${height}`
+      : measuredAspect || declaredAspect || (source ? undefined : "4 / 3");
   const title =
     typeof data?.title === "string" ? data.title : "正在生成图片";
   const alt = typeof data?.alt === "string" ? data.alt : title;
@@ -141,21 +327,9 @@ function ChatImagePart({ part }: { part: MessagePart }) {
     !downloadFailed;
   const failed = part.status === "failed" || downloadFailed;
   const done = part.status === "completed" && Boolean(source) && !loadingRevision;
-  const progress = useSimulatedImageProgress(isWorking && !failed, done);
-
-  // Keep the overlay briefly after completion so the bar visibly hits 100%.
-  const [showCompletion, setShowCompletion] = useState(false);
-  const wasWorkingRef = useRef(false);
-  useEffect(() => {
-    if (done && wasWorkingRef.current) {
-      setShowCompletion(true);
-      const timer = window.setTimeout(() => setShowCompletion(false), 900);
-      wasWorkingRef.current = false;
-      return () => window.clearTimeout(timer);
-    }
-    if (isWorking) wasWorkingRef.current = true;
-    return undefined;
-  }, [done, isWorking]);
+  // Particle field only while there is no usable preview yet; once a partial
+  // or final image is present we keep the canvas off to avoid covering it.
+  const showParticles = isWorking && !failed && !source;
 
   const stateLabel = downloadFailed
     ? "图片预览加载失败"
@@ -165,10 +339,25 @@ function ChatImagePart({ part }: { part: MessagePart }) {
         ? "图片已生成"
         : source
           ? "正在优化预览"
-          : "正在生成图片";
+          : "正在创建图片";
   const imageKey = useMemo(
     () => `${fileId || directSource}-${revision}`,
     [directSource, fileId, revision],
+  );
+
+  useEffect(() => {
+    setMeasuredAspect(undefined);
+  }, [imageKey]);
+
+  const handleImageLoad = useCallback(
+    (event: SyntheticEvent<HTMLImageElement>) => {
+      if (width && height) return;
+      const node = event.currentTarget;
+      if (node.naturalWidth > 0 && node.naturalHeight > 0) {
+        setMeasuredAspect(`${node.naturalWidth} / ${node.naturalHeight}`);
+      }
+    },
+    [height, width],
   );
 
   const mimeType = typeof data?.mime_type === "string" ? data.mime_type : "";
@@ -203,16 +392,17 @@ function ChatImagePart({ part }: { part: MessagePart }) {
   }, [downloadName, source]);
 
   const interactive = done && !failed;
-  const showOverlay = isWorking || !source || failed || showCompletion;
-  const showProgress = !failed && (isWorking || showCompletion || !source);
+  // Failed states, or partial-preview polishing, keep a compact status chip.
+  // Pure wait (no preview yet) is handled entirely by the particle card.
+  const showOverlay = failed || (isWorking && Boolean(source));
 
   return (
     <figure
       aria-busy={isWorking}
       className={`chat-generated-image${
         source ? " chat-generated-image--has-preview" : ""
-      }`}
-      style={{ aspectRatio }}
+      }${showParticles ? " chat-generated-image--particles" : ""}`}
+      style={aspectRatio ? { aspectRatio } : undefined}
     >
       {source ? (
         interactive ? (
@@ -226,6 +416,7 @@ function ChatImagePart({ part }: { part: MessagePart }) {
               alt={alt}
               className="chat-generated-image__preview"
               key={imageKey}
+              onLoad={handleImageLoad}
               src={source}
             />
           </button>
@@ -234,14 +425,21 @@ function ChatImagePart({ part }: { part: MessagePart }) {
             alt={alt}
             className="chat-generated-image__preview"
             key={imageKey}
+            onLoad={handleImageLoad}
             src={source}
           />
         )
       ) : null}
-      {isWorking && !failed ? (
-        <div aria-hidden="true" className="chat-generated-image__shimmer">
-          <i className="chat-generated-image__shimmer-dots" />
-          <i className="chat-generated-image__shimmer-sweep" />
+      {showParticles ? (
+        <div
+          aria-live="polite"
+          className="chat-generated-image__particle-card"
+          role="status"
+        >
+          <span className="chat-generated-image__particle-title">
+            {stateLabel}
+          </span>
+          <ImageParticleField active={showParticles} />
         </div>
       ) : null}
       {showOverlay ? (
@@ -252,33 +450,12 @@ function ChatImagePart({ part }: { part: MessagePart }) {
           <span className="chat-generated-image__icon">
             {failed ? (
               <CircleAlert className="size-5" />
-            ) : loadingRevision ? (
-              <LoaderCircle className="size-5" />
             ) : (
-              <ImageIcon className="size-5" />
+              <LoaderCircle className="size-5 animate-spin" />
             )}
           </span>
           <strong>{stateLabel}</strong>
-          <span>{title}</span>
-          {showProgress ? (
-            <span className="chat-generated-image__progress-row">
-              <span
-                aria-valuemax={100}
-                aria-valuemin={0}
-                aria-valuenow={Math.round(progress)}
-                className="chat-generated-image__progressbar"
-                role="progressbar"
-              >
-                <i
-                  className="chat-generated-image__progressbar-fill"
-                  style={{ width: `${progress}%` }}
-                />
-              </span>
-              <span className="chat-generated-image__percent">
-                {Math.floor(progress)}%
-              </span>
-            </span>
-          ) : null}
+          {failed || title !== stateLabel ? <span>{title}</span> : null}
         </div>
       ) : null}
       {interactive ? (
@@ -333,11 +510,13 @@ function ChatImagePart({ part }: { part: MessagePart }) {
 }
 
 export function ChatStreamPartRenderer({
+  interactive = true,
   onAction,
   part,
   siblingParts,
   streaming = false,
 }: {
+  interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
   part: MessagePart;
   siblingParts?: MessagePart[];
@@ -346,6 +525,7 @@ export function ChatStreamPartRenderer({
   if (part.type === "image") return <ChatImagePart part={part} />;
   return (
     <MessagePartRenderer
+      interactive={interactive}
       onAction={onAction}
       part={part}
       siblingParts={siblingParts}

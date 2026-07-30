@@ -28,6 +28,7 @@ from app.domain.models import (
     FileTextChunk,
     Goal,
     Graph,
+    GraphChangeSet,
     GraphEdge,
     GraphNode,
     ImageGenerationTask,
@@ -2506,6 +2507,167 @@ class ChatService:
             return ""
 
 
+    def _start_generate_image_placeholder(
+        self,
+        *,
+        session_id: str,
+        assistant_message_id: str,
+        assistant_version_id: str,
+        input_data: dict,
+        next_ordinal: int,
+        sequence: int,
+        streamed_parts: list,
+    ) -> tuple[MessagePartRecord, str]:
+        """Create a durable pending image part so the chat canvas can wait.
+
+        Agent `generate_image` only returns the finished artifact after the
+        provider stream ends. Without this placeholder the UI shows only the
+        tool-call chip ("进行中") and never the particle canvas.
+        """
+
+        prompt_raw = input_data.get("prompt") if isinstance(input_data, dict) else None
+        prompt = (
+            " ".join(prompt_raw.split())
+            if isinstance(prompt_raw, str) and prompt_raw.strip()
+            else ""
+        )
+        title_raw = input_data.get("title") if isinstance(input_data, dict) else None
+        title = (
+            " ".join(title_raw.split())[:120]
+            if isinstance(title_raw, str) and title_raw.strip()
+            else (prompt[:80] if prompt else "正在创建图片")
+        )
+        image_data = {
+            "title": title,
+            "alt": (prompt[:240] if prompt else title),
+            "prompt": prompt,
+            "progress_mode": "indeterminate",
+            "preview_revision": 0,
+            "tool": "generate_image",
+            # Neutral landscape frame until the provider reports real dimensions.
+            "aspect_ratio": "4 / 3",
+        }
+        record = self.message_parts.add(
+            MessagePartRecord(
+                workspace_id=self.workspace_id,
+                message_version_id=assistant_version_id,
+                ordinal=next_ordinal,
+                part_type="image",
+                status="pending",
+                content=title,
+                data=image_data,
+            )
+        )
+        streamed_parts.append(record)
+        started = self._append_event(
+            session_id=session_id,
+            message_id=assistant_message_id,
+            message_version_id=assistant_version_id,
+            part_id=record.id,
+            sequence=sequence,
+            event_type="part.started",
+            payload={
+                "part": self._part_snapshot(
+                    record.id,
+                    "image",
+                    "pending",
+                    record.content,
+                    record.data,
+                    sequence=record.ordinal,
+                )
+            },
+        )
+        return record, self._encode_event(started)
+
+    def _finish_generate_image_placeholder(
+        self,
+        image_record: MessagePartRecord,
+        *,
+        session_id: str,
+        assistant_message_id: str,
+        assistant_version_id: str,
+        result_meta: dict,
+        sequence: int,
+    ) -> str:
+        """Promote a pending image part to completed/failed after the tool returns.
+
+        Consumes `result_meta["artifact"]` when it is an image so
+        `_emit_sandbox_side_effect_parts` does not create a second image part.
+        """
+
+        artifact = result_meta.get("artifact") if isinstance(result_meta, dict) else None
+        completed = (
+            isinstance(result_meta, dict)
+            and result_meta.get("status") == "completed"
+            and isinstance(artifact, dict)
+            and str(artifact.get("type") or "") == "image"
+        )
+        if completed:
+            data = (
+                artifact.get("data")
+                if isinstance(artifact.get("data"), dict)
+                else {}
+            )
+            if not isinstance(data, dict):
+                data = {}
+            merged = {
+                **(image_record.data or {}),
+                **data,
+                "progress_mode": "completed",
+            }
+            image_record.status = "completed"
+            image_record.content = str(
+                data.get("title")
+                or data.get("alt")
+                or image_record.content
+                or "生成图片"
+            )
+            image_record.data = merged
+            # Prevent the generic side-effect emitter from re-adding this image.
+            result_meta.pop("artifact", None)
+            event_type = "part.completed"
+        else:
+            error_code = ""
+            error_message = "图片生成失败"
+            if isinstance(result_meta, dict):
+                error_code = str(
+                    result_meta.get("error_code")
+                    or result_meta.get("reason")
+                    or ""
+                )
+                error_message = str(
+                    result_meta.get("error_message")
+                    or result_meta.get("message")
+                    or error_message
+                )
+            image_record.status = "failed"
+            image_record.data = {
+                **(image_record.data or {}),
+                "progress_mode": "failed",
+                "error_code": error_code or None,
+                "error_message": error_message,
+            }
+            event_type = "part.failed"
+        event = self._append_event(
+            session_id=session_id,
+            message_id=assistant_message_id,
+            message_version_id=assistant_version_id,
+            part_id=image_record.id,
+            sequence=sequence,
+            event_type=event_type,
+            payload={
+                "part": self._part_snapshot(
+                    image_record.id,
+                    "image",
+                    image_record.status,
+                    image_record.content,
+                    image_record.data,
+                    sequence=image_record.ordinal,
+                )
+            },
+        )
+        return self._encode_event(event)
+
     def _emit_sandbox_side_effect_parts(
         self,
         *,
@@ -2653,6 +2815,32 @@ class ChatService:
                     data=data,
                 )
             )
+            # Agent-emitted graph proposals must bind the durable card part so
+            # confirm/reject/undo can rewrite the snapshot after review.
+            if (
+                part_type == "component"
+                and isinstance(data, dict)
+                and data.get("component_type") == "graph_update_proposal"
+            ):
+                props = data.get("props") if isinstance(data.get("props"), dict) else {}
+                proposal_id = props.get("proposal_id")
+                change_set_id = (
+                    result_meta.get("graph_change_set_id")
+                    if isinstance(result_meta, dict)
+                    else None
+                )
+                target_id = proposal_id or change_set_id
+                if isinstance(target_id, str) and target_id:
+                    change_set = self.db.get(GraphChangeSet, target_id)
+                    if (
+                        change_set is not None
+                        and change_set.workspace_id == self.workspace_id
+                    ):
+                        GraphChangeSetService(
+                            self.db,
+                            self.workspace_id,
+                            self.actor_id,
+                        ).bind_component(change_set, record)
             streamed_parts.append(record)
             event = self._append_event(
                 session_id=session_id,
@@ -7199,6 +7387,26 @@ class ChatService:
                                 )
                                 sequence += 1
                                 yield self._encode_event(tool_started)
+                                # Show the particle canvas while generate_image runs.
+                                pending_image_record: MessagePartRecord | None = None
+                                if tool_name == "generate_image" and isinstance(
+                                    input_data, dict
+                                ):
+                                    (
+                                        pending_image_record,
+                                        pending_image_event,
+                                    ) = self._start_generate_image_placeholder(
+                                        session_id=session_id,
+                                        assistant_message_id=message.id,
+                                        assistant_version_id=version.id,
+                                        input_data=input_data,
+                                        next_ordinal=next_ordinal,
+                                        sequence=sequence,
+                                        streamed_parts=reasoning_records,
+                                    )
+                                    next_ordinal += 1
+                                    sequence += 1
+                                    yield pending_image_event
                                 result_content, result_meta, result_sources = (
                                     self._execute_agent_tool(
                                         tool_call,
@@ -7257,6 +7465,21 @@ class ChatService:
                                 )
                                 sequence += 1
                                 yield self._encode_event(tool_completed)
+                                if pending_image_record is not None:
+                                    finish_event = self._finish_generate_image_placeholder(
+                                        pending_image_record,
+                                        session_id=session_id,
+                                        assistant_message_id=message.id,
+                                        assistant_version_id=version.id,
+                                        result_meta=(
+                                            result_meta
+                                            if isinstance(result_meta, dict)
+                                            else {}
+                                        ),
+                                        sequence=sequence,
+                                    )
+                                    sequence += 1
+                                    yield finish_event
                                 for extra_event in self._emit_sandbox_side_effect_parts(
                                     session_id=session_id,
                                     assistant_message_id=message.id,
@@ -9766,6 +9989,26 @@ class ChatService:
                                 )
                                 sequence += 1
                                 yield self._encode_event(tool_started)
+                                # Show the particle canvas while generate_image runs.
+                                pending_image_record: MessagePartRecord | None = None
+                                if tool_name == "generate_image" and isinstance(
+                                    input_data, dict
+                                ):
+                                    (
+                                        pending_image_record,
+                                        pending_image_event,
+                                    ) = self._start_generate_image_placeholder(
+                                        session_id=session_id,
+                                        assistant_message_id=assistant_message.id,
+                                        assistant_version_id=assistant_version.id,
+                                        input_data=input_data,
+                                        next_ordinal=next_stream_part_ordinal,
+                                        sequence=sequence,
+                                        streamed_parts=streamed_parts,
+                                    )
+                                    next_stream_part_ordinal += 1
+                                    sequence += 1
+                                    yield pending_image_event
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
                                 result_content, result_meta, result_sources = self._execute_agent_tool(
@@ -9827,6 +10070,21 @@ class ChatService:
                                 )
                                 sequence += 1
                                 yield self._encode_event(tool_completed)
+                                if pending_image_record is not None:
+                                    finish_event = self._finish_generate_image_placeholder(
+                                        pending_image_record,
+                                        session_id=session_id,
+                                        assistant_message_id=assistant_message.id,
+                                        assistant_version_id=assistant_version.id,
+                                        result_meta=(
+                                            result_meta
+                                            if isinstance(result_meta, dict)
+                                            else {}
+                                        ),
+                                        sequence=sequence,
+                                    )
+                                    sequence += 1
+                                    yield finish_event
 
                                 # Promote structured sandbox side-effects into first-class
                                 # MessageParts so the session UI can render downloads,

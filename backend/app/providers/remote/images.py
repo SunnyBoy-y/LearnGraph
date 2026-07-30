@@ -79,6 +79,9 @@ def _iter_sse_payloads(response: httpx.Response) -> Iterator[dict[str, Any]]:
     def decode_event() -> dict[str, Any] | None:
         nonlocal data_lines, event_name
         if not data_lines:
+            # Bare `event:` frames without data (or keep-alive blanks) are
+            # ignored.  Some image relays also emit an empty `data: {}`
+            # heartbeat before the real frame — drop those below.
             event_name = None
             return None
         data = "\n".join(data_lines)
@@ -97,12 +100,46 @@ def _iter_sse_payloads(response: httpx.Response) -> Iterator[dict[str, Any]]:
             raise ImageGenerationProviderResponseError(
                 "OpenAI Images SSE data must be an object"
             )
+        # Empty objects are used by some OpenAI-compatible relays as stream
+        # openers / heartbeats.  Without a named event they carry no signal.
+        if not payload and not current_event_name:
+            return None
         payload_type = payload.get("type")
         if current_event_name and payload_type and current_event_name != payload_type:
-            raise ImageGenerationProviderResponseError(
-                "OpenAI Images SSE event name does not match its payload type"
-            )
+            # Prefer the payload type for OpenAI-native frames, but keep the
+            # SSE event name when the body is an error envelope without a
+            # matching type (e.g. `event: proxy_error` + `{"error": ...}`).
+            if not (
+                isinstance(payload.get("error"), dict)
+                or current_event_name
+                in {
+                    "error",
+                    "proxy_error",
+                    "image_generation.failed",
+                    "image_edit.failed",
+                }
+            ):
+                raise ImageGenerationProviderResponseError(
+                    "OpenAI Images SSE event name does not match its payload type"
+                )
         if current_event_name and not payload_type:
+            payload["type"] = current_event_name
+        elif (
+            current_event_name
+            and payload_type
+            and current_event_name != payload_type
+            and (
+                isinstance(payload.get("error"), dict)
+                or current_event_name
+                in {
+                    "error",
+                    "proxy_error",
+                    "image_generation.failed",
+                    "image_edit.failed",
+                }
+            )
+        ):
+            # Surface the relay event name so error handling can classify it.
             payload["type"] = current_event_name
         return payload
 
@@ -114,12 +151,12 @@ def _iter_sse_payloads(response: httpx.Response) -> Iterator[dict[str, Any]]:
             continue
         if line.startswith(":"):
             continue
+        # WHATWG SSE: a line without `:` is a field name with an empty value.
+        # Older strict parsing rejected these and broke several image relays.
         field, separator, value = line.partition(":")
         if not separator:
-            raise ImageGenerationProviderResponseError(
-                "OpenAI Images returned a malformed SSE field"
-            )
-        if value.startswith(" "):
+            field, value = line, ""
+        elif value.startswith(" "):
             value = value[1:]
         if field == "event":
             if event_name is not None:
@@ -129,10 +166,7 @@ def _iter_sse_payloads(response: httpx.Response) -> Iterator[dict[str, Any]]:
             event_name = value
         elif field == "data":
             data_lines.append(value)
-        elif field not in {"id", "retry"}:
-            raise ImageGenerationProviderResponseError(
-                "OpenAI Images returned an unsupported SSE field"
-            )
+        # Ignore id/retry and any proprietary relay fields.
     payload = decode_event()
     if payload is not None:
         yield payload
@@ -286,11 +320,53 @@ def _native_image_url(payload: dict[str, Any]) -> str | None:
     return None
 
 
+_PARTIAL_IMAGE_EVENT_TYPES = frozenset(
+    {
+        "image_generation.partial_image",
+        "image_edit.partial_image",
+    }
+)
+_COMPLETED_IMAGE_EVENT_TYPES = frozenset(
+    {
+        "image_generation.completed",
+        "image_edit.completed",
+    }
+)
+_ERROR_IMAGE_EVENT_TYPES = frozenset(
+    {
+        "error",
+        "proxy_error",
+        "image_generation.failed",
+        "image_edit.failed",
+    }
+)
+
+
+def _sse_error_detail(payload: dict[str, Any]) -> str:
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        err_type = error.get("type")
+        if isinstance(message, str) and message.strip():
+            prefix = (
+                f"{err_type.strip()}: "
+                if isinstance(err_type, str) and err_type.strip()
+                else ""
+            )
+            return f"{prefix}{message.strip()}"
+        if isinstance(err_type, str) and err_type.strip():
+            return err_type.strip()
+    message = payload.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return ""
+
+
 def parse_image_generation_event(
     payload: dict[str, Any], expected_mime_type: str
 ) -> ImageGenerationEvent:
     event_type = payload.get("type")
-    if event_type == "image_generation.partial_image":
+    if event_type in _PARTIAL_IMAGE_EVENT_TYPES:
         partial_index = payload.get("partial_image_index")
         if (
             isinstance(partial_index, bool)
@@ -309,7 +385,7 @@ def parse_image_generation_event(
             mime_type=mime_type,
             partial_index=partial_index,
         )
-    if event_type == "image_generation.completed":
+    if event_type in _COMPLETED_IMAGE_EVENT_TYPES:
         image_bytes, mime_type = _decode_image(
             payload.get("b64_json"), expected_mime_type
         )
@@ -321,6 +397,7 @@ def parse_image_generation_event(
         )
     raise ImageGenerationProviderResponseError(
         "OpenAI Images returned an unsupported SSE event type"
+        + (f": {event_type}" if isinstance(event_type, str) and event_type else "")
     )
 
 
@@ -605,28 +682,25 @@ class OpenAIImagesProvider:
         partial_indexes: set[int] = set()
         for event_payload in _iter_sse_payloads(response):
             event_type = event_payload.get("type")
-            if event_type in {"error", "image_generation.failed"}:
-                error = event_payload.get("error")
-                detail = (
-                    error.get("message", "").strip()
-                    if isinstance(error, dict)
-                    and isinstance(error.get("message"), str)
-                    else ""
-                )
+            has_error_body = isinstance(event_payload.get("error"), dict)
+            if event_type in _ERROR_IMAGE_EVENT_TYPES or (
+                has_error_body
+                and event_type not in _PARTIAL_IMAGE_EVENT_TYPES
+                and event_type not in _COMPLETED_IMAGE_EVENT_TYPES
+            ):
+                detail = _sse_error_detail(event_payload)
                 raise ImageGenerationProviderHTTPError(
                     "OpenAI Images stream returned an error event"
                     + (f": {detail}" if detail else "")
                 )
-            if event_type == "done":
+            if event_type in {None, "", "done"}:
+                # Heartbeats / stream terminators / empty relay openers.
                 continue
             if completed:
                 raise ImageGenerationProviderResponseError(
                     "OpenAI Images returned data after the completed event"
                 )
-            if event_type in {
-                "image_generation.partial_image",
-                "image_generation.completed",
-            }:
+            if event_type in _PARTIAL_IMAGE_EVENT_TYPES | _COMPLETED_IMAGE_EVENT_TYPES:
                 event = parse_image_generation_event(
                     event_payload,
                     _MIME_BY_FORMAT[self.output_format],
@@ -637,14 +711,17 @@ class OpenAIImagesProvider:
                         raise ImageGenerationProviderResponseError(
                             "OpenAI Images partial event has no index"
                         )
-                    if partial_index >= request.partial_images:
-                        raise ImageGenerationProviderResponseError(
-                            "OpenAI Images returned more partial images than requested"
-                        )
-                    if partial_index in partial_indexes:
-                        raise ImageGenerationProviderResponseError(
-                            "OpenAI Images returned a duplicate partial image index"
-                        )
+                    # `partial_images` is the count we *request* (0-3).  Some
+                    # OpenAI-compatible relays ignore that budget and still
+                    # emit extra progressive frames (or any frames when we
+                    # asked for 0).  Extra previews are safe to drop; aborting
+                    # a nearly-finished image for an off-by-one preview is not.
+                    if (
+                        request.partial_images <= 0
+                        or partial_index >= request.partial_images
+                        or partial_index in partial_indexes
+                    ):
+                        continue
                     partial_indexes.add(partial_index)
                     yield event
                     continue
@@ -655,6 +732,7 @@ class OpenAIImagesProvider:
                 continue
             raise ImageGenerationProviderResponseError(
                 "OpenAI Images returned an unsupported SSE event type"
+                + (f": {event_type}" if isinstance(event_type, str) else "")
             )
         if not completed:
             raise ImageGenerationProviderResponseError(

@@ -7,19 +7,18 @@ import {
 } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { createUuid } from "@/lib/uuid";
 import {
   ArrowUp,
+  Bot,
+  Brain,
   ChevronDown,
   ExternalLink,
-  FileText,
   LoaderCircle,
   MessageSquareText,
-  Plus,
   Search,
+  Sparkles,
   Square,
-  X,
-  Image as ImageIcon,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -43,12 +42,23 @@ import {
   groupPartsForDisplay,
   thinkingDurationSeconds,
 } from "@/features/chat/chat-message-parts";
+import {
+  bindExplanationSession,
+  buildSelectionExplainPrompt,
+  createSelectionExplanationId,
+  getSelectionExplanation,
+  inferSelectionAction,
+  type SelectionExplainAction,
+  type SelectionExplanationOpenDetail,
+  type SelectionExplanationRecord,
+  upsertSelectionExplanation,
+} from "@/features/chat/selection-explanation";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuLabel,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
@@ -56,8 +66,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { discoverProviderModels, listProviders } from "@/api/providers";
+import { getAgentSandboxReadiness } from "@/api/control";
+import {
+  cancelSessionMessage,
+  createSession,
+  listSessionMessages,
+  listSessions,
+  streamSessionMessage,
+} from "@/api/sessions";
 import {
   capabilityThinkingModes,
   fuzzyModelMatch,
@@ -68,24 +85,14 @@ import {
   thinkingLabels,
 } from "@/lib/model-choices";
 import {
-  setSessionComposerPrefs,
   getSessionComposerPrefs,
+  setSessionComposerPrefs,
+  type ResponseMode,
   type ThinkingMode,
 } from "@/lib/session-composer-prefs";
+import { createUuid } from "@/lib/uuid";
 import { isDeepSeekProvider, isModelProviderType } from "@/types/providers";
-import {
-  cancelSessionMessage,
-  createSession,
-  listSessionMessages,
-  listSessions,
-  streamSessionMessage,
-} from "@/api/sessions";
-import { lookupFile, uploadFile } from "@/api/files";
-import { ApiError } from "@/api/client";
-import { hashFileSha256 } from "@/lib/file-hash";
-import type { FileRecord } from "@/types/files";
 import type {
-  DocumentSelectionContext,
   Message,
   MessageCreateRequest,
   MessagePart,
@@ -93,55 +100,13 @@ import type {
   SessionMessageStreamData,
 } from "@/types/sessions";
 
-
 type ChatStatus = "ready" | "submitted" | "streaming" | "error";
 
-
-export interface PendingDocumentSelection {
-  file_id: string;
-  document_revision_id: string;
-  /** Best-effort chunk anchor; null when the selection could not be resolved to a single chunk. */
-  chunk_id: string | null;
-  locator: Record<string, unknown>;
-  locator_label: string;
-  selected_text: string;
-}
-
-
-interface DocumentChatPanelProps {
-  autoSubmitSeed?: boolean;
-  embeddedImages?: Array<{ id: string; blob: Blob; filename: string; locator: Record<string, unknown> }>;
-  file: FileRecord;
-  onRemoveEmbeddedImage?: (id: string) => void;
-  onClearSelection: () => void;
-  onSessionChange: (sessionId: string) => void;
-  questionSeed?: { id: string; text: string };
-  selection: PendingDocumentSelection | null;
-  sessionId: string;
+export type SelectionExplanationPanelProps = {
+  detail: SelectionExplanationOpenDetail;
+  parentSessionId: string;
   workspaceId: string;
-}
-
-function EmbeddedImagePreview({ blob, filename }: { blob: Blob; filename: string }) {
-  const [source, setSource] = useState("");
-  useEffect(() => {
-    const url = URL.createObjectURL(blob);
-    setSource(url);
-    return () => URL.revokeObjectURL(url);
-  }, [blob]);
-  return source ? <img alt={filename} className="max-h-[75svh] w-full object-contain" src={source} /> : null;
-}
-
-
-async function sha256(value: string) {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  );
-  return Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
+};
 
 function appendPart(parts: MessagePart[], incoming: MessagePart): MessagePart[] {
   const index = parts.findIndex((part) => part.id === incoming.id);
@@ -167,7 +132,6 @@ function appendPart(parts: MessagePart[], incoming: MessagePart): MessagePart[] 
   );
 }
 
-
 function isMessagePart(value: unknown): value is MessagePart {
   return Boolean(
     value &&
@@ -178,13 +142,11 @@ function isMessagePart(value: unknown): value is MessagePart {
   );
 }
 
-
 function streamData(value: SessionMessageStreamData): Record<string, unknown> {
   return typeof value === "object" && value !== null
     ? (value as Record<string, unknown>)
     : {};
 }
-
 
 function streamEventType(data: Record<string, unknown>) {
   return typeof data.type === "string"
@@ -194,29 +156,60 @@ function streamEventType(data: Record<string, unknown>) {
       : "";
 }
 
-
 function messageParts(message: Message): MessagePart[] {
   if (message.parts.length) return message.parts;
   return message.content
-    ? [{ id: `${message.id}-text`, type: "text", status: "completed", content: message.content }]
+    ? [
+        {
+          id: `${message.id}-text`,
+          type: "text",
+          status: "completed",
+          content: message.content,
+        },
+      ]
     : [];
 }
 
+function responseModeLabel(mode: ResponseMode) {
+  return mode === "fast" ? "极速" : mode === "agentic" ? "智能体" : "思考";
+}
 
-export function DocumentChatPanel({
-  autoSubmitSeed = false,
-  embeddedImages = [],
-  file,
-  onRemoveEmbeddedImage,
-  onClearSelection,
-  onSessionChange,
-  questionSeed,
-  selection,
-  sessionId,
+function ensureRecord(
+  detail: SelectionExplanationOpenDetail,
+  parentSessionId: string,
+): SelectionExplanationRecord {
+  if (detail.recordId) {
+    const existing = getSelectionExplanation(parentSessionId, detail.recordId);
+    if (existing) return existing;
+  }
+  const action =
+    detail.action ?? inferSelectionAction(detail.selectedText);
+  const record: SelectionExplanationRecord = {
+    id: detail.recordId ?? createSelectionExplanationId(),
+    parentSessionId,
+    sourceMessageId: detail.sourceMessageId,
+    selectedText: detail.selectedText.trim(),
+    prefix: detail.prefix ?? "",
+    suffix: detail.suffix ?? "",
+    contentMatched: detail.contentMatched ?? false,
+    action,
+    explanationSessionId: detail.explanationSessionId,
+    createdAt: new Date().toISOString(),
+  };
+  return upsertSelectionExplanation(record);
+}
+
+export function SelectionExplanationPanel({
+  detail,
+  parentSessionId,
   workspaceId,
-}: DocumentChatPanelProps) {
+}: SelectionExplanationPanelProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const [record, setRecord] = useState<SelectionExplanationRecord>(() =>
+    ensureRecord(detail, parentSessionId),
+  );
+  const [sessionId, setSessionId] = useState(record.explanationSessionId ?? "");
   const [draft, setDraft] = useState("");
   const [localMessages, setLocalMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ChatStatus>("ready");
@@ -225,16 +218,24 @@ export function DocumentChatPanel({
   const activeStreamSessionId = useRef("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const createdSessionRef = useRef("");
-  const submittedSeedRef = useRef("");
+  const autoSubmittedRef = useRef("");
   const sendRef = useRef<(content: string) => Promise<void>>(async () => undefined);
-  const [previewImage, setPreviewImage] = useState<(typeof embeddedImages)[number] | null>(null);
+
+  const initialPrefs = getSessionComposerPrefs(
+    record.explanationSessionId || parentSessionId,
+  );
   const [selectedProviderId, setSelectedProviderId] = useState(
-    () => getSessionComposerPrefs(sessionId).providerId ?? "",
+    () => initialPrefs.providerId ?? "",
   );
   const [selectedModelId, setSelectedModelId] = useState(
-    () => getSessionComposerPrefs(sessionId).modelId ?? "",
+    () => initialPrefs.modelId ?? "",
   );
-  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("off");
+  const [responseMode, setResponseMode] = useState<ResponseMode>(
+    () => initialPrefs.responseMode,
+  );
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(
+    () => initialPrefs.thinkingMode,
+  );
   const [modelSearch, setModelSearch] = useState("");
 
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
@@ -245,6 +246,7 @@ export function DocumentChatPanel({
     enabled: Boolean(sessionId),
     gcTime: 15_000,
   });
+
   const modelProviders = useMemo(
     () =>
       (providers.data ?? []).filter(
@@ -311,21 +313,43 @@ export function DocumentChatPanel({
   );
   const thinkingRequired =
     selectedModel?.capabilities?.thinking_required === true;
+  const supportsThinkingMode = thinkingModes.length > 0;
+  const effectiveThinkingMode =
+    responseMode === "fast" && !thinkingRequired
+      ? "off"
+      : thinkingModes.includes(thinkingMode)
+        ? thinkingMode
+        : (thinkingModes[0] ?? "off");
   const activeSession = sessions.data?.find((item) => item.id === sessionId);
   const messages = useMemo(
     () => [...(history.data ?? []), ...localMessages],
     [history.data, localMessages],
   );
 
-  // Adopt the session's persisted composer prefs so panel and full chat page agree.
+  // Rebind when the parent opens a different selection record.
   useEffect(() => {
-    if (!sessionId) return;
-    const stored = getSessionComposerPrefs(sessionId);
-    if (!stored.providerId && !stored.modelId) return;
-    if (stored.providerId) setSelectedProviderId(stored.providerId);
-    if (stored.modelId) setSelectedModelId(stored.modelId);
-    setThinkingMode(stored.responseMode === "fast" ? "off" : stored.thinkingMode);
-  }, [sessionId]);
+    const next = ensureRecord(detail, parentSessionId);
+    setRecord(next);
+    setSessionId(next.explanationSessionId ?? "");
+    setLocalMessages([]);
+    setStatus("ready");
+    setDraft("");
+    autoSubmittedRef.current = "";
+    const prefs = getSessionComposerPrefs(
+      next.explanationSessionId || parentSessionId,
+    );
+    if (prefs.providerId) setSelectedProviderId(prefs.providerId);
+    if (prefs.modelId) setSelectedModelId(prefs.modelId);
+    setResponseMode(prefs.responseMode);
+    setThinkingMode(prefs.thinkingMode);
+  }, [
+    detail.recordId,
+    detail.sourceMessageId,
+    detail.selectedText,
+    detail.action,
+    detail.explanationSessionId,
+    parentSessionId,
+  ]);
 
   useEffect(() => {
     setSelectedProviderId((current) =>
@@ -345,73 +369,34 @@ export function DocumentChatPanel({
 
   useEffect(() => {
     setThinkingMode((current) => {
-      if (current === "off") {
-        return thinkingRequired && thinkingModes.length
-          ? (thinkingModes.includes("medium") ? "medium" : thinkingModes[0])
-          : current;
+      if (responseMode === "fast" && !thinkingRequired) return "off";
+      if (!thinkingModes.length) return current === "off" ? "off" : current;
+      if (current === "off" && thinkingRequired) {
+        return thinkingModes.includes("medium") ? "medium" : thinkingModes[0]!;
       }
       return thinkingModes.includes(current)
         ? current
         : (thinkingModes[0] ?? "off");
     });
-  }, [thinkingModes, thinkingRequired]);
+  }, [responseMode, thinkingModes, thinkingRequired]);
 
   function persistComposerPrefs(
     targetSessionId: string,
     overrides: {
       providerId?: string;
       modelId?: string;
+      responseMode?: ResponseMode;
       thinkingMode?: ThinkingMode;
     } = {},
   ) {
     if (!targetSessionId) return;
-    const nextThinking = overrides.thinkingMode ?? thinkingMode;
     setSessionComposerPrefs(targetSessionId, {
       providerId: overrides.providerId ?? activeProvider?.id,
       modelId: overrides.modelId ?? selectedModel?.id,
-      responseMode: nextThinking === "off" ? "fast" : "thinking",
-      thinkingMode: nextThinking,
+      responseMode: overrides.responseMode ?? responseMode,
+      thinkingMode: overrides.thinkingMode ?? thinkingMode,
     });
   }
-
-  useEffect(() => {
-    if (!selection) return;
-    setDraft((current) =>
-      current.trim()
-        ? current
-        : `请解释这段内容：${selection.selected_text.slice(0, 600)}`,
-    );
-    requestAnimationFrame(() => composerRef.current?.focus());
-  }, [selection]);
-
-  useEffect(() => {
-    if (!questionSeed?.text.trim()) return;
-    setDraft(questionSeed.text.trim());
-    requestAnimationFrame(() => composerRef.current?.focus());
-    if (
-      autoSubmitSeed &&
-      activeProvider &&
-      history.isSuccess &&
-      submittedSeedRef.current !== questionSeed.id
-    ) {
-      submittedSeedRef.current = questionSeed.id;
-      void sendRef.current(questionSeed.text.trim());
-    }
-  }, [activeProvider, autoSubmitSeed, history.isSuccess, questionSeed]);
-
-  useEffect(() => {
-    if (!sessionId) {
-      setLocalMessages([]);
-      setStatus("ready");
-      return;
-    }
-    if (createdSessionRef.current === sessionId) {
-      createdSessionRef.current = "";
-      return;
-    }
-    setLocalMessages([]);
-    setStatus("ready");
-  }, [sessionId]);
 
   useEffect(
     () => () => {
@@ -420,89 +405,71 @@ export function DocumentChatPanel({
     [],
   );
 
+  async function ensureExplanationSession(): Promise<string> {
+    if (sessionId) return sessionId;
+    const titleSeed = record.selectedText.replace(/\s+/gu, " ").slice(0, 24);
+    const created = await createSession({
+      title: `划词解释 · ${titleSeed || "选区"}`,
+      memory_enabled: false,
+      project_id: sessions.data?.find((item) => item.id === parentSessionId)
+        ?.project_id,
+    });
+    createdSessionRef.current = created.id;
+    setSessionId(created.id);
+    const bound = bindExplanationSession(parentSessionId, record.id, created.id);
+    if (bound) setRecord(bound);
+    queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+      created,
+      ...(current ?? []).filter((item) => item.id !== created.id),
+    ]);
+    persistComposerPrefs(created.id);
+    return created.id;
+  }
+
   async function send(event?: FormEvent, contentOverride?: string) {
     event?.preventDefault();
     const content = contentOverride?.trim() || draft.trim();
     if (!content || status === "submitted" || status === "streaming") return;
-    if (!activeProvider) {
-      toast.error("没有可用的真实模型 Provider，无法发送文档问题。");
+    if (!activeProvider || !selectedModel?.id) {
+      toast.error("没有可用的真实模型 Provider，无法发送划词解释。");
       return;
     }
-    const fileIsImage = file.mime_type.toLowerCase().startsWith("image/");
-    const needsIndex =
-      !fileIsImage &&
-      file.parse_status !== "indexed" &&
-      !embeddedImages.length;
-    if (needsIndex && !selection) {
-      toast.error("请先完成文档索引，再把原文证据发送到学习对话。");
-      return;
-    }
-    if (file.parse_status !== "indexed" && selection) {
-      toast.error("请先完成文档索引，再发送划词证据。");
-      return;
-    }
-
-    let targetSessionId = sessionId;
-    if (!targetSessionId) {
-      const created = await createSession({
-        title: `阅读 ${file.original_name}`,
-        memory_enabled: false,
-      });
-      targetSessionId = created.id;
-      createdSessionRef.current = created.id;
-      onSessionChange(created.id);
-      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
-        created,
-        ...(current ?? []).filter((item) => item.id !== created.id),
-      ]);
-    }
-    persistComposerPrefs(targetSessionId);
-
-    // Upload / reuse embedded images so the server can route native or vision.
-    const imageFileIds: string[] = [];
-    for (const image of embeddedImages) {
+    if (responseMode === "agentic") {
       try {
-        const digest = await hashFileSha256(image.blob);
-        let record: FileRecord | null = null;
-        try {
-          record = await lookupFile({ name: image.filename, sha256: digest });
-        } catch (error) {
-          if (!(error instanceof ApiError && error.status === 404)) throw error;
-        }
-        if (!record) {
-          const asFile = new File([image.blob], image.filename, {
-            type: image.blob.type || "image/png",
+        const readiness = await getAgentSandboxReadiness();
+        if (!readiness.available) {
+          toast.error("智能体沙箱不可用", {
+            description: [readiness.message, readiness.remediation_steps[0]]
+              .filter(Boolean)
+              .join(" "),
           });
-          record = await uploadFile(asFile);
+          return;
         }
-        imageFileIds.push(record.id);
       } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? `图片附件失败：${error.message}`
-            : "图片附件失败",
-        );
+        toast.error("无法检查智能体沙箱状态", {
+          description:
+            error instanceof Error ? error.message : "请确认后端服务可用后重试。",
+        });
         return;
       }
     }
-    // Clear embedded images after successful upload / reuse.
-    for (const image of [...embeddedImages]) {
-      onRemoveEmbeddedImage?.(image.id);
-    }
 
-    const documentSelection: DocumentSelectionContext | undefined = selection
-      ? {
-          file_id: selection.file_id,
-          document_revision_id: selection.document_revision_id,
-          chunk_id: selection.chunk_id,
-          locator: selection.locator,
-          selected_text: selection.selected_text,
-          selected_text_hash: await sha256(selection.selected_text),
-        }
-      : undefined;
+    let targetSessionId: string;
+    try {
+      targetSessionId = await ensureExplanationSession();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "创建解释会话失败");
+      return;
+    }
+    persistComposerPrefs(targetSessionId);
+
     const stamp = Date.now();
+    // Independent explanation sessions do not share the parent timeline, so
+    // selection_context (which validates against the *current* session) cannot
+    // be sent. Embed the quote as a local part and keep the prompt self-contained.
+
     const optimisticUser: Message = {
-      id: `document-user-${stamp}`,
+      id: `explain-user-${stamp}`,
       workspace_id: workspaceId,
       session_id: targetSessionId,
       parent_message_id: null,
@@ -511,26 +478,30 @@ export function DocumentChatPanel({
       status: "completed",
       content,
       parts: [
-        { id: `document-user-text-${stamp}`, type: "text", status: "completed", content },
-        ...(documentSelection
-          ? [{
-              id: `document-selection-${stamp}`,
-              type: "document_selection" as const,
-              status: "completed" as const,
-              content: documentSelection.selected_text,
-              data: {
-                ...documentSelection,
-                filename: file.original_name,
-                locator_label: selection?.locator_label,
-              },
-            }]
-          : []),
+        {
+          id: `explain-user-text-${stamp}`,
+          type: "text",
+          status: "completed",
+          content,
+        },
+        {
+          id: `explain-quote-${stamp}`,
+          type: "selection_quote",
+          status: "completed",
+          content: record.selectedText,
+          data: {
+            source_role: "assistant",
+            source_message_id: record.sourceMessageId,
+            parent_session_id: parentSessionId,
+            action: record.action,
+          },
+        },
       ],
       provider_trace: {},
       created_at: new Date().toISOString(),
     };
     const optimisticAssistant: Message = {
-      id: `document-assistant-${stamp}`,
+      id: `explain-assistant-${stamp}`,
       workspace_id: workspaceId,
       session_id: targetSessionId,
       parent_message_id: optimisticUser.id,
@@ -549,26 +520,18 @@ export function DocumentChatPanel({
     const controller = new AbortController();
     abortRef.current = controller;
     activeStreamSessionId.current = targetSessionId;
-    const fileIds = Array.from(
-      new Set([
-        ...(fileIsImage || file.parse_status === "indexed" ? [file.id] : []),
-        ...imageFileIds,
-      ]),
-    );
     const request: MessageCreateRequest = {
       content,
-      file_ids: fileIds,
       provider_id: activeProvider.id,
-      model_id:
-        selectedModel?.id ??
-        (typeof activeProvider.capabilities.default_model === "string"
-          ? activeProvider.capabilities.default_model
-          : undefined),
-      // Only send an explicit intensity when the model declares reasoning support.
-      thinking_mode: thinkingModes.length ? thinkingMode : undefined,
-      document_selection: documentSelection,
+      model_id: selectedModel.id,
+      thinking_mode: effectiveThinkingMode,
+      agent_mode: responseMode === "agentic",
+      generation_mode: "text",
+      search_route: "disabled",
+      web_search: false,
+      graph_action: "none",
     };
-    const idempotencyKey = `document-chat-${createUuid()}`;
+    const idempotencyKey = `selection-explain-${createUuid()}`;
     const seenEventIds = new Set<string>();
     let lastEventId: string | undefined;
     let completed = false;
@@ -590,7 +553,9 @@ export function DocumentChatPanel({
             setStatus("streaming");
             const data = streamData(item.data);
             const type = streamEventType(data);
-            if (typeof data.message_id === "string") activeMessageId.current = data.message_id;
+            if (typeof data.message_id === "string") {
+              activeMessageId.current = data.message_id;
+            }
             if (type === "message.completed") completed = true;
             if (type === "message.failed") {
               const eventPayload =
@@ -607,10 +572,14 @@ export function DocumentChatPanel({
               const errorMessage =
                 typeof errorPayload?.message === "string"
                   ? errorPayload.message
-                  : null;
+                  : typeof eventPayload.message === "string"
+                    ? eventPayload.message
+                    : typeof data.message === "string"
+                      ? data.message
+                      : null;
               terminalFailure = errorMessage
-                ? `模型流在服务端失败：${errorMessage}`
-                : "模型流在服务端失败。";
+                ? `划词解释失败：${errorMessage}`
+                : "划词解释失败";
             }
             if (type === "message.cancelled") terminalFailure = "生成已取消。";
             setLocalMessages((current) =>
@@ -621,14 +590,15 @@ export function DocumentChatPanel({
                     ...message,
                     id: String(data.message_id ?? message.id),
                     status: "completed",
-                    provider_trace: (data.provider_trace ?? {}) as Record<string, unknown>,
+                    provider_trace: (data.provider_trace ??
+                      {}) as Record<string, unknown>,
                   };
                 }
                 if (type === "message.failed" || type === "message.cancelled") {
                   return {
                     ...message,
                     id: String(data.message_id ?? message.id),
-                    status: type === "message.cancelled" ? "cancelled" : "failed",
+                    status: "failed",
                   };
                 }
                 return isMessagePart(data.part)
@@ -646,16 +616,19 @@ export function DocumentChatPanel({
         if (attempt === 2) throw transientError ?? new Error("消息流中断");
       }
       if (!completed) throw new Error("消息流结束但没有收到完成事件。");
-      await queryClient.invalidateQueries({ queryKey: ["messages", targetSessionId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["messages", targetSessionId],
+      });
+      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
       setLocalMessages([]);
       setStatus("ready");
       activeMessageId.current = null;
-      onClearSelection();
     } catch (error) {
       if (controller.signal.aborted) {
         setStatus("ready");
       } else {
         setStatus("error");
+        toast.error(error instanceof Error ? error.message : "划词解释失败");
         setLocalMessages((current) =>
           current.map((message) =>
             message.id === optimisticAssistant.id
@@ -665,17 +638,17 @@ export function DocumentChatPanel({
                   parts: [
                     ...message.parts,
                     {
-                      id: `document-error-${stamp}`,
+                      id: `explain-error-${stamp}`,
                       type: "error",
                       status: "failed",
-                      content: error instanceof Error ? error.message : "文档对话失败",
+                      content:
+                        error instanceof Error ? error.message : "划词解释失败",
                     },
                   ],
                 }
               : message,
           ),
         );
-        toast.error(error instanceof Error ? error.message : "文档对话失败");
       }
     } finally {
       abortRef.current = null;
@@ -684,6 +657,29 @@ export function DocumentChatPanel({
     }
   }
   sendRef.current = (content) => send(undefined, content);
+
+  // Auto-send define/explain on first open of a fresh record.
+  useEffect(() => {
+    if (!activeProvider || !selectedModel?.id) return;
+    if (sessionId && history.isPending) return;
+    if (messages.length > 0) return;
+    if (status !== "ready") return;
+    const autoKey = `${record.id}:${record.action}`;
+    if (autoSubmittedRef.current === autoKey) return;
+    autoSubmittedRef.current = autoKey;
+    const prompt = buildSelectionExplainPrompt(record.action, record.selectedText);
+    void sendRef.current(prompt);
+  }, [
+    activeProvider,
+    selectedModel?.id,
+    sessionId,
+    history.isPending,
+    messages.length,
+    status,
+    record.id,
+    record.action,
+    record.selectedText,
+  ]);
 
   async function stop() {
     const messageId = activeMessageId.current;
@@ -697,46 +693,123 @@ export function DocumentChatPanel({
     setStatus("ready");
   }
 
-  async function expandToFullChat() {
-    let targetSessionId = sessionId;
-    if (!targetSessionId) {
-      const created = await createSession({
-        title: `阅读 ${file.original_name}`,
-        memory_enabled: false,
-      });
-      targetSessionId = created.id;
-      createdSessionRef.current = created.id;
-      onSessionChange(created.id);
-      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
-        created,
-        ...(current ?? []).filter((item) => item.id !== created.id),
-      ]);
+  function setMode(mode: ResponseMode) {
+    setResponseMode(mode);
+    if (mode === "fast") setThinkingMode("off");
+    else if (mode === "thinking" && thinkingMode === "off" && thinkingModes.length) {
+      setThinkingMode(
+        thinkingModes.includes("medium") ? "medium" : thinkingModes[0]!,
+      );
     }
-    persistComposerPrefs(targetSessionId);
-    navigate(`/w/${workspaceId}/chat/${targetSessionId}`);
+    if (sessionId) {
+      persistComposerPrefs(sessionId, {
+        responseMode: mode,
+        thinkingMode:
+          mode === "fast"
+            ? "off"
+            : thinkingMode === "off" && thinkingModes.length
+              ? thinkingModes.includes("medium")
+                ? "medium"
+                : thinkingModes[0]!
+              : thinkingMode,
+      });
+    }
   }
 
-  const unavailableSession = Boolean(
-    sessionId && sessions.isSuccess && !activeSession,
-  );
-  const sessionClosed = activeSession?.status === "closed";
+  function setAction(action: SelectionExplainAction) {
+    const next = upsertSelectionExplanation({ ...record, action });
+    setRecord(next);
+  }
+
   const busy = status === "submitted" || status === "streaming";
+  const sessionClosed = activeSession?.status === "closed";
 
   return (
-    <section className="flex h-full min-h-[36rem] flex-col bg-background" aria-label="文档学习对话">
-      <header className="flex h-12 flex-none items-center gap-2 border-b px-3">
-        <MessageSquareText className="size-4" />
-        <div className="min-w-0 flex-1">
-          <h2 className="truncate text-xs font-semibold">文档学习对话</h2>
-          <p className="truncate text-[10px] text-muted-foreground">
-            {activeProvider ? `${activeProvider.display_name} · 持久会话` : "真实模型未配置"}
-          </p>
+    <section
+      aria-label="划词解释独立画布"
+      className="selection-explanation-panel flex h-full min-h-0 flex-col"
+    >
+      <div className="selection-explanation-rail__quote selection-explanation-panel__quote">
+        <div className="flex items-center justify-between gap-2">
+          <span>选中内容</span>
+          <div className="flex items-center gap-1">
+            <Button
+              aria-pressed={record.action === "define"}
+              className="h-6 px-2 text-[10px]"
+              onClick={() => setAction("define")}
+              size="xs"
+              type="button"
+              variant={record.action === "define" ? "secondary" : "ghost"}
+            >
+              定义
+            </Button>
+            <Button
+              aria-pressed={record.action === "explain"}
+              className="h-6 px-2 text-[10px]"
+              onClick={() => setAction("explain")}
+              size="xs"
+              type="button"
+              variant={record.action === "explain" ? "secondary" : "ghost"}
+            >
+              解释
+            </Button>
+          </div>
         </div>
-        <DropdownMenu onOpenChange={(open) => { if (!open) setModelSearch(""); }}>
+        <p>{record.selectedText}</p>
+      </div>
+
+      <div className="selection-explanation-panel__toolbar">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              aria-label="选择响应模式"
+              className="h-7 gap-1 px-2"
+              disabled={busy}
+              size="xs"
+              variant="outline"
+            >
+              {responseMode === "fast" ? (
+                <Zap className="size-3" />
+              ) : responseMode === "agentic" ? (
+                <Bot className="size-3" />
+              ) : (
+                <Brain className="size-3" />
+              )}
+              <span className="text-[10px]">{responseModeLabel(responseMode)}</span>
+              <ChevronDown className="size-3" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-40">
+            <DropdownMenuLabel>响应模式</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              onValueChange={(value) => setMode(value as ResponseMode)}
+              value={responseMode}
+            >
+              <DropdownMenuRadioItem value="fast">
+                <Zap className="mr-2 size-3.5" />
+                极速
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="thinking">
+                <Brain className="mr-2 size-3.5" />
+                思考
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="agentic">
+                <Bot className="mr-2 size-3.5" />
+                智能体
+              </DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <DropdownMenu
+          onOpenChange={(open) => {
+            if (!open) setModelSearch("");
+          }}
+        >
           <DropdownMenuTrigger asChild>
             <Button
               aria-label="选择模型与思考力度"
-              className="max-w-36 gap-1 px-2"
+              className="max-w-[9.5rem] gap-1 px-2"
               disabled={!modelProviders.length || busy}
               size="xs"
               variant="outline"
@@ -753,9 +826,28 @@ export function DocumentChatPanel({
               onValueChange={(value) => {
                 const mode = value as ThinkingMode;
                 setThinkingMode(mode);
-                if (sessionId) persistComposerPrefs(sessionId, { thinkingMode: mode });
+                if (mode !== "off" && responseMode === "fast") {
+                  setResponseMode("thinking");
+                }
+                if (sessionId) {
+                  persistComposerPrefs(sessionId, {
+                    thinkingMode: mode,
+                    responseMode:
+                      mode === "off" && responseMode !== "agentic"
+                        ? "fast"
+                        : responseMode === "fast"
+                          ? "thinking"
+                          : responseMode,
+                  });
+                }
               }}
-              value={thinkingModes.length ? thinkingMode : "off"}
+              value={
+                responseMode === "fast" && !thinkingRequired
+                  ? "off"
+                  : supportsThinkingMode
+                    ? effectiveThinkingMode
+                    : "off"
+              }
             >
               <DropdownMenuRadioItem disabled={thinkingRequired} value="off">
                 关闭{thinkingRequired ? "（该模型仅支持思考）" : ""}
@@ -829,70 +921,42 @@ export function DocumentChatPanel({
             </div>
           </DropdownMenuContent>
         </DropdownMenu>
+
         <Button
           aria-label="在完整会话画布中打开"
-          disabled={busy}
-          onClick={() =>
-            void expandToFullChat().catch((error: Error) => toast.error(error.message))
-          }
+          className="ml-auto"
+          disabled={!sessionId || busy}
+          onClick={() => {
+            if (!sessionId) return;
+            persistComposerPrefs(sessionId);
+            navigate(`/w/${workspaceId}/chat/${sessionId}`);
+          }}
           size="icon-xs"
           variant="ghost"
         >
           <ExternalLink className="size-3.5" />
         </Button>
-        <Button
-          aria-label="新建文档学习对话"
-          disabled={busy}
-          onClick={() => onSessionChange("")}
-          size="icon-xs"
-          variant="ghost"
-        >
-          <Plus className="size-3.5" />
-        </Button>
-      </header>
-
-      {selection ? (
-        <div className="flex flex-none gap-2 border-b bg-muted/35 px-3 py-2 text-[11px]">
-          <FileText className="mt-0.5 size-3.5 flex-none text-primary" />
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <strong className="truncate">{selection.locator_label || "整文件上下文"}</strong>
-              <span className="text-muted-foreground">
-                {selection.chunk_id ? "已校验后发送" : "以整文件 + 选区提示发送"}
-              </span>
-            </div>
-            <p className="mt-1 line-clamp-3 leading-4 text-muted-foreground">
-              {selection.selected_text}
-            </p>
-          </div>
-          <Button aria-label="清除文档选区" onClick={onClearSelection} size="icon-xs" variant="ghost">
-            <X className="size-3" />
-          </Button>
-        </div>
-      ) : null}
+      </div>
 
       <Conversation className="min-h-0 flex-1">
-        <ConversationContent className="gap-5 px-3 py-4">
+        <ConversationContent className="gap-4 px-3 py-3">
           {history.isPending && sessionId ? (
-            <div className="grid min-h-32 place-items-center">
+            <div className="grid min-h-24 place-items-center">
               <LoaderCircle className="size-4 animate-spin" />
             </div>
           ) : null}
-          {unavailableSession ? (
+          {!messages.length && !history.isPending ? (
             <ConversationEmptyState
-              description="该会话已删除、不可访问或不属于当前工作区。"
-              icon={<MessageSquareText className="size-5" />}
-              title="无法读取会话"
-            >
-              <Button onClick={() => onSessionChange("")} size="sm" variant="outline">开始新对话</Button>
-            </ConversationEmptyState>
-          ) : null}
-          {!messages.length && !history.isPending && !unavailableSession ? (
-            <ConversationEmptyState
-              className="min-h-64 px-5"
-              description="选中原文后直接提问，回答、引用和 Provider Trace 会保存到正式 Session。"
-              icon={<MessageSquareText className="size-5" />}
-              title="围绕原文件继续学习"
+              className="min-h-40 px-4"
+              description="会自动按「定义 / 解释」方式生成首答，也可继续追问。"
+              icon={<Sparkles className="size-4" />}
+              title={
+                busy
+                  ? record.action === "define"
+                    ? "正在定义…"
+                    : "正在解释…"
+                  : "独立解释上下文"
+              }
             />
           ) : null}
           {messages.map((message) => {
@@ -919,8 +983,15 @@ export function DocumentChatPanel({
                 return renderPart(group.part);
               });
             return (
-              <AiMessage from={message.role === "user" ? "user" : "assistant"} key={message.id}>
-                <MessageContent className={message.role === "assistant" ? "w-full gap-2" : undefined}>
+              <AiMessage
+                from={message.role === "user" ? "user" : "assistant"}
+                key={message.id}
+              >
+                <MessageContent
+                  className={
+                    message.role === "assistant" ? "w-full gap-2" : undefined
+                  }
+                >
                   {groupPartsForDisplay(parts).map((segment, index) =>
                     segment.kind === "chain" ? (
                       <ThinkingChain
@@ -956,7 +1027,10 @@ export function DocumentChatPanel({
         <ConversationScrollButton />
       </Conversation>
 
-      <form className="document-chat-composer flex-none border-t p-3" onSubmit={(event) => void send(event)}>
+      <form
+        className="selection-explanation-panel__composer"
+        onSubmit={(event) => void send(event)}
+      >
         {!providers.isPending && !activeProvider ? (
           <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-amber-800">
             <span>没有可用的真实模型 Provider。</span>
@@ -971,26 +1045,15 @@ export function DocumentChatPanel({
           </div>
         ) : null}
         {sessionClosed ? (
-          <p className="mb-2 text-[11px] text-muted-foreground">该会话已结束。新建对话后可继续询问。</p>
-        ) : null}
-        {embeddedImages.length ? (
-          <div className="document-chat-attachments" aria-label="待发送图片">
-            {embeddedImages.map((image) => (
-              <div className="document-chat-attachment" key={image.id}>
-                <button aria-label={`预览 ${image.filename}`} onClick={() => setPreviewImage(image)} type="button">
-                  <EmbeddedImagePreview blob={image.blob} filename={image.filename} />
-                  <span><strong>{image.filename}</strong><small>源文件图片 · 待发送</small></span>
-                </button>
-                <Button aria-label={`移除 ${image.filename}`} onClick={() => onRemoveEmbeddedImage?.(image.id)} size="icon-xs" type="button" variant="ghost"><X /></Button>
-              </div>
-            ))}
-          </div>
+          <p className="mb-2 text-[11px] text-muted-foreground">
+            该解释会话已结束。关闭后重新划词可再开一条。
+          </p>
         ) : null}
         <div className="relative rounded-md border bg-background focus-within:ring-1 focus-within:ring-ring">
           <Textarea
-            aria-label="询问当前文档"
-            className="min-h-20 resize-none border-0 pb-11 shadow-none focus-visible:ring-0"
-            disabled={!activeProvider || sessionClosed || unavailableSession}
+            aria-label="针对这段内容继续提问"
+            className="min-h-16 resize-none border-0 pb-10 shadow-none focus-visible:ring-0"
+            disabled={!activeProvider || sessionClosed}
             onChange={(event) => setDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -998,37 +1061,44 @@ export function DocumentChatPanel({
                 void send();
               }
             }}
-            placeholder="询问选区、公式、表格或当前文档…"
+            placeholder="针对这段内容继续提问…"
             ref={composerRef}
             value={draft}
           />
           <div className="absolute inset-x-2 bottom-2 flex items-center justify-between gap-2">
             <span className="truncate text-[10px] text-muted-foreground">
-              {selection ? selection.locator_label : file.original_name}
+              <MessageSquareText className="mr-1 inline size-3" />
+              {responseModeLabel(responseMode)}
+              {activeProvider ? ` · ${activeProvider.display_name}` : ""}
             </span>
-            {status === "submitted" || status === "streaming" ? (
-              <Button aria-label="停止生成" onClick={() => void stop()} size="icon-sm" type="button" variant="secondary">
-                <Square className="size-3.5" color="#111" fill="#111" strokeWidth={0} />
+            {busy ? (
+              <Button
+                aria-label="停止生成"
+                onClick={() => void stop()}
+                size="icon-sm"
+                type="button"
+                variant="secondary"
+              >
+                <Square
+                  className="size-3.5"
+                  color="#111"
+                  fill="#111"
+                  strokeWidth={0}
+                />
               </Button>
             ) : (
               <Button
-                aria-label="发送文档问题"
-                disabled={!draft.trim() || !activeProvider || sessionClosed || unavailableSession || Boolean(embeddedImages.length)}
+                aria-label="发送划词追问"
+                disabled={!draft.trim() || !activeProvider || sessionClosed}
                 size="icon-sm"
                 type="submit"
               >
-                {status === "error" ? <ArrowUp className="size-4" /> : <ArrowUp className="size-4" />}
+                <ArrowUp className="size-4" />
               </Button>
             )}
           </div>
         </div>
       </form>
-      <Dialog onOpenChange={(open) => { if (!open) setPreviewImage(null); }} open={Boolean(previewImage)}>
-        <DialogContent className="max-w-4xl">
-          <DialogTitle className="truncate text-sm"><ImageIcon className="mr-2 inline size-4" />{previewImage?.filename}</DialogTitle>
-          {previewImage ? <EmbeddedImagePreview blob={previewImage.blob} filename={previewImage.filename} /> : null}
-        </DialogContent>
-      </Dialog>
     </section>
   );
 }

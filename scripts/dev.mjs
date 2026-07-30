@@ -11,7 +11,11 @@ import { initializeEnvFiles } from './init-env.mjs'
 const MINIMUM_NODE_MAJOR = 20
 const HEALTH_TIMEOUT_MS = 45_000
 const HEALTH_INTERVAL_MS = 500
-const HEALTH_MONITOR_INTERVAL_MS = 2_000
+// Steady-state monitoring does not need sub-second resolution. Poll slowly
+// while healthy, then tighten only after a failure so crash recovery stays
+// quick without flooding uvicorn access logs during normal development.
+const HEALTH_MONITOR_INTERVAL_MS = 15_000
+const HEALTH_MONITOR_FAILURE_INTERVAL_MS = 2_000
 const HEALTH_MONITOR_FAILURE_LIMIT = 5
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000
 const BACKEND_RESTART_DELAY_MS = 1_000
@@ -233,7 +237,14 @@ function watchHealth(url) {
     let failures = 0
     let lastProblem = 'no response'
     while (!stopped) {
-      await wait(HEALTH_MONITOR_INTERVAL_MS)
+      // Healthy backends only need a coarse heartbeat. Once a probe fails,
+      // switch to the short interval so consecutive failures still surface
+      // within roughly HEALTH_MONITOR_FAILURE_LIMIT * failure interval.
+      const intervalMs =
+        failures > 0
+          ? HEALTH_MONITOR_FAILURE_INTERVAL_MS
+          : HEALTH_MONITOR_INTERVAL_MS
+      await wait(intervalMs)
       if (stopped) break
       const check = await checkHealth(url)
       if (check.healthy) {

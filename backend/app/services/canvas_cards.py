@@ -104,6 +104,71 @@ def _strip_nulls(value: Any) -> Any:
     return value
 
 
+def _normalize_answer_key(props: dict[str, Any]) -> dict[str, Any]:
+    """Keep optional answer-key fields used for client-side grading."""
+
+    cleaned = dict(props)
+    correct_ids = cleaned.get("correct_option_ids")
+    if isinstance(correct_ids, list):
+        cleaned["correct_option_ids"] = [
+            item.strip()[:80]
+            for item in correct_ids
+            if isinstance(item, str) and item.strip()
+        ][:100]
+    elif "correct_option_ids" in cleaned:
+        cleaned.pop("correct_option_ids", None)
+
+    # Derive answer key from option-level is_correct when not provided.
+    if not cleaned.get("correct_option_ids"):
+        options = cleaned.get("options")
+        if isinstance(options, list):
+            derived = [
+                str(item.get("id")).strip()[:80]
+                for item in options
+                if isinstance(item, dict)
+                and item.get("is_correct") is True
+                and isinstance(item.get("id"), str)
+                and str(item.get("id")).strip()
+            ]
+            if derived:
+                cleaned["correct_option_ids"] = derived
+
+    correct_answers = cleaned.get("correct_answers")
+    if isinstance(correct_answers, list):
+        cleaned["correct_answers"] = [
+            item.strip()[:2_000]
+            for item in correct_answers
+            if isinstance(item, str) and item.strip()
+        ][:20]
+    elif isinstance(correct_answers, str) and correct_answers.strip():
+        cleaned["correct_answers"] = [correct_answers.strip()[:2_000]]
+    elif "correct_answers" in cleaned:
+        cleaned.pop("correct_answers", None)
+
+    for field in ("explanation", "feedback_correct", "feedback_incorrect"):
+        value = cleaned.get(field)
+        if isinstance(value, str) and value.strip():
+            limit = 5_000 if field == "explanation" else 2_000
+            cleaned[field] = value.strip()[:limit]
+        elif field in cleaned:
+            cleaned.pop(field, None)
+    return cleaned
+
+
+def _answer_key_renderer_props(props: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for field in (
+        "correct_option_ids",
+        "correct_answers",
+        "explanation",
+        "feedback_correct",
+        "feedback_incorrect",
+    ):
+        if field in props:
+            out[field] = props[field]
+    return out
+
+
 def _normalize_props(component_type: str, props: dict[str, Any]) -> dict[str, Any]:
     """Map Agent-friendly props onto the builtin data_schema shapes."""
 
@@ -133,6 +198,8 @@ def _normalize_props(component_type: str, props: dict[str, Any]) -> dict[str, An
                 description = item.get("description")
                 if isinstance(description, str) and description.strip():
                     cleaned["description"] = description.strip()[:2_000]
+                if item.get("is_correct") is True:
+                    cleaned["is_correct"] = True
                 cleaned_options.append(cleaned)
             props = {**props, "options": cleaned_options}
         if "options" not in props or not isinstance(props.get("options"), list):
@@ -145,6 +212,7 @@ def _normalize_props(component_type: str, props: dict[str, Any]) -> dict[str, An
             prompt = props.get("prompt")
             if isinstance(prompt, str) and prompt.strip():
                 props = {**props, "title": prompt}
+        props = _normalize_answer_key(props)
     if component_type == "fill_blank":
         if "blank_ids" not in props:
             props = {**props, "blank_ids": ["answer"]}
@@ -154,6 +222,7 @@ def _normalize_props(component_type: str, props: dict[str, Any]) -> dict[str, An
             props = {**props, "title": props["prompt"]}
         if "prompt" not in props and "title" not in props:
             props = {**props, "title": "请填写", "prompt": "请填写"}
+        props = _normalize_answer_key(props)
     if component_type == "short_answer_table":
         if "title" not in props:
             props = {**props, "title": "简答题表"}
@@ -161,6 +230,7 @@ def _normalize_props(component_type: str, props: dict[str, Any]) -> dict[str, An
             props = {**props, "columns": ["问题", "回答"]}
         if not isinstance(props.get("rows"), list):
             props = {**props, "rows": [[""]]}
+        props = _normalize_answer_key(props)
     if component_type == "image_frame":
         status = props.get("status")
         if status in {"completed", "ready"}:
@@ -238,6 +308,7 @@ def build_trusted_component_part(
             "options": normalized_props.get("options") or [],
             "allow_custom": bool(normalized_props.get("allow_custom", True)),
             "allow_skip": bool(normalized_props.get("allow_skip", True)),
+            **_answer_key_renderer_props(normalized_props),
         }
         description = normalized_props.get("description")
         if isinstance(description, str) and description.strip():
@@ -253,6 +324,7 @@ def build_trusted_component_part(
                 "multiline": True,
                 "columns": normalized_props.get("columns"),
                 "rows": normalized_props.get("rows"),
+                **_answer_key_renderer_props(normalized_props),
             }
             description = normalized_props.get("description")
             if isinstance(description, str) and description.strip():
@@ -276,6 +348,7 @@ def build_trusted_component_part(
             renderer_props = {
                 "title": str(title)[:500],
                 "multiline": bool(normalized_props.get("multiline", False)),
+                **_answer_key_renderer_props(normalized_props),
             }
             description = normalized_props.get("description")
             if isinstance(description, str) and description.strip():

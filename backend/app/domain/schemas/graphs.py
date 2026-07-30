@@ -156,7 +156,7 @@ class GraphChangeSetView(ORMModel):
     source_user_message_id: str
     source_assistant_message_id: str
     mode: Literal["create", "update"]
-    status: Literal["proposed", "confirmed", "rejected"]
+    status: Literal["proposed", "confirmed", "rejected", "undone"]
     base_revision: int
     confirmed_revision: int | None
     proposal: ModelConversationGraphProposal
