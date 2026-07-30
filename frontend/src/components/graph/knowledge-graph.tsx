@@ -69,7 +69,7 @@ export type KnowledgeNodeData = {
   collapsed?: boolean;
   hasChildren?: boolean;
   hiddenCount?: number;
-  /** Local goal importance 1–100 (maps to TJ-Sylva recommend dots). */
+  /** Local goal importance 1–100 (maps to recommend dots). */
   targetWeight?: number;
   /** Deep-dive round count for this node (conversation evidence). */
   exploreCount?: number;
@@ -181,7 +181,7 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
   const collapsed = Boolean(data.collapsed);
   const hiddenCount = data.hiddenCount ?? 0;
 
-  // Tree edges leave/enter from the spine or card sides (TJ-Sylva anchors).
+  // Tree edges leave/enter from the spine or card sides.
   const targetPosition =
     kind === "root" || kind === "main"
       ? Position.Bottom
@@ -354,7 +354,7 @@ function KnowledgeTreeEdge({
       typeof data === "object" &&
       (data as Record<string, unknown>).active,
   );
-  // TJ-Sylva edgePath: vertical spine = line; horizontal branch = cubic @ 0.46.
+  // Edge path: vertical spine = line; horizontal branch = cubic @ 0.46.
   const dx = targetX - sourceX;
   const path =
     Math.abs(dx) < 16
@@ -552,7 +552,7 @@ export function KnowledgeGraph({
 
   const collapsedIds = internalCollapsed;
 
-  // Depth LOD mirroring TJ-Sylva: low / mid / high.
+  // Depth LOD: low / mid / high.
   const zoomLevel: "low" | "mid" | "high" =
     zoom < 0.4 ? "low" : zoom < 0.8 ? "mid" : "high";
 
@@ -586,7 +586,7 @@ export function KnowledgeGraph({
         onCollapsedIdsChange?.([...next]);
         return next;
       });
-      // After collapse/expand, re-center on the toggled card (TJ-Sylva).
+      // After collapse/expand, re-center on the toggled card.
       suppressAutoFit.current = true;
       window.setTimeout(() => {
         if (!flowInstance) return;

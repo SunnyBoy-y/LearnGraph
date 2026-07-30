@@ -112,6 +112,265 @@ class GraphChangeSetService:
 
         return any(dfs(node) for node in list(adjacency))
 
+    @staticmethod
+    def _contains_depths(
+        *,
+        root_id: str,
+        node_ids: set[str],
+        contains_edges: list[tuple[str, str]],
+    ) -> tuple[dict[str, int], dict[str, list[str]], dict[str, list[str]]]:
+        """BFS depths over contains edges (parent -> child). Root is layer 0."""
+
+        children: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+        parents: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+        for source, target in contains_edges:
+            if source not in node_ids or target not in node_ids:
+                continue
+            children.setdefault(source, []).append(target)
+            parents.setdefault(target, []).append(source)
+
+        depths: dict[str, int] = {root_id: 0}
+        queue = [root_id]
+        while queue:
+            current = queue.pop(0)
+            current_depth = depths[current]
+            for child in children.get(current, []):
+                # Prefer the shallowest path when multiple parents exist.
+                next_depth = current_depth + 1
+                if child not in depths or next_depth < depths[child]:
+                    depths[child] = next_depth
+                    queue.append(child)
+        return depths, children, parents
+
+    def _validate_contains_hierarchy(
+        self,
+        proposal: ModelConversationGraphProposal,
+        *,
+        mode: str,
+        existing_ids: set[str],
+        existing_nodes: list[GraphNode],
+        existing_edges: list[GraphEdge],
+        projected_node_types: dict[str, str],
+    ) -> None:
+        """Enforce layer-0 root, no orphans, and progressive next-layer splits.
+
+        Hierarchy is defined solely by ``contains`` edges (broader parent ->
+        narrower child). Layer 0 is the single root. Initial create proposals
+        must introduce layer 0 + layer 1 only. Incremental updates may only
+        attach newly added nodes under an already-existing parent at the next
+        layer (parent_depth + 1), never as orphans or multi-layer jumps.
+        """
+
+        root_ids = [node_id for node_id, node_type in projected_node_types.items() if node_type == "root"]
+        if len(root_ids) != 1:
+            raise AppError(
+                502,
+                "graph_proposal_invalid",
+                "Graph proposals require exactly one root at layer 0",
+                {"root_count": len(root_ids)},
+            )
+        root_id = root_ids[0]
+
+        added_refs = {node.ref for node in proposal.nodes if node.change == "add"}
+        # For create mode every node is newly added; for update, only proposal adds.
+        proposed_contains: list[tuple[str, str]] = [
+            (edge.source_ref, edge.target_ref)
+            for edge in proposal.edges
+            if edge.relation == "contains"
+        ]
+        existing_contains: list[tuple[str, str]] = [
+            (edge.source_node_id, edge.target_node_id)
+            for edge in existing_edges
+            if edge.relation == "contains"
+        ]
+        projected_contains = existing_contains + proposed_contains
+        projected_node_ids = set(projected_node_types)
+
+        # Reject contains self-loops / endpoints outside projected nodes early.
+        for source, target in proposed_contains:
+            if source not in projected_node_ids or target not in projected_node_ids:
+                raise AppError(
+                    502,
+                    "graph_proposal_out_of_scope",
+                    "A contains edge must connect nodes inside the projected graph",
+                    {"source_ref": source, "target_ref": target},
+                )
+            if source == target:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "A contains edge cannot connect a node to itself",
+                    {"node_ref": source},
+                )
+
+        # Detect contains cycles over the projected teaching tree.
+        if self._has_prerequisite_cycle(projected_contains):
+            raise AppError(
+                502,
+                "graph_proposal_contains_cycle",
+                "The proposal would introduce a contains cycle and break the teaching hierarchy",
+            )
+
+        depths, _children, parents = self._contains_depths(
+            root_id=root_id,
+            node_ids=projected_node_ids,
+            contains_edges=projected_contains,
+        )
+
+        # Root must stay at layer 0 and never become a contains child.
+        if parents.get(root_id):
+            raise AppError(
+                502,
+                "graph_proposal_hierarchy_invalid",
+                "The root node is layer 0 and cannot be the child of a contains edge",
+                {"root_id": root_id, "parents": parents.get(root_id, [])},
+            )
+
+        # Prefer a single contains parent; multi-parent trees confuse layering.
+        multi_parent = {
+            node_id: parent_ids
+            for node_id, parent_ids in parents.items()
+            if node_id != root_id and len(set(parent_ids)) > 1
+        }
+        if multi_parent:
+            raise AppError(
+                502,
+                "graph_proposal_hierarchy_invalid",
+                "Each non-root node must have exactly one contains parent so layers stay unambiguous",
+                {
+                    "multi_parent_nodes": {
+                        node_id: sorted(set(parent_ids))
+                        for node_id, parent_ids in multi_parent.items()
+                    }
+                },
+            )
+
+        # Every non-root projected node must be reachable from root via contains.
+        orphaned = sorted(
+            node_id
+            for node_id in projected_node_ids
+            if node_id != root_id and node_id not in depths
+        )
+        if orphaned:
+            raise AppError(
+                502,
+                "graph_proposal_orphaned_nodes",
+                "Every non-root node must connect to the root through contains edges; orphaned or hierarchy-disconnected nodes are not allowed",
+                {"orphaned_refs": orphaned},
+            )
+
+        # Non-root nodes without a contains parent are structural orphans even if
+        # reachable somehow (should not happen after BFS, but keep explicit).
+        missing_parent = sorted(
+            node_id
+            for node_id in projected_node_ids
+            if node_id != root_id and not parents.get(node_id)
+        )
+        if missing_parent:
+            raise AppError(
+                502,
+                "graph_proposal_orphaned_nodes",
+                "Every non-root node must have exactly one contains parent",
+                {"orphaned_refs": missing_parent},
+            )
+
+        if mode == "create":
+            # Initial draft must include layer 0 (root) and layer 1 only.
+            layer_one = [node_id for node_id, depth in depths.items() if depth == 1]
+            if not layer_one:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "A new graph must include layer 0 (root) and at least one layer-1 child connected by contains",
+                    {"root_id": root_id},
+                )
+            too_deep = sorted(
+                node_id for node_id, depth in depths.items() if depth > 1
+            )
+            if too_deep:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "Initial graph generation may only create layer 0 and layer 1; deeper layers are produced by later node splits",
+                    {"deep_refs": too_deep, "max_allowed_depth": 1},
+                )
+            # Every L1 node must be a direct contains child of the root.
+            not_under_root = sorted(
+                node_id
+                for node_id in projected_node_ids
+                if node_id != root_id and parents.get(node_id) != [root_id]
+            )
+            if not_under_root:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "On first generation every non-root node must be a direct contains child of the layer-0 root",
+                    {"invalid_refs": not_under_root, "root_id": root_id},
+                )
+            return
+
+        # Update mode: newly added nodes refine the next layer under existing parents.
+        if not added_refs:
+            return
+
+        existing_depths, _, _ = self._contains_depths(
+            root_id=root_id,
+            node_ids=existing_ids,
+            contains_edges=existing_contains,
+        )
+        # Existing graphs may already be imperfect; still require the projected
+        # root to exist among current nodes.
+        if root_id not in existing_ids:
+            raise AppError(
+                502,
+                "graph_proposal_hierarchy_invalid",
+                "An update must preserve the existing layer-0 root",
+                {"root_id": root_id},
+            )
+
+        for ref in sorted(added_refs):
+            parent_ids = parents.get(ref) or []
+            if len(parent_ids) != 1:
+                raise AppError(
+                    502,
+                    "graph_proposal_orphaned_nodes",
+                    "Each added node must attach under exactly one contains parent",
+                    {"orphaned_refs": [ref], "parents": parent_ids},
+                )
+            parent_id = parent_ids[0]
+            # Progressive split: parent must already exist in the live graph.
+            # Chaining newly added nodes under other new nodes would skip layers.
+            if parent_id not in existing_ids:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "Node splits may only attach under an already-existing parent; do not create multi-layer chains in one update",
+                    {"added_ref": ref, "parent_ref": parent_id},
+                )
+            parent_depth = existing_depths.get(parent_id)
+            if parent_depth is None:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "Cannot split under a parent that is not connected to the root through contains edges",
+                    {"added_ref": ref, "parent_id": parent_id},
+                )
+            child_depth = depths.get(ref)
+            expected_depth = parent_depth + 1
+            if child_depth != expected_depth:
+                raise AppError(
+                    502,
+                    "graph_proposal_hierarchy_invalid",
+                    "A node split must create the next layer under the chosen parent only",
+                    {
+                        "added_ref": ref,
+                        "parent_id": parent_id,
+                        "parent_depth": parent_depth,
+                        "child_depth": child_depth,
+                        "expected_depth": expected_depth,
+                    },
+                )
+
     def validate_proposal(
         self,
         proposal: ModelConversationGraphProposal,
@@ -122,6 +381,7 @@ class GraphChangeSetService:
         proposal_refs = {node.ref for node in proposal.nodes}
         existing_ids: set[str] = set()
         existing_nodes: list[GraphNode] = []
+        existing_edges: list[GraphEdge] = []
         if mode == "create":
             if graph is not None:
                 raise AppError(409, "graph_create_target_invalid", "A create proposal cannot target an existing graph")
@@ -151,6 +411,14 @@ class GraphChangeSetService:
                     select(GraphNode).where(
                         GraphNode.workspace_id == self.workspace_id,
                         GraphNode.graph_id == graph.id,
+                    )
+                ).all()
+            )
+            existing_edges = list(
+                self.db.scalars(
+                    select(GraphEdge).where(
+                        GraphEdge.workspace_id == self.workspace_id,
+                        GraphEdge.graph_id == graph.id,
                     )
                 ).all()
             )
@@ -235,6 +503,7 @@ class GraphChangeSetService:
             edge_keys.add(key)
 
         # Added nodes must attach via at least one edge so the tree does not fragment.
+        # Stronger contains-tree connectivity is enforced below.
         added_refs = {node.ref for node in proposal.nodes if node.change == "add"}
         if added_refs:
             attached: set[str] = set()
@@ -254,15 +523,7 @@ class GraphChangeSetService:
 
         # Project prerequisite edges (existing + proposed) and reject cycles.
         prereq_edges: list[tuple[str, str]] = []
-        if mode == "update" and graph is not None:
-            existing_edges = list(
-                self.db.scalars(
-                    select(GraphEdge).where(
-                        GraphEdge.workspace_id == self.workspace_id,
-                        GraphEdge.graph_id == graph.id,
-                    )
-                ).all()
-            )
+        if mode == "update":
             for edge in existing_edges:
                 if edge.relation == "prerequisite":
                     prereq_edges.append((edge.source_node_id, edge.target_node_id))
@@ -275,6 +536,15 @@ class GraphChangeSetService:
                 "graph_proposal_prerequisite_cycle",
                 "The proposal would introduce a prerequisite cycle and break the learning order",
             )
+
+        self._validate_contains_hierarchy(
+            proposal,
+            mode=mode,
+            existing_ids=existing_ids,
+            existing_nodes=existing_nodes,
+            existing_edges=existing_edges,
+            projected_node_types=projected_node_types,
+        )
 
     def create_proposal(
         self,

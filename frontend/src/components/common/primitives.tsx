@@ -6,7 +6,7 @@ export function StarRating({
 }: {
   value: number
   max?: number
-  /** mastery = green growth stars; importance = yellow knowledge-importance stars (TJ-Sylva style) */
+  /** mastery = green growth stars; importance = yellow knowledge-importance stars */
   tone?: "mastery" | "importance"
   label?: string
 }) {

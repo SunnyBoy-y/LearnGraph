@@ -2,7 +2,7 @@ import type { Edge } from "@xyflow/react";
 
 import type { KnowledgeNode } from "./knowledge-graph";
 
-/** TJ-Sylva style tree geometry (px). */
+/** Knowledge-tree geometry (px). */
 export const TREE_CARD_W = 230;
 export const TREE_MAIN_W = 250;
 export const TREE_ROOT_SIZE = 64;
@@ -138,7 +138,7 @@ export function buildKnowledgeTreeHierarchy(
 }
 
 /**
- * TJ-Sylva-style "knowledge tree":
+ * Knowledge tree layout:
  * - root seed sits near the bottom of a vertical spine
  * - main topics climb the spine upward
  * - deeper branches alternate left / right
@@ -325,8 +325,8 @@ export function buildKnowledgeTreeLayout(
     });
   }
 
-  // Descendants of collapsed nodes are intentionally omitted from the stage
-  // (TJ-Sylva visibleNodeIdSet). Mark them so they do not fall into orphans.
+  // Descendants of collapsed nodes are intentionally omitted from the stage.
+  // Mark them so they do not fall into orphans.
   const isUnderCollapsedAncestor = (nodeId: string) => {
     let cursor = parentByChild.get(nodeId);
     while (cursor) {

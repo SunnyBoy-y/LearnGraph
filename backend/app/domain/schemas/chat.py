@@ -49,6 +49,11 @@ class SessionCreateRequest(BaseModel):
     goal_id: str | None = Field(default=None, min_length=1, max_length=36)
     graph_id: str | None = Field(default=None, min_length=1, max_length=36)
     project_id: str | None = Field(default=None, min_length=1, max_length=36)
+    # Optional parent for nested side threads (e.g. 划词解释). The child is
+    # listed under the parent in the sidebar, not as a peer root session.
+    parent_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+    # Defaults to "main"; nested 划词解释 / side threads use "side".
+    session_kind: Literal["main", "concept_branch", "side", "standalone"] | None = None
     memory_enabled: bool = False
 
 

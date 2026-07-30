@@ -1,19 +1,8 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import {
-  ArrowRight,
   Check,
   Download,
-  Filter,
-  RefreshCcw,
   Sparkles,
   X,
 } from "lucide-react";
@@ -24,20 +13,15 @@ import {
   answerExercise,
   decideEvidence,
   generateExercises,
-  getCurrentUser,
   getMastery,
   listEvidence,
   listExercises,
   listFiles,
-  listMasteryReviewJobs,
   listMasterySchedules,
-  listMasterySessionStates,
   runMasteryReview,
-  tickMasteryScheduler,
 } from "@/api";
 import {
   ErrorState,
-  GrowthStars,
   LoadingState,
   MetricStrip,
   PageFrame,
@@ -48,17 +32,6 @@ import {
 } from "@/components/shared/page-elements";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -73,7 +46,6 @@ import type {
   Evidence,
   Exercise,
   ExerciseQuestionType,
-  MasterySchedulerTick,
 } from "@/types/learning";
 import {
   ExerciseAnswerCard,
@@ -92,342 +64,6 @@ function downloadJson(name: string, value: unknown) {
   anchor.download = name;
   anchor.click();
   URL.revokeObjectURL(url);
-}
-
-export function MasteryPage() {
-  const { workspaceId = "" } = useParams();
-  const queryClient = useQueryClient();
-  const mastery = useQuery({ queryKey: ["mastery"], queryFn: getMastery });
-  const operator = useQuery({ queryKey: ["current-user"], queryFn: getCurrentUser });
-  const isSystemAdmin = operator.data?.is_system_admin === true;
-  const reviewJobs = useQuery({
-    queryKey: ["mastery-review-jobs"],
-    queryFn: listMasteryReviewJobs,
-    enabled: isSystemAdmin,
-  });
-  const sessionStates = useQuery({
-    queryKey: ["mastery-session-states"],
-    queryFn: listMasterySessionStates,
-    enabled: isSystemAdmin,
-  });
-  const review = useMutation({
-    mutationFn: () => runMasteryReview(),
-    onSuccess: () => {
-      toast.success("掌握度更新已完成");
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery-review-jobs"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery-session-states"] });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const tick = useMutation({
-    mutationFn: tickMasteryScheduler,
-    onSuccess: async (result) => {
-      toast.success(
-        `调度完成：入队 ${result.enqueued_job_ids.length}、完成 ${result.completed_job_ids.length}、失败 ${result.failed_job_ids.length}`,
-      );
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["mastery"] }),
-        queryClient.invalidateQueries({ queryKey: ["mastery-review-jobs"] }),
-        queryClient.invalidateQueries({ queryKey: ["mastery-session-states"] }),
-        queryClient.invalidateQueries({ queryKey: ["mastery-schedules"] }),
-      ]);
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const [filter, setFilter] = useState("all");
-  if (mastery.isPending)
-    return (
-      <PageFrame>
-        <LoadingState />
-      </PageFrame>
-    );
-  if (mastery.isError)
-    return (
-      <PageFrame>
-        <ErrorState message={mastery.error.message} />
-      </PageFrame>
-    );
-  const rows = mastery.data.filter(
-    (node) =>
-      filter === "all" ||
-      node.retrieval_state === filter ||
-      node.evidence_state === filter,
-  );
-  return (
-    <PageFrame>
-      <PageIntro
-        description="成长星级只增不减；遗忘、到期复习和证据冲突通过独立状态表达，不显示误导性的掌握百分比。"
-        eyebrow="Learning evidence"
-        title="掌握度总览"
-      />
-      <Surface className="overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
-          <SectionHeading
-            description={`${mastery.data.length} 个持久化节点 · 三层成长矩阵`}
-            title="节点掌握状态"
-          />
-          <div className="flex gap-2">
-            <Select onValueChange={setFilter} value={filter}>
-              <SelectTrigger className="w-40">
-                <Filter className="size-3.5" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部状态</SelectItem>
-                <SelectItem value="due">due</SelectItem>
-                <SelectItem value="relearning">relearning</SelectItem>
-                <SelectItem value="conflicted">conflicted</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              disabled={review.isPending}
-              onClick={() => review.mutate()}
-              size="sm"
-              variant="outline"
-            >
-              {review.isPending ? "更新中…" : "立即更新"}
-            </Button>
-          </div>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[760px] text-left text-sm">
-            <thead className="bg-muted/35 text-xs text-muted-foreground">
-              <tr>
-                <th className="px-5 py-3">节点</th>
-                <th className="px-5 py-3">成长星级</th>
-                <th className="px-5 py-3">当前可提取性</th>
-                <th className="px-5 py-3">证据状态</th>
-                <th className="px-5 py-3">关注状态</th>
-                <th className="px-5 py-3">下一步</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {rows.map((node) => (
-                <tr className="hover:bg-muted/20" key={node.node_id}>
-                  <td className="px-5 py-4 font-medium">{node.label}</td>
-                  <td className="px-5 py-4">
-                    <GrowthStars value={node.mastery_stars} />
-                  </td>
-                  <td className="px-5 py-4">
-                    <StatePill status={node.retrieval_state} />
-                  </td>
-                  <td className="px-5 py-4">
-                    <StatePill status={node.evidence_state} />
-                  </td>
-                  <td className="px-5 py-4 text-xs">{node.attention_state}</td>
-                  <td className="px-5 py-4">
-                    <Button asChild size="xs" variant="ghost">
-                      <Link
-                        to={`/w/${encodeURIComponent(workspaceId)}/practice?node=${encodeURIComponent(node.node_id)}`}
-                      >
-                        {node.retrieval_state === "due"
-                          ? "复习"
-                          : node.retrieval_state === "relearning"
-                            ? "重学"
-                            : "综合题"}
-                        <ArrowRight className="size-3" />
-                      </Link>
-                    </Button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Surface>
-      <div className="grid gap-5 lg:grid-cols-[1.1fr_.9fr]">
-        <Surface className="p-5">
-          <SectionHeading
-            description="按当前服务端快照展示，不伪造历史趋势"
-            title="当前节点星级"
-          />
-          {mastery.data.length ? (
-            <div className="mt-4 h-52">
-              <ResponsiveContainer height="100%" width="100%">
-                <LineChart
-                  data={mastery.data.map((node) => ({
-                    label: node.label,
-                    stars: node.mastery_stars,
-                  }))}
-                >
-                  <XAxis
-                    axisLine={false}
-                    dataKey="label"
-                    fontSize={11}
-                    tickLine={false}
-                  />
-                  <YAxis
-                    axisLine={false}
-                    domain={[0, 5]}
-                    fontSize={11}
-                    tickLine={false}
-                    width={24}
-                  />
-                  <Tooltip />
-                  <Line
-                    dataKey="stars"
-                    dot={{ fill: "var(--primary)" }}
-                    stroke="var(--primary)"
-                    strokeWidth={2.5}
-                    type="monotone"
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          ) : (
-            <p className="grid h-52 place-items-center text-sm text-muted-foreground">
-              暂无掌握度节点
-            </p>
-          )}
-        </Surface>
-        <Surface className="p-5">
-          <SectionHeading title="如何阅读这些状态" />
-          <p className="mt-4 text-sm leading-7 text-muted-foreground">
-            星级记录已经达到过的里程碑；当前能否顺畅复述由可提取性表示；证据是否充分、冲突或跨时间稳定由证据状态表示。答错不会扣除已经获得的星级。
-          </p>
-        </Surface>
-      </div>
-      {isSystemAdmin ? (
-        <Surface className="overflow-hidden">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
-            <SectionHeading
-              description="只对系统管理员显示；Job 与 Session 游标均来自当前工作区的持久化调度事实，手动 Tick 会再次由服务端校验身份和工作区。"
-              title="管理员调度诊断"
-            />
-            <div className="flex gap-2">
-              <Button
-                disabled={reviewJobs.isFetching || sessionStates.isFetching}
-                onClick={() => {
-                  void reviewJobs.refetch();
-                  void sessionStates.refetch();
-                }}
-                size="sm"
-                variant="outline"
-              >
-                <RefreshCcw className="size-4" />刷新状态
-              </Button>
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button disabled={tick.isPending} size="sm" variant="outline">
-                    {tick.isPending ? "调度中…" : "运行 Scheduler Tick"}
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>执行当前工作区的 Scheduler Tick？</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      此操作会恢复过期租约、补偿阈值/空闲批次并处理到期节点。服务端用去重键避免同一活动版本或到期快照重复创建 Job。
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>取消</AlertDialogCancel>
-                    <AlertDialogAction disabled={tick.isPending} onClick={() => tick.mutate()}>
-                      {tick.isPending ? "执行中…" : "确认执行 Tick"}
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </div>
-          </div>
-          <div className="grid divide-y lg:grid-cols-2 lg:divide-x lg:divide-y-0">
-            <section className="min-w-0 p-5">
-              <div className="flex items-center justify-between gap-3">
-                <p className="text-sm font-semibold">复习调度 Job</p>
-                <Badge variant="outline">{reviewJobs.data?.length ?? 0} 条</Badge>
-              </div>
-              {reviewJobs.isError ? (
-                <p className="mt-4 text-sm text-destructive">{reviewJobs.error.message}</p>
-              ) : reviewJobs.isPending ? (
-                <p className="mt-4 text-sm text-muted-foreground">正在读取持久化 Job…</p>
-              ) : (
-                <div className="mt-4 max-h-[32rem] divide-y overflow-auto rounded-xl border">
-                  {(reviewJobs.data ?? []).slice(0, 24).map((job) => (
-                    <div className="p-3 text-xs" key={job.id}>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <StatePill status={job.status} />
-                        <span className="font-medium">{job.trigger}</span>
-                        <span className="font-mono text-muted-foreground">attempt {job.attempt_count}</span>
-                      </div>
-                      <p className="mt-2 break-all font-mono text-[10px] text-muted-foreground">
-                        Job {job.id} · dedupe {job.dedupe_key ?? "—"}
-                      </p>
-                      <p className="mt-1 text-muted-foreground">
-                        节点 {job.node_ids.length} · 创建 {new Date(job.created_at).toLocaleString()} · 完成 {job.completed_at ? new Date(job.completed_at).toLocaleString() : "—"}
-                      </p>
-                      {job.last_error ? <p className="mt-1 break-all text-destructive">{job.last_error}</p> : null}
-                      <details className="mt-2">
-                        <summary className="cursor-pointer text-muted-foreground">查看规则报告</summary>
-                        <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 font-mono text-[10px]">{JSON.stringify(job.report, null, 2)}</pre>
-                      </details>
-                    </div>
-                  ))}
-                  {!(reviewJobs.data ?? []).length ? <p className="p-5 text-sm text-muted-foreground">当前工作区尚无持久化调度 Job。</p> : null}
-                </div>
-              )}
-            </section>
-            <section className="min-w-0 p-5">
-              <div className="flex items-center justify-between gap-3">
-                <p className="text-sm font-semibold">Session 分析游标</p>
-                <Badge variant="outline">{sessionStates.data?.length ?? 0} 个 Session</Badge>
-              </div>
-              {sessionStates.isError ? (
-                <p className="mt-4 text-sm text-destructive">{sessionStates.error.message}</p>
-              ) : sessionStates.isPending ? (
-                <p className="mt-4 text-sm text-muted-foreground">正在读取 Session 游标…</p>
-              ) : (
-                <div className="mt-4 max-h-[32rem] divide-y overflow-auto rounded-xl border">
-                  {(sessionStates.data ?? []).map((state) => (
-                    <div className="p-3 text-xs" key={state.id}>
-                      <p className="break-all font-mono text-[10px] text-muted-foreground">Session {state.session_id}</p>
-                      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1">
-                        <span>待分析消息 {state.pending_message_count}</span>
-                        <span>activity {state.activity_version}</span>
-                        <span>processed {state.processed_version}</span>
-                        <span>enqueued {state.enqueued_version}</span>
-                      </div>
-                      <p className="mt-1 text-muted-foreground">
-                        空闲截止 {state.idle_due_at ? new Date(state.idle_due_at).toLocaleString() : "—"} · 上次处理 {state.last_processed_at ? new Date(state.last_processed_at).toLocaleString() : "—"}
-                      </p>
-                      {state.pending_node_ids.length ? <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">待处理节点：{state.pending_node_ids.join(", ")}</p> : null}
-                    </div>
-                  ))}
-                  {!(sessionStates.data ?? []).length ? <p className="p-5 text-sm text-muted-foreground">当前工作区没有待观察的 Session 游标。</p> : null}
-                </div>
-              )}
-            </section>
-          </div>
-          {tick.data ? <SchedulerTickSummary result={tick.data} /> : null}
-        </Surface>
-      ) : null}
-    </PageFrame>
-  );
-}
-
-function SchedulerTickSummary({ result }: { result: MasterySchedulerTick }) {
-  const groups: Array<[string, string[]]> = [
-    ["恢复 Job", result.recovered_job_ids],
-    ["入队 Job", result.enqueued_job_ids],
-    ["完成 Job", result.completed_job_ids],
-    ["失败 Job", result.failed_job_ids],
-    ["阈值 Session", result.threshold_session_ids],
-    ["空闲 Session", result.idle_session_ids],
-    ["到期节点", result.due_node_ids],
-  ];
-  return (
-    <div className="border-t bg-muted/20 p-5">
-      <p className="text-sm font-semibold">最近一次本页 Tick 返回</p>
-      <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {groups.map(([label, ids]) => (
-          <div className="rounded-xl border bg-background/80 p-3 text-xs" key={label}>
-            <p className="text-muted-foreground">{label}</p>
-            <p className="mt-1 font-mono text-sm">{ids.length}</p>
-            {ids.length ? <p className="mt-1 line-clamp-2 break-all font-mono text-[10px] text-muted-foreground">{ids.join(", ")}</p> : null}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 function EvidenceRow({

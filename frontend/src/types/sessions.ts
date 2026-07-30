@@ -42,6 +42,9 @@ export interface SessionCreateRequest {
   goal_id?: string | null
   graph_id?: string | null
   project_id?: string | null
+  /** Nest under a parent conversation (e.g. 划词解释). */
+  parent_session_id?: string | null
+  session_kind?: 'main' | 'concept_branch' | 'side' | 'standalone'
   memory_enabled?: boolean
 }
 

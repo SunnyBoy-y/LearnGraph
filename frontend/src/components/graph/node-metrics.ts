@@ -1,9 +1,9 @@
 /**
- * TJ-Sylva-style node metric helpers.
+ * Node metric helpers.
  *
  * LearnGraph stores local goal importance as `target_weight` (1–100).
- * TJ-Sylva uses discrete 1–3 metrics (importance / relevance / difficulty)
- * and folds importance+relevance into 1–3 recommend dots.
+ * Discrete 1–3 metrics (importance / relevance / difficulty) fold
+ * importance+relevance into 1–3 recommend dots.
  * Card chrome also shows yellow ★ knowledge-importance stars (1–3)
  * from the same weight bands — distinct from green mastery stars (0–5).
  */
@@ -16,7 +16,7 @@ export function clampMetric(value: unknown): MetricLevel {
   return Math.max(1, Math.min(3, Math.round(number))) as MetricLevel;
 }
 
-/** Map LearnGraph 1–100 weight → TJ-Sylva 1–3 importance. */
+/** Map LearnGraph 1–100 weight → 1–3 importance. */
 export function weightToImportance(weight: number | null | undefined): MetricLevel {
   const value = Number(weight);
   if (!Number.isFinite(value)) return 2;
@@ -44,7 +44,7 @@ export function recommendAdvice(score: MetricLevel): string {
 
 /**
  * Fold importance (+ optional relevance) into 1–3 recommend dots.
- * Difficulty stays out of the score (TJ-Sylva design).
+ * Difficulty stays out of the score.
  */
 export function recommendScore(
   importance: MetricLevel,

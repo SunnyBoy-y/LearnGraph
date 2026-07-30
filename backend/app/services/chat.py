@@ -3667,13 +3667,14 @@ class ChatService:
                 f"Constraints: {json.dumps(goal.constraints or {}, ensure_ascii=False)}"
             )
             action_rules = (
-                "Generate a new candidate target graph. Return at least two add nodes, exactly one root node, "
-                "and only edges whose endpoints use refs declared in nodes. Build a reviewable teaching tree: "
-                "use contains edges from a broader parent to a narrower child, keep broad learning modules "
-                "separate from concrete learnable concepts or practice, and give every non-root structural node "
-                "one contains path toward the root. Use prerequisite only for a real learning dependency, never "
-                "just to force an order. Avoid duplicate or near-duplicate labels. Keep this bounded initial "
-                "draft within the response schema; it is not a claim of a complete curriculum."
+                "Generate a new candidate target graph. Return at least two add nodes, exactly one root node "
+                "(layer 0), and only edges whose endpoints use refs declared in nodes. Hierarchy is mandatory: "
+                "contains edges define the teaching tree (broader parent -> narrower child). The first draft "
+                "MUST include layer 0 and layer 1 only — every non-root node is a direct contains child of the "
+                "root, with no orphans and no depth>1 chains. Deeper layers are created later by splitting a "
+                "chosen node. Use prerequisite only for a real learning dependency, never just to force an "
+                "order. Avoid duplicate or near-duplicate labels. Keep this bounded initial draft within the "
+                "response schema; it is not a claim of a complete curriculum."
             )
         else:
             target_graph_id = payload.graph_id or session.graph_id
@@ -3776,8 +3777,9 @@ class ChatService:
                 )
                 selected_focus = (
                     f" Focus the refinement on these currently selected learning nodes: {focus_labels}. "
-                    "Prefer adding or refining children of those nodes (via contains) rather than expanding "
-                    "unrelated distant branches."
+                    "Split those nodes only: add next-layer children under them via contains "
+                    "(parent must already exist; no multi-layer chains under newly added nodes), "
+                    "rather than expanding unrelated distant branches."
                 )
             existing_labels = sorted(
                 {
@@ -3793,13 +3795,14 @@ class ChatService:
             )
             action_rules = (
                 "Generate a non-destructive incremental graph change (图谱变更). Prefer refining the current "
-                "learning focus: add child concept/practice nodes under the selected or most relevant parent, "
-                "or update an existing node's label/description when the user is correcting it. You may add nodes, "
-                "update only existing node IDs listed above, and add relationships. Do not delete nodes or edges "
-                "and do not add another root node. Edge endpoints may use a proposal ref or an existing node ID "
-                "listed above. Preserve the contains teaching hierarchy: contains runs from a broader parent to "
-                "its narrower child and must not form a cycle; prerequisite represents only genuine learn-before "
-                "dependencies."
+                "learning focus by splitting an existing node: add child concept/practice nodes only under that "
+                "already-existing parent via contains (next layer = parent_depth + 1). Do not create multi-layer "
+                "chains under newly added nodes in one proposal, and do not leave orphans. You may also update an "
+                "existing node's label/description when the user is correcting it. Update only existing node IDs "
+                "listed above. Do not delete nodes or edges and do not add another root. Edge endpoints may use a "
+                "proposal ref or an existing node ID listed above. Preserve the contains teaching hierarchy "
+                "(exactly one contains parent per non-root node, no contains cycle); prerequisite is only for "
+                "genuine learn-before dependencies."
                 f"{selected_focus}{dedupe_hint}"
                 " Strict de-duplication: do not add a new node whose label is identical or only trivially different "
                 "(synonym, punctuation, case, plural, or parenthetical gloss) from an existing concept; if the "
@@ -4051,8 +4054,30 @@ class ChatService:
                     "session_goal_not_approved",
                     "A learning Session can only bind an approved Goal",
                 )
+        parent_session = None
+        if payload.parent_session_id:
+            parent_session = self.sessions.require(payload.parent_session_id, "parent session")
+            if parent_session.parent_session_id:
+                raise AppError(
+                    409,
+                    "session_parent_nested",
+                    "Nested sessions cannot themselves become parents",
+                )
         session_values = payload.model_dump()
         session_values["goal_id"] = resolved_goal_id
+        if parent_session is not None:
+            # Inherit project/goal/graph from the parent so sidebar grouping and
+            # ACL stay aligned with the conversation the side thread belongs to.
+            session_values["project_id"] = parent_session.project_id
+            session_values["goal_id"] = parent_session.goal_id
+            session_values["graph_id"] = parent_session.graph_id
+            session_values["parent_session_id"] = parent_session.id
+            if not session_values.get("session_kind"):
+                session_values["session_kind"] = "side"
+        else:
+            session_values.pop("parent_session_id", None)
+            if not session_values.get("session_kind"):
+                session_values["session_kind"] = "main"
         session = self.sessions.add(
             ChatSession(
                 workspace_id=self.workspace_id,
@@ -4077,6 +4102,8 @@ class ChatService:
                 "project_id": session.project_id,
                 "goal_id": session.goal_id,
                 "graph_id": session.graph_id,
+                "parent_session_id": session.parent_session_id,
+                "session_kind": session.session_kind,
             },
         )
         self.db.commit()

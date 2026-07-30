@@ -411,6 +411,8 @@ export function SelectionExplanationPanel({
     const created = await createSession({
       title: `划词解释 · ${titleSeed || "选区"}`,
       memory_enabled: false,
+      parent_session_id: parentSessionId,
+      session_kind: "side",
       project_id: sessions.data?.find((item) => item.id === parentSessionId)
         ?.project_id,
     });

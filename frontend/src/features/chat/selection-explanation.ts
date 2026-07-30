@@ -119,6 +119,24 @@ export function listSelectionExplanations(
   return Array.isArray(list) ? list : [];
 }
 
+/**
+ * Map child explanation-session id → parent session id from local history.
+ * Used to nest older 划词解释 sessions that predate parent_session_id writes.
+ */
+export function selectionExplanationParentMap(): Record<string, string> {
+  const map = readAll();
+  const out: Record<string, string> = {};
+  for (const [parentSessionId, records] of Object.entries(map)) {
+    if (!Array.isArray(records)) continue;
+    for (const record of records) {
+      if (record?.explanationSessionId) {
+        out[record.explanationSessionId] = parentSessionId;
+      }
+    }
+  }
+  return out;
+}
+
 export function getSelectionExplanation(
   parentSessionId: string | null | undefined,
   recordId: string | null | undefined,
