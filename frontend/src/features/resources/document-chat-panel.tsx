@@ -36,7 +36,6 @@ import {
   Message as AiMessage,
   MessageContent,
 } from "@/components/ai-elements/message";
-import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import {
   groupQuestionParts,

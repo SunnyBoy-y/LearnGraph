@@ -331,7 +331,7 @@ function nestSidebarSessions(
         ...session,
         parent_session_id:
           session.parent_session_id || localParents[session.id] || null,
-        children: [] as SidebarSession[],
+        children: [] as SidebarSession[] | undefined,
       },
     ]),
   );
@@ -348,7 +348,7 @@ function nestSidebarSessions(
     if (session.children?.length) {
       session.children = sortSidebarSessions(session.children, activity);
     } else {
-      delete session.children;
+      session.children = undefined;
     }
   }
   return sortSidebarSessions(roots, activity);

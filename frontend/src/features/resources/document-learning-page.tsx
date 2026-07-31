@@ -453,7 +453,7 @@ export function DocumentLearningPage() {
         selected_text_hash: await sha256(pendingSelection.selected_text),
       },
       selected_sentence: pendingSelection.selected_text,
-      surrounding_text: selected?.chunk.content.slice(0, 8_000) ?? "",
+      surrounding_text: selected?.chunk?.content.slice(0, 8_000) ?? "",
       source_title: file.original_name,
     });
     await queryClient.invalidateQueries({ queryKey: ["sessions"] });
@@ -508,7 +508,7 @@ export function DocumentLearningPage() {
         query: query.trim(),
         file_ids: effectiveFileIds,
         scope: effectiveScope,
-        locator: selected
+        locator: selected?.chunk
           ? { chunk_id: selected.chunk.id }
           : effectiveScope === "page"
             ? { page: pageNumber }
