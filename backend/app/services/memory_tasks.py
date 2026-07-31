@@ -4,7 +4,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.memory_event_models import MemoryScopeContext, MemoryTaskState, new_id, utc_now
+from app.domain.memory_event_models import (
+    MemoryScopeContext,
+    MemoryTaskState,
+    new_id,
+    utc_now,
+)
 from app.domain.memory_event_types import MemoryEventType
 from app.domain.schemas.memory_tasks import (
     TaskStateCreateRequest,
@@ -12,6 +17,34 @@ from app.domain.schemas.memory_tasks import (
     TaskStateView,
 )
 from app.services.memory_event_store import AppendEvent, MemoryEventStore
+
+# ── State machine ─────────────────────────────────────────────────────────────
+# Each key maps to the set of statuses the task may transition TO.
+_VALID_TRANSITIONS: dict[str, frozenset[str]] = {
+    "planned": frozenset({"in_progress", "blocked", "cancelled", "superseded"}),
+    "in_progress": frozenset({"blocked", "paused", "completed", "cancelled", "superseded"}),
+    "blocked": frozenset({"in_progress", "paused", "cancelled", "superseded"}),
+    "paused": frozenset({"in_progress", "cancelled", "superseded"}),
+    "completed": frozenset(),  # terminal
+    "cancelled": frozenset(),  # terminal
+    "superseded": frozenset(),  # terminal
+}
+
+
+def validate_transition(current: str, target: str) -> None:
+    """Raise 409 if the transition is not allowed."""
+
+    if current == target:
+        # Same-status updates are allowed (idempotent); event store deduplicates.
+        return
+    allowed = _VALID_TRANSITIONS.get(current, frozenset())
+    if target not in allowed:
+        raise AppError(
+            409,
+            "memory_task_invalid_transition",
+            f"Task status cannot transition from '{current}' to '{target}'",
+            {"current_status": current, "target_status": target},
+        )
 
 
 class MemoryTaskService:
@@ -67,6 +100,8 @@ class MemoryTaskService:
         request: TaskStateUpdateRequest,
     ) -> TaskStateView:
         state = self.require(scope, task_id)
+        if request.status is not None:
+            validate_transition(state.status, request.status)
         event_type = self._event_type(request.status)
         result = self.store.append(
             scope,
