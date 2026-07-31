@@ -9,6 +9,11 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.domain.memory_event_models import MemoryScopeContext, MemorySearchDocument
+from app.services.memory_projector import (
+    ensure_memory_search_fts,
+    normalize_bm25_score,
+    probe_memory_search_fts_capability,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,16 +123,15 @@ class MemoryHybridRetriever:
                 continue
             raw_fts = fts_scores.get(document.id)
             document_tokens = _tokens(f"{document.subject} {document.content}")
-            lexical = (
-                1.0 / (1.0 + max(0.0, raw_fts))
-                if raw_fts is not None
-                else (
-                    len(query_tokens & document_tokens)
-                    / math.sqrt(len(query_tokens) * len(document_tokens))
-                    if query_tokens and document_tokens
-                    else 0.0
+            if raw_fts is not None:
+                # bm25() is already normalized to [0, 1) by _fts_scores.
+                lexical = raw_fts
+            elif query_tokens and document_tokens:
+                lexical = len(query_tokens & document_tokens) / math.sqrt(
+                    len(query_tokens) * len(document_tokens)
                 )
-            )
+            else:
+                lexical = 0.0
             entity = 1.0 if query_tokens & _tokens(document.entity_aliases_text) else 0.0
             recency = 0.5
             confidence = max(0.0, min(1.0, document.confidence))
@@ -187,18 +191,30 @@ class MemoryHybridRetriever:
     def _fts_scores(
         self, scope: MemoryScopeContext, query: str, *, limit: int
     ) -> dict[str, float]:
+        """Return document_id → normalized lexical score in [0, 1).
+
+        SQL uses ``ORDER BY bm25(...) ASC`` (smaller raw bm25 = more relevant).
+        """
+
         if self.db.bind is None or self.db.bind.dialect.name != "sqlite" or not query.strip():
             return {}
+        capability = probe_memory_search_fts_capability(self.db)
+        if capability == "unavailable":
+            ensure_memory_search_fts(self.db)
+            capability = probe_memory_search_fts_capability(self.db)
+            if capability == "unavailable":
+                return {}
         safe_query = " ".join(sorted(_tokens(query)))
         if not safe_query:
             return {}
         try:
+            # Explicit ASC: FTS5 bm25 is more relevant when smaller/negative.
             rows = self.db.execute(
                 text(
                     "SELECT document_id, bm25(memory_search_fts) AS rank "
                     "FROM memory_search_fts WHERE memory_search_fts MATCH :query "
                     "AND tenant_id = :tenant AND (workspace_id = :workspace OR workspace_id = '') "
-                    "ORDER BY rank ASC LIMIT :limit"
+                    "ORDER BY bm25(memory_search_fts) ASC LIMIT :limit"
                 ),
                 {
                     "query": safe_query,
@@ -209,4 +225,4 @@ class MemoryHybridRetriever:
             ).all()
         except Exception:
             return {}
-        return {str(row[0]): abs(float(row[1])) for row in rows}
+        return {str(row[0]): normalize_bm25_score(float(row[1])) for row in rows}

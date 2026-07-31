@@ -25,18 +25,39 @@ class SchemaMigration:
 def _memory_foundation(connection: Connection) -> None:
     if connection.dialect.name != "sqlite":
         return
+    capability = "unicode"
     try:
         connection.exec_driver_sql(
             "CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_fts USING fts5("
             "document_id UNINDEXED, tenant_id UNINDEXED, workspace_id UNINDEXED, "
             "subject, content, keywords, memory_type, entity_aliases, tokenize='trigram')"
         )
+        capability = "trigram"
     except Exception:
         connection.exec_driver_sql(
             "CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_fts USING fts5("
             "document_id UNINDEXED, tenant_id UNINDEXED, workspace_id UNINDEXED, "
             "subject, content, keywords, memory_type, entity_aliases)"
         )
+        capability = "unicode"
+    # Record tokenizer capability for operators; last_error column is reused as a
+    # small status slot for this non-positional projector marker.
+    connection.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS memory_projection_checkpoints ("
+        "projector_name VARCHAR(120) NOT NULL PRIMARY KEY, "
+        "projection_version INTEGER NOT NULL DEFAULT 1, "
+        "last_global_position INTEGER NOT NULL DEFAULT 0, "
+        "lease_owner VARCHAR(120), "
+        "lease_until DATETIME, "
+        "last_error TEXT NOT NULL DEFAULT '', "
+        "updated_at DATETIME NOT NULL)"
+    )
+    # capability is a controlled token (trigram|unicode), never user input.
+    connection.exec_driver_sql(
+        "INSERT OR REPLACE INTO memory_projection_checkpoints("
+        "projector_name, projection_version, last_global_position, last_error, updated_at) "
+        f"VALUES ('memory_search_fts_capability', 1, 0, '{capability}', CURRENT_TIMESTAMP)"
+    )
 
 
 def _memory_outbox_lease_generation(connection: Connection) -> None:

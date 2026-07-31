@@ -265,3 +265,38 @@ def backfill_memory_projection(
     db.commit()
     parity = projector.parity_report(context.workspace.id)
     return {"backfilled": count, "parity": asdict(parity)}
+
+
+@router.post("/maintenance/rebuild-search")
+def rebuild_search_projection(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    """Fully replay Event Store into memory_search_documents + FTS (manage only).
+
+    Uses envelope decryption without principal scope filters so a workspace
+    manager can rebuild the whole local projection from the event log. Failure
+    rolls back both structured documents and FTS rows.
+    """
+
+    context.require_permission("workspace.manage")
+    store = event_store(db, settings)
+    projector = MemoryProjector(db, cipher=store.cipher)
+    try:
+        report = projector.rebuild_search_projection()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "event_count": report.event_count,
+        "applied_count": report.applied_count,
+        "skipped_forgotten": report.skipped_forgotten,
+        "skipped_non_memory": report.skipped_non_memory,
+        "skipped_unavailable": report.skipped_unavailable,
+        "document_count": report.document_count,
+        "fts_row_count": report.fts_row_count,
+        "content_fingerprint": report.content_fingerprint,
+        "fts_capability": report.fts_capability,
+    }
