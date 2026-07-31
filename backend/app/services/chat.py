@@ -657,10 +657,14 @@ class ChatService:
         | None = None,
         agent_tool_runtime: AgentToolRuntime | None = None,
         vision_provider: ModelProviderPort | None = None,
+        tenant_id: str = "local-tenant",
+        context_builder: object | None = None,
     ) -> None:
         self.db = db
         self.workspace_id = workspace_id
         self.actor_id = actor_id
+        self.tenant_id = tenant_id
+        self.context_builder = context_builder
         self.model_provider = model_provider
         self.vision_provider = vision_provider
         self.search_provider = search_provider
@@ -1828,6 +1832,28 @@ class ChatService:
                     prompt_token_budget=self._memory_prompt_token_budget(),
                 )
             )
+        if self.context_builder is not None and get_settings().memory_context_builder_v2:
+            from app.domain.memory_event_models import MemoryScopeContext
+            from app.domain.schemas.context_builds import ContextBuildRequest
+
+            built = self.context_builder.build(
+                MemoryScopeContext(
+                    tenant_id=self.tenant_id,
+                    principal_user_id=self.actor_id,
+                    workspace_id=self.workspace_id,
+                    conversation_id=session_id,
+                    node_ids=tuple(node_ids or ()),
+                ),
+                ContextBuildRequest(
+                    conversation_id=session_id,
+                    query=current_content,
+                    token_budget=self._memory_prompt_token_budget(),
+                    agent_id="main_agent",
+                    provider_id=self.model_provider.provider_id,
+                    model_id=str(getattr(self.model_provider, "model_id", "")),
+                ),
+            )
+            context_sections.append(built.prompt_block)
         if additional_context:
             context_sections.append(additional_context)
         authorized_context = "\n\n".join(section for section in context_sections if section)
@@ -2176,6 +2202,28 @@ class ChatService:
                     prompt_token_budget=self._memory_prompt_token_budget(),
                 )
             )
+        if self.context_builder is not None and get_settings().memory_context_builder_v2:
+            from app.domain.memory_event_models import MemoryScopeContext
+            from app.domain.schemas.context_builds import ContextBuildRequest
+
+            built = self.context_builder.build(
+                MemoryScopeContext(
+                    tenant_id=self.tenant_id,
+                    principal_user_id=self.actor_id,
+                    workspace_id=self.workspace_id,
+                    conversation_id=session_id,
+                    node_ids=tuple(node_ids or ()),
+                ),
+                ContextBuildRequest(
+                    conversation_id=session_id,
+                    query=current_content,
+                    token_budget=self._memory_prompt_token_budget(),
+                    agent_id="main_agent",
+                    provider_id=self.model_provider.provider_id,
+                    model_id=str(getattr(self.model_provider, "model_id", "")),
+                ),
+            )
+            context_sections.append(built.prompt_block)
         if additional_context:
             context_sections.append(additional_context)
         authorized_context = "\n\n".join(

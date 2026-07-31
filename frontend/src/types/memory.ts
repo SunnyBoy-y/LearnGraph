@@ -1,4 +1,9 @@
 import type { IsoDateTime } from './common'
+import type {
+  MemoryAudienceType,
+  MemoryLifecycleStatus,
+  MemorySensitivity,
+} from './memory-events'
 
 export type MemoryNamespace = 'workspace' | 'session'
 export type MemoryScopeType = 'workspace' | 'goal' | 'node' | 'session'
@@ -96,6 +101,22 @@ export interface MemoryEntry {
   deleted_at: IsoDateTime | null
   recoverable_until: IsoDateTime | null
   content_destroyed_at: IsoDateTime | null
+  tenant_id?: string
+  subject_user_id?: string | null
+  audience_type?: MemoryAudienceType
+  task_id?: string | null
+  project_id?: string | null
+  conversation_id?: string | null
+  file_id?: string | null
+  memory_layer?: 'L3' | 'L4' | 'L5' | 'L6'
+  assertion_type?: 'explicit' | 'inferred' | 'system_observed' | 'file_derived' | 'tool_observed'
+  sensitivity?: MemorySensitivity
+  lifecycle_status?: MemoryLifecycleStatus
+  superseded_by_id?: string | null
+  head_event_id?: string | null
+  projection_version?: number
+  auto_recall_suppressed?: boolean
+  child_agent_denied?: boolean
   restore_available: boolean
   created_at: IsoDateTime
   updated_at: IsoDateTime

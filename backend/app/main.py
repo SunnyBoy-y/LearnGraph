@@ -23,6 +23,8 @@ from app.services.durable_queue import (
     durable_queue_worker,
     reconcile_research_polling,
 )
+from app.services.memory_outbox_runtime import memory_outbox_scheduler
+from app.services.document_learning import mark_interrupted_document_jobs
 from app.services.chat import mark_interrupted_message_streams
 from app.services.chat_durable import enqueue_interrupted_chat_resumes
 
@@ -41,6 +43,7 @@ async def lifespan(_: FastAPI):
             "\n  ".join(_profile_warnings),
         )
     ensure_demo_data()
+    mark_interrupted_document_jobs()
     mark_interrupted_message_streams()
     durable_queue_stop: asyncio.Event | None = None
     durable_queue_task: asyncio.Task[None] | None = None
@@ -66,6 +69,8 @@ async def lifespan(_: FastAPI):
     sandbox_task: asyncio.Task[None] | None = None
     mcp_runner_stop: asyncio.Event | None = None
     mcp_runner_task: asyncio.Task[None] | None = None
+    outbox_stop: asyncio.Event | None = None
+    outbox_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
         scheduler_stop = asyncio.Event()
         scheduler_task = asyncio.create_task(mastery_scheduler(scheduler_stop))
@@ -81,6 +86,9 @@ async def lifespan(_: FastAPI):
     if settings.mcp_stdio_cleanup_scheduler_enabled:
         mcp_runner_stop = asyncio.Event()
         mcp_runner_task = asyncio.create_task(mcp_runner_cleanup_scheduler(mcp_runner_stop))
+    if settings.memory_outbox_worker_enabled:
+        outbox_stop = asyncio.Event()
+        outbox_task = asyncio.create_task(memory_outbox_scheduler(outbox_stop))
     try:
         yield
     finally:
@@ -102,6 +110,9 @@ async def lifespan(_: FastAPI):
         if mcp_runner_stop is not None and mcp_runner_task is not None:
             mcp_runner_stop.set()
             await mcp_runner_task
+        if outbox_stop is not None and outbox_task is not None:
+            outbox_stop.set()
+            await outbox_task
 
 
 settings = get_settings()

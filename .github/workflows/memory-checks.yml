@@ -1,0 +1,52 @@
+name: Memory architecture checks
+
+on:
+  pull_request:
+    paths:
+      - "backend/app/**"
+      - "backend/tests/memory/**"
+      - "backend/tests/context/**"
+      - "backend/tests/integration/**"
+      - "backend/pyproject.toml"
+      - "frontend/src/features/memory/**"
+      - "frontend/src/api/**"
+      - "frontend/src/types/**"
+      - ".github/workflows/memory-checks.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/app/**"
+      - "backend/tests/memory/**"
+      - "backend/tests/context/**"
+      - "backend/tests/integration/**"
+      - "backend/pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --extra test pytest tests/memory tests/context tests/integration -q
+      - run: uv run python -c "from app.main import app; print(app.title)"
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build

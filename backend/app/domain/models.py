@@ -616,6 +616,12 @@ class FileRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     parser_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     parser_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    logical_version: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(40), default="upload")
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(24), default="active", index=True)
 
 
 class AudioTranscription(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -668,6 +674,7 @@ class FileTextChunk(Base, TimestampMixin, WorkspaceScopedMixin):
     token_count: Mapped[int] = mapped_column(Integer, default=0)
     content: Mapped[str] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64))
+    lifecycle_status: Mapped[str] = mapped_column(String(24), default="active", index=True)
 
 
 class DocumentRevision(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -694,6 +701,11 @@ class DocumentRevision(Base, TimestampMixin, WorkspaceScopedMixin):
     created_by: Mapped[str] = mapped_column(String(64))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    supersedes_revision_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    index_status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    embedding_status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(24), default="active", index=True)
 
 
 class DocumentCollection(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -1004,6 +1016,16 @@ class Evidence(Base, TimestampMixin, WorkspaceScopedMixin):
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     status: Mapped[str] = mapped_column(String(40), default="pending")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[str] = mapped_column(String(32), default="observed")
+    difficulty: Mapped[float] = mapped_column(Float, default=0.5)
+    assistance_level: Mapped[float] = mapped_column(Float, default=0.0)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source_ref: Mapped[str] = mapped_column(String(200), default="")
+    source_version_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_content_hash: Mapped[str] = mapped_column(String(64), default="")
+    validity_status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidation_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class MasterySchedule(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -1218,6 +1240,22 @@ class MemoryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     content_destroyed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    tenant_id: Mapped[str] = mapped_column(String(64), default="local-tenant", index=True)
+    subject_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    audience_type: Mapped[str] = mapped_column(String(24), default="workspace", index=True)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    project_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    file_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    memory_layer: Mapped[str] = mapped_column(String(16), default="L4", index=True)
+    assertion_type: Mapped[str] = mapped_column(String(32), default="explicit", index=True)
+    sensitivity: Mapped[str] = mapped_column(String(24), default="normal", index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    superseded_by_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    head_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    projection_version: Mapped[int] = mapped_column(Integer, default=1)
+    auto_recall_suppressed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    child_agent_denied: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class MemoryEvidence(Base, TimestampMixin, WorkspaceScopedMixin):

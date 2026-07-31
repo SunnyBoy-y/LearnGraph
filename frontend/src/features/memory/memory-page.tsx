@@ -67,6 +67,8 @@ import {
   Surface,
 } from '@/components/shared/page-elements'
 import { SessionCombobox } from '@/components/shared/session-combobox'
+import { ContextManifestPanel } from './components/context-manifest-panel'
+import { MemoryGovernancePanel } from './components/memory-governance-panel'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -398,6 +400,9 @@ export function MemoryPage() {
           <TabsTrigger className="px-3" value="preview">
             AI 眼中的我
           </TabsTrigger>
+          <TabsTrigger className="px-3" value="context-manifest">
+            AI 本轮看到了什么
+          </TabsTrigger>
           <TabsTrigger className="px-3" value="deleted">
             删除恢复
             {deletedMemories.length ? (
@@ -479,6 +484,18 @@ export function MemoryPage() {
 
         <TabsContent className="mt-0 outline-none" value="preview">
           <MemoryInjectionPreviewTab sessions={sessionList} workspaceId={workspaceId} />
+        </TabsContent>
+
+        <TabsContent className="mt-0 outline-none" value="context-manifest">
+          <Surface className="p-5">
+            <SectionHeading
+              description="只保存来源、版本、分数、排除原因和 Token，不保存完整 Prompt。"
+              title="Context Build Manifest"
+            />
+            <div className="mt-4">
+              <ContextManifestPanel />
+            </div>
+          </Surface>
         </TabsContent>
 
         <TabsContent className="mt-0 outline-none" value="deleted">
@@ -1423,6 +1440,7 @@ function MemoryDetailDialog({
               {metadata.map(([key, value]) => <div className="contents" key={key}><dt className="text-muted-foreground">{key}</dt><dd className="break-all font-mono">{value}</dd></div>)}
             </dl>
             <pre className="max-h-[42vh] overflow-auto whitespace-pre-wrap rounded-xl border p-4 font-mono text-xs leading-6">{memory.data.content ?? '正文不可用'}</pre>
+            <MemoryGovernancePanel memory={memory.data} />
             <section>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-sm font-semibold">Provider Binding</p>

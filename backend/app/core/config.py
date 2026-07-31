@@ -72,6 +72,21 @@ class Settings(BaseSettings):
     memory_extraction_interval_seconds: int = 120
     memory_extraction_idle_seconds: int = 180
     memory_extraction_sessions_per_sweep: int = 3
+    # Event-sourced memory architecture rollout. Architecture flags are deployment
+    # controls, never ordinary workspace settings editable by agents.
+    memory_write_mode: str = "dual"
+    memory_read_mode: str = "legacy"
+    memory_shadow_sample_rate: float = 0.05
+    memory_context_builder_v2: bool = False
+    memory_task_episode_enabled: bool = True
+    memory_file_revision_invalidation_enabled: bool = True
+    memory_agent_run_enabled: bool = True
+    memory_strategy_enabled: bool = False
+    memory_event_master_key: str | None = None
+    memory_outbox_worker_enabled: bool = True
+    memory_outbox_interval_seconds: int = 5
+    memory_outbox_lease_seconds: int = 120
+    memory_outbox_max_attempts: int = 8
     # Docker is the cross-platform hardened baseline: Docker Engine on Linux,
     # Docker Desktop/WSL2 on Windows, and Docker Desktop on macOS.  Enabling
     # the feature by default does not make an unpinned/missing runner image

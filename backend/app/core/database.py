@@ -84,9 +84,17 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_database() -> None:
-    from app.domain import extension_models, migration_models, models  # noqa: F401
+    from app.domain import (  # noqa: F401
+        extension_models,
+        memory_event_models,
+        migration_models,
+        models,
+    )
+    from app.core.migrations import apply_schema_migrations
 
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        apply_schema_migrations(connection)
     _ensure_sqlite_skill_package_columns()
     _verify_schema_revisions()
 
@@ -334,6 +342,7 @@ def _apply_sqlite_additive_migrations() -> None:
         "graph_nodes": {
             "external_concept_id": "VARCHAR(255)",
             "target_weight": "INTEGER NOT NULL DEFAULT 50",
+            "teaching_strategy": "TEXT NOT NULL DEFAULT ''",
         },
         "goals": {
             "target_weight": "INTEGER NOT NULL DEFAULT 50",
@@ -355,6 +364,34 @@ def _apply_sqlite_additive_migrations() -> None:
             "locator_json": "JSON NOT NULL DEFAULT '{}'",
             "section_path": "JSON NOT NULL DEFAULT '[]'",
             "token_count": "INTEGER NOT NULL DEFAULT 0",
+            "lifecycle_status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+        },
+        "files": {
+            "active_revision_id": "VARCHAR(36)",
+            "logical_version": "INTEGER NOT NULL DEFAULT 0",
+            "source": "VARCHAR(40) NOT NULL DEFAULT 'upload'",
+            "created_by": "VARCHAR(64)",
+            "updated_by": "VARCHAR(64)",
+            "lifecycle_status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+        },
+        "document_revisions": {
+            "supersedes_revision_id": "VARCHAR(36)",
+            "activated_at": "DATETIME",
+            "index_status": "VARCHAR(24) NOT NULL DEFAULT 'pending'",
+            "embedding_status": "VARCHAR(24) NOT NULL DEFAULT 'pending'",
+            "lifecycle_status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+        },
+        "evidence": {
+            "result": "VARCHAR(32) NOT NULL DEFAULT 'observed'",
+            "difficulty": "FLOAT NOT NULL DEFAULT 0.5",
+            "assistance_level": "FLOAT NOT NULL DEFAULT 0.0",
+            "score": "FLOAT",
+            "source_ref": "VARCHAR(200) NOT NULL DEFAULT ''",
+            "source_version_id": "VARCHAR(64)",
+            "source_content_hash": "VARCHAR(64) NOT NULL DEFAULT ''",
+            "validity_status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+            "invalidated_at": "DATETIME",
+            "invalidation_event_id": "VARCHAR(64)",
         },
         "retrieval_traces": {
             "query_text": "TEXT NOT NULL DEFAULT ''",
@@ -440,6 +477,22 @@ def _apply_sqlite_additive_migrations() -> None:
             "deleted_at": "DATETIME",
             "recoverable_until": "DATETIME",
             "content_destroyed_at": "DATETIME",
+            "tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'local-tenant'",
+            "subject_user_id": "VARCHAR(64)",
+            "audience_type": "VARCHAR(24) NOT NULL DEFAULT 'workspace'",
+            "task_id": "VARCHAR(64)",
+            "project_id": "VARCHAR(64)",
+            "conversation_id": "VARCHAR(64)",
+            "file_id": "VARCHAR(64)",
+            "memory_layer": "VARCHAR(16) NOT NULL DEFAULT 'L4'",
+            "assertion_type": "VARCHAR(32) NOT NULL DEFAULT 'explicit'",
+            "sensitivity": "VARCHAR(24) NOT NULL DEFAULT 'normal'",
+            "lifecycle_status": "VARCHAR(32) NOT NULL DEFAULT 'active'",
+            "superseded_by_id": "VARCHAR(64)",
+            "head_event_id": "VARCHAR(64)",
+            "projection_version": "INTEGER NOT NULL DEFAULT 1",
+            "auto_recall_suppressed": "BOOLEAN NOT NULL DEFAULT 0",
+            "child_agent_denied": "BOOLEAN NOT NULL DEFAULT 0",
         },
         "provider_secrets": {
             "algorithm": "VARCHAR(40) NOT NULL DEFAULT 'fernet_sha256_v1'",
@@ -474,9 +527,6 @@ def _apply_sqlite_additive_migrations() -> None:
             "cached_input_usd_per_million": "FLOAT",
             "cache_write_usd_per_million": "FLOAT",
             "conditions": "JSON NOT NULL DEFAULT '{}'",
-        },
-        "graph_nodes": {
-            "teaching_strategy": "TEXT NOT NULL DEFAULT ''",
         },
         "exercises": {
             "difficulty": "VARCHAR(20) NOT NULL DEFAULT 'medium'",

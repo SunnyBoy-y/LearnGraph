@@ -125,6 +125,22 @@ class MemoryView(ORMModel):
     deleted_at: datetime | None
     recoverable_until: datetime | None
     content_destroyed_at: datetime | None
+    tenant_id: str = "local-tenant"
+    subject_user_id: str | None = None
+    audience_type: str = "workspace"
+    task_id: str | None = None
+    project_id: str | None = None
+    conversation_id: str | None = None
+    file_id: str | None = None
+    memory_layer: str = "L4"
+    assertion_type: str = "explicit"
+    sensitivity: str = "normal"
+    lifecycle_status: str = "active"
+    superseded_by_id: str | None = None
+    head_event_id: str | None = None
+    projection_version: int = 1
+    auto_recall_suppressed: bool = False
+    child_agent_denied: bool = False
     restore_available: bool
     created_at: datetime
     updated_at: datetime

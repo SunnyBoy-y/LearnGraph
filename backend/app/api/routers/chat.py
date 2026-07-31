@@ -59,6 +59,9 @@ from app.providers.factory import (
     vision_provider_for_workspace,
 )
 from app.services.chat import ChatService
+from app.services.context_builder import ContextBuilder
+from app.services.memory_retrieval import MemoryHybridRetriever
+from app.services.memory_router import MemoryRouter
 from app.services.dictation import (
     DictationService,
     authenticate_realtime_dictation,
@@ -366,10 +369,18 @@ def service(
         context.workspace_id,
         context.principal.user_id,
         model_provider_for_workspace(db, context.workspace_id, settings, **model_kwargs),
+        tenant_id=context.principal.tenant_id,
+        context_builder=(
+            ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db)))
+            if settings.memory_context_builder_v2
+            else None
+        ),
         search_provider=search_provider,
-        # Recall never probes the semantic provider, so the streaming and
-        # cache paths can share one loader.
-        memory_context_loader=memory_service.context_for_session,
+        memory_context_loader=(
+            None
+            if settings.memory_context_builder_v2
+            else memory_service.context_for_session
+        ),
         memory_cache_context_loader=memory_service.context_for_session,
         suggested_prompt_context_access_checker=lambda session, session_permission: (
             authorization.can_access_resource(

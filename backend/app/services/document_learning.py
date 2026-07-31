@@ -624,18 +624,26 @@ class DocumentLearningService:
             revision.processor_version = parsed.parser_version
 
             self._set_stage(job, "chunk", 50, execution_token)
+            # Keep immutable revision chunks for provenance. Only this revision is
+            # replaced on an idempotent retry; activation below stales prior rows.
+            self.db.execute(
+                text(
+                    "DELETE FROM document_chunks_fts WHERE chunk_id IN ("
+                    "SELECT id FROM file_text_chunks WHERE workspace_id = :workspace_id "
+                    "AND file_id = :file_id AND document_revision_id = :revision_id)"
+                ),
+                {
+                    "workspace_id": self.workspace_id,
+                    "file_id": record.id,
+                    "revision_id": revision.id,
+                },
+            )
             self.db.execute(
                 delete(FileTextChunk).where(
                     FileTextChunk.workspace_id == self.workspace_id,
                     FileTextChunk.file_id == record.id,
+                    FileTextChunk.document_revision_id == revision.id,
                 )
-            )
-            self.db.execute(
-                text(
-                    "DELETE FROM document_chunks_fts "
-                    "WHERE workspace_id = :workspace_id AND file_id = :file_id"
-                ),
-                {"workspace_id": self.workspace_id, "file_id": record.id},
             )
             ordinal = 0
             headings: list[str] = []
@@ -697,6 +705,19 @@ class DocumentLearningService:
             record.parser_name = parsed.parser_name
             record.parser_version = parsed.parser_version
             record.error_message = None
+            from app.domain.memory_event_models import MemoryScopeContext
+            from app.services.memory_file_invalidation import MemoryFileInvalidationService
+
+            MemoryFileInvalidationService(self.db).activate_revision(
+                MemoryScopeContext(
+                    tenant_id="local-tenant",
+                    principal_user_id=self.actor_id,
+                    workspace_id=self.workspace_id,
+                ),
+                file_id=record.id,
+                revision_id=revision.id,
+                actor_id=self.actor_id,
+            )
             self._complete(job, revision, reused=False, execution_token=execution_token)
             return job
         except _DocumentJobExecutionStopped:

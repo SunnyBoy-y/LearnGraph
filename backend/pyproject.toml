@@ -29,7 +29,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-  "pytest>=8,<10",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
 ]
 infrastructure = [
   "minio>=7.2,<8",

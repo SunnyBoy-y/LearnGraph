@@ -215,6 +215,192 @@ class MemoryService:
         self.nodes = GraphNodeRepository(db, workspace.id)
         self.audit = AuditRepository(db, workspace.id)
 
+    def _event_store(self):
+        from app.core.config import get_settings
+        from app.services.memory_event_ingestor import event_cipher_from_settings
+        from app.services.memory_event_store import MemoryEventStore
+
+        return MemoryEventStore(self.db, event_cipher_from_settings(get_settings()))
+
+    def _event_scope(self, record: MemoryRecord | None = None):
+        from app.domain.memory_event_models import MemoryScopeContext
+
+        return MemoryScopeContext(
+            tenant_id=self.workspace.tenant_id,
+            principal_user_id=(
+                record.subject_user_id
+                if record is not None and record.subject_user_id
+                else self.actor_id
+            ),
+            workspace_id=self.workspace_id,
+            task_id=record.task_id if record is not None else None,
+            project_id=record.project_id if record is not None else None,
+            conversation_id=(
+                record.conversation_id or record.session_id if record is not None else None
+            ),
+            goal_id=record.goal_id if record is not None else None,
+        )
+
+    def _mirror_event(self, record: MemoryRecord, content: str, operation: str) -> None:
+        from app.core.config import get_settings
+        from app.services.memory_commands import MemoryCommandService
+
+        if get_settings().memory_write_mode == "legacy":
+            return
+        command_service = MemoryCommandService(self.db, self._event_store())
+        event = command_service.mirror_legacy_record(
+            self._event_scope(record),
+            record,
+            content=content,
+            operation=operation,
+            actor_id=self.actor_id,
+            idempotency_key=f"memory:{record.id}:{record.revision}:{operation}",
+        )
+        from app.services.memory_projector import MemoryProjector
+
+        MemoryProjector(self.db).apply(
+            event,
+            command_service._payload(record, content),
+        )
+
+    def _project_after_commit(
+        self,
+        record: MemoryRecord,
+        canonical: CanonicalMemory,
+        *,
+        previous_provider_id: str | None = None,
+        previous_binding_id: str | None = None,
+    ) -> None:
+        """Best-effort synchronous projection after the canonical commit.
+
+        The durable Outbox remains queued as the retry source. This fast path
+        preserves the existing UI/readback behavior when the provider is healthy.
+        """
+
+        try:
+            binding_id = (
+                record.provider_binding_id
+                if record.provider_id == self.provider.provider_id
+                else None
+            )
+            result = self.provider.upsert(canonical, provider_record_id=binding_id)
+            if (
+                previous_provider_id == self.local_projection.provider_id
+                and previous_binding_id
+                and previous_binding_id != result.provider_record_id
+            ):
+                try:
+                    self.local_projection.delete(previous_binding_id)
+                except Exception:
+                    logger.warning(
+                        "Stale local memory projection %s could not be removed",
+                        previous_binding_id,
+                        exc_info=True,
+                    )
+            if previous_provider_id and previous_provider_id != self.provider.provider_id:
+                prior_bindings = self.db.scalars(
+                    self.bindings.query().where(
+                        MemoryProviderBinding.memory_id == record.id,
+                        MemoryProviderBinding.provider_instance_id == previous_provider_id,
+                        MemoryProviderBinding.binding_status == "verified",
+                    )
+                ).all()
+                for binding in prior_bindings:
+                    binding.binding_status = (
+                        "superseded"
+                        if previous_provider_id == self.local_projection.provider_id
+                        else "orphaned"
+                    )
+            record.provider_id = self.provider.provider_id
+            record.provider_binding_id = result.provider_record_id
+            record.relative_path = result.relative_path
+            self._add_binding(
+                record=record,
+                revision=canonical.revision,
+                result=result,
+                now=utc_now(),
+            )
+            journal = self.db.scalar(
+                self.journal.query()
+                .where(
+                    MemoryJournalEntry.memory_id == record.id,
+                    MemoryJournalEntry.revision == canonical.revision,
+                )
+                .order_by(MemoryJournalEntry.created_at.desc())
+            )
+            if journal is not None:
+                journal.provider_id = self.provider.provider_id
+                journal.provider_record_id = result.provider_record_id
+            from app.domain.memory_event_models import MemoryProjectionOutbox
+
+            completed_kind = (
+                "mem0" if self.provider.remote_capability else "markdown"
+            )
+            queued_jobs = self.db.scalars(
+                select(MemoryProjectionOutbox).where(
+                    MemoryProjectionOutbox.aggregate_id == record.id,
+                    MemoryProjectionOutbox.projection_kind == completed_kind,
+                    MemoryProjectionOutbox.status.in_(("queued", "failed")),
+                )
+            ).all()
+            for job in queued_jobs:
+                job.status = "succeeded"
+                job.last_error = ""
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.warning(
+                "Memory %s committed locally; provider projection remains queued",
+                record.id,
+                exc_info=True,
+            )
+
+    def _delete_projection_after_commit(
+        self,
+        *,
+        memory_id: str,
+        provider_id: str,
+        provider_binding_id: str | None,
+    ) -> None:
+        if not provider_binding_id:
+            return
+        try:
+            if provider_id == self.provider.provider_id:
+                self.provider.delete(provider_binding_id)
+            elif provider_id == self.local_projection.provider_id:
+                self.local_projection.delete(provider_binding_id)
+            bindings = self.db.scalars(
+                self.bindings.query().where(MemoryProviderBinding.memory_id == memory_id)
+            ).all()
+            for binding in bindings:
+                binding.binding_status = "deleted"
+            from app.domain.memory_event_models import MemoryProjectionOutbox
+
+            completed_kind = (
+                "mem0"
+                if provider_id == self.provider.provider_id
+                and self.provider.remote_capability
+                else "markdown"
+            )
+            jobs = self.db.scalars(
+                select(MemoryProjectionOutbox).where(
+                    MemoryProjectionOutbox.aggregate_id == memory_id,
+                    MemoryProjectionOutbox.projection_kind == completed_kind,
+                    MemoryProjectionOutbox.status.in_(("queued", "failed")),
+                )
+            ).all()
+            for job in jobs:
+                job.status = "succeeded"
+                job.last_error = ""
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.warning(
+                "Memory %s was deleted locally; provider deletion remains queued",
+                memory_id,
+                exc_info=True,
+            )
+
     def _provider_epoch(self) -> int:
         setting = self.db.scalar(
             self.settings.query().where(WorkspaceSetting.key == MEMORY_PROVIDER_EPOCH_KEY)
@@ -849,6 +1035,14 @@ class MemoryService:
         record = MemoryRecord(
             id=_memory_id(),
             workspace_id=self.workspace_id,
+            tenant_id=self.workspace.tenant_id,
+            subject_user_id=self.actor_id if payload.namespace == "session" else None,
+            audience_type="user" if payload.namespace == "session" else "workspace",
+            conversation_id=payload.session_id,
+            memory_layer="L3" if payload.namespace == "session" else "L4",
+            assertion_type="explicit" if payload.source.startswith("user") else "inferred",
+            sensitivity="normal",
+            lifecycle_status="active",
             namespace=payload.namespace,
             session_id=payload.session_id,
             scope_type=scope_type,
@@ -886,10 +1080,10 @@ class MemoryService:
             source_ids=record.source_ids,
             now=now,
         )
-        result = self.provider.upsert(canonical)
+        # Canonical DB state commits before any external projection. Markdown,
+        # Mem0 and embeddings are rebuildable Outbox targets, never transaction
+        # participants in the memory fact write.
         record.content_hash = canonical.content_hash
-        record.relative_path = result.relative_path
-        record.provider_binding_id = result.provider_record_id
         self.memories.add(record)
         self.revisions.add(
             MemoryRevision(
@@ -912,7 +1106,6 @@ class MemoryService:
                 is_active=True,
             )
         )
-        self._add_binding(record=record, revision=1, result=result, now=now)
         self.journal.add(
             MemoryJournalEntry(
                 workspace_id=self.workspace_id,
@@ -921,7 +1114,7 @@ class MemoryService:
                 operation="ADD",
                 provider_id=self.provider.provider_id,
                 provider_epoch=self._provider_epoch(),
-                provider_record_id=result.provider_record_id,
+                provider_record_id=None,
                 content_hash=record.content_hash,
                 payload=self._journal_payload(record, payload.content.rstrip()),
             )
@@ -943,15 +1136,19 @@ class MemoryService:
             },
         )
         self._mark_profile_stale("memory_created")
+        self._mirror_event(record, payload.content.rstrip(), "ADD")
         self.db.commit()
+        self._project_after_commit(record, canonical)
+        record = self.memories.require(record.id, "memory")
         self.db.refresh(record)
         return self._view(record, include_content=True)
 
     def update(self, memory_id: str, payload: MemoryUpdateRequest) -> MemoryView:
         self.purge_expired()
         record = self._require_active(memory_id)
-        self._migrate_record_to_active_provider(record)
         self._check_revision(record, payload.expected_revision)
+        previous_provider_id = record.provider_id
+        previous_binding_id = record.provider_binding_id
         current = self._ensure_revision(record)
         if current is None or current.content is None:
             raise AppError(410, "memory_content_destroyed", "Memory content is no longer available")
@@ -1057,10 +1254,6 @@ class MemoryService:
             source_ids=source_ids,
             now=now,
         )
-        result = self.provider.upsert(
-            canonical,
-            provider_record_id=record.provider_binding_id,
-        )
         current_revision = record.revision
         cas = self.db.execute(
             sql_update(MemoryRecord)
@@ -1073,7 +1266,6 @@ class MemoryService:
             .values(
                 title=title,
                 content_hash=canonical.content_hash,
-                relative_path=result.relative_path,
                 revision=next_revision,
                 zone=zone,
                 source_ids=source_ids,
@@ -1087,7 +1279,6 @@ class MemoryService:
                 scope_id=scope_id,
                 goal_id=goal_id,
                 node_id=node_id,
-                provider_binding_id=result.provider_record_id,
                 updated_at=now,
             )
             .execution_options(synchronize_session=False)
@@ -1095,21 +1286,6 @@ class MemoryService:
         if cas.rowcount != 1:
             self.db.rollback()
             fresh = self.memories.require(memory_id, "memory")
-            winner = self._latest_revision(memory_id)
-            if winner is not None and winner.content is not None:
-                winner_canonical = self._canonical(
-                    fresh,
-                    title=winner.title,
-                    content=winner.content,
-                    revision=winner.revision,
-                    zone=winner.zone,
-                    source_ids=list(winner.source_ids or []),
-                    now=_as_utc(fresh.updated_at),
-                )
-                self.provider.upsert(
-                    winner_canonical,
-                    provider_record_id=fresh.provider_binding_id,
-                )
             self.audit.record(
                 actor_id=self.actor_id,
                 action="memory.revision_conflict",
@@ -1136,7 +1312,6 @@ class MemoryService:
         current.is_active = False
         record.title = title
         record.content_hash = canonical.content_hash
-        record.relative_path = result.relative_path
         record.revision = next_revision
         record.zone = zone
         record.source_ids = source_ids
@@ -1151,7 +1326,6 @@ class MemoryService:
         record.scope_id = scope_id
         record.goal_id = goal_id
         record.node_id = node_id
-        record.provider_binding_id = result.provider_record_id
         record.updated_at = now
         revision = self.revisions.add(
             MemoryRevision(
@@ -1174,7 +1348,6 @@ class MemoryService:
                 is_active=True,
             )
         )
-        self._add_binding(record=record, revision=next_revision, result=result, now=now)
         self.journal.add(
             MemoryJournalEntry(
                 workspace_id=self.workspace_id,
@@ -1183,7 +1356,7 @@ class MemoryService:
                 operation="UPDATE",
                 provider_id=self.provider.provider_id,
                 provider_epoch=self._provider_epoch(),
-                provider_record_id=result.provider_record_id,
+                provider_record_id=record.provider_binding_id,
                 content_hash=record.content_hash,
                 payload=self._journal_payload(record, content),
             )
@@ -1201,7 +1374,15 @@ class MemoryService:
             },
         )
         self._mark_profile_stale("memory_updated")
+        self._mirror_event(record, content, "UPDATE")
         self.db.commit()
+        self._project_after_commit(
+            record,
+            canonical,
+            previous_provider_id=previous_provider_id,
+            previous_binding_id=previous_binding_id,
+        )
+        record = self.memories.require(record.id, "memory")
         self.db.refresh(record)
         return self._view(record, include_content=True)
 
@@ -1319,22 +1500,8 @@ class MemoryService:
         audit_until = now + DELETION_AUDIT_RETENTION
         snapshot = self._recovery_snapshot(record)
         encrypted_payload, key_path = self.vault.encrypt(record.id, snapshot)
-        # A frozen-generation binding belongs to a previous provider: the local
-        # projection can be removed directly, but a remote projection owned by
-        # a now-disabled provider must not be called — leave the remote copy
-        # and mark its bindings orphaned below.
-        orphaned_remote_projection = False
-        try:
-            if record.provider_binding_id:
-                if record.provider_id == self.provider.provider_id:
-                    self.provider.delete(record.provider_binding_id)
-                elif record.provider_id == self.local_projection.provider_id:
-                    self.local_projection.delete(record.provider_binding_id)
-                else:
-                    orphaned_remote_projection = True
-        except Exception:
-            self.vault.destroy(record.id)
-            raise
+        previous_provider_id = record.provider_id
+        previous_binding_id = record.provider_binding_id
         recovery = self.db.scalar(
             self.recoveries.query().where(MemoryDeletionRecovery.memory_id == record.id)
         )
@@ -1392,12 +1559,7 @@ class MemoryService:
             self.bindings.query().where(MemoryProviderBinding.memory_id == record.id)
         ).all()
         for binding in bindings:
-            binding.binding_status = (
-                "orphaned"
-                if orphaned_remote_projection
-                and binding.provider_instance_id == record.provider_id
-                else "deleted"
-            )
+            binding.binding_status = "pending_delete"
         self.audit.record(
             actor_id=self.actor_id,
             action="memory.soft_delete",
@@ -1407,11 +1569,18 @@ class MemoryService:
                 "recoverable_until": recoverable_until.isoformat(),
                 "audit_retention_until": audit_until.isoformat(),
                 "provider_id": self.provider.provider_id,
-                "orphaned_remote_projection": orphaned_remote_projection,
+                "projection_delete_pending": bool(previous_binding_id),
             },
         )
         self._mark_profile_stale("memory_deleted")
+        self._mirror_event(record, "", "DELETE")
         self.db.commit()
+        self._delete_projection_after_commit(
+            memory_id=record.id,
+            provider_id=previous_provider_id,
+            provider_binding_id=previous_binding_id,
+        )
+        record = self.memories.require(record.id, "memory")
         self.db.refresh(record)
         return self._view(record)
 
@@ -1471,11 +1640,9 @@ class MemoryService:
             source_ids=[str(value) for value in last.get("source_ids") or []],
             now=now,
         )
-        result = self.provider.upsert(canonical)
         record.title = canonical.title
         record.zone = canonical.zone
         record.content_hash = canonical.content_hash
-        record.relative_path = result.relative_path
         record.revision = next_revision
         # Restore re-projects into whichever provider is active now, so the
         # record adopts the current generation even across a provider switch.
@@ -1484,7 +1651,8 @@ class MemoryService:
         record.deleted_at = None
         record.recoverable_until = None
         record.content_destroyed_at = None
-        record.provider_binding_id = result.provider_record_id
+        record.provider_binding_id = None
+        record.relative_path = ""
         record.source_ids = list(canonical.source_ids)
         self.revisions.add(
             MemoryRevision(
@@ -1507,7 +1675,6 @@ class MemoryService:
                 is_active=True,
             )
         )
-        self._add_binding(record=record, revision=next_revision, result=result, now=now)
         self.journal.add(
             MemoryJournalEntry(
                 workspace_id=self.workspace_id,
@@ -1516,7 +1683,7 @@ class MemoryService:
                 operation="RESTORE_DELETE",
                 provider_id=self.provider.provider_id,
                 provider_epoch=self._provider_epoch(),
-                provider_record_id=result.provider_record_id,
+                provider_record_id=None,
                 content_hash=record.content_hash,
                 payload=self._journal_payload(record, content),
             )
@@ -1533,7 +1700,10 @@ class MemoryService:
             details={"new_revision": next_revision, "provider_id": self.provider.provider_id},
         )
         self._mark_profile_stale("memory_restored")
+        self._mirror_event(record, content, "RESTORE_DELETE")
         self.db.commit()
+        self._project_after_commit(record, canonical)
+        record = self.memories.require(record.id, "memory")
         self.db.refresh(record)
         return self._view(record, include_content=True)
 
@@ -1899,6 +2069,8 @@ class MemoryService:
         now = utc_now()
         statement = self.memories.query().where(
             MemoryRecord.state == "active",
+            MemoryRecord.lifecycle_status == "active",
+            MemoryRecord.auto_recall_suppressed.is_(False),
             MemoryRecord.zone.in_(["hot", "recent", "topics"]),
         )
         if session_id:
