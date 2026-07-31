@@ -720,13 +720,17 @@ class ChatService:
     def _asr_available(self) -> bool:
         from app.core.config import get_settings
         from app.providers.factory import transcription_provider_for_workspace
+        from app.services.dictation import is_realtime_transcription_model
 
         provider = transcription_provider_for_workspace(
             self.db,
             self.workspace_id,
             get_settings(),
+            purpose="stored",
         )
-        return provider is not None
+        return provider is not None and not is_realtime_transcription_model(
+            provider.model_id
+        )
 
     def _latest_completed_transcript(self, file_id: str) -> AudioTranscription | None:
         return self.db.scalar(
@@ -1051,6 +1055,24 @@ class ChatService:
                 "vision_provider_id": getattr(self.vision_provider, "provider_id", None),
             },
         )
+
+    def _validate_video_input_path(
+        self,
+        files: list[FileRecord],
+        *,
+        structured_chat: bool,
+    ) -> None:
+        video_files = [file for file in files if self._is_video_attachment(file)]
+        if not video_files:
+            return
+        if not structured_chat:
+            raise AppError(
+                409,
+                "multimodal_transport_unsupported",
+                "Video understanding requires a structured model transport",
+                {"provider_id": self.model_provider.provider_id},
+            )
+        self._require_video_input_path(video_files)
 
     def _image_input_parts(self, files: list[FileRecord]) -> list[dict]:
         image_files = [file for file in files if self._is_multimodal_image(file)]
@@ -3085,20 +3107,18 @@ class ChatService:
                     else None,
                     scope=scope or None,
                 )
+                card_data = part.get("data") or {}
                 return (
                     json.dumps(
                         {
                             "published": True,
-                            "channel": "react_sandbox",
-                            "runtime_available": bool(
-                                (part.get("data") or {}).get("origin_verified")
-                            ),
+                            "channel": "sandboxed_html_preview",
+                            "runtime_available": card_data.get("status") == "ready",
+                            "runtime": card_data.get("runtime"),
                             "part_type": "magic_card",
-                            "card_instance_id": (part.get("data") or {}).get(
-                                "card_instance_id"
-                            ),
-                            "status": (part.get("data") or {}).get("status"),
-                            "reason": (part.get("data") or {}).get("reason"),
+                            "card_instance_id": card_data.get("card_instance_id"),
+                            "status": card_data.get("status"),
+                            "reason": card_data.get("reason"),
                         },
                         ensure_ascii=False,
                         separators=(",", ":"),
@@ -5719,7 +5739,14 @@ class ChatService:
                 .order_by(Message.created_at)
             ).all()
         )
-        if session.parent_session_id is None or session.session_kind == "concept_branch":
+        # concept_branch and side sessions are not history-inheriting branches:
+        # concept_branch has its own capsule, side sessions are parallel threads
+        # grouped under a parent but start from scratch.  Both return only their
+        # own local messages without requiring a source_message_id.
+        if session.parent_session_id is None or session.session_kind in (
+            "concept_branch",
+            "side",
+        ):
             return local_messages
         if session.source_message_id is None:
             raise AppError(
@@ -5973,6 +6000,8 @@ class ChatService:
                     file.id
                     for file in files
                     if not self._is_image_attachment(file)
+                    and not self._is_video_attachment(file)
+                    and not is_audio_attachment(file)
                     and file.parse_status != "indexed"
                 ]
                 if unavailable:
@@ -6442,84 +6471,13 @@ class ChatService:
         self.db.commit()
         return version.id
 
-    def preflight_retry_message(
+    def _retry_learning_context_ids(
         self,
-        session_id: str,
-        message_id: str,
-        payload: MessageRetryRequest | None = None,
-    ) -> bool:
-        """Validate cheap retry transport invariants before SSE headers flush."""
-
-        retry_payload = payload or MessageRetryRequest()
-        session = self.sessions.require(session_id, "session")
-        if session.status == "closed":
-            raise AppError(409, "session_closed", "Closed sessions cannot retry messages")
-        self._ensure_model_provider_available()
-        message = self.messages.require(message_id, "message")
-        if message.session_id != session.id or message.role != "assistant":
-            raise AppError(
-                404,
-                "assistant_message_not_found",
-                "Retry target must be an assistant message in this session",
-            )
-        parent = self.messages.require(
-            message.parent_message_id or "",
-            "parent user message",
-        )
-        if parent.session_id != session.id or parent.role != "user":
-            raise AppError(
-                409,
-                "retry_parent_invalid",
-                "The retry target has no valid original user message",
-            )
-        self._ensure_web_search_available(retry_payload)
-        previous = self._latest_version(message.id)
-        previous_trace = (
-            previous.provider_trace
-            if isinstance(previous.provider_trace, dict)
-            else {}
-        )
-        return (
-            retry_payload.agent_mode
-            if retry_payload.agent_mode is not None
-            else bool(previous_trace.get("agent_mode"))
-        )
-
-    def retry_message(
-        self,
-        session_id: str,
-        message_id: str,
-        payload: MessageRetryRequest | None = None,
-    ) -> Iterable[str]:
-        retry_payload = payload or MessageRetryRequest()
-        generation_started_at = utc_now()
-        generation_started_monotonic = time.monotonic()
-        session = self.sessions.require(session_id, "session")
-        if session.status == "closed":
-            raise AppError(409, "session_closed", "Closed sessions cannot retry messages")
-        self._ensure_model_provider_available()
-        message = self.messages.require(message_id, "message")
-        if message.session_id != session.id or message.role != "assistant":
-            raise AppError(
-                404,
-                "assistant_message_not_found",
-                "Retry target must be an assistant message in this session",
-            )
-        previous = self._latest_version(message.id)
-        parent = self.messages.require(
-            message.parent_message_id or "",
-            "parent user message",
-        )
-        if parent.session_id != session.id or parent.role != "user":
-            raise AppError(
-                409,
-                "retry_parent_invalid",
-                "The retry target has no valid original user message",
-            )
-
-        # Recover the durable learning-context authorization used by the
-        # original turn. A later retry version may not contain this Part, so
-        # inspect all target versions plus the original user's attachments.
+        message: Message,
+        parent: Message,
+    ) -> tuple[list[str], list[str]]:
+        # A later retry version may not contain the original resolved context, so
+        # inspect every target version plus the original user's attachments.
         node_ids: list[str] = []
         file_ids: list[str] = []
         target_versions = list(
@@ -6555,8 +6513,123 @@ class ChatService:
             file_id = (record.data or {}).get("file_id")
             if isinstance(file_id, str):
                 file_ids.append(file_id)
-        node_ids = list(dict.fromkeys(node_ids))
-        file_ids = list(dict.fromkeys(file_ids))
+        return list(dict.fromkeys(node_ids)), list(dict.fromkeys(file_ids))
+
+    def preflight_retry_message(
+        self,
+        session_id: str,
+        message_id: str,
+        payload: MessageRetryRequest | None = None,
+    ) -> bool:
+        """Validate cheap retry transport invariants before SSE headers flush."""
+
+        retry_payload = payload or MessageRetryRequest()
+        session = self.sessions.require(session_id, "session")
+        if session.status == "closed":
+            raise AppError(409, "session_closed", "Closed sessions cannot retry messages")
+        self._ensure_model_provider_available()
+        message = self.messages.require(message_id, "message")
+        if message.session_id != session.id or message.role != "assistant":
+            raise AppError(
+                404,
+                "assistant_message_not_found",
+                "Retry target must be an assistant message in this session",
+            )
+        parent = self.messages.require(
+            message.parent_message_id or "",
+            "parent user message",
+        )
+        if parent.session_id != session.id or parent.role != "user":
+            raise AppError(
+                409,
+                "retry_parent_invalid",
+                "The retry target has no valid original user message",
+            )
+        previous = self._latest_version(message.id)
+        previous_trace = (
+            previous.provider_trace
+            if isinstance(previous.provider_trace, dict)
+            else {}
+        )
+        retry_agent_mode = (
+            retry_payload.agent_mode
+            if retry_payload.agent_mode is not None
+            else bool(previous_trace.get("agent_mode"))
+        )
+        retry_goal_mode = bool(previous_trace.get("goal_mode")) and retry_agent_mode
+        node_ids, file_ids = self._retry_learning_context_ids(message, parent)
+        retry_context = MessageCreateRequest(
+            content=parent.content,
+            node_ids=node_ids,
+            file_ids=file_ids,
+            agent_mode=retry_agent_mode,
+            goal_mode=retry_goal_mode,
+            search_route=retry_payload.search_route or "disabled",
+            web_search=retry_payload.web_search,
+            allowed_domains=retry_payload.allowed_domains,
+        )
+        self._validate_context(session_id, retry_context)
+        structured_chat = bool(
+            getattr(self.model_provider, "supports_structured_chat", False)
+        )
+        if retry_agent_mode and not structured_chat:
+            raise AppError(
+                409,
+                "agent_mode_unsupported",
+                "The selected retry model does not expose structured tool calls",
+            )
+        attached_files = self._attached_files(file_ids)
+        if any(self._is_image_attachment(file) for file in attached_files):
+            image_mode = self._require_image_input_path(
+                [f for f in attached_files if self._is_image_attachment(f)]
+            )
+            if image_mode == "native" and not structured_chat:
+                raise AppError(
+                    409,
+                    "multimodal_transport_unsupported",
+                    "The selected model does not expose a structured multimodal chat transport",
+                    {"provider_id": self.model_provider.provider_id},
+                )
+        self._validate_video_input_path(
+            attached_files,
+            structured_chat=structured_chat,
+        )
+        self._ensure_web_search_available(retry_payload)
+        return retry_agent_mode
+
+    def retry_message(
+        self,
+        session_id: str,
+        message_id: str,
+        payload: MessageRetryRequest | None = None,
+    ) -> Iterable[str]:
+        retry_payload = payload or MessageRetryRequest()
+        generation_started_at = utc_now()
+        generation_started_monotonic = time.monotonic()
+        session = self.sessions.require(session_id, "session")
+        if session.status == "closed":
+            raise AppError(409, "session_closed", "Closed sessions cannot retry messages")
+        self._ensure_model_provider_available()
+        message = self.messages.require(message_id, "message")
+        if message.session_id != session.id or message.role != "assistant":
+            raise AppError(
+                404,
+                "assistant_message_not_found",
+                "Retry target must be an assistant message in this session",
+            )
+        previous = self._latest_version(message.id)
+        parent = self.messages.require(
+            message.parent_message_id or "",
+            "parent user message",
+        )
+        if parent.session_id != session.id or parent.role != "user":
+            raise AppError(
+                409,
+                "retry_parent_invalid",
+                "The retry target has no valid original user message",
+            )
+
+        node_ids, file_ids = self._retry_learning_context_ids(message, parent)
 
         previous_trace = (
             previous.provider_trace
@@ -6602,16 +6675,10 @@ class ChatService:
                     "The selected model does not expose a structured multimodal chat transport",
                     {"provider_id": self.model_provider.provider_id},
                 )
-        if (
-            any(self._is_video_attachment(file) for file in attached_files)
-            and not structured_chat
-        ):
-            raise AppError(
-                409,
-                "multimodal_transport_unsupported",
-                "Video understanding requires a structured model transport",
-                {"provider_id": self.model_provider.provider_id},
-            )
+        self._validate_video_input_path(
+            attached_files,
+            structured_chat=structured_chat,
+        )
         source_results, source_context = self._run_web_search(retry_context)
         skill_package_context = self._agent_skill_package_instructions(
             agent_mode_enabled=retry_agent_mode,
@@ -8384,15 +8451,10 @@ class ChatService:
                     "The selected model does not expose a structured multimodal chat transport",
                     {"provider_id": self.model_provider.provider_id},
                 )
-        if (
-            any(self._is_video_attachment(file) for file in attached_files)
-            and not structured_chat
-        ):
-            raise AppError(
-                409,
-                "multimodal_transport_unsupported",
-                "Video understanding requires a structured model transport",
-                {"provider_id": self.model_provider.provider_id},
+        if not existing_submission:
+            self._validate_video_input_path(
+                attached_files,
+                structured_chat=structured_chat,
             )
         # D-082: non-agent turns hard-validate whitelist + auto-ASR readiness
         # before the stream starts (also covers optimistic client retries).
@@ -8593,6 +8655,10 @@ class ChatService:
                     "The selected model does not expose a structured multimodal chat transport",
                     {"provider_id": self.model_provider.provider_id},
                 )
+        self._validate_video_input_path(
+            attached_files,
+            structured_chat=structured_chat,
+        )
         audio_transcripts: list[tuple[FileRecord, AudioTranscription]] = []
         workspace_seed_notes: list[str] = []
         if payload.agent_mode and attached_files:

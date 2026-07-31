@@ -7,6 +7,7 @@ import {
   CodeBlockHeader,
 } from "@/components/ai-elements/code-block";
 import { Badge } from "@/components/ui/badge";
+import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 
 const supportedLanguages = new Set<BundledLanguage>([
   "css",
@@ -22,35 +23,6 @@ function codeLanguage(value: unknown): BundledLanguage {
   return typeof value === "string" && supportedLanguages.has(value as BundledLanguage)
     ? (value as BundledLanguage)
     : "tsx";
-}
-
-const DYNAMIC_PREVIEW_CSP =
-  "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:; connect-src 'none'; frame-src 'none'; media-src data: blob:; object-src 'none'; base-uri 'none'; form-action 'none'";
-
-/** Sandboxed dynamic preview: scripts run; no same-origin / network / frames. */
-function dynamicPreviewDocument(html: string) {
-  const trimmed = html.trim();
-  const cspMeta = `<meta http-equiv="Content-Security-Policy" content="${DYNAMIC_PREVIEW_CSP}">`;
-  const isFullDocument =
-    /^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed);
-
-  if (isFullDocument) {
-    if (/http-equiv\s*=\s*["']?Content-Security-Policy/i.test(trimmed)) {
-      return trimmed;
-    }
-    if (/<head[\s>]/i.test(trimmed)) {
-      return trimmed.replace(/<head([^>]*)>/i, `<head$1>${cspMeta}`);
-    }
-    if (/^<!doctype\s+html[^>]*>/i.test(trimmed)) {
-      return trimmed.replace(
-        /^(<!doctype\s+html[^>]*>)/i,
-        `$1<head>${cspMeta}</head>`,
-      );
-    }
-    return `<head>${cspMeta}</head>${trimmed}`;
-  }
-
-  return `<!doctype html><html><head><meta charset="utf-8">${cspMeta}<meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;min-height:100%;font-family:system-ui,sans-serif;color:#171717;background:#fff}*{box-sizing:border-box}</style></head><body>${html}</body></html>`;
 }
 
 export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
@@ -79,7 +51,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           className="sandbox-artifact__preview"
           referrerPolicy="no-referrer"
           sandbox="allow-scripts"
-          srcDoc={dynamicPreviewDocument(previewHtml)}
+          srcDoc={sandboxedHtmlPreviewDocument(previewHtml)}
           title={`${title}动态沙箱预览`}
         />
       ) : canRenderRemote ? (

@@ -193,6 +193,39 @@ async function main() {
     ) {
       failures.push('Backend application import')
     }
+
+    if (
+      !(await runCommand(
+        'Stored audio transcription regression',
+        {
+          command: 'uv',
+          args: ['run', '--locked', 'python', 'scripts/verify_file_transcription.py'],
+        },
+        backendDir,
+        pythonEnv,
+      ))
+    ) {
+      failures.push('Stored audio transcription regression')
+    }
+
+    if (
+      !(await runCommand(
+        'Dual transcription model routing',
+        {
+          command: 'uv',
+          args: [
+            'run',
+            '--locked',
+            'python',
+            'scripts/verify_transcription_model_routing.py',
+          ],
+        },
+        backendDir,
+        pythonEnv,
+      ))
+    ) {
+      failures.push('Dual transcription model routing')
+    }
   }
 
   if (failures.length > 0) {

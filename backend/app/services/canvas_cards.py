@@ -1,9 +1,8 @@
 """Canvas Builder helpers for conversational generative micro-apps.
 
 Channel A (trusted declarative components) and the first-class magic_card Part
-are assembled here. Channel B runtime compilation remains unavailable until the
-isolated browser sandbox is configured; magic_card still emits a safe fallback
-Part so the dialogue never mounts untrusted code in the host DOM.
+are assembled here. Channel B runtime compilation remains unavailable, while
+self-contained HTML previews run inside an opaque-origin browser sandbox.
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ CHANNEL_A_TYPES = frozenset(
         "image_frame",
     }
 )
+MAX_MAGIC_CARD_PREVIEW_CHARS = 100_000
 
 DEFAULT_RENDER_CONTRACT: dict[str, Any] = {
     "slot": "inline",
@@ -44,6 +44,7 @@ DEFAULT_RENDER_CONTRACT: dict[str, Any] = {
         "webgl": False,
         "fullscreen": True,
         "file_drop": False,
+        "sandboxed_html_preview": True,
         "react_sandbox_runtime": False,
     },
     "component_catalog": sorted(CHANNEL_A_TYPES),
@@ -55,6 +56,7 @@ DEFAULT_RENDER_CONTRACT: dict[str, Any] = {
     ],
     "channels": {
         "declarative": True,
+        "sandboxed_html_preview": True,
         "react_sandbox": False,
         "reason": "isolated_browser_renderer_not_configured",
     },
@@ -420,14 +422,30 @@ def build_magic_card_part(
         and isinstance(artifact_url, str)
         and artifact_url.startswith("https://")
     )
+    cleaned_preview = preview_html.strip() if isinstance(preview_html, str) else ""
+    if not runtime_ready and not cleaned_preview:
+        raise AppError(
+            422,
+            "magic_card_preview_required",
+            "preview_html must contain a complete self-contained HTML preview",
+        )
+    if len(cleaned_preview) > MAX_MAGIC_CARD_PREVIEW_CHARS:
+        raise AppError(
+            422,
+            "magic_card_preview_too_large",
+            f"preview_html must not exceed {MAX_MAGIC_CARD_PREVIEW_CHARS} characters",
+            {"max_chars": MAX_MAGIC_CARD_PREVIEW_CHARS},
+        )
+
+    inline_ready = bool(cleaned_preview)
     data: dict[str, Any] = {
         "card_instance_id": instance_id,
         "card_id": card_key,
         "version": max(1, int(version or 1)),
-        "runtime": "react-sandbox-v1",
+        "runtime": "react-sandbox-v1" if runtime_ready else "html-srcdoc-sandbox-v1",
         "title": cleaned_title,
         "fallback_text": (fallback_text or cleaned_title)[:500],
-        "status": "ready" if runtime_ready else "unavailable",
+        "status": "ready",
         "origin_verified": runtime_ready,
         "viewport": {
             "mode": "inline",
@@ -435,21 +453,19 @@ def build_magic_card_part(
             "max_height": 720,
         },
         "scope": scope or {},
-        "reason": None
-        if runtime_ready
-        else "isolated_browser_renderer_not_configured",
+        "reason": None,
     }
     if preferred_height is not None:
         data["preferred_height"] = max(120, min(900, int(preferred_height)))
-    if isinstance(preview_html, str) and preview_html.strip():
-        # Dynamic preview HTML — host renders via sandboxed iframe with scripts
-        # enabled (no allow-same-origin; connect-src blocked by CSP).
-        data["preview_html"] = preview_html[:20_000]
+    if inline_ready:
+        # Dynamic preview HTML runs in an opaque-origin iframe. The host replaces
+        # its CSP and blocks network, frames, forms, and host-DOM access.
+        data["preview_html"] = cleaned_preview
     if runtime_ready:
         data["artifact_url"] = artifact_url
     return {
         "type": "magic_card",
-        "status": "completed" if (runtime_ready or data.get("preview_html")) else "failed",
+        "status": "completed",
         "content": cleaned_title,
         "data": data,
     }

@@ -410,6 +410,15 @@ class MessageSelectionContext(BaseModel):
 class MessageCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
     generation_mode: Literal["text", "image"] = "text"
+    image_size: Literal[
+        "auto",
+        "2048x2048",
+        "2048x1152",
+        "1152x2048",
+        "1536x1152",
+        "1152x1536",
+    ] = "auto"
+    source_file_ids: list[str] = Field(default_factory=list, max_length=4)
     parent_message_id: str | None = None
     node_ids: list[str] = Field(default_factory=list, max_length=8)
     file_ids: list[str] = Field(default_factory=list, max_length=20)
@@ -428,6 +437,10 @@ class MessageCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_graph_action_target(self):
+        if self.generation_mode != "image" and (
+            self.image_size != "auto" or self.source_file_ids
+        ):
+            raise ValueError("image_size and source_file_ids require image generation mode")
         if self.goal_mode and not self.agent_mode:
             raise ValueError("goal_mode requires agent_mode")
         if self.graph_action in {"none", "propose_create"} and self.graph_id is not None:

@@ -4,6 +4,7 @@ import {
   Bot,
   CircleDollarSign,
   Database,
+  Info,
   Palette,
   Search,
   ShieldCheck,
@@ -29,6 +30,7 @@ export const settingsNav: SettingsNavItem[] = [
   { label: "账户与访问", icon: UsersRound, path: "settings/access" },
   { label: "权限审计", icon: ShieldCheck, path: "settings/audit" },
   { label: "存储迁移", icon: Database, path: "settings/storage/migrations" },
+  { label: "关于", icon: Info, path: "settings/about" },
 ];
 
 export function isSettingsNavActive(pathname: string, item: SettingsNavItem) {

@@ -42,9 +42,70 @@ class ParserCapability:
 
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"]
+LOCAL_TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".html",
+    ".htm",
+    ".csv",
+    ".log",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".xml",
+    ".css",
+    ".scss",
+    ".less",
+    ".py",
+    ".pyi",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".java",
+    ".go",
+    ".rs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".rb",
+    ".php",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".scala",
+    ".sql",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".r",
+    ".vue",
+    ".svelte",
+    ".dart",
+    ".lua",
+    ".pl",
+    ".pm",
+}
+BUILT_IN_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xls", ".xlsx"}
+ISOLATED_DOCUMENT_EXTENSIONS = {".doc"}
 
 
-def parser_capabilities() -> list[ParserCapability]:
+def parser_capabilities(
+    *,
+    legacy_doc_available: bool = False,
+    legacy_doc_reason: str | None = None,
+) -> list[ParserCapability]:
     pdf_available = importlib.util.find_spec("pypdf") is not None
     pillow_available = importlib.util.find_spec("PIL") is not None
     pytesseract_available = importlib.util.find_spec("pytesseract") is not None
@@ -61,10 +122,10 @@ def parser_capabilities() -> list[ParserCapability]:
         ParserCapability(
             capability_id="plain_text",
             mode="built_in",
-            extensions=[".txt", ".md", ".markdown"],
+            extensions=sorted(LOCAL_TEXT_EXTENSIONS),
             available=True,
             parser_name="local_text",
-            reason="UTF-8 text is parsed locally with stable line locators.",
+            reason="UTF-8 text and source code are parsed locally with stable line locators.",
         ),
         ParserCapability(
             capability_id="ooxml",
@@ -107,19 +168,44 @@ def parser_capabilities() -> list[ParserCapability]:
             reason="No image-vision Provider port is configured; OCR availability does not imply visual understanding.",
         ),
         ParserCapability(
-            capability_id="legacy_office",
+            capability_id="legacy_xls",
+            mode="built_in",
+            extensions=[".xls"],
+            available=importlib.util.find_spec("xlrd") is not None,
+            parser_name="xlrd" if importlib.util.find_spec("xlrd") is not None else None,
+            reason=(
+                "xlrd is installed for inert legacy Excel cell extraction."
+                if importlib.util.find_spec("xlrd") is not None
+                else "The required xlrd package is not installed."
+            ),
+        ),
+        ParserCapability(
+            capability_id="legacy_doc",
             mode="isolated",
-            extensions=[".doc", ".ppt", ".xls"],
+            extensions=[".doc"],
+            available=legacy_doc_available,
+            parser_name="antiword" if legacy_doc_available else None,
+            reason=(
+                "Legacy Word text is extracted by antiword in the isolated, network-disabled sandbox."
+                if legacy_doc_available
+                else legacy_doc_reason
+                or "The isolated antiword sandbox converter is unavailable."
+            ),
+        ),
+        ParserCapability(
+            capability_id="legacy_ppt",
+            mode="isolated",
+            extensions=[".ppt"],
             available=False,
             parser_name=None,
-            reason="Legacy binary Office formats require an isolated converter and are never executed in the host process.",
+            reason="Legacy PowerPoint requires an isolated converter and is not supported.",
         ),
     ]
 
 
 def parse_document(original_name: str, payload: bytes) -> ParsedDocument:
     extension = Path(original_name).suffix.casefold()
-    if extension in {".txt", ".md", ".markdown"}:
+    if extension in LOCAL_TEXT_EXTENSIONS:
         return _parse_text(payload)
     if extension == ".docx":
         return _parse_docx(payload)
@@ -127,13 +213,19 @@ def parse_document(original_name: str, payload: bytes) -> ParsedDocument:
         return _parse_pptx(payload)
     if extension == ".xlsx":
         return _parse_xlsx(payload)
+    if extension == ".xls":
+        return _parse_xls(payload)
     if extension == ".pdf":
         return _parse_pdf(payload)
     if extension in IMAGE_EXTENSIONS:
         return _parse_image_ocr(payload)
-    if extension in {".doc", ".ppt", ".xls"}:
+    if extension == ".doc":
         raise ProcessorUnavailable(
-            "Legacy Office formats require an isolated converter; they are never executed in the host process"
+            "Legacy Word parsing must run through the isolated antiword sandbox"
+        )
+    if extension == ".ppt":
+        raise ProcessorUnavailable(
+            "Legacy PowerPoint requires an isolated converter and is not supported"
         )
     raise ProcessorUnavailable("No parser is available for this file type")
 
@@ -264,6 +356,46 @@ def _parse_xlsx(payload: bytes) -> ParsedDocument:
         return _document("ooxml_xlsx", chunks)
     finally:
         archive.close()
+
+
+def _parse_xls(payload: bytes) -> ParsedDocument:
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise ProcessorUnavailable("Legacy Excel parsing requires xlrd") from exc
+    workbook = None
+    try:
+        workbook = xlrd.open_workbook(file_contents=payload, on_demand=True)
+        chunks: list[ParsedChunk] = []
+        for sheet_index, sheet in enumerate(workbook.sheets(), start=1):
+            for row_index in range(sheet.nrows):
+                values = [str(value).strip() for value in sheet.row_values(row_index)]
+                if any(values):
+                    chunks.append(
+                        ParsedChunk(
+                            f"sheet:{sheet_index}!row:{row_index + 1}",
+                            "\t".join(values),
+                        )
+                    )
+    except Exception as exc:
+        raise DocumentParseError("Legacy Excel parser could not extract cells") from exc
+    finally:
+        if workbook is not None:
+            workbook.release_resources()
+    return _document("xlrd", chunks, parser_version=str(xlrd.__version__))
+
+
+def isolated_text_document(
+    text: str,
+    *,
+    parser_name: str,
+    parser_version: str,
+) -> ParsedDocument:
+    return _document(
+        parser_name,
+        [ParsedChunk("document", text)],
+        parser_version=parser_version,
+    )
 
 
 def _parse_pdf(payload: bytes) -> ParsedDocument:

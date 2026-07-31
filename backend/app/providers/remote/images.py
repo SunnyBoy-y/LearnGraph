@@ -40,6 +40,39 @@ _MIME_BY_FORMAT = {
     "webp": "image/webp",
 }
 _MAX_ENCODED_IMAGE_BYTES = 80 * 1024 * 1024
+_MIN_IMAGE_AREA = 655_360
+_MAX_IMAGE_AREA = 8_294_400
+_MAX_IMAGE_EDGE = 3_840
+_MAX_IMAGE_ASPECT_RATIO = 3
+
+def _validate_size(value: str) -> str:
+    size = value.strip().casefold()
+    if size == "auto":
+        return size
+    try:
+        width_text, height_text = size.split("x", 1)
+        width = int(width_text)
+        height = int(height_text)
+    except (ValueError, TypeError) as exc:
+        raise ImageGenerationProviderResponseError(
+            "OpenAI Images size must be auto or WIDTHxHEIGHT"
+        ) from exc
+    area = width * height
+    if (
+        width <= 0
+        or height <= 0
+        or width % 16
+        or height % 16
+        or max(width, height) > _MAX_IMAGE_EDGE
+        or area < _MIN_IMAGE_AREA
+        or area > _MAX_IMAGE_AREA
+        or max(width / height, height / width) > _MAX_IMAGE_ASPECT_RATIO
+    ):
+        raise ImageGenerationProviderResponseError(
+            "OpenAI Images size is outside gpt-image-2 constraints"
+        )
+    return f"{width}x{height}"
+
 
 _DASHSCOPE_NATIVE_GENERATION_PATH = (
     "/api/v1/services/aigc/multimodal-generation/generation"
@@ -455,6 +488,11 @@ class OpenAIImagesProvider:
             raise ImageGenerationProviderResponseError(
                 "partial_images must be an integer from 0 to 3"
             )
+        size = _validate_size(request.size)
+        if request.source_images and self.model_id.casefold() != "gpt-image-2":
+            raise ImageGenerationProviderResponseError(
+                "Image editing is only supported with gpt-image-2"
+            )
         self.last_usage = {}
         self.last_request_id = None
         if self.native_generation_url is not None:
@@ -462,16 +500,20 @@ class OpenAIImagesProvider:
                 prompt,
                 self.native_generation_url,
                 source_images=request.source_images,
+                size=size,
             )
             return
         if request.source_images:
             # Image edits are a one-shot multipart endpoint; partial previews
             # are not portable across OpenAI-compatible gateways.
-            yield from self._edit_with_sources(prompt, request.source_images)
+            yield from self._edit_with_sources(
+                prompt, request.source_images, size=size
+            )
             return
         streaming_payload = {
             "model": self.model_id,
             "prompt": prompt,
+            "size": size,
             "stream": True,
             "partial_images": request.partial_images,
             "output_format": self.output_format,
@@ -524,7 +566,11 @@ class OpenAIImagesProvider:
                 fallback_response = client.post(
                     f"{self.base_url}/images/generations",
                     headers={"Accept": "application/json"},
-                    json={"model": self.model_id, "prompt": prompt},
+                    json={
+                        "model": self.model_id,
+                        "prompt": prompt,
+                        "size": size,
+                    },
                 )
                 if not fallback_response.is_success:
                     detail = (
@@ -551,6 +597,7 @@ class OpenAIImagesProvider:
         url: str,
         *,
         source_images: tuple[ImageSourceInput, ...] = (),
+        size: str = "auto",
     ) -> Iterator[ImageGenerationEvent]:
         # DashScope's native generation endpoint is one-shot JSON with no SSE
         # variant, so partial previews are unavailable and a single completed
@@ -565,6 +612,8 @@ class OpenAIImagesProvider:
             "model": self.model_id,
             "input": {"messages": [{"role": "user", "content": content}]},
         }
+        if size != "auto":
+            payload["parameters"] = {"size": size}
         try:
             with httpx.Client(
                 headers={
@@ -599,13 +648,17 @@ class OpenAIImagesProvider:
     }
 
     def _edit_with_sources(
-        self, prompt: str, source_images: tuple[ImageSourceInput, ...]
+        self,
+        prompt: str,
+        source_images: tuple[ImageSourceInput, ...],
+        *,
+        size: str = "auto",
     ) -> Iterator[ImageGenerationEvent]:
         """One-shot OpenAI-compatible /images/edits call with source images."""
 
-        # OpenAI accepts a single file as `image`; multiple references use the
-        # `image[]` array form (gpt-image-1). Compatible gateways follow suit.
-        field = "image" if len(source_images) == 1 else "image[]"
+        # gpt-image-2 uses the repeated `image[]` multipart field for both one
+        # and multiple references.
+        field = "image[]"
         files: list[tuple[str, tuple[str, bytes, str]]] = []
         for index, source in enumerate(source_images):
             suffix = self._SOURCE_SUFFIX_BY_MIME.get(source.mime_type, ".png")
@@ -622,7 +675,11 @@ class OpenAIImagesProvider:
             ) as client:
                 response = client.post(
                     f"{self.base_url}/images/edits",
-                    data={"model": self.model_id, "prompt": prompt},
+                    data={
+                        "model": self.model_id,
+                        "prompt": prompt,
+                        "size": size,
+                    },
                     files=files,
                 )
         except httpx.TimeoutException as exc:

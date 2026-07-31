@@ -11,7 +11,7 @@ description: Teach the Agent how to call canvas_emit_trusted_component with vali
 - 你需要把结构化 UI 写入助手消息流（而不是用 Markdown 伪表单或 HTML）
 - 工具 `canvas_emit_trusted_component` 已出现在本回合 tool 列表中
 
-不要用本 skill 去写任意 React/HTML；那是 `canvas_emit_magic_card`（通道 B，当前多为安全降级）。
+不要用本 skill 去写任意 React/HTML；那是 `canvas_emit_magic_card`（通道 B，需在同一次调用里给出完整自包含的 `preview_html`）。
 
 ## Instructions
 
@@ -153,5 +153,5 @@ description: Teach the Agent how to call canvas_emit_trusted_component with vali
 ## Notes
 
 - 通道 A 是**声明式可信渲染**；非法数据会在前端显示「组件已安全降级」，并露出 JSON，不会执行脚本。
-- 通道 B（`canvas_emit_magic_card`）在隔离浏览器未配置时只会安全降级，**不要**拿它替代表单。
+- 通道 B（`canvas_emit_magic_card`）在隔离沙箱 iframe 里执行内联 HTML/CSS/JS，必须一次提交全部源码且不能依赖任何网络资源；**不要**拿它替代表单。
 - 本 skill 只注入指令，不会注册新 function tool；实际工具名仍是 `canvas_emit_trusted_component`。

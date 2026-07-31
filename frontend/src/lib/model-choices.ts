@@ -34,6 +34,10 @@ export function providerCapabilityString(
   return typeof value === "string" ? value.trim() : "";
 }
 
+export function isRealtimeTranscriptionModel(modelId: string | null | undefined) {
+  return Boolean(modelId?.toLocaleLowerCase().includes("realtime"));
+}
+
 export function providerModelOptions(
   provider: Provider | undefined,
   discovered: ProviderModel[] | undefined,

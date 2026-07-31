@@ -659,6 +659,10 @@ class ProviderService:
             capabilities["default_transcription_model_id"] = (
                 payload.default_transcription_model_id
             )
+        if payload.default_realtime_transcription_model_id is not None:
+            capabilities["default_realtime_transcription_model_id"] = (
+                payload.default_realtime_transcription_model_id
+            )
         if payload.default_vision_model_id is not None:
             capabilities["default_vision_model_id"] = payload.default_vision_model_id
             # Vision companions also expose default_model so discovery UIs and
@@ -682,6 +686,9 @@ class ProviderService:
                     ),
                     "default_transcription_model_id": capabilities.get(
                         "default_transcription_model_id"
+                    ),
+                    "default_realtime_transcription_model_id": capabilities.get(
+                        "default_realtime_transcription_model_id"
                     ),
                     "default_vision_model_id": capabilities.get(
                         "default_vision_model_id"
@@ -846,11 +853,17 @@ class ProviderService:
                     "provider_not_configured",
                     "ASR Provider requires a base URL and encrypted secret before enabling",
                 )
-            if not str(capabilities.get("default_transcription_model_id") or "").strip():
+            stored_model = str(
+                capabilities.get("default_transcription_model_id") or ""
+            ).strip()
+            realtime_model = str(
+                capabilities.get("default_realtime_transcription_model_id") or ""
+            ).strip()
+            if not stored_model and not realtime_model:
                 raise AppError(
                     409,
                     "provider_transcription_model_required",
-                    "A default transcription model is required before enabling",
+                    "A stored-file or realtime transcription model is required before enabling",
                 )
             for current in self.providers.list():
                 if (
@@ -915,6 +928,9 @@ class ProviderService:
                 ),
                 "default_transcription_model_id": capabilities.get(
                     "default_transcription_model_id"
+                ),
+                "default_realtime_transcription_model_id": capabilities.get(
+                    "default_realtime_transcription_model_id"
                 ),
                 "default_vision_model_id": capabilities.get(
                     "default_vision_model_id"

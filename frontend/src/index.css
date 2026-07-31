@@ -1245,6 +1245,10 @@ body.is-resizing .workspace-resizer {
 .chat-dictation-polish:hover em, .chat-dictation-polish:focus-visible em { color: #3d3d3d; }
 .chat-image-action, .chat-selection-reference { display: flex; width: fit-content; max-width: 100%; align-items: center; gap: 7px; margin: 0 0 8px 8px; border: 1px solid rgba(255,255,255,.45); border-radius: 999px; background: rgba(255,255,255,.48); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); padding: 3px 4px 3px 10px; color: #444; font-size: 10px; box-shadow: 0 6px 18px rgba(0,0,0,.05); }
 .chat-image-action span, .chat-selection-reference span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-image-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 8px 8px; }
+.chat-image-controls .chat-image-action { margin: 0; }
+.chat-image-size-select { width: 92px; height: 28px; border-radius: 999px; background: color-mix(in srgb, var(--background) 82%, transparent); font-size: 11px; }
+.chat-image-controls > button { height: 28px; border-radius: 999px; font-size: 10px; }
 .chat-selection-menu { position: fixed; z-index: 80; display: flex; max-width: calc(100vw - 20px); align-items: center; gap: 2px; border: 1px solid #d7d7d7; border-radius: 8px; background: rgba(255,255,255,.98); padding: 4px; box-shadow: 0 12px 30px rgba(0,0,0,.15); transform: translate(-50%, -100%); animation: chat-selection-in 140ms ease-out both; }
 .chat-selection-menu > span { max-width: 160px; overflow: hidden; padding: 0 6px; color: #777; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .chat-selection-menu button { flex: none; border-radius: 6px; }
@@ -1411,7 +1415,7 @@ body.is-resizing .workspace-resizer {
   color: transparent;
   animation: thinking-sheen 1.6s linear infinite;
 }
-/* Wait frame uses a neutral 4/3 canvas; completed previews follow natural ratio. */
+/* Wait frame uses a neutral 4/3 canvas; completed previews fit their real ratio. */
 .chat-generated-image {
   position: relative;
   display: grid;
@@ -1427,20 +1431,23 @@ body.is-resizing .workspace-resizer {
   aspect-ratio: 4 / 3;
 }
 .chat-generated-image--has-preview {
-  width: min(100%, 640px);
+  width: fit-content;
+  max-width: min(100%, 640px);
   min-height: 0;
-  max-height: min(68svh, 720px);
+  max-height: none;
   border: 1px solid #dedede;
   border-radius: 12px;
-  background: #f5f5f4;
-  /* Inline style (real width/height) overrides this once known. */
+  background: transparent;
+  /* Inline style keeps the figure at the generated image's real ratio. */
   aspect-ratio: auto;
   height: auto;
 }
 .chat-generated-image--has-preview .chat-generated-image__preview {
-  width: 100%;
+  display: block;
+  width: auto;
+  max-width: 100%;
   height: auto;
-  max-height: min(68svh, 720px);
+  max-height: min(82svh, 900px);
   object-fit: contain;
 }
 .chat-generated-image__preview {
@@ -1459,6 +1466,8 @@ body.is-resizing .workspace-resizer {
   cursor: zoom-in;
 }
 .chat-generated-image--has-preview .chat-generated-image__zoom {
+  width: fit-content;
+  max-width: 100%;
   height: auto;
 }
 /* ChatGPT-like particle wait card: soft rounded panel + breathing dot field. */

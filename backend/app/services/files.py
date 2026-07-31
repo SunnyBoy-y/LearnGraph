@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 import hashlib
 import json
+import logging
 import time
 from typing import Any
 
@@ -46,37 +47,35 @@ from app.repositories.domain import (
     FileRepository,
     FileTextChunkRepository,
 )
-from app.services.document_parsers import parser_capabilities
+from app.services.document_parsers import (
+    BUILT_IN_DOCUMENT_EXTENSIONS as _BUILT_IN_DOCUMENT_EXTENSIONS,
+    ISOLATED_DOCUMENT_EXTENSIONS as _ISOLATED_DOCUMENT_EXTENSIONS,
+    LOCAL_TEXT_EXTENSIONS as _LOCAL_TEXT_EXTENSIONS,
+    parser_capabilities,
+)
 from app.services.file_references import FileReferenceService
 from app.services.billing import BillingService
+from app.services.dictation import is_realtime_transcription_model
+
+
+logger = logging.getLogger(__name__)
 
 
 from app.services.chat_attachment_policy import (
     AUDIO_EXTENSIONS as _AUDIO_EXTENSIONS,
-    BUILT_IN_DOCUMENT_EXTENSIONS as _BUILT_IN_DOCUMENT_EXTENSIONS,
-    LOCAL_TEXT_EXTENSIONS as _LOCAL_TEXT_EXTENSIONS,
     OPTIONAL_IMAGE_EXTENSIONS as _OPTIONAL_IMAGE_EXTENSIONS,
 )
 
 LOCAL_TEXT_EXTENSIONS = set(_LOCAL_TEXT_EXTENSIONS)
 RECOGNIZED_PROCESSOR_EXTENSIONS = {
-    ".pdf",
     ".ppt",
-    ".pptx",
-    ".doc",
-    ".docx",
-    ".xls",
-    ".xlsx",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".gif",
-    ".html",
-    ".htm",
     *LOCAL_TEXT_EXTENSIONS,
+    *_BUILT_IN_DOCUMENT_EXTENSIONS,
+    *_ISOLATED_DOCUMENT_EXTENSIONS,
+    *_OPTIONAL_IMAGE_EXTENSIONS,
 }
 BUILT_IN_DOCUMENT_EXTENSIONS = set(_BUILT_IN_DOCUMENT_EXTENSIONS)
+ISOLATED_DOCUMENT_EXTENSIONS = set(_ISOLATED_DOCUMENT_EXTENSIONS)
 OPTIONAL_PROCESSOR_EXTENSIONS = set(_OPTIONAL_IMAGE_EXTENSIONS)
 AUDIO_EXTENSIONS = set(_AUDIO_EXTENSIONS)
 
@@ -236,9 +235,17 @@ class FileService:
             limit_bytes=self.settings.max_upload_bytes,
         )
 
-    @staticmethod
-    def capabilities():
-        return parser_capabilities()
+    def capabilities(self):
+        from app.services.sandbox_bootstrap import backend_for_settings
+
+        sandbox = backend_for_settings(self.settings).probe()
+        legacy_doc_available = (
+            sandbox.available and "legacy_doc_extract" in sandbox.capabilities
+        )
+        return parser_capabilities(
+            legacy_doc_available=legacy_doc_available,
+            legacy_doc_reason=sandbox.reason,
+        )
 
     def list_references(self, file_id: str) -> list[FileReference]:
         return self.reference_service.list_for_file(file_id)
@@ -255,6 +262,49 @@ class FileService:
                 .order_by(AudioTranscription.created_at.desc())
             ).all()
         )
+
+    def _persist_transcription_failure(
+        self,
+        *,
+        transcription_id: str,
+        file_id: str,
+        provider_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        self.db.rollback()
+        try:
+            transcription = self.db.scalar(
+                select(AudioTranscription).where(
+                    AudioTranscription.workspace_id == self.workspace_id,
+                    AudioTranscription.id == transcription_id,
+                )
+            )
+            if transcription is None or transcription.status == "completed":
+                return
+            transcription.status = "failed"
+            transcription.error_code = error_code
+            transcription.error_message = error_message[:4_000]
+            transcription.completed_at = utc_now()
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="file.transcription.failed",
+                resource_type="audio_transcription",
+                resource_id=transcription_id,
+                outcome="failed",
+                details={
+                    "file_id": file_id,
+                    "provider_id": provider_id,
+                    "error_code": error_code,
+                },
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.exception(
+                "Failed to persist terminal state for audio transcription %s",
+                transcription_id,
+            )
 
     def transcribe(
         self,
@@ -291,9 +341,22 @@ class FileService:
             self.settings,
             provider_id=payload.provider_id,
             model_id=payload.model_id,
+            purpose="stored",
         )
         if provider is None:
             raise AppError(503, "transcription_provider_unavailable", "No enabled remote ASR Provider matches this request")
+        if is_realtime_transcription_model(provider.model_id):
+            raise AppError(
+                409,
+                "stored_transcription_model_required",
+                "The configured ASR model is realtime-only. Stored audio transcription requires a non-realtime model that supports /audio/transcriptions.",
+                {
+                    "provider_id": provider.provider_id,
+                    "model_id": provider.model_id,
+                    "configured_transport": "realtime_websocket",
+                    "required_transport": "http_audio_transcriptions",
+                },
+            )
         billing = BillingService(self.db, self.workspace_id, self.actor_id)
         quote = billing.preflight_model_call(
             provider_id=provider.provider_id,
@@ -314,73 +377,120 @@ class FileService:
             request_hash=request_hash,
             created_by=self.actor_id,
         )
-        self.db.add(transcription)
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="file.transcription.started",
-            resource_type="audio_transcription",
-            resource_id=transcription.id,
-            details={"file_id": file_id, "provider_id": provider.provider_id, "model_id": provider.model_id},
-        )
-        self.db.commit()
-        audio = self.storage.read_bytes(record.object_key, limit_bytes=self.settings.max_upload_bytes)
+        try:
+            self.db.add(transcription)
+            self.db.flush()
+            transcription_id = transcription.id
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="file.transcription.started",
+                resource_type="audio_transcription",
+                resource_id=transcription_id,
+                details={"file_id": file_id, "provider_id": provider.provider_id, "model_id": provider.model_id},
+            )
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            logger.exception("Failed to persist the start of an audio transcription")
+            raise AppError(
+                500,
+                "transcription_start_failed",
+                "The audio transcription could not be started",
+            ) from exc
+
         started = time.monotonic()
         try:
+            audio = self.storage.read_bytes(
+                record.object_key,
+                limit_bytes=self.settings.max_upload_bytes,
+            )
             result = provider.transcribe(
                 filename=record.original_name,
                 mime_type=record.mime_type,
                 content=audio,
                 language=payload.language,
             )
-        except TranscriptionProviderError as exc:
-            transcription.status = "failed"
-            transcription.error_code = "transcription_provider_failed"
-            transcription.error_message = str(exc)
+            transcription.status = "completed"
+            transcription.transcript = result.text
+            transcription.language = result.language or payload.language
+            transcription.duration_seconds = result.duration_seconds
+            transcription.provider_request_id = result.request_id
+            latency_ms = int((time.monotonic() - started) * 1000)
+            transcription.provider_trace = {
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+                "remote_capability": True,
+                "request_id": result.request_id,
+                "latency_ms": latency_ms,
+                "usage": result.usage,
+            }
+            usage = billing.record_usage(
+                quote,
+                input_tokens=int(result.usage.get("input_tokens") or 0),
+                output_tokens=int(result.usage.get("output_tokens") or 0),
+                attempt=1,
+                latency_ms=latency_ms,
+                usage_reported=bool(result.usage),
+            )
+            self.db.flush()
+            transcription.provider_trace = {
+                **transcription.provider_trace,
+                "usage_event_id": usage.id,
+            }
             transcription.completed_at = utc_now()
             self.audit.record(
                 actor_id=self.actor_id,
-                action="file.transcription.failed",
+                action="file.transcription.completed",
                 resource_type="audio_transcription",
-                resource_id=transcription.id,
-                outcome="failed",
-                details={"file_id": file_id, "provider_id": provider.provider_id},
+                resource_id=transcription_id,
+                details={"file_id": file_id, "provider_id": provider.provider_id, "request_id": result.request_id},
             )
             self.db.commit()
-            raise AppError(502, "transcription_provider_failed", str(exc), {"transcription_id": transcription.id}) from exc
-        transcription.status = "completed"
-        transcription.transcript = result.text
-        transcription.language = result.language or payload.language
-        transcription.duration_seconds = result.duration_seconds
-        transcription.provider_request_id = result.request_id
-        transcription.provider_trace = {
-            "provider_id": provider.provider_id,
-            "model_id": provider.model_id,
-            "remote_capability": True,
-            "request_id": result.request_id,
-            "latency_ms": int((time.monotonic() - started) * 1000),
-            "usage": result.usage,
-        }
-        usage = billing.record_usage(
-            quote,
-            input_tokens=int(result.usage.get("input_tokens") or 0),
-            output_tokens=int(result.usage.get("output_tokens") or 0),
-            attempt=1,
-            latency_ms=transcription.provider_trace["latency_ms"],
-            usage_reported=bool(result.usage),
-        )
-        self.db.flush()
-        transcription.provider_trace["usage_event_id"] = usage.id
-        transcription.completed_at = utc_now()
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="file.transcription.completed",
-            resource_type="audio_transcription",
-            resource_id=transcription.id,
-            details={"file_id": file_id, "provider_id": provider.provider_id, "request_id": result.request_id},
-        )
-        self.db.commit()
-        self.db.refresh(transcription)
-        return transcription
+            self.db.refresh(transcription)
+            return transcription
+        except TranscriptionProviderError as exc:
+            self._persist_transcription_failure(
+                transcription_id=transcription_id,
+                file_id=file_id,
+                provider_id=provider.provider_id,
+                error_code="transcription_provider_failed",
+                error_message=str(exc),
+            )
+            raise AppError(
+                502,
+                "transcription_provider_failed",
+                str(exc),
+                {"transcription_id": transcription_id},
+            ) from exc
+        except AppError as exc:
+            self._persist_transcription_failure(
+                transcription_id=transcription_id,
+                file_id=file_id,
+                provider_id=provider.provider_id,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            raise AppError(
+                exc.status_code,
+                exc.code,
+                exc.message,
+                {**exc.details, "transcription_id": transcription_id},
+            ) from exc
+        except Exception as exc:
+            logger.exception("Audio transcription %s failed", transcription_id)
+            self._persist_transcription_failure(
+                transcription_id=transcription_id,
+                file_id=file_id,
+                provider_id=provider.provider_id,
+                error_code="transcription_failed",
+                error_message="The audio transcription failed unexpectedly",
+            )
+            raise AppError(
+                500,
+                "transcription_failed",
+                "The audio transcription failed unexpectedly",
+                {"transcription_id": transcription_id},
+            ) from exc
 
     def add_reference(self, file_id: str, payload: FileReferenceCreate) -> FileReference:
         reference = self.reference_service.add(file_id, payload)
@@ -463,6 +573,8 @@ class FileService:
             capability = "local_text"
         elif extension in BUILT_IN_DOCUMENT_EXTENSIONS:
             capability = "built_in_document"
+        elif extension in ISOLATED_DOCUMENT_EXTENSIONS:
+            capability = "isolated_converter_required"
         elif extension in OPTIONAL_PROCESSOR_EXTENSIONS:
             capability = "optional_processor"
         elif extension in RECOGNIZED_PROCESSOR_EXTENSIONS:

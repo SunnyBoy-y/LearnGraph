@@ -32,6 +32,9 @@ import {
   Trash2,
   ZoomIn,
   ZoomOut,
+  CheckCircle2,
+  List,
+  Star,
 } from "lucide-react";
 import {
   Link,

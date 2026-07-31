@@ -181,6 +181,10 @@ export interface MessageCreateRequest {
   content: string
   /** Defaults to text for older callers; chat always sends this explicitly. */
   generation_mode?: 'text' | 'image'
+  /** OpenAI Images output dimensions; auto lets the image model choose. */
+  image_size?: 'auto' | '2048x2048' | '2048x1152' | '1152x2048' | '1536x1152' | '1152x1536'
+  /** Existing workspace images sent to gpt-image-2 /images/edits. */
+  source_file_ids?: string[]
   parent_message_id?: string | null
   node_ids?: string[]
   file_ids?: string[]

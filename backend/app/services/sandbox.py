@@ -467,6 +467,96 @@ class SandboxTaskService:
             raise AppError(409, "sandbox_session_expired", "Sandbox session has expired")
         return session
 
+    def extract_legacy_doc(self, file: FileRecord) -> dict[str, Any]:
+        """Extract legacy Word text through the fixed network-disabled runner."""
+
+        capability = self.backend.probe()
+        if not capability.available or "legacy_doc_extract" not in capability.capabilities:
+            raise SandboxBackendUnavailable(
+                capability.reason or "The isolated antiword parser is unavailable"
+            )
+        sandbox_session_id = f"doc-{new_id()}"
+        workspace_relative_path = _initialize_workspace(
+            self.settings, self.actor_id, sandbox_session_id
+        )
+        handle: SandboxSessionHandle | None = None
+        try:
+            handle = self.backend.create(
+                SandboxCreateSpec(
+                    session_id=sandbox_session_id,
+                    image_ref=resolve_sandbox_image(self.settings) or "",
+                    memory_bytes=self.settings.sandbox_memory_bytes,
+                    memory_swap_bytes=self.settings.sandbox_memory_swap_bytes,
+                    cpu_count=self.settings.sandbox_cpu_count,
+                    pids_max=self.settings.sandbox_pids_max,
+                    disk_bytes=self.settings.sandbox_disk_bytes,
+                    workspace_path=str(
+                        _sandbox_workspace_path(self.settings, workspace_relative_path)
+                    ),
+                    runtime_kind="python-node",
+                )
+            )
+            raw = self.storage.read_bytes(
+                file.object_key,
+                limit_bytes=self.settings.max_document_parse_bytes,
+            )
+            input_path = f"input/{file.id}.bin"
+            output_path = f"output/{sandbox_session_id}.json"
+            self.backend.write(handle, input_path, raw)
+            result = self.backend.exec_fixed(
+                handle,
+                (
+                    "python",
+                    "/opt/learngraph/runner.py",
+                    "--task",
+                    "extract_legacy_doc",
+                    "--input",
+                    input_path,
+                    "--output",
+                    output_path,
+                ),
+                timeout_seconds=self.settings.sandbox_wall_time_seconds,
+                output_limit=self.settings.sandbox_output_bytes,
+            )
+            if result.timed_out:
+                raise SandboxBackendError("The isolated antiword parser timed out")
+            if result.exit_code != 0:
+                detail = result.stderr.decode("utf-8", errors="replace").strip()[:2_000]
+                raise SandboxBackendError(
+                    f"The isolated antiword parser failed: {detail or result.exit_code}"
+                )
+            artifact = json.loads(
+                self.backend.read(
+                    handle,
+                    output_path,
+                    self.settings.sandbox_output_bytes,
+                )
+            )
+            if (
+                not isinstance(artifact, dict)
+                or artifact.get("schema_version") != "1.0"
+                or artifact.get("sha256") != file.sha256
+                or not isinstance(artifact.get("text"), str)
+                or not artifact["text"].strip()
+            ):
+                raise SandboxBackendError(
+                    "The isolated antiword parser returned an invalid artifact"
+                )
+            return artifact
+        finally:
+            if handle is not None:
+                try:
+                    self.backend.delete(handle)
+                except Exception:
+                    logger.exception(
+                        "Failed to clean isolated document parser %s",
+                        sandbox_session_id,
+                    )
+            shutil.rmtree(
+                _sandbox_workspace_path(self.settings, workspace_relative_path),
+                ignore_errors=True,
+            )
+
     def create_task(
         self,
         payload: SandboxTaskCreateRequest,
@@ -1622,7 +1712,10 @@ class SandboxAgentWorkspaceService:
                 413, "sandbox_file_too_large", "Workspace audio exceeds the upload limit"
             )
         provider = transcription_provider_for_workspace(
-            self.db, self.workspace_id, self.settings
+            self.db,
+            self.workspace_id,
+            self.settings,
+            purpose="stored",
         )
         if provider is None:
             raise AppError(

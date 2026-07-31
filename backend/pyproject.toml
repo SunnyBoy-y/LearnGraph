@@ -19,6 +19,7 @@ dependencies = [
   "keyring>=25.6,<26",
   "jsonschema>=4.23,<5",
   "pypdf>=5,<7",
+  "xlrd>=2.0.2,<3",
   "pillow>=10,<12",
   "docker>=7.1,<8",
   # IANA zone database for zoneinfo on Windows (and minimal Linux images).

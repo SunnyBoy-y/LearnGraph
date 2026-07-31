@@ -590,6 +590,7 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
         settings,
         provider_id=str(start.get("provider_id") or "") or None,
         model_id=str(start.get("model_id") or "") or None,
+        purpose="realtime",
     )
     if adapter is None:
         await _ws_error(

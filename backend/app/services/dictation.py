@@ -270,6 +270,7 @@ class DictationService:
             self.settings,
             provider_id=provider_id,
             model_id=model_id,
+            purpose="stored",
         )
         if provider is None:
             raise AppError(

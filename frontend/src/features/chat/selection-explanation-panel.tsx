@@ -327,6 +327,11 @@ export function SelectionExplanationPanel({
   );
 
   // Rebind when the parent opens a different selection record.
+  // NOTE: autoSubmittedRef is intentionally NOT reset here. The auto-send guard
+  // key includes record.id and action, so a genuinely new record will always get
+  // its own key (no match → fires). Resetting here causes a double-send in React
+  // StrictMode because the second mount cycle clears the guard right before the
+  // auto-send effect re-runs.
   useEffect(() => {
     const next = ensureRecord(detail, parentSessionId);
     setRecord(next);
@@ -334,7 +339,6 @@ export function SelectionExplanationPanel({
     setLocalMessages([]);
     setStatus("ready");
     setDraft("");
-    autoSubmittedRef.current = "";
     const prefs = getSessionComposerPrefs(
       next.explanationSessionId || parentSessionId,
     );

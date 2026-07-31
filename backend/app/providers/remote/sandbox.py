@@ -262,9 +262,11 @@ class DockerSandboxBackend(SandboxBackendPort):
                 capabilities=(),
                 reason="Sandbox image must be configured with an immutable sha256 digest",
             )
+        image_labels: dict[str, str] = {}
         try:
             client = self._client()
-            client.images.get(self.image_ref)
+            image = client.images.get(self.image_ref)
+            image_labels = dict(image.labels or {})
         except SandboxBackendUnavailable as exc:
             return SandboxCapabilitySnapshot(False, self.backend_id, self.platform, (), str(exc))
         except Exception:
@@ -278,9 +280,7 @@ class DockerSandboxBackend(SandboxBackendPort):
         finally:
             if "client" in locals():
                 client.close()
-        # The unified runner image serves every runtime kind, so the full
-        # capability surface (browser, media, doc conversion) is always on.
-        capabilities = (
+        capabilities = [
             "isolated_workspace",
             "network_none",
             "fixed_runner",
@@ -298,12 +298,14 @@ class DockerSandboxBackend(SandboxBackendPort):
             "cjk_fonts",
             "frontend_toolchain",
             "doc_convert",
-        )
+        ]
+        if image_labels.get("com.learngraph.legacy-doc-extract") == "true":
+            capabilities.append("legacy_doc_extract")
         return SandboxCapabilitySnapshot(
             available=True,
             backend_id=self.backend_id,
             platform=self.platform,
-            capabilities=capabilities,
+            capabilities=tuple(capabilities),
         )
 
     def host_capacity(self) -> tuple[int, int]:

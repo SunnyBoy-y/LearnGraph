@@ -1,10 +1,7 @@
 /**
  * Chat attachment mode policy (D-082 / D-083).
- * Keep extension lists aligned with backend
- * `app/services/chat_attachment_policy.py`.
+ * Keep extension lists aligned with backend `document_parsers.py`.
  */
-
-export type ResponseModeKind = "fast" | "thinking" | "agentic";
 
 export const LOCAL_TEXT_EXTENSIONS = new Set([
   ".txt",
@@ -64,12 +61,11 @@ export const LOCAL_TEXT_EXTENSIONS = new Set([
 
 export const WHITELIST_DOCUMENT_EXTENSIONS = new Set([
   ".pdf",
+  ".doc",
   ".docx",
   ".pptx",
-  ".xlsx",
-  ".ppt",
-  ".doc",
   ".xls",
+  ".xlsx",
 ]);
 
 export const IMAGE_EXTENSIONS = new Set([
@@ -81,7 +77,6 @@ export const IMAGE_EXTENSIONS = new Set([
   ".tif",
   ".tiff",
 ]);
-
 export const AUDIO_EXTENSIONS = new Set([
   ".mp3",
   ".m4a",
@@ -90,7 +85,6 @@ export const AUDIO_EXTENSIONS = new Set([
   ".flac",
   ".aac",
 ]);
-
 export const VIDEO_EXTENSIONS = new Set([
   ".mp4",
   ".mov",
@@ -100,7 +94,6 @@ export const VIDEO_EXTENSIONS = new Set([
   ".flv",
   ".wmv",
 ]);
-
 export const SPECIAL_BINARY_EXTENSIONS = new Set([
   ".exe",
   ".dll",
@@ -129,51 +122,29 @@ export function fileExtension(name: string): string {
 
 export function isImageNameOrMime(name: string, mime?: string | null): boolean {
   const type = (mime ?? "").toLowerCase().split(";", 1)[0].trim();
-  if (type.startsWith("image/")) return true;
-  return IMAGE_EXTENSIONS.has(fileExtension(name));
+  return type.startsWith("image/") || IMAGE_EXTENSIONS.has(fileExtension(name));
 }
 
 export function isAudioNameOrMime(name: string, mime?: string | null): boolean {
   const type = (mime ?? "").toLowerCase().split(";", 1)[0].trim();
-  if (type.startsWith("audio/")) return true;
-  return AUDIO_EXTENSIONS.has(fileExtension(name));
+  return type.startsWith("audio/") || AUDIO_EXTENSIONS.has(fileExtension(name));
 }
 
 export function isVideoNameOrMime(name: string, mime?: string | null): boolean {
   const type = (mime ?? "").toLowerCase().split(";", 1)[0].trim();
-  if (type.startsWith("video/")) return true;
-  return VIDEO_EXTENSIONS.has(fileExtension(name));
+  return type.startsWith("video/") || VIDEO_EXTENSIONS.has(fileExtension(name));
 }
 
 export function isSpecialBinaryName(name: string): boolean {
   return SPECIAL_BINARY_EXTENSIONS.has(fileExtension(name));
 }
 
-export function isFastThinkingWhitelistDocument(
-  name: string,
-  mime?: string | null,
-  parseCapability?: string | null,
-): boolean {
-  if (
-    isImageNameOrMime(name, mime) ||
-    isAudioNameOrMime(name, mime) ||
-    isVideoNameOrMime(name, mime)
-  ) {
-    return false;
-  }
+export function isFastThinkingWhitelistDocument(name: string): boolean {
   if (isSpecialBinaryName(name)) return false;
   const extension = fileExtension(name);
-  if (
+  return (
     LOCAL_TEXT_EXTENSIONS.has(extension) ||
     WHITELIST_DOCUMENT_EXTENSIONS.has(extension)
-  ) {
-    return true;
-  }
-  const capability = (parseCapability ?? "").trim();
-  return (
-    capability === "local_text" ||
-    capability === "built_in_document" ||
-    capability === "optional_processor"
   );
 }
 
@@ -186,63 +157,38 @@ export type AttachmentBlockReason =
 export function classifyNonAgentAttachment(options: {
   name: string;
   mime?: string | null;
-  parseCapability?: string | null;
   parseStatus?: string | null;
   asrAvailable: boolean;
-}): { ok: boolean; reason: AttachmentBlockReason; message: string } {
-  const { name, mime, parseCapability, parseStatus, asrAvailable } = options;
-  if (isSpecialBinaryName(name)) {
-    return {
-      ok: false,
-      reason: "unsupported",
-      message: `「${name}」不能在极速/思考模式使用（可执行或特殊二进制）。请切换到智能体模式，或移除该附件。`,
-    };
-  }
-  if (isImageNameOrMime(name, mime)) {
-    return { ok: true, reason: null, message: "" };
-  }
-  if (isVideoNameOrMime(name, mime)) {
-    return { ok: true, reason: null, message: "" };
+  requireReady?: boolean;
+}): { ok: boolean; reason: AttachmentBlockReason } {
+  const {
+    name,
+    mime,
+    parseStatus,
+    asrAvailable,
+    requireReady = false,
+  } = options;
+  if (isSpecialBinaryName(name)) return { ok: false, reason: "unsupported" };
+  if (isImageNameOrMime(name, mime) || isVideoNameOrMime(name, mime)) {
+    return { ok: true, reason: null };
   }
   if (isAudioNameOrMime(name, mime)) {
-    if (!asrAvailable) {
-      return {
-        ok: false,
-        reason: "audio_needs_asr",
-        message: `音频「${name}」在极速/思考模式下需要已启用的 ASR Provider。请在设置中配置转写，切换到智能体模式，或移除该附件。`,
-      };
-    }
-    return { ok: true, reason: null, message: "" };
+    return asrAvailable
+      ? { ok: true, reason: null }
+      : { ok: false, reason: "audio_needs_asr" };
   }
-  if (!isFastThinkingWhitelistDocument(name, mime, parseCapability)) {
-    return {
-      ok: false,
-      reason: "unsupported",
-      message: `「${name}」不在极速/思考模式支持的常用文件白名单内。请切换到智能体模式，或移除该附件。`,
-    };
+  if (!isFastThinkingWhitelistDocument(name)) {
+    return { ok: false, reason: "unsupported" };
   }
-  if (parseStatus && parseStatus !== "indexed") {
-    return {
-      ok: false,
-      reason: "document_not_ready",
-      message: `「${name}」尚未完成文本解析，极速/思考只能引用解析结果。请等待解析完成、切换智能体，或移除附件。`,
-    };
+  if (requireReady && parseStatus !== "indexed") {
+    return { ok: false, reason: "document_not_ready" };
   }
-  return { ok: true, reason: null, message: "" };
+  return { ok: true, reason: null };
 }
 
-/** HTML accept for fast/thinking file pickers. */
-export function fastThinkingAcceptAttribute(asrAvailable: boolean): string {
-  const parts = [
-    "image/*",
-    "video/*",
-    ...WHITELIST_DOCUMENT_EXTENSIONS,
-    ...LOCAL_TEXT_EXTENSIONS,
-    ...IMAGE_EXTENSIONS,
-    ...VIDEO_EXTENSIONS,
-  ];
-  if (asrAvailable) {
-    parts.push("audio/*", ...AUDIO_EXTENSIONS);
-  }
-  return parts.join(",");
+export function nonAgentAttachmentBlockedMessage(names: string[]): string {
+  const uniqueNames = [...new Set(names.filter(Boolean))];
+  const preview = uniqueNames.slice(0, 5).map((name) => `「${name}」`).join("、");
+  const remainder = uniqueNames.length > 5 ? ` 等 ${uniqueNames.length} 个文件` : "";
+  return `极速/思考模式不支持以下附件：${preview}${remainder}。请切换到智能体模式，或者删除不受支持的文件后再发送。`;
 }

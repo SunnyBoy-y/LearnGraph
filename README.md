@@ -40,27 +40,22 @@
 
 <table>
   <tr>
-    <th width="50%">工作区首页</th>
-    <th width="50%">学习产物预览</th>
+    <th width="50%">主对话页面</th>
+    <th width="50%">可交互web组件生成</th>
   </tr>
   <tr>
-    <td><img src=".github/assets/product-workspace-home.png" alt="LearnGraph 工作区首页：学习计划、下一步行动与学习活动热力图"></td>
-    <td><img src=".github/assets/product-artifact-preview.png" alt="LearnGraph 学习产物预览"></td>
+    <td><img src=".github/assets/chat.jpg" alt="LearnGraph 主对话页面：知识图谱、智能体、主交互页面图"></td>
+    <td><img src=".github/assets/product-artifact-preview.png" alt="LearnGraph 可交互式web组件"></td>
   </tr>
   <tr>
-    <th>交互练习与图谱联动</th>
-    <th>用量计费与预算</th>
+    <th>随心练习速览解释</th>
+    <th>文档学习与溯源问答</th>
   </tr>
   <tr>
-    <td><img src=".github/assets/product-learning-exercise.png" alt="LearnGraph 交互练习与知识图谱联动"></td>
-    <td><img src=".github/assets/product-usage-budget.png" alt="LearnGraph 用量计费与预算面板"></td>
+    <td><img src=".github/assets/exam.png" alt="LearnGraph 交互练习与滑词解释"></td>
+    <td><img src=".github/assets/product-document-learning.png" alt="LearnGraph 文档学习与溯源问答"></td>
   </tr>
-  <tr>
-    <th colspan="2">文档学习与溯源问答</th>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><img src=".github/assets/product-document-learning.png" alt="LearnGraph 文档学习与溯源问答" width="50%"></td>
-  </tr>
+
 </table>
 
 ## 📚 开发者文档

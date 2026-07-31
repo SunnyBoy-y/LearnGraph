@@ -18,6 +18,8 @@ class ImageSourceInput:
 class ImageGenerationRequest:
     prompt: str
     partial_images: int = 2
+    # OpenAI Images `size` value. `auto` lets the provider choose.
+    size: str = "auto"
     # When non-empty, the provider must condition the generation on these
     # source images (image edit) instead of a pure text-to-image call.
     source_images: tuple[ImageSourceInput, ...] = ()

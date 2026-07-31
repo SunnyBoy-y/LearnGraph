@@ -19,6 +19,8 @@ export type RealtimeDictationHandle = {
 };
 
 export type RealtimeDictationOptions = {
+  providerId: string;
+  modelId: string;
   /** 未定稿的当前句(整句替换,不追加)。 */
   onPartial: (text: string) => void;
   /** 一句定稿(按顺序追加)。 */
@@ -135,6 +137,8 @@ export async function startRealtimeDictation(
           type: "start",
           token,
           workspace_id: workspaceId,
+          provider_id: options.providerId,
+          model_id: options.modelId,
           sample_rate: TARGET_SAMPLE_RATE,
         }),
       );

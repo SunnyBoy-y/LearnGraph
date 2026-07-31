@@ -50,6 +50,7 @@ from app.providers.remote.fetch import (
 )
 from app.providers.storage_factory import object_storage_provider
 from app.repositories.audit import AuditRepository
+from app.services.canvas_cards import MAX_MAGIC_CARD_PREVIEW_CHARS
 from app.services.chat_attachment_policy import is_image_attachment
 from app.services.image_generations import ImageGenerationService
 from app.services.mcp_skills import MCPAndSkillService
@@ -616,12 +617,13 @@ class AgentToolRuntime:
                 "function": {
                     "name": "canvas_emit_magic_card",
                     "description": (
-                        "Publish a channel-B magic_card Message Part. Until the "
-                        "isolated browser sandbox is configured, this records a safe "
-                        "fallback card with optional dynamic preview_html (scripts run "
-                        "inside a sandboxed iframe, not host DOM). Prefer full HTML "
-                        "documents or fragments with <script> for animations/canvas. "
-                        "Do not use this for ordinary forms."
+                        "Publish a channel-B magic_card Message Part from a complete, "
+                        "self-contained preview_html document or fragment. Inline HTML, "
+                        "CSS, and JavaScript run inside an opaque-origin sandboxed iframe, "
+                        "not the host DOM. Include all executable source in this call; do "
+                        "not depend on sandbox files or a React build. Do not use CDN or "
+                        "remote scripts, images, fonts, module imports, fetch, WebSocket, "
+                        "or other network resources. Do not use this for ordinary forms."
                     ),
                     "parameters": {
                         "type": "object",
@@ -635,11 +637,19 @@ class AgentToolRuntime:
                                 "minimum": 120,
                                 "maximum": 900,
                             },
-                            "preview_html": {"type": "string"},
+                            "preview_html": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_MAGIC_CARD_PREVIEW_CHARS,
+                                "description": (
+                                    "Complete self-contained inline HTML/CSS/JavaScript; "
+                                    "all network access is blocked by the host sandbox."
+                                ),
+                            },
                             "goal_id": {"type": "string"},
                             "node_id": {"type": "string"},
                         },
-                        "required": ["title"],
+                        "required": ["title", "preview_html"],
                         "additionalProperties": False,
                     },
                 },
@@ -910,6 +920,9 @@ class AgentToolRuntime:
                                 "default_model": {"type": "string"},
                                 "default_image_generation_model_id": {"type": "string"},
                                 "default_transcription_model_id": {"type": "string"},
+                                "default_realtime_transcription_model_id": {
+                                    "type": "string"
+                                },
                                 "default_vision_model_id": {"type": "string"},
                             },
                             "required": ["provider_id"],
@@ -1482,6 +1495,22 @@ class AgentToolRuntime:
                                 "description": (
                                     "Optional configured and enabled image-generation "
                                     "model ID. Omit to use the default image model."
+                                ),
+                            },
+                            "size": {
+                                "type": "string",
+                                "enum": [
+                                    "auto",
+                                    "2048x2048",
+                                    "2048x1152",
+                                    "1152x2048",
+                                    "1536x1152",
+                                    "1152x1536",
+                                ],
+                                "description": (
+                                    "Output dimensions. Use 2048x1152 for 16:9, "
+                                    "1152x2048 for 9:16, 1536x1152 for 4:3, "
+                                    "1152x1536 for 3:4, or auto when unspecified."
                                 ),
                             },
                             "source_file_ids": {
@@ -2366,6 +2395,7 @@ class AgentToolRuntime:
                     "default_model",
                     "default_image_generation_model_id",
                     "default_transcription_model_id",
+                    "default_realtime_transcription_model_id",
                     "default_vision_model_id",
                 )
                 if key in arguments and arguments[key] is not None
@@ -2842,6 +2872,7 @@ class AgentToolRuntime:
                     if arguments.get("model_id")
                     else None
                 ),
+                purpose="stored",
             )
             if provider is None or not getattr(provider, "available", True):
                 raise AppError(
@@ -3408,27 +3439,29 @@ class AgentToolRuntime:
                 else None,
                 scope=scope or None,
             )
+            card_data = part.get("data") or {}
             self.audit.record(
                 actor_id=self.actor_id,
                 action="canvas.emit_magic_card",
                 resource_type="chat_session",
                 resource_id=chat_session_id,
                 details={
-                    "card_id": (part.get("data") or {}).get("card_id"),
-                    "card_instance_id": (part.get("data") or {}).get("card_instance_id"),
-                    "status": (part.get("data") or {}).get("status"),
+                    "card_id": card_data.get("card_id"),
+                    "card_instance_id": card_data.get("card_instance_id"),
+                    "status": card_data.get("status"),
                 },
             )
             self.extensions.db.commit()
             return self._success(
                 {
                     "published": True,
-                    "channel": "react_sandbox",
-                    "runtime_available": bool((part.get("data") or {}).get("origin_verified")),
+                    "channel": "sandboxed_html_preview",
+                    "runtime_available": card_data.get("status") == "ready",
+                    "runtime": card_data.get("runtime"),
                     "part_type": "magic_card",
-                    "card_instance_id": (part.get("data") or {}).get("card_instance_id"),
-                    "status": (part.get("data") or {}).get("status"),
-                    "reason": (part.get("data") or {}).get("reason"),
+                    "card_instance_id": card_data.get("card_instance_id"),
+                    "status": card_data.get("status"),
+                    "reason": card_data.get("reason"),
                 },
                 {
                     "canvas": True,
@@ -4345,6 +4378,22 @@ class AgentToolRuntime:
             if isinstance(model_id_raw, str) and model_id_raw.strip()
             else None
         )
+        size_raw = arguments.get("size")
+        size = (
+            size_raw.strip().casefold()
+            if isinstance(size_raw, str) and size_raw.strip()
+            else "auto"
+        )
+        allowed_sizes = {
+            "auto",
+            "2048x2048",
+            "2048x1152",
+            "1152x2048",
+            "1536x1152",
+            "1152x1536",
+        }
+        if size not in allowed_sizes:
+            raise AppError(422, "invalid_tool_arguments", "size is not supported")
         source_file_ids_raw = arguments.get("source_file_ids")
         source_file_ids: list[str] = []
         if source_file_ids_raw is not None:
@@ -4410,6 +4459,12 @@ class AgentToolRuntime:
                 "The selected image generation model is not configured and enabled",
             )
 
+        if source_file_ids and image_provider.model_id.casefold() != "gpt-image-2":
+            return self._failure(
+                "image_edit_model_unsupported",
+                "Image editing is only supported with gpt-image-2. The active text LLM may still be DeepSeek; select gpt-image-2 for this image tool call.",
+            )
+
         images = ImageGenerationService(
             self.extensions.db,
             self.workspace_id,
@@ -4434,6 +4489,7 @@ class AgentToolRuntime:
                 ImageGenerationRequest(
                     prompt=prompt,
                     partial_images=0,
+                    size=size,
                     source_images=tuple(source_inputs),
                 )
             ):
@@ -4458,6 +4514,7 @@ class AgentToolRuntime:
                         image_provider, "last_request_id", None
                     ),
                     "agent_tool": "generate_image",
+                    "image_size": size,
                     "source_file_ids": source_file_ids,
                 },
             )
@@ -4498,6 +4555,7 @@ class AgentToolRuntime:
             "title": title,
             "alt": prompt[:240],
             "prompt": prompt,
+            "image_size": size,
             "source_file_ids": source_file_ids,
             "progress_mode": "completed",
             "preview_revision": 1,

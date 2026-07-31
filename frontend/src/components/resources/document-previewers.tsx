@@ -19,6 +19,7 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { Workbook, type Cell, type Worksheet } from "exceljs";
 
 import { Button } from "@/components/ui/button";
+import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -868,82 +869,6 @@ export function BlobImage({ blob, alt }: { blob: Blob; alt: string }) {
 }
 
 
-const HTML_PREVIEW_CSP = [
-  "default-src 'none'",
-  "img-src data: blob:",
-  "media-src data: blob:",
-  "font-src data:",
-  "style-src 'unsafe-inline'",
-  "script-src 'unsafe-inline' 'unsafe-eval' blob:",
-  "worker-src blob:",
-  "connect-src 'none'",
-  "frame-src 'none'",
-  "object-src 'none'",
-  "base-uri 'none'",
-  "form-action 'none'",
-].join("; ");
-
-function sandboxedHtmlDocument(html: string): string {
-  // Parse in a detached document. Scripts are retained because they execute
-  // only inside a unique-origin iframe without storage, network, frames, forms,
-  // popups, top navigation, or access to the LearnGraph application.
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
-  doc
-    .querySelectorAll("iframe, object, embed, form, link[rel=import]")
-    .forEach((node) => node.remove());
-  doc.querySelectorAll<HTMLElement>("*").forEach((element) => {
-    for (const attribute of Array.from(element.attributes)) {
-      const name = attribute.name.toLowerCase();
-      if (name === "srcdoc") {
-        element.removeAttribute(attribute.name);
-      }
-    }
-  });
-  doc.querySelectorAll<HTMLElement>("[src], [href], [xlink\\:href]").forEach((element) => {
-    for (const attributeName of ["src", "href", "xlink:href"]) {
-      const value = element.getAttribute(attributeName)?.trim();
-      if (
-        value &&
-        !value.startsWith("#") &&
-        !value.startsWith("blob:") &&
-        !value.startsWith("data:") &&
-        // Allow relative assets to fail closed; keep only safe in-document anchors/data.
-        !value.startsWith("./") &&
-        !value.startsWith("../") &&
-        !value.startsWith("/")
-      ) {
-        // Drop external network loads from untrusted HTML previews.
-        if (/^(https?:|\/\/|javascript:|vbscript:)/iu.test(value)) {
-          element.removeAttribute(attributeName);
-        }
-      }
-      if (
-        value &&
-        /^javascript:/iu.test(value) &&
-        !attributeName.toLowerCase().includes("href")
-      ) {
-        element.removeAttribute(attributeName);
-      }
-    }
-  });
-  doc.querySelectorAll("style").forEach((style) => {
-    style.textContent = (style.textContent ?? "")
-      .replace(/@import\s+[^;]+;?/giu, "")
-      .replace(/url\(\s*(['"]?)https?:[^)]+\)/giu, "none")
-      .replace(/expression\s*\(/giu, "invalid(");
-  });
-  doc.querySelectorAll<HTMLScriptElement>("script[src]").forEach((script) => {
-    // A standalone uploaded HTML file has no authorized asset origin. Inline
-    // scripts run; remote and relative script fetches fail closed.
-    script.removeAttribute("src");
-  });
-  return `<!DOCTYPE html><html><head><meta charset="utf-8" /><meta http-equiv="Content-Security-Policy" content="${HTML_PREVIEW_CSP}" />${
-    doc.head?.innerHTML ?? ""
-  }</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
-}
-
-
 export function HtmlDocumentViewer({
   blob,
   filename,
@@ -966,7 +891,7 @@ export function HtmlDocumentViewer({
       .then((text) => {
         if (cancelled) return;
         setSourceText(text);
-        setPreviewHtml(sandboxedHtmlDocument(text));
+        setPreviewHtml(sandboxedHtmlPreviewDocument(text));
       })
       .catch((err: unknown) => {
         if (cancelled) return;

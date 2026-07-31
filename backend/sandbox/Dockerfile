@@ -4,12 +4,14 @@
 # Base digest is pinned for reproducibility; Bootstrap builds and re-pins the result.
 FROM python:3.12-alpine@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df
 
+LABEL com.learngraph.legacy-doc-extract="true"
+
 # Mirror overrides for constrained networks (only used at build time).
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG NPM_REGISTRY=https://registry.npmjs.org/
 
 RUN apk add --no-cache nodejs npm chromium chromium-swiftshader nss freetype harfbuzz ca-certificates \
-        ttf-freefont font-noto-cjk ffmpeg \
+        ttf-freefont font-noto-cjk ffmpeg antiword \
     && addgroup -g 65532 learngraph \
     && adduser -D -H -u 65532 -G learngraph learngraph
 
@@ -45,6 +47,7 @@ RUN chmod 0555 /opt/learngraph/runner.py /opt/learngraph/browser-smoke.js /opt/l
     && python --version \
     && node --version \
     && ffmpeg -version \
+    && command -v antiword >/dev/null \
     && python -c "import mammoth, pypdf, openpyxl, PIL, pydub, learngraph_tasks" \
     && cd /tmp && node -e "require('playwright-core'); Promise.all(['vite','vue','react','react-dom','@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile'].map((m) => import(m))).then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
 

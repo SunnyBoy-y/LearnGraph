@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Box, Sparkles } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 
 type MagicCardData = {
   card_instance_id?: string;
@@ -11,6 +12,7 @@ type MagicCardData = {
   fallback_text?: string;
   title?: string;
   status?: string;
+  reason?: string;
   origin_verified?: boolean;
   artifact_url?: string;
   preview_html?: string;
@@ -34,38 +36,13 @@ function positiveHeight(value: unknown, fallback: number) {
     : fallback;
 }
 
-/** CSP for sandboxed dynamic HTML previews (scripts on, no network/frames). */
-const DYNAMIC_PREVIEW_CSP =
-  "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:; connect-src 'none'; frame-src 'none'; media-src data: blob:; object-src 'none'; base-uri 'none'; form-action 'none'";
-
-/**
- * Build srcDoc for agent HTML. Full documents pass through (with CSP meta
- * injected); fragments are wrapped so scripts/canvas animations can execute.
- */
-function buildDynamicPreviewSrcDoc(html: string): string {
-  const trimmed = html.trim();
-  const cspMeta = `<meta http-equiv="Content-Security-Policy" content="${DYNAMIC_PREVIEW_CSP}">`;
-  const isFullDocument =
-    /^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed);
-
-  if (isFullDocument) {
-    if (/http-equiv\s*=\s*["']?Content-Security-Policy/i.test(trimmed)) {
-      return trimmed;
-    }
-    if (/<head[\s>]/i.test(trimmed)) {
-      return trimmed.replace(/<head([^>]*)>/i, `<head$1>${cspMeta}`);
-    }
-    if (/^<!doctype\s+html[^>]*>/i.test(trimmed)) {
-      return trimmed.replace(
-        /^(<!doctype\s+html[^>]*>)/i,
-        `$1<head>${cspMeta}</head>`,
-      );
-    }
-    return `<head>${cspMeta}</head>${trimmed}`;
-  }
-
-  return `<!doctype html><html><head><meta charset="utf-8">${cspMeta}<meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;min-height:100%;font-family:system-ui,sans-serif;color:#171717;background:#fff}*{box-sizing:border-box}</style></head><body>${html}</body></html>`;
-}
+/** Reasons persisted by the backend for cards without an executable preview. */
+const CARD_REASON_TEXT: Record<string, string> = {
+  isolated_browser_renderer_not_configured:
+    "这张卡片没有随消息保存可执行的隔离预览内容，无法重新运行。",
+  magic_card_preview_required:
+    "这张卡片没有随消息保存可执行的隔离预览内容，无法重新运行。",
+};
 
 function MagicCardFallback({
   title,
@@ -108,11 +85,11 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     (typeof card.fallback_text === "string" && card.fallback_text) ||
     (typeof card.card_id === "string" && card.card_id) ||
     "交互卡片";
-  const height = positiveHeight(
-    card.preferred_height ?? card.viewport?.preferred_height,
-    360,
-  );
   const maxHeight = positiveHeight(card.viewport?.max_height, 720);
+  const height = Math.min(
+    maxHeight,
+    positiveHeight(card.preferred_height ?? card.viewport?.preferred_height, 360),
+  );
   const artifactUrl =
     typeof card.artifact_url === "string" ? card.artifact_url : "";
   const previewHtml =
@@ -232,8 +209,9 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   if (previewHtml) {
     // Dynamic preview: allow scripts inside an opaque-origin sandbox (no
     // allow-same-origin) so agent HTML/canvas/animation can run without
-    // host-DOM access. Still block network, frames, and forms.
-    const srcDoc = buildDynamicPreviewSrcDoc(previewHtml);
+    // host-DOM access. The host owns the CSP; network, frames, and forms stay
+    // blocked even if the card ships its own policy.
+    const srcDoc = sandboxedHtmlPreviewDocument(previewHtml);
     return (
       <section aria-label={title} className="magic-card">
         <div className="magic-card__heading">
@@ -257,14 +235,13 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     );
   }
 
-  return (
-    <MagicCardFallback
-      reason={
-        typeof card.status === "string" && card.status === "building"
-          ? "卡片仍在构建或尚未发布可验证运行时。"
-          : "缺少已签名的独立源运行时，无法安全加载可执行卡片。"
-      }
-      title={title}
-    />
-  );
+  if (card.status === "building") {
+    return <MagicCardFallback reason="卡片仍在构建，尚未产出可运行内容。" title={title} />;
+  }
+
+  const mappedReason =
+    (typeof card.reason === "string" ? CARD_REASON_TEXT[card.reason] : "") ||
+    (typeof card.fallback_text === "string" ? card.fallback_text.trim() : "") ||
+    "这张卡片没有随消息保存可执行的隔离预览内容，无法重新运行。";
+  return <MagicCardFallback reason={mappedReason} title={title} />;
 }

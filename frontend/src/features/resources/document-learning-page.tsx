@@ -38,6 +38,7 @@ import {
   transcribeAudioFile,
 } from "@/api/files";
 import { listProviders } from "@/api/providers";
+import { ApiError } from "@/api/client";
 import { listGoals } from "@/api/goals";
 import { createSession } from "@/api/sessions";
 import { createConceptBranch } from "@/api/sessions";
@@ -52,6 +53,10 @@ import {
   FilePreviewCanvas,
 } from "@/components/resources/file-preview";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
+import {
+  isRealtimeTranscriptionModel,
+  providerCapabilityString,
+} from "@/lib/model-choices";
 import { ConceptBranchWorkspace } from "@/features/resources/concept-branch-workspace";
 import { cn } from "@/lib/utils";
 import type {
@@ -324,7 +329,23 @@ export function DocumentLearningPage() {
     queryKey: ["audio-transcriptions", fileId],
     queryFn: () => listAudioTranscriptions(fileId),
     enabled: Boolean(fileId && (file?.mime_type.startsWith("audio/") || /\.(mp3|m4a|wav|webm|ogg|flac|aac)$/iu.test(file?.original_name ?? ""))),
+    refetchInterval: (query) =>
+      query.state.data?.[0]?.status === "running" ? 1_000 : false,
   });
+  const transcriptionProviders = (providers.data ?? []).filter((provider) =>
+    provider.enabled &&
+    provider.remote_capability &&
+    provider.provider_type === "openai_compatible_transcription",
+  );
+  const storedTranscriptionProvider = transcriptionProviders.find((provider) => {
+    const modelId = providerCapabilityString(
+      provider,
+      "default_transcription_model_id",
+    );
+    return Boolean(modelId && !isRealtimeTranscriptionModel(modelId));
+  });
+  const realtimeOnlyTranscription =
+    transcriptionProviders.length > 0 && !storedTranscriptionProvider;
 
   useEffect(() => {
     if (!jobId || job.data?.status === undefined) return;
@@ -442,22 +463,40 @@ export function DocumentLearningPage() {
 
   const transcription = useMutation({
     mutationFn: () => {
-      const provider = providers.data?.find((item) =>
-        item.enabled && item.remote_capability && item.provider_type === "openai_compatible_transcription",
-      );
-      if (!provider) throw new Error("没有可用的真实 ASR Provider，请先在 Provider 管理中配置。");
+      if (!storedTranscriptionProvider) {
+        throw new Error(
+          realtimeOnlyTranscription
+            ? "当前 ASR 模型仅支持实时听写。文件转写需在 Provider 管理中选择非 realtime 模型。"
+            : "没有可用的文件转写 ASR Provider，请先在 Provider 管理中配置。",
+        );
+      }
       return transcribeAudioFile(fileId, {
-        provider_id: provider.id,
-        model_id: typeof provider.capabilities.default_transcription_model_id === "string"
-          ? provider.capabilities.default_transcription_model_id
-          : undefined,
+        provider_id: storedTranscriptionProvider.id,
+        model_id: providerCapabilityString(
+          storedTranscriptionProvider,
+          "default_transcription_model_id",
+        ),
       });
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["audio-transcriptions", fileId] });
       toast.success("音频转写已完成");
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error) => {
+      if (
+        error instanceof ApiError &&
+        error.code === "stored_transcription_model_required"
+      ) {
+        toast.error("当前 ASR 模型仅支持实时听写", {
+          description: "请在 Provider 管理中选择支持文件转写的非 realtime 模型。",
+        });
+        return;
+      }
+      toast.error(error.message);
+    },
+    onSettled: () =>
+      queryClient.invalidateQueries({
+        queryKey: ["audio-transcriptions", fileId],
+      }),
   });
 
   const preview = useMutation({
@@ -552,8 +591,16 @@ export function DocumentLearningPage() {
   const previewKind = resolveFilePreviewKind(file.original_name, file.mime_type);
   const isAudio = previewKind === "audio";
   const hasOriginalPreview = previewKind !== "unsupported";
+  // 仅 PDF / DOCX / DOC 支持证据检索与图谱构建；其余格式隐藏这两个标签页。
+  const supportsEvidenceAndGraph =
+    /\.(pdf|docx|doc)$/i.test(file.original_name) ||
+    [
+      "application/pdf",
+      "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ].includes(file.mime_type);
   // HTML 页面在沙箱 iframe 中整体预览，证据检索与图谱构建不适用。
-  const chatOnlyPanel = previewKind === "html";
+  const chatOnlyPanel = previewKind === "html" || !supportsEvidenceAndGraph;
   const effectiveRightPanel = chatOnlyPanel ? "chat" : rightPanel;
   const confirmedGoals = (goals.data ?? []).filter((item) =>
     ["confirmed", "candidate_ready", "approved"].includes(item.status),
@@ -836,15 +883,69 @@ export function DocumentLearningPage() {
               <section className="audio-transcript">
                 <div className="audio-transcript__header">
                   <div><p>ASR 文稿</p><span>远程 Provider 结果会持久保存</span></div>
-                  <Button disabled={transcription.isPending} onClick={() => transcription.mutate()} size="sm">
-                    {transcription.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
-                    {transcriptions.data?.[0]?.status === "completed" ? "重新转写" : "开始转写"}
+                  <Button
+                    disabled={
+                      transcription.isPending ||
+                      transcriptions.data?.[0]?.status === "running" ||
+                      !storedTranscriptionProvider
+                    }
+                    onClick={() => transcription.mutate()}
+                    size="sm"
+                    title={
+                      realtimeOnlyTranscription
+                        ? "当前模型仅支持实时听写；文件转写需选择非 realtime 模型"
+                        : storedTranscriptionProvider
+                          ? undefined
+                          : "请先配置文件转写 ASR Provider"
+                    }
+                  >
+                    {transcription.isPending || transcriptions.data?.[0]?.status === "running" ? (
+                      <LoaderCircle className="size-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="size-4" />
+                    )}
+                    {transcription.isPending || transcriptions.data?.[0]?.status === "running"
+                      ? "正在转写"
+                      : transcriptions.data?.[0]?.status === "completed"
+                        ? "重新转写"
+                        : transcriptions.data?.[0]?.status === "failed"
+                          ? "重试转写"
+                          : "开始转写"}
                   </Button>
                 </div>
-                {transcriptions.data?.[0]?.status === "completed" ? (
+                {transcriptions.isPending ? (
+                  <p className="audio-transcript__empty">正在读取转写记录…</p>
+                ) : transcriptions.isError ? (
+                  <div className="audio-transcript__error" role="alert">
+                    <p>无法读取转写记录：{transcriptions.error.message}</p>
+                    <Button
+                      disabled={transcriptions.isFetching}
+                      onClick={() => void transcriptions.refetch()}
+                      size="xs"
+                      variant="outline"
+                    >
+                      重新读取
+                    </Button>
+                  </div>
+                ) : realtimeOnlyTranscription ? (
+                  <p className="audio-transcript__error">
+                    当前 ASR 模型仅支持实时听写。请在 Provider 管理中选择支持文件转写的非 realtime 模型。
+                  </p>
+                ) : !storedTranscriptionProvider ? (
+                  <p className="audio-transcript__error">
+                    尚未配置可用的文件转写 ASR Provider。
+                  </p>
+                ) : transcriptions.data?.[0]?.status === "completed" ? (
                   <div className="audio-transcript__text">{transcriptions.data[0].transcript}</div>
                 ) : transcriptions.data?.[0]?.status === "failed" ? (
-                  <p className="audio-transcript__error">{transcriptions.data[0].error_message}</p>
+                  <p className="audio-transcript__error">
+                    {transcriptions.data[0].error_code
+                      ? `${transcriptions.data[0].error_code} · `
+                      : ""}
+                    {transcriptions.data[0].error_message ?? "音频转写失败"}
+                  </p>
+                ) : transcriptions.data?.[0]?.status === "running" ? (
+                  <p className="audio-transcript__empty">服务端正在转写，结果完成后会自动刷新。</p>
                 ) : (
                   <p className="audio-transcript__empty">尚无转写文稿。</p>
                 )}

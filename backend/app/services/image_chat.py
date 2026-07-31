@@ -6,6 +6,7 @@ import re
 import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.domain.models import (
+    FileRecord,
     ImageGenerationTask,
     Message,
     MessageControl,
@@ -26,12 +28,15 @@ from app.domain.models import (
     UsageEvent,
 )
 from app.domain.schemas.chat import MessageCreateRequest, SSEEventEnvelope
+from app.domain.schemas.files import FileReferenceCreate
 from app.providers.ports.image_generation import (
     ImageGenerationProviderPort,
     ImageGenerationRequest,
+    ImageSourceInput,
 )
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import (
+    FileRepository,
     MessagePartRepository,
     MessageRepository,
     MessageStreamEventRepository,
@@ -39,11 +44,15 @@ from app.repositories.domain import (
     MessageVersionRepository,
     SessionRepository,
 )
+from app.services.file_references import FileReferenceService
 from app.services.image_generations import ImageGenerationService
+from app.providers.storage_factory import object_storage_provider
 
 
 _DRAW_COMMAND = re.compile(r"^@绘图(?:\s+|$)")
 _TERMINAL = {"completed", "failed", "cancelled"}
+_IMAGE_EDIT_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
+_IMAGE_EDIT_MAX_BYTES = 50 * 1024 * 1024
 
 
 class _ImageCancellationRequested(Exception):
@@ -65,6 +74,7 @@ class ImageChatService:
         self.settings = settings
         self.image_provider = image_provider
         self.sessions = SessionRepository(db, workspace_id)
+        self.files = FileRepository(db, workspace_id)
         self.messages = MessageRepository(db, workspace_id)
         self.versions = MessageVersionRepository(db, workspace_id)
         self.parts = MessagePartRepository(db, workspace_id)
@@ -232,8 +242,7 @@ class ImageChatService:
             )
         return prompt
 
-    @staticmethod
-    def _validate_mode(payload: MessageCreateRequest) -> None:
+    def _validate_mode(self, payload: MessageCreateRequest) -> None:
         if (
             payload.node_ids
             or payload.file_ids
@@ -247,8 +256,69 @@ class ImageChatService:
             raise AppError(
                 422,
                 "image_mode_combination_unsupported",
-                "Image generation currently accepts a text prompt without search, Agent tools, files, nodes, or graph actions",
+                "Image generation currently accepts a prompt, optional gpt-image-2 source images, and no search, Agent tools, nodes, or graph actions",
             )
+        source_ids = list(dict.fromkeys(payload.source_file_ids))
+        if not source_ids:
+            return
+        if self.image_provider.model_id.casefold() != "gpt-image-2":
+            raise AppError(
+                422,
+                "image_edit_model_unsupported",
+                "Image editing is only supported with gpt-image-2",
+            )
+        files = list(
+            self.db.scalars(
+                self.files.query().where(FileRecord.id.in_(source_ids))
+            ).all()
+        )
+        if len(files) != len(source_ids):
+            raise AppError(
+                404,
+                "image_edit_source_not_found",
+                "At least one source image is outside this workspace",
+            )
+        invalid = [
+            file.id
+            for file in files
+            if file.storage_status != "stored"
+            or file.mime_type.casefold() not in _IMAGE_EDIT_MIME_TYPES
+            or file.size_bytes > _IMAGE_EDIT_MAX_BYTES
+        ]
+        if invalid:
+            raise AppError(
+                415,
+                "image_edit_source_unsupported",
+                "Source images must be stored PNG, JPEG, or WEBP files under 50 MB",
+                {"file_ids": invalid},
+            )
+
+    def _source_inputs(self, source_file_ids: list[str]) -> tuple[ImageSourceInput, ...]:
+        source_ids = list(dict.fromkeys(source_file_ids))
+        if not source_ids:
+            return ()
+        by_id = {
+            file.id: file
+            for file in self.db.scalars(
+                self.files.query().where(FileRecord.id.in_(source_ids))
+            ).all()
+        }
+        storage = object_storage_provider(
+            self.db, self.workspace_id, self.settings
+        )
+        inputs: list[ImageSourceInput] = []
+        for source_id in source_ids:
+            file = by_id[source_id]
+            inputs.append(
+                ImageSourceInput(
+                    image_bytes=storage.read_bytes(
+                        file.object_key, limit_bytes=_IMAGE_EDIT_MAX_BYTES
+                    ),
+                    mime_type=file.mime_type.casefold(),
+                    name=Path(file.original_name).name[:100] or "source.png",
+                )
+            )
+        return tuple(inputs)
 
     def _validate_parent_message(
         self,
@@ -396,6 +466,16 @@ class ImageChatService:
         )
         self.db.flush()
 
+        for source_file_id in dict.fromkeys(payload.source_file_ids):
+            FileReferenceService(self.db, self.workspace_id).add(
+                source_file_id,
+                FileReferenceCreate(
+                    target_type="message",
+                    target_id=user.id,
+                    relation="image_edit_source",
+                ),
+            )
+
         image_part_id = str(uuid4())
         trace = {
             "provider_id": self.image_provider.provider_id,
@@ -403,6 +483,8 @@ class ImageChatService:
             "model_id": self.image_provider.model_id,
             "remote_capability": True,
             "generation_mode": "image",
+            "image_size": payload.image_size,
+            "source_file_ids": list(dict.fromkeys(payload.source_file_ids)),
             "cost_status": "unpriced",
         }
         assistant = self.messages.add(
@@ -441,9 +523,13 @@ class ImageChatService:
             "generation_id": task.id,
             "provider_id": task.provider_id,
             "model_id": task.model_id,
-            "title": "正在绘图",
+            "title": "正在编辑图片" if payload.source_file_ids else "正在绘图",
             "alt": task.prompt_summary,
-            "aspect_ratio": "4 / 3",
+            "aspect_ratio": payload.image_size.replace("x", " / ")
+            if payload.image_size != "auto"
+            else "4 / 3",
+            "image_size": payload.image_size,
+            "source_file_ids": list(dict.fromkeys(payload.source_file_ids)),
             "progress_mode": "indeterminate",
             "preview_revision": 0,
         }
@@ -622,33 +708,40 @@ class ImageChatService:
                 status="running",
             )
             self.db.add(attempt)
-            self.images.mark_running(task)
-            image_record.status = "streaming"
-            started_part = self._part(
-                image_record.id,
-                "streaming",
-                image_record.content,
-                image_data,
-            )
-            started = self._append_event(
-                session_id=session_id,
-                message_id=assistant.id,
-                version_id=version.id,
-                part_id=image_record.id,
-                sequence=sequence,
-                event_type="image.generation.started",
-                payload={"part": started_part},
-            )
-            sequence += 1
-            yield self._encode(started)
-
-            provider_stream = self.image_provider.stream_generate(
-                ImageGenerationRequest(prompt=prompt, partial_images=2)
-            )
+            provider_stream = None
             started_at = time.monotonic()
             completed = False
             usage: dict = {}
             try:
+                source_inputs = self._source_inputs(payload.source_file_ids)
+                self.images.mark_running(task)
+                image_record.status = "streaming"
+                started_part = self._part(
+                    image_record.id,
+                    "streaming",
+                    image_record.content,
+                    image_data,
+                )
+                started = self._append_event(
+                    session_id=session_id,
+                    message_id=assistant.id,
+                    version_id=version.id,
+                    part_id=image_record.id,
+                    sequence=sequence,
+                    event_type="image.generation.started",
+                    payload={"part": started_part},
+                )
+                sequence += 1
+                yield self._encode(started)
+
+                provider_stream = self.image_provider.stream_generate(
+                    ImageGenerationRequest(
+                        prompt=prompt,
+                        partial_images=0 if payload.source_file_ids else 2,
+                        size=payload.image_size,
+                        source_images=source_inputs,
+                    )
+                )
                 for provider_event in provider_stream:
                     if cancelled():
                         raise _ImageCancellationRequested()

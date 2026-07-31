@@ -10,6 +10,8 @@ import { useNavigate } from "react-router-dom";
 import { createUuid } from "@/lib/uuid";
 import {
   ArrowUp,
+  Bot,
+  Brain,
   ChevronDown,
   ExternalLink,
   FileText,
@@ -19,6 +21,7 @@ import {
   Search,
   Square,
   X,
+  Zap,
   Image as ImageIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -34,6 +37,7 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
+import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import {
   groupQuestionParts,
   QuestionSetPager,
@@ -70,8 +74,10 @@ import {
 import {
   setSessionComposerPrefs,
   getSessionComposerPrefs,
+  type ResponseMode,
   type ThinkingMode,
 } from "@/lib/session-composer-prefs";
+import { getAgentSandboxReadiness } from "@/api/control";
 import { isDeepSeekProvider, isModelProviderType } from "@/types/providers";
 import {
   cancelSessionMessage,
@@ -234,7 +240,12 @@ export function DocumentChatPanel({
   const [selectedModelId, setSelectedModelId] = useState(
     () => getSessionComposerPrefs(sessionId).modelId ?? "",
   );
-  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("off");
+  const [responseMode, setResponseMode] = useState<ResponseMode>(
+    () => getSessionComposerPrefs(sessionId).responseMode,
+  );
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(
+    () => getSessionComposerPrefs(sessionId).thinkingMode,
+  );
   const [modelSearch, setModelSearch] = useState("");
 
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
@@ -324,7 +335,8 @@ export function DocumentChatPanel({
     if (!stored.providerId && !stored.modelId) return;
     if (stored.providerId) setSelectedProviderId(stored.providerId);
     if (stored.modelId) setSelectedModelId(stored.modelId);
-    setThinkingMode(stored.responseMode === "fast" ? "off" : stored.thinkingMode);
+    setResponseMode(stored.responseMode);
+    setThinkingMode(stored.thinkingMode);
   }, [sessionId]);
 
   useEffect(() => {
@@ -345,6 +357,7 @@ export function DocumentChatPanel({
 
   useEffect(() => {
     setThinkingMode((current) => {
+      if (responseMode === "fast" && !thinkingRequired) return "off";
       if (current === "off") {
         return thinkingRequired && thinkingModes.length
           ? (thinkingModes.includes("medium") ? "medium" : thinkingModes[0])
@@ -354,24 +367,33 @@ export function DocumentChatPanel({
         ? current
         : (thinkingModes[0] ?? "off");
     });
-  }, [thinkingModes, thinkingRequired]);
+  }, [responseMode, thinkingModes, thinkingRequired]);
 
   function persistComposerPrefs(
     targetSessionId: string,
     overrides: {
       providerId?: string;
       modelId?: string;
+      responseMode?: ResponseMode;
       thinkingMode?: ThinkingMode;
     } = {},
   ) {
     if (!targetSessionId) return;
-    const nextThinking = overrides.thinkingMode ?? thinkingMode;
     setSessionComposerPrefs(targetSessionId, {
       providerId: overrides.providerId ?? activeProvider?.id,
       modelId: overrides.modelId ?? selectedModel?.id,
-      responseMode: nextThinking === "off" ? "fast" : "thinking",
-      thinkingMode: nextThinking,
+      responseMode: overrides.responseMode ?? responseMode,
+      thinkingMode: overrides.thinkingMode ?? thinkingMode,
     });
+  }
+
+  function setMode(mode: ResponseMode) {
+    setResponseMode(mode);
+    if (mode === "fast") setThinkingMode("off");
+    else if (mode === "thinking" && thinkingMode === "off" && thinkingModes.length) {
+      setThinkingMode(thinkingModes.includes("medium") ? "medium" : thinkingModes[0]!);
+    }
+    if (sessionId) persistComposerPrefs(sessionId, { responseMode: mode });
   }
 
   useEffect(() => {
@@ -427,6 +449,19 @@ export function DocumentChatPanel({
     if (!activeProvider) {
       toast.error("没有可用的真实模型 Provider，无法发送文档问题。");
       return;
+    }
+    // 智能体模式：检查沙箱可用性
+    if (responseMode === "agentic") {
+      try {
+        const readiness = await getAgentSandboxReadiness();
+        if (!readiness.available) {
+          toast.error("智能体沙箱不可用，请切换到极速或思考模式，或在设置中初始化沙箱。");
+          return;
+        }
+      } catch {
+        toast.error("无法检查智能体沙箱状态，请稍后再试。");
+        return;
+      }
     }
     const fileIsImage = file.mime_type.toLowerCase().startsWith("image/");
     const needsIndex =
@@ -565,7 +600,8 @@ export function DocumentChatPanel({
           ? activeProvider.capabilities.default_model
           : undefined),
       // Only send an explicit intensity when the model declares reasoning support.
-      thinking_mode: thinkingModes.length ? thinkingMode : undefined,
+      thinking_mode: responseMode !== "fast" && thinkingModes.length ? thinkingMode : undefined,
+      agent_mode: responseMode === "agentic",
       document_selection: documentSelection,
     };
     const idempotencyKey = `document-chat-${createUuid()}`;
@@ -735,33 +771,65 @@ export function DocumentChatPanel({
         <DropdownMenu onOpenChange={(open) => { if (!open) setModelSearch(""); }}>
           <DropdownMenuTrigger asChild>
             <Button
-              aria-label="选择模型与思考力度"
-              className="max-w-36 gap-1 px-2"
+              aria-label="选择响应模式与模型"
+              className="max-w-40 gap-1 px-2"
               disabled={!modelProviders.length || busy}
               size="xs"
               variant="outline"
             >
-              <span className="truncate font-mono text-[10px]">
-                {selectedModel?.id ?? "选择模型"}
+              {responseMode === "fast" ? (
+                <Zap className="size-3 flex-none" />
+              ) : responseMode === "agentic" ? (
+                <Bot className="size-3 flex-none" />
+              ) : (
+                <Brain className="size-3 flex-none" />
+              )}
+              <span className="text-[10px]">
+                {responseMode === "fast" ? "极速" : responseMode === "agentic" ? "智能体" : "思考"}
               </span>
               <ChevronDown className="size-3 flex-none" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-64" collisionPadding={12}>
-            <DropdownMenuLabel>思考力度</DropdownMenuLabel>
+            <DropdownMenuLabel>响应模式</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              onValueChange={(value) => setMode(value as ResponseMode)}
+              value={responseMode}
+            >
+              <DropdownMenuRadioItem value="fast">
+                <Zap className="mr-2 size-3.5" />
+                极速
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="thinking">
+                <Brain className="mr-2 size-3.5" />
+                思考
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="agentic">
+                <Bot className="mr-2 size-3.5" />
+                智能体
+              </DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>
+              思考力度{responseMode === "fast" ? "（极速模式下已关闭）" : ""}
+            </DropdownMenuLabel>
             <DropdownMenuRadioGroup
               onValueChange={(value) => {
                 const mode = value as ThinkingMode;
                 setThinkingMode(mode);
-                if (sessionId) persistComposerPrefs(sessionId, { thinkingMode: mode });
+                if (mode !== "off" && responseMode === "fast") setResponseMode("thinking");
+                if (sessionId) persistComposerPrefs(sessionId, {
+                  thinkingMode: mode,
+                  responseMode: mode === "off" && responseMode !== "agentic" ? "fast" : responseMode === "fast" ? "thinking" : responseMode,
+                });
               }}
-              value={thinkingModes.length ? thinkingMode : "off"}
+              value={responseMode === "fast" && !thinkingRequired ? "off" : thinkingModes.includes(thinkingMode) ? thinkingMode : "off"}
             >
-              <DropdownMenuRadioItem disabled={thinkingRequired} value="off">
+              <DropdownMenuRadioItem disabled={thinkingRequired || responseMode === "fast"} value="off">
                 关闭{thinkingRequired ? "（该模型仅支持思考）" : ""}
               </DropdownMenuRadioItem>
               {thinkingModes.map((mode) => (
-                <DropdownMenuRadioItem key={mode} value={mode}>
+                <DropdownMenuRadioItem disabled={responseMode === "fast"} key={mode} value={mode}>
                   {thinkingLabels[mode]}
                 </DropdownMenuRadioItem>
               ))}
@@ -899,7 +967,7 @@ export function DocumentChatPanel({
             const parts = messageParts(message);
             const streaming = message.status === "streaming";
             const renderPart = (part: MessagePart) => (
-              <MessagePartRenderer
+              <ChatStreamPartRenderer
                 key={part.id}
                 part={part}
                 siblingParts={parts}

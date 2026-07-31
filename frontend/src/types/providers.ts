@@ -44,6 +44,7 @@ export interface ProviderUpdateRequest {
   default_model?: string | null;
   default_image_generation_model_id?: string | null;
   default_transcription_model_id?: string | null;
+  default_realtime_transcription_model_id?: string | null;
   default_vision_model_id?: string | null;
   /** Custom HTTP headers for proxy / relay stations. Credentials are never accepted here. */
   extra_headers?: Record<string, string> | null;

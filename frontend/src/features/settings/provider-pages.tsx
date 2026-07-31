@@ -139,6 +139,7 @@ import type {
   ThinkingMode,
 } from "@/types/providers";
 import { Textarea } from "@/components/ui/textarea";
+import { isRealtimeTranscriptionModel } from "@/lib/model-choices";
 
 function persistedProviderModels(
   provider: Provider,
@@ -308,6 +309,9 @@ export function ProvidersPage() {
   const [defaultModels, setDefaultModels] = useState<Record<string, string>>(
     {},
   );
+  const [realtimeTranscriptionModels, setRealtimeTranscriptionModels] = useState<
+    Record<string, string>
+  >({});
   const [capabilityTarget, setCapabilityTarget] = useState<{
     provider: Provider;
     modelId: string;
@@ -401,13 +405,38 @@ export function ProvidersPage() {
                   ? configuredProvider?.capabilities.default_embedding_model_id
                     ?? configuredProvider?.capabilities.default_model
                   : configuredProvider?.capabilities.default_model;
+      const fallbackModel =
+        configuredProviderRole === "transcription"
+          ? result.models.find(
+              (model) => !isRealtimeTranscriptionModel(model.id),
+            )?.id
+          : result.models[0]?.id;
       setDefaultModels((current) =>
         current[result.provider_id] ||
         (typeof configuredModel === "string" && configuredModel.trim()) ||
-        !result.models[0]?.id
+        !fallbackModel
           ? current
-          : { ...current, [result.provider_id]: result.models[0].id },
+          : { ...current, [result.provider_id]: fallbackModel },
       );
+      if (configuredProviderRole === "transcription") {
+        const configuredRealtime =
+          configuredProvider?.capabilities
+            .default_realtime_transcription_model_id;
+        setRealtimeTranscriptionModels((current) =>
+          current[result.provider_id] ||
+          (typeof configuredRealtime === "string" &&
+            configuredRealtime.trim()) ||
+          !result.models.find((model) => isRealtimeTranscriptionModel(model.id))
+            ?.id
+            ? current
+            : {
+                ...current,
+                [result.provider_id]: result.models.find((model) =>
+                  isRealtimeTranscriptionModel(model.id),
+                )!.id,
+              },
+        );
+      }
     },
     onError: (error) => toast.error(error.message),
   });
@@ -432,6 +461,7 @@ export function ProvidersPage() {
       default_model,
       default_image_generation_model_id,
       default_transcription_model_id,
+      default_realtime_transcription_model_id,
       default_vision_model_id,
     }: {
       id: string;
@@ -439,6 +469,7 @@ export function ProvidersPage() {
       default_model?: string;
       default_image_generation_model_id?: string;
       default_transcription_model_id?: string;
+      default_realtime_transcription_model_id?: string;
       default_vision_model_id?: string;
     }) =>
       updateProvider(id, {
@@ -446,6 +477,7 @@ export function ProvidersPage() {
         default_model,
         default_image_generation_model_id,
         default_transcription_model_id,
+        default_realtime_transcription_model_id,
         default_vision_model_id,
       }),
     onSuccess: (provider) => {
@@ -674,8 +706,28 @@ export function ProvidersPage() {
                     : "";
                 const modelValue =
                   defaultModels[provider.id] ?? configuredModel;
+                const configuredRealtimeModelValue = isTranscriptionProvider
+                  ? provider.capabilities.default_realtime_transcription_model_id
+                  : undefined;
+                const configuredRealtimeModel =
+                  typeof configuredRealtimeModelValue === "string"
+                    ? configuredRealtimeModelValue
+                    : "";
+                const realtimeModelValue =
+                  realtimeTranscriptionModels[provider.id] ??
+                  configuredRealtimeModel;
                 const providerModels =
                   models[provider.id] ?? persistedProviderModels(provider);
+                const storedTranscriptionModels = isTranscriptionProvider
+                  ? (providerModels?.models ?? []).filter(
+                      (model) => !isRealtimeTranscriptionModel(model.id),
+                    )
+                  : [];
+                const realtimeTranscriptionOptions = isTranscriptionProvider
+                  ? (providerModels?.models ?? []).filter((model) =>
+                      isRealtimeTranscriptionModel(model.id),
+                    )
+                  : [];
                 const capabilityModelValue =
                   modelValue.trim() || providerModels?.models[0]?.id || "";
                 const customHeaderCount = Object.keys(
@@ -814,7 +866,129 @@ export function ProvidersPage() {
                       <p>{provider.api_key_masked ?? "未保存"}</p>
                     </td>
                     <td className="px-5 py-4">
-                      {hasConfigurableDefaultModel &&
+                      {isTranscriptionProvider ? (
+                        <div className="grid min-w-64 gap-3">
+                          <div className="grid gap-1">
+                            <Label className="text-[10px] text-muted-foreground">
+                              文件转写模型（上传音频 / HTTP）
+                            </Label>
+                            {storedTranscriptionModels.length ? (
+                              <SearchableModelSelect
+                                onValueChange={(value) => {
+                                  setDefaultModels((current) => ({
+                                    ...current,
+                                    [provider.id]: value,
+                                  }));
+                                  update.mutate({
+                                    id: provider.id,
+                                    enabled: provider.enabled,
+                                    default_transcription_model_id: value,
+                                  });
+                                }}
+                                value={modelValue}
+                              >
+                                <SelectTrigger className="h-7 w-64 font-mono text-xs">
+                                  <SelectValue placeholder="选择非 realtime 模型" />
+                                </SelectTrigger>
+                                <SelectContent className="max-h-72 overflow-y-auto">
+                                  {storedTranscriptionModels.map((model) => (
+                                    <SelectItem key={model.id} value={model.id}>
+                                      {model.id}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </SearchableModelSelect>
+                            ) : (
+                              <Input
+                                aria-label={`${provider.display_name} 文件转写模型`}
+                                className="h-7 w-64 font-mono text-xs"
+                                onChange={(event) =>
+                                  setDefaultModels((current) => ({
+                                    ...current,
+                                    [provider.id]: event.target.value,
+                                  }))
+                                }
+                                onBlur={(event) => {
+                                  const value = event.target.value.trim();
+                                  if (!value || isRealtimeTranscriptionModel(value)) return;
+                                  update.mutate({
+                                    id: provider.id,
+                                    enabled: provider.enabled,
+                                    default_transcription_model_id: value,
+                                  });
+                                }}
+                                placeholder="如 qwen3-asr-flash"
+                                value={modelValue}
+                              />
+                            )}
+                            {modelValue && isRealtimeTranscriptionModel(modelValue) ? (
+                              <p className="text-[10px] text-destructive">
+                                文件模型不能使用 realtime 型号。
+                              </p>
+                            ) : null}
+                          </div>
+                          <div className="grid gap-1">
+                            <Label className="text-[10px] text-muted-foreground">
+                              实时听写模型（麦克风 / WebSocket）
+                            </Label>
+                            {realtimeTranscriptionOptions.length ? (
+                              <SearchableModelSelect
+                                onValueChange={(value) => {
+                                  setRealtimeTranscriptionModels((current) => ({
+                                    ...current,
+                                    [provider.id]: value,
+                                  }));
+                                  update.mutate({
+                                    id: provider.id,
+                                    enabled: provider.enabled,
+                                    default_realtime_transcription_model_id: value,
+                                  });
+                                }}
+                                value={realtimeModelValue}
+                              >
+                                <SelectTrigger className="h-7 w-64 font-mono text-xs">
+                                  <SelectValue placeholder="选择 realtime 模型" />
+                                </SelectTrigger>
+                                <SelectContent className="max-h-72 overflow-y-auto">
+                                  {realtimeTranscriptionOptions.map((model) => (
+                                    <SelectItem key={model.id} value={model.id}>
+                                      {model.id}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </SearchableModelSelect>
+                            ) : (
+                              <Input
+                                aria-label={`${provider.display_name} 实时听写模型`}
+                                className="h-7 w-64 font-mono text-xs"
+                                onChange={(event) =>
+                                  setRealtimeTranscriptionModels((current) => ({
+                                    ...current,
+                                    [provider.id]: event.target.value,
+                                  }))
+                                }
+                                onBlur={(event) => {
+                                  const value = event.target.value.trim();
+                                  if (!value || !isRealtimeTranscriptionModel(value)) return;
+                                  update.mutate({
+                                    id: provider.id,
+                                    enabled: provider.enabled,
+                                    default_realtime_transcription_model_id: value,
+                                  });
+                                }}
+                                placeholder="如 paraformer-realtime-v2"
+                                value={realtimeModelValue}
+                              />
+                            )}
+                            {realtimeModelValue &&
+                            !isRealtimeTranscriptionModel(realtimeModelValue) ? (
+                              <p className="text-[10px] text-destructive">
+                                实时听写模型必须是 realtime 型号。
+                              </p>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : hasConfigurableDefaultModel &&
                       (providerModels?.models.length ?? 0) > 0 ? (
                         <SearchableModelSelect
                           onValueChange={(value) => {
@@ -999,7 +1173,9 @@ export function ProvidersPage() {
                             update.isPending ||
                             (hasConfigurableDefaultModel &&
                               !provider.enabled &&
-                              !modelValue.trim())
+                              !(isTranscriptionProvider
+                                ? modelValue.trim() || realtimeModelValue.trim()
+                                : modelValue.trim()))
                           }
                           onClick={() =>
                             update.mutate({
@@ -1016,8 +1192,12 @@ export function ProvidersPage() {
                                   ? modelValue.trim() || undefined
                                   : undefined,
                               default_transcription_model_id:
-                                isTranscriptionProvider
-                                  ? modelValue.trim() || undefined
+                                isTranscriptionProvider && modelValue.trim()
+                                  ? modelValue.trim()
+                                  : undefined,
+                              default_realtime_transcription_model_id:
+                                isTranscriptionProvider && realtimeModelValue.trim()
+                                  ? realtimeModelValue.trim()
                                   : undefined,
                               default_vision_model_id: isVisionProvider
                                 ? modelValue.trim() || undefined
@@ -2437,6 +2617,8 @@ function ProviderDialog({
     // so the row can be enabled without a second manual step.
     if (role === "transcription" && activeQuickProvider?.brandId === "qwen") {
       capabilities.default_transcription_model_id = "qwen3-asr-flash";
+      capabilities.default_realtime_transcription_model_id =
+        "paraformer-realtime-v2";
     }
     if (role === "embedding" && activeQuickProvider?.brandId === "qwen") {
       capabilities.default_model = "text-embedding-v4";

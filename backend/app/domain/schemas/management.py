@@ -681,6 +681,9 @@ class ProviderUpdateRequest(BaseModel):
     default_transcription_model_id: str | None = Field(
         default=None, min_length=1, max_length=160
     )
+    default_realtime_transcription_model_id: str | None = Field(
+        default=None, min_length=1, max_length=160
+    )
     default_vision_model_id: str | None = Field(
         default=None, min_length=1, max_length=160
     )

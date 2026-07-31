@@ -945,8 +945,11 @@ def transcription_provider_for_workspace(
     *,
     provider_id: str | None = None,
     model_id: str | None = None,
+    purpose: str = "stored",
 ) -> TranscriptionProviderPort | None:
-    if provider_id is None and model_id is None:
+    if purpose not in {"stored", "realtime"}:
+        raise ValueError(f"Unsupported transcription purpose: {purpose}")
+    if purpose == "stored" and provider_id is None and model_id is None:
         provider_id, model_id = _functional_model_target(
             db, workspace_id, "transcription"
         )
@@ -962,11 +965,24 @@ def transcription_provider_for_workspace(
     if provider is None or not provider.base_url:
         return None
     capabilities = dict(provider.capabilities or {})
-    resolved_model = (
-        (model_id or "").strip()
-        or str(capabilities.get("default_transcription_model_id") or "").strip()
-    )
+    explicit_model = (model_id or "").strip()
+    stored_model = str(
+        capabilities.get("default_transcription_model_id") or ""
+    ).strip()
+    realtime_model = str(
+        capabilities.get("default_realtime_transcription_model_id") or ""
+    ).strip()
+    if purpose == "realtime":
+        resolved_model = explicit_model or realtime_model
+        if not resolved_model and "realtime" in stored_model.casefold():
+            # Legacy rows overloaded the stored key with the realtime model.
+            resolved_model = stored_model
+    else:
+        resolved_model = explicit_model or stored_model
     if not resolved_model:
+        return None
+    is_realtime = "realtime" in resolved_model.casefold()
+    if (purpose == "realtime") != is_realtime:
         return None
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)

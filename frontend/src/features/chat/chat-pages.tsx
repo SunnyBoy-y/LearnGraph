@@ -105,10 +105,10 @@ import {
 } from "@/lib/realtime-dictation";
 import {
   classifyNonAgentAttachment,
-  fastThinkingAcceptAttribute,
   isAudioNameOrMime,
   isImageNameOrMime,
-  isSpecialBinaryName,
+  isVideoNameOrMime,
+  nonAgentAttachmentBlockedMessage,
 } from "@/lib/chat-attachment-policy";
 import {
   Conversation,
@@ -253,6 +253,7 @@ import {
 import {
   capabilityThinkingModes,
   fuzzyModelMatch,
+  isRealtimeTranscriptionModel,
   modelChoiceValue,
   modelProtocolLabel,
   parseModelChoiceValue,
@@ -300,6 +301,27 @@ import type {
 
 type ChatStatus = "ready" | "submitted" | "streaming" | "error";
 type GraphAction = NonNullable<MessageCreateRequest["graph_action"]>;
+type ImageSize = NonNullable<MessageCreateRequest["image_size"]>;
+
+const IMAGE_EDIT_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+]);
+
+const IMAGE_SIZE_OPTIONS: ReadonlyArray<{
+  value: ImageSize;
+  label: string;
+  detail: string;
+}> = [
+  { value: "auto", label: "自动", detail: "由模型决定" },
+  { value: "2048x2048", label: "1:1", detail: "2048 × 2048" },
+  { value: "2048x1152", label: "16:9", detail: "2048 × 1152" },
+  { value: "1152x2048", label: "9:16", detail: "1152 × 2048" },
+  { value: "1536x1152", label: "4:3", detail: "1536 × 1152" },
+  { value: "1152x1536", label: "3:4", detail: "1152 × 1536" },
+];
+
 type LearningNodeContext = {
   graphId: string;
   nodeId?: string;
@@ -643,6 +665,29 @@ function mergeMessageIntoCache(
     return message;
   });
   return found ? next : [...next, message];
+}
+
+function optimisticAttachmentParts(files: FileRecord[]): MessagePart[] {
+  const seen = new Set<string>();
+  return files.flatMap((file, index) => {
+    if (seen.has(file.id)) return [];
+    seen.add(file.id);
+    return [
+      {
+        id: `temp-attachment-${file.id}-${index}`,
+        type: "attachment" as const,
+        status: "completed" as const,
+        content: file.original_name,
+        data: {
+          file_id: file.id,
+          filename: file.original_name,
+          media_type: file.mime_type,
+          mime_type: file.mime_type,
+          parse_status: file.parse_status,
+        },
+      },
+    ];
+  });
 }
 
 type BrowserSpeechRecognitionResult = {
@@ -2230,6 +2275,7 @@ export function ChatCanvasPage() {
   const [generationMode, setGenerationMode] = useState<GenerationMode>(
     initialComposerPrefs.generationMode,
   );
+  const [imageSize, setImageSize] = useState<ImageSize>("auto");
   useEffect(() => {
     setStreamConnectionNotice(null);
   }, [conversationResetKey]);
@@ -2697,41 +2743,67 @@ export function ChatCanvasPage() {
       ) ?? imageProviders[0],
     [imageProviders, selectedImageProviderId],
   );
-  const asrAvailable = useMemo(
+  const transcriptionProviders = useMemo(
     () =>
-      (providers.data ?? []).some((provider) => {
+      (providers.data ?? []).filter((provider) => {
         if (!provider.enabled || !provider.remote_capability) return false;
         const role = providerCapabilityString(provider, "provider_role");
-        const isTranscription =
+        return (
           role === "transcription" ||
-          provider.provider_type === "openai_compatible_transcription";
-        if (!isTranscription) return false;
-        return Boolean(
-          providerCapabilityString(provider, "default_transcription_model_id"),
+          provider.provider_type === "openai_compatible_transcription"
         );
       }),
     [providers.data],
   );
+  const asrAvailable = transcriptionProviders.some((provider) => {
+    const storedModel = providerCapabilityString(
+      provider,
+      "default_transcription_model_id",
+    );
+    const realtimeModel = providerCapabilityString(
+      provider,
+      "default_realtime_transcription_model_id",
+    );
+    return Boolean(storedModel || realtimeModel);
+  });
+  const storedAudioTranscriptionProvider = transcriptionProviders.find(
+    (provider) => {
+      const modelId = providerCapabilityString(
+        provider,
+        "default_transcription_model_id",
+      );
+      return Boolean(modelId && !isRealtimeTranscriptionModel(modelId));
+    },
+  );
+  const storedAudioAsrAvailable = Boolean(storedAudioTranscriptionProvider);
   // realtime 系列 ASR 模型只提供 WebSocket 接口,听写须走实时长连接;
   // 非 realtime 模型走 HTTP 分段上传。
-  const asrRealtimeConfigured = useMemo(() => {
-    const provider = (providers.data ?? []).find((item) => {
-      if (!item.enabled || !item.remote_capability) return false;
-      const role = providerCapabilityString(item, "provider_role");
-      return (
-        role === "transcription" ||
-        item.provider_type === "openai_compatible_transcription"
+  const realtimeAudioTranscriptionProvider = transcriptionProviders.find(
+    (provider) => {
+      const configuredRealtime = providerCapabilityString(
+        provider,
+        "default_realtime_transcription_model_id",
       );
-    });
-    const model = provider
-      ? providerCapabilityString(provider, "default_transcription_model_id")
-      : null;
-    return Boolean(model && model.toLowerCase().includes("realtime"));
-  }, [providers.data]);
-  const composerFileAccept = useMemo(() => {
-    if (responseMode === "agentic") return undefined;
-    return fastThinkingAcceptAttribute(asrAvailable);
-  }, [asrAvailable, responseMode]);
+      if (isRealtimeTranscriptionModel(configuredRealtime)) return true;
+      // 兼容旧配置：旧 key 中的 realtime 型号仅用于实时听写。
+      return isRealtimeTranscriptionModel(
+        providerCapabilityString(provider, "default_transcription_model_id"),
+      );
+    },
+  );
+  const realtimeAudioTranscriptionModel = realtimeAudioTranscriptionProvider
+    ? providerCapabilityString(
+        realtimeAudioTranscriptionProvider,
+        "default_realtime_transcription_model_id",
+      ) ||
+      providerCapabilityString(
+        realtimeAudioTranscriptionProvider,
+        "default_transcription_model_id",
+      )
+    : "";
+  const asrRealtimeConfigured = Boolean(
+    realtimeAudioTranscriptionProvider && realtimeAudioTranscriptionModel,
+  );
   const imageProviderModelQueries = useQueries({
     queries: imageProviders.map((provider) => ({
       queryKey: ["provider-models", provider.id],
@@ -2779,6 +2851,36 @@ export function ChatCanvasPage() {
   const selectedImageModel =
     imageModelOptions.find((model) => model.id === selectedImageModelId) ??
     imageModelOptions[0];
+  const imageEditEnabled =
+    selectedImageModel?.id.toLowerCase() === "gpt-image-2";
+  const imageSizeOption =
+    IMAGE_SIZE_OPTIONS.find((option) => option.value === imageSize) ??
+    IMAGE_SIZE_OPTIONS[0];
+  useEffect(() => {
+    if (generationMode !== "image") return;
+    setPendingFiles((current) => {
+      const retained = imageEditEnabled
+        ? current
+            .filter((file) =>
+              IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase()),
+            )
+            .slice(0, 4)
+        : [];
+      if (retained.length !== current.length) {
+        toast.message(
+          imageEditEnabled
+            ? "已移除绘图模式不支持的附件。"
+            : "已移除参考图：图生图仅支持 gpt-image-2。",
+        );
+      }
+      return retained;
+    });
+  }, [generationMode, imageEditEnabled]);
+  const composerFileAccept = useMemo(() => {
+    if (generationMode === "image")
+      return imageEditEnabled ? "image/png,image/jpeg,image/webp" : "";
+    return undefined;
+  }, [generationMode, imageEditEnabled]);
   const defaultImageModelId = providerCapabilityString(
     activeImageProvider,
     "default_image_generation_model_id",
@@ -4179,10 +4281,13 @@ export function ChatCanvasPage() {
       contentValue: string,
       options: {
         fileIds?: string[];
+        attachmentFiles?: FileRecord[];
         graphAction?: GraphAction;
         generationMode?: GenerationMode;
         imageProviderId?: string;
         imageModelId?: string;
+        imageSize?: ImageSize;
+        sourceFileIds?: string[];
         sandboxPreflighted?: boolean;
         selectionContext?: MessageSelectionContext | null;
       } = {},
@@ -4271,6 +4376,7 @@ export function ChatCanvasPage() {
         status: "completed",
         content,
         parts: [
+          ...optimisticAttachmentParts(options.attachmentFiles ?? []),
           {
             id: `temp-user-part-${stamp}`,
             type: "text",
@@ -4297,7 +4403,16 @@ export function ChatCanvasPage() {
                   id: `temp-image-${stamp}`,
                   type: "image",
                   status: "pending",
-                  data: { optimistic: true, title: "正在生成图片" },
+                  data: {
+                    optimistic: true,
+                    title: options.sourceFileIds?.length
+                      ? "正在编辑图片"
+                      : "正在生成图片",
+                    aspect_ratio:
+                      (options.imageSize ?? imageSize) === "auto"
+                        ? "4 / 3"
+                        : (options.imageSize ?? imageSize).replace("x", " / "),
+                  },
                 },
               ]
             : [
@@ -4429,6 +4544,12 @@ export function ChatCanvasPage() {
       const request: MessageCreateRequest = {
         content,
         generation_mode: requestedGenerationMode,
+        image_size:
+          requestedGenerationMode === "image"
+            ? options.imageSize ?? imageSize
+            : "auto",
+        source_file_ids:
+          requestedGenerationMode === "image" ? options.sourceFileIds ?? [] : [],
         file_ids:
           requestedGenerationMode === "image" ? [] : options.fileIds ?? [],
         node_ids:
@@ -4499,16 +4620,27 @@ export function ChatCanvasPage() {
         );
       };
       const reconcilePersisted = async (statuses: readonly string[]) => {
-        if (!persistedAssistantId)
-          throw new Error("服务端未返回持久助手消息标识。");
-        const persisted = await confirmedSessionMessages(
-          targetSessionId,
-          persistedAssistantId,
-          statuses,
-        );
+        if (!persistedUserId || !persistedAssistantId)
+          throw new Error("服务端未返回完整的持久消息标识。");
+        const [persistedUser, persistedAssistant] = await Promise.all([
+          confirmedSessionMessages(targetSessionId, persistedUserId, ["completed"]),
+          confirmedSessionMessages(
+            targetSessionId,
+            persistedAssistantId,
+            statuses,
+          ),
+        ]);
         queryClient.setQueryData<Message[]>(
           ["messages", targetSessionId],
-          (current) => mergeMessageIntoCache(current, persisted),
+          (current) => [
+            ...(current ?? []).filter(
+              (message) =>
+                message.id !== persistedUser.id &&
+                message.id !== persistedAssistant.id,
+            ),
+            persistedUser,
+            persistedAssistant,
+          ],
         );
         if (isViewingStream()) {
           optimisticSessionId.current = null;
@@ -4864,6 +4996,7 @@ export function ChatCanvasPage() {
       hasAuthorizedAgentSearchProvider,
       history.isSuccess,
       imageProviders,
+      imageSize,
       location.key,
       messages,
       selectedModel?.id,
@@ -4883,143 +5016,89 @@ export function ChatCanvasPage() {
     ],
   );
 
+  const prepareStoredFile = useCallback(
+    async (file: FileRecord, agentMode: boolean) => {
+      if (
+        isImageNameOrMime(file.original_name, file.mime_type) ||
+        isVideoNameOrMime(file.original_name, file.mime_type)
+      )
+        return file;
+      if (isAudioNameOrMime(file.original_name, file.mime_type)) {
+        if (agentMode) return file;
+        const prior = await listAudioTranscriptions(file.id);
+        const completed = prior.find(
+          (item) =>
+            item.status === "completed" && item.transcript.trim().length > 0,
+        );
+        if (completed) return file;
+        toast.message(`正在为「${file.original_name}」自动转写…`);
+        const transcription = await transcribeAudioFile(file.id, {
+          provider_id: storedAudioTranscriptionProvider?.id,
+          model_id: providerCapabilityString(
+            storedAudioTranscriptionProvider,
+            "default_transcription_model_id",
+          ),
+        });
+        if (
+          transcription.status !== "completed" ||
+          !transcription.transcript.trim()
+        ) {
+          throw new Error(
+            `音频「${file.original_name}」自动转写失败：${transcription.error_message ?? transcription.status}`,
+          );
+        }
+        toast.success(`「${file.original_name}」转写完成，将引用转写文本`);
+        return file;
+      }
+      if (file.parse_status === "indexed") return file;
+      if (
+        file.parse_capability === "attachment_only" ||
+        file.original_name.toLowerCase().endsWith(".ppt")
+      ) {
+        if (!agentMode) {
+          throw new Error(
+            `「${file.original_name}」当前无法建立文本索引。请切换到智能体模式，或者删除不受支持的文件后再发送。`,
+          );
+        }
+        return file;
+      }
+      try {
+        return await parseFile(file.id);
+      } catch (error) {
+        if (agentMode && error instanceof ApiError) {
+          toast.message(
+            `“${file.original_name}”已安全存储，但解析失败：${error.message}。将作为原始文件附到本轮。`,
+          );
+          return file;
+        }
+        throw new Error(
+          `“${file.original_name}”解析失败：${error instanceof Error ? error.message : "未知错误"}。请切换到智能体模式，或者删除该文件后再发送。`,
+        );
+      } finally {
+        await queryClient.invalidateQueries({ queryKey: ["files"] });
+      }
+    },
+    [queryClient, storedAudioTranscriptionProvider],
+  );
+
   const uploadAndIndex = useCallback(
     async (file: File, options?: { agentMode?: boolean }) => {
       const agentMode = options?.agentMode ?? responseMode === "agentic";
-      // Fast/thinking: block special binaries early before upload cost.
-      if (!agentMode && isSpecialBinaryName(file.name)) {
-        throw new Error(
-          `「${file.name}」不能在极速/思考模式使用。请切换到智能体模式，或取消该附件。`,
-        );
-      }
-      if (
-        !agentMode &&
-        isAudioNameOrMime(file.name, file.type) &&
-        !asrAvailable
-      ) {
-        throw new Error(
-          `音频「${file.name}」需要已启用的 ASR Provider。请在设置中配置转写，切换智能体，或移除该附件。`,
-        );
-      }
-      // Reuse materials-library files when name + SHA-256 already match.
+      let stored: FileRecord | null = null;
       try {
         const digest = await hashFileSha256(file);
-        const existing = await lookupFile({
-          name: file.name,
-          sha256: digest,
-        });
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
-        toast.message(`已复用资料库文件「${existing.original_name}」`);
-        if (
-          !agentMode &&
-          isAudioNameOrMime(existing.original_name, existing.mime_type)
-        ) {
-          const prior = await listAudioTranscriptions(existing.id);
-          const completed = prior.find(
-            (item) =>
-              item.status === "completed" && item.transcript.trim().length > 0,
-          );
-          if (!completed) {
-            toast.message(`正在为「${existing.original_name}」自动转写…`);
-            const transcription = await transcribeAudioFile(existing.id, {});
-            if (
-              transcription.status !== "completed" ||
-              !transcription.transcript.trim()
-            ) {
-              throw new Error(
-                `音频「${existing.original_name}」自动转写未完成：${transcription.error_message ?? transcription.status}`,
-              );
-            }
-            toast.success(`「${existing.original_name}」转写完成`);
-          }
-        }
-        return existing;
+        stored = await lookupFile({ name: file.name, sha256: digest });
+        toast.message(`已复用资料库文件「${stored.original_name}」`);
       } catch (error) {
-        if (error instanceof Error && /智能体|ASR|转写|不能在极速/u.test(error.message)) {
-          throw error;
-        }
         if (!(error instanceof ApiError && error.status === 404)) {
-          // Non-404 lookup failures should not block a fresh upload path.
-          if (error instanceof ApiError) {
-            // fall through to upload
-          } else if (!(error instanceof Error && /digest|subtle|crypto/iu.test(error.message))) {
-            // crypto unavailable — fall through
-          }
+          // Lookup and browser-digest failures fall back to normal upload.
         }
       }
-      const uploaded = await uploadFile(file);
-      // Images are direct multimodal attachments, not text documents.
-      if (isImageNameOrMime(uploaded.original_name, uploaded.mime_type)) {
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
-        return uploaded;
-      }
-      // Audio: auto-ASR for non-agent; agent keeps source for sandbox.
-      if (isAudioNameOrMime(uploaded.original_name, uploaded.mime_type)) {
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
-        if (!agentMode) {
-          toast.message(`正在为「${uploaded.original_name}」自动转写…`);
-          const transcription = await transcribeAudioFile(uploaded.id, {});
-          if (
-            transcription.status !== "completed" ||
-            !transcription.transcript.trim()
-          ) {
-            throw new Error(
-              `音频「${uploaded.original_name}」自动转写失败：${transcription.error_message ?? transcription.status}`,
-            );
-          }
-          toast.success(`「${uploaded.original_name}」转写完成，将引用转写文本`);
-        }
-        return uploaded;
-      }
-      // Formats that the server stores safely but never indexes in-process
-      // (legacy .doc/.ppt/.xls, attachment_only, etc.) must still attach so
-      // Agent mode can materialize them into the session workspace inputs/.
-      const unindexableCapability =
-        uploaded.parse_capability === "isolated_converter_required" ||
-        uploaded.parse_capability === "attachment_only";
-      if (unindexableCapability) {
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
-        if (!agentMode) {
-          throw new Error(
-            `「${uploaded.original_name}」当前无法建立文本索引，极速/思考不能使用。请切换到智能体模式，或移除该附件。`,
-          );
-        }
-        toast.message(
-          `“${uploaded.original_name}”已安全存储；当前无法建立文本索引，将作为原始文件附到本轮（智能体可在工作区读取）。`,
-        );
-        return uploaded;
-      }
-      try {
-        const indexed = await parseFile(uploaded.id);
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
-        return indexed;
-      } catch (error) {
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
-        // Keep the stored file attachable when parse fails for agent mode.
-        if (error instanceof ApiError) {
-          if (
-            error.code === "file_parse_capability_unavailable" ||
-            error.code === "format_not_parseable" ||
-            error.status === 409 ||
-            error.status === 422
-          ) {
-            if (!agentMode) {
-              throw new Error(
-                `“${uploaded.original_name}”解析失败，极速/思考只能引用解析结果：${error.message}。请切换智能体或移除附件。`,
-              );
-            }
-            toast.message(
-              `“${uploaded.original_name}”已安全存储，但解析失败：${error.message}。将作为原始文件附到本轮。`,
-            );
-            return uploaded;
-          }
-        }
-        throw new Error(
-          `“${uploaded.original_name}”已安全存储，但解析失败：${error instanceof Error ? error.message : "未知错误"}`,
-        );
-      }
+      if (!stored) stored = await uploadFile(file);
+      await queryClient.invalidateQueries({ queryKey: ["files"] });
+      return prepareStoredFile(stored, agentMode);
     },
-    [asrAvailable, queryClient, responseMode],
+    [prepareStoredFile, queryClient, responseMode],
   );
 
   const convertLongPaste = useMutation({
@@ -5053,11 +5132,42 @@ export function ChatCanvasPage() {
           hasImageMention || generationMode === "image" ? "image" : "text";
         if (
           requestedGenerationMode === "text" &&
+          responseMode !== "agentic"
+        ) {
+          const blockedNames = [
+            ...message.files
+              .filter(
+                (part) =>
+                  !classifyNonAgentAttachment({
+                    name: part.filename ?? "未命名附件",
+                    mime: part.mediaType,
+                    asrAvailable: storedAudioAsrAvailable,
+                  }).ok,
+              )
+              .map((part) => part.filename ?? "未命名附件"),
+            ...pendingFiles
+              .filter(
+                (file) =>
+                  !classifyNonAgentAttachment({
+                    name: file.original_name,
+                    mime: file.mime_type,
+                    asrAvailable: storedAudioAsrAvailable,
+                  }).ok,
+              )
+              .map((file) => file.original_name),
+          ];
+          if (blockedNames.length) {
+            toast.error(nonAgentAttachmentBlockedMessage(blockedNames));
+            return false;
+          }
+        }
+        if (
+          requestedGenerationMode === "text" &&
           responseMode === "agentic" &&
           !goalMode &&
           !(await ensureAgentSandboxReady())
         ) {
-          return;
+          return false;
         }
         const contentText =
           requestedGenerationMode === "image"
@@ -5067,56 +5177,71 @@ export function ChatCanvasPage() {
           toast.message(
             "请先补充目标描述。附件可以关联到 Goal，但当前澄清不会读取附件正文。",
           );
-          return Promise.reject(new Error("goal_description_required"));
+          return false;
         }
         if (
           requestedGenerationMode === "image" &&
           (!activeImageProvider || !selectedImageModel)
         ) {
           toast.error("请先启用绘图 Provider 并选择已配置的文生图模型。");
-          return;
+          return false;
         }
         if (
           requestedGenerationMode === "image" &&
-          (message.files.length > 0 || pendingFiles.length > 0)
-        )
-          toast.message("绘图模式当前只发送文字描述，附件不会进入本次请求。");
+          pendingFiles.some(
+            (file) => !IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase()),
+          )
+        ) {
+          toast.error("绘图模式的参考附件只能是图片。");
+          return false;
+        }
+        if (
+          requestedGenerationMode === "image" &&
+          (message.files.length > 0 || pendingFiles.length > 0) &&
+          selectedImageModel.id.toLowerCase() !== "gpt-image-2"
+        ) {
+          toast.error("图生图和图片编辑仅支持 gpt-image-2。");
+          return false;
+        }
+        if (
+          requestedGenerationMode === "image" &&
+          message.files.some(
+            (part) =>
+              !IMAGE_EDIT_MIME_TYPES.has(
+                (part.mediaType ?? "").toLowerCase(),
+              ),
+          )
+        ) {
+          toast.error("绘图模式的参考附件只能是图片。");
+          return false;
+        }
         const hasImageAttachment =
           requestedGenerationMode === "text" &&
           (message.files.some((part) =>
-            (part.mediaType ?? "").toLowerCase().startsWith("image/"),
+            isImageNameOrMime(
+              part.filename ?? "",
+              part.mediaType,
+            ),
           ) ||
             pendingFiles.some((file) =>
-              file.mime_type.toLowerCase().startsWith("image/"),
+              isImageNameOrMime(file.original_name, file.mime_type),
             ));
         if (hasImageAttachment && !selectedModelSupportsImageInput) {
           toast.error(
             "当前模型尚未确认支持图片输入。请在 Provider 设置的模型能力快照中开启并确认该能力后再发送图片。",
           );
-          return;
+          return false;
         }
-        // D-082: block unsupported pending attachments before upload work.
-        if (
-          requestedGenerationMode === "text" &&
-          responseMode !== "agentic" &&
-          pendingFiles.length
-        ) {
-          for (const file of pendingFiles) {
-            const check = classifyNonAgentAttachment({
-              name: file.original_name,
-              mime: file.mime_type,
-              parseCapability: file.parse_capability,
-              parseStatus: file.parse_status,
-              asrAvailable,
-            });
-            if (!check.ok) {
-              toast.error(check.message);
-              return;
-            }
-          }
-        }
+        const preparedPendingFiles =
+          requestedGenerationMode === "text"
+            ? await Promise.all(
+                pendingFiles.map((file) =>
+                  prepareStoredFile(file, responseMode === "agentic"),
+                ),
+              )
+            : pendingFiles;
         const uploaded = await Promise.all(
-          (requestedGenerationMode === "image" ? [] : message.files).map(async (part, index) => {
+          message.files.map(async (part, index) => {
             if (!part.url)
               throw new Error(
                 `附件 ${part.filename ?? index + 1} 缺少可读取内容`,
@@ -5133,24 +5258,31 @@ export function ChatCanvasPage() {
             );
           }),
         );
-        const fileIds = [
-          ...(requestedGenerationMode === "image"
-            ? []
-            : pendingFiles.map((file) => file.id)),
-          ...uploaded.map((file) => file.id),
-        ];
+        const attachmentFiles = [...preparedPendingFiles, ...uploaded].filter(
+          (file, index, files) =>
+            files.findIndex((candidate) => candidate.id === file.id) === index,
+        );
+        const attachmentFileIds = attachmentFiles.map((file) => file.id);
+        if (requestedGenerationMode === "image" && attachmentFileIds.length > 4) {
+          toast.error("gpt-image-2 最多支持 4 张参考图片。");
+          return false;
+        }
+        const fileIds =
+          requestedGenerationMode === "text" ? attachmentFileIds : [];
+        const sourceFileIds =
+          requestedGenerationMode === "image" ? attachmentFileIds : [];
         const content =
           contentText ||
           (fileIds.length ? "请阅读并结合附件内容回答。" : "");
         if (!content) {
           if (requestedGenerationMode === "image")
             toast.message("请补充要生成的画面描述。");
-          return;
+          return false;
         }
         if (goalMode && requestedGenerationMode === "text") {
           if (goalFlow.stage !== "capture" || goalFlow.busy) {
             toast.message("请先完成上方的目标审核。");
-            return;
+            return false;
           }
           if (fileIds.length) {
             toast.message(
@@ -5160,17 +5292,23 @@ export function ChatCanvasPage() {
           await goalFlow.submit(content, fileIds);
           setPendingFiles([]);
           setComposerText("");
+          return true;
         } else {
           const sending = send(content, {
             fileIds,
+            attachmentFiles:
+              requestedGenerationMode === "text" ? attachmentFiles : [],
             generationMode: requestedGenerationMode,
+            imageSize,
+            sourceFileIds,
             sandboxPreflighted:
               requestedGenerationMode === "text" && responseMode === "agentic",
           });
           setPendingFiles([]);
           setComposerText("");
           setGenerationMode("text");
-          await sending;
+          void sending.catch(() => undefined);
+          return true;
         }
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "附件处理失败");
@@ -5179,16 +5317,18 @@ export function ChatCanvasPage() {
     },
     [
       activeImageProvider,
-      asrAvailable,
       ensureAgentSandboxReady,
       generationMode,
       goalFlow,
       goalMode,
+      imageSize,
       pendingFiles,
+      prepareStoredFile,
       responseMode,
       selectedModelSupportsImageInput,
       selectedImageModel,
       send,
+      storedAudioAsrAvailable,
       uploadAndIndex,
     ],
   );
@@ -5710,10 +5850,22 @@ export function ChatCanvasPage() {
         if (dictationCleanupSessionRef.current === session)
           finishDictationSession(session);
       };
-      const beginSegmentedDictation = () =>
-        startProviderDictation({
+      const beginSegmentedDictation = () => {
+        if (!storedAudioTranscriptionProvider) {
+          handleFatal("尚未配置文件/分段转写模型");
+          return Promise.resolve();
+        }
+        return startProviderDictation({
           transcribe: async (segment) =>
-            (await transcribeDictationSegment(segment)).text,
+            (
+              await transcribeDictationSegment(segment, {
+                provider_id: storedAudioTranscriptionProvider.id,
+                model_id: providerCapabilityString(
+                  storedAudioTranscriptionProvider,
+                  "default_transcription_model_id",
+                ),
+              })
+            ).text,
           onSegmentText: (text) => {
             if (dictationCleanupSessionRef.current !== session) return;
             appendFinalText(text);
@@ -5730,8 +5882,11 @@ export function ChatCanvasPage() {
               dictationCleanupSessionRef.current = null;
             toast.error("未获得麦克风权限");
           });
+      };
       if (asrRealtimeConfigured && realtimeDictationSupported()) {
         startRealtimeDictation({
+          providerId: realtimeAudioTranscriptionProvider!.id,
+          modelId: realtimeAudioTranscriptionModel,
           onPartial: (text) => {
             if (dictationCleanupSessionRef.current !== session) return;
             session.interim = text;
@@ -5881,7 +6036,10 @@ export function ChatCanvasPage() {
     dictationEngine,
     finishDictationSession,
     isListening,
+    realtimeAudioTranscriptionModel,
+    realtimeAudioTranscriptionProvider,
     selectedModelId,
+    storedAudioTranscriptionProvider,
   ]);
 
   const skipDictationFinalizing = useCallback(() => {
@@ -6578,15 +6736,28 @@ export function ChatCanvasPage() {
         current.replace(/(^|\s)@[^\s@]*$/u, "$1").trimEnd(),
       );
       setDismissedMention("");
-      setPendingFiles((current) =>
-        current.some((item) => item.id === file.id)
-          ? current
-          : [...current, file],
-      );
+      setPendingFiles((current) => {
+        if (current.some((item) => item.id === file.id)) return current;
+        if (generationMode === "image") {
+          if (!imageEditEnabled) {
+            toast.error("图生图仅支持 gpt-image-2。");
+            return current;
+          }
+          if (!IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase())) {
+            toast.error("绘图模式的参考附件只能是图片。");
+            return current;
+          }
+          if (current.length >= 4) {
+            toast.error("gpt-image-2 最多支持 4 张参考图片。");
+            return current;
+          }
+        }
+        return [...current, file];
+      });
       toast.message(`已引用资料「${file.original_name}」`);
       focusComposer();
     },
-    [focusComposer],
+    [focusComposer, generationMode, imageEditEnabled],
   );
   const activateComposerCommand = useCallback(
     (action: ComposerCommandId) => {
@@ -7338,18 +7509,55 @@ export function ChatCanvasPage() {
           </div>
         ) : null}
         {!goalMode && generationMode === "image" ? (
-          <div className="chat-image-action" role="status">
-            <ImageIcon className="size-3.5" />
-            <span>
-              绘图 · {activeGenerationProvider?.display_name} / {activeGenerationModelId}
-            </span>
-            <Button
-              aria-label="退出绘图模式"
-              onClick={() => setGenerationMode("text")}
-              size="icon-xs"
-              variant="ghost"
+          <div className="chat-image-controls" role="group" aria-label="绘图设置">
+            <div className="chat-image-action" role="status">
+              <ImageIcon className="size-3.5" />
+              <span>
+                绘图 · {activeGenerationProvider?.display_name} / {activeGenerationModelId}
+              </span>
+              <Button
+                aria-label="退出绘图模式"
+                onClick={() => setGenerationMode("text")}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <X className="size-3" />
+              </Button>
+            </div>
+            <Select
+              onValueChange={(value) => setImageSize(value as ImageSize)}
+              value={imageSize}
             >
-              <X className="size-3" />
+              <SelectTrigger
+                aria-label="选择图片比例"
+                className="chat-image-size-select"
+              >
+                <SelectValue>{imageSizeOption.label}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {IMAGE_SIZE_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    <span className="flex items-center gap-2">
+                      <strong>{option.label}</strong>
+                      <span className="text-muted-foreground">{option.detail}</span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              disabled={!imageEditEnabled}
+              onClick={() => openFileDialogRef.current()}
+              size="xs"
+              title={
+                imageEditEnabled
+                  ? "添加参考图片，使用 gpt-image-2 编辑"
+                  : "图生图仅支持 gpt-image-2"
+              }
+              variant="outline"
+            >
+              <FilePlus2 className="size-3.5" />
+              {pendingFiles.length ? `参考图 ${pendingFiles.length}` : "添加参考图"}
             </Button>
           </div>
         ) : null}
@@ -7443,6 +7651,10 @@ export function ChatCanvasPage() {
         <PromptInput
           key={composerInstanceKey}
           accept={composerFileAccept}
+          maxFiles={generationMode === "image" ? 4 : undefined}
+          maxFileSize={
+            generationMode === "image" ? 50 * 1024 * 1024 : undefined
+          }
           className={
             composerExpanded ? "chat-composer is-expanded" : "chat-composer"
           }
@@ -7450,9 +7662,11 @@ export function ChatCanvasPage() {
           onError={(error) => {
             if (error.code === "accept") {
               toast.error(
-                responseMode === "agentic"
-                  ? error.message
-                  : "该文件类型不能在极速/思考模式使用。请切换到智能体模式，或选择图片、文档、文本/代码（音频需已配置 ASR）。",
+                generationMode === "image"
+                  ? imageEditEnabled
+                    ? "参考图仅支持 PNG、JPEG、WEBP 等图片格式。"
+                    : "图生图仅支持 gpt-image-2，请先切换绘图模型。"
+                  : error.message,
               );
               return;
             }
@@ -7475,8 +7689,12 @@ export function ChatCanvasPage() {
               <PromptInputActionMenuContent className="chat-plus-menu">
                 <DropdownMenuLabel>上下文</DropdownMenuLabel>
                 <PromptInputActionAddAttachments
-                  disabled={sessionIsClosed || goalFlow.busy}
-                  label="添加资料"
+                  disabled={
+                    sessionIsClosed ||
+                    goalFlow.busy ||
+                    (generationMode === "image" && !imageEditEnabled)
+                  }
+                  label={generationMode === "image" ? "添加参考图片" : "添加资料"}
                 />
                 {(["goal", "graph"] as const).map((id) => {
                   const command = composerCommands.find(
@@ -7637,7 +7855,9 @@ export function ChatCanvasPage() {
                       ? "完成审核，或开启搜索"
                       : "描述你的学习目标…"
                   : generationMode === "image"
-                    ? "描述你想生成的画面…"
+                    ? pendingFiles.length
+                      ? "描述你想如何修改参考图片…"
+                      : "描述你想生成的画面…"
                     : "输入消息，或输入 @ 选择模式 / 文件…"
               }
               ref={composerTextareaRef}

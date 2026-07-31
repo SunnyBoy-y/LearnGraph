@@ -44,6 +44,7 @@ from app.repositories.domain import FileRepository, FileTextChunkRepository
 from app.services.document_parsers import (
     DocumentParseError,
     ProcessorUnavailable,
+    isolated_text_document,
     parse_document,
 )
 
@@ -592,11 +593,33 @@ class DocumentLearningService:
             self.db.commit()
 
             self._set_stage(job, "parse", 20, execution_token)
-            payload = self.storage.read_bytes(
-                record.object_key,
-                limit_bytes=self.settings.max_document_parse_bytes,
-            )
-            parsed = parse_document(record.original_name, payload)
+            if Path(record.original_name).suffix.casefold() == ".doc":
+                from app.providers.remote.sandbox import (
+                    SandboxBackendError,
+                    SandboxBackendUnavailable,
+                )
+                from app.services.sandbox import SandboxService
+
+                try:
+                    artifact = SandboxService(
+                        self.db,
+                        self.workspace_id,
+                        self.actor_id,
+                        self.settings,
+                    ).extract_legacy_doc(record)
+                except (SandboxBackendError, SandboxBackendUnavailable) as exc:
+                    raise ProcessorUnavailable(str(exc)) from exc
+                parsed = isolated_text_document(
+                    artifact["text"],
+                    parser_name=str(artifact.get("parser_name") or "antiword"),
+                    parser_version=str(artifact.get("parser_version") or "0.37"),
+                )
+            else:
+                payload = self.storage.read_bytes(
+                    record.object_key,
+                    limit_bytes=self.settings.max_document_parse_bytes,
+                )
+                parsed = parse_document(record.original_name, payload)
             revision.processor_id = parsed.parser_name
             revision.processor_version = parsed.parser_version
 
