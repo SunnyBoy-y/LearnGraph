@@ -1263,7 +1263,9 @@ class SandboxAgentWorkspaceService:
         )
         self.db.commit()
 
-    def _validate_command(self, payload: SandboxAgentCommandRequest) -> tuple[str, ...]:
+    def _validate_command(
+        self, payload: SandboxAgentCommandRequest
+    ) -> tuple[tuple[str, ...], dict[str, Any] | None]:
         raw = tuple(payload.argv)
         try:
             argv = validate_agent_argv(
@@ -1278,15 +1280,11 @@ class SandboxAgentWorkspaceService:
                 argv=raw,
             )
             raise AppError(422, "sandbox_command_blocked", str(exc)) from exc
-        # Hard-block malformed/host-like destructive targets here. Matching
-        # grants are checked and consumed only after resolving a concrete session.
-        intent = classify_destructive_argv(argv)
-        if intent is not None and intent.get("hard_blocked"):
-            self.authz.authorize_or_raise(
-                chat_session_id=payload.chat_session_id,
-                argv=argv,
-            )
-        return argv
+        # Destructive argv is shape-validated above; authorization is separate.
+        intent = self.authz.authorize_or_raise(
+            chat_session_id=payload.chat_session_id, argv=argv
+        )
+        return argv, intent
 
     def create_session(self, payload: SandboxAgentSessionCreateRequest) -> SandboxSession:
         session = self._resolve_session(
@@ -1398,7 +1396,7 @@ class SandboxAgentWorkspaceService:
         *,
         idempotency_key: str | None,
     ) -> SandboxAgentCommand:
-        argv = self._validate_command(payload)
+        argv, destructive_intent = self._validate_command(payload)
         argv_digest = hashlib.sha256("\0".join(argv).encode()).hexdigest()
         key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
         if key_hash:

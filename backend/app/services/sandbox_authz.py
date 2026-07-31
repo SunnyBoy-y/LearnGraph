@@ -228,48 +228,66 @@ class SandboxAuthorizationService:
         self.db.commit()
         return False
 
-    def active_delete_prefixes(
+    def consume_delete_grants(
         self,
         *,
         chat_session_id: str,
         sandbox_session_id: str,
-        consume: bool = False,
+        paths: tuple[str, ...],
     ) -> tuple[str, ...]:
+        """Atomically consume only grants that authorize this delete command."""
+
         now = utc_now()
+        remaining = set(paths)
         prefixes: list[str] = []
         for grant in self.list_grants(chat_session_id):
             expires = grant.expires_at
             if expires.tzinfo is None:
-                from datetime import timezone
-
                 expires = expires.replace(tzinfo=timezone.utc)
             if expires <= now:
                 grant.status = "expired"
                 continue
-            if grant.action != "delete_path":
+            if (
+                grant.action != "delete_path"
+                or grant.sandbox_session_id != sandbox_session_id
+                or grant.consumed_at is not None
+            ):
                 continue
-            if consume and grant.sandbox_session_id != sandbox_session_id:
+            authorized = {
+                path
+                for path in remaining
+                if path == grant.path_prefix
+                or path.startswith(grant.path_prefix.rstrip("/") + "/")
+            }
+            if not authorized:
                 continue
-            if not consume and grant.sandbox_session_id not in {None, sandbox_session_id}:
-                continue
-            prefixes.append(grant.path_prefix)
-            if consume:
-                claimed = self.db.execute(
-                    update(SandboxDestructiveGrant)
-                    .where(
-                        SandboxDestructiveGrant.id == grant.id,
-                        SandboxDestructiveGrant.status == "active",
-                        SandboxDestructiveGrant.consumed_at.is_(None),
-                    )
-                    .values(status="consumed", consumed_at=now)
+            claimed = self.db.execute(
+                update(SandboxDestructiveGrant)
+                .where(
+                    SandboxDestructiveGrant.id == grant.id,
+                    SandboxDestructiveGrant.status == "active",
+                    SandboxDestructiveGrant.consumed_at.is_(None),
+                    SandboxDestructiveGrant.expires_at > now,
                 )
-                if claimed.rowcount != 1:
-                    self.db.rollback()
-                    raise AppError(
-                        409,
-                        "sandbox_grant_already_consumed",
-                        "The destructive authorization has already been consumed",
-                    )
+                .values(status="consumed", consumed_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount != 1:
+                self.db.rollback()
+                raise AppError(
+                    409,
+                    "sandbox_grant_already_consumed",
+                    "The destructive authorization has already been consumed",
+                )
+            prefixes.append(grant.path_prefix)
+            remaining -= authorized
+        if remaining:
+            self.db.rollback()
+            raise AppError(
+                403,
+                "sandbox_auth_required",
+                "Destructive session workspace action requires user authorization",
+            )
         self.db.commit()
         return tuple(sorted(set(prefixes)))
 

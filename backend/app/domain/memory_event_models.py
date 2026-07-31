@@ -141,7 +141,10 @@ class MemoryProjectionCheckpoint(Base):
 
 class MemoryProjectionOutbox(Base, TimestampMixin):
     __tablename__ = "memory_projection_outbox"
-    __table_args__ = (UniqueConstraint("dedupe_key", name="uq_memory_projection_outbox_dedupe"),)
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_memory_projection_outbox_dedupe"),
+        Index("ix_memory_outbox_claim", "status", "available_at", "lease_until"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
     event_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -156,6 +159,7 @@ class MemoryProjectionOutbox(Base, TimestampMixin):
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str] = mapped_column(Text, default="")
 
 

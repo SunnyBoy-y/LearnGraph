@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     memory_outbox_interval_seconds: int = 5
     memory_outbox_lease_seconds: int = 120
     memory_outbox_max_attempts: int = 8
+    memory_outbox_strict_leases: bool = False
     # Docker is the cross-platform hardened baseline: Docker Engine on Linux,
     # Docker Desktop/WSL2 on Windows, and Docker Desktop on macOS.  Enabling
     # the feature by default does not make an unpinned/missing runner image

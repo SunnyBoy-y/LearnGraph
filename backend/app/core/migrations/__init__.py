@@ -39,8 +39,31 @@ def _memory_foundation(connection: Connection) -> None:
         )
 
 
+def _memory_outbox_lease_generation(connection: Connection) -> None:
+    if connection.dialect.name != "sqlite":
+        return
+    columns = {
+        column["name"]
+        for column in inspect(connection).get_columns("memory_projection_outbox")
+    }
+    if "lease_generation" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE memory_projection_outbox "
+            "ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+        )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_memory_outbox_claim "
+        "ON memory_projection_outbox (status, available_at, lease_until)"
+    )
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
+    SchemaMigration(
+        "0002_memory_outbox_lease_generation",
+        "Add generation-aware outbox lease ownership",
+        _memory_outbox_lease_generation,
+    ),
 )
 
 

@@ -38,6 +38,7 @@ def run_memory_outbox_once(*, limit: int = 25) -> dict[str, int]:
             worker_id="embedded-memory-outbox",
             lease_seconds=settings.memory_outbox_lease_seconds,
             max_attempts=settings.memory_outbox_max_attempts,
+            strict_leases=settings.memory_outbox_strict_leases,
         )
         report = worker.run_once(limit=limit)
         return {
@@ -45,6 +46,7 @@ def run_memory_outbox_once(*, limit: int = 25) -> dict[str, int]:
             "succeeded": report.succeeded,
             "failed": report.failed,
             "dead_letter": report.dead_letter,
+            "ownership_lost": report.ownership_lost,
         }
 
 
