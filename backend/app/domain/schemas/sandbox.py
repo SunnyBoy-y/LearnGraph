@@ -272,7 +272,7 @@ class SandboxDestructiveGrantRequest(BaseModel):
     path_prefix: str = Field(min_length=1, max_length=255)
     action: Literal["delete_path"] = "delete_path"
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
-    ttl_seconds: int = Field(default=1800, ge=60, le=86_400)
+    ttl_seconds: int = Field(default=300, ge=60, le=1_800)
     reason: str = Field(default="", max_length=500)
 
 

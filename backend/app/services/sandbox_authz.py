@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
@@ -19,7 +19,7 @@ from app.providers.remote.sandbox import (
 from app.repositories.audit import AuditRepository
 
 
-DEFAULT_GRANT_TTL_SECONDS = 30 * 60
+DEFAULT_GRANT_TTL_SECONDS = 5 * 60
 
 
 def classify_destructive_argv(argv: tuple[str, ...]) -> dict[str, Any] | None:
@@ -182,6 +182,8 @@ class SandboxAuthorizationService:
             if expires <= now:
                 grant.status = "expired"
                 continue
+            if grant.consumed_at is not None:
+                continue
             if grant.action != action:
                 continue
             prefix = grant.path_prefix
@@ -191,7 +193,11 @@ class SandboxAuthorizationService:
         return False
 
     def active_delete_prefixes(
-        self, *, chat_session_id: str, sandbox_session_id: str
+        self,
+        *,
+        chat_session_id: str,
+        sandbox_session_id: str,
+        consume: bool = False,
     ) -> tuple[str, ...]:
         now = utc_now()
         prefixes: list[str] = []
@@ -206,9 +212,28 @@ class SandboxAuthorizationService:
                 continue
             if grant.action != "delete_path":
                 continue
-            if grant.sandbox_session_id not in {None, sandbox_session_id}:
+            if consume and grant.sandbox_session_id != sandbox_session_id:
+                continue
+            if not consume and grant.sandbox_session_id not in {None, sandbox_session_id}:
                 continue
             prefixes.append(grant.path_prefix)
+            if consume:
+                claimed = self.db.execute(
+                    update(SandboxDestructiveGrant)
+                    .where(
+                        SandboxDestructiveGrant.id == grant.id,
+                        SandboxDestructiveGrant.status == "active",
+                        SandboxDestructiveGrant.consumed_at.is_(None),
+                    )
+                    .values(status="consumed", consumed_at=now)
+                )
+                if claimed.rowcount != 1:
+                    self.db.rollback()
+                    raise AppError(
+                        409,
+                        "sandbox_grant_already_consumed",
+                        "The destructive authorization has already been consumed",
+                    )
         self.db.commit()
         return tuple(sorted(set(prefixes)))
 

@@ -4,7 +4,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from typing import Annotated
-from fastapi import APIRouter, File, Header, Query, Response, UploadFile, status
+from fastapi import APIRouter, File, Header, Query, Request, Response, UploadFile, status
+from fastapi.responses import StreamingResponse
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.core.errors import AppError
@@ -172,16 +173,61 @@ def parse_file(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSet
 
 
 @router.get("/{file_id}/content")
-def download_file(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> Response:
+def download_file(
+    file_id: str,
+    request: Request,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> Response:
     _require_file_access(db, context, file_id, "read")
-    record, payload = service(db, context, settings).content(file_id)
-    return Response(
-        content=payload,
+    file_service = service(db, context, settings)
+    record = file_service.content_record(file_id)
+    start = 0
+    end = record.size_bytes - 1
+    status_code = status.HTTP_200_OK
+    range_header = request.headers.get("range")
+    if range_header:
+        if not range_header.startswith("bytes=") or "," in range_header:
+            return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+        raw_start, separator, raw_end = range_header.removeprefix("bytes=").partition("-")
+        try:
+            if not raw_start:
+                suffix = int(raw_end)
+                if suffix <= 0:
+                    raise ValueError
+                start = max(0, record.size_bytes - suffix)
+            else:
+                start = int(raw_start)
+                end = int(raw_end) if separator and raw_end else end
+        except ValueError:
+            return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+        if start < 0 or start >= record.size_bytes or end < start:
+            return Response(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                headers={"Content-Range": f"bytes */{record.size_bytes}"},
+            )
+        end = min(end, record.size_bytes - 1)
+        status_code = status.HTTP_206_PARTIAL_CONTENT
+    length = max(0, end - start + 1)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": _content_disposition(record.original_name),
+        "Content-Length": str(length),
+        "ETag": f'"sha256-{record.sha256}"',
+    }
+    if status_code == status.HTTP_206_PARTIAL_CONTENT:
+        headers["Content-Range"] = f"bytes {start}-{end}/{record.size_bytes}"
+    return StreamingResponse(
+        file_service.storage.iter_bytes(
+            record.object_key,
+            offset=start,
+            length=length,
+        ),
+        status_code=status_code,
         media_type=record.mime_type,
-        headers={
-            "Cache-Control": "private, no-store",
-            "Content-Disposition": _content_disposition(record.original_name),
-        },
+        headers=headers,
     )
 
 

@@ -70,6 +70,16 @@ function notifyRecordsChanged(parentSessionId: string) {
   );
 }
 
+export function clearSelectionExplanations() {
+  pendingOpenDetail = null;
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Best-effort privacy cleanup for restricted browser storage.
+  }
+}
+
 export function createSelectionExplanationId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return crypto.randomUUID();

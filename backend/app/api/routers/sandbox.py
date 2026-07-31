@@ -109,8 +109,12 @@ def agent_readiness(
 def start_bootstrap(
     context: CurrentWorkspace, settings: AppSettings
 ) -> SandboxBootstrapStartResponse:
-    # Product decision: any workspace writer may initialize the local Docker runner.
-    context.require_permission("workspace.write")
+    if not context.principal.is_system_admin:
+        raise AppError(
+            403,
+            "deployment_admin_required",
+            "Sandbox runtime bootstrap requires a deployment administrator",
+        )
     result = get_bootstrap_service().start(
         settings, actor_id=context.principal.user_id
     )

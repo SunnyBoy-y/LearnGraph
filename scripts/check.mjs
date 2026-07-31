@@ -196,6 +196,30 @@ async function main() {
 
     if (
       !(await runCommand(
+        'P0 security regressions',
+        {
+          command: 'uv',
+          args: [
+            'run',
+            '--locked',
+            '--extra',
+            'test',
+            'pytest',
+            '-q',
+            'tests/security',
+            '--basetemp',
+            'data/pytest-p0',
+          ],
+        },
+        backendDir,
+        pythonEnv,
+      ))
+    ) {
+      failures.push('P0 security regressions')
+    }
+
+    if (
+      !(await runCommand(
         'Stored audio transcription regression',
         {
           command: 'uv',

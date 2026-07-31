@@ -140,9 +140,7 @@ temp/
 /three-files.yaml
 /workspace-*.yaml
 
-# Test sources are intentionally excluded from the public code-only tree
-/backend/tests/
-/backend/test_*.py
+# Product/security regressions under backend/tests are version-controlled.
 /frontend/e2e/
 /frontend/playwright.config.*
 **/__tests__/
@@ -150,7 +148,9 @@ temp/
 **/*_test.py
 **/test_*.py
 **/*.test.*
-**/*.spec.*
+!backend/tests/
+!backend/tests/security/
+!backend/tests/security/test_*.py
 
 # Local editor, operating-system, and agent state
 .idea/

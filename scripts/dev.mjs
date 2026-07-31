@@ -60,6 +60,7 @@ function parseArguments(argv) {
     backendPort: 8000,
     frontendPort: 5173,
     install: false,
+    lan: false,
     help: false,
   }
 
@@ -68,6 +69,10 @@ function parseArguments(argv) {
     if (argument === '--') continue
     if (argument === '--install') {
       options.install = true
+      continue
+    }
+    if (argument === '--lan') {
+      options.lan = true
       continue
     }
     if (argument === '--help' || argument === '-h') {
@@ -101,6 +106,7 @@ Start the LearnGraph backend and frontend together.
 
 Options:
   --install                 Install from frontend/package-lock.json and sync backend/uv.lock
+  --lan                     Bind both services to all interfaces (explicit remote access)
   --frontend-port <port>    First Vite port to try; uses the next free port if needed (default: 5173)
   --backend-port <port>     Uvicorn port (default: 8000)
   -h, --help                Show this help`)
@@ -357,9 +363,14 @@ async function main() {
     console.log(`Frontend port ${options.frontendPort} is in use; using ${frontendPort} instead.`)
   }
 
-  // Bind both services to all interfaces so another device on the LAN can
-  // reach the dev server.  The browser still uses same-origin /api requests.
-  const listenHost = process.env.LEARNGRAPH_LISTEN_HOST?.trim() || '0.0.0.0'
+  const listenHost =
+    process.env.LEARNGRAPH_LISTEN_HOST?.trim() || (options.lan ? '0.0.0.0' : '127.0.0.1')
+  if (listenHost !== '127.0.0.1' && listenHost !== 'localhost' && listenHost !== '::1') {
+    console.warn(
+      `\nWARNING: LearnGraph development services are exposed on ${listenHost}. ` +
+        'Use trusted networks only; LAN access does not grant host-device capabilities.',
+    )
+  }
   const backendOrigin = `http://127.0.0.1:${options.backendPort}`
   const frontendOrigin = `http://127.0.0.1:${frontendPort}`
   // Default to same-origin '/' so the browser calls the Vite dev proxy and

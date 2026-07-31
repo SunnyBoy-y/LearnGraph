@@ -34,15 +34,15 @@ export function SandboxAuthDialog({
             path_prefix: path.startsWith("work/") ? path : `work/${path}`,
             action: "delete_path",
             sandbox_session_id: request.sandboxSessionId,
-            ttl_seconds: 1800,
-            reason: "user_confirmed_in_chat",
+            ttl_seconds: 300,
+            reason: "user_confirmed_single_use_in_chat",
           }),
         );
       }
       return results;
     },
     onSuccess: () => {
-      toast.success("已授权本次会话工作区内的删除操作");
+      toast.success("已授权下一次匹配的删除命令，使用后立即失效");
       onGranted?.();
       onClose();
     },
@@ -62,7 +62,10 @@ export function SandboxAuthDialog({
               {request.message ||
                 "智能体请求删除会话沙箱内的文件。这只影响当前会话工作区，不会删除你电脑上的真实文件。"}
             </p>
-            <ul className="mt-3 list-disc space-y-1 pl-5 font-mono text-xs">
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                授权仅供下一次匹配这些路径的删除命令使用，使用后立即失效；路径或会话变化时必须重新确认。
+              </p>
+              <ul className="mt-3 list-disc space-y-1 pl-5 font-mono text-xs">
               {request.paths.map((path) => (
                 <li key={path}>{path}</li>
               ))}

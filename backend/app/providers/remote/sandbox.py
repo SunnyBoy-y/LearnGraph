@@ -38,6 +38,10 @@ class SandboxWorkspaceQuotaExceeded(SandboxBackendError):
     pass
 
 
+class SandboxOutputLimitExceeded(SandboxBackendError):
+    pass
+
+
 class SandboxDestructiveAuthorizationRequired(SandboxBackendError):
     def __init__(self, paths: tuple[str, ...]) -> None:
         super().__init__(
@@ -520,60 +524,89 @@ class DockerSandboxBackend(SandboxBackendPort):
         return tuple(restored)
 
     @classmethod
-    def _wait_exec(
+    def _stream_exec(
         cls,
-        future,
+        client,
         container,
         *,
+        argv: tuple[str, ...],
+        workdir: str,
+        user: str,
+        environment: dict[str, str] | None,
         timeout_seconds: int,
         output_limit: int,
         started: float,
     ) -> SandboxExecResult:
+        """Consume Docker exec output incrementally and bound host memory."""
+
+        exec_id = client.api.exec_create(
+            container.id,
+            list(argv),
+            stdout=True,
+            stderr=True,
+            stdin=False,
+            tty=False,
+            privileged=False,
+            user=user,
+            environment=environment,
+            workdir=workdir,
+        )["Id"]
+        stream = client.api.exec_start(exec_id, stream=True, demux=True, tty=False)
         deadline = started + timeout_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                container.kill()
-                return SandboxExecResult(
-                    exit_code=-1,
-                    stdout=b"",
-                    stderr=b"",
-                    timed_out=True,
-                    latency_ms=int((time.monotonic() - started) * 1_000),
-                    truncated=False,
-                )
-            try:
-                result = future.result(timeout=min(0.1, remaining))
-                try:
-                    cls._ensure_workspace_quota(container)
-                except SandboxWorkspaceQuotaExceeded:
+        stdout = bytearray()
+        stderr = bytearray()
+        truncated = False
+        timed_out = False
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(next, stream, None)
+        try:
+            while True:
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    timed_out = True
                     container.kill()
-                    raise
-                stdout, stderr = (
-                    result.output
-                    if isinstance(result.output, tuple)
-                    else (result.output, b"")
-                )
-                stdout = stdout or b""
-                stderr = stderr or b""
-                truncated = len(stdout) + len(stderr) > output_limit
+                    break
+                try:
+                    frame = future.result(timeout=min(0.1, remaining_time))
+                except FutureTimeout:
+                    cls._ensure_workspace_quota(container)
+                    continue
+                if frame is None:
+                    break
+                future = pool.submit(next, stream, None)
+                cls._ensure_workspace_quota(container)
+                out_chunk, err_chunk = frame if isinstance(frame, tuple) else (frame, None)
+                for chunk, target in ((out_chunk, stdout), (err_chunk, stderr)):
+                    if not chunk:
+                        continue
+                    remaining = max(0, output_limit - len(stdout) - len(stderr))
+                    if len(chunk) > remaining:
+                        target.extend(chunk[:remaining])
+                        truncated = True
+                        container.kill()
+                        break
+                    target.extend(chunk)
                 if truncated:
-                    stdout = stdout[:output_limit]
-                    stderr = stderr[: max(0, output_limit - len(stdout))]
-                return SandboxExecResult(
-                    exit_code=int(result.exit_code),
-                    stdout=stdout,
-                    stderr=stderr,
-                    timed_out=False,
-                    latency_ms=int((time.monotonic() - started) * 1_000),
-                    truncated=truncated,
-                )
-            except FutureTimeout:
-                try:
-                    cls._ensure_workspace_quota(container)
-                except SandboxWorkspaceQuotaExceeded:
-                    container.kill()
-                    raise
+                    break
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        if timed_out or truncated:
+            exit_code = -1
+        else:
+            inspection = client.api.exec_inspect(exec_id)
+            exit_code = int(inspection.get("ExitCode") or 0)
+        return SandboxExecResult(
+            exit_code=exit_code,
+            stdout=bytes(stdout),
+            stderr=bytes(stderr),
+            timed_out=timed_out,
+            latency_ms=int((time.monotonic() - started) * 1_000),
+            truncated=truncated,
+        )
 
     def resume(self, session_id: str, backend_ref: str) -> SandboxSessionHandle:
         client, _ = self._container(backend_ref)
@@ -645,20 +678,14 @@ class DockerSandboxBackend(SandboxBackendPort):
         client, container = self._container(session.backend_ref)
         started = time.monotonic()
 
-        def run():
-            return container.exec_run(
-                list(argv),
+        try:
+            return self._stream_exec(
+                client,
+                container,
+                argv=argv,
                 workdir="/workspace",
                 user="65532:65532",
-                demux=True,
-            )
-
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(run)
-        try:
-            return self._wait_exec(
-                future,
-                container,
+                environment=None,
                 timeout_seconds=timeout_seconds,
                 output_limit=output_limit,
                 started=started,
@@ -666,7 +693,6 @@ class DockerSandboxBackend(SandboxBackendPort):
         except Exception as exc:
             raise SandboxBackendError("Sandbox runner execution failed") from exc
         finally:
-            pool.shutdown(wait=False, cancel_futures=True)
             client.close()
 
     def exec_agent(
@@ -703,33 +729,27 @@ class DockerSandboxBackend(SandboxBackendPort):
             ) from exc
         started = time.monotonic()
 
-        def run():
-            return container.exec_run(
-                list(effective_argv),
-                workdir="/workspace",
-                user="65532:65532",
-                environment={
-                    "HOME": "/workspace",
-                    "PATH": "/usr/local/bin:/usr/bin:/bin",
-                    "PYTHONNOUSERSITE": "1",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "PIP_NO_INDEX": "1",
-                    "http_proxy": "",
-                    "https_proxy": "",
-                    "HTTP_PROXY": "",
-                    "HTTPS_PROXY": "",
-                    "NODE_PATH": "/usr/local/lib/node_modules",
-                },
-                demux=True,
-            )
-
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(run)
+        environment = {
+            "HOME": "/workspace",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PIP_NO_INDEX": "1",
+            "http_proxy": "",
+            "https_proxy": "",
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "NODE_PATH": "/usr/local/lib/node_modules",
+        }
         try:
             try:
-                result = self._wait_exec(
-                    future,
+                result = self._stream_exec(
+                    client,
                     container,
+                    argv=effective_argv,
+                    workdir="/workspace",
+                    user="65532:65532",
+                    environment=environment,
                     timeout_seconds=timeout_seconds,
                     output_limit=output_limit,
                     started=started,
@@ -783,7 +803,6 @@ class DockerSandboxBackend(SandboxBackendPort):
             return result
         finally:
             shutil.rmtree(snapshot, ignore_errors=True)
-            pool.shutdown(wait=False, cancel_futures=True)
             client.close()
 
     def read(self, session: SandboxSessionHandle, path: str, limit_bytes: int) -> bytes:

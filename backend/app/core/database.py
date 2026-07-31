@@ -434,6 +434,11 @@ def _apply_sqlite_additive_migrations() -> None:
             "runtime_last_used_at": "DATETIME",
             "workspace_expires_at": "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'",
             "absolute_expires_at": "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'",
+            "lease_token_hash": "VARCHAR(64)",
+            "lease_expires_at": "DATETIME",
+            "heartbeat_at": "DATETIME",
+            "active_command_id": "VARCHAR(36)",
+            "command_generation": "INTEGER NOT NULL DEFAULT 0",
         },
     }
     with engine.begin() as connection:
@@ -447,6 +452,14 @@ def _apply_sqlite_additive_migrations() -> None:
                     connection.exec_driver_sql(
                         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
                     )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_sandbox_sessions_active_command_id "
+            "ON sandbox_sessions(active_command_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_sandbox_sessions_lease_expires_at "
+            "ON sandbox_sessions(lease_expires_at)"
+        )
         connection.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_mastery_review_job_dedupe "
             "ON mastery_review_jobs(workspace_id, dedupe_key) "

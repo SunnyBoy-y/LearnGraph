@@ -1,6 +1,7 @@
 import type { ApiErrorEnvelope, ValidationIssue } from '@/types/common'
 
 import { authStore } from './auth-store'
+import { clearAuthenticatedClientState } from '@/lib/auth-query-cache'
 import { parseSseResponse } from './sse'
 import type { SseEvent, SseParseOptions } from './sse'
 
@@ -178,6 +179,7 @@ export class ApiClient {
       const known = appError(responseBody)
       const issues = validationIssues(responseBody)
       if (response.status === 401 && options.auth !== false) {
+        await clearAuthenticatedClientState()
         authStore.clear()
         if (
           typeof window !== 'undefined' &&

@@ -5087,8 +5087,10 @@ export function ChatCanvasPage() {
       let stored: FileRecord | null = null;
       try {
         const digest = await hashFileSha256(file);
-        stored = await lookupFile({ name: file.name, sha256: digest });
-        toast.message(`已复用资料库文件「${stored.original_name}」`);
+        if (digest) {
+          stored = await lookupFile({ name: file.name, sha256: digest });
+          toast.message(`已复用资料库文件「${stored.original_name}」`);
+        }
       } catch (error) {
         if (!(error instanceof ApiError && error.status === 404)) {
           // Lookup and browser-digest failures fall back to normal upload.

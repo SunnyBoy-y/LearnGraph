@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from uuid import uuid4
 
@@ -63,6 +63,27 @@ class LocalObjectStorageProvider:
         if path.stat().st_size > limit_bytes:
             raise AppError(422, "text_parse_limit", "Text file is too large for the MVP parser")
         return path.read_text(encoding="utf-8")
+
+    def iter_bytes(
+        self,
+        object_key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+        chunk_size: int = 1024 * 1024,
+    ) -> Iterator[bytes]:
+        remaining = length
+        with self._resolve(object_key).open("rb") as source:
+            source.seek(offset)
+            while remaining is None or remaining > 0:
+                chunk = source.read(
+                    chunk_size if remaining is None else min(chunk_size, remaining)
+                )
+                if not chunk:
+                    break
+                yield chunk
+                if remaining is not None:
+                    remaining -= len(chunk)
 
     def read_bytes(self, object_key: str, limit_bytes: int = 50 * 1024 * 1024) -> bytes:
         path = self._resolve(object_key)

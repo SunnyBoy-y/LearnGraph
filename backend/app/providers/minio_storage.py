@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from tempfile import SpooledTemporaryFile
 from uuid import uuid4
 
@@ -64,6 +64,26 @@ class MinioObjectStorageProvider:
 
     def delete(self, object_key: str) -> None:
         self.client.remove_object(self.bucket, object_key)
+
+    def iter_bytes(
+        self,
+        object_key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+        chunk_size: int = 1024 * 1024,
+    ) -> Iterator[bytes]:
+        response = self.client.get_object(
+            self.bucket,
+            object_key,
+            offset=offset,
+            length=length,
+        )
+        try:
+            yield from response.stream(chunk_size)
+        finally:
+            response.close()
+            response.release_conn()
 
     def read_bytes(self, object_key: str, limit_bytes: int = 50 * 1024 * 1024) -> bytes:
         stat = self.client.stat_object(self.bucket, object_key)

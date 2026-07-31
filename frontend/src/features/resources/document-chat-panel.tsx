@@ -498,10 +498,12 @@ export function DocumentChatPanel({
       try {
         const digest = await hashFileSha256(image.blob);
         let record: FileRecord | null = null;
-        try {
-          record = await lookupFile({ name: image.filename, sha256: digest });
-        } catch (error) {
-          if (!(error instanceof ApiError && error.status === 404)) throw error;
+        if (digest) {
+          try {
+            record = await lookupFile({ name: image.filename, sha256: digest });
+          } catch (error) {
+            if (!(error instanceof ApiError && error.status === 404)) throw error;
+          }
         }
         if (!record) {
           const asFile = new File([image.blob], image.filename, {

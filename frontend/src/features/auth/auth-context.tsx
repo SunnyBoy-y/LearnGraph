@@ -11,6 +11,8 @@ import {
 } from "@/api/auth";
 import { authStore } from "@/api/auth-store";
 import { getCurrentUser } from "@/api/control";
+import { clearAuthenticatedClientState } from "@/lib/auth-query-cache";
+import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
 
 import {
   AuthContext,
@@ -75,7 +77,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       username: session?.displayName ?? session?.username ?? "",
       workspaceId: session?.workspaceId ?? "",
       workspaceName: workspaceName || session?.workspaceId || "",
+      async setWorkspaceId(workspaceId) {
+        if (!session || workspaceId === session.workspaceId) return;
+        await clearAuthenticatedClientState();
+        authStore.setWorkspaceId(workspaceId);
+        setSession({ ...session, workspaceId });
+      },
       async login(username, password) {
+        await clearAuthenticatedClientState();
         const response = await loginAccount({ username, password });
         const nextSession = authStore.getSession();
         setSession(nextSession);
@@ -88,6 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         };
       },
       async register(payload) {
+        await clearAuthenticatedClientState();
         const response = await registerAccount(payload);
         const nextSession = authStore.getSession();
         setSession(nextSession);
@@ -104,6 +114,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
       async deleteAccount(currentPassword, confirmation) {
         await deleteCurrentAccount(currentPassword, confirmation);
+        clearSelectionExplanations();
+        await clearAuthenticatedClientState();
         authStore.clear();
         setSession(null);
         setWorkspaceName("");
@@ -112,6 +124,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         try {
           await revokeCurrentSession();
         } finally {
+          clearSelectionExplanations();
+          await clearAuthenticatedClientState();
           authStore.clear();
           setSession(null);
           setWorkspaceName("");

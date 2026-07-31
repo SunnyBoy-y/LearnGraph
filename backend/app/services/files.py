@@ -228,6 +228,9 @@ class FileService:
             ).all()
         )
 
+    def content_record(self, file_id: str) -> FileRecord:
+        return self.files.require(file_id, "file")
+
     def content(self, file_id: str) -> tuple[FileRecord, bytes]:
         record = self.files.require(file_id, "file")
         return record, self.storage.read_bytes(

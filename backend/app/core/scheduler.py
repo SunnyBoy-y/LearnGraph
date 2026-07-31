@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.domain.models import (
     MemoryProfileSnapshot,
+    SandboxAgentCommand,
     SandboxSession,
     Workspace,
     utc_now,
@@ -300,7 +301,7 @@ async def memory_extraction_scheduler(
 def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
     settings = get_settings()
     current = now or utc_now()
-    totals = {"cooled": 0, "cleaned": 0, "cleanup_blocked": 0}
+    totals = {"cooled": 0, "cleaned": 0, "recovered": 0, "cleanup_blocked": 0}
     workspace_root = settings.resolved_sandbox_workspace_root
     workspace_root.mkdir(parents=True, exist_ok=True)
 
@@ -328,11 +329,34 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
                 (workspace_expires and workspace_expires <= current)
                 or (absolute_expires and absolute_expires <= current)
             )
-            if workspace_expired and session.lifecycle_state in {"STARTING", "RUNNING"}:
-                # The wall-time watchdog owns an active command. Never remove
-                # its bind mount underneath it; the next sweep can expire it
-                # after the command has left an active state.
-                continue
+            if session.lifecycle_state in {"STARTING", "RUNNING"}:
+                lease_expires = aware(session.lease_expires_at)
+                heartbeat = aware(session.heartbeat_at)
+                legacy_stale_at = heartbeat or runtime_last or runtime_started or aware(
+                    session.updated_at
+                )
+                legacy_stale = bool(
+                    legacy_stale_at
+                    and legacy_stale_at
+                    + timedelta(seconds=settings.sandbox_wall_time_seconds + 60)
+                    <= current
+                )
+                lease_stale = bool(lease_expires and lease_expires <= current)
+                if not lease_stale and not (lease_expires is None and legacy_stale):
+                    continue
+                if session.active_command_id:
+                    command = db.get(SandboxAgentCommand, session.active_command_id)
+                    if command is not None and command.status in {"created", "running"}:
+                        command.status = "failed"
+                        command.error_class = "sandbox_command_interrupted"
+                        command.error_message = "Sandbox command lease expired during backend interruption"
+                session.lifecycle_state = "RECOVERING"
+                session.active_command_id = None
+                session.lease_token_hash = None
+                session.lease_expires_at = None
+                session.heartbeat_at = current
+                db.commit()
+                totals["recovered"] += 1
             runtime_expired = bool(
                 session.backend_session_ref
                 and session.lifecycle_state != "RUNNING"

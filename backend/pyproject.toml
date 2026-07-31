@@ -28,6 +28,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = [
+  "pytest>=8,<10",
+]
 infrastructure = [
   "minio>=7.2,<8",
   "psycopg[binary]>=3.2,<4",

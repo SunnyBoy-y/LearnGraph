@@ -1483,6 +1483,15 @@ class SandboxSession(Base, TimestampMixin, WorkspaceScopedMixin):
     )
     cleanup_status: Mapped[str] = mapped_column(String(32), default="not_started", index=True)
     cleanup_error_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    lease_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    active_command_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    command_generation: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SandboxTask(Base, TimestampMixin, WorkspaceScopedMixin):

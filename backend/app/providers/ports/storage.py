@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -22,6 +22,15 @@ class ObjectStoragePort(Protocol):
     ) -> StoredObject: ...
 
     def delete(self, object_key: str) -> None: ...
+
+    def iter_bytes(
+        self,
+        object_key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+        chunk_size: int = 1024 * 1024,
+    ) -> Iterator[bytes]: ...
 
     def read_bytes(self, object_key: str, limit_bytes: int = 50 * 1024 * 1024) -> bytes: ...
 

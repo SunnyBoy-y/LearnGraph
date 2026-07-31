@@ -1083,23 +1083,6 @@ def stream_message(
     ] = None,
 ) -> StreamingResponse:
     require_session_access(session_id, "write", db, context)
-    if payload.agent_mode:
-        sandbox_readiness = agent_sandbox_readiness(
-            settings,
-            authorized="workspace.manage" in context.permissions,
-        )
-        if not sandbox_readiness["available"]:
-            raise AppError(
-                403
-                if sandbox_readiness["code"] == "sandbox_permission_required"
-                else 503,
-                str(sandbox_readiness["code"] or "sandbox_backend_unavailable"),
-                str(sandbox_readiness["message"]),
-                {
-                    "backend_id": sandbox_readiness["backend_id"],
-                    "remediation_steps": sandbox_readiness["remediation_steps"],
-                },
-            )
     if after_event_id and last_event_id and after_event_id != last_event_id:
         raise AppError(
             400,

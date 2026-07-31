@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -13,7 +14,7 @@ from pathlib import Path
 from datetime import timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -53,6 +54,7 @@ from app.providers.remote.sandbox import (
     SandboxBackendUnavailable,
     SandboxCapabilityMismatch,
     SandboxDestructiveAuthorizationRequired,
+    SandboxOutputLimitExceeded,
     SandboxWorkspaceQuotaExceeded,
     image_ref_is_pinned,
     validate_agent_argv,
@@ -518,6 +520,10 @@ class SandboxTaskService:
                 timeout_seconds=self.settings.sandbox_wall_time_seconds,
                 output_limit=self.settings.sandbox_output_bytes,
             )
+            if result.truncated:
+                raise SandboxOutputLimitExceeded(
+                    "Sandbox output exceeded the configured host-side limit"
+                )
             if result.timed_out:
                 raise SandboxBackendError("The isolated antiword parser timed out")
             if result.exit_code != 0:
@@ -698,6 +704,10 @@ class SandboxTaskService:
             execution.truncated = result.truncated
             execution.stdout_summary = result.stdout.decode("utf-8", errors="replace")[:2_000]
             execution.stderr_summary = result.stderr.decode("utf-8", errors="replace")[:2_000]
+            if result.truncated:
+                raise SandboxOutputLimitExceeded(
+                    "Sandbox output exceeded the configured host-side limit"
+                )
             if result.timed_out:
                 return self._fail_task(task, session, execution, "sandbox_timeout", "Sandbox task timed out")
             if result.exit_code != 0:
@@ -1262,6 +1272,72 @@ class SandboxAgentWorkspaceService:
             self.db.commit()
             raise AppError(502, "sandbox_execution_failed", "Sandbox session startup failed") from exc
 
+    def _claim_command_lease(
+        self, session: SandboxSession, command: SandboxAgentCommand
+    ) -> tuple[str, int]:
+        now = utc_now()
+        token_hash = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        lease_expires_at = now + timedelta(
+            seconds=self.settings.sandbox_wall_time_seconds + 30
+        )
+        claimed = self.db.execute(
+            update(SandboxSession)
+            .where(
+                SandboxSession.id == session.id,
+                SandboxSession.active_command_id.is_(None),
+            )
+            .values(
+                active_command_id=command.id,
+                lease_token_hash=token_hash,
+                lease_expires_at=lease_expires_at,
+                heartbeat_at=now,
+                command_generation=SandboxSession.command_generation + 1,
+                status="running",
+                lifecycle_state="RUNNING",
+            )
+        )
+        if claimed.rowcount != 1:
+            self.db.rollback()
+            raise AppError(
+                409,
+                "sandbox_session_busy",
+                "Another command is already running in this sandbox session",
+                {"sandbox_session_id": session.id},
+            )
+        self.db.commit()
+        self.db.refresh(session)
+        return token_hash, session.command_generation
+
+    def _release_command_lease(
+        self,
+        session: SandboxSession,
+        command: SandboxAgentCommand,
+        token_hash: str,
+        generation: int,
+    ) -> None:
+        released = self.db.execute(
+            update(SandboxSession)
+            .where(
+                SandboxSession.id == session.id,
+                SandboxSession.active_command_id == command.id,
+                SandboxSession.lease_token_hash == token_hash,
+                SandboxSession.command_generation == generation,
+            )
+            .values(
+                active_command_id=None,
+                lease_token_hash=None,
+                lease_expires_at=None,
+                heartbeat_at=utc_now(),
+            )
+        )
+        if released.rowcount != 1:
+            self.db.rollback()
+            raise AppError(
+                409,
+                "sandbox_command_lease_lost",
+                "Sandbox command lease ownership changed before completion",
+            )
+
     def execute_command(
         self,
         payload: SandboxAgentCommandRequest,
@@ -1308,11 +1384,10 @@ class SandboxAgentWorkspaceService:
             status="created",
         )
         self.db.add(command)
-        self.db.commit()
+        self.db.flush()
+        lease_token_hash, command_generation = self._claim_command_lease(session, command)
         try:
             handle = self._ensure_backend_session(session)
-            session.status = "running"
-            session.lifecycle_state = "RUNNING"
             command.status = "running"
             self.db.commit()
             result = self._runtime_backend(session).exec_agent(
@@ -1324,6 +1399,7 @@ class SandboxAgentWorkspaceService:
                 destructive_path_prefixes=self.authz.active_delete_prefixes(
                     chat_session_id=payload.chat_session_id,
                     sandbox_session_id=session.id,
+                    consume=True,
                 ),
             )
             command.exit_code = result.exit_code
@@ -1340,6 +1416,10 @@ class SandboxAgentWorkspaceService:
             command.stderr_summary = _redact_agent_text(
                 result.stderr.decode("utf-8", errors="replace")
             )
+            if result.truncated:
+                raise SandboxOutputLimitExceeded(
+                    "Sandbox output exceeded the configured host-side limit"
+                )
             if result.timed_out:
                 command.status = "failed"
                 command.error_class = "sandbox_timeout"
@@ -1375,9 +1455,26 @@ class SandboxAgentWorkspaceService:
                     "timed_out": command.timed_out,
                 },
             )
+            self._release_command_lease(
+                session,
+                command,
+                lease_token_hash,
+                command_generation,
+            )
             self.db.commit()
             self.db.refresh(command)
             return command
+        except AppError as exc:
+            if exc.code in {"sandbox_auth_required", "sandbox_grant_already_consumed"}:
+                exc.details.setdefault("sandbox_session_id", session.id)
+                self._release_command_lease(
+                    session,
+                    command,
+                    lease_token_hash,
+                    command_generation,
+                )
+                self.db.commit()
+            raise
         except SandboxBackendUnavailable as exc:
             return self._fail_command(
                 command,
@@ -1410,6 +1507,14 @@ class SandboxAgentWorkspaceService:
                 "Sandbox code attempted a workspace deletion that requires authorization",
                 type(exc).__name__,
             )
+        except SandboxOutputLimitExceeded as exc:
+            return self._fail_command(
+                command,
+                session,
+                "sandbox_output_limit_exceeded",
+                "Sandbox Agent command exceeded the output limit",
+                type(exc).__name__,
+            )
         except SandboxBackendError as exc:
             return self._fail_command(
                 command,
@@ -1426,6 +1531,9 @@ class SandboxAgentWorkspaceService:
         error_class: str,
         message: str,
         internal_class: str,
+        *,
+        lease_token_hash: str | None = None,
+        command_generation: int | None = None,
     ) -> SandboxAgentCommand:
         command.status = "failed"
         command.error_class = error_class
@@ -1433,9 +1541,21 @@ class SandboxAgentWorkspaceService:
         self._mark_session_failed(session)
         if error_class in {
             "sandbox_timeout",
+            "sandbox_output_limit_exceeded",
             "sandbox_workspace_quota_exceeded",
         }:
             self._discard_killed_runtime(session)
+        if lease_token_hash is None:
+            lease_token_hash = session.lease_token_hash
+        if command_generation is None and session.active_command_id == command.id:
+            command_generation = session.command_generation
+        if lease_token_hash is not None and command_generation is not None:
+            self._release_command_lease(
+                session,
+                command,
+                lease_token_hash,
+                command_generation,
+            )
         self.audit.record(
             actor_id=self.actor_id,
             action="sandbox.agent.command.failed",

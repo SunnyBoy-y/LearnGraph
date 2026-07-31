@@ -1,4 +1,4 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect, type ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { LoaderCircle, Network } from 'lucide-react'
@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { AuthProvider, RequireAuth } from '@/features/auth/auth-context'
 import { useAuth } from '@/features/auth/auth-context-value'
+import { registerAuthQueryClient } from '@/lib/auth-query-cache'
 
 const LoginPage = lazy(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
 const DashboardPage = lazy(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.DashboardPage })))
@@ -53,6 +54,7 @@ const queryClient = new QueryClient({
     mutations: { retry: 0 },
   },
 })
+registerAuthQueryClient(queryClient)
 
 function RootRedirect() {
   const auth = useAuth()
@@ -76,6 +78,19 @@ function RouteLoading() {
   return <main aria-live="polite" className="grid min-h-svh place-items-center bg-background"><div className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在载入工作区…</div></main>
 }
 
+function WorkspaceRouteGuard({ children }: { children: ReactNode }) {
+  const { workspaceId: activeWorkspaceId, setWorkspaceId } = useAuth()
+  const { workspaceId = '' } = useParams()
+  useEffect(() => {
+    if (workspaceId && workspaceId !== activeWorkspaceId) {
+      void setWorkspaceId(workspaceId)
+    }
+  }, [activeWorkspaceId, setWorkspaceId, workspaceId])
+  if (!workspaceId) return <Navigate replace to={`/w/${activeWorkspaceId}/home`} />
+  if (workspaceId !== activeWorkspaceId) return <RouteLoading />
+  return children
+}
+
 function AppRoutes() {
   return (
     <Suspense fallback={<RouteLoading />}><Routes>
@@ -83,7 +98,7 @@ function AppRoutes() {
       <Route element={<LoginPage />} path="/auth/login" />
       <Route element={<Navigate replace to="/auth/login" />} path="/login" />
       <Route
-        element={<RequireAuth><WorkspaceShell /></RequireAuth>}
+        element={<RequireAuth><WorkspaceRouteGuard><WorkspaceShell /></WorkspaceRouteGuard></RequireAuth>}
         path="/w/:workspaceId"
       >
         <Route element={<Navigate replace to="home" />} index />
