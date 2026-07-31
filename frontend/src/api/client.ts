@@ -1,7 +1,7 @@
 import type { ApiErrorEnvelope, ValidationIssue } from '@/types/common'
 
 import { authStore } from './auth-store'
-import { invalidateAuthenticatedClient } from '@/lib/auth-query-cache'
+import { clearAuthenticatedClientState } from '@/lib/auth-query-cache'
 import { parseSseResponse } from './sse'
 import type { SseEvent, SseParseOptions } from './sse'
 
@@ -179,7 +179,7 @@ export class ApiClient {
       const known = appError(responseBody)
       const issues = validationIssues(responseBody)
       if (response.status === 401 && options.auth !== false) {
-        await invalidateAuthenticatedClient()
+        await clearAuthenticatedClientState()
         authStore.clear()
         if (
           typeof window !== 'undefined' &&
@@ -230,6 +230,26 @@ export class ApiClient {
 
   async getBlob(path: string, options: ApiRequestOptions = {}): Promise<Blob> {
     const response = await this.fetchResponse('GET', path, options)
+    return response.blob()
+  }
+
+  /**
+   * Download a byte range. Returns the blob for the requested range.
+   * Pass null end to read from start to EOF.
+   */
+  async getBlobRange(
+    path: string,
+    start: number,
+    end: number | null,
+    options: ApiRequestOptions = {},
+  ): Promise<Blob> {
+    const response = await this.fetchResponse('GET', path, {
+      ...options,
+      headers: {
+        ...options.headers,
+        Range: `bytes=${start}-${end !== null ? end : ''}`,
+      },
+    })
     return response.blob()
   }
 

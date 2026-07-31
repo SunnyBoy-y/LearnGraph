@@ -38,6 +38,25 @@ def test_browser_file_hash_skips_large_files() -> None:
     assert "if (file.size > MAX_BROWSER_HASH_BYTES) return null" in source
 
 
+def test_preview_download_caps_large_files_via_range() -> None:
+    """R-012: in-browser preview must not load >16 MiB files into memory."""
+
+    files_api = (FRONTEND / "api" / "files.ts").read_text(encoding="utf-8")
+    assert "downloadFileForPreview" in files_api
+    assert "PREVIEW_MAX_BYTES = 16 * 1024 * 1024" in files_api
+    assert "getBlobRange" in files_api
+
+    client = (FRONTEND / "api" / "client.ts").read_text(encoding="utf-8")
+    assert "getBlobRange" in client
+    assert "Range" in client
+
+    learning_page = (
+        FRONTEND / "features" / "resources" / "document-learning-page.tsx"
+    ).read_text(encoding="utf-8")
+    assert "downloadFileForPreview" in learning_page
+    assert "file.size_bytes" in learning_page
+
+
 def test_dev_listen_defaults_to_loopback() -> None:
     dev = (ROOT / "scripts" / "dev.mjs").read_text(encoding="utf-8")
     vite = (ROOT / "frontend" / "vite.config.ts").read_text(encoding="utf-8")

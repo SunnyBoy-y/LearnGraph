@@ -132,6 +132,28 @@ export function downloadFile(fileId: string): Promise<Blob> {
   return apiClient.getBlob(`/files/${encodeURIComponent(fileId)}/content`)
 }
 
+/** Max bytes to load into browser memory for in-app preview (16 MiB). */
+const PREVIEW_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Download a file for preview, capping at PREVIEW_MAX_BYTES via Range header
+ * when the file is large. This prevents large files (e.g. 200 MiB PDFs) from
+ * exhausting browser memory on mobile / low-end devices.
+ */
+export function downloadFileForPreview(
+  fileId: string,
+  fileSizeBytes: number,
+): Promise<Blob> {
+  if (fileSizeBytes <= PREVIEW_MAX_BYTES) {
+    return downloadFile(fileId);
+  }
+  return apiClient.getBlobRange(
+    `/files/${encodeURIComponent(fileId)}/content`,
+    0,
+    PREVIEW_MAX_BYTES - 1,
+  );
+}
+
 export function listAudioTranscriptions(fileId: string): Promise<AudioTranscription[]> {
   return apiClient.get<AudioTranscription[]>(
     `/files/${encodeURIComponent(fileId)}/transcriptions`,

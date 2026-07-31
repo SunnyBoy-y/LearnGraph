@@ -27,6 +27,7 @@ import {
   cancelDocumentJob,
   createDocumentJob,
   downloadFile,
+  downloadFileForPreview,
   getDocumentJob,
   listDocumentJobEvents,
   listDocumentRevisions,
@@ -307,7 +308,10 @@ export function DocumentLearningPage() {
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
   const blob = useQuery({
     queryKey: ["file-content", fileId],
-    queryFn: () => downloadFile(fileId),
+    queryFn: () =>
+      file?.size_bytes
+        ? downloadFileForPreview(fileId, file.size_bytes)
+        : downloadFile(fileId),
     enabled: Boolean(fileId && file),
   });
   const job = useQuery({
