@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -635,6 +636,9 @@ def compatibility_event_type(event_type: str) -> str:
     if event_type in {"part.delta", "part.completed"}:
         return "message.part.delta"
     return event_type
+
+
+logger = logging.getLogger(__name__)
 
 
 class ChatService:
@@ -1609,6 +1613,80 @@ class ChatService:
 
         return max(400, min(3_000, int(self._input_token_budget() * 0.08)))
 
+    def _build_v2_memory_context(
+        self,
+        session_id: str,
+        current_content: str,
+        *,
+        node_ids: list[str] | None = None,
+        task_id: str | None = None,
+    ) -> tuple[str | None, dict]:
+        """Build memory context via the event-sourced Context Builder.
+
+        Returns ``(prompt_block, telemetry)``.  ``prompt_block`` is non-None
+        only when the v2 builder should **replace** the legacy memory section
+        (``memory_read_mode == "events"``).  In shadow mode the block is
+        ``None`` (legacy is still used) but ``telemetry`` carries comparison
+        metrics.  On any failure both are safe no-ops.
+        """
+
+        settings = get_settings()
+        if self.context_builder is None or not settings.memory_context_builder_v2:
+            return None, {}
+
+        try:
+            from app.domain.memory_event_models import MemoryScopeContext
+            from app.domain.schemas.context_builds import ContextBuildRequest
+
+            scope = MemoryScopeContext(
+                tenant_id=self.tenant_id,
+                principal_user_id=self.actor_id,
+                workspace_id=self.workspace_id,
+                task_id=task_id,
+                conversation_id=session_id,
+                node_ids=tuple(node_ids or ()),
+            )
+            request = ContextBuildRequest(
+                conversation_id=session_id,
+                task_id=task_id,
+                query=current_content,
+                token_budget=self._memory_prompt_token_budget(),
+                agent_id="main_agent",
+                provider_id=self.model_provider.provider_id,
+                model_id=str(getattr(self.model_provider, "model_id", "")),
+            )
+            built = self.context_builder.build(scope, request)
+            telemetry = {
+                "context_build_id": built.view.context_build_id,
+                "trace_id": built.view.trace_id,
+                "memory_count": len(built.view.memories),
+                "total_tokens": built.view.total_tokens,
+                "excluded": dict(built.view.excluded),
+                "degraded_modes": list(built.view.degraded_modes),
+                "read_mode": settings.memory_read_mode,
+            }
+
+            if settings.memory_read_mode == "events":
+                return built.prompt_block, telemetry
+
+            # Shadow mode: log comparison but still use legacy.
+            self._write_shadow_telemetry(scope, request, built.view, telemetry)
+            return None, telemetry
+
+        except Exception:
+            logger.debug("v2 context builder failed, degrading to legacy", exc_info=True)
+            return None, {"degraded": True, "read_mode": settings.memory_read_mode}
+
+    def _write_shadow_telemetry(self, scope, request, view, telemetry: dict) -> None:
+        """Best-effort telemetry write; never blocks chat."""
+
+        try:
+            from app.services.context_telemetry import ContextTelemetryWriter
+
+            ContextTelemetryWriter(self.db).write(scope, request, view)
+        except Exception:
+            pass
+
     def _compose_context_summary_text(
         self,
         session_id: str,
@@ -1832,28 +1910,11 @@ class ChatService:
                     prompt_token_budget=self._memory_prompt_token_budget(),
                 )
             )
-        if self.context_builder is not None and get_settings().memory_context_builder_v2:
-            from app.domain.memory_event_models import MemoryScopeContext
-            from app.domain.schemas.context_builds import ContextBuildRequest
-
-            built = self.context_builder.build(
-                MemoryScopeContext(
-                    tenant_id=self.tenant_id,
-                    principal_user_id=self.actor_id,
-                    workspace_id=self.workspace_id,
-                    conversation_id=session_id,
-                    node_ids=tuple(node_ids or ()),
-                ),
-                ContextBuildRequest(
-                    conversation_id=session_id,
-                    query=current_content,
-                    token_budget=self._memory_prompt_token_budget(),
-                    agent_id="main_agent",
-                    provider_id=self.model_provider.provider_id,
-                    model_id=str(getattr(self.model_provider, "model_id", "")),
-                ),
-            )
-            context_sections.append(built.prompt_block)
+        v2_block, _v2_telemetry = self._build_v2_memory_context(
+            session_id, current_content, node_ids=node_ids
+        )
+        if v2_block is not None:
+            context_sections.append(v2_block)
         if additional_context:
             context_sections.append(additional_context)
         authorized_context = "\n\n".join(section for section in context_sections if section)
@@ -2202,28 +2263,11 @@ class ChatService:
                     prompt_token_budget=self._memory_prompt_token_budget(),
                 )
             )
-        if self.context_builder is not None and get_settings().memory_context_builder_v2:
-            from app.domain.memory_event_models import MemoryScopeContext
-            from app.domain.schemas.context_builds import ContextBuildRequest
-
-            built = self.context_builder.build(
-                MemoryScopeContext(
-                    tenant_id=self.tenant_id,
-                    principal_user_id=self.actor_id,
-                    workspace_id=self.workspace_id,
-                    conversation_id=session_id,
-                    node_ids=tuple(node_ids or ()),
-                ),
-                ContextBuildRequest(
-                    conversation_id=session_id,
-                    query=current_content,
-                    token_budget=self._memory_prompt_token_budget(),
-                    agent_id="main_agent",
-                    provider_id=self.model_provider.provider_id,
-                    model_id=str(getattr(self.model_provider, "model_id", "")),
-                ),
-            )
-            context_sections.append(built.prompt_block)
+        v2_block, _v2_telemetry = self._build_v2_memory_context(
+            session_id, current_content, node_ids=node_ids
+        )
+        if v2_block is not None:
+            context_sections.append(v2_block)
         if additional_context:
             context_sections.append(additional_context)
         authorized_context = "\n\n".join(
