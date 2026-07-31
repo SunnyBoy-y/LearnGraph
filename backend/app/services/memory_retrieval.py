@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, text
@@ -69,8 +70,11 @@ class MemoryHybridRetriever:
             "lifecycle": 0,
             "quality": 0,
             "duplicate": 0,
+            "expired": 0,
         }
         query_tokens = _tokens(query)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # ── Hard scope filters ──────────────────────────────────────────────
         workspace_scope = (
             (MemorySearchDocument.workspace_id == scope.workspace_id)
             | (
@@ -96,6 +100,11 @@ class MemoryHybridRetriever:
         fts_scores = self._fts_scores(scope, query, limit=max(top_k * 5, 20))
         candidates: list[RetrievalCandidate] = []
         for document in documents:
+            # ── Lifecycle: expired documents ────────────────────────────────
+            if document.valid_until is not None and document.valid_until < now:
+                excluded["expired"] += 1
+                continue
+            # ── Audience / scope ────────────────────────────────────────────
             audience_ok = False
             scope_score = 0.0
             if document.task_id and scope.task_id == document.task_id:
@@ -121,10 +130,10 @@ class MemoryHybridRetriever:
             if document.confidence < min_confidence:
                 excluded["quality"] += 1
                 continue
+            # ── Scoring ─────────────────────────────────────────────────────
             raw_fts = fts_scores.get(document.id)
             document_tokens = _tokens(f"{document.subject} {document.content}")
             if raw_fts is not None:
-                # bm25() is already normalized to [0, 1) by _fts_scores.
                 lexical = raw_fts
             elif query_tokens and document_tokens:
                 lexical = len(query_tokens & document_tokens) / math.sqrt(
@@ -208,7 +217,6 @@ class MemoryHybridRetriever:
         if not safe_query:
             return {}
         try:
-            # Explicit ASC: FTS5 bm25 is more relevant when smaller/negative.
             rows = self.db.execute(
                 text(
                     "SELECT document_id, bm25(memory_search_fts) AS rank "

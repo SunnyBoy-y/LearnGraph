@@ -412,6 +412,34 @@ class StrategyMemory(Base, TimestampMixin):
     projection_version: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class MemoryRetrievalTrace(Base, TimestampMixin):
+    """Memory-domain retrieval trace. Query plaintext is never persisted."""
+
+    __tablename__ = "memory_retrieval_traces"
+    __table_args__ = (
+        Index("ix_memory_retrieval_trace_build", "context_build_id"),
+        Index("ix_memory_retrieval_trace_scope", "tenant_id", "workspace_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    context_build_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    workspace_id: Mapped[str] = mapped_column(String(64), index=True)
+    subject_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    agent_id: Mapped[str] = mapped_column(String(80), default="main_agent")
+    query_hash: Mapped[str] = mapped_column(String(64))
+    routes_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    signals_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    selected_count: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_counts_json: Mapped[dict[str, int]] = mapped_column(JSON, default=dict)
+    degraded_modes_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    fts_capability: Mapped[str] = mapped_column(String(24), default="unknown")
+    strategy: Mapped[str] = mapped_column(String(40), default="hybrid_memory_v2")
+    status: Mapped[str] = mapped_column(String(24), default="completed")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryScopeContext:
     tenant_id: str

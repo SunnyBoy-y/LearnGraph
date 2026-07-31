@@ -132,7 +132,7 @@ def search_memory(
         agent_id=payload.agent_id,
         allowed_sensitivity=_allowed_sensitivity(payload),
     )
-    routed = MemoryRouter(MemoryHybridRetriever(db)).route(scope, payload.query)
+    routed = MemoryRouter(MemoryHybridRetriever(db), db=db).route(scope, payload.query)
     return {
         "route": list(routed.routes),
         "candidates": [
@@ -179,7 +179,7 @@ def build_context(
         agent_id=payload.agent_id,
         allowed_sensitivity=_allowed_sensitivity(payload),
     )
-    built = ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db))).build(scope, payload)
+    built = ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db), db=db)).build(scope, payload)
     ContextTelemetryWriter(db).write(scope, payload, built.view)
     return built.view
 

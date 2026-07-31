@@ -139,6 +139,7 @@ class ContextBuilder:
         ]
         view = ContextBuildView(
             context_build_id=context_build_id,
+            trace_id=routed.trace_id,
             task_state=task,
             memories=evidence if any(name == "memories" for name, _, _ in selected_sections) else [],
             episodes=episodes if any(name == "episodes" for name, _, _ in selected_sections) else [],

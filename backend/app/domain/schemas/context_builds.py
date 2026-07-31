@@ -36,6 +36,7 @@ class ContextEvidenceView(BaseModel):
 
 class ContextBuildView(BaseModel):
     context_build_id: str
+    trace_id: str | None = None
     task_state: dict[str, Any] | None = None
     recent_context: list[dict[str, Any]] = Field(default_factory=list)
     memories: list[ContextEvidenceView] = Field(default_factory=list)
