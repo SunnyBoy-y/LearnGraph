@@ -4642,6 +4642,7 @@ class AgentToolRuntime:
                 "paths": details.get("paths") or [],
                 "chat_session_id": details.get("chat_session_id"),
                 "sandbox_session_id": details.get("sandbox_session_id"),
+                "command_intent_digest": details.get("command_intent_digest"),
                 "affects_host_files": bool(details.get("affects_host_files", False)),
                 "message_zh": details.get("message_zh")
                 or "智能体请求删除会话工作区内的文件；不影响你电脑上的真实文件。",

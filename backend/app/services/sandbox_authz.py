@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any
@@ -67,6 +69,28 @@ def classify_destructive_argv(argv: tuple[str, ...]) -> dict[str, Any] | None:
     }
 
 
+def destructive_intent_digest(
+    *,
+    chat_session_id: str,
+    sandbox_session_id: str,
+    argv: tuple[str, ...],
+    paths: tuple[str, ...],
+) -> str:
+    encoded = json.dumps(
+        {
+            "action": "delete_path",
+            "argv": list(argv),
+            "chat_session_id": chat_session_id,
+            "paths": list(paths),
+            "sandbox_session_id": sandbox_session_id,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class SandboxAuthorizationService:
     def __init__(
         self,
@@ -99,7 +123,8 @@ class SandboxAuthorizationService:
         chat_session_id: str,
         path_prefix: str,
         action: str = "delete_path",
-        sandbox_session_id: str | None = None,
+        sandbox_session_id: str,
+        command_intent_digest: str,
         ttl_seconds: int = DEFAULT_GRANT_TTL_SECONDS,
         reason: str = "",
     ) -> SandboxDestructiveGrant:
@@ -114,6 +139,14 @@ class SandboxAuthorizationService:
                 "Destructive grants are limited to the session work/ tree",
             )
         ttl = max(60, min(ttl_seconds, 24 * 3600))
+        if len(command_intent_digest) != 64 or any(
+            character not in "0123456789abcdef" for character in command_intent_digest
+        ):
+            raise AppError(
+                422,
+                "invalid_command_intent_digest",
+                "Command intent digest must be a lowercase SHA-256 hex value",
+            )
         record = SandboxDestructiveGrant(
             id=new_id(),
             workspace_id=self.workspace_id,
@@ -122,6 +155,7 @@ class SandboxAuthorizationService:
             sandbox_session_id=sandbox_session_id,
             action=action,
             path_prefix=prefix,
+            command_intent_digest=command_intent_digest,
             status="active",
             granted_by=self.actor_id,
             expires_at=utc_now() + timedelta(seconds=ttl),
@@ -139,6 +173,8 @@ class SandboxAuthorizationService:
                 "action": action,
                 "ttl_seconds": ttl,
                 "chat_session_id": chat_session_id,
+                "sandbox_session_id": sandbox_session_id,
+                "command_intent_digest": command_intent_digest,
             },
         )
         self.db.commit()
@@ -236,6 +272,75 @@ class SandboxAuthorizationService:
                     )
         self.db.commit()
         return tuple(sorted(set(prefixes)))
+
+    def consume_delete_prefixes(
+        self,
+        *,
+        chat_session_id: str,
+        sandbox_session_id: str,
+        paths: tuple[str, ...],
+        command_intent_digest: str,
+    ) -> tuple[str, ...]:
+        """Atomically consume only grants needed by this exact command."""
+
+        now = utc_now()
+        matches: dict[str, SandboxDestructiveGrant] = {}
+        for raw_path in paths:
+            path = validate_agent_workspace_path(raw_path)
+            candidate = next(
+                (
+                    grant
+                    for grant in self.list_grants(chat_session_id)
+                    if grant.sandbox_session_id == sandbox_session_id
+                    and grant.command_intent_digest == command_intent_digest
+                    and grant.consumed_at is None
+                    and grant.action == "delete_path"
+                    and (path == grant.path_prefix or path.startswith(grant.path_prefix.rstrip("/") + "/"))
+                    and (
+                        grant.expires_at.replace(tzinfo=timezone.utc)
+                        if grant.expires_at.tzinfo is None
+                        else grant.expires_at
+                    )
+                    > now
+                ),
+                None,
+            )
+            if candidate is None:
+                self.db.rollback()
+                raise AppError(
+                    403,
+                    "sandbox_auth_required",
+                    "Destructive session workspace action requires a fresh single-use authorization",
+                    details={
+                        "action": "delete_path",
+                        "paths": [path],
+                        "chat_session_id": chat_session_id,
+                        "sandbox_session_id": sandbox_session_id,
+                        "command_intent_digest": command_intent_digest,
+                        "affects_host_files": False,
+                        "message_zh": "智能体请求删除会话工作区内的文件；本次授权使用后立即失效。",
+                    },
+                )
+            matches[candidate.id] = candidate
+        for grant in matches.values():
+            claimed = self.db.execute(
+                update(SandboxDestructiveGrant)
+                .where(
+                    SandboxDestructiveGrant.id == grant.id,
+                    SandboxDestructiveGrant.status == "active",
+                    SandboxDestructiveGrant.consumed_at.is_(None),
+                )
+                .values(status="consumed", consumed_at=now)
+            )
+            if claimed.rowcount != 1:
+                self.db.rollback()
+                raise AppError(
+                    409,
+                    "sandbox_grant_already_consumed",
+                    "The destructive authorization has already been consumed",
+                )
+        self.db.commit()
+        return tuple(sorted({grant.path_prefix for grant in matches.values()}))
 
     def authorize_or_raise(
         self,

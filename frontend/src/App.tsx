@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { LoaderCircle, Network } from 'lucide-react'
@@ -81,12 +81,16 @@ function RouteLoading() {
 function WorkspaceRouteGuard({ children }: { children: ReactNode }) {
   const { workspaceId: activeWorkspaceId, setWorkspaceId } = useAuth()
   const { workspaceId = '' } = useParams()
+  const [denied, setDenied] = useState(false)
   useEffect(() => {
+    setDenied(false)
     if (workspaceId && workspaceId !== activeWorkspaceId) {
-      void setWorkspaceId(workspaceId)
+      void setWorkspaceId(workspaceId).catch(() => setDenied(true))
     }
   }, [activeWorkspaceId, setWorkspaceId, workspaceId])
-  if (!workspaceId) return <Navigate replace to={`/w/${activeWorkspaceId}/home`} />
+  if (!workspaceId || denied) {
+    return <Navigate replace to={`/w/${activeWorkspaceId}/home`} />
+  }
   if (workspaceId !== activeWorkspaceId) return <RouteLoading />
   return children
 }

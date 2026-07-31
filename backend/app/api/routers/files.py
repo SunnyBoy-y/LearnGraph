@@ -186,11 +186,18 @@ def download_file(
     start = 0
     end = record.size_bytes - 1
     status_code = status.HTTP_200_OK
+    etag = f'"sha256-{record.sha256}"'
     range_header = request.headers.get("range")
+    if_range = request.headers.get("if-range")
+    if range_header and if_range and if_range.strip() != etag:
+        range_header = None
     if range_header:
-        if not range_header.startswith("bytes=") or "," in range_header:
+        if range_header[:6].casefold() != "bytes=" or "," in range_header:
             return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
-        raw_start, separator, raw_end = range_header.removeprefix("bytes=").partition("-")
+        raw_range = range_header[6:]
+        if "-" not in raw_range:
+            return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+        raw_start, raw_end = raw_range.split("-", 1)
         try:
             if not raw_start:
                 suffix = int(raw_end)
@@ -199,7 +206,7 @@ def download_file(
                 start = max(0, record.size_bytes - suffix)
             else:
                 start = int(raw_start)
-                end = int(raw_end) if separator and raw_end else end
+                end = int(raw_end) if raw_end else end
         except ValueError:
             return Response(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
         if start < 0 or start >= record.size_bytes or end < start:
@@ -215,7 +222,7 @@ def download_file(
         "Cache-Control": "private, no-store",
         "Content-Disposition": _content_disposition(record.original_name),
         "Content-Length": str(length),
-        "ETag": f'"sha256-{record.sha256}"',
+        "ETag": etag,
     }
     if status_code == status.HTTP_206_PARTIAL_CONTENT:
         headers["Content-Range"] = f"bytes {start}-{end}/{record.size_bytes}"

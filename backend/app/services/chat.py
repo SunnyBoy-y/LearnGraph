@@ -2773,6 +2773,8 @@ class ChatService:
                         "action": auth.get("action") or "delete_path",
                         "paths": auth.get("paths") or [],
                         "chat_session_id": auth.get("chat_session_id") or session_id,
+                        "sandbox_session_id": auth.get("sandbox_session_id"),
+                        "command_intent_digest": auth.get("command_intent_digest"),
                         "affects_host_files": bool(auth.get("affects_host_files", False)),
                         "message_zh": auth.get("message_zh")
                         or "智能体请求删除会话工作区内的文件；不影响你电脑上的真实文件。",

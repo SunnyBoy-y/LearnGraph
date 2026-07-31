@@ -75,7 +75,7 @@ from app.services.memory import MemoryService
 from app.services.authorization import AuthorizationService
 from app.services.agent_runtime import AgentToolRuntime
 from app.services.mcp_skills import MCPAndSkillService
-from app.services.sandbox import SandboxAgentWorkspaceService, agent_sandbox_readiness
+from app.services.sandbox import SandboxAgentWorkspaceService
 from app.services.session_retrieval import SessionRetrievalService
 
 
@@ -1242,6 +1242,7 @@ def retry_message(
     payload: MessageRetryRequest | None = None,
 ) -> StreamingResponse:
     retry_payload = payload or MessageRetryRequest()
+    require_session_access(session_id, "write", db, context)
     chat_service = service(
         db,
         context,
@@ -1251,23 +1252,11 @@ def retry_message(
         thinking_mode=retry_payload.thinking_mode,
         search_route=retry_payload.search_route,
     )
-    retry_agent_mode = chat_service.preflight_retry_message(
+    chat_service.preflight_retry_message(
         session_id,
         message_id,
         retry_payload,
     )
-    if retry_agent_mode:
-        sandbox_readiness = agent_sandbox_readiness(
-            settings,
-            authorized="workspace.manage" in context.permissions,
-        )
-        if not sandbox_readiness["available"]:
-            raise AppError(
-                409,
-                str(sandbox_readiness["code"]),
-                str(sandbox_readiness["message"]),
-                sandbox_readiness,
-            )
 
     return StreamingResponse(
         _detached_retry_stream(

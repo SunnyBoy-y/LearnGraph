@@ -359,7 +359,8 @@ export function createSandboxDestructiveGrant(payload: {
   chat_session_id: string;
   path_prefix: string;
   action?: "delete_path";
-  sandbox_session_id?: string;
+  sandbox_session_id: string;
+  command_intent_digest: string;
   ttl_seconds?: number;
   reason?: string;
 }): Promise<{

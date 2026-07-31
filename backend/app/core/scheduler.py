@@ -5,7 +5,7 @@ import logging
 import shutil
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
@@ -344,12 +344,45 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
                 lease_stale = bool(lease_expires and lease_expires <= current)
                 if not lease_stale and not (lease_expires is None and legacy_stale):
                     continue
-                if session.active_command_id:
-                    command = db.get(SandboxAgentCommand, session.active_command_id)
+                observed_command_id = session.active_command_id
+                observed_lease_token = session.lease_token_hash
+                observed_generation = session.command_generation
+                claimed = db.execute(
+                    update(SandboxSession)
+                    .where(
+                        SandboxSession.id == session.id,
+                        SandboxSession.active_command_id == observed_command_id,
+                        SandboxSession.lease_token_hash == observed_lease_token,
+                        SandboxSession.command_generation == observed_generation,
+                    )
+                    .values(
+                        lifecycle_state="RECOVERING",
+                        lease_token_hash=None,
+                        lease_expires_at=None,
+                    )
+                )
+                if claimed.rowcount != 1:
+                    db.rollback()
+                    continue
+                db.commit()
+                if session.backend_session_ref:
+                    try:
+                        backend_for_settings(settings, session.runtime_kind).delete(
+                            SandboxSessionHandle(session.id, session.backend_session_ref)
+                        )
+                    except Exception as exc:
+                        session.cleanup_status = "cleanup_blocked"
+                        session.cleanup_error_class = type(exc).__name__
+                        totals["cleanup_blocked"] += 1
+                        db.commit()
+                        continue
+                if observed_command_id:
+                    command = db.get(SandboxAgentCommand, observed_command_id)
                     if command is not None and command.status in {"created", "running"}:
                         command.status = "failed"
                         command.error_class = "sandbox_command_interrupted"
                         command.error_message = "Sandbox command lease expired during backend interruption"
+                session.backend_session_ref = None
                 session.lifecycle_state = "RECOVERING"
                 session.active_command_id = None
                 session.lease_token_hash = None

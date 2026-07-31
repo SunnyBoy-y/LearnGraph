@@ -1650,6 +1650,9 @@ class SandboxDestructiveGrant(Base, TimestampMixin, WorkspaceScopedMixin):
     )
     action: Mapped[str] = mapped_column(String(40), default="delete_path")
     path_prefix: Mapped[str] = mapped_column(String(255))
+    command_intent_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     granted_by: Mapped[str] = mapped_column(String(64))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

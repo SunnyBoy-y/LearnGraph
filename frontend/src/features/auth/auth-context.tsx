@@ -11,7 +11,10 @@ import {
 } from "@/api/auth";
 import { authStore } from "@/api/auth-store";
 import { getCurrentUser } from "@/api/control";
-import { clearAuthenticatedClientState } from "@/lib/auth-query-cache";
+import {
+  clearAuthenticatedClientState,
+  registerAuthInvalidationHandler,
+} from "@/lib/auth-query-cache";
 import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
 
 import {
@@ -23,6 +26,15 @@ import {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState(() => authStore.getSession());
   const [workspaceName, setWorkspaceName] = useState("");
+
+  useEffect(
+    () =>
+      registerAuthInvalidationHandler(() => {
+        setSession(null);
+        setWorkspaceName("");
+      }),
+    [],
+  );
 
   useEffect(() => {
     if (!session?.workspaceId) {
@@ -79,6 +91,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       workspaceName: workspaceName || session?.workspaceId || "",
       async setWorkspaceId(workspaceId) {
         if (!session || workspaceId === session.workspaceId) return;
+        const workspaces = await listWorkspaces();
+        if (!workspaces.some((workspace) => workspace.id === workspaceId)) {
+          throw new Error("Workspace is not accessible to this account");
+        }
         await clearAuthenticatedClientState();
         authStore.setWorkspaceId(workspaceId);
         setSession({ ...session, workspaceId });

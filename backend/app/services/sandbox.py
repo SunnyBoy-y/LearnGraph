@@ -33,7 +33,11 @@ from app.domain.models import (
     new_id,
     utc_now,
 )
-from app.services.sandbox_authz import SandboxAuthorizationService
+from app.services.sandbox_authz import (
+    SandboxAuthorizationService,
+    classify_destructive_argv,
+    destructive_intent_digest,
+)
 from app.services.session_workspace import SessionWorkspaceService
 from app.domain.schemas.sandbox import (
     SandboxAgentCommandRequest,
@@ -1230,8 +1234,14 @@ class SandboxAgentWorkspaceService:
                 argv=raw,
             )
             raise AppError(422, "sandbox_command_blocked", str(exc)) from exc
-        # Destructive argv is shape-validated above; authorization is separate.
-        self.authz.authorize_or_raise(chat_session_id=payload.chat_session_id, argv=argv)
+        # Hard-block malformed/host-like destructive targets here. Matching
+        # grants are checked and consumed only after resolving a concrete session.
+        intent = classify_destructive_argv(argv)
+        if intent is not None and intent.get("hard_blocked"):
+            self.authz.authorize_or_raise(
+                chat_session_id=payload.chat_session_id,
+                argv=argv,
+            )
         return argv
 
     def create_session(self, payload: SandboxAgentSessionCreateRequest) -> SandboxSession:
@@ -1372,6 +1382,23 @@ class SandboxAgentWorkspaceService:
             payload.chat_session_id,
             payload.runtime,
         )
+        intent = classify_destructive_argv(argv)
+        destructive_paths = tuple(intent.get("paths") or ()) if intent else ()
+        if destructive_paths:
+            intent_digest = destructive_intent_digest(
+                chat_session_id=payload.chat_session_id,
+                sandbox_session_id=session.id,
+                argv=argv,
+                paths=destructive_paths,
+            )
+            destructive_prefixes = self.authz.consume_delete_prefixes(
+                chat_session_id=payload.chat_session_id,
+                sandbox_session_id=session.id,
+                paths=destructive_paths,
+                command_intent_digest=intent_digest,
+            )
+        else:
+            destructive_prefixes = ()
         command = SandboxAgentCommand(
             workspace_id=self.workspace_id,
             owner_user_id=self.actor_id,
@@ -1396,11 +1423,7 @@ class SandboxAgentWorkspaceService:
                 cwd_relative=payload.cwd,
                 timeout_seconds=self.settings.sandbox_wall_time_seconds,
                 output_limit=self.settings.sandbox_output_bytes,
-                destructive_path_prefixes=self.authz.active_delete_prefixes(
-                    chat_session_id=payload.chat_session_id,
-                    sandbox_session_id=session.id,
-                    consume=True,
-                ),
+                destructive_path_prefixes=destructive_prefixes,
             )
             command.exit_code = result.exit_code
             command.timed_out = result.timed_out
@@ -1465,8 +1488,14 @@ class SandboxAgentWorkspaceService:
             self.db.refresh(command)
             return command
         except AppError as exc:
-            if exc.code in {"sandbox_auth_required", "sandbox_grant_already_consumed"}:
+            if exc.code in {
+                "sandbox_auth_required",
+                "sandbox_grant_already_consumed",
+                "sandbox_session_busy",
+                "sandbox_command_lease_lost",
+            }:
                 exc.details.setdefault("sandbox_session_id", session.id)
+            if session.active_command_id == command.id:
                 self._release_command_lease(
                     session,
                     command,

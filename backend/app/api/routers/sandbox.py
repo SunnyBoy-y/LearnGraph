@@ -414,6 +414,7 @@ def create_destructive_grant(
         path_prefix=payload.path_prefix,
         action=payload.action,
         sandbox_session_id=payload.sandbox_session_id,
+        command_intent_digest=payload.command_intent_digest,
         ttl_seconds=payload.ttl_seconds,
         reason=payload.reason,
     )

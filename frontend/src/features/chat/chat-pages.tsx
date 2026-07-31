@@ -3277,6 +3277,15 @@ export function ChatCanvasPage() {
         (typeof part.data?.chat_session_id === "string" && part.data.chat_session_id) ||
         sessionId;
       if (!chatSessionId || chatSessionId === "new") continue;
+      const sandboxSessionId =
+        typeof part.data?.sandbox_session_id === "string"
+          ? part.data.sandbox_session_id
+          : "";
+      const commandIntentDigest =
+        typeof part.data?.command_intent_digest === "string"
+          ? part.data.command_intent_digest
+          : "";
+      if (!sandboxSessionId || !commandIntentDigest) continue;
       setSandboxAuthRequest((current) => {
         if (current) return current;
         return {
@@ -3285,10 +3294,8 @@ export function ChatCanvasPage() {
           action: typeof part.data?.action === "string" ? part.data.action : "delete_path",
           message:
             typeof part.data?.message_zh === "string" ? part.data.message_zh : undefined,
-          sandboxSessionId:
-            typeof part.data?.sandbox_session_id === "string"
-              ? part.data.sandbox_session_id
-              : undefined,
+          sandboxSessionId,
+          commandIntentDigest,
         };
       });
       break;

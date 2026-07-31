@@ -10,7 +10,8 @@ export type SandboxAuthRequest = {
   paths: string[];
   action?: string;
   message?: string;
-  sandboxSessionId?: string;
+  sandboxSessionId: string;
+  commandIntentDigest: string;
 };
 
 export function SandboxAuthDialog({
@@ -34,6 +35,7 @@ export function SandboxAuthDialog({
             path_prefix: path.startsWith("work/") ? path : `work/${path}`,
             action: "delete_path",
             sandbox_session_id: request.sandboxSessionId,
+            command_intent_digest: request.commandIntentDigest,
             ttl_seconds: 300,
             reason: "user_confirmed_single_use_in_chat",
           }),

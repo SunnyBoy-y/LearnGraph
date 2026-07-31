@@ -7,13 +7,22 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.domain.models import Base, ChatSession, SandboxDestructiveGrant, utc_now
-from app.services.sandbox_authz import SandboxAuthorizationService
+from app.services.sandbox_authz import (
+    SandboxAuthorizationService,
+    destructive_intent_digest,
+)
 
 
 def test_single_use_grant_is_consumed_once(tmp_path: Path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'grants.db'}")
     Base.metadata.create_all(engine)
     now = utc_now()
+    intent_digest = destructive_intent_digest(
+        chat_session_id="chat-1",
+        sandbox_session_id="sandbox-1",
+        argv=("rm", "work/file.txt"),
+        paths=("work/file.txt",),
+    )
     with Session(engine) as db:
         db.add(ChatSession(id="chat-1", workspace_id="workspace-1", title="test"))
         db.add(
@@ -25,6 +34,7 @@ def test_single_use_grant_is_consumed_once(tmp_path: Path) -> None:
                 sandbox_session_id="sandbox-1",
                 action="delete_path",
                 path_prefix="work/file.txt",
+                command_intent_digest=intent_digest,
                 status="active",
                 granted_by="user-1",
                 expires_at=now + timedelta(minutes=5),
@@ -35,10 +45,11 @@ def test_single_use_grant_is_consumed_once(tmp_path: Path) -> None:
         assert authz.has_active_grant(
             chat_session_id="chat-1", path="work/file.txt"
         )
-        assert authz.active_delete_prefixes(
+        assert authz.consume_delete_prefixes(
             chat_session_id="chat-1",
             sandbox_session_id="sandbox-1",
-            consume=True,
+            paths=("work/file.txt",),
+            command_intent_digest=intent_digest,
         ) == ("work/file.txt",)
         assert not authz.has_active_grant(
             chat_session_id="chat-1", path="work/file.txt"

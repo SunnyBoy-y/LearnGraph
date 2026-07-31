@@ -425,6 +425,9 @@ def _apply_sqlite_additive_migrations() -> None:
         "answer_records": {
             "actor_id": "VARCHAR(64)",
         },
+        "sandbox_destructive_grants": {
+            "command_intent_digest": "VARCHAR(64)",
+        },
         "sandbox_sessions": {
             "policy_revision": "VARCHAR(40) NOT NULL DEFAULT 'sandbox-policy-v1'",
             "runtime_kind": "VARCHAR(40) NOT NULL DEFAULT 'python-node'",
@@ -452,6 +455,10 @@ def _apply_sqlite_additive_migrations() -> None:
                     connection.exec_driver_sql(
                         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
                     )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_sandbox_destructive_grant_intent "
+            "ON sandbox_destructive_grants(command_intent_digest)"
+        )
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_sandbox_sessions_active_command_id "
             "ON sandbox_sessions(active_command_id)"
