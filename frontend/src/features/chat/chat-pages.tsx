@@ -436,13 +436,13 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
         ? "智能体沙箱尚未初始化"
         : "智能体沙箱暂不可用";
   const description = dockerMissing
-    ? "当前设备未检测到 Docker。安装并启动 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）后，才能使用智能体的文件与代码能力。"
+    ? "当前设备未检测到 Docker。安装并启动 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）后，才能使用文件执行与代码沙箱工具；普通智能体对话仍可继续。"
     : dockerStopped
-      ? "已检测到 Docker，但引擎当前不可达。请启动 Docker 后刷新沙箱状态。"
+      ? "已检测到 Docker，但引擎当前不可达。请启动 Docker 后刷新沙箱状态。文件/代码沙箱工具会暂时不可用，对话本身不受阻。"
       : activeJob
         ? `${activeJob.message}（${activeJob.progress_percent}%）`
         : needsInitialization
-          ? "已检测到可用的 Docker。是否现在构建并初始化智能体沙箱？首次初始化可能需要几分钟。"
+          ? "已检测到可用的 Docker。是否现在构建并初始化智能体沙箱？首次初始化可能需要几分钟。未初始化前，沙箱工具不可用，但智能体对话仍可发送。"
           : readiness.data.message;
 
   return (
@@ -3277,15 +3277,6 @@ export function ChatCanvasPage() {
         (typeof part.data?.chat_session_id === "string" && part.data.chat_session_id) ||
         sessionId;
       if (!chatSessionId || chatSessionId === "new") continue;
-      const sandboxSessionId =
-        typeof part.data?.sandbox_session_id === "string"
-          ? part.data.sandbox_session_id
-          : "";
-      const commandIntentDigest =
-        typeof part.data?.command_intent_digest === "string"
-          ? part.data.command_intent_digest
-          : "";
-      if (!sandboxSessionId || !commandIntentDigest) continue;
       setSandboxAuthRequest((current) => {
         if (current) return current;
         return {
@@ -3294,8 +3285,10 @@ export function ChatCanvasPage() {
           action: typeof part.data?.action === "string" ? part.data.action : "delete_path",
           message:
             typeof part.data?.message_zh === "string" ? part.data.message_zh : undefined,
-          sandboxSessionId,
-          commandIntentDigest,
+          sandboxSessionId:
+            typeof part.data?.sandbox_session_id === "string"
+              ? part.data.sandbox_session_id
+              : undefined,
         };
       });
       break;
@@ -4265,21 +4258,29 @@ export function ChatCanvasPage() {
   );
 
   const ensureAgentSandboxReady = useCallback(async (): Promise<boolean> => {
+    // R-007: agentic chat must still run without Docker. Sandbox tools degrade
+    // server-side; only warn here so non-sandbox agent work is not blocked.
     try {
       const readiness = await getAgentSandboxReadiness();
       if (readiness.available) return true;
-      toast.error("智能体沙箱不可用", {
-        description: [readiness.message, readiness.remediation_steps[0]]
+      toast.message("沙箱工具暂不可用", {
+        description: [
+          readiness.message || "本机 Docker/沙箱未就绪。",
+          "智能体对话仍可继续；文件执行与代码沙箱工具会暂时不可用。",
+          readiness.remediation_steps[0],
+        ]
           .filter(Boolean)
           .join(" "),
       });
-      return false;
+      return true;
     } catch (error) {
-      toast.error("无法检查智能体沙箱状态", {
+      toast.message("无法检查智能体沙箱状态", {
         description:
-          error instanceof Error ? error.message : "请确认后端服务可用后重试。",
+          error instanceof Error
+            ? `${error.message} 将继续发送；沙箱工具可能不可用。`
+            : "将继续发送；沙箱工具可能不可用。",
       });
-      return false;
+      return true;
     }
   }, []);
 

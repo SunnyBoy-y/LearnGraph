@@ -444,19 +444,23 @@ export function SelectionExplanationPanel({
       try {
         const readiness = await getAgentSandboxReadiness();
         if (!readiness.available) {
-          toast.error("智能体沙箱不可用", {
-            description: [readiness.message, readiness.remediation_steps[0]]
+          toast.message("沙箱工具暂不可用", {
+            description: [
+              readiness.message,
+              "划词解释仍可继续；需要代码/文件沙箱时请稍后再试。",
+              readiness.remediation_steps[0],
+            ]
               .filter(Boolean)
               .join(" "),
           });
-          return;
         }
       } catch (error) {
-        toast.error("无法检查智能体沙箱状态", {
+        toast.message("无法检查智能体沙箱状态", {
           description:
-            error instanceof Error ? error.message : "请确认后端服务可用后重试。",
+            error instanceof Error
+              ? `${error.message} 将继续发送。`
+              : "将继续发送；沙箱工具可能不可用。",
         });
-        return;
       }
     }
 

@@ -449,17 +449,20 @@ export function DocumentChatPanel({
       toast.error("没有可用的真实模型 Provider，无法发送文档问题。");
       return;
     }
-    // 智能体模式：检查沙箱可用性
+    // 智能体模式：沙箱不可用时降级提示，不阻断文档问答本身。
     if (responseMode === "agentic") {
       try {
         const readiness = await getAgentSandboxReadiness();
         if (!readiness.available) {
-          toast.error("智能体沙箱不可用，请切换到极速或思考模式，或在设置中初始化沙箱。");
-          return;
+          toast.message("沙箱工具暂不可用", {
+            description:
+              "文档问答仍可继续；文件执行与代码沙箱工具会暂时不可用。可在设置中初始化沙箱。",
+          });
         }
       } catch {
-        toast.error("无法检查智能体沙箱状态，请稍后再试。");
-        return;
+        toast.message("无法检查智能体沙箱状态", {
+          description: "将继续发送；沙箱工具可能不可用。",
+        });
       }
     }
     const fileIsImage = file.mime_type.toLowerCase().startsWith("image/");
