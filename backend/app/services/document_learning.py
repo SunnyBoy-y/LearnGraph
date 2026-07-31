@@ -706,9 +706,14 @@ class DocumentLearningService:
             record.parser_version = parsed.parser_version
             record.error_message = None
             from app.domain.memory_event_models import MemoryScopeContext
+            from app.services.memory_event_ingestor import event_cipher_from_settings
+            from app.services.memory_event_store import MemoryEventStore
             from app.services.memory_file_invalidation import MemoryFileInvalidationService
 
-            MemoryFileInvalidationService(self.db).activate_revision(
+            MemoryFileInvalidationService(
+                self.db,
+                MemoryEventStore(self.db, event_cipher_from_settings(self.settings)),
+            ).activate_revision(
                 MemoryScopeContext(
                     tenant_id="local-tenant",
                     principal_user_id=self.actor_id,
@@ -1018,6 +1023,7 @@ class DocumentLearningService:
             .where(
                 FileTextChunk.workspace_id == self.workspace_id,
                 FileTextChunk.file_id.in_(file_ids),
+                FileTextChunk.lifecycle_status == "active",
             )
             .order_by(FileTextChunk.file_id, FileTextChunk.ordinal)
             .limit(limit)
@@ -1065,6 +1071,7 @@ class DocumentLearningService:
              WHERE document_chunks_fts MATCH :query
                AND c.workspace_id = :workspace_id
                AND c.file_id IN :file_ids
+               AND c.lifecycle_status = 'active'
                {scope_clause}
              ORDER BY raw_score ASC, c.ordinal ASC
              LIMIT :limit
@@ -1096,6 +1103,7 @@ class DocumentLearningService:
             .where(
                 FileTextChunk.workspace_id == self.workspace_id,
                 FileTextChunk.file_id.in_(file_ids),
+                FileTextChunk.lifecycle_status == "active",
                 or_(*filters),
             )
             .order_by(FileTextChunk.ordinal)

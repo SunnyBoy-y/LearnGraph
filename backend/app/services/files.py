@@ -223,7 +223,10 @@ class FileService:
         return list(
             self.db.scalars(
                 self.chunks.query()
-                .where(FileTextChunk.file_id == file_id)
+                .where(
+                    FileTextChunk.file_id == file_id,
+                    FileTextChunk.lifecycle_status == "active",
+                )
                 .order_by(FileTextChunk.ordinal)
             ).all()
         )
