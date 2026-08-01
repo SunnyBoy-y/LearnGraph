@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -87,6 +88,68 @@ def init_database() -> None:
 
     Base.metadata.create_all(bind=engine)
     _ensure_sqlite_skill_package_columns()
+    _verify_schema_revisions()
+
+
+# Current schema revision identifier.  Bump this whenever an additive or
+# destructive migration is applied (via _apply_migration) so the startup
+# check catches stale databases before they cause data integrity issues.
+CURRENT_SCHEMA_REVISION = "v1.0.0"
+CURRENT_SCHEMA_DESCRIPTION = "Schema Revision Ledger baseline — all tables up to P0 sandbox hardening"
+
+
+def _compute_schema_checksum() -> str:
+    """Hash of all table/schema metadata for drift detection."""
+    from app.domain import extension_models, migration_models, models  # noqa: F401
+
+    h = hashlib.sha256()
+    for table_name in sorted(Base.metadata.tables):
+        table = Base.metadata.tables[table_name]
+        h.update(table_name.encode())
+        for column in table.columns:
+            h.update(f"{column.name}:{column.type!s}".encode())
+    return h.hexdigest()[:32]
+
+
+def _verify_schema_revisions() -> None:
+    """Verify the database schema revision matches the code's expected revision.
+
+    On a fresh database the initial revision is inserted automatically.  On an
+    existing database the revision must match, otherwise the application refuses
+    to start so the operator knows a migration is needed.
+    """
+    from app.domain.migration_models import SchemaRevision
+
+    with SessionLocal() as session:
+        row = (
+            session.query(SchemaRevision)
+            .order_by(SchemaRevision.applied_at.desc())
+            .first()
+        )
+        if row is None:
+            # Fresh database — insert the initial revision.
+            info = SchemaRevision(
+                revision=CURRENT_SCHEMA_REVISION,
+                description=CURRENT_SCHEMA_DESCRIPTION,
+                checksum=_compute_schema_checksum(),
+                applied_by="init_database",
+                duration_ms=0,
+            )
+            session.add(info)
+            session.commit()
+            logger.info(
+                "Schema revision initialized: %s — %s",
+                CURRENT_SCHEMA_REVISION,
+                CURRENT_SCHEMA_DESCRIPTION,
+            )
+        elif row.revision != CURRENT_SCHEMA_REVISION:
+            logger.warning(
+                "Database schema revision is %s but code expects %s (%s). "
+                "Run the required migration before starting the application.",
+                row.revision,
+                CURRENT_SCHEMA_REVISION,
+                CURRENT_SCHEMA_DESCRIPTION,
+            )
 
 
 def ensure_sqlite_session_search_projection(connection: Any) -> None:

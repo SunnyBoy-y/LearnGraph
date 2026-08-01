@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
@@ -8,6 +8,27 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 from app.domain.models import TimestampMixin, WorkspaceScopedMixin, new_id
+
+
+class SchemaRevision(Base):
+    """Immutable ledger of applied schema revisions.
+
+    Each row records one versioned migration with its content hash so the
+    application can verify at startup that the database schema matches the
+    code it expects.  This is the first table created so all subsequent
+    migrations can reference it.
+    """
+
+    __tablename__ = "schema_revisions"
+
+    revision: Mapped[str] = mapped_column(String(64), primary_key=True)
+    description: Mapped[str] = mapped_column(String(500), default="")
+    checksum: Mapped[str] = mapped_column(String(64), default="")
+    applied_by: Mapped[str] = mapped_column(String(64), default="system")
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class MigrationExecution(Base, TimestampMixin, WorkspaceScopedMixin):
