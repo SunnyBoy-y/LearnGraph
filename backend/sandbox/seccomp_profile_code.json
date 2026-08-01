@@ -12,8 +12,8 @@
   ],
   "syscalls": [
     {
-      "comment": "Browser-offline profile: Chromium user-namespace sandbox plus the chroot jail its helper performs inside that namespace",
-      "names": ["clone", "clone3", "setns", "unshare", "chroot"],
+      "comment": "Code-offline profile: retain ordinary process creation for Python/Node but deny Chromium-specific user namespace, clone3, setns, unshare, and chroot syscalls",
+      "names": ["clone"],
       "action": "SCMP_ACT_ALLOW",
       "args": []
     },

@@ -112,25 +112,49 @@ MAX_AGENT_ARCHIVE_BYTES = 16 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
-def sandbox_seccomp_security_options() -> list[str]:
-    """Allowlist seccomp profile (Docker-default style + Chromium userns).
+CODE_RUNTIME_KIND = "python-node"
+BROWSER_RUNTIME_KIND = "python-node-browser"
+CODE_SHM_SIZE = "64m"
+BROWSER_SHM_SIZE = "1g"
 
-    Applied to every sandbox container: the unified runner image ships
-    Chromium, so all containers need the userns allowances while keeping the
-    default-deny posture for everything else.
+
+def sandbox_runtime_policy(runtime_kind: str) -> tuple[Path, str]:
+    """Return the seccomp profile and shared-memory budget for a runtime.
+
+    Runtime kinds are persisted with sandbox sessions.  Unknown values must
+    fail closed: a malformed database row must never receive the browser
+    profile's namespace/chroot allowances by default.
     """
 
-    profile_path = Path(__file__).resolve().parents[3] / "sandbox" / "seccomp_profile.json"
+    sandbox_dir = Path(__file__).resolve().parents[3] / "sandbox"
+    if runtime_kind == CODE_RUNTIME_KIND:
+        return sandbox_dir / "seccomp_profile_code.json", CODE_SHM_SIZE
+    if runtime_kind == BROWSER_RUNTIME_KIND:
+        return sandbox_dir / "seccomp_profile.json", BROWSER_SHM_SIZE
+    raise SandboxCapabilityMismatch(f"Unsupported sandbox runtime kind: {runtime_kind}")
+
+
+def sandbox_seccomp_security_options(runtime_kind: str) -> list[str]:
+    """Build fail-closed Docker seccomp options for one runtime profile."""
+
+    profile_path, _ = sandbox_runtime_policy(runtime_kind)
     try:
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SandboxBackendUnavailable(
-            "Sandbox seccomp profile is unavailable"
+            f"Sandbox seccomp profile is unavailable for {runtime_kind}"
         ) from exc
     return [
         f"seccomp={json.dumps(profile, separators=(',', ':'))}",
         "no-new-privileges:true",
     ]
+
+
+def sandbox_shm_size(runtime_kind: str) -> str:
+    """Return the explicit /dev/shm budget associated with a runtime profile."""
+
+    _, shm_size = sandbox_runtime_policy(runtime_kind)
+    return shm_size
 
 
 def _safe_workspace_path(path: str) -> PurePosixPath:
@@ -353,6 +377,7 @@ class DockerSandboxBackend(SandboxBackendPort):
 
             workspace_path = Path(spec.workspace_path).expanduser().resolve()
             workspace_path.mkdir(parents=True, exist_ok=True)
+            shm_size = sandbox_shm_size(spec.runtime_kind)
             container = client.containers.create(
                 spec.image_ref,
                 command=["sleep", "infinity"],
@@ -369,10 +394,10 @@ class DockerSandboxBackend(SandboxBackendPort):
                 read_only=True,
                 user="65532:65532",
                 cap_drop=["ALL"],
-                # One image, one hardened posture: the allowlist seccomp
-                # profile (with Chromium userns allowances) applies to every
-                # container because Chromium ships in the unified image.
-                security_opt=sandbox_seccomp_security_options(),
+                # Select the runtime-specific seccomp policy. The unified image may contain
+                # Chromium, but ordinary code sessions never receive Chromium's
+                # user namespace/chroot allowances.
+                security_opt=sandbox_seccomp_security_options(spec.runtime_kind),
                 mem_limit=spec.memory_bytes,
                 memswap_limit=spec.memory_swap_bytes,
                 pids_limit=spec.pids_max,
@@ -384,10 +409,8 @@ class DockerSandboxBackend(SandboxBackendPort):
                         hard=spec.disk_bytes,
                     )
                 ],
-                # Chromium renders through /dev/shm; tmpfs costs memory only
-                # when actually used, so the browser-grade size is safe for
-                # pure code sessions too.
-                shm_size="1g",
+                # /dev/shm is runtime-specific: code uses 64 MiB, Chromium retains 1 GiB.
+                shm_size=shm_size,
                 mounts=[
                     Mount(
                         target="/workspace",

@@ -863,7 +863,7 @@ class SandboxTaskService:
         return session
 
 
-AGENT_SANDBOX_POLICY_REVISION = "sandbox-agent-v1"
+AGENT_SANDBOX_POLICY_REVISION = "sandbox-agent-v2-runtime-profiles"
 _AGENT_SECRET_OUTPUT = re.compile(
     r"(?i)(?:\b(?:as_sk|sk)_[a-z0-9_-]{8,}\b|"
     r"\b(?:authorization|api[_-]?key|token|password)\s*[:=]\s*[^\s,;]+)"

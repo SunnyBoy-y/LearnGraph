@@ -54,8 +54,9 @@ def test_docker_create_forces_network_mode_none(monkeypatch) -> None:
     monkeypatch.setattr(
         sandbox_module,
         "sandbox_seccomp_security_options",
-        lambda: ["seccomp={}", "no-new-privileges:true"],
+        lambda runtime_kind: ["seccomp={}", "no-new-privileges:true"],
     )
+    monkeypatch.setattr(sandbox_module, "sandbox_shm_size", lambda runtime_kind: "64m")
     # Mounts require docker.types; stub create path after imports inside method by
     # monkeypatching the docker.types symbols used after import.
     import types
@@ -97,7 +98,7 @@ def test_docker_create_forces_network_mode_none(monkeypatch) -> None:
                 pids_max=64,
                 disk_bytes=64 * 1024 * 1024,
                 workspace_path=str(workspace),
-                runtime_kind="code",
+                runtime_kind="python-node",
             )
         )
     assert handle.session_id == "session-1"
@@ -106,6 +107,11 @@ def test_docker_create_forces_network_mode_none(monkeypatch) -> None:
     assert fake.containers.kwargs.get("read_only") is True
     assert fake.containers.kwargs.get("user") == "65532:65532"
     assert fake.containers.kwargs.get("cap_drop") == ["ALL"]
+    assert fake.containers.kwargs.get("shm_size") == "64m"
+    assert fake.containers.kwargs.get("security_opt") == [
+        "seccomp={}",
+        "no-new-privileges:true",
+    ]
 
 
 def test_create_source_hardcodes_network_none() -> None:

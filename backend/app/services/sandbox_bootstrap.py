@@ -17,6 +17,9 @@ from app.providers.remote.sandbox import (
     DockerSandboxBackend,
     image_ref_is_pinned,
     sandbox_seccomp_security_options,
+    sandbox_shm_size,
+    CODE_RUNTIME_KIND,
+    BROWSER_RUNTIME_KIND,
 )
 from app.services.sandbox_runtime import (
     load_runtime_config,
@@ -409,12 +412,73 @@ class SandboxBootstrapService:
             client.close()
 
     def _smoke_test(self, image_digest: str, settings: Settings) -> str | None:
-        """Exercise the unified image under the exact production hardening.
+        """Exercise the unified image under both code-offline and browser-offline hardening.
 
-        The container options mirror ``DockerSandboxBackend.create`` (seccomp
-        allowlist, noexec /tmp, shm 1g, production memory/pids limits) so a
-        passing smoke actually predicts a working session runtime.
+        Creates two short-lived containers, each with its own runtime profile
+        (seccomp + /dev/shm), and requires both to pass before the image is
+        published.  The container options mirror ``DockerSandboxBackend.create``.
         """
+
+        code_error = self._smoke_container(
+            image_digest,
+            settings,
+            runtime_kind=CODE_RUNTIME_KIND,
+            argv=[
+                ["python", "--version"],
+                ["node", "--version"],
+                ["ffmpeg", "-version"],
+                [
+                    "python",
+                    "-c",
+                    "import mammoth, pypdf, openpyxl, PIL, pydub, learngraph_tasks",
+                ],
+                [
+                    "node",
+                    "-e",
+                    "Promise.all(['vite','vue','react','react-dom',"
+                    "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']"
+                    ".map((m) => import(m)))"
+                    ".then(() => process.exit(0))"
+                    ".catch((e) => { console.error(e); process.exit(1); })",
+                ],
+            ],
+            label_prefix="code",
+        )
+        if code_error:
+            return code_error
+
+        browser_error = self._smoke_container(
+            image_digest,
+            settings,
+            runtime_kind=BROWSER_RUNTIME_KIND,
+            argv=[
+                ["python", "--version"],
+                ["node", "-e",
+                 "require('playwright-core'); "
+                 "Promise.all(['vite','vue','react','react-dom',"
+                 "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']"
+                 ".map((m) => import(m)))"
+                 ".then(() => process.exit(0))"
+                 ".catch((e) => { console.error(e); process.exit(1); })",
+                 ],
+                ["node", "/opt/learngraph/browser-smoke.js"],
+            ],
+            label_prefix="browser",
+        )
+        if browser_error:
+            return browser_error
+
+        return None
+
+    def _smoke_container(
+        self,
+        image_digest: str,
+        settings: Settings,
+        runtime_kind: str,
+        argv: list[list[str]],
+        label_prefix: str,
+    ) -> str | None:
+        """Run a set of checks inside one short-lived container with the given profile."""
 
         client = self._docker_client()
         name = f"{SMOKE_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
@@ -428,43 +492,19 @@ class SandboxBootstrapService:
                 read_only=True,
                 user="65532:65532",
                 cap_drop=["ALL"],
-                security_opt=sandbox_seccomp_security_options(),
+                security_opt=sandbox_seccomp_security_options(runtime_kind),
                 mem_limit=settings.sandbox_memory_bytes,
                 memswap_limit=settings.sandbox_memory_swap_bytes,
                 pids_limit=settings.sandbox_pids_max,
-                shm_size="1g",
+                shm_size=sandbox_shm_size(runtime_kind),
                 tmpfs={"/tmp": "rw,noexec,nosuid,nodev,size=67108864,mode=1777"},
                 labels={"com.learngraph.sandbox": "smoke"},
             )
             container.start()
-            # playwright-core is a global CJS module (NODE_PATH); the vite
-            # toolchain is ESM and must resolve via /node_modules from cwd.
-            toolchain_check = (
-                "require('playwright-core'); "
-                "Promise.all(['vite','vue','react','react-dom',"
-                "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']"
-                ".map((m) => import(m)))"
-                ".then(() => process.exit(0))"
-                ".catch((e) => { console.error(e); process.exit(1); })"
-            )
-            checks: tuple[tuple[list[str], str], ...] = (
-                (["python", "--version"], "python"),
-                (["node", "--version"], "node"),
-                (["ffmpeg", "-version"], "ffmpeg"),
-                (
-                    [
-                        "python",
-                        "-c",
-                        "import mammoth, pypdf, openpyxl, PIL, pydub, learngraph_tasks",
-                    ],
-                    "python-task-libs",
-                ),
-                (["node", "-e", toolchain_check], "node-toolchain"),
-                (["node", "/opt/learngraph/browser-smoke.js"], "browser"),
-            )
-            for argv, label in checks:
+            for argv_item in argv:
+                label = f"{label_prefix}:{argv_item[0]}"
                 result = container.exec_run(
-                    argv,
+                    argv_item,
                     user="65532:65532",
                     environment={"HOME": "/tmp"},
                 )
@@ -473,7 +513,7 @@ class SandboxBootstrapService:
                     return f"Smoke check failed for {label}: {out or 'non-zero exit'}"
             return None
         except Exception as exc:
-            return f"Smoke test could not run: {exc}"
+            return f"Smoke test ({label_prefix}) could not run: {exc}"
         finally:
             if container is not None:
                 try:
