@@ -212,3 +212,38 @@ def test_workspace_scoped_query_keys_include_workspace_id() -> None:
     assert 'setQueryData<Session[]>(["sessions"],' not in sel_panel
     assert 'setQueryData(["sessions"],' not in doc_chat
     assert 'setQueryData<Session[]>(["sessions"],' not in doc_chat
+
+
+def test_sandbox_quota_limits_file_and_directory_count() -> None:
+    """R-008: workspace quota must also limit file count and directory count,
+    not just disk bytes, to prevent inode/directory-bomb DoS."""
+
+    sandbox_adapter = (
+        ROOT / "backend" / "app" / "providers" / "remote" / "sandbox.py"
+    ).read_text(encoding="utf-8")
+
+    # Structured usage stats replace the old scalar return.
+    assert "_WorkspaceUsageStats" in sandbox_adapter
+    assert "class _WorkspaceUsageStats" in sandbox_adapter
+    assert "bytes: int" in sandbox_adapter
+    assert "file_count: int" in sandbox_adapter
+    assert "directory_count: int" in sandbox_adapter
+
+    # Quota check consults all three dimensions.
+    assert "workspace_limit_files" in sandbox_adapter
+    assert "workspace_limit_dirs" in sandbox_adapter
+    assert "usage.file_count > limit_files" in sandbox_adapter
+    assert "usage.directory_count > limit_dirs" in sandbox_adapter
+
+    # Container labels carry the new limits.
+    container_create_idx = sandbox_adapter.index("client.containers.create")
+    create_block = sandbox_adapter[container_create_idx : container_create_idx + 1200]
+    assert 'workspace_limit_files": "20000"' in create_block
+    assert 'workspace_limit_dirs": "5000"' in create_block
+
+    config = (ROOT / "backend" / "app" / "core" / "config.py").read_text(
+        encoding="utf-8"
+    )
+    assert "sandbox_file_count" in config
+    assert "sandbox_directory_count" in config
+    assert "sandbox_snapshot_reserve_bytes" in config

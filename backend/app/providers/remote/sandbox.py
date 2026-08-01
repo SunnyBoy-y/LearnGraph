@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from app.providers.ports.sandbox import (
@@ -50,6 +51,13 @@ class SandboxDestructiveAuthorizationRequired(SandboxBackendError):
         self.paths = paths
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceUsageStats:
+    bytes: int
+    file_count: int
+    directory_count: int
+
+
 def image_ref_is_pinned(image_ref: str) -> bool:
     if "@sha256:" in image_ref:
         return True
@@ -57,6 +65,18 @@ def image_ref_is_pinned(image_ref: str) -> bool:
         digest = image_ref.removeprefix("sha256:")
         return len(digest) == 64 and all(character in "0123456789abcdef" for character in digest)
     return False
+
+
+def _quota_label(container, name: str) -> int | None:
+    """Parse a positive integer quota label from a container, or return None."""
+    raw = container.labels.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        raise SandboxBackendError(f"Sandbox quota label {name} is invalid")
+    return value if value > 0 else None
 
 
 DESTRUCTIVE_COMMANDS = frozenset(
@@ -342,6 +362,8 @@ class DockerSandboxBackend(SandboxBackendPort):
                     "com.learngraph.sandbox": "true",
                     "com.learngraph.session_id": spec.session_id,
                     "com.learngraph.workspace_limit_bytes": str(spec.disk_bytes),
+                    "com.learngraph.workspace_limit_files": "20000",
+                    "com.learngraph.workspace_limit_dirs": "5000",
                 },
                 network_mode="none",
                 read_only=True,
@@ -416,34 +438,49 @@ class DockerSandboxBackend(SandboxBackendPort):
         raise SandboxBackendError("Managed sandbox workspace mount is unavailable")
 
     @classmethod
-    def _workspace_usage(cls, container) -> int:
+    def _workspace_usage(cls, container) -> _WorkspaceUsageStats:
         source = cls._workspace_source(container)
-        total = 0
+        total_bytes = 0
+        file_count = 0
+        directory_count = 0
         for root, directories, files in os.walk(source, followlinks=False):
             directories[:] = [
                 name
                 for name in directories
                 if not os.path.islink(os.path.join(root, name))
             ]
+            directory_count += 1
             for name in files:
                 candidate = os.path.join(root, name)
                 try:
                     if not os.path.islink(candidate):
-                        total += os.path.getsize(candidate)
+                        total_bytes += os.path.getsize(candidate)
+                        file_count += 1
                 except FileNotFoundError:
                     continue
-        return total
+        return _WorkspaceUsageStats(
+            bytes=total_bytes,
+            file_count=file_count,
+            directory_count=directory_count,
+        )
 
     @classmethod
     def _ensure_workspace_quota(cls, container, *, incoming_bytes: int = 0) -> None:
-        raw_limit = container.labels.get("com.learngraph.workspace_limit_bytes")
-        try:
-            limit = int(raw_limit or 0)
-        except ValueError as exc:
-            raise SandboxBackendError("Sandbox workspace quota label is invalid") from exc
-        if limit <= 0 or cls._workspace_usage(container) + incoming_bytes > limit:
+        usage = cls._workspace_usage(container)
+        limit_bytes = _quota_label(container, "com.learngraph.workspace_limit_bytes")
+        limit_files = _quota_label(container, "com.learngraph.workspace_limit_files")
+        limit_dirs = _quota_label(container, "com.learngraph.workspace_limit_dirs")
+        if limit_bytes and usage.bytes + incoming_bytes > limit_bytes:
             raise SandboxWorkspaceQuotaExceeded(
-                "Sandbox workspace aggregate disk quota has been exceeded"
+                "Sandbox workspace disk quota has been exceeded"
+            )
+        if limit_files and usage.file_count > limit_files:
+            raise SandboxWorkspaceQuotaExceeded(
+                "Sandbox workspace file count quota has been exceeded"
+            )
+        if limit_dirs and usage.directory_count > limit_dirs:
+            raise SandboxWorkspaceQuotaExceeded(
+                "Sandbox workspace directory count quota has been exceeded"
             )
 
     @classmethod

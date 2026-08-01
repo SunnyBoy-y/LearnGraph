@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     sandbox_build_pip_index_url: str | None = None
     sandbox_build_npm_registry: str | None = None
     sandbox_disk_bytes: int = 256 * 1024 * 1024
+    sandbox_file_count: int = 20_000
+    sandbox_directory_count: int = 5_000
+    sandbox_snapshot_reserve_bytes: int = 256 * 1024 * 1024
     sandbox_output_bytes: int = 5 * 1024 * 1024
     sandbox_active_per_user: int = 2
     sandbox_queued_tasks_per_user: int = 5
