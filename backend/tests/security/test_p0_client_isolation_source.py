@@ -260,3 +260,16 @@ def test_selection_explanations_has_settings_page_clear_button() -> None:
     assert "clearSelectionExplanations" in personalization
     assert "清除记录" in personalization
     assert "variant=\"destructive\"" in personalization
+
+
+def test_main_app_has_security_response_headers_baseline() -> None:
+    """R-020: the main application must have a verifiable security response
+    header baseline in the repository (CSP, frame-ancestors, referrer)."""
+
+    index_html = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    assert "Content-Security-Policy" in index_html
+    assert "default-src 'self'" in index_html
+    assert "frame-ancestors 'none'" in index_html
+    assert "script-src 'self'" in index_html
+    assert "referrer" in index_html
+    assert "strict-origin-when-cross-origin" in index_html
