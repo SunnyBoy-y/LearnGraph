@@ -15,7 +15,7 @@ import {
   clearAuthenticatedClientState,
   registerAuthInvalidationHandler,
 } from "@/lib/auth-query-cache";
-import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
+import { clearSelectionExplanations, clearAllSelectionExplanations } from "@/features/chat/selection-explanation";
 
 import {
   AuthContext,
@@ -130,7 +130,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
       async deleteAccount(currentPassword, confirmation) {
         await deleteCurrentAccount(currentPassword, confirmation);
-        clearSelectionExplanations();
+        clearAllSelectionExplanations();
         await clearAuthenticatedClientState();
         authStore.clear();
         setSession(null);

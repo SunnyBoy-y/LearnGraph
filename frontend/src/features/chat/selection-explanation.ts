@@ -1,3 +1,5 @@
+import { authStore } from "@/api/auth-store";
+
 /**
  * Independent 划词解释 (selection explanation) records.
  *
@@ -33,16 +35,51 @@ export type SelectionExplanationOpenDetail = {
   explanationSessionId?: string;
 };
 
-const STORAGE_KEY = "learngraph:selection-explanations";
+// R-017: selection history holds private document excerpts (selected text +
+// surrounding context). It must never be shared across accounts on a shared
+// machine or a future WebView. Storage is therefore partitioned per
+// (user, workspace): account A's logout cannot leak into account B's login.
+const STORAGE_KEY_PREFIX = "learngraph:selection-explanations";
+const LEGACY_STORAGE_KEY = "learngraph:selection-explanations";
 const OPEN_EVENT = "learngraph:selection-explanation";
 const RECORDS_EVENT = "learngraph:selection-explanation-records";
 
 type StorageMap = Record<string, SelectionExplanationRecord[]>;
 
-function readAll(): StorageMap {
+// Per-namespace budget bounds stored footprint on phones / low-memory desktops
+// and bounds the worst-case amount of private text persisted locally.
+const MAX_PARENT_SESSIONS = 200;
+const MAX_RECORDS_PER_SESSION = 80;
+const MAX_TOTAL_RECORDS = 4_000;
+// ~1 MiB ceiling. Selections with full prefix/suffix can reach a few KiB each;
+// the cap is a coarse backstop, not an exact policy instrument.
+const MAX_STORAGE_BYTES = 1 * 1024 * 1024;
+
+function namespaceScope(): { userId: string; workspaceId: string } {
+  // On a shared machine the logged-in user owns these records; the workspace
+  // further scopes multi-workspace accounts. authStore is keyed off sessionStorage
+  // which is cleared on logout, so a not-yet-authenticated window degrades to a
+  // shared "__anon__" bucket that is still workspace-partitioned when possible.
+  const session = authStore.getSession();
+  const userId = session?.userId ?? "__anon__";
+  const workspaceId = session?.workspaceId ?? "__default__";
+  return { userId, workspaceId };
+}
+
+function storageKeyFor(userId: string, workspaceId: string): string {
+  return `${STORAGE_KEY_PREFIX}:${userId}:${workspaceId}`;
+}
+
+/** Current logged-in partition's storage key. */
+function currentStorageKey(): string {
+  const { userId, workspaceId } = namespaceScope();
+  return storageKeyFor(userId, workspaceId);
+}
+
+function readNamespace(key: string): StorageMap {
   try {
     if (typeof window === "undefined" || !window.localStorage) return {};
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
@@ -52,13 +89,96 @@ function readAll(): StorageMap {
   }
 }
 
+// Legacy data (pre-namespace) cannot be attributed to whoever is logged in
+// now, so the spec mandates discarding it rather than silently absorbing it
+// into the current user's partition. Sweep it once on first access.
+let legacySwept = false;
+
+function sweepLegacyKey() {
+  if (legacySwept) return;
+  legacySwept = true;
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    if (window.localStorage.getItem(LEGACY_STORAGE_KEY) !== null) {
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    }
+  } catch {
+    // Best-effort; a later clear*() call will retry the cleanup.
+    legacySwept = false;
+  }
+}
+
+function readAll(): StorageMap {
+  if (typeof window === "undefined" || !window.localStorage) return {};
+  sweepLegacyKey();
+  return readNamespace(currentStorageKey());
+}
+
+/**
+ * Persist with a bounded footprint. Enforces per-session record counts and a
+ * global (records + bytes) budget, evicting the oldest entries first so a
+ * runaway session cannot silently accumulate private text beyond the cap.
+ */
 function writeAll(map: StorageMap) {
   try {
     if (typeof window === "undefined" || !window.localStorage) return;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+    const key = currentStorageKey();
+    const bounded = boundStorage(map);
+    window.localStorage.setItem(key, JSON.stringify(bounded));
   } catch {
     // Quota / private mode — keep the in-memory caller path only.
   }
+}
+
+function boundStorage(map: StorageMap): StorageMap {
+  const entries = Object.entries(map)
+    .filter(([, records]) => Array.isArray(records))
+    .map(([parentId, records]) => [
+      parentId,
+      records.slice(0, MAX_RECORDS_PER_SESSION),
+    ] as [string, SelectionExplanationRecord[]]);
+
+  // Flatten to oldest-first order so eviction always drops the least-recent
+  // underline sets regardless of which parent session they belong to.
+  const flat: Array<[string, SelectionExplanationRecord]> = entries
+    .flatMap(([parentId, records]) =>
+      records.map((record) => [parentId, record] as const),
+    )
+    .sort(
+      (a, b) => (a[1].createdAt ?? "").localeCompare(b[1].createdAt ?? ""),
+    );
+
+  // Cap distinct parent sessions (each is a separate chat session's underline set).
+  const keptParents = new Set(
+    flat
+      .slice(-MAX_PARENT_SESSIONS)
+      .map(([parentId]) => parentId),
+  );
+
+  // Enforce a global record budget + a byte budget, evicting oldest-first.
+  // Both budgets are cross-partition: a single runaway parent session cannot
+  // starve the others, and the device-wide footprint stays bounded.
+  const kept: StorageMap = {};
+  let bytes = 2; // account for the leading/trailing JSON braces
+  let totalCount = 0;
+  for (const [parentId, record] of flat) {
+    if (!keptParents.has(parentId)) continue;
+    if (totalCount >= MAX_TOTAL_RECORDS) continue;
+    let bucket = kept[parentId];
+    if (!bucket) {
+      bucket = [];
+      kept[parentId] = bucket;
+    }
+    const candidate = [...bucket, record];
+    const delta =
+      // Approximate serialized size of this record plus its array slot.
+      JSON.stringify(candidate).length - JSON.stringify(bucket).length + 1;
+    if (bytes + delta > MAX_STORAGE_BYTES) continue;
+    bucket.push(record);
+    bytes += delta;
+    totalCount += 1;
+  }
+  return kept;
 }
 
 function notifyRecordsChanged(parentSessionId: string) {
@@ -74,7 +194,38 @@ export function clearSelectionExplanations() {
   pendingOpenDetail = null;
   try {
     if (typeof window === "undefined" || !window.localStorage) return;
-    window.localStorage.removeItem(STORAGE_KEY);
+    // Remove the current partition (the logged-in user + active workspace).
+    // Logout/deleteAccount call this while authStore still holds the session,
+    // so the key resolves to the partition about to become invalid.
+    window.localStorage.removeItem(currentStorageKey());
+    // Legacy pre-namespace key held private text without account partitioning.
+    // It cannot be safely attributed to whoever is logging out now, so it is
+    // discarded outright rather than absorbed into the current partition.
+    window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+  } catch {
+    // Best-effort privacy cleanup for restricted browser storage.
+  }
+}
+
+/**
+ * Wipe every partition on this device. Used when the user deletes their
+ * account entirely, where the device itself must not retain prior private
+ * excerpts under any partition (including stale anonymous buckets left by a
+ * not-yet-authenticated window).
+ */
+export function clearAllSelectionExplanations() {
+  pendingOpenDetail = null;
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    const toRemove: string[] = [];
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index);
+      if (!key) continue;
+      if (key === LEGACY_STORAGE_KEY || key.startsWith(`${STORAGE_KEY_PREFIX}:`)) {
+        toRemove.push(key);
+      }
+    }
+    for (const key of toRemove) window.localStorage.removeItem(key);
   } catch {
     // Best-effort privacy cleanup for restricted browser storage.
   }
@@ -169,7 +320,7 @@ export function upsertSelectionExplanation(
   const next =
     index >= 0
       ? current.map((item, itemIndex) => (itemIndex === index ? record : item))
-      : [record, ...current].slice(0, 80);
+      : [record, ...current].slice(0, MAX_RECORDS_PER_SESSION);
   map[record.parentSessionId] = next;
   writeAll(map);
   notifyRecordsChanged(record.parentSessionId);

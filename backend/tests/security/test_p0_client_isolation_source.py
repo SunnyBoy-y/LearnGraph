@@ -86,3 +86,77 @@ def test_agentic_send_does_not_hard_block_without_docker() -> None:
         encoding="utf-8"
     )
     assert "文档问答仍可继续" in doc
+
+
+def test_selection_explanations_partitioned_by_user_and_workspace() -> None:
+    """R-017: private selection history must be isolated per (user, workspace)."""
+
+    source = (FRONTEND / "features" / "chat" / "selection-explanation.ts").read_text(
+        encoding="utf-8"
+    )
+
+    # Storage key is derived from the authenticated user + active workspace so
+    # account A's logout cannot surface in account B's partition.
+    assert "STORAGE_KEY_PREFIX" in source and "LEGACY_STORAGE_KEY" in source
+    assert "namespaceScope" in source
+    assert "authStore.getSession" in source
+    assert "storageKeyFor" in source
+    assert "currentStorageKey" in source
+    # Both dimensions of the partition must be encoded into the key.
+    assert "userId" in source and "workspaceId" in source
+    assert source.count("learngraph:selection-explanations") >= 2  # prefix + legacy
+
+    # Explicit footprint bound, not "keep forever". The cap prevents runaway
+    # local accumulation of private document excerpts on phones / shared desktops.
+    assert "MAX_TOTAL_RECORDS" in source
+    assert "MAX_STORAGE_BYTES" in source
+    assert "MAX_PARENT_SESSIONS" in source
+    assert "MAX_RECORDS_PER_SESSION" in source
+    assert "boundStorage" in source
+
+    # Legacy pre-namespace key must not be silently absorbed into whoever is
+    # logged in now: it is swept once on first read and dropped outright.
+    assert "sweepLegacyKey" in source
+    assert "legacySwept" in source
+    assert 'removeItem(LEGACY_STORAGE_KEY)' in source
+
+    # Per-partition clear (logout / 401) plus a device-wide wipe (account delete).
+    assert "function clearSelectionExplanations()" in source
+    assert "export function clearAllSelectionExplanations()" in source
+    assert "removeItem(currentStorageKey())" in source
+    # The device-wide wipe prefixes every partition key, not the active one.
+    assert "STORAGE_KEY_PREFIX" in source
+    assert source.count("STORAGE_KEY_PREFIX") >= 3  # decl + storageKeyFor + clearAll
+
+    # The old un-partitioned read/write path must be gone.
+    assert 'localStorage.getItem(STORAGE_KEY)' not in source
+    assert 'localStorage.setItem(STORAGE_KEY' not in source
+    assert 'localStorage.removeItem(STORAGE_KEY)' not in source
+
+
+def test_selection_explanations_cleared_on_logout_401_and_account_delete() -> None:
+    """R-017: logout / 401 drop the current partition; account delete wipes all."""
+
+    auth_context = (FRONTEND / "features" / "auth" / "auth-context.tsx").read_text(
+        encoding="utf-8"
+    )
+    # Logout clears the logged-in partition while authStore still resolves it.
+    logout_idx = auth_context.index("async logout()")
+    logout_block = auth_context[logout_idx : logout_idx + 600]
+    assert "clearSelectionExplanations()" in logout_block
+    # Account deletion wipes every partition on the device, not just the active one.
+    delete_idx = auth_context.index("async deleteAccount")
+    delete_block = auth_context[delete_idx : delete_idx + 400]
+    assert "clearAllSelectionExplanations()" in delete_block
+    assert "clearAllSelectionExplanations" in auth_context
+
+    client = (FRONTEND / "api" / "client.ts").read_text(encoding="utf-8")
+    # The 401 path clears selection history BEFORE authStore.clear() so the
+    # partition still resolves to the invalidated account.
+    assert "clearSelectionExplanations" in client
+    on401_idx = client.index('response.status === 401')
+    on401_block = client[on401_idx : on401_idx + 600]
+    assert "clearSelectionExplanations()" in on401_block
+    assert on401_block.index("clearSelectionExplanations()") < on401_block.index(
+        "authStore.clear()"
+    )
