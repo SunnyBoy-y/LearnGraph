@@ -7,9 +7,10 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.api.memory_deps import event_store, memory_scope
 from app.domain.memory_event_models import LearningNodeState
 from app.domain.memory_event_types import MemoryEventType
-from app.domain.models import Evidence
+from app.domain.models import Evidence, GraphNode
 from app.domain.schemas.learning_state import LearningEvidenceRequest, LearningNodeStateView
 from app.services.learning_state import LearningStateProjector
+from app.services.mastery import MasteryService
 from app.services.memory_event_store import AppendEvent
 
 
@@ -65,6 +66,20 @@ def record_learning_evidence(
         )
         db.add(existing)
         db.flush()
+    # Same evidence drives both the legacy growth-star milestone (never
+    # decreases) and the current learning state projection, so the two views
+    # never drift. A learning node without a graph node still gets the new
+    # projection; the legacy star is skipped.
+    graph_node = db.scalar(
+        select(GraphNode).where(
+            GraphNode.id == payload.node_id,
+            GraphNode.workspace_id == context.workspace.id,
+        )
+    )
+    if graph_node is not None:
+        MasteryService(
+            db, context.workspace.id, context.principal.user_id
+        ).apply_evidence(existing, graph_node)
     state = LearningStateProjector(db).rebuild_node(
         scope, payload.node_id, head_event_id=event.event_id
     ).state
