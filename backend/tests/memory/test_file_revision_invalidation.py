@@ -365,3 +365,29 @@ def test_activation_is_scoped_to_workspace():
                 revision_id="rev-1",
                 actor_id="u1",
             )
+
+
+def test_explicit_version_query_can_read_stale_revision():
+    with SessionLocal() as db:
+        _add_file(db, file_id="file-1")
+        _add_revision(db, file_id="file-1", revision_no=1, revision_id="rev-1")
+        _add_chunk(db, chunk_id="chunk-1", file_id="file-1", revision_id="rev-1", ordinal=1, content="old")
+        file = db.get(FileRecord, "file-1")
+        file.active_revision_id = "rev-1"
+        _add_revision(db, file_id="file-1", revision_no=2, revision_id="rev-2")
+        _add_chunk(db, chunk_id="chunk-2", file_id="file-1", revision_id="rev-2", ordinal=2, content="new")
+        db.commit()
+        _service(db).activate_revision(scope(), file_id="file-1", revision_id="rev-2", actor_id="u1")
+        db.commit()
+        active_ids = list(db.scalars(
+            select(FileTextChunk.id).where(
+                FileTextChunk.workspace_id == "w1", FileTextChunk.file_id == "file-1",
+                FileTextChunk.lifecycle_status == "active",
+            ).order_by(FileTextChunk.ordinal)
+        ))
+        assert active_ids == ["chunk-2"]
+        stale_rev = db.get(DocumentRevision, "rev-1")
+        assert stale_rev is not None and stale_rev.lifecycle_status == "stale"
+        stale_chunk = db.get(FileTextChunk, "chunk-1")
+        assert stale_chunk is not None and stale_chunk.lifecycle_status == "stale"
+        assert stale_chunk.content == "old"
