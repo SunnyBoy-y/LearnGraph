@@ -239,7 +239,7 @@ export function SelectionExplanationPanel({
   const [modelSearch, setModelSearch] = useState("");
 
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
   const history = useQuery({
     queryKey: ["messages", sessionId],
     queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
@@ -424,7 +424,7 @@ export function SelectionExplanationPanel({
     setSessionId(created.id);
     const bound = bindExplanationSession(parentSessionId, record.id, created.id);
     if (bound) setRecord(bound);
-    queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+    queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
       created,
       ...(current ?? []).filter((item) => item.id !== created.id),
     ]);

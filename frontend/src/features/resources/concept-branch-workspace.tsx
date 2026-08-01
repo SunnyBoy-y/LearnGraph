@@ -27,7 +27,7 @@ export function ConceptBranchWorkspace({
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
   const [activeId, setActiveId] = useState(branchIds.at(-1) ?? "");
   const [position, setPosition] = useState({ x: 72, y: 92 });
   const dragRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);

@@ -248,7 +248,7 @@ export function DocumentChatPanel({
   const [modelSearch, setModelSearch] = useState("");
 
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
   const history = useQuery({
     queryKey: ["messages", sessionId],
     queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
@@ -488,7 +488,7 @@ export function DocumentChatPanel({
       targetSessionId = created.id;
       createdSessionRef.current = created.id;
       onSessionChange(created.id);
-      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
         created,
         ...(current ?? []).filter((item) => item.id !== created.id),
       ]);
@@ -747,7 +747,7 @@ export function DocumentChatPanel({
       targetSessionId = created.id;
       createdSessionRef.current = created.id;
       onSessionChange(created.id);
-      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
         created,
         ...(current ?? []).filter((item) => item.id !== created.id),
       ]);

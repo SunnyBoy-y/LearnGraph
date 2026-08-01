@@ -160,3 +160,55 @@ def test_selection_explanations_cleared_on_logout_401_and_account_delete() -> No
     assert on401_block.index("clearSelectionExplanations()") < on401_block.index(
         "authStore.clear()"
     )
+
+
+def test_workspace_scoped_query_keys_include_workspace_id() -> None:
+    """R-018: workspace-scoped useQuery keys must carry workspaceId to prevent
+    cross-workspace cache confusion on the same browser tab."""
+
+    workspace_shell = (
+        FRONTEND / "components" / "layout" / "workspace-shell.tsx"
+    ).read_text(encoding="utf-8")
+    # Both SidebarNav and ContextRail sessions queries include workspaceId.
+    assert 'queryKey: ["sessions", workspaceId]' in workspace_shell
+
+    chat_pages = (FRONTEND / "features" / "chat" / "chat-pages.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert 'queryKey: ["sessions", workspaceId]' in chat_pages
+
+    dashboard = (FRONTEND / "features" / "dashboard" / "dashboard-page.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert 'queryKey: ["sessions", workspaceId]' in dashboard
+
+    memory_page = (FRONTEND / "features" / "memory" / "memory-page.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert 'queryKey: [\'memory\', \'active\', workspaceId]' in memory_page
+    assert 'queryKey: [\'sessions\', workspaceId]' in memory_page
+
+    sel_panel = (
+        FRONTEND / "features" / "chat" / "selection-explanation-panel.tsx"
+    ).read_text(encoding="utf-8")
+    assert 'queryKey: ["sessions", workspaceId]' in sel_panel
+
+    doc_chat = (
+        FRONTEND / "features" / "resources" / "document-chat-panel.tsx"
+    ).read_text(encoding="utf-8")
+    assert 'queryKey: ["sessions", workspaceId]' in doc_chat
+
+    concept_branch = (
+        FRONTEND / "features" / "resources" / "concept-branch-workspace.tsx"
+    ).read_text(encoding="utf-8")
+    assert 'queryKey: ["sessions", workspaceId]' in concept_branch
+
+    # setQueryData writes to the same partitioned key, not the bare global one.
+    assert 'setQueryData(["sessions"],' not in workspace_shell
+    assert 'setQueryData<Session[]>(["sessions"],' not in workspace_shell
+    assert 'setQueryData(["sessions"],' not in chat_pages
+    assert 'setQueryData<Session[]>(["sessions"],' not in chat_pages
+    assert 'setQueryData(["sessions"],' not in sel_panel
+    assert 'setQueryData<Session[]>(["sessions"],' not in sel_panel
+    assert 'setQueryData(["sessions"],' not in doc_chat
+    assert 'setQueryData<Session[]>(["sessions"],' not in doc_chat

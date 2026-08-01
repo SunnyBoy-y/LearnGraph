@@ -93,7 +93,7 @@ export function DashboardPage() {
     queryKey: ["dashboard", workspaceId],
     queryFn: getDashboard,
   });
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
   const recentSession = sessions.data?.[0];
   const recentMessages = useQuery({
     queryKey: ["messages", recentSession?.id, "dashboard-preview"],

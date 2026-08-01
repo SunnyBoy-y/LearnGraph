@@ -2441,7 +2441,7 @@ export function ChatCanvasPage() {
     // primary bound, this is the safety net for unobserved caches.
     gcTime: 15_000,
   });
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
 
   // Reset older-page cursor state when the active session changes.
   useEffect(() => {
@@ -3909,7 +3909,7 @@ export function ChatCanvasPage() {
           defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
         );
       }
-      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
         session,
         ...(current ?? []).filter((item) => item.id !== session.id),
       ]);
@@ -3944,7 +3944,7 @@ export function ChatCanvasPage() {
       }
       const reusePromise = listSessions()
         .then((sessions) => {
-          queryClient.setQueryData(["sessions"], sessions);
+          queryClient.setQueryData(["sessions", workspaceId], sessions);
           return sessions.find((session) => session.id === existingDraftId);
         })
         .then((session) => {
@@ -4047,7 +4047,7 @@ export function ChatCanvasPage() {
               title: goal.title,
             });
         if (canReuseCurrentSession) {
-          queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+          queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
             current
               ? current.map((item) =>
                   item.id === learningSession.id ? learningSession : item,
@@ -4103,7 +4103,7 @@ export function ChatCanvasPage() {
       return closeSession(currentSession.id);
     },
     onSuccess: async (closedSession) => {
-      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
         current
           ? current.map((item) =>
               item.id === closedSession.id ? closedSession : item,
@@ -5402,7 +5402,7 @@ export function ChatCanvasPage() {
           }),
         })),
       );
-      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
         current?.map((item) =>
           item.id === sessionId
             ? {

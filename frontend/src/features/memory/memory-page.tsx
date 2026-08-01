@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, motion } from 'motion/react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import {
   Archive,
   ArrowUp,
@@ -159,26 +159,27 @@ function downloadBlob(blob: Blob): void {
 export function MemoryPage() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const { workspaceId = '' } = useParams()
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const memories = useQuery({
-    queryKey: ['memory', 'active'],
+    queryKey: ['memory', 'active', workspaceId],
     queryFn: () => listMemories({ include_content: true }),
   })
   const profile = useQuery({
     queryKey: ['memory-profile'],
     queryFn: getMemoryProfile,
   })
-  const memoryTypes = useQuery({ queryKey: ['memory', 'types'], queryFn: listMemoryTypes })
-  const goals = useQuery({ queryKey: ['goals'], queryFn: listGoals })
-  const graphs = useQuery({ queryKey: ['graphs'], queryFn: listGraphs })
+  const memoryTypes = useQuery({ queryKey: ['memory', 'types', workspaceId], queryFn: listMemoryTypes })
+  const goals = useQuery({ queryKey: ['goals', workspaceId], queryFn: listGoals })
+  const graphs = useQuery({ queryKey: ['graphs', workspaceId], queryFn: listGraphs })
   const deleted = useQuery({
-    queryKey: ['memory', 'deleted'],
+    queryKey: ['memory', 'deleted', workspaceId],
     queryFn: async () => [
       ...(await listMemories({ state: 'deleted' })),
       ...(await listMemories({ state: 'destroyed' })),
     ],
   })
-  const sessions = useQuery({ queryKey: ['sessions'], queryFn: listSessions })
+  const sessions = useQuery({ queryKey: ['sessions', workspaceId], queryFn: listSessions })
   const operator = useQuery({ queryKey: ['current-user'], queryFn: getCurrentUser })
 
   const refreshMemory = async () => {

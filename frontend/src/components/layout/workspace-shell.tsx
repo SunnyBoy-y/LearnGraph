@@ -508,7 +508,7 @@ function SidebarNav({
     queryFn: () => listProjects(true),
   });
   const sessionsQuery = useQuery({
-    queryKey: ["sessions"],
+    queryKey: ["sessions", workspaceId],
     queryFn: listSessions,
   });
   const settingsQuery = useQuery({
@@ -709,7 +709,7 @@ function SidebarNav({
       const session = (event as CustomEvent<{ session?: Session }>).detail
         ?.session;
       if (!session) return;
-      queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
         session,
         ...(current ?? []).filter((item) => item.id !== session.id),
       ]);
@@ -918,7 +918,7 @@ function SidebarNav({
             defaultComposerPrefsForResponseMode(resolvedMode),
           );
         }
-        queryClient.setQueryData<Session[]>(["sessions"], (current) => [
+        queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
           session,
           ...(current ?? []).filter((item) => item.id !== session.id),
         ]);
@@ -1469,7 +1469,7 @@ function SidebarNav({
     try {
       const updated = await updateSession(session.id, { title: nextTitle });
       patchSidebarSession(session.id, { title: updated.title });
-      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
         current?.map((item) => (item.id === updated.id ? updated : item)),
       );
       toast.success("会话名称已更新");
@@ -1484,7 +1484,7 @@ function SidebarNav({
     try {
       const updated = await updateSession(session.id, { pinned: !session.pinned });
       patchSidebarSession(session.id, { pinned: updated.pinned });
-      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
         current?.map((item) => (item.id === updated.id ? updated : item)),
       );
       toast.success(updated.pinned ? "会话已置顶" : "已取消置顶");
@@ -3059,7 +3059,7 @@ function ContextRail({
     queryFn: () => listProjects(),
   });
   const railSessions = useQuery({
-    queryKey: ["sessions"],
+    queryKey: ["sessions", workspaceId],
     queryFn: listSessions,
   });
   const isSettings = pathname.includes("/settings/");
