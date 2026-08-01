@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.api.routers import (
+    artifact_gateway,
     audit_settings,
     auth,
     chat,
@@ -33,6 +34,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 for router in (
     health.router,
+    artifact_gateway.router,
     auth.router,
     dashboard.router,
     goals.router,

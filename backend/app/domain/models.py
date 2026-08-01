@@ -1696,6 +1696,70 @@ class CapabilityGrant(Base, TimestampMixin, WorkspaceScopedMixin):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class Artifact(Base, TimestampMixin):
+    """Tenant-visible logical collection of immutable published outputs."""
+
+    __tablename__ = "artifacts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    workspace_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_by: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(240))
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+
+
+class ArtifactVersion(Base, TimestampMixin):
+    """Immutable snapshot of one FileRecord published as an artifact output."""
+
+    __tablename__ = "artifact_versions"
+    __table_args__ = (
+        UniqueConstraint("artifact_id", "version", name="uq_artifact_version"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    file_id: Mapped[str] = mapped_column(
+        ForeignKey("files.id", ondelete="RESTRICT"), index=True
+    )
+    original_name: Mapped[str] = mapped_column(String(255))
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    mime_type: Mapped[str] = mapped_column(String(160))
+    source_workspace_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_chat_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    published_by: Mapped[str] = mapped_column(String(64))
+    release_notes: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="published", index=True)
+
+
+class ArtifactShareToken(Base, TimestampMixin):
+    """Revocable, read-only token scoped to one immutable artifact version."""
+
+    __tablename__ = "artifact_share_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_artifact_share_token_hash"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    artifact_version_id: Mapped[str] = mapped_column(
+        ForeignKey("artifact_versions.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(64))
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    token_prefix: Mapped[str] = mapped_column(String(16))
+    label: Mapped[str] = mapped_column(String(120), default="")
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    max_downloads: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    download_count: Mapped[int] = mapped_column(Integer, default=0)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+
 class ProviderSecret(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "provider_secrets"
     provider_id: Mapped[str] = mapped_column(
