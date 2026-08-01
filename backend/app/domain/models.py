@@ -1660,6 +1660,42 @@ class SandboxDestructiveGrant(Base, TimestampMixin, WorkspaceScopedMixin):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class CapabilityGrant(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Generic capability grant for any action type and resource.
+
+    Extends the delete-only SandboxDestructiveGrant pattern to arbitrary
+    actions (host write, GitHub push, API egress, device capability, etc.).
+    Old SandboxDestructiveGrant rows remain valid for their existing API.
+    """
+
+    __tablename__ = "capability_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    resources: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    chat_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    sandbox_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sandbox_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    command_intent_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    session_origin: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    agent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    single_use: Mapped[bool] = mapped_column(default=True)
+    usage_limit: Mapped[int] = mapped_column(default=1)
+    usage_count: Mapped[int] = mapped_column(default=0)
+    granted_by: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ProviderSecret(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "provider_secrets"
     provider_id: Mapped[str] = mapped_column(

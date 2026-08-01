@@ -12,7 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.models import SandboxDestructiveGrant, new_id, utc_now
+from app.domain.models import CapabilityGrant, SandboxDestructiveGrant, new_id, utc_now
 from app.providers.remote.sandbox import (
     DESTRUCTIVE_COMMANDS,
     SandboxCapabilityMismatch,
@@ -393,3 +393,113 @@ class SandboxAuthorizationService:
                 },
             )
         return intent
+
+    # ---- Generic capability grant (P1) ----
+
+    def create_capability_grant(
+        self,
+        *,
+        action: str,
+        resources: dict[str, Any] | None = None,
+        chat_session_id: str | None = None,
+        sandbox_session_id: str | None = None,
+        command_intent_digest: str | None = None,
+        session_origin: str | None = None,
+        agent_id: str | None = None,
+        single_use: bool = True,
+        ttl_seconds: int = DEFAULT_GRANT_TTL_SECONDS,
+        reason: str = "",
+    ) -> CapabilityGrant:
+        ttl = max(60, min(ttl_seconds, 24 * 3600))
+        record = CapabilityGrant(
+            id=new_id(),
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            action=action,
+            resources=resources or {},
+            chat_session_id=chat_session_id,
+            sandbox_session_id=sandbox_session_id,
+            command_intent_digest=command_intent_digest,
+            session_origin=session_origin,
+            agent_id=agent_id,
+            status="active",
+            single_use=single_use,
+            granted_by=self.actor_id,
+            expires_at=utc_now() + timedelta(seconds=ttl),
+            reason=reason[:500],
+        )
+        self.db.add(record)
+        self.db.flush()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="capability.granted",
+            resource_type="capability_grant",
+            resource_id=record.id,
+            details={
+                "action": action,
+                "resources": resources,
+                "ttl_seconds": ttl,
+                "single_use": single_use,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(record)
+        return record
+
+    def consume_capability_grant(
+        self,
+        grant_id: str,
+    ) -> CapabilityGrant | None:
+        """Atomically consume a single-use grant.  Returns the grant or None."""
+        now = utc_now()
+        grant = self.db.scalar(
+            select(CapabilityGrant).where(
+                CapabilityGrant.id == grant_id,
+                CapabilityGrant.workspace_id == self.workspace_id,
+                CapabilityGrant.owner_user_id == self.actor_id,
+                CapabilityGrant.status == "active",
+                CapabilityGrant.expires_at > now,
+                CapabilityGrant.consumed_at.is_(None),
+            )
+        )
+        if grant is None:
+            return None
+        if grant.single_use:
+            grant.status = "consumed"
+            grant.consumed_at = now
+        else:
+            grant.usage_count = CapabilityGrant.usage_count + 1
+            if grant.usage_count >= grant.usage_limit:
+                grant.status = "consumed"
+                grant.consumed_at = now
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="capability.consumed",
+            resource_type="capability_grant",
+            resource_id=grant.id,
+            details={"usage_count": grant.usage_count},
+        )
+        self.db.commit()
+        return grant
+
+    def revoke_capability_grant(self, grant_id: str) -> CapabilityGrant:
+        record = self.db.scalar(
+            select(CapabilityGrant).where(
+                CapabilityGrant.id == grant_id,
+                CapabilityGrant.workspace_id == self.workspace_id,
+                CapabilityGrant.owner_user_id == self.actor_id,
+            )
+        )
+        if record is None:
+            raise AppError(404, "capability_grant_not_found", "Capability grant was not found")
+        record.status = "revoked"
+        record.revoked_at = utc_now()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="capability.revoked",
+            resource_type="capability_grant",
+            resource_id=record.id,
+        )
+        self.db.commit()
+        self.db.refresh(record)
+        return record
