@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -65,7 +65,7 @@ class LearningStateProjector:
         else:
             status = "learning"
         now = utc_now()
-        if last_assessed is not None and (now - last_assessed).days >= 14 and status in {"mastered", "familiar"}:
+        if last_assessed is not None and (now - last_assessed.replace(tzinfo=timezone.utc)).days >= 14 and status in {"mastered", "familiar"}:
             status = "needs_review"
         state = self.db.scalar(
             select(LearningNodeState).where(
@@ -82,6 +82,7 @@ class LearningStateProjector:
                 subject_user_id=scope.principal_user_id,
                 workspace_id=scope.workspace_id,
                 knowledge_node_id=knowledge_node_id,
+                stream_version=0,
                 head_event_id=head_event_id,
             )
             self.db.add(state)
