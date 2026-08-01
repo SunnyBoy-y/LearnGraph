@@ -51,6 +51,41 @@ class TaskStateView(BaseModel):
     updated_at: datetime
 
 
+class TaskStatePatchCandidate(BaseModel):
+    """Incremental patch an LLM/agent may propose for a task state.
+
+    Every field is a delta, never an authoritative snapshot. The server validates
+    the proposal against the state machine and the current projection, then
+    applies it via deterministic events. A proposer cannot write authoritative
+    fields directly or force an illegal status transition.
+    """
+
+    proposed_status: Literal[
+        "planned", "in_progress", "blocked", "paused", "completed", "cancelled", "superseded"
+    ] | None = None
+    current_stage: str | None = Field(default=None, max_length=120)
+    completed_add: list[dict[str, Any]] = Field(default_factory=list)
+    pending_add: list[dict[str, Any]] = Field(default_factory=list)
+    pending_remove: list[str] = Field(default_factory=list)
+    constraints_add: list[dict[str, Any]] = Field(default_factory=list)
+    # ``blocked_by_add`` models a planned step that failed and is now blocked on
+    # a dependency. When the proposer leaves ``proposed_status`` blank the server
+    # still records the failure observably: it pushes the task to ``blocked``
+    # (if the state machine permits) so a ``task.blocked`` event is emitted
+    # instead of collapsing the failure into an opaque ``task.stage_changed``.
+    blocked_by_add: list[dict[str, Any]] = Field(default_factory=list)
+    decisions_add: list[dict[str, Any]] = Field(default_factory=list)
+    next_action: str | None = Field(default=None, max_length=10_000)
+
+
+class TaskStatePatchRequest(BaseModel):
+    """Envelope for a proposed patch; carries the CAS expected version."""
+
+    expected_stream_version: int = Field(ge=0)
+    candidate: TaskStatePatchCandidate
+    idempotency_key: str = Field(min_length=8, max_length=160)
+
+
 class EpisodeGenerateRequest(BaseModel):
     conversation_id: str = Field(min_length=1, max_length=64)
     task_id: str | None = Field(default=None, max_length=64)

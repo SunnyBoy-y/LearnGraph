@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 _SCRATCH = Path(tempfile.mkdtemp(prefix="lg-task-tests-"))
 os.environ["LEARNGRAPH_DATABASE_URL"] = f"sqlite:///{(_SCRATCH / 'tasks.db').as_posix()}"
@@ -16,11 +17,15 @@ from app.core.database import Base, SessionLocal, engine  # noqa: E402
 from app.core.migrations import apply_schema_migrations  # noqa: E402
 from app.core.errors import AppError  # noqa: E402
 from app.domain import memory_event_models, models  # noqa: E402,F401
-from app.domain.memory_event_models import MemoryScopeContext  # noqa: E402
+from app.domain.memory_event_models import MemoryScopeContext, MemoryTaskState  # noqa: E402
+from app.domain.memory_event_types import MemoryEventType  # noqa: E402
 from app.domain.schemas.memory_tasks import (  # noqa: E402
     TaskStateCreateRequest,
+    TaskStatePatchCandidate,
+    TaskStatePatchRequest,
     TaskStateUpdateRequest,
 )
+from app.repositories.memory_events import MemoryEventRepository  # noqa: E402
 from app.services.memory_crypto import MemoryPayloadCipher  # noqa: E402
 from app.services.memory_event_store import MemoryEventStore  # noqa: E402
 from app.services.memory_tasks import (  # noqa: E402
@@ -392,3 +397,301 @@ def test_stage_update_without_status_change():
         assert updated.next_action == "review PR"
         assert len(updated.decisions) == 1
         assert updated.status == "planned"  # unchanged
+
+
+# ── LLM patch candidate pipeline ──────────────────────────────────────────────
+
+
+def _patch(
+    svc: MemoryTaskService,
+    task_id: str,
+    *,
+    expected_version: int,
+    candidate: dict,
+    idem: str,
+    scope_override: MemoryScopeContext | None = None,
+):
+    return svc.apply_patch(
+        scope_override or scope(),
+        "u1",
+        task_id,
+        TaskStatePatchRequest(
+            expected_stream_version=expected_version,
+            candidate=TaskStatePatchCandidate(**candidate),
+            idempotency_key=idem,
+        ),
+    )
+
+
+def _stream_events(db, task_id: str) -> list:
+    state = db.scalar(
+        select(MemoryTaskState).where(MemoryTaskState.id == task_id)
+    )
+    assert state is not None
+    return MemoryEventRepository(db).stream_events(scope(), state.stream_id)
+
+
+def test_patch_merges_incremental_deltas():
+    """Patch adds completed/pending/next_action without replacing existing lists."""
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-merge")
+        svc = _service(db)
+        updated = _patch(
+            svc,
+            "task-patch-merge",
+            expected_version=view.stream_version,
+            candidate={
+                "proposed_status": "in_progress",
+                "current_stage": "implementing",
+                "completed_add": [{"step": "design schema"}],
+                "pending_add": [{"step": "write code"}, {"step": "run tests"}],
+                "next_action": "implement memory_tasks",
+            },
+            idem="patch-merge-1",
+        )
+        assert updated.status == "in_progress"
+        assert updated.current_stage == "implementing"
+        assert [c["step"] for c in updated.completed] == ["design schema"]
+        assert [p["step"] for p in updated.pending] == ["write code", "run tests"]
+        assert updated.next_action == "implement memory_tasks"
+
+        # Second patch is additive: existing completed/pending are preserved.
+        updated2 = _patch(
+            svc,
+            "task-patch-merge",
+            expected_version=updated.stream_version,
+            candidate={
+                "completed_add": [{"step": "write code"}],
+                "pending_add": [{"step": "refactor"}],
+            },
+            idem="patch-merge-2",
+        )
+        assert [c["step"] for c in updated2.completed] == ["design schema", "write code"]
+        assert [p["step"] for p in updated2.pending] == ["run tests", "refactor"]
+
+
+def test_patch_pending_remove_by_title():
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-remove")
+        svc = _service(db)
+        view = _patch(
+            svc,
+            "task-patch-remove",
+            expected_version=view.stream_version,
+            candidate={"pending_add": [{"step": "obsolete step"}]},
+            idem="patch-remove-1",
+        )
+        updated = _patch(
+            svc,
+            "task-patch-remove",
+            expected_version=view.stream_version,
+            candidate={"pending_remove": ["obsolete step"]},
+            idem="patch-remove-2",
+        )
+        assert updated.pending == []
+
+
+def test_patch_pending_remove_not_found_raises_422():
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-missing")
+        svc = _service(db)
+        with pytest.raises(AppError) as exc_info:
+            _patch(
+                svc,
+                "task-patch-missing",
+                expected_version=view.stream_version,
+                candidate={"pending_remove": ["does-not-exist"]},
+                idem="patch-missing-1",
+            )
+        assert exc_info.value.code == "memory_task_pending_not_found"
+
+
+def test_patch_illegal_transition_raises_409():
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-legal")
+        svc = _service(db)
+        _patch(
+            svc,
+            "task-patch-legal",
+            expected_version=view.stream_version,
+            candidate={"proposed_status": "completed"},
+            idem="patch-legal-1",
+        )
+        completed = _patch(
+            svc,
+            "task-patch-legal",
+            expected_version=view.stream_version + 1,
+            candidate={"proposed_status": "completed"},
+            idem="patch-legal-2",
+        )
+        with pytest.raises(AppError) as exc_info:
+            _patch(
+                svc,
+                "task-patch-legal",
+                expected_version=completed.stream_version,
+                candidate={"proposed_status": "in_progress"},
+                idem="patch-legal-3",
+            )
+        assert exc_info.value.code == "memory_task_invalid_transition"
+
+
+def test_patch_cas_conflict_on_stale_version():
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-cas")
+        svc = _service(db)
+        _patch(
+            svc,
+            "task-patch-cas",
+            expected_version=view.stream_version,
+            candidate={"proposed_status": "in_progress"},
+            idem="patch-cas-1",
+        )
+        with pytest.raises(AppError) as exc_info:
+            _patch(
+                svc,
+                "task-patch-cas",
+                expected_version=view.stream_version,  # stale
+                candidate={"proposed_status": "blocked"},
+                idem="patch-cas-2",
+            )
+        assert exc_info.value.code == "memory_stream_version_conflict"
+
+
+def test_patch_scope_isolation():
+    with SessionLocal() as db:
+        _create_task(db, task_id="task-patch-scope", scope_override=scope(workspace="w1"))
+        svc = _service(db)
+        with pytest.raises(AppError) as exc_info:
+            _patch(
+                svc,
+                "task-patch-scope",
+                expected_version=0,
+                candidate={"proposed_status": "in_progress"},
+                idem="patch-scope-1",
+                scope_override=scope(workspace="w2"),
+            )
+        assert exc_info.value.code == "memory_task_not_found"
+
+
+def test_patch_idempotent_replay_returns_same():
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-idem")
+        svc = _service(db)
+        first = _patch(
+            svc,
+            "task-patch-idem",
+            expected_version=view.stream_version,
+            candidate={"pending_add": [{"step": "x"}]},
+            idem="patch-idem-key",
+        )
+        second = _patch(
+            svc,
+            "task-patch-idem",
+            expected_version=view.stream_version,
+            candidate={"pending_add": [{"step": "x"}]},
+            idem="patch-idem-key",
+        )
+        assert first.stream_version == second.stream_version
+        assert first.pending == second.pending
+
+
+def test_patch_completed_add_emits_step_completed_event():
+    """completed_add must emit a dedicated task.step_completed event."""
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-steps")
+        svc = _service(db)
+        _patch(
+            svc,
+            "task-patch-steps",
+            expected_version=view.stream_version,
+            candidate={
+                "proposed_status": "in_progress",
+                "completed_add": [{"step": "design"}],
+            },
+            idem="patch-steps-1",
+        )
+        events = _stream_events(db, "task-patch-steps")
+        event_types = [e.event_type for e in events]
+        assert MemoryEventType.TASK_STEP_COMPLETED in event_types
+        assert MemoryEventType.TASK_RESUMED in event_types  # planned -> in_progress
+
+
+def test_patch_without_status_change_emits_stage_event():
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-stage")
+        svc = _service(db)
+        _patch(
+            svc,
+            "task-patch-stage",
+            expected_version=view.stream_version,
+            candidate={"current_stage": "planning"},
+            idem="patch-stage-1",
+        )
+        events = _stream_events(db, "task-patch-stage")
+        event_types = [e.event_type for e in events]
+        # create + stage change; no status event since status stayed "planned"
+        assert MemoryEventType.TASK_STAGE_CHANGED in event_types
+
+
+def test_patch_blocked_by_add_without_status_pushes_to_blocked():
+    """A failed planned step (blocked_by_add, no explicit status) must push an
+    in_progress task to ``blocked`` and emit a dedicated task.blocked event
+    rather than collapsing the failure into an opaque stage change."""
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-block")
+        svc = _service(db)
+        # Move into in_progress first so blocked is a legal transition.
+        view = _patch(
+            svc,
+            "task-patch-block",
+            expected_version=view.stream_version,
+            candidate={"proposed_status": "in_progress"},
+            idem="patch-block-start",
+        )
+        updated = _patch(
+            svc,
+            "task-patch-block",
+            expected_version=view.stream_version,
+            candidate={"blocked_by_add": [{"task": "missing dependency"}]},
+            idem="patch-block-fail",
+        )
+        assert updated.status == "blocked"
+        assert [b["task"] for b in updated.blocked_by] == ["missing dependency"]
+        events = _stream_events(db, "task-patch-block")
+        event_types = [e.event_type for e in events]
+        assert MemoryEventType.TASK_BLOCKED in event_types
+
+
+def test_patch_blocked_by_add_from_paused_stays_stage_changed():
+    """A paused task cannot legally move to blocked, so blockers are recorded
+    via stage_changed without an illegal status transition."""
+    with SessionLocal() as db:
+        view = _create_task(db, task_id="task-patch-pause")
+        svc = _service(db)
+        view = _patch(
+            svc,
+            "task-patch-pause",
+            expected_version=view.stream_version,
+            candidate={"proposed_status": "in_progress"},
+            idem="patch-pause-start",
+        )
+        view = _patch(
+            svc,
+            "task-patch-pause",
+            expected_version=view.stream_version,
+            candidate={"proposed_status": "paused"},
+            idem="patch-pause-pause",
+        )
+        updated = _patch(
+            svc,
+            "task-patch-pause",
+            expected_version=view.stream_version,
+            candidate={"blocked_by_add": [{"task": "external wait"}]},
+            idem="patch-pause-block",
+        )
+        # paused -> blocked is illegal; status stays paused, no TASK_BLOCKED event
+        assert updated.status == "paused"
+        assert [b["task"] for b in updated.blocked_by] == ["external wait"]
+        events = _stream_events(db, "task-patch-pause")
+        event_types = [e.event_type for e in events]
+        assert MemoryEventType.TASK_BLOCKED not in event_types

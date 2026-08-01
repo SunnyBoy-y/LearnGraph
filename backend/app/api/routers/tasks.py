@@ -6,6 +6,7 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.api.memory_deps import event_store, memory_scope
 from app.domain.schemas.memory_tasks import (
     TaskStateCreateRequest,
+    TaskStatePatchRequest,
     TaskStateUpdateRequest,
     TaskStateView,
 )
@@ -47,6 +48,23 @@ def update_task_state(
     settings: AppSettings,
 ) -> TaskStateView:
     return MemoryTaskService(db, event_store(db, settings)).update(
+        memory_scope(context, task_id=task_id),
+        context.principal.user_id,
+        task_id,
+        payload,
+    )
+
+
+@router.post("/{task_id}/patch", response_model=TaskStateView)
+def patch_task_state(
+    task_id: str,
+    payload: TaskStatePatchRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> TaskStateView:
+    """Apply a validated LLM/agent patch candidate via deterministic events."""
+    return MemoryTaskService(db, event_store(db, settings)).apply_patch(
         memory_scope(context, task_id=task_id),
         context.principal.user_id,
         task_id,

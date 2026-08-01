@@ -38,6 +38,8 @@ class MemoryEventType(StrEnum):
     STRATEGY_CANDIDATE_CREATED = "strategy.candidate_created"
     STRATEGY_VERIFIED = "strategy.verified"
     STRATEGY_DEGRADED = "strategy.degraded"
+    STRATEGY_DEPRECATED = "strategy.deprecated"
+    STRATEGY_DISPUTED = "strategy.disputed"
 
 
 CURRENT_EVENT_SCHEMA_VERSIONS: dict[str, int] = {

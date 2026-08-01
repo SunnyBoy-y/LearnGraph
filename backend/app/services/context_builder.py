@@ -45,7 +45,6 @@ class ContextBuilder:
         self, scope: MemoryScopeContext, request: ContextBuildRequest
     ) -> BuiltContext:
         routed = self.router.route(scope, request.query)
-        task = self._task(scope, request.task_id)
         episodes = self._episodes(scope, request.conversation_id)
         learning = self._learning(scope)
         strategies = self._strategies(scope)
@@ -67,8 +66,9 @@ class ContextBuilder:
             for item in routed.retrieval.candidates
         ]
         sections: list[tuple[str, str, Any]] = []
-        if task is not None:
-            sections.append(("task_state", json.dumps(task, ensure_ascii=False, sort_keys=True), task))
+        task_view = self._task(scope, request.task_id)
+        if task_view is not None:
+            sections.append(("task_state", json.dumps(task_view, ensure_ascii=False, sort_keys=True), task_view))
         if evidence:
             blocks = [
                 {
@@ -101,14 +101,37 @@ class ContextBuilder:
         excluded = dict(routed.retrieval.excluded)
         excluded.setdefault("budget", 0)
         section_tokens: dict[str, int] = {}
-        for name, serialized, raw in sections:
+
+        def _try_section(name: str, serialized: str, raw: Any) -> bool:
+            nonlocal used
             cost = estimate_tokens(serialized)
             if used + cost > request.token_budget:
                 excluded["budget"] += len(raw) if isinstance(raw, list) else 1
-                continue
+                return False
             selected_sections.append((name, serialized, raw))
             section_tokens[name] = cost
             used += cost
+            return True
+
+        for name, serialized, raw in sections:
+            if name == "task_state" and raw is not None:
+                # Cross-session continuity depends on the task state above all
+                # else (plan §4.3 "继续上次"). Reserve priority for it: if the
+                # full snapshot does not fit, degrade to a compact form that
+                # keeps the resumption-critical fields (status / stage / pending
+                # / completed / next_action) and drops the bulky goal /
+                # constraints / decisions. Only if even the compact form
+                # overflows is the section counted as excluded.
+                if _try_section(name, serialized, raw):
+                    continue
+                compact = self._compact_task(raw)
+                compact_serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+                if _try_section(name, compact_serialized, compact):
+                    task_view = compact
+                    continue
+                task_view = None
+                continue
+            _try_section(name, serialized, raw)
         prompt_block = "\n\n".join(
             [header]
             + [f"<HOST_DATA_BLOCK kind={name}>\n{serialized}\n</HOST_DATA_BLOCK>" for name, serialized, _ in selected_sections]
@@ -140,7 +163,7 @@ class ContextBuilder:
         view = ContextBuildView(
             context_build_id=context_build_id,
             trace_id=routed.trace_id,
-            task_state=task,
+            task_state=task_view,
             memories=evidence if any(name == "memories" for name, _, _ in selected_sections) else [],
             episodes=episodes if any(name == "episodes" for name, _, _ in selected_sections) else [],
             learning_states=learning if any(name == "learning_states" for name, _, _ in selected_sections) else [],
@@ -175,10 +198,36 @@ class ContextBuilder:
             "goal": row.goal,
             "status": row.status,
             "current_stage": row.current_stage,
-            "next_action": row.next_action,
+            "completed": row.completed_json,
+            "pending": row.pending_json,
             "constraints": row.constraints_json,
             "decisions": row.decisions_json,
+            "blocked_by": row.blocked_by_json,
+            "next_action": row.next_action,
             "stream_version": row.stream_version,
+        }
+
+    @staticmethod
+    def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
+        """Resumption-critical subset of a task snapshot used under budget pressure.
+
+        Cross-session continuation (plan §4.3 "继续上次") needs the status, the
+        current stage, the done/todo step lists, and the next action above all
+        else. The longer prose (``goal``), the bullying-but-rarely-resumption-
+        critical ``constraints`` / ``decisions`` are dropped first when the
+        full snapshot overflows the budget. ``blocked_by`` is kept because it
+        is small and explains why a task is stuck.
+        """
+        return {
+            "task_id": task.get("task_id"),
+            "title": task.get("title"),
+            "status": task.get("status"),
+            "current_stage": task.get("current_stage"),
+            "completed": task.get("completed") or [],
+            "pending": task.get("pending") or [],
+            "blocked_by": task.get("blocked_by") or [],
+            "next_action": task.get("next_action"),
+            "stream_version": task.get("stream_version"),
         }
 
     def _episodes(self, scope: MemoryScopeContext, conversation_id: str | None) -> list[dict[str, Any]]:
