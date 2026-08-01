@@ -247,3 +247,16 @@ def test_sandbox_quota_limits_file_and_directory_count() -> None:
     assert "sandbox_file_count" in config
     assert "sandbox_directory_count" in config
     assert "sandbox_snapshot_reserve_bytes" in config
+
+
+def test_selection_explanations_has_settings_page_clear_button() -> None:
+    """R-017: the settings page must provide a 'clear learning traces on this
+    device' button that calls clearSelectionExplanations."""
+
+    personalization = (
+        FRONTEND / "features" / "settings" / "personalization-page.tsx"
+    ).read_text(encoding="utf-8")
+    assert "清除本设备学习痕迹" in personalization
+    assert "clearSelectionExplanations" in personalization
+    assert "清除记录" in personalization
+    assert "variant=\"destructive\"" in personalization

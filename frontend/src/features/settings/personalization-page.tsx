@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Palette, RotateCcw, Sparkles } from "lucide-react";
+import { Palette, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { listSettings, updateSetting } from "@/api";
+import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
 import {
   ErrorState,
   LoadingState,
@@ -228,6 +229,32 @@ export function PersonalizationPage() {
               保存后立即作用于本工作区后续的学习对话（含重试）。自动标题、问题建议与结构化
               JSON 生成任务不受人格设置影响。若对话中明确要求某种语气或格式，以当前请求为准。
             </p>
+          </div>
+        </div>
+      </Surface>
+
+      <Surface className="mt-5 p-5">
+        <div className="flex items-start gap-3">
+          <Trash2 className="mt-0.5 size-5 shrink-0 text-destructive" />
+          <div className="min-w-0 text-sm leading-6 text-muted-foreground">
+            <p className="font-medium text-foreground">清除本设备学习痕迹</p>
+            <p className="mt-1">
+              划词解释记录（选中文本及上下文）保存在浏览器本地，按当前登录账户和工作区隔离。
+              点击下方按钮将清除本账户在本设备上的所有划词历史记录，此操作不可撤销。
+            </p>
+            <Button
+              className="mt-3"
+              onClick={() => {
+                clearSelectionExplanations();
+                toast.success("已清除本设备上的划词学习痕迹");
+              }}
+              size="sm"
+              type="button"
+              variant="destructive"
+            >
+              <Trash2 className="size-4" />
+              清除记录
+            </Button>
           </div>
         </div>
       </Surface>
