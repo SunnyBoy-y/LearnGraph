@@ -8,6 +8,8 @@ from typing import Annotated
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+DEPLOYMENT_PROFILES = frozenset({"personal_desktop", "self_hosted_team", "cloud_saas"})
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -16,6 +18,12 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    # Deployment profile sets default listen host, CORS policy, and sandbox
+    # configurability.  personal_desktop is the single-user local default;
+    # self_hosted_team relaxes the listen address; cloud_saas expects a
+    # managed TLS termination / reverse proxy in front.
+    deployment_profile: str = "personal_desktop"
 
     env: str = "development"
     database_url: str = "sqlite:///./data/learngraph.db"
@@ -196,6 +204,37 @@ class Settings(BaseSettings):
         if not 1 <= value <= 64:
             raise ValueError("Sandbox Agent command argument limit must be between 1 and 64")
         return value
+
+    @field_validator("deployment_profile", mode="before")
+    @classmethod
+    def validate_deployment_profile(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in DEPLOYMENT_PROFILES:
+            raise ValueError(
+                f"Deployment profile must be one of {sorted(DEPLOYMENT_PROFILES)}"
+            )
+        return normalized
+
+    @property
+    def profile_listen_host(self) -> str:
+        """Return the safe default listen host for the active deployment profile."""
+        if self.deployment_profile == "personal_desktop":
+            return "127.0.0.1"
+        return "0.0.0.0"
+
+    def profile_validate(self) -> list[str]:
+        """Check for conflicting deployment profile settings.  Returns a list of
+        human-readable warnings; an empty list means the profile is consistent."""
+        warnings: list[str] = []
+        if self.deployment_profile == "personal_desktop":
+            if self.cors_origins and any("0.0.0.0" in o for o in self.cors_origins):
+                warnings.append("personal_desktop: CORS origins should not contain 0.0.0.0")
+        if self.deployment_profile in ("self_hosted_team", "cloud_saas"):
+            if self.sandbox_enabled and self.sandbox_backend != "docker":
+                warnings.append(
+                    f"{self.deployment_profile}: sandbox_backend must be 'docker'"
+                )
+        return warnings
 
 
 @lru_cache

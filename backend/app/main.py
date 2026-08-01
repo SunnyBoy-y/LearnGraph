@@ -27,6 +27,13 @@ async def lifespan(_: FastAPI):
     settings.storage_root.mkdir(parents=True, exist_ok=True)
     settings.memory_root.mkdir(parents=True, exist_ok=True)
     init_database()
+    _profile_warnings = settings.profile_validate()
+    if _profile_warnings:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Deployment profile conflicts detected:\n  %s",
+            "\n  ".join(_profile_warnings),
+        )
     ensure_demo_data()
     mark_interrupted_document_jobs()
     mark_interrupted_message_streams()
