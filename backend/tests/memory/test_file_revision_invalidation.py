@@ -17,6 +17,7 @@ from app.core.database import Base, SessionLocal, engine  # noqa: E402
 from app.core.migrations import apply_schema_migrations  # noqa: E402
 from app.domain import memory_event_models, models  # noqa: E402,F401
 from app.domain.memory_event_models import (  # noqa: E402
+    ConversationEpisode,
     MemoryEvent,
     MemoryScopeContext,
     MemoryStream,
@@ -26,7 +27,11 @@ from app.domain.models import (  # noqa: E402
     DocumentRevision,
     FileRecord,
     FileTextChunk,
+    MemoryEmbedding,
     MemoryEvidence,
+    MemoryRecord,
+    RetrievalHit,
+    RetrievalTrace,
     new_id,
 )
 from app.services.memory_crypto import MemoryPayloadCipher  # noqa: E402
@@ -161,6 +166,35 @@ def _events(db) -> list[MemoryEvent]:
     return list(db.scalars(select(MemoryEvent).order_by(MemoryEvent.global_position)))
 
 
+def _add_retrieval_hit(
+    db,
+    *,
+    trace_id: str,
+    chunk_id: str,
+    rank: int = 1,
+    used_in_context: bool = True,
+) -> RetrievalHit:
+    trace = RetrievalTrace(
+        id=trace_id,
+        workspace_id="w1",
+        actor_id="u1",
+        query_hash=f"query-{trace_id}",
+    )
+    db.add(trace)
+    db.flush()
+    hit = RetrievalHit(
+        workspace_id="w1",
+        trace_id=trace.id,
+        chunk_id=chunk_id,
+        rank=rank,
+        score=1.0,
+        used_in_context=used_in_context,
+    )
+    db.add(hit)
+    db.flush()
+    return hit
+
+
 # ── Activation ────────────────────────────────────────────────────────────────
 
 def test_activation_stales_old_revision_and_chunks_and_emits_event():
@@ -292,6 +326,123 @@ def test_default_retrieval_excludes_stale_chunks():
             ).scalar()
             assert stale_fts == 0
             assert active_fts >= 1
+
+
+# ── Derived-cache invalidation ─────────────────────────────────────────────────
+
+
+def test_activation_clears_context_use_for_stale_chunk_but_keeps_active_chunk():
+    with SessionLocal() as db:
+        _add_file(db, file_id="file-1")
+        _add_revision(db, file_id="file-1", revision_no=1, revision_id="rev-1")
+        _add_chunk(db, chunk_id="chunk-1", file_id="file-1", revision_id="rev-1", ordinal=1, content="old")
+        file = db.get(FileRecord, "file-1")
+        file.active_revision_id = "rev-1"
+        _add_revision(db, file_id="file-1", revision_no=2, revision_id="rev-2")
+        _add_chunk(db, chunk_id="chunk-2", file_id="file-1", revision_id="rev-2", ordinal=2, content="new")
+        stale_hit = _add_retrieval_hit(db, trace_id="trace-stale", chunk_id="chunk-1")
+        active_hit = _add_retrieval_hit(db, trace_id="trace-active", chunk_id="chunk-2")
+        db.commit()
+
+        report = _service(db).activate_revision(
+            scope(), file_id="file-1", revision_id="rev-2", actor_id="u1"
+        )
+        db.commit()
+
+        assert report.invalidated_retrieval_hits == 1
+        assert db.get(RetrievalHit, stale_hit.id).used_in_context is False
+        assert db.get(RetrievalHit, active_hit.id).used_in_context is True
+
+
+def test_explicit_invalidation_clears_context_use_for_revision_chunks():
+    with SessionLocal() as db:
+        _add_file(db, file_id="file-1")
+        _add_revision(db, file_id="file-1", revision_no=1, revision_id="rev-1")
+        _add_chunk(db, chunk_id="chunk-1", file_id="file-1", revision_id="rev-1", ordinal=1, content="old")
+        hit = _add_retrieval_hit(db, trace_id="trace-1", chunk_id="chunk-1")
+        db.commit()
+
+        _service(db).invalidate_revision(
+            scope(), file_id="file-1", revision_id="rev-1", actor_id="u1"
+        )
+        db.commit()
+
+        assert db.get(RetrievalHit, hit.id).used_in_context is False
+
+
+def test_activation_leaves_episode_projection_intact_when_its_sources_are_messages():
+    with SessionLocal() as db:
+        _add_file(db, file_id="file-1")
+        _add_revision(db, file_id="file-1", revision_no=1, revision_id="rev-1")
+        _add_chunk(db, chunk_id="chunk-1", file_id="file-1", revision_id="rev-1", ordinal=1, content="old")
+        file = db.get(FileRecord, "file-1")
+        file.active_revision_id = "rev-1"
+        _add_revision(db, file_id="file-1", revision_no=2, revision_id="rev-2")
+        _add_chunk(db, chunk_id="chunk-2", file_id="file-1", revision_id="rev-2", ordinal=2, content="new")
+        episode = ConversationEpisode(
+            id="episode-1",
+            stream_id="episode-stream-1",
+            tenant_id="t1",
+            subject_user_id="u1",
+            workspace_id="w1",
+            conversation_id="conversation-1",
+            title="Message-derived episode",
+            content_hash="e" * 64,
+            head_event_id="event-1",
+            source_message_refs_json=["message-1"],
+        )
+        db.add(episode)
+        db.commit()
+
+        _service(db).activate_revision(
+            scope(), file_id="file-1", revision_id="rev-2", actor_id="u1"
+        )
+        db.commit()
+
+        persisted = db.get(ConversationEpisode, episode.id)
+        assert persisted is not None
+        assert persisted.source_message_refs_json == ["message-1"]
+        assert persisted.status == "open"
+
+
+def test_activation_keeps_memory_embedding_because_it_is_keyed_by_memory_content():
+    with SessionLocal() as db:
+        _add_file(db, file_id="file-1")
+        _add_revision(db, file_id="file-1", revision_no=1, revision_id="rev-1")
+        _add_chunk(db, chunk_id="chunk-1", file_id="file-1", revision_id="rev-1", ordinal=1, content="old")
+        file = db.get(FileRecord, "file-1")
+        file.active_revision_id = "rev-1"
+        _add_revision(db, file_id="file-1", revision_no=2, revision_id="rev-2")
+        _add_chunk(db, chunk_id="chunk-2", file_id="file-1", revision_id="rev-2", ordinal=2, content="new")
+        memory = MemoryRecord(
+            id="memory-1",
+            workspace_id="w1",
+            file_id="file-1",
+            title="Independent atom",
+            content_hash="m" * 64,
+            relative_path="memory-1.md",
+        )
+        embedding = MemoryEmbedding(
+            id="embedding-1",
+            workspace_id="w1",
+            memory_id=memory.id,
+            model_key="test-model",
+            content_hash=memory.content_hash,
+            dim=2,
+            vector=[0.1, 0.2],
+        )
+        db.add_all((memory, embedding))
+        db.commit()
+
+        _service(db).activate_revision(
+            scope(), file_id="file-1", revision_id="rev-2", actor_id="u1"
+        )
+        db.commit()
+
+        persisted = db.get(MemoryEmbedding, embedding.id)
+        assert persisted is not None
+        assert persisted.memory_id == memory.id
+        assert persisted.content_hash == memory.content_hash
 
 
 # ── Explicit invalidation ─────────────────────────────────────────────────────

@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.domain.memory_event_models import MemoryScopeContext
 from app.domain.memory_event_types import MemoryEventType
-from app.domain.models import DocumentRevision, FileRecord, FileTextChunk, MemoryEvidence, utc_now
+from app.domain.models import (
+    DocumentRevision,
+    FileRecord,
+    FileTextChunk,
+    MemoryEvidence,
+    RetrievalHit,
+    utc_now,
+)
 from app.services.memory_event_store import AppendEvent, MemoryEventStore
 
 
@@ -17,6 +24,7 @@ class RevisionActivationReport:
     stale_revision_ids: tuple[str, ...]
     stale_chunk_count: int
     invalidated_memory_evidence: int
+    invalidated_retrieval_hits: int
 
 
 class MemoryFileInvalidationService:
@@ -101,6 +109,11 @@ class MemoryFileInvalidationService:
                 evidence.deleted_at = utc_now()
                 evidence.eligibility_reason = "source_revision_stale"
                 invalidated += 1
+        invalidated_retrieval_hits = self._invalidate_retrieval_hits(
+            scope,
+            file_id=file_id,
+            stale_revision_ids=stale_ids,
+        )
         if self.store is not None:
             expected = self._artifact_stream_version(scope, file_id)
             self.store.append(
@@ -116,6 +129,7 @@ class MemoryFileInvalidationService:
                         "supersedes_revision_id": revision.supersedes_revision_id,
                         "stale_revision_ids": list(stale_ids),
                         "invalidated_memory_evidence": invalidated,
+                        "invalidated_retrieval_hits": invalidated_retrieval_hits,
                         "actor_id": actor_id,
                     },
                     idempotency_key=f"rev_act:{file_id}:{revision_id}",
@@ -125,7 +139,13 @@ class MemoryFileInvalidationService:
                 outbox_kinds=("index",),
             )
         self.db.flush()
-        return RevisionActivationReport(revision.id, stale_ids, stale_chunks, invalidated)
+        return RevisionActivationReport(
+            revision.id,
+            stale_ids,
+            stale_chunks,
+            invalidated,
+            invalidated_retrieval_hits,
+        )
 
     def invalidate_revision(
         self,
@@ -166,6 +186,11 @@ class MemoryFileInvalidationService:
                     text("DELETE FROM document_chunks_fts WHERE chunk_id = :id"),
                     {"id": chunk.id},
                 )
+        invalidated_retrieval_hits = self._invalidate_retrieval_hits(
+            scope,
+            file_id=file_id,
+            stale_revision_ids=(revision.id,),
+        )
         if self.store is not None:
             expected = self._artifact_stream_version(scope, file_id)
             self.store.append(
@@ -179,6 +204,7 @@ class MemoryFileInvalidationService:
                         "file_id": file_id,
                         "revision_id": revision_id,
                         "reason": reason,
+                        "invalidated_retrieval_hits": invalidated_retrieval_hits,
                         "actor_id": actor_id,
                     },
                     idempotency_key=f"rev_inv:{file_id}:{revision_id}:{reason}",
@@ -196,6 +222,37 @@ class MemoryFileInvalidationService:
                 DocumentRevision.lifecycle_status == "active",
             )
         )
+
+    def _invalidate_retrieval_hits(
+        self,
+        scope: MemoryScopeContext,
+        *,
+        file_id: str,
+        stale_revision_ids: tuple[str, ...],
+    ) -> int:
+        """Clear context-use lineage for chunks no longer in an active revision.
+
+        Retrieval hits are immutable result history except for ``used_in_context``.
+        Clearing that marker preserves the query audit trail while ensuring a
+        stale chunk cannot remain recorded as active model context.
+        """
+        if not stale_revision_ids:
+            return 0
+        stale_chunk_ids = select(FileTextChunk.id).where(
+            FileTextChunk.workspace_id == scope.workspace_id,
+            FileTextChunk.file_id == file_id,
+            FileTextChunk.document_revision_id.in_(stale_revision_ids),
+        )
+        result = self.db.execute(
+            update(RetrievalHit)
+            .where(
+                RetrievalHit.workspace_id == scope.workspace_id,
+                RetrievalHit.chunk_id.in_(stale_chunk_ids),
+                RetrievalHit.used_in_context.is_(True),
+            )
+            .values(used_in_context=False)
+        )
+        return int(result.rowcount or 0)
 
     def _artifact_stream_version(self, scope: MemoryScopeContext, file_id: str) -> int:
         """Current CAS version of the artifact event stream, 0 if it does not exist yet."""
