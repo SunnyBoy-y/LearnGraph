@@ -20,6 +20,25 @@ export function retractMemory(memoryId: string, reason: string) {
   )
 }
 
+/**
+ * Supersede a memory the user says is wrong. The backend records a `wrong`
+ * feedback event and stores the replacement text/fields in the payload so a new
+ * active memory can be derived without silently overwriting history. Requires a
+ * non-empty replacement; callers must validate before invoking.
+ */
+export function supersedeMemory(
+  memoryId: string,
+  payload: { replacement_title: string; replacement_content: string; reason?: string },
+) {
+  return apiClient.post<{ feedback_id: string; applied_event_id: string }, MemoryFeedbackRequest>(
+    `/memory/${encodeURIComponent(memoryId)}/feedback`,
+    {
+      feedback_type: 'wrong',
+      payload,
+    },
+  )
+}
+
 export function forgetMemory(memoryId: string, payload: MemoryForgetRequest) {
   return apiClient.post<Record<string, unknown>, MemoryForgetRequest>(
     `/memory/${encodeURIComponent(memoryId)}/forget`,
@@ -33,4 +52,13 @@ export function getMemoryArchitectureStatus() {
 
 export function replayValidateMemory() {
   return apiClient.post<Record<string, unknown>>('/memory/maintenance/replay-validate')
+}
+
+/**
+ * Export the immutable event manifest for the active workspace. Requires
+ * `workspace.manage` permission server-side; returns a JSON manifest rather
+ * than the legacy markdown zip.
+ */
+export function exportMemoryEventManifest() {
+  return apiClient.post<Record<string, unknown>>('/memory/export/events')
 }

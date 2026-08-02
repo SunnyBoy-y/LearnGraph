@@ -1396,7 +1396,7 @@ class SandboxAgentWorkspaceService:
         *,
         idempotency_key: str | None,
     ) -> SandboxAgentCommand:
-        argv, destructive_intent = self._validate_command(payload)
+        argv, _ = self._validate_command(payload)
         argv_digest = hashlib.sha256("\0".join(argv).encode()).hexdigest()
         key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
         if key_hash:

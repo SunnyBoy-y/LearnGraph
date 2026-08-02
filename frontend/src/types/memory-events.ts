@@ -43,6 +43,31 @@ export interface MemoryForgetRequest {
   reason?: string
 }
 
+/**
+ * Forget cleanup status. The backend destroys the event payload key and fans out
+ * deletions across projections; external provider deletions may still be pending
+ * or retrying, so the UI must never report success until every target is clean.
+ */
+export interface MemoryForgetResult {
+  memory_id: string
+  content_key_destroyed: boolean
+  projections_removed: string[]
+  external_provider_pending: boolean
+  external_provider_last_error: string | null
+  completed_at: string | null
+}
+
+/**
+ * Supersede request: the user says a memory is wrong and supplies the corrected
+ * title/content. The backend records a `wrong` feedback event carrying the
+ * replacement so a new active memory can be derived without overwriting history.
+ */
+export interface MemorySupersedeRequest {
+  replacement_title: string
+  replacement_content: string
+  reason?: string
+}
+
 export interface MemoryArchitectureStatus {
   write_mode: 'legacy' | 'dual' | 'events'
   read_mode: 'legacy' | 'shadow' | 'events'

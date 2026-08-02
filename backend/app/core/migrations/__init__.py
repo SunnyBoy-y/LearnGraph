@@ -7,7 +7,8 @@ from typing import Any
 from sqlalchemy import inspect
 from sqlalchemy.engine import Connection
 
-from app.domain.memory_event_models import SchemaRevision, utc_now
+from app.domain.migration_models import SchemaRevision
+from app.domain.models import utc_now
 
 
 @dataclass(frozen=True, slots=True)

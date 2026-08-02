@@ -23,17 +23,6 @@ from app.core.database import Base
 from app.domain.models import TimestampMixin, WorkspaceScopedMixin, new_id, utc_now
 
 
-class SchemaRevision(Base):
-    """Ordered application-managed schema revision ledger."""
-
-    __tablename__ = "schema_revisions"
-
-    revision: Mapped[str] = mapped_column(String(80), primary_key=True)
-    checksum: Mapped[str] = mapped_column(String(64))
-    description: Mapped[str] = mapped_column(String(240), default="")
-    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-
-
 class MemoryStream(Base, TimestampMixin):
     """CAS-protected aggregate stream for memory-domain events."""
 

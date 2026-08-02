@@ -153,14 +153,12 @@ temp/
 !backend/tests/security/test_*.py
 
 # Long-term memory architecture regression tests are an explicit tracked exception.
-!/backend/tests/
-/backend/tests/*
-!/backend/tests/memory/
-!/backend/tests/context/
-!/backend/tests/integration/
-!/backend/tests/memory/**
-!/backend/tests/context/**
-!/backend/tests/integration/**
+!backend/tests/memory/
+!backend/tests/context/
+!backend/tests/integration/
+!backend/tests/memory/**
+!backend/tests/context/**
+!backend/tests/integration/**
 
 # Local editor, operating-system, and agent state
 .idea/

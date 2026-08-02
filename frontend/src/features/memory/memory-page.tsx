@@ -69,6 +69,9 @@ import {
 import { SessionCombobox } from '@/components/shared/session-combobox'
 import { ContextManifestPanel } from './components/context-manifest-panel'
 import { MemoryGovernancePanel } from './components/memory-governance-panel'
+import { MemoryPendingConfirmationPanel } from './components/memory-pending-confirmation-panel'
+import { MemorySettingsExportPanel } from './components/memory-settings-export-panel'
+import { MemoryTaskEpisodePanel } from './components/memory-task-episode-panel'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -115,6 +118,9 @@ import type {
 import type { Goal } from '@/types/goals'
 import type { GraphNode, GraphSummary } from '@/types/graphs'
 import type { Session } from '@/types/sessions'
+
+const memoryGovernanceV2Enabled =
+  import.meta.env.VITE_MEMORY_GOVERNANCE_V2 === '1'
 
 const zoneDefinitions: Array<{
   zone: MemoryZone
@@ -411,6 +417,19 @@ export function MemoryPage() {
               </span>
             ) : null}
           </TabsTrigger>
+          {memoryGovernanceV2Enabled ? (
+            <>
+              <TabsTrigger className="px-3" value="task-episode">
+                任务与 Episode
+              </TabsTrigger>
+              <TabsTrigger className="px-3" value="pending">
+                待确认
+              </TabsTrigger>
+              <TabsTrigger className="px-3" value="settings-export">
+                设置与导出
+              </TabsTrigger>
+            </>
+          ) : null}
         </TabsList>
 
         <TabsContent className="mt-0 outline-none" value="summary">
@@ -545,6 +564,20 @@ export function MemoryPage() {
           </Surface>
           {operator.data?.is_system_admin ? <RetentionMaintenanceCard workspaceId={workspaceId} /> : null}
         </TabsContent>
+
+        {memoryGovernanceV2Enabled ? (
+          <>
+            <TabsContent className="mt-0 outline-none" value="task-episode">
+              <MemoryTaskEpisodePanel />
+            </TabsContent>
+            <TabsContent className="mt-0 outline-none" value="pending">
+              <MemoryPendingConfirmationPanel />
+            </TabsContent>
+            <TabsContent className="mt-0 outline-none" value="settings-export">
+              <MemorySettingsExportPanel />
+            </TabsContent>
+          </>
+        ) : null}
       </Tabs>
 
       <MemoryDetailDialog
