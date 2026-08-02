@@ -139,3 +139,39 @@ def test_rebuild_is_idempotent():
         assert second.changed is False
         assert first.state.status == second.state.status
         assert first.state.mastery_score == second.state.mastery_score
+
+
+def test_familiar_decays_to_needs_review_after_two_weeks():
+    """Mastered/familiar evidence older than 14 days must drop to needs_review."""
+    from datetime import timedelta
+    from app.domain.models import utc_now as model_now
+
+    with SessionLocal() as db:
+        evidence = _add_evidence(
+            db, evidence_id="ev-1", node_id="node-1",
+            score=0.9, confidence=0.9, difficulty=0.8,
+        )
+        # Simulate a strong evidence assessed 15 days ago (above the 14-day floor).
+        evidence.updated_at = model_now() - timedelta(days=15)
+        db.commit()
+        result = LearningStateProjector(db).rebuild_node(
+            scope(), "node-1", head_event_id="evt-1"
+        )
+        assert result.state.status == "needs_review"
+
+
+def test_recent_familiar_does_not_decay():
+    from datetime import timedelta
+    from app.domain.models import utc_now as model_now
+
+    with SessionLocal() as db:
+        evidence = _add_evidence(
+            db, evidence_id="ev-1", node_id="node-1",
+            score=0.9, confidence=0.9, difficulty=0.8,
+        )
+        evidence.updated_at = model_now() - timedelta(days=7)
+        db.commit()
+        result = LearningStateProjector(db).rebuild_node(
+            scope(), "node-1", head_event_id="evt-1"
+        )
+        assert result.state.status == "familiar"
