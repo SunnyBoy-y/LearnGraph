@@ -33,22 +33,27 @@ class FetchedDocument:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def require_public_http_url(url: str, allowed_domains: set[str]) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise UnsafeFetchURL("Only absolute HTTP(S) source URLs are allowed")
-    if not domain_is_allowed(url, allowed_domains):
-        raise UnsafeFetchURL("The source URL is outside the authorized domain set")
-    hostname = parsed.hostname.casefold().strip(".")
+def _resolve_public_host(hostname: str) -> str:
+    """Resolve every address for a host and reject unsafe SSRF destinations."""
+    normalized = hostname.casefold().strip(".")
     try:
-        literal = ipaddress.ip_address(hostname)
-        addresses = [literal]
+        addresses = [ipaddress.ip_address(normalized)]
     except ValueError:
         try:
-            addresses = [
-                ipaddress.ip_address(info[4][0])
-                for info in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-            ]
+            # getaddrinfo returns both A and AAAA results when available.  Every
+            # resolved address must be public; accepting one public answer while
+            # another is private creates a DNS-rebinding/round-robin SSRF path.
+            addresses = list(
+                {
+                    ipaddress.ip_address(info[4][0])
+                    for info in socket.getaddrinfo(
+                        normalized,
+                        None,
+                        family=socket.AF_UNSPEC,
+                        type=socket.SOCK_STREAM,
+                    )
+                }
+            )
         except OSError as exc:
             raise UnsafeFetchURL("The source host could not be resolved safely") from exc
     if not addresses or any(
@@ -60,8 +65,46 @@ def require_public_http_url(url: str, allowed_domains: set[str]) -> str:
         or address.is_unspecified
         for address in addresses
     ):
-        raise UnsafeFetchURL("Private, loopback, link-local, or reserved source addresses are blocked")
-    return normalize_domain(hostname)
+        raise UnsafeFetchURL(
+            "Private, loopback, link-local, metadata, multicast, or reserved source addresses are blocked"
+        )
+    return normalize_domain(normalized)
+
+
+def _parse_public_http_url(url: str, *, label: str) -> tuple[str, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise UnsafeFetchURL(f"Only absolute HTTP(S) {label} URLs are allowed")
+    # A bridge URL with userinfo can hide an unexpected authority from logs and
+    # configuration review; credentials belong in ProviderSecret, never URLs.
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise UnsafeFetchURL(f"{label.capitalize()} URLs must not contain userinfo")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsafeFetchURL(f"{label.capitalize()} URL has an invalid port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise UnsafeFetchURL(f"{label.capitalize()} URL has an invalid port")
+    return normalize_domain(parsed.hostname), parsed.geturl()
+
+
+def validate_bridge_url(url: str) -> str:
+    """Validate an admin-configured provider bridge URL before connecting to it.
+
+    Unlike document fetch targets, bridge URLs do not have a caller-provided
+    domain allowlist. They still must be public HTTP(S), credential-free, and
+    resolve exclusively to public addresses.
+    """
+    hostname, normalized_url = _parse_public_http_url(url, label="provider bridge")
+    _resolve_public_host(hostname)
+    return normalized_url.rstrip("/")
+
+
+def require_public_http_url(url: str, allowed_domains: set[str]) -> str:
+    hostname, _ = _parse_public_http_url(url, label="source")
+    if not domain_is_allowed(url, allowed_domains):
+        raise UnsafeFetchURL("The source URL is outside the authorized domain set")
+    return _resolve_public_host(hostname)
 
 
 class Crawl4AIHTTPFetchProvider:
@@ -86,7 +129,7 @@ class Crawl4AIHTTPFetchProvider:
         max_content_chars: int = 2_000_000,
     ) -> None:
         self.provider_id = provider_id
-        self.base_url = base_url.rstrip("/")
+        self.base_url = validate_bridge_url(base_url)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds
@@ -159,7 +202,7 @@ class FirecrawlFetchProvider:
         max_content_chars: int = 2_000_000,
     ) -> None:
         self.provider_id = provider_id
-        self.base_url = base_url.rstrip("/")
+        self.base_url = validate_bridge_url(base_url)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds

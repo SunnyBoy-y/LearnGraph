@@ -53,7 +53,11 @@ class SearXNGSearchProvider:
         timeout_seconds: float = 15.0,
     ) -> None:
         self.provider_id = provider_id
-        self.base_url = base_url.rstrip("/")
+        # Local import avoids a module cycle: fetch.py reuses domain_is_allowed
+        # from this module while this constructor validates bridge egress.
+        from app.providers.remote.fetch import validate_bridge_url
+
+        self.base_url = validate_bridge_url(base_url)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds
@@ -151,7 +155,10 @@ class CloudSearchProvider:
             raise ValueError("Unsupported cloud search provider type")
         self.provider_id = provider_id
         self.provider_type = provider_type
-        self.base_url = base_url.rstrip("/")
+        # Local import avoids a module cycle; see SearXNGSearchProvider above.
+        from app.providers.remote.fetch import validate_bridge_url
+
+        self.base_url = validate_bridge_url(base_url)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds
