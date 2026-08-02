@@ -48,6 +48,12 @@ import {
   summarizeSessionContext,
   updateMemory,
 } from '@/api'
+import { authStore } from '@/api/auth-store'
+import {
+  identityQueryKey,
+  workspaceQueryKey,
+  workspaceResourcePrefix,
+} from '@/lib/query-keys'
 import { MessageResponse } from '@/components/ai-elements/message'
 import {
   EmptyState,
@@ -162,29 +168,35 @@ export function MemoryPage() {
   const { workspaceId = '' } = useParams()
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const memories = useQuery({
-    queryKey: ['memory', 'active', workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'active'),
     queryFn: () => listMemories({ include_content: true }),
   })
   const profile = useQuery({
-    queryKey: ['memory-profile'],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile'),
     queryFn: getMemoryProfile,
   })
-  const memoryTypes = useQuery({ queryKey: ['memory', 'types', workspaceId], queryFn: listMemoryTypes })
-  const goals = useQuery({ queryKey: ['goals', workspaceId], queryFn: listGoals })
-  const graphs = useQuery({ queryKey: ['graphs', workspaceId], queryFn: listGraphs })
+  const memoryTypes = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'types'),
+    queryFn: listMemoryTypes,
+  })
+  const goals = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'goals'), queryFn: listGoals })
+  const graphs = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'graphs'), queryFn: listGraphs })
   const deleted = useQuery({
-    queryKey: ['memory', 'deleted', workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'deleted'),
     queryFn: async () => [
       ...(await listMemories({ state: 'deleted' })),
       ...(await listMemories({ state: 'destroyed' })),
     ],
   })
-  const sessions = useQuery({ queryKey: ['sessions', workspaceId], queryFn: listSessions })
-  const operator = useQuery({ queryKey: ['current-user'], queryFn: getCurrentUser })
+  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'sessions'), queryFn: listSessions })
+  // /auth/me deliberately opts out of X-Workspace-ID, so it belongs to the identity namespace.
+  const operator = useQuery({
+    queryKey: identityQueryKey(authStore.getSession()?.userId, 'current-user'),
+    queryFn: getCurrentUser,
+  })
 
   const refreshMemory = async () => {
-    await queryClient.invalidateQueries({ queryKey: ['memory'] })
-    await queryClient.invalidateQueries({ queryKey: ['memory-profile'] })
+    await queryClient.invalidateQueries({ queryKey: workspaceResourcePrefix(workspaceId, 'memory') })
   }
   const create = useMutation({
     mutationFn: createMemory,
@@ -200,8 +212,8 @@ export function MemoryPage() {
     onSuccess: async (item) => {
       toast.success(`Revision ${item.revision} 已保存`)
       await refreshMemory()
-      await queryClient.invalidateQueries({ queryKey: ['memory-detail', item.id] })
-      await queryClient.invalidateQueries({ queryKey: ['memory-revisions', item.id] })
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'detail', item.id) })
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'revisions', item.id) })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -228,7 +240,7 @@ export function MemoryPage() {
     onSuccess: async (item) => {
       toast.success(`已从历史版本生成 revision ${item.revision}`)
       await refreshMemory()
-      await queryClient.invalidateQueries({ queryKey: ['memory-revisions', item.id] })
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'revisions', item.id) })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -258,7 +270,7 @@ export function MemoryPage() {
     mutationFn: refreshMemoryProfile,
     onSuccess: async () => {
       toast.success('记忆摘要已整篇重写')
-      await queryClient.invalidateQueries({ queryKey: ['memory-profile'] })
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -335,6 +347,7 @@ export function MemoryPage() {
               onCreate={(payload) => create.mutateAsync(payload).then(() => undefined)}
               sessions={sessionList}
               types={typeList}
+              workspaceId={workspaceId}
             />
           </div>
         }
@@ -448,6 +461,7 @@ export function MemoryPage() {
                           onUpdate={(payload) =>
                             update.mutateAsync({ id: item.id, payload }).then(() => undefined)
                           }
+                          workspaceId={workspaceId}
                         />
                       ))}
                       {!items.length ? (
@@ -464,7 +478,7 @@ export function MemoryPage() {
         </TabsContent>
 
         <TabsContent className="mt-0 outline-none" value="preview">
-          <MemoryInjectionPreviewTab sessions={sessionList} />
+          <MemoryInjectionPreviewTab sessions={sessionList} workspaceId={workspaceId} />
         </TabsContent>
 
         <TabsContent className="mt-0 outline-none" value="deleted">
@@ -512,11 +526,15 @@ export function MemoryPage() {
               />
             )}
           </Surface>
-          {operator.data?.is_system_admin ? <RetentionMaintenanceCard /> : null}
+          {operator.data?.is_system_admin ? <RetentionMaintenanceCard workspaceId={workspaceId} /> : null}
         </TabsContent>
       </Tabs>
 
-      <MemoryDetailDialog memoryId={selectedId} onClose={() => setSelectedId(null)} />
+      <MemoryDetailDialog
+        memoryId={selectedId}
+        onClose={() => setSelectedId(null)}
+        workspaceId={workspaceId}
+      />
     </PageFrame>
   )
 }
@@ -735,11 +753,17 @@ function MemorySummaryCard({
   )
 }
 
-function MemoryInjectionPreviewTab({ sessions }: { sessions: Session[] }) {
+function MemoryInjectionPreviewTab({
+  sessions,
+  workspaceId,
+}: {
+  sessions: Session[]
+  workspaceId: string
+}) {
   const queryClient = useQueryClient()
   const [sessionId, setSessionId] = useState(sessions[0]?.id ?? '')
   const preview = useQuery({
-    queryKey: ['memory-package', sessionId],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'package', sessionId),
     queryFn: () => getEffectiveMemoryPackage({ session_id: sessionId }),
     enabled: Boolean(sessionId),
   })
@@ -753,8 +777,10 @@ function MemoryInjectionPreviewTab({ sessions }: { sessions: Session[] }) {
           `抽取完成：提炼 ${result.drafts_created} 条（自动写入 ${result.auto_committed ?? 0} 条）`,
         )
       }
-      await queryClient.invalidateQueries({ queryKey: ['memory'] })
-      await queryClient.invalidateQueries({ queryKey: ['memory-package'] })
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory') })
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, 'memory', 'package'),
+      })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -873,7 +899,7 @@ function MemoryInjectionPreviewTab({ sessions }: { sessions: Session[] }) {
   )
 }
 
-function RetentionMaintenanceCard() {
+function RetentionMaintenanceCard({ workspaceId }: { workspaceId: string }) {
   const queryClient = useQueryClient()
   const purge = useMutation({
     mutationFn: purgeExpiredMemoryContent,
@@ -881,9 +907,10 @@ function RetentionMaintenanceCard() {
       toast.success(
         `维护完成：销毁 ${result.content_keys_destroyed} 个到期内容密钥，清理 ${result.journal_entries_removed} 条 Journal`,
       )
-      await queryClient.invalidateQueries({ queryKey: ['memory'] })
-      await queryClient.invalidateQueries({ queryKey: ['memory-detail'] })
-      await queryClient.invalidateQueries({ queryKey: ['memory-bindings'] })
+      // Prefix match: every memory* entry for the active workspace.
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, 'memory'),
+      })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -929,6 +956,7 @@ function RetentionMaintenanceCard() {
 function MemoryRow({
   item,
   busy,
+  workspaceId,
   onOpen,
   onUpdate,
   onDelete,
@@ -936,6 +964,7 @@ function MemoryRow({
 }: {
   item: MemoryEntry
   busy: boolean
+  workspaceId: string
   onOpen: () => void
   onUpdate: (payload: Parameters<typeof updateMemory>[1]) => Promise<void>
   onDelete: () => void
@@ -955,8 +984,13 @@ function MemoryRow({
         {item.record_kind ? <Badge variant="outline">{item.record_kind}</Badge> : null}
       </div>
       <div className="mt-2.5 flex flex-wrap items-center gap-0.5 border-t pt-2">
-        <EditMemoryDialog busy={busy} item={item} onUpdate={onUpdate} />
-        <RevisionDialog busy={busy} item={item} onRestore={onRestoreRevision} />
+        <EditMemoryDialog busy={busy} item={item} onUpdate={onUpdate} workspaceId={workspaceId} />
+        <RevisionDialog
+          busy={busy}
+          item={item}
+          onRestore={onRestoreRevision}
+          workspaceId={workspaceId}
+        />
         <AlertDialog>
           <AlertDialogTrigger asChild>
             <Button aria-label={`删除 ${item.title}`} disabled={busy} size="icon-xs" variant="ghost">
@@ -995,6 +1029,7 @@ function ScopeFields({
   onNodeIdChange,
   goals,
   graphs,
+  workspaceId,
 }: {
   scopeType: MemoryScopeType
   onScopeTypeChange: (value: MemoryScopeType) => void
@@ -1004,10 +1039,11 @@ function ScopeFields({
   onNodeIdChange: (value: string) => void
   goals: Goal[]
   graphs: GraphSummary[]
+  workspaceId: string
 }) {
   const selectedGraphId = graphs.find((graph) => graph.goal_id === goalId)?.id ?? graphs[0]?.id ?? ''
   const graphDetail = useQuery({
-    queryKey: ['graph-detail', selectedGraphId],
+    queryKey: workspaceQueryKey(workspaceId, 'graph', selectedGraphId),
     queryFn: () => getGraph(selectedGraphId),
     enabled: scopeType === 'node' && Boolean(selectedGraphId),
   })
@@ -1070,6 +1106,7 @@ function CreateMemoryDialog({
   graphs,
   types,
   busy,
+  workspaceId,
   onCreate,
 }: {
   sessions: Session[]
@@ -1077,6 +1114,7 @@ function CreateMemoryDialog({
   graphs: GraphSummary[]
   types: Array<{ memory_type: string; description: string }>
   busy: boolean
+  workspaceId: string
   onCreate: (payload: MemoryCreateRequest) => Promise<void>
 }) {
   const [open, setOpen] = useState(false)
@@ -1178,6 +1216,7 @@ function CreateMemoryDialog({
               onNodeIdChange={setNodeId}
               onScopeTypeChange={setScopeType}
               scopeType={scopeType}
+              workspaceId={workspaceId}
             />
             {namespace === 'session' ? (
               <div className="space-y-2">
@@ -1213,15 +1252,17 @@ function CreateMemoryDialog({
 function EditMemoryDialog({
   item,
   busy,
+  workspaceId,
   onUpdate,
 }: {
   item: MemoryEntry
   busy: boolean
+  workspaceId: string
   onUpdate: (payload: Parameters<typeof updateMemory>[1]) => Promise<void>
 }) {
   const [open, setOpen] = useState(false)
   const detail = useQuery({
-    queryKey: ['memory-detail', item.id],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'detail', item.id),
     queryFn: () => getMemory(item.id),
     enabled: open,
   })
@@ -1279,15 +1320,17 @@ function EditMemoryDialog({
 function RevisionDialog({
   item,
   busy,
+  workspaceId,
   onRestore,
 }: {
   item: MemoryEntry
   busy: boolean
+  workspaceId: string
   onRestore: (revision: number) => void
 }) {
   const [open, setOpen] = useState(false)
   const revisions = useQuery({
-    queryKey: ['memory-revisions', item.id],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'revisions', item.id),
     queryFn: () => listMemoryRevisions(item.id),
     enabled: open,
   })
@@ -1340,14 +1383,22 @@ function RevisionRow({
   )
 }
 
-function MemoryDetailDialog({ memoryId, onClose }: { memoryId: string | null; onClose: () => void }) {
+function MemoryDetailDialog({
+  memoryId,
+  workspaceId,
+  onClose,
+}: {
+  memoryId: string | null
+  workspaceId: string
+  onClose: () => void
+}) {
   const memory = useQuery({
-    queryKey: ['memory-detail', memoryId],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'detail', memoryId),
     queryFn: () => getMemory(memoryId ?? ''),
     enabled: Boolean(memoryId),
   })
   const bindings = useQuery({
-    queryKey: ['memory-bindings', memoryId],
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'bindings', memoryId),
     queryFn: () => listMemoryBindings(memoryId ?? ''),
     enabled: Boolean(memoryId),
   })

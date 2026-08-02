@@ -51,6 +51,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import type {
   Goal,
   Graph,
@@ -156,7 +157,7 @@ export function GoalConfirmPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const goals = useQuery({
-    queryKey: ["goals", workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, "goals"),
     queryFn: () => apiClient.get<Goal[]>("/goals"),
   });
   const goal = goals.data?.find((item) => item.id === goalId);
@@ -185,7 +186,9 @@ export function GoalConfirmPage() {
     mutationFn: (body: GoalConfirmBody) =>
       apiClient.put<Goal, GoalConfirmBody>(`/goals/${goalId}/confirm`, body),
     onSuccess: (data) => {
-      void queryClient.invalidateQueries({ queryKey: ["goals"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "goals"),
+      });
       toast.success(`Goal「${data.title}」已确认`);
     },
   });
@@ -482,19 +485,19 @@ export function GraphReviewPage() {
   const [selected, setSelected] = useState<string>();
   const queryClient = useQueryClient();
   const graphs = useQuery({
-    queryKey: ["graphs", workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, "graphs"),
     queryFn: () => apiClient.get<GraphSummary[]>("/graphs"),
   });
   const graphId =
     requestedGraph ??
     graphs.data?.find((graph) => graph.goal_id === goalId)?.id;
   const graph = useQuery({
-    queryKey: ["graph", graphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     enabled: Boolean(graphId),
     queryFn: () => apiClient.get<Graph>(`/graphs/${graphId}`),
   });
   const roadmap = useQuery({
-    queryKey: ["roadmap", goalId],
+    queryKey: workspaceQueryKey(workspaceId, "roadmap", goalId),
     enabled: Boolean(goalId),
     queryFn: () => getRoadmap(goalId),
     retry: false,
@@ -529,10 +532,18 @@ export function GraphReviewPage() {
     onSuccess: (data) => {
       toast.success("图谱已发布为正式版本");
       void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["graphs"] }),
-        queryClient.invalidateQueries({ queryKey: ["graph", data.graph_id] }),
-        queryClient.invalidateQueries({ queryKey: ["goals"] }),
-        queryClient.invalidateQueries({ queryKey: ["roadmap", goalId] }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graphs"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graph", data.graph_id),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "goals"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "roadmap", goalId),
+        }),
       ]);
     },
     onError: handleGraphMutationError,
@@ -551,7 +562,9 @@ export function GraphReviewPage() {
       }),
     onSuccess: async () => {
       toast.success("候选知识卡片已更新");
-      await queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
+      });
     },
     onError: handleGraphMutationError,
   });
@@ -571,7 +584,9 @@ export function GraphReviewPage() {
       ),
     onSuccess: async (node) => {
       toast.success(`已局部重建「${node.label}」`);
-      await queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
+      });
     },
     onError: handleGraphMutationError,
   });
@@ -581,7 +596,9 @@ export function GraphReviewPage() {
     onSuccess: async () => {
       setSelected(undefined);
       toast.success("候选节点及相连关系已删除");
-      await queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
+      });
     },
     onError: handleGraphMutationError,
   });
@@ -589,7 +606,9 @@ export function GraphReviewPage() {
     mutationFn: () => replanRoadmap(goalId),
     onSuccess: () => {
       toast.success("学习路线已按当前图谱重新生成并立即生效");
-      void queryClient.invalidateQueries({ queryKey: ["roadmap", goalId] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "roadmap", goalId),
+      });
     },
     onError: (error) => toast.error(error.message),
   });

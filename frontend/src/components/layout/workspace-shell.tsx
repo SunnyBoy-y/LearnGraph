@@ -89,6 +89,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import { SettingsModal } from "@/components/layout/settings-modal";
 import { SelectionExplanationPanel } from "@/features/chat/selection-explanation-panel";
 import {
@@ -504,15 +505,15 @@ function SidebarNav({
     getSessionActivitySnapshot,
   );
   const projectsQuery = useQuery({
-    queryKey: ["projects"],
+    queryKey: workspaceQueryKey(workspaceId, "projects"),
     queryFn: () => listProjects(true),
   });
   const sessionsQuery = useQuery({
-    queryKey: ["sessions", workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, "sessions"),
     queryFn: listSessions,
   });
   const settingsQuery = useQuery({
-    queryKey: ["settings"],
+    queryKey: workspaceQueryKey(workspaceId, "settings"),
     queryFn: listSettings,
   });
   const workspaceDefaultResponseMode = useMemo(
@@ -538,12 +539,12 @@ function SidebarNav({
   const base = `/w/${workspaceId}`;
   const isSettings = pathname.includes("/settings/");
   const graphsQuery = useQuery({
-    queryKey: ["graphs"],
+    queryKey: workspaceQueryKey(workspaceId, "graphs"),
     queryFn: listGraphs,
     enabled: !isSettings,
   });
   const goalsQuery = useQuery({
-    queryKey: ["goals"],
+    queryKey: workspaceQueryKey(workspaceId, "goals"),
     queryFn: listGoals,
     enabled: !isSettings,
   });
@@ -709,7 +710,7 @@ function SidebarNav({
       const session = (event as CustomEvent<{ session?: Session }>).detail
         ?.session;
       if (!session) return;
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
         session,
         ...(current ?? []).filter((item) => item.id !== session.id),
       ]);
@@ -810,7 +811,7 @@ function SidebarNav({
       void updateProjectRecord(detail.projectId, {
         primary_graph_id: detail.graphId,
       })
-        .then(() => queryClient.invalidateQueries({ queryKey: ["projects"] }))
+        .then(() => queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") }))
         .catch((error: Error) => toast.error(error.message));
       window.dispatchEvent(
         new CustomEvent("learngraph:project-graph-bound", {
@@ -860,7 +861,7 @@ function SidebarNav({
           try {
             const settings =
               (await queryClient.fetchQuery({
-                queryKey: ["settings"],
+                queryKey: workspaceQueryKey(workspaceId, "settings"),
                 queryFn: listSettings,
               })) as WorkspaceSetting[] | undefined;
             resolvedMode = readChatDefaultResponseMode(settings);
@@ -904,7 +905,7 @@ function SidebarNav({
             try {
               const settings =
                 (await queryClient.fetchQuery({
-                  queryKey: ["settings"],
+                  queryKey: workspaceQueryKey(workspaceId, "settings"),
                   queryFn: listSettings,
                 })) as WorkspaceSetting[] | undefined;
               resolvedMode = readChatDefaultResponseMode(settings);
@@ -918,7 +919,7 @@ function SidebarNav({
             defaultComposerPrefsForResponseMode(resolvedMode),
           );
         }
-        queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
+        queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
           session,
           ...(current ?? []).filter((item) => item.id !== session.id),
         ]);
@@ -1049,7 +1050,7 @@ function SidebarNav({
         );
         if (existing)
           await updateProjectRecord(existing.id, { primary_graph_id: graphId });
-        await queryClient.invalidateQueries({ queryKey: ["projects"] });
+        await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
       }
       const prompt =
         request.prompt?.trim() ||
@@ -1147,7 +1148,7 @@ function SidebarNav({
       );
     try {
       await assignSessionProject(sessionId, projectId ?? null);
-      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "移动会话失败");
       await sessionsQuery.refetch();
@@ -1383,8 +1384,8 @@ function SidebarNav({
       }
 
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["projects"] }),
-        queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
       ]);
       toast.success(
         deleteTarget.kind === "session"
@@ -1410,7 +1411,7 @@ function SidebarNav({
     if (!title || title === project.title) return;
     try {
       await updateProjectRecord(project.id, { title });
-      await queryClient.invalidateQueries({ queryKey: ["projects"] });
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
       toast.success("项目名称已更新");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "项目改名失败");
@@ -1469,7 +1470,7 @@ function SidebarNav({
     try {
       const updated = await updateSession(session.id, { title: nextTitle });
       patchSidebarSession(session.id, { title: updated.title });
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
         current?.map((item) => (item.id === updated.id ? updated : item)),
       );
       toast.success("会话名称已更新");
@@ -1484,7 +1485,7 @@ function SidebarNav({
     try {
       const updated = await updateSession(session.id, { pinned: !session.pinned });
       patchSidebarSession(session.id, { pinned: updated.pinned });
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
         current?.map((item) => (item.id === updated.id ? updated : item)),
       );
       toast.success(updated.pinned ? "会话已置顶" : "已取消置顶");
@@ -1501,7 +1502,7 @@ function SidebarNav({
       patchSidebarSession(session.id, {
         status: updated.status,
       });
-      await queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
       toast.success(session.status === "archived" ? "会话已恢复" : "会话已归档");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "会话状态更新失败");
@@ -1522,7 +1523,7 @@ function SidebarNav({
     try {
       if (project.status === "archived") await restoreProject(project.id);
       else await archiveProject(project.id);
-      await queryClient.invalidateQueries({ queryKey: ["projects"] });
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
       toast.success(
         project.status === "archived" ? "项目已恢复" : "项目已归档",
       );
@@ -1716,7 +1717,7 @@ function SidebarNav({
           }
           onCreateProject={async (title) => {
             const created = await createProjectRecord({ title });
-            await queryClient.invalidateQueries({ queryKey: ["projects"] });
+            await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
             return created.id;
           }}
           onRequestProjectDeletion={(project) =>
@@ -2785,7 +2786,7 @@ function TopBar({
   const auth = useAuth();
   const isChat = pathname.includes("/chat/");
   const dashboard = useQuery({
-    queryKey: ["dashboard", workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, "dashboard"),
     queryFn: getDashboard,
     enabled: !isChat,
   });
@@ -3055,11 +3056,11 @@ function ContextRail({
   const [selectionExplanation, setSelectionExplanation] =
     useState<SelectionExplanationOpenDetail | null>(null);
   const railProjects = useQuery({
-    queryKey: ["projects"],
+    queryKey: workspaceQueryKey(workspaceId, "projects"),
     queryFn: () => listProjects(),
   });
   const railSessions = useQuery({
-    queryKey: ["sessions", workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, "sessions"),
     queryFn: listSessions,
   });
   const isSettings = pathname.includes("/settings/");
@@ -3354,12 +3355,17 @@ function ChatGraphRail({
           <BoundGraphRail
             graphId={binding.graphId}
             title={binding.graphTitle}
+            workspaceId={workspaceId}
           />
         ) : (
-          <ProjectBookshelf project={project} onBind={bindGraph} />
+          <ProjectBookshelf
+            onBind={bindGraph}
+            project={project}
+            workspaceId={workspaceId}
+          />
         )
       ) : (
-        <CapabilityGraphRail />
+        <CapabilityGraphRail workspaceId={workspaceId} />
       )}
     </div>
   );
@@ -3368,11 +3374,13 @@ function ChatGraphRail({
 function ProjectBookshelf({
   project,
   onBind,
+  workspaceId,
 }: {
   project?: SidebarProject;
   onBind: (graph: GraphSummary) => void;
+  workspaceId: string;
 }) {
-  const graphs = useQuery({ queryKey: ["graphs"], queryFn: listGraphs });
+  const graphs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "graphs"), queryFn: listGraphs });
   const books = graphs.data ?? [];
   return (
     <section
@@ -3478,14 +3486,16 @@ function BoundGraphRail({
   graphId,
   selectedNodeId: requestedNodeId,
   title,
+  workspaceId,
 }: {
   graphId: string;
   selectedNodeId?: string;
   title: string;
+  workspaceId: string;
 }) {
   const queryClient = useQueryClient();
   const graphQuery = useQuery({
-    queryKey: ["graph", graphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     queryFn: () => getGraph(graphId),
     enabled: Boolean(graphId),
   });
@@ -3529,7 +3539,7 @@ function BoundGraphRail({
     (graph ? pickDefaultLearningNode(graph) : undefined);
   const effectiveNodeId = selectedNodeId ?? selectedNode?.id;
   const questionsQuery = useQuery({
-    queryKey: ["node-questions", graphId, effectiveNodeId],
+    queryKey: workspaceQueryKey(workspaceId, "node-questions", graphId, effectiveNodeId),
     queryFn: () => listNodeQuestions(graphId, effectiveNodeId!),
     enabled: Boolean(effectiveNodeId),
     staleTime: 15_000,
@@ -3587,7 +3597,7 @@ function BoundGraphRail({
         description,
       }),
     onSuccess: (updated) => {
-      queryClient.setQueryData<Graph>(["graph", graphId], (current) =>
+      queryClient.setQueryData<Graph>(workspaceQueryKey(workspaceId, "graph", graphId), (current) =>
         current
           ? {
               ...current,
@@ -3600,18 +3610,18 @@ function BoundGraphRail({
       setEditing(false);
       setValidation(undefined);
       toast.success("图谱节点已更新");
-      void queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graph", graphId) });
     },
     onError: (error) => {
       toast.error(error.message);
-      void queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graph", graphId) });
     },
   });
   const focus = useMutation({
     mutationFn: (nodeId: string) =>
       updateGraphNode(graphId, nodeId, { attention_state: "focused" }),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graph", graphId) });
       toast.success("已设为重点节点");
     },
     onError: (error) => toast.error(error.message),
@@ -3628,7 +3638,7 @@ function BoundGraphRail({
         attention_state: mastered ? "mastered" : "normal",
       }),
     onSuccess: (updated) => {
-      queryClient.setQueryData<Graph>(["graph", graphId], (current) =>
+      queryClient.setQueryData<Graph>(workspaceQueryKey(workspaceId, "graph", graphId), (current) =>
         current
           ? {
               ...current,
@@ -3638,8 +3648,8 @@ function BoundGraphRail({
             }
           : current,
       );
-      void queryClient.invalidateQueries({ queryKey: ["graph", graphId] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graph", graphId) });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "mastery") });
       toast.success(
         updated.attention_state === "mastered"
           ? "已标记为已掌握，将出现在能力成长图谱"
@@ -4170,9 +4180,9 @@ function BoundGraphRail({
   );
 }
 
-function CapabilityGraphRail() {
+function CapabilityGraphRail({ workspaceId }: { workspaceId: string }) {
   const [maxDepth, setMaxDepth] = useState(1);
-  const mastery = useQuery({ queryKey: ["mastery"], queryFn: getMastery });
+  const mastery = useQuery({ queryKey: workspaceQueryKey(workspaceId, "mastery"), queryFn: getMastery });
   // Only user-declared mastered nodes enter the capability graph.
   const masteredNodes = useMemo(
     () =>
@@ -4419,14 +4429,14 @@ function graphIdFromPathname(pathname: string) {
 }
 
 function GraphWorkspaceRail() {
-  const { graphId: paramGraphId = "" } = useParams();
+  const { graphId: paramGraphId = "", workspaceId = "" } = useParams();
   const { pathname, search } = useLocation();
   // ContextRail is rendered by the parent workspace route. Derive the child
   // graph id from the URL as well, so the rail never falls back to GET /graphs/.
   const graphId = paramGraphId || graphIdFromPathname(pathname);
   const [view, setView] = useState<"learning" | "capability">("learning");
   const graph = useQuery({
-    queryKey: ["graph", graphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     queryFn: () => getGraph(graphId),
     enabled: Boolean(graphId),
   });
@@ -4486,6 +4496,7 @@ function GraphWorkspaceRail() {
             graphId={graphId}
             selectedNodeId={selectedNodeId}
             title={title}
+            workspaceId={workspaceId}
           />
         ) : (
           <div
@@ -4515,7 +4526,7 @@ function GraphWorkspaceRail() {
           </div>
         )
       ) : (
-        <CapabilityGraphRail />
+        <CapabilityGraphRail workspaceId={workspaceId} />
       )}
     </div>
   );
@@ -4526,7 +4537,7 @@ export function WorkspaceShell() {
   const navigate = useNavigate();
   const { workspaceId = "" } = useParams();
   const settings = useQuery({
-    queryKey: ["settings"],
+    queryKey: workspaceQueryKey(workspaceId, "settings"),
     queryFn: listSettings,
   });
   const [collapsed, setCollapsed] = useState(

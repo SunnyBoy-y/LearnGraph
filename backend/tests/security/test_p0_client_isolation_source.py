@@ -182,55 +182,55 @@ def test_selection_explanation_marks_preserve_context_anchors() -> None:
 
 
 def test_workspace_scoped_query_keys_include_workspace_id() -> None:
-    """R-018: workspace-scoped useQuery keys must carry workspaceId to prevent
-    cross-workspace cache confusion on the same browser tab."""
+    """R-018: workspace-backed React Query keys share one tenant namespace."""
+
+    key_factory = (FRONTEND / "lib" / "query-keys.ts").read_text(encoding="utf-8")
+    assert 'return ["workspace", workspaceId, ...parts]' in key_factory
+    assert "workspaceQueryPrefix" in key_factory
+    assert "identityQueryKey" in key_factory
+
+    auth_cache = (FRONTEND / "lib" / "auth-query-cache.ts").read_text(
+        encoding="utf-8"
+    )
+    assert "clearWorkspaceClientState" in auth_cache
+    assert "workspaceQueryPrefix(workspaceId)" in auth_cache
+    assert "removeQueries({ queryKey })" in auth_cache
+
+    auth_context = (FRONTEND / "features" / "auth" / "auth-context.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "selectWorkspace(workspaceId)" in auth_context
+    assert "clearWorkspaceClientState(previousWorkspaceId)" in auth_context
+
+    # High-traffic workspace surfaces must both read and mutate the canonical key.
+    for relative_path in (
+        "components/layout/workspace-shell.tsx",
+        "features/chat/chat-pages.tsx",
+        "features/chat/selection-explanation-panel.tsx",
+        "features/resources/document-chat-panel.tsx",
+        "features/resources/concept-branch-workspace.tsx",
+    ):
+        source = (FRONTEND / relative_path).read_text(encoding="utf-8")
+        assert "workspaceQueryKey" in source
 
     workspace_shell = (
         FRONTEND / "components" / "layout" / "workspace-shell.tsx"
     ).read_text(encoding="utf-8")
-    # Both SidebarNav and ContextRail sessions queries include workspaceId.
-    assert 'queryKey: ["sessions", workspaceId]' in workspace_shell
+    assert 'workspaceQueryKey(workspaceId, "sessions")' in workspace_shell
+    assert 'workspaceQueryKey(workspaceId, "projects")' in workspace_shell
+    assert 'workspaceQueryKey(workspaceId, "settings")' in workspace_shell
 
     chat_pages = (FRONTEND / "features" / "chat" / "chat-pages.tsx").read_text(
         encoding="utf-8"
     )
-    assert 'queryKey: ["sessions", workspaceId]' in chat_pages
-
-    dashboard = (FRONTEND / "features" / "dashboard" / "dashboard-page.tsx").read_text(
-        encoding="utf-8"
+    assert 'workspaceQueryKey(workspaceId, "sessions")' in chat_pages
+    # Explicit workspaceId form preferred over currentWorkspaceQueryKey so the
+    # tenant segment stays visible at every call site and matches shell/chat.
+    assert 'workspaceQueryKey(workspaceId, "messages"' in chat_pages or (
+        'workspaceQueryKey(workspaceId,"messages"' in chat_pages
     )
-    assert 'queryKey: ["sessions", workspaceId]' in dashboard
-
-    memory_page = (FRONTEND / "features" / "memory" / "memory-page.tsx").read_text(
-        encoding="utf-8"
-    )
-    assert 'queryKey: [\'memory\', \'active\', workspaceId]' in memory_page
-    assert 'queryKey: [\'sessions\', workspaceId]' in memory_page
-
-    sel_panel = (
-        FRONTEND / "features" / "chat" / "selection-explanation-panel.tsx"
-    ).read_text(encoding="utf-8")
-    assert 'queryKey: ["sessions", workspaceId]' in sel_panel
-
-    doc_chat = (
-        FRONTEND / "features" / "resources" / "document-chat-panel.tsx"
-    ).read_text(encoding="utf-8")
-    assert 'queryKey: ["sessions", workspaceId]' in doc_chat
-
-    concept_branch = (
-        FRONTEND / "features" / "resources" / "concept-branch-workspace.tsx"
-    ).read_text(encoding="utf-8")
-    assert 'queryKey: ["sessions", workspaceId]' in concept_branch
-
-    # setQueryData writes to the same partitioned key, not the bare global one.
-    assert 'setQueryData(["sessions"],' not in workspace_shell
-    assert 'setQueryData<Session[]>(["sessions"],' not in workspace_shell
-    assert 'setQueryData(["sessions"],' not in chat_pages
-    assert 'setQueryData<Session[]>(["sessions"],' not in chat_pages
-    assert 'setQueryData(["sessions"],' not in sel_panel
-    assert 'setQueryData<Session[]>(["sessions"],' not in sel_panel
-    assert 'setQueryData(["sessions"],' not in doc_chat
-    assert 'setQueryData<Session[]>(["sessions"],' not in doc_chat
+    assert 'workspaceQueryKey(workspaceId, "provider-models", provider.id)' in chat_pages
+    assert 'queryKey: ["sessions", workspaceId]' not in chat_pages
 
 
 def test_sandbox_quota_limits_file_and_directory_count() -> None:

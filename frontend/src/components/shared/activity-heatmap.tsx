@@ -10,6 +10,8 @@ import {
 
 import { listActions, listSessions, renderSessionActivitySummary } from "@/api";
 import { SectionHeading } from "@/components/shared/page-elements";
+import { useAuth } from "@/features/auth/auth-context-value";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import type { Session } from "@/types/sessions";
 
 const HEATMAP_WEEKS = 53;
@@ -71,8 +73,15 @@ export function ActivityHeatmap({
 }: {
   variant?: "rail" | "panel";
 }) {
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
-  const actions = useQuery({ queryKey: ["actions"], queryFn: listActions });
+  const { workspaceId } = useAuth();
+  const sessions = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "sessions"),
+    queryFn: listSessions,
+  });
+  const actions = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "actions"),
+    queryFn: listActions,
+  });
   const queryClient = useQueryClient();
   const scrollRef = useRef<HTMLDivElement>(null);
   // In-flight session IDs so we never request the same summary twice
@@ -133,7 +142,9 @@ export function ActivityHeatmap({
         expected_title: session.title,
       })
         .then((updated) => {
-          queryClient.setQueryData<Session[]>(["sessions"], (current) => {
+          queryClient.setQueryData<Session[]>(
+            workspaceQueryKey(workspaceId, "sessions"),
+            (current) => {
             if (!current) return [updated];
             return current.map((item) =>
               item.id === updated.id
@@ -149,7 +160,7 @@ export function ActivityHeatmap({
           inflightSummaries.current.delete(session.id);
         });
     }
-  }, [queryClient, selectedKey, sessions.data]);
+  }, [queryClient, selectedKey, sessions.data, workspaceId]);
 
   const dayActivity = useMemo(() => {
     const result: Record<string, DayActivityItem[]> = {};

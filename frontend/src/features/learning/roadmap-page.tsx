@@ -29,6 +29,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import { toast } from "sonner";
 
 import {
@@ -443,16 +444,16 @@ export function RoadmapPlannerPage() {
   });
 
   const roadmap = useQuery({
-    queryKey: ["roadmap", goalId],
+    queryKey: workspaceQueryKey(workspaceId, "roadmap", goalId),
     queryFn: () => getRoadmap(goalId),
     enabled: Boolean(goalId),
   });
 
   function acceptLatest(result: Roadmap) {
-    queryClient.setQueryData(["roadmap", goalId], result);
+    queryClient.setQueryData(workspaceQueryKey(workspaceId, "roadmap", goalId), result);
     void Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["actions"] }),
-      queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+      queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "actions") }),
+      queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "dashboard") }),
     ]);
   }
 

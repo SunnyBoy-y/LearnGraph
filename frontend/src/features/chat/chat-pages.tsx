@@ -275,6 +275,9 @@ import { ContextUsageRing } from "@/components/chat/context-usage-ring";
 import { shouldShowSuggestedPromptError } from "@/lib/suggested-prompts";
 import { cn } from "@/lib/utils";
 import {
+  workspaceQueryKey,
+} from "@/lib/query-keys";
+import {
   groupPartsForDisplay,
   isDeepResearchApprovalPart,
   orderedMessageParts,
@@ -368,13 +371,13 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const readiness = useQuery({
-    queryKey: ["agent-sandbox-readiness"],
+    queryKey: workspaceQueryKey(workspaceId, "agent-sandbox-readiness"),
     queryFn: getAgentSandboxReadiness,
     refetchInterval: (query) =>
       query.state.data?.available === false ? 5_000 : false,
   });
   const bootstrap = useQuery({
-    queryKey: ["sandbox-bootstrap-status"],
+    queryKey: workspaceQueryKey(workspaceId, "sandbox-bootstrap-status"),
     queryFn: getSandboxBootstrapStatus,
     enabled: readiness.data?.code === "sandbox_backend_unavailable",
     refetchInterval: (query) =>
@@ -395,9 +398,12 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
           ? "已加入正在进行的沙箱初始化"
           : "沙箱初始化已开始",
       );
-      queryClient.setQueryData(["sandbox-bootstrap-status"], result.status);
+      queryClient.setQueryData(
+        workspaceQueryKey(workspaceId, "sandbox-bootstrap-status"),
+        result.status,
+      );
       void queryClient.invalidateQueries({
-        queryKey: ["sandbox-bootstrap-status"],
+        queryKey: workspaceQueryKey(workspaceId, "sandbox-bootstrap-status"),
       });
     },
     onError: (error) =>
@@ -409,9 +415,9 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
   useEffect(() => {
     if (!bootstrap.data?.image_ready) return;
     void queryClient.invalidateQueries({
-      queryKey: ["agent-sandbox-readiness"],
+      queryKey: workspaceQueryKey(workspaceId, "agent-sandbox-readiness"),
     });
-  }, [bootstrap.data?.image_ready, queryClient]);
+  }, [bootstrap.data?.image_ready, queryClient, workspaceId]);
 
   if (
     dismissed ||
@@ -1446,6 +1452,7 @@ function LazyMessageMount({
 function AssistantMessageInner({
   message,
   sessionId,
+  workspaceId,
   onRetry,
   onBranch,
   onComponentAction,
@@ -1459,6 +1466,7 @@ function AssistantMessageInner({
 }: {
   message: Message;
   sessionId: string;
+  workspaceId: string;
   onRetry: () => void;
   onBranch: () => void;
   onComponentAction: (action: TrustedComponentAction) => void | Promise<void>;
@@ -1482,7 +1490,7 @@ function AssistantMessageInner({
   // already gated on `selectedVersionId`; this gates its prerequisite too.
   const [versionsRequested, setVersionsRequested] = useState(false);
   const versions = useQuery({
-    queryKey: ["message-versions", sessionId, message.id],
+    queryKey: workspaceQueryKey(workspaceId, "message-versions", sessionId, message.id),
     queryFn: () => listMessageVersions(sessionId, message.id),
     enabled: persisted && versionsRequested,
   });
@@ -1493,7 +1501,7 @@ function AssistantMessageInner({
     setSelectedVersionId(undefined);
   }, [message.id, message.version]);
   const snapshot = useQuery({
-    queryKey: ["message-snapshot", sessionId, message.id, selectedVersionId],
+    queryKey: workspaceQueryKey(workspaceId, "message-snapshot", sessionId, message.id, selectedVersionId),
     queryFn: () => getMessageSnapshot(sessionId, message.id, selectedVersionId),
     enabled: persisted && Boolean(selectedVersionId),
   });
@@ -1745,6 +1753,7 @@ const areEqualAssistantMessage = (
 ): boolean =>
   prev.message === next.message &&
   prev.sessionId === next.sessionId &&
+  prev.workspaceId === next.workspaceId &&
   prev.retryDisabled === next.retryDisabled &&
   prev.branchDisabled === next.branchDisabled &&
   prev.retryDisabledReason === next.retryDisabledReason &&
@@ -2416,14 +2425,14 @@ export function ChatCanvasPage() {
   const loadingOlderRef = useRef(false);
 
   const history = useQuery({
-    queryKey: ["messages", sessionId],
+    queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
     queryFn: async () => {
       const page = await listSessionMessagesPage(sessionId, {
         limit: INITIAL_MESSAGE_PAGE,
       });
       setHistoryTotalCount(page.total_count);
       const previous =
-        queryClient.getQueryData<Message[]>(["messages", sessionId]) ?? [];
+        queryClient.getQueryData<Message[]>(workspaceQueryKey(workspaceId, "messages", sessionId)) ?? [];
       const pageIds = new Set(page.items.map((item) => item.id));
       const oldestPageId = page.items[0]?.id;
       const oldestIndex = oldestPageId
@@ -2451,7 +2460,7 @@ export function ChatCanvasPage() {
     // primary bound, this is the safety net for unobserved caches.
     gcTime: 15_000,
   });
-  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
 
   // Reset older-page cursor state when the active session changes.
   useEffect(() => {
@@ -2489,12 +2498,15 @@ export function ChatCanvasPage() {
           ) ?? null;
         const previousHeight = scroller?.scrollHeight ?? 0;
         const previousTop = scroller?.scrollTop ?? 0;
-        queryClient.setQueryData<Message[]>(["messages", sessionId], (current) => {
-          const existing = current ?? [];
-          const seen = new Set(existing.map((item) => item.id));
-          const older = page.items.filter((item) => !seen.has(item.id));
-          return older.length ? [...older, ...existing] : existing;
-        });
+        queryClient.setQueryData<Message[]>(
+          workspaceQueryKey(workspaceId, "messages", sessionId),
+          (current) => {
+            const existing = current ?? [];
+            const seen = new Set(existing.map((item) => item.id));
+            const older = page.items.filter((item) => !seen.has(item.id));
+            return older.length ? [...older, ...existing] : existing;
+          },
+        );
         if (scroller) {
           requestAnimationFrame(() => {
             const delta = scroller.scrollHeight - previousHeight;
@@ -2510,7 +2522,7 @@ export function ChatCanvasPage() {
       loadingOlderRef.current = false;
       setLoadingOlderMessages(false);
     }
-  }, [history.data, historyHasMoreBefore, queryClient, sessionId]);
+  }, [history.data, historyHasMoreBefore, queryClient, sessionId, workspaceId]);
 
   // Near the top of the conversation scroller, pull older turns automatically.
   useEffect(() => {
@@ -2547,16 +2559,18 @@ export function ChatCanvasPage() {
     queryClient.removeQueries({
       predicate: (query) => {
         const key = query.queryKey;
-        if (!Array.isArray(key) || key.length < 2) return false;
-        const root = key[0];
+        if (!Array.isArray(key) || key.length < 4) return false;
+        const [namespace, cachedWorkspaceId, resource, cachedSessionId] = key;
+        if (namespace !== "workspace" || cachedWorkspaceId !== workspaceId) {
+          return false;
+        }
         if (
-          root !== "messages" &&
-          root !== "message-versions" &&
-          root !== "message-snapshot"
+          resource !== "messages" &&
+          resource !== "message-versions" &&
+          resource !== "message-snapshot"
         ) {
           return false;
         }
-        const cachedSessionId = key[1];
         return (
           typeof cachedSessionId === "string" &&
           cachedSessionId !== "new" &&
@@ -2573,9 +2587,9 @@ export function ChatCanvasPage() {
       });
       return next.length === current.length ? current : next;
     });
-  }, [queryClient, sessionId]);
+  }, [queryClient, sessionId, workspaceId]);
 
-  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
+  const settings = useQuery({ queryKey: workspaceQueryKey(workspaceId, "settings"), queryFn: listSettings });
   const workspaceDefaultResponseMode = useMemo(
     () => readChatDefaultResponseMode(settings.data),
     [settings.data],
@@ -2691,13 +2705,13 @@ export function ChatCanvasPage() {
     thinkingMode,
   ]);
   const providers = useQuery({
-    queryKey: ["providers"],
+    queryKey: workspaceQueryKey(workspaceId, "providers"),
     queryFn: listProviders,
   });
-  const graphs = useQuery({ queryKey: ["graphs"], queryFn: listGraphs });
+  const graphs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "graphs"), queryFn: listGraphs });
   // 空会话提示优先参考工作区记忆；无记忆时使用中文默认问题。
   const emptySessionMemories = useQuery({
-    queryKey: ["memories", "empty-session-prompts"],
+    queryKey: workspaceQueryKey(workspaceId, "memories", "empty-session-prompts"),
     queryFn: () => listMemories({ state: "active", zone: "hot" }),
     staleTime: 60_000,
   });
@@ -2816,7 +2830,7 @@ export function ChatCanvasPage() {
   );
   const imageProviderModelQueries = useQueries({
     queries: imageProviders.map((provider) => ({
-      queryKey: ["provider-models", provider.id],
+      queryKey: workspaceQueryKey(workspaceId, "provider-models", provider.id),
       queryFn: () => discoverProviderModels(provider.id),
       retry: false,
     })),
@@ -2897,7 +2911,7 @@ export function ChatCanvasPage() {
   );
   const providerModelQueries = useQueries({
     queries: modelProviders.map((provider) => ({
-      queryKey: ["provider-models", provider.id],
+      queryKey: workspaceQueryKey(workspaceId, "provider-models", provider.id),
       queryFn: () => discoverProviderModels(provider.id),
       retry: false,
     })),
@@ -2944,7 +2958,7 @@ export function ChatCanvasPage() {
     (provider) => provider.id === retryProviderId,
   );
   const retryDiscoveredModels = useQuery({
-    queryKey: ["provider-models", retryProviderId],
+    queryKey: workspaceQueryKey(workspaceId, "provider-models", retryProviderId),
     queryFn: () => discoverProviderModels(retryProviderId),
     enabled: Boolean(retryTarget && retryProviderId),
     retry: false,
@@ -3482,7 +3496,7 @@ export function ChatCanvasPage() {
               )
             ) {
               queryClient.setQueryData<Message[]>(
-                ["messages", streamSessionId],
+                workspaceQueryKey(workspaceId, "messages", streamSessionId),
                 (current) => {
                   if (!current?.length) return [refreshed];
                   let found = false;
@@ -3520,9 +3534,9 @@ export function ChatCanvasPage() {
         }
         if (completed) {
           await queryClient.invalidateQueries({
-            queryKey: ["messages", streamSessionId],
+            queryKey: workspaceQueryKey(workspaceId, "messages", streamSessionId),
           });
-          void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+          void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
           // Always drop the optimistic row once the durable message is terminal,
           // even if the user is currently looking at another session.
           setLocalMessages((current) =>
@@ -3670,14 +3684,15 @@ export function ChatCanvasPage() {
     return `${persisted.length}:${last.id}:${last.status}`;
   }, [history.data]);
   const contextUsage = useQuery({
-    queryKey: [
+    queryKey: workspaceQueryKey(
+      workspaceId,
       "context-usage",
       sessionId,
       activeModelProvider?.id ?? "",
       selectedModel?.id ?? "",
       responseMode === "agentic",
       persistedTimelineStamp,
-    ],
+    ),
     queryFn: () =>
       getSessionContextUsage(sessionId, {
         provider_id: activeModelProvider?.id,
@@ -3729,11 +3744,12 @@ export function ChatCanvasPage() {
       suggestionAnchor !== undefined,
   );
   const suggestionAnchorVersions = useQuery({
-    queryKey: [
+    queryKey: workspaceQueryKey(
+      workspaceId,
       "message-versions",
       suggestionAnchor?.session_id ?? sessionId,
       suggestionAnchor?.id ?? null,
-    ],
+    ),
     queryFn: () =>
       listMessageVersions(suggestionAnchor!.session_id, suggestionAnchor!.id),
     enabled: Boolean(canPrepareSuggestedPrompts && suggestionAnchor),
@@ -3770,11 +3786,12 @@ export function ChatCanvasPage() {
     selectedModel?.id ?? null,
   ] as const;
   const persistedSuggestedPrompts = useQuery({
-    queryKey: [
+    queryKey: workspaceQueryKey(
+      workspaceId,
       "suggested-prompts",
       "persisted",
       ...suggestionQueryContext,
-    ],
+    ),
     queryFn: async ({ signal }) =>
       (await getSessionSuggestedPrompts(sessionId, { signal })) ?? null,
     enabled: canReadSuggestedPrompts,
@@ -3808,13 +3825,14 @@ export function ChatCanvasPage() {
       remoteSuggestionProviderAvailable,
   );
   const generatedSuggestedPrompts = useQuery({
-    queryKey: [
+    queryKey: workspaceQueryKey(
+      workspaceId,
       "suggested-prompts",
       "generated",
       ...suggestionQueryContext,
       suggestedPromptsModel.provider_id,
       suggestedPromptsModel.model_id,
-    ],
+    ),
     queryFn: ({ signal }) =>
       generateSessionSuggestedPrompts(
         sessionId,
@@ -3926,7 +3944,7 @@ export function ChatCanvasPage() {
           defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
         );
       }
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
         session,
         ...(current ?? []).filter((item) => item.id !== session.id),
       ]);
@@ -3944,7 +3962,7 @@ export function ChatCanvasPage() {
     const existingDraftId = getDraftSessionId();
     if (existingDraftId) {
       const cached = (
-        queryClient.getQueryData<Session[]>(["sessions"]) ?? []
+        queryClient.getQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions")) ?? []
       ).find((session) => session.id === existingDraftId);
       if (cached) {
         // Blank drafts re-opened via /chat/new adopt the current workspace
@@ -3961,7 +3979,7 @@ export function ChatCanvasPage() {
       }
       const reusePromise = listSessions()
         .then((sessions) => {
-          queryClient.setQueryData(["sessions", workspaceId], sessions);
+          queryClient.setQueryData(workspaceQueryKey(workspaceId, "sessions"), sessions);
           return sessions.find((session) => session.id === existingDraftId);
         })
         .then((session) => {
@@ -4064,7 +4082,7 @@ export function ChatCanvasPage() {
               title: goal.title,
             });
         if (canReuseCurrentSession) {
-          queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
+          queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
             current
               ? current.map((item) =>
                   item.id === learningSession.id ? learningSession : item,
@@ -4103,6 +4121,7 @@ export function ChatCanvasPage() {
     enabled: goalMode,
     onPublished: completeGoalSetup,
     scopeKey: conversationResetKey,
+    workspaceId,
   });
   useEffect(() => {
     if (!goalMode) return;
@@ -4120,7 +4139,7 @@ export function ChatCanvasPage() {
       return closeSession(currentSession.id);
     },
     onSuccess: async (closedSession) => {
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
         current
           ? current.map((item) =>
               item.id === closedSession.id ? closedSession : item,
@@ -4129,36 +4148,40 @@ export function ChatCanvasPage() {
       );
       setCloseDialogOpen(false);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
         // The session is closed — evict its message history and per-message
         // derived caches rather than just marking them stale. invalidate keeps
         // the (potentially large) cached message array resident; remove drops
         // it so a closed session stops holding memory, while re-opening simply
         // re-fetches. removeQueries returns void; wrap so Promise.all is uniform.
         Promise.resolve(
-          queryClient.removeQueries({ queryKey: ["messages", closedSession.id] }),
+          queryClient.removeQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", closedSession.id) }),
         ),
         Promise.resolve(
           queryClient.removeQueries({
-            queryKey: ["message-versions", closedSession.id],
+            queryKey: workspaceQueryKey(workspaceId, "message-versions", closedSession.id),
           }),
         ),
         Promise.resolve(
           queryClient.removeQueries({
-            queryKey: ["message-snapshot", closedSession.id],
+            queryKey: workspaceQueryKey(workspaceId, "message-snapshot", closedSession.id),
           }),
         ),
-        queryClient.invalidateQueries({ queryKey: ["evidence"] }),
-        queryClient.invalidateQueries({ queryKey: ["mastery"] }),
-        queryClient.invalidateQueries({ queryKey: ["mastery-review-jobs"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "evidence") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "mastery") }),
         queryClient.invalidateQueries({
-          queryKey: ["mastery-session-states"],
+          queryKey: workspaceQueryKey(workspaceId, "mastery-review-jobs"),
         }),
-        queryClient.invalidateQueries({ queryKey: ["mastery-schedules"] }),
-        queryClient.invalidateQueries({ queryKey: ["dashboard", workspaceId] }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "mastery-session-states"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "mastery-schedules"),
+        }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "dashboard") }),
         closedSession.goal_id
           ? queryClient.invalidateQueries({
-              queryKey: ["roadmap", closedSession.goal_id],
+              queryKey: workspaceQueryKey(workspaceId, "roadmap", closedSession.goal_id),
             })
           : Promise.resolve(),
       ]);
@@ -4656,7 +4679,7 @@ export function ChatCanvasPage() {
           ),
         ]);
         queryClient.setQueryData<Message[]>(
-          ["messages", targetSessionId],
+          workspaceQueryKey(workspaceId, "messages", targetSessionId),
           (current) => [
             ...(current ?? []).filter(
               (message) =>
@@ -4689,7 +4712,7 @@ export function ChatCanvasPage() {
             }
           }
           void queryClient.invalidateQueries({
-            queryKey: ["messages", targetSessionId],
+            queryKey: workspaceQueryKey(workspaceId, "messages", targetSessionId),
           });
         })();
       };
@@ -4774,7 +4797,7 @@ export function ChatCanvasPage() {
                   })
                     .then(async (updatedSession) => {
                       queryClient.setQueryData<Session[]>(
-                        ["sessions"],
+                        workspaceQueryKey(workspaceId, "sessions"),
                         (current) => {
                           if (!current) return [updatedSession];
                           if (
@@ -4792,7 +4815,7 @@ export function ChatCanvasPage() {
                         },
                       );
                       await queryClient.invalidateQueries({
-                        queryKey: ["sessions"],
+                        queryKey: workspaceQueryKey(workspaceId, "sessions"),
                       });
                     })
                     .catch(async (error: unknown) => {
@@ -4801,7 +4824,7 @@ export function ChatCanvasPage() {
                         error.code === "session_title_changed"
                       ) {
                         await queryClient.invalidateQueries({
-                          queryKey: ["sessions"],
+                          queryKey: workspaceQueryKey(workspaceId, "sessions"),
                         });
                         return;
                       }
@@ -4894,15 +4917,16 @@ export function ChatCanvasPage() {
         }
         if (activeLearningNode?.nodeId) {
           await queryClient.invalidateQueries({
-            queryKey: [
+            queryKey: workspaceQueryKey(
+              workspaceId,
               "node-questions",
               activeLearningNode.graphId,
               activeLearningNode.nodeId,
-            ],
+            ),
           });
           // Mastery stars / evidence may have moved; refresh rail graph cards.
           await queryClient.invalidateQueries({
-            queryKey: ["graph", activeLearningNode.graphId],
+            queryKey: workspaceQueryKey(workspaceId, "graph", activeLearningNode.graphId),
           });
         }
         markSessionGenerationFinished(targetSessionId, {
@@ -4910,7 +4934,7 @@ export function ChatCanvasPage() {
         });
         if (isViewingStream()) setStatus("ready");
         if (isViewingStream()) setStreamConnectionNotice(null);
-        void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+        void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
       } catch (error) {
         if (controller.signal.aborted) {
           const cancellation = activeCancellationRef.current;
@@ -5100,7 +5124,7 @@ export function ChatCanvasPage() {
           `“${file.original_name}”解析失败：${error instanceof Error ? error.message : "未知错误"}。请切换到智能体模式，或者删除该文件后再发送。`,
         );
       } finally {
-        await queryClient.invalidateQueries({ queryKey: ["files"] });
+        await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
       }
     },
     [queryClient, storedAudioTranscriptionProvider],
@@ -5122,7 +5146,7 @@ export function ChatCanvasPage() {
         }
       }
       if (!stored) stored = await uploadFile(file);
-      await queryClient.invalidateQueries({ queryKey: ["files"] });
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
       return prepareStoredFile(stored, agentMode);
     },
     [prepareStoredFile, queryClient, responseMode],
@@ -5386,7 +5410,7 @@ export function ChatCanvasPage() {
         changeSet.status === "confirmed"
           ? (["undo"] as string[])
           : ([] as string[]);
-      queryClient.setQueryData<Message[]>(["messages", sessionId], (current) =>
+      queryClient.setQueryData<Message[]>(workspaceQueryKey(workspaceId, "messages", sessionId), (current) =>
         current?.map((message) => ({
           ...message,
           parts: message.parts.map((part) => {
@@ -5419,7 +5443,7 @@ export function ChatCanvasPage() {
           }),
         })),
       );
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) =>
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
         current?.map((item) =>
           item.id === sessionId
             ? {
@@ -5435,15 +5459,15 @@ export function ChatCanvasPage() {
         ),
       );
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["messages", sessionId] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) }),
         queryClient.invalidateQueries({
-          queryKey: ["graph-change-sets", sessionId],
+          queryKey: workspaceQueryKey(workspaceId, "graph-change-sets", sessionId),
         }),
-        queryClient.invalidateQueries({ queryKey: ["sessions"] }),
-        queryClient.invalidateQueries({ queryKey: ["graphs"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graphs") }),
         changeSet.graph_id
           ? queryClient.invalidateQueries({
-              queryKey: ["graph", changeSet.graph_id],
+              queryKey: workspaceQueryKey(workspaceId, "graph", changeSet.graph_id),
             })
           : Promise.resolve(),
       ]);
@@ -6142,13 +6166,13 @@ export function ChatCanvasPage() {
       minimumVersion,
     );
     queryClient.setQueryData<Message[]>(
-      ["messages", sourceSessionId],
+      workspaceQueryKey(workspaceId, "messages", sourceSessionId),
       (current) => mergeMessageIntoCache(current, sourceMessage),
     );
     if (sessionId !== sourceSessionId) {
       // Retry versions live on the source session; just invalidate the viewing
       // session cache rather than re-fetching a full timeline.
-      void queryClient.invalidateQueries({ queryKey: ["messages", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
     }
   };
   const retry = useMutation<
@@ -6171,7 +6195,7 @@ export function ChatCanvasPage() {
       const tempId = `temp-retry-${stamp}`;
       const currentVersion =
         queryClient
-          .getQueryData<Message[]>(["messages", sourceSessionId])
+          .getQueryData<Message[]>(workspaceQueryKey(workspaceId, "messages", sourceSessionId))
           ?.find((message) => message.id === messageId)?.version ?? 0;
       const expectedVersion = currentVersion + 1;
       retryExpectedVersionRef.current = expectedVersion;
@@ -6367,12 +6391,12 @@ export function ChatCanvasPage() {
           toast.message("新版本已生成，消息记录正在后台同步。");
         }
         void Promise.all([
-          queryClient.invalidateQueries({ queryKey: ["messages", sessionId] }),
+          queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) }),
           queryClient.invalidateQueries({
-            queryKey: ["messages", variables.sourceSessionId],
+            queryKey: workspaceQueryKey(workspaceId, "messages", variables.sourceSessionId),
           }),
           queryClient.invalidateQueries({
-            queryKey: ["message-versions", variables.sourceSessionId],
+            queryKey: workspaceQueryKey(workspaceId, "message-versions", variables.sourceSessionId),
           }),
         ]);
         return;
@@ -6387,7 +6411,7 @@ export function ChatCanvasPage() {
         current.filter((message) => message.id !== result.tempId),
       );
       void queryClient.invalidateQueries({
-        queryKey: ["message-versions", variables.sourceSessionId],
+        queryKey: workspaceQueryKey(workspaceId, "message-versions", variables.sourceSessionId),
       });
       retryExpectedVersionRef.current = 0;
     },
@@ -6412,13 +6436,13 @@ export function ChatCanvasPage() {
       } catch {
         void Promise.all([
           queryClient.invalidateQueries({
-            queryKey: ["messages", variables.sourceSessionId],
+            queryKey: workspaceQueryKey(workspaceId, "messages", variables.sourceSessionId),
           }),
-          queryClient.invalidateQueries({ queryKey: ["messages", sessionId] }),
+          queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) }),
         ]);
       }
       void queryClient.invalidateQueries({
-        queryKey: ["message-versions", variables.sourceSessionId],
+        queryKey: workspaceQueryKey(workspaceId, "message-versions", variables.sourceSessionId),
       });
       retryExpectedVersionRef.current = 0;
       setStatus("ready");
@@ -6429,7 +6453,7 @@ export function ChatCanvasPage() {
   const mentionMatch = composerText.match(/(^|\s)@([^\s@]*)$/u);
   const mentionQuery = mentionMatch?.[2]?.toLocaleLowerCase() ?? "";
   const libraryFileMentions = useQuery({
-    queryKey: ["files", "mention", mentionQuery],
+    queryKey: workspaceQueryKey(workspaceId, "files", "mention", mentionQuery),
     queryFn: () => listFiles({ q: mentionQuery || undefined, limit: 8 }),
     enabled: Boolean(mentionMatch && !goalMode && !sessionIsClosed),
     staleTime: 15_000,
@@ -7238,6 +7262,7 @@ export function ChatCanvasPage() {
                                     : undefined
                       }
                       sessionId={message.session_id}
+                      workspaceId={workspaceId}
                     />
                   </LazyMessageMount>
                 );
@@ -7432,7 +7457,7 @@ export function ChatCanvasPage() {
         <SandboxAuthDialog
           onClose={() => setSandboxAuthRequest(null)}
           onGranted={() => {
-            void queryClient.invalidateQueries({ queryKey: ["messages", sessionId] });
+            void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
           }}
           request={sandboxAuthRequest}
         />
@@ -8647,14 +8672,14 @@ export function ChatCanvasPage() {
 }
 
 export function VersionsPage() {
-  const { sessionId = "" } = useParams();
+  const { sessionId = "", workspaceId = "" } = useParams();
   const queryClient = useQueryClient();
   const [messageId, setMessageId] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [draftId, setDraftId] = useState("");
   const [draftContent, setDraftContent] = useState("");
   const messages = useQuery({
-    queryKey: ["messages", sessionId],
+    queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
     queryFn: () => listSessionMessages(sessionId, { limit: 100 }),
     enabled: Boolean(sessionId),
     gcTime: 15_000,
@@ -8664,7 +8689,7 @@ export function VersionsPage() {
   );
   const targetId = messageId || assistants.at(-1)?.id || "";
   const versions = useQuery({
-    queryKey: ["message-versions", sessionId, targetId],
+    queryKey: workspaceQueryKey(workspaceId, "message-versions", sessionId, targetId),
     queryFn: () => listMessageVersions(sessionId, targetId),
     enabled: Boolean(targetId),
   });
@@ -8682,7 +8707,7 @@ export function VersionsPage() {
       toast.success("合并版本已保存并设为当前版本");
       setDraftId("");
       setSelected([]);
-      void queryClient.invalidateQueries({ queryKey: ["messages", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
       void versions.refetch();
     },
     onError: (error) => toast.error(error.message),

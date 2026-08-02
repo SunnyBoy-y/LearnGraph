@@ -10,6 +10,7 @@ import {
   previewNodeMerge,
   undoNodeMerge,
 } from "@/api";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import { StatePill } from "@/components/shared/page-elements";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,6 +37,7 @@ type GraphReviewDialogProps = {
   graph: Graph;
   onOpenChange: (open: boolean) => void;
   open: boolean;
+  workspaceId: string;
 };
 
 function JsonDetails({ label, value }: { label: string; value: Record<string, unknown> }) {
@@ -60,6 +62,7 @@ export function GraphReviewDialog({
   graph,
   onOpenChange,
   open,
+  workspaceId,
 }: GraphReviewDialogProps) {
   const queryClient = useQueryClient();
   const [sourceNodeId, setSourceNodeId] = useState("");
@@ -68,12 +71,12 @@ export function GraphReviewDialog({
   const [rationale, setRationale] = useState("");
   const [mergeConfirmed, setMergeConfirmed] = useState(false);
   const revisions = useQuery({
-    queryKey: ["graph-revisions", graph.id],
+    queryKey: workspaceQueryKey(workspaceId, "graph-revisions", graph.id),
     queryFn: () => listGraphRevisions(graph.id),
     enabled: open,
   });
   const merges = useQuery({
-    queryKey: ["node-merges"],
+    queryKey: workspaceQueryKey(workspaceId, "node-merges"),
     queryFn: listNodeMerges,
     enabled: open,
   });
@@ -113,9 +116,15 @@ export function GraphReviewDialog({
       setRationale("");
       setMergeConfirmed(false);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["node-merges"] }),
-        queryClient.invalidateQueries({ queryKey: ["graph-revisions", graph.id] }),
-        queryClient.invalidateQueries({ queryKey: ["graph", graph.id] }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "node-merges"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graph-revisions", graph.id),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graph", graph.id),
+        }),
       ]);
       return record;
     },
@@ -125,7 +134,9 @@ export function GraphReviewDialog({
     mutationFn: undoNodeMerge,
     onSuccess: async () => {
       toast.success("节点关系决策已撤销");
-      await queryClient.invalidateQueries({ queryKey: ["node-merges"] });
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "node-merges"),
+      });
     },
     onError: (error) => toast.error(error.message),
   });

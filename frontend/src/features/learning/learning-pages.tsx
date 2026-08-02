@@ -41,6 +41,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useAuth } from "@/features/auth/auth-context-value";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import type {
   AnswerResult,
   Evidence,
@@ -134,8 +136,12 @@ function EvidenceRow({
 }
 
 export function EvidenceReviewPage() {
+  const { workspaceId } = useAuth();
   const queryClient = useQueryClient();
-  const evidence = useQuery({ queryKey: ["evidence"], queryFn: listEvidence });
+  const evidence = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "evidence"),
+    queryFn: listEvidence,
+  });
   const decision = useMutation({
     mutationFn: ({
       id,
@@ -147,15 +153,21 @@ export function EvidenceReviewPage() {
       decideEvidence(id, { decision: choice, reason: "用户在审核箱中确认" }),
     onSuccess: () => {
       toast.success("审核结果已写入证据日志");
-      void queryClient.invalidateQueries({ queryKey: ["evidence"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "evidence"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
     },
   });
   const review = useMutation({
     mutationFn: () => runMasteryReview(),
     onSuccess: () => {
       toast.success("掌握度更新已完成");
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
     },
   });
   const batch = useMutation({
@@ -172,8 +184,12 @@ export function EvidenceReviewPage() {
       ),
     onSuccess: () => {
       toast.success("待审核证据已逐项接受");
-      void queryClient.invalidateQueries({ queryKey: ["evidence"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "evidence"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
     },
   });
   if (evidence.isPending)
@@ -275,7 +291,11 @@ export function PracticePage() {
   const [submittingId, setSubmittingId] = useState<string | null>(null);
 
   const exercises = useQuery({
-    queryKey: ["exercises", { wrongOnly, nodeId, activeBatchId }],
+    queryKey: workspaceQueryKey(workspaceId, "exercises", {
+      wrongOnly,
+      nodeId,
+      activeBatchId,
+    }),
     queryFn: () =>
       listExercises({
         wrongOnly,
@@ -283,12 +303,18 @@ export function PracticePage() {
         batchId: activeBatchId || undefined,
       }),
   });
-  const mastery = useQuery({ queryKey: ["mastery"], queryFn: getMastery });
+  const mastery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "mastery"),
+    queryFn: getMastery,
+  });
   const schedules = useQuery({
-    queryKey: ["mastery-schedules"],
+    queryKey: workspaceQueryKey(workspaceId, "mastery-schedules"),
     queryFn: listMasterySchedules,
   });
-  const files = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
+  const files = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "files"),
+    queryFn: () => listFiles(),
+  });
 
   const resolvedNodeId = nodeId || mastery.data?.[0]?.node_id || "";
 
@@ -306,8 +332,12 @@ export function PracticePage() {
       setActiveBatchId(batchId);
       setBatchAnswers({});
       setBatchResults({});
-      void queryClient.invalidateQueries({ queryKey: ["exercises"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "exercises"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -383,10 +413,18 @@ export function PracticePage() {
       const result = await answerExercise(exercise.id, { answer });
       setBatchResults((current) => ({ ...current, [exercise.id]: result }));
       toast[result.is_correct ? "success" : "error"](result.feedback);
-      void queryClient.invalidateQueries({ queryKey: ["exercises"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery-schedules"] });
-      void queryClient.invalidateQueries({ queryKey: ["evidence"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "exercises"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery-schedules"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "evidence"),
+      });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "提交失败");
     } finally {
@@ -703,23 +741,34 @@ export function ExerciseAnswerPage() {
   const { questionId = "", workspaceId = "", setId = "default" } = useParams();
   const queryClient = useQueryClient();
   const exercises = useQuery({
-    queryKey: ["exercises", { setId }],
+    queryKey: workspaceQueryKey(workspaceId, "exercises", { setId }),
     queryFn: () =>
       listExercises({
         batchId: setId !== "default" ? setId : undefined,
       }),
   });
-  const mastery = useQuery({ queryKey: ["mastery"], queryFn: getMastery });
+  const mastery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "mastery"),
+    queryFn: getMastery,
+  });
   const exercise = exercises.data?.find((item) => item.id === questionId);
   const [answer, setAnswer] = useState<string | string[]>("");
   const submit = useMutation({
     mutationFn: () => answerExercise(questionId, { answer }),
     onSuccess: (result) => {
       toast[result.is_correct ? "success" : "error"](result.feedback);
-      void queryClient.invalidateQueries({ queryKey: ["exercises"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
-      void queryClient.invalidateQueries({ queryKey: ["mastery-schedules"] });
-      void queryClient.invalidateQueries({ queryKey: ["evidence"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "exercises"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery-schedules"),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "evidence"),
+      });
     },
     onError: (error) => toast.error(error.message),
   });

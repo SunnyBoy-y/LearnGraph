@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import type { FileRecord } from "@/types/files";
 import type { PendingDocumentSelection } from "./document-chat-panel";
 import { DocumentChatPanel } from "./document-chat-panel";
+import { workspaceQueryKey } from "@/lib/query-keys";
 
 export function ConceptBranchWorkspace({
   branchIds,
@@ -27,7 +28,7 @@ export function ConceptBranchWorkspace({
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
+  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
   const [activeId, setActiveId] = useState(branchIds.at(-1) ?? "");
   const [position, setPosition] = useState({ x: 72, y: 92 });
   const dragRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);
@@ -38,7 +39,7 @@ export function ConceptBranchWorkspace({
   const effectiveActiveId = branchIds.includes(activeId) ? activeId : branchIds.at(-1) ?? "";
   const active = sessions.data?.find((session) => session.id === effectiveActiveId);
   const messages = useQuery({
-    queryKey: ["messages", effectiveActiveId],
+    queryKey: workspaceQueryKey(workspaceId, "messages", effectiveActiveId),
     queryFn: () => listSessionMessages(effectiveActiveId, { limit: 50 }),
     enabled: Boolean(effectiveActiveId),
     gcTime: 15_000,
@@ -75,7 +76,7 @@ export function ConceptBranchWorkspace({
     mutationFn: ({ action, summary }: { action: 'merge_summary' | 'standalone'; summary?: string }) =>
       promoteConceptBranch(effectiveActiveId, { action, summary }),
     onSuccess: (session, variables) => {
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
       if (variables.action === "standalone") {
         navigate(`/w/${workspaceId}/chat/${session.id}`);
       } else {
@@ -96,7 +97,7 @@ export function ConceptBranchWorkspace({
       source_ids: [effectiveActiveId, file.id],
     }),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["memory"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memory") });
       toast.success("概念解释已保存为笔记");
     },
     onError: (error) => toast.error(error.message),

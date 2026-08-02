@@ -88,6 +88,7 @@ import {
 import { lookupFile, uploadFile } from "@/api/files";
 import { ApiError } from "@/api/client";
 import { hashFileSha256 } from "@/lib/file-hash";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import type { FileRecord } from "@/types/files";
 import type {
   DocumentSelectionContext,
@@ -247,10 +248,10 @@ export function DocumentChatPanel({
   );
   const [modelSearch, setModelSearch] = useState("");
 
-  const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
-  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
+  const providers = useQuery({ queryKey: workspaceQueryKey(workspaceId, "providers"), queryFn: listProviders });
+  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
   const history = useQuery({
-    queryKey: ["messages", sessionId],
+    queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
     queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
     enabled: Boolean(sessionId),
     gcTime: 15_000,
@@ -267,7 +268,7 @@ export function DocumentChatPanel({
   );
   const providerModelQueries = useQueries({
     queries: modelProviders.map((provider) => ({
-      queryKey: ["provider-models", provider.id],
+      queryKey: workspaceQueryKey(workspaceId, "provider-models", provider.id),
       queryFn: () => discoverProviderModels(provider.id),
       retry: false,
     })),
@@ -488,7 +489,7 @@ export function DocumentChatPanel({
       targetSessionId = created.id;
       createdSessionRef.current = created.id;
       onSessionChange(created.id);
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
         created,
         ...(current ?? []).filter((item) => item.id !== created.id),
       ]);
@@ -686,7 +687,7 @@ export function DocumentChatPanel({
         if (attempt === 2) throw transientError ?? new Error("消息流中断");
       }
       if (!completed) throw new Error("消息流结束但没有收到完成事件。");
-      await queryClient.invalidateQueries({ queryKey: ["messages", targetSessionId] });
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", targetSessionId) });
       setLocalMessages([]);
       setStatus("ready");
       activeMessageId.current = null;
@@ -747,7 +748,7 @@ export function DocumentChatPanel({
       targetSessionId = created.id;
       createdSessionRef.current = created.id;
       onSessionChange(created.id);
-      queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
         created,
         ...(current ?? []).filter((item) => item.id !== created.id),
       ]);

@@ -34,6 +34,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import type { Graph, GraphNode } from "@/types/graphs";
 import type {
   ClarificationQuestion,
@@ -62,6 +63,7 @@ type GoalSetupOptions = {
   enabled: boolean;
   onPublished: (result: { goal: Goal; graph: Graph }) => Promise<void> | void;
   scopeKey: string;
+  workspaceId: string;
 };
 
 function initialGoalDraft(goal: Goal): GoalConfirmRequest {
@@ -135,6 +137,7 @@ export function useGoalSetupFlow({
   enabled,
   onPublished,
   scopeKey,
+  workspaceId,
 }: GoalSetupOptions) {
   const queryClient = useQueryClient();
   const wasEnabled = useRef(enabled);
@@ -166,7 +169,7 @@ export function useGoalSetupFlow({
       }),
   });
   const graph = useQuery({
-    queryKey: ["graph", scopeKey, graphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     queryFn: () => getGraph(graphId),
     enabled: Boolean(graphId),
   });
@@ -203,10 +206,14 @@ export function useGoalSetupFlow({
       setAcceptedNodeIds(new Set());
       setStage("graph_review");
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["goals"] }),
-        queryClient.invalidateQueries({ queryKey: ["graphs"] }),
         queryClient.invalidateQueries({
-          queryKey: ["graph", scopeKey, graphSummary.id],
+          queryKey: workspaceQueryKey(workspaceId, "goals"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graphs"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graph", graphSummary.id),
         }),
       ]);
     },
@@ -227,7 +234,7 @@ export function useGoalSetupFlow({
         return next;
       });
       await queryClient.invalidateQueries({
-        queryKey: ["graph", scopeKey, graphId],
+        queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
       });
     },
     onError: refreshGraphAfterConflict,
@@ -253,7 +260,7 @@ export function useGoalSetupFlow({
         return next;
       });
       await queryClient.invalidateQueries({
-        queryKey: ["graph", scopeKey, graphId],
+        queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
       });
     },
     onError: refreshGraphAfterConflict,
@@ -268,7 +275,7 @@ export function useGoalSetupFlow({
         return next;
       });
       await queryClient.invalidateQueries({
-        queryKey: ["graph", scopeKey, graphId],
+        queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
       });
     },
     onError: refreshGraphAfterConflict,
@@ -288,10 +295,14 @@ export function useGoalSetupFlow({
     onSuccess: async (published) => {
       setStage("complete");
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["goals"] }),
-        queryClient.invalidateQueries({ queryKey: ["graphs"] }),
         queryClient.invalidateQueries({
-          queryKey: ["graph", scopeKey, graphId],
+          queryKey: workspaceQueryKey(workspaceId, "goals"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graphs"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
         }),
       ]);
       await onPublished(published);
@@ -414,7 +425,9 @@ export function useGoalSetupFlow({
     setResult(response);
     setDraft(initialGoalDraft(response.goal));
     setStage(response.questions.length ? "clarifying" : "goal_review");
-    await queryClient.invalidateQueries({ queryKey: ["goals"] });
+    await queryClient.invalidateQueries({
+      queryKey: workspaceQueryKey(workspaceId, "goals"),
+    });
   }
 
   function recordAnswer(

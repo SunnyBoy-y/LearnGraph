@@ -74,12 +74,13 @@ export function workspaceResourcePrefix(
  * workspace header.
  *
  * WHICH ENDPOINTS QUALIFY: request does NOT carry `X-Workspace-ID`. Typical
- * examples are current-user (profile, preferences, sessions list) and
- * organization/account management — data that belongs to the account, not to
- * one workspace, and is therefore safe (and correct) to share across workspace
- * switches. If the endpoint you are keying sends `X-Workspace-ID`, use
- * `workspaceQueryKey` / `currentWorkspaceQueryKey` instead; using an identity
- * key there bleeds cache cross-tenant.
+ * examples are current-user (profile / preferences) and organization or
+ * account management — data that belongs to the account, not to one
+ * workspace, and is therefore safe (and correct) to share across workspace
+ * switches. Chat session lists, messages, graphs, and other resources that
+ * send `X-Workspace-ID` must use `workspaceQueryKey` /
+ * `currentWorkspaceQueryKey` instead; using an identity key there bleeds
+ * cache cross-tenant.
  */
 export function identityQueryKey(
   userId: string | null | undefined,

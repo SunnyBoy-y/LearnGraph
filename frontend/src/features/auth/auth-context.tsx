@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
 import {
@@ -8,11 +8,13 @@ import {
   login as loginAccount,
   register as registerAccount,
   logout as revokeCurrentSession,
+  selectWorkspace,
 } from "@/api/auth";
 import { authStore } from "@/api/auth-store";
 import { getCurrentUser } from "@/api/control";
 import {
   clearAuthenticatedClientState,
+  clearWorkspaceClientState,
   registerAuthInvalidationHandler,
 } from "@/lib/auth-query-cache";
 import { clearSelectionExplanations, clearAllSelectionExplanations } from "@/features/chat/selection-explanation";
@@ -26,6 +28,7 @@ import {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState(() => authStore.getSession());
   const [workspaceName, setWorkspaceName] = useState("");
+  const workspaceSelectionRequestRef = useRef(0);
 
   useEffect(
     () =>
@@ -91,13 +94,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       workspaceName: workspaceName || session?.workspaceId || "",
       async setWorkspaceId(workspaceId) {
         if (!session || workspaceId === session.workspaceId) return;
-        const workspaces = await listWorkspaces();
-        if (!workspaces.some((workspace) => workspace.id === workspaceId)) {
-          throw new Error("Workspace is not accessible to this account");
-        }
-        await clearAuthenticatedClientState();
+        const requestId = workspaceSelectionRequestRef.current + 1;
+        workspaceSelectionRequestRef.current = requestId;
+        await selectWorkspace(workspaceId);
+        // A slower, earlier selection must not overwrite the newest choice.
+        if (requestId !== workspaceSelectionRequestRef.current) return;
+        const previousWorkspaceId = session.workspaceId;
+        await clearWorkspaceClientState(previousWorkspaceId);
+        if (requestId !== workspaceSelectionRequestRef.current) return;
         authStore.setWorkspaceId(workspaceId);
-        setSession({ ...session, workspaceId });
+        setSession((current) =>
+          current && current.workspaceId === previousWorkspaceId
+            ? { ...current, workspaceId }
+            : current,
+        );
       },
       async login(username, password) {
         await clearAuthenticatedClientState();

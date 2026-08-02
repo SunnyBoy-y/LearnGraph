@@ -3,6 +3,7 @@ import type {
   LoginResponse,
   RegisterRequest,
   Workspace,
+  WorkspaceSelectionResponse,
 } from '@/types/auth'
 
 import { authStore } from './auth-store'
@@ -62,6 +63,14 @@ export function deleteAccount(
     { current_password: currentPassword, confirmation },
     { workspace: false },
   )
+}
+
+export function selectWorkspace(workspaceId: string): Promise<WorkspaceSelectionResponse> {
+  // Selecting a workspace changes the server-side session default. It must not
+  // inherit X-Workspace-ID for the workspace that is about to be left.
+  return apiClient.post<WorkspaceSelectionResponse>(`/workspaces/${workspaceId}/select`, undefined, {
+    workspace: false,
+  })
 }
 
 export function listWorkspaces(): Promise<Workspace[]> {

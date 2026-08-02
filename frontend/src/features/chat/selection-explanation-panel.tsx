@@ -68,6 +68,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { discoverProviderModels, listProviders } from "@/api/providers";
 import { getAgentSandboxReadiness } from "@/api/control";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import {
   cancelSessionMessage,
   createSession,
@@ -238,10 +239,10 @@ export function SelectionExplanationPanel({
   );
   const [modelSearch, setModelSearch] = useState("");
 
-  const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
-  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
+  const providers = useQuery({ queryKey: workspaceQueryKey(workspaceId, "providers"), queryFn: listProviders });
+  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
   const history = useQuery({
-    queryKey: ["messages", sessionId],
+    queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
     queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
     enabled: Boolean(sessionId),
     gcTime: 15_000,
@@ -259,7 +260,7 @@ export function SelectionExplanationPanel({
   );
   const providerModelQueries = useQueries({
     queries: modelProviders.map((provider) => ({
-      queryKey: ["provider-models", provider.id],
+      queryKey: workspaceQueryKey(workspaceId, "provider-models", provider.id),
       queryFn: () => discoverProviderModels(provider.id),
       retry: false,
     })),
@@ -424,7 +425,7 @@ export function SelectionExplanationPanel({
     setSessionId(created.id);
     const bound = bindExplanationSession(parentSessionId, record.id, created.id);
     if (bound) setRecord(bound);
-    queryClient.setQueryData<Session[]>(["sessions", workspaceId], (current) => [
+    queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
       created,
       ...(current ?? []).filter((item) => item.id !== created.id),
     ]);
@@ -627,9 +628,9 @@ export function SelectionExplanationPanel({
       }
       if (!completed) throw new Error("消息流结束但没有收到完成事件。");
       await queryClient.invalidateQueries({
-        queryKey: ["messages", targetSessionId],
+        queryKey: workspaceQueryKey(workspaceId, "messages", targetSessionId),
       });
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
       setLocalMessages([]);
       setStatus("ready");
       activeMessageId.current = null;

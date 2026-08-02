@@ -55,6 +55,7 @@ import {
   studyMultipleNodes,
   updateGraphNode,
 } from "@/api";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { GraphReviewDialog } from "@/components/graph/graph-review-dialog";
 import {
@@ -618,12 +619,18 @@ export function GraphWorkspacePage() {
   // graphId 为空时只展示书架，不自动打开任何图谱画布。
   const hasOpenedGraph = Boolean(graphId);
   const graph = useQuery({
-    queryKey: ["graph", graphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     queryFn: () => getGraph(graphId),
     enabled: hasOpenedGraph,
   });
-  const graphs = useQuery({ queryKey: ["graphs"], queryFn: listGraphs });
-  const goals = useQuery({ queryKey: ["goals"], queryFn: listGoals });
+  const graphs = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "graphs"),
+    queryFn: listGraphs,
+  });
+  const goals = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "goals"),
+    queryFn: listGoals,
+  });
   const goalBooks: GoalShelfEntry[] = (goals.data ?? []).map((goal) => ({
     id: `goal-${goal.id}`,
     title: goal.title,
@@ -687,7 +694,7 @@ export function GraphWorkspacePage() {
     window.localStorage.setItem("learngraph:graph-node-filter", nodeStateFilter);
   }, [nodeStateFilter]);
   const openedGraph = useQuery({
-    queryKey: ["graph", activeGraphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
     queryFn: () => getGraph(activeGraphId),
     enabled: Boolean(activeGraphId) && activeGraphId !== graphId,
   });
@@ -716,6 +723,7 @@ export function GraphWorkspacePage() {
   // loads (avoids N parallel questions calls for every card on large graphs).
   // Cache counts across selection so interactive learning updates stick.
   const selectedExplore = useNodeExploreRounds(
+    workspaceId,
     activeGraphId || undefined,
     selectedNode?.id,
   );
@@ -883,9 +891,11 @@ export function GraphWorkspacePage() {
             : "已取消节点关注状态",
       );
       void queryClient.invalidateQueries({
-        queryKey: ["graph", activeGraphId],
+        queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
       });
-      void queryClient.invalidateQueries({ queryKey: ["mastery"] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "mastery"),
+      });
     },
     onError: async (error) => {
       if (
@@ -894,7 +904,7 @@ export function GraphWorkspacePage() {
       ) {
         setEditingNode(false);
         await queryClient.invalidateQueries({
-          queryKey: ["graph", activeGraphId],
+          queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
         });
         toast.warning(
           "图谱已由其他编辑更新，已刷新到最新修订，请重新确认。",
@@ -903,7 +913,7 @@ export function GraphWorkspacePage() {
       }
       toast.error(error.message);
       await queryClient.invalidateQueries({
-        queryKey: ["graph", activeGraphId],
+        queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
       });
     },
   });
@@ -926,7 +936,8 @@ export function GraphWorkspacePage() {
         target_weight: targetWeight,
       }),
     onSuccess: (updated) => {
-      queryClient.setQueryData<Graph>(["graph", activeGraphId], (current) =>
+      queryClient.setQueryData<Graph>(
+        workspaceQueryKey(workspaceId, "graph", activeGraphId), (current) =>
         current
           ? {
               ...current,
@@ -939,12 +950,14 @@ export function GraphWorkspacePage() {
       setEditingNode(false);
       toast.success("节点内容已保存");
       void queryClient.invalidateQueries({
-        queryKey: ["graph", activeGraphId],
+        queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
       });
     },
     onError: (error) => {
       toast.error(error.message);
-      void queryClient.invalidateQueries({ queryKey: ["graph", activeGraphId] });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
+      });
     },
   });
 
@@ -1045,11 +1058,21 @@ export function GraphWorkspacePage() {
         setSearchParams(next, { replace: true });
       }
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["goals"] }),
-        queryClient.invalidateQueries({ queryKey: ["graphs"] }),
-        queryClient.invalidateQueries({ queryKey: ["projects"] }),
-        queryClient.invalidateQueries({ queryKey: ["sessions"] }),
-        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "goals"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "graphs"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "projects"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "sessions"),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "dashboard"),
+        }),
       ]);
     } catch (error) {
       setGoalDeleteError(
@@ -1676,6 +1699,7 @@ export function GraphWorkspacePage() {
           graph={activeGraph}
           onOpenChange={setGraphReviewOpen}
           open={graphReviewOpen}
+          workspaceId={workspaceId}
         />
       ) : null}
     </PageFrame>
@@ -2003,7 +2027,10 @@ export function JointStudyPage() {
   const { workspaceId = "" } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const graphs = useQuery({ queryKey: ["graphs"], queryFn: listGraphs });
+  const graphs = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "graphs"),
+    queryFn: listGraphs,
+  });
   const requestedGraphId = searchParams.get("graphId") ?? "";
   const requestedNodeIds = useMemo(
     () =>
@@ -2018,7 +2045,7 @@ export function JointStudyPage() {
   const [graphId, setGraphId] = useState(requestedGraphId);
   const resolvedGraphId = graphId || graphs.data?.[0]?.id || "";
   const graph = useQuery({
-    queryKey: ["graph", resolvedGraphId],
+    queryKey: workspaceQueryKey(workspaceId, "graph", resolvedGraphId),
     queryFn: () => getGraph(resolvedGraphId),
     enabled: Boolean(resolvedGraphId),
   });
@@ -2332,12 +2359,15 @@ export function JointStudyPage() {
 
 export function CapabilityGraphPage() {
   const { workspaceId = "" } = useParams();
-  const mastery = useQuery({ queryKey: ["mastery"], queryFn: getMastery });
+  const mastery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "mastery"),
+    queryFn: getMastery,
+  });
   const [selectedId, setSelectedId] = useState("");
   const [depthLimit, setDepthLimit] = useState(1);
   const [alignmentOpen, setAlignmentOpen] = useState(false);
   const alignment = useQuery({
-    queryKey: ["mastery-alignment", selectedId],
+    queryKey: workspaceQueryKey(workspaceId, "mastery-alignment", selectedId),
     queryFn: () => getMasteryAlignment(selectedId),
     enabled: alignmentOpen && Boolean(selectedId),
   });

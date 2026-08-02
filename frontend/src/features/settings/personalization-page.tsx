@@ -5,6 +5,8 @@ import { toast } from "sonner";
 
 import { listSettings, updateSetting } from "@/api";
 import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
+import { useAuth } from "@/features/auth/auth-context-value";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import {
   ErrorState,
   LoadingState,
@@ -47,8 +49,12 @@ function stylesEqual(a: ResponseStyleConfig, b: ResponseStyleConfig): boolean {
 }
 
 export function PersonalizationPage() {
+  const { workspaceId } = useAuth();
   const queryClient = useQueryClient();
-  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
+  const settings = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "settings"),
+    queryFn: listSettings,
+  });
   const saved = useMemo(
     () => getResponseStyleFromSettings(settings.data),
     [settings.data],
@@ -66,10 +72,13 @@ export function PersonalizationPage() {
       updateSetting(CHAT_RESPONSE_STYLE_SETTING_KEY, value),
     onError: (error: Error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
-        ...(current ?? []).filter((item) => item.key !== setting.key),
-        setting,
-      ]);
+      queryClient.setQueryData<WorkspaceSetting[]>(
+        workspaceQueryKey(workspaceId, "settings"),
+        (current) => [
+          ...(current ?? []).filter((item) => item.key !== setting.key),
+          setting,
+        ],
+      );
       toast.success("个性化设置已保存");
     },
   });

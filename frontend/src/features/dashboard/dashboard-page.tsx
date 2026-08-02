@@ -34,6 +34,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import { cn } from "@/lib/utils";
 
 const SUMMARY_CHARACTER_LIMIT = 100;
@@ -90,13 +91,21 @@ export function DashboardPage() {
   const auth = useAuth();
   const base = `/w/${workspaceId}`;
   const dashboard = useQuery({
-    queryKey: ["dashboard", workspaceId],
+    queryKey: workspaceQueryKey(workspaceId, "dashboard"),
     queryFn: getDashboard,
   });
-  const sessions = useQuery({ queryKey: ["sessions", workspaceId], queryFn: listSessions });
+  const sessions = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "sessions"),
+    queryFn: listSessions,
+  });
   const recentSession = sessions.data?.[0];
   const recentMessages = useQuery({
-    queryKey: ["messages", recentSession?.id, "dashboard-preview"],
+    queryKey: workspaceQueryKey(
+      workspaceId,
+      "messages",
+      recentSession?.id,
+      "dashboard-preview",
+    ),
     queryFn: () => listSessionMessages(recentSession!.id, { limit: 8 }),
     enabled: Boolean(recentSession),
     gcTime: 30_000,
@@ -120,7 +129,7 @@ export function DashboardPage() {
     onSuccess: () => {
       setTodo("");
       void queryClient.invalidateQueries({
-        queryKey: ["dashboard", workspaceId],
+        queryKey: workspaceQueryKey(workspaceId, "dashboard"),
       });
     },
     onError: (error) => toast.error(error.message),
@@ -129,7 +138,7 @@ export function DashboardPage() {
     mutationFn: (id: string) => updateAction(id, { status: "completed" }),
     onSuccess: () =>
       void queryClient.invalidateQueries({
-        queryKey: ["dashboard", workspaceId],
+        queryKey: workspaceQueryKey(workspaceId, "dashboard"),
       }),
     onError: (error) => toast.error(error.message),
   });

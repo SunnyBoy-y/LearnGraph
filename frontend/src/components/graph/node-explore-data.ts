@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { listNodeQuestions } from "@/api";
+import { workspaceQueryKey } from "@/lib/query-keys";
 
 export type NodeExploreRound = {
   id: string;
@@ -8,11 +9,15 @@ export type NodeExploreRound = {
   created_at: string;
 };
 
-export function useNodeExploreRounds(graphId?: string, nodeId?: string) {
+export function useNodeExploreRounds(
+  workspaceId: string,
+  graphId?: string,
+  nodeId?: string,
+) {
   return useQuery({
-    queryKey: ["node-questions", graphId, nodeId],
+    queryKey: workspaceQueryKey(workspaceId, "node-questions", graphId, nodeId),
     queryFn: () => listNodeQuestions(graphId!, nodeId!),
-    enabled: Boolean(graphId && nodeId),
+    enabled: Boolean(workspaceId && graphId && nodeId),
     staleTime: 30_000,
   });
 }
