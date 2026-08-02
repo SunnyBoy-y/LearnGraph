@@ -5,6 +5,7 @@
   "dependencies": {
     "@vitejs/plugin-react": "4.3.4",
     "@vitejs/plugin-vue": "5.2.1",
+    "playwright-core": "1.62.0",
     "react": "19.0.0",
     "react-dom": "19.0.0",
     "vite": "6.0.7",

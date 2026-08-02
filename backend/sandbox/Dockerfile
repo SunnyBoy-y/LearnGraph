@@ -26,11 +26,13 @@ RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
 
 # Frontend toolchain lives at /node_modules: Node resolves imports upward from
 # /workspace, so per-session workspaces use vue/react/vite with zero downloads
-# and zero workspace disk quota. playwright-core stays global for NODE_PATH.
-COPY toolchain/package.json /package.json
+# and zero workspace disk quota. package-lock.json makes the dependency graph
+# reproducible; npm ci never mutates it during image builds.
+COPY toolchain/package.json toolchain/package-lock.json /tmp/toolchain/
 RUN npm config set registry "${NPM_REGISTRY}" \
-    && npm install --global --omit=dev playwright-core@1.62.0 \
-    && cd / && npm install --omit=dev --no-audit --no-fund \
+    && cd /tmp/toolchain \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && mv node_modules /node_modules \
     && npm cache clean --force
 
 COPY --chown=65532:65532 runner.py /opt/learngraph/runner.py
@@ -38,7 +40,7 @@ COPY --chown=65532:65532 browser-smoke.js /opt/learngraph/browser-smoke.js
 COPY --chown=65532:65532 tasks/render.js /opt/learngraph/tasks/render.js
 COPY tasks/learngraph_tasks /usr/local/lib/python3.12/site-packages/learngraph_tasks
 
-ENV NODE_PATH=/usr/local/lib/node_modules \
+ENV NODE_PATH=/node_modules \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
