@@ -1244,7 +1244,12 @@ function UserMessage({
   const markedSegments = useMemo(() => {
     const marks = selectionMarks
       .filter((item) => item.sourceMessageId === message.id)
-      .map((item) => ({ id: item.id, selectedText: item.selectedText }));
+      .map((item) => ({
+        id: item.id,
+        selectedText: item.selectedText,
+        prefix: item.prefix,
+        suffix: item.suffix,
+      }));
     return splitTextWithSelectionMarks(message.content, marks);
   }, [message.content, message.id, selectionMarks]);
 
@@ -1556,7 +1561,12 @@ function AssistantMessageInner({
     if (selectedVersionId || !messageContentRef.current) return;
     const marks = selectionMarks
       .filter((item) => item.sourceMessageId === message.id)
-      .map((item) => ({ id: item.id, selectedText: item.selectedText }));
+      .map((item) => ({
+        id: item.id,
+        selectedText: item.selectedText,
+        prefix: item.prefix,
+        suffix: item.suffix,
+      }));
     if (!marks.length) return;
     let dispose: (() => void) | undefined;
     // Streamdown can replace text nodes after paint; decorate on the next frame
@@ -3277,6 +3287,15 @@ export function ChatCanvasPage() {
         (typeof part.data?.chat_session_id === "string" && part.data.chat_session_id) ||
         sessionId;
       if (!chatSessionId || chatSessionId === "new") continue;
+      const sandboxSessionId =
+        typeof part.data?.sandbox_session_id === "string"
+          ? part.data.sandbox_session_id
+          : null;
+      const commandIntentDigest =
+        typeof part.data?.command_intent_digest === "string"
+          ? part.data.command_intent_digest
+          : null;
+      if (!sandboxSessionId || !commandIntentDigest) continue;
       setSandboxAuthRequest((current) => {
         if (current) return current;
         return {
@@ -3285,10 +3304,8 @@ export function ChatCanvasPage() {
           action: typeof part.data?.action === "string" ? part.data.action : "delete_path",
           message:
             typeof part.data?.message_zh === "string" ? part.data.message_zh : undefined,
-          sandboxSessionId:
-            typeof part.data?.sandbox_session_id === "string"
-              ? part.data.sandbox_session_id
-              : undefined,
+          sandboxSessionId,
+          commandIntentDigest,
         };
       });
       break;

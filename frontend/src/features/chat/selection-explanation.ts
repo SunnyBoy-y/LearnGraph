@@ -142,7 +142,9 @@ function boundStorage(map: StorageMap): StorageMap {
   // underline sets regardless of which parent session they belong to.
   const flat: Array<[string, SelectionExplanationRecord]> = entries
     .flatMap(([parentId, records]) =>
-      records.map((record) => [parentId, record] as const),
+      records.map(
+        (record) => [parentId, record] as [string, SelectionExplanationRecord],
+      ),
     )
     .sort(
       (a, b) => (a[1].createdAt ?? "").localeCompare(b[1].createdAt ?? ""),
@@ -381,38 +383,98 @@ export function selectionExplanationRecordsEventName() {
 }
 
 /**
- * Split plain text into segments with clickable explain marks for the first
- * exact occurrence of each mark. Used for user messages (React-owned text).
+ * Locate a stored selection in current rendered content. Prefer an exact
+ * prefix/suffix anchor, then the strongest partial context match, and finally
+ * the first non-overlapping occurrence for older or edited records.
+ */
+type SelectionExplanationMark = Pick<
+  SelectionExplanationRecord,
+  "id" | "selectedText" | "prefix" | "suffix"
+>;
+
+type TextRange = { start: number; end: number };
+
+function matchingPrefixLength(content: string, prefix: string): number {
+  const maxLength = Math.min(content.length, prefix.length);
+  for (let length = maxLength; length > 0; length -= 1) {
+    if (content.endsWith(prefix.slice(-length))) return length;
+  }
+  return 0;
+}
+
+function matchingSuffixLength(content: string, suffix: string): number {
+  const maxLength = Math.min(content.length, suffix.length);
+  for (let length = maxLength; length > 0; length -= 1) {
+    if (content.startsWith(suffix.slice(0, length))) return length;
+  }
+  return 0;
+}
+
+function rangesOverlap(left: TextRange, right: TextRange): boolean {
+  return left.start < right.end && left.end > right.start;
+}
+
+function findSelectionRange(
+  content: string,
+  mark: SelectionExplanationMark,
+  usedRanges: TextRange[],
+): TextRange | null {
+  const needle = mark.selectedText.trim();
+  if (!needle) return null;
+
+  const candidates: Array<TextRange & { exact: boolean; score: number }> = [];
+  let from = 0;
+  while (from <= content.length - needle.length) {
+    const start = content.indexOf(needle, from);
+    if (start < 0) break;
+    const range = { start, end: start + needle.length };
+    if (!usedRanges.some((used) => rangesOverlap(range, used))) {
+      const before = content.slice(0, start);
+      const after = content.slice(range.end);
+      const prefixScore = matchingPrefixLength(before, mark.prefix);
+      const suffixScore = matchingSuffixLength(after, mark.suffix);
+      candidates.push({
+        ...range,
+        exact:
+          (!mark.prefix || prefixScore === mark.prefix.length) &&
+          (!mark.suffix || suffixScore === mark.suffix.length),
+        score: prefixScore + suffixScore,
+      });
+    }
+    from = start + Math.max(1, needle.length);
+  }
+  if (!candidates.length) return null;
+
+  candidates.sort(
+    (left, right) =>
+      Number(right.exact) - Number(left.exact) ||
+      right.score - left.score ||
+      left.start - right.start,
+  );
+  const { start, end } = candidates[0]!;
+  return { start, end };
+}
+
+/**
+ * Split plain text into segments with clickable explain marks. Stored context
+ * keeps repeated selections anchored to their original occurrence.
  */
 export function splitTextWithSelectionMarks(
   content: string,
-  marks: Array<Pick<SelectionExplanationRecord, "id" | "selectedText">>,
+  marks: SelectionExplanationMark[],
 ): Array<
   | { type: "text"; value: string }
   | { type: "mark"; id: string; value: string }
 > {
   if (!content || !marks.length) return [{ type: "text", value: content }];
-  type Hit = { id: string; start: number; end: number };
+  type Hit = TextRange & { id: string };
   const hits: Hit[] = [];
-  const usedRanges: Array<{ start: number; end: number }> = [];
+  const usedRanges: TextRange[] = [];
   for (const mark of marks) {
-    const needle = mark.selectedText.trim();
-    if (!needle) continue;
-    let from = 0;
-    while (from <= content.length - needle.length) {
-      const start = content.indexOf(needle, from);
-      if (start < 0) break;
-      const end = start + needle.length;
-      const overlaps = usedRanges.some(
-        (range) => start < range.end && end > range.start,
-      );
-      if (!overlaps) {
-        hits.push({ id: mark.id, start, end });
-        usedRanges.push({ start, end });
-        break;
-      }
-      from = start + 1;
-    }
+    const range = findSelectionRange(content, mark, usedRanges);
+    if (!range) continue;
+    hits.push({ id: mark.id, ...range });
+    usedRanges.push(range);
   }
   if (!hits.length) return [{ type: "text", value: content }];
   hits.sort((a, b) => a.start - b.start);
@@ -439,13 +501,12 @@ export function splitTextWithSelectionMarks(
 }
 
 /**
- * Wrap first exact occurrence of each mark's selected text under `root` with a
- * clickable underline span. Safe to re-run; previous marks are cleared first.
+ * Wrap anchored occurrences under `root` with clickable underline buttons.
  * Used for assistant markdown (HTML) where React does not own the text nodes.
  */
 export function decorateSelectionExplanationMarks(
   root: HTMLElement,
-  marks: Array<Pick<SelectionExplanationRecord, "id" | "selectedText">>,
+  marks: SelectionExplanationMark[],
   onOpen: (recordId: string) => void,
 ): () => void {
   const previous = root.querySelectorAll<HTMLElement>("[data-selection-explain-id]");
@@ -457,24 +518,57 @@ export function decorateSelectionExplanationMarks(
     parent.normalize();
   });
 
+  type Piece = { node: Text; start: number; end: number };
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const pieces: Piece[] = [];
+  let content = "";
+  let node = walker.nextNode();
+  while (node) {
+    const textNode = node as Text;
+    const value = textNode.nodeValue ?? "";
+    const parent = textNode.parentElement;
+    if (
+      value &&
+      !parent?.closest("button, a, input, textarea")
+    ) {
+      const start = content.length;
+      content += value;
+      pieces.push({ node: textNode, start, end: content.length });
+    }
+    node = walker.nextNode();
+  }
+
+  const selected: Array<TextRange & { id: string; needle: string }> = [];
+  const usedRanges: TextRange[] = [];
+  for (const mark of marks) {
+    const range = findSelectionRange(content, mark, usedRanges);
+    if (!range) continue;
+    selected.push({ id: mark.id, needle: mark.selectedText.trim(), ...range });
+    usedRanges.push(range);
+  }
+
   const handlers: Array<{ node: HTMLElement; handler: (event: Event) => void }> =
     [];
-  const used = new Set<string>();
+  for (const hit of selected.sort((left, right) => right.start - left.start)) {
+    const startPiece = pieces.find(
+      (piece) => piece.start <= hit.start && piece.end > hit.start,
+    );
+    const endPiece = pieces.find(
+      (piece) => piece.start < hit.end && piece.end >= hit.end,
+    );
+    if (!startPiece || !endPiece || startPiece.node !== endPiece.node) continue;
 
-  for (const mark of marks) {
-    const needle = mark.selectedText.trim();
-    if (!needle || used.has(mark.id)) continue;
-    const hit = findTextRange(root, needle);
-    if (!hit) continue;
-    used.add(mark.id);
+    const range = document.createRange();
+    range.setStart(startPiece.node, hit.start - startPiece.start);
+    range.setEnd(endPiece.node, hit.end - endPiece.start);
     const span = document.createElement("button");
     span.type = "button";
     span.className = "selection-explain-mark";
-    span.dataset.selectionExplainId = mark.id;
-    span.setAttribute("aria-label", `打开划词解释：${needle.slice(0, 40)}`);
+    span.dataset.selectionExplainId = hit.id;
+    span.setAttribute("aria-label", `打开划词解释：${hit.needle.slice(0, 40)}`);
     span.title = "打开历史划词解释";
     try {
-      hit.range.surroundContents(span);
+      range.surroundContents(span);
     } catch {
       // Cross-element ranges (markdown mid-token) cannot surround; skip quietly.
       continue;
@@ -482,7 +576,7 @@ export function decorateSelectionExplanationMarks(
     const handler = (event: Event) => {
       event.preventDefault();
       event.stopPropagation();
-      onOpen(mark.id);
+      onOpen(hit.id);
     };
     span.addEventListener("click", handler);
     handlers.push({ node: span, handler });
@@ -493,55 +587,4 @@ export function decorateSelectionExplanationMarks(
       node.removeEventListener("click", handler);
     }
   };
-}
-
-function findTextRange(
-  root: HTMLElement,
-  needle: string,
-): { range: Range } | null {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  let node = walker.nextNode();
-  let pending = "";
-  type Piece = { node: Text; start: number; end: number };
-  const pieces: Piece[] = [];
-
-  while (node) {
-    const textNode = node as Text;
-    const value = textNode.nodeValue ?? "";
-    if (value) {
-      // Skip text already inside an explain mark (or other interactive control).
-      const parent = textNode.parentElement;
-      if (
-        parent &&
-        (parent.closest("[data-selection-explain-id]") ||
-          parent.closest("button, a, input, textarea"))
-      ) {
-        node = walker.nextNode();
-        continue;
-      }
-      const start = pending.length;
-      pending += value;
-      pieces.push({ node: textNode, start, end: pending.length });
-      const index = pending.indexOf(needle);
-      if (index >= 0) {
-        const end = index + needle.length;
-        const startPiece = pieces.find(
-          (piece) => piece.start <= index && piece.end > index,
-        );
-        const endPiece = pieces.find(
-          (piece) => piece.start < end && piece.end >= end,
-        );
-        if (!startPiece || !endPiece || startPiece.node !== endPiece.node) {
-          // Multi-node wrap is unreliable for markdown; only decorate single-node hits.
-          return null;
-        }
-        const range = document.createRange();
-        range.setStart(startPiece.node, index - startPiece.start);
-        range.setEnd(endPiece.node, end - endPiece.start);
-        return { range };
-      }
-    }
-    node = walker.nextNode();
-  }
-  return null;
 }

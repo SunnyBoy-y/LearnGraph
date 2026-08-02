@@ -162,6 +162,25 @@ def test_selection_explanations_cleared_on_logout_401_and_account_delete() -> No
     )
 
 
+def test_selection_explanation_marks_preserve_context_anchors() -> None:
+    """R-017: repeated text must reopen at its stored prefix/suffix location."""
+
+    selection = (
+        FRONTEND / "features" / "chat" / "selection-explanation.ts"
+    ).read_text(encoding="utf-8")
+    assert "function findSelectionRange" in selection
+    assert "matchingPrefixLength" in selection
+    assert "matchingSuffixLength" in selection
+    assert '"id" | "selectedText" | "prefix" | "suffix"' in selection
+    assert "findSelectionRange(content, mark, usedRanges)" in selection
+
+    chat_pages = (FRONTEND / "features" / "chat" / "chat-pages.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert chat_pages.count("prefix: item.prefix") >= 2
+    assert chat_pages.count("suffix: item.suffix") >= 2
+
+
 def test_workspace_scoped_query_keys_include_workspace_id() -> None:
     """R-018: workspace-scoped useQuery keys must carry workspaceId to prevent
     cross-workspace cache confusion on the same browser tab."""
