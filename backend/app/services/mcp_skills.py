@@ -56,12 +56,15 @@ from app.providers.ports.mcp import (
     MCPProbeResult,
     MCPProtocolFailure,
     MCPResponseTooLarge,
+    MCPRunnerResourceExceeded,
+    MCPRunnerTimeout,
     MCPTransportFailure,
     MCPTransportPort,
     MCPTransportTimeout,
     MCPTransportUnavailable,
 )
 from app.providers.remote.mcp_http import PROTOCOL_VERSION, StreamableHTTPMCPAdapter
+from app.providers.remote.mcp_stdio import DockerStdioMCPRunner, StdioIsolatedMCPAdapter
 from app.repositories.audit import AuditRepository
 from app.repositories.extensions import (
     ExtensionInvocationRepository,
@@ -75,6 +78,7 @@ from app.services.authorization import AuthorizationService
 from app.services.billing import BillingService
 from app.services.learning import EvidenceService
 from app.services.management import UsageService
+from app.services.mcp_oauth import MCPOAuthLifecycle
 from app.services.skill_package import (
     CONTEXTUAL_OFFICIAL_SKILL_KEYS,
     MAX_SKILL_FILE_BYTES,
@@ -1943,12 +1947,14 @@ class MCPAndSkillService:
             self.db.refresh(invocation)
             return invocation
         except MCPTransportFailure as exc:
-            status = "timed_out" if isinstance(exc, MCPTransportTimeout) else (
-                "result_too_large" if isinstance(exc, MCPResponseTooLarge) else "failed"
-            )
-            http_status = 504 if isinstance(exc, MCPTransportTimeout) else (
-                413 if isinstance(exc, MCPResponseTooLarge) else 502
-            )
+            if isinstance(exc, (MCPRunnerTimeout, MCPTransportTimeout)):
+                status, http_status = "timed_out", 504
+            elif isinstance(exc, MCPRunnerResourceExceeded):
+                status, http_status = "quota_exceeded", 429
+            elif isinstance(exc, MCPResponseTooLarge):
+                status, http_status = "result_too_large", 413
+            else:
+                status, http_status = "failed", 502
             self._fail_invocation(
                 invocation,
                 exc.code,
@@ -2807,8 +2813,170 @@ class MCPAndSkillService:
             {"invocation_id": invocation.id, **(details or {})},
         )
 
+    def _stdio_launch_spec(self, server: MCPServer) -> dict[str, Any] | None:
+        """Return the approved, immutable stdio launch envelope, or deny.
+
+        A launch spec only becomes executable after an explicit audited
+        approval; an unapproved spec keeps the ``UnavailableStdioMCPAdapter``
+        deny-by-default path. The FastAPI process never executes the command —
+        the isolated Docker runner consumes this envelope.
+        """
+
+        if server.launch_status != "approved":
+            return None
+        command = list(server.launch_command or [])
+        if not server.runner_image_digest or not command:
+            return None
+        return {
+            "server_id": server.id,
+            "workspace_id": server.workspace_id,
+            "image_digest": server.runner_image_digest,
+            "command": command,
+            "protocol_version": PROTOCOL_VERSION,
+            "capability_hash": server.launch_spec_hash or "",
+            "resource_limits": {},
+            "network_mode": "none",
+        }
+
+    def _require_stdio_server(self, server_id: str) -> MCPServer:
+        server = self.servers.require(server_id, "MCP server")
+        if server.transport != "stdio":
+            raise AppError(
+                409,
+                "mcp_stdio_launch_spec_http_only",
+                "Launch specs apply only to stdio MCP servers",
+            )
+        return server
+
+    def register_stdio_launch_spec(
+        self,
+        server_id: str,
+        *,
+        image_digest: str,
+        command: list[str],
+    ) -> MCPServer:
+        """Register a reviewed stdio launch spec in an inert (unapproved) state.
+
+        Registration and execution are deliberately separated: this stores the
+        allowlisted, digest-pinned command for a future audited approval and
+        never makes it executable by itself.
+        """
+
+        server = self._require_stdio_server(server_id)
+        digest = image_digest.strip()
+        if digest.startswith("sha256:"):
+            hex_part = digest.removeprefix("sha256:")
+        elif "@sha256:" in digest:
+            hex_part = digest.split("@sha256:", 1)[1]
+        else:
+            raise AppError(
+                422,
+                "mcp_stdio_image_not_pinned",
+                "MCP stdio runner image must be an immutable sha256 digest",
+            )
+        if len(hex_part) != 64 or not all(
+            character in "0123456789abcdef" for character in hex_part
+        ):
+            raise AppError(
+                422,
+                "mcp_stdio_image_not_pinned",
+                "MCP stdio runner image must be an immutable sha256 digest",
+            )
+        if not command or len(command) > int(self.settings.mcp_stdio_command_args_max):
+            raise AppError(
+                422,
+                "mcp_stdio_command_bound",
+                f"MCP stdio launch command must contain 1 to {self.settings.mcp_stdio_command_args_max} arguments",
+            )
+        executable = command[0].strip().split("/")[-1]
+        if executable.casefold() not in {"python", "python3", "node", "nodejs"}:
+            raise AppError(
+                422,
+                "mcp_stdio_executable_forbidden",
+                "MCP stdio launch command executable must be python, python3, node or nodejs",
+            )
+
+        launch_spec_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "image_digest": f"sha256:{hex_part}",
+                    "command": command,
+                    "protocol_version": PROTOCOL_VERSION,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        server.runner_image_digest = f"sha256:{hex_part}"
+        server.launch_command = list(command)
+        server.launch_spec_hash = launch_spec_hash
+        server.launch_status = "unapproved"
+        server.launch_approved_by = None
+        server.launch_approved_at = None
+        server.last_error = (
+            "MCP stdio launch spec registered but not yet approved; execution stays unavailable"
+        )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="mcp.stdio_launch_spec_registered",
+            resource_type="mcp_server",
+            resource_id=server.id,
+            details={
+                "launch_spec_hash": launch_spec_hash,
+                "image_digest": f"sha256:{hex_part}",
+                "command": list(command),
+                "approval_required": True,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(server)
+        return server
+
+    def approve_stdio_launch_spec(self, server_id: str) -> MCPServer:
+        """Approve a previously registered stdio launch spec (audited).
+
+        Only an approved spec unlocks the isolated runner adapter; unreviewed
+        or unapproved specs always stay on the deny-by-default path.
+        """
+
+        server = self._require_stdio_server(server_id)
+        if not server.launch_command or not server.runner_image_digest:
+            raise AppError(
+                409,
+                "mcp_stdio_launch_spec_missing",
+                "Register a reviewed stdio launch spec before approving it",
+            )
+        server.launch_status = "approved"
+        server.launch_approved_by = self.actor_id
+        server.launch_approved_at = utc_now()
+        server.last_error = None
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="mcp.stdio_launch_spec_approved",
+            resource_type="mcp_server",
+            resource_id=server.id,
+            outcome="success",
+            details={
+                "launch_spec_hash": server.launch_spec_hash,
+                "command": list(server.launch_command),
+                "image_digest": server.runner_image_digest,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(server)
+        return server
+
     def _adapter(self, server: MCPServer) -> MCPTransportPort:
         if server.transport == "stdio":
+            if self.settings.mcp_stdio_runner_enabled:
+                launch_spec = self._stdio_launch_spec(server)
+                if launch_spec is not None:
+                    return StdioIsolatedMCPAdapter(
+                        DockerStdioMCPRunner(self.settings),
+                        launch_spec,
+                        credential_resolver=lambda: self._runner_credential_token(server),
+                    )
             return UnavailableStdioMCPAdapter()
         if not server.endpoint_url:
             raise MCPTransportUnavailable("MCP HTTP endpoint is not configured")
@@ -2818,6 +2986,25 @@ class MCPAndSkillService:
             timeout_ms=server.timeout_ms,
             max_response_bytes=server.max_result_bytes,
         )
+
+    def _runner_credential_token(self, server: MCPServer) -> dict[str, Any] | None:
+        """Runner-only OAuth token envelope for stdio invocation.
+
+        Resolves the live access token via the encrypted secret store and hands
+        it to the isolated runner for injection into the container workspace.
+        The token never appears in API responses, agent tool traffic, frontend
+        state, or ordinary audit JSON. ``None`` (or an AppError) fails the
+        invocation closed.
+        """
+
+        if server.transport != "stdio":
+            return None
+        try:
+            return self.oauth_lifecycle().runner_only_token(
+                server, audience="mcp-stdio-runner"
+            )
+        except AppError:
+            return None
 
     def _credential(self, server: MCPServer) -> MCPServerCredential | None:
         if not server.auth_reference:
@@ -2841,6 +3028,47 @@ class MCPAndSkillService:
             return SecretCipher(self.settings.master_key).decrypt(credential.ciphertext)
         except ValueError as exc:
             raise MCPTransportUnavailable("MCP encrypted auth reference cannot be decrypted") from exc
+
+    def oauth_lifecycle(self) -> MCPOAuthLifecycle:
+        """Construct a workspace-scoped OAuth lifecycle bound to this service.
+
+        P2-B OAuth helpers run through the same encrypted master-key secret store
+        as the existing static-bearer flow. The HTTP/stdio adapter and the
+        launch-spec flow are left untouched: this accessor only enables an OAuth
+        credential to be refreshed/redacted from service call sites.
+        """
+
+        return MCPOAuthLifecycle(
+            self.db,
+            self.workspace_id,
+            self.actor_id,
+            master_key=self.settings.master_key,
+        )
+
+    def refresh_server_oauth_token(
+        self,
+        server_id: str,
+        *,
+        token_endpoint: str,
+        force: bool = False,
+    ) -> dict[str, Any] | None:
+        """Refresh an OAuth access token and return its redacted projection.
+
+        Returns ``None`` when the server does not hold an OAuth authorization-code
+        credential. The live token never leaves the runner boundary; the returned
+        projection is masked/fingerprinted only.
+        """
+
+        server = self.require_server(server_id)
+        lifecycle = self.oauth_lifecycle()
+        credential = lifecycle.refresh_access_token(
+            server,
+            token_endpoint=token_endpoint,
+            force=force,
+        )
+        view = lifecycle.redact_for_api(credential)
+        lifecycle.assert_no_secret_leak(view)
+        return view
 
     def _current_snapshot(self, server: MCPServer) -> MCPCapabilitySnapshot | None:
         if not server.current_snapshot_id:

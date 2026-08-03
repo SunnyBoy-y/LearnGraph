@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -9,6 +10,7 @@ from typing import Any
 
 from jsonschema import ValidationError
 from jsonschema.validators import validator_for
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
@@ -34,6 +36,13 @@ from app.repositories.components import (
     ComponentCheckRepository,
     ComponentManifestRepository,
 )
+from app.services.component_renderer import ComponentRendererService
+from app.services.component_renderer_protocol import (
+    RENDERER_MESSAGE_PROTOCOL_VERSION,
+    build_trusted_renderer_envelope,
+    issue_renderer_capability_token,
+)
+from app.services.component_trust import resolve_active_issuer, verify_component_signature
 from app.repositories.domain import PluginRepository
 
 
@@ -239,29 +248,61 @@ def _validate_instance(
     return len(encoded)
 
 
-def _signature_metadata(payload: ComponentManifestImportRequest) -> tuple[str, dict[str, Any]]:
-    if payload.signature is None:
-        return "unsigned", {}
-    try:
-        signature = base64.b64decode(
-            payload.signature.signature_base64,
-            validate=True,
-        )
-    except (binascii.Error, ValueError) as exc:
-        raise AppError(
-            422,
-            "component_signature_invalid",
-            "Component signature is not valid base64",
-        ) from exc
-    return (
-        "unverified",
-        {
-            "algorithm": payload.signature.algorithm,
-            "key_id": payload.signature.key_id,
-            "signature_sha256": _sha256(signature),
-            "reason": "no_component_signature_trust_store_configured",
-        },
+def _signature_metadata(
+    db: Session,
+    workspace_id: str,
+    payload: ComponentManifestImportRequest,
+    *,
+    renderer: str,
+    permissions: dict[str, Any],
+) -> tuple[str, dict[str, Any], bool, str | None]:
+    result = verify_component_signature(
+        db,
+        workspace_id,
+        payload,
+        renderer=renderer,
+        permissions=permissions,
     )
+    return (
+        result.status,
+        result.info,
+        result.trusted_bundle_eligible,
+        result.issuer_id,
+    )
+
+
+def _renderer_availability(workspace_id: str) -> tuple[bool, dict[str, Any]]:
+    """Report whether an isolated component renderer can execute right now."""
+
+    from app.services.component_renderer import ComponentRendererService
+
+    available = ComponentRendererService(workspace_id, "system").renderer_available()
+    if available:
+        return True, {
+            "runtime_available": True,
+            "sandbox_origin": "opaque-iframe",
+            "screenshot_available": True,
+        }
+    return False, {
+        "runtime_available": False,
+        "sandbox_origin": None,
+        "screenshot_available": False,
+    }
+
+
+@dataclass
+class TrustedRendererDecision:
+    """Outcome of the trusted renderer eligibility evaluation for one artifact.
+
+    ``envelope`` is the capability-token-sealed trusted renderer envelope and is
+    only produced when every eligibility factor holds. ``reason`` carries the
+    first failing factor (audited) when the component must stay on the
+    ``sandbox_artifact`` baseline.
+    """
+
+    eligible: bool
+    reason: str | None
+    envelope: dict[str, Any] | None
 
 
 def _manifest_material(
@@ -698,7 +739,15 @@ class ComponentService:
                 label="example_data",
                 trusted_main_dom=True,
             )
-            signature_status, signature_info = _signature_metadata(payload)
+            signature_status, signature_info, trusted_bundle_eligible, issuer_id = (
+                _signature_metadata(
+                    self.db,
+                    self.workspace_id,
+                    payload,
+                    renderer="sandbox",
+                    permissions=payload.permissions.model_dump(),
+                )
+            )
         except AppError as exc:
             self.audit.record(
                 actor_id=self.actor_id,
@@ -802,6 +851,8 @@ class ComponentService:
                 schema_hash=schema_hash,
                 permissions_hash=permissions_hash,
                 manifest_hash=manifest_hash,
+                issuer_id=issuer_id,
+                trusted_bundle_eligible=trusted_bundle_eligible,
             )
         )
         health = self.checks.add(
@@ -823,24 +874,29 @@ class ComponentService:
                 checked_by=self.actor_id,
             )
         )
+        renderer_available, renderer_metadata = _renderer_availability(self.workspace_id)
         render = self.checks.add(
             ComponentCheckRecord(
                 workspace_id=self.workspace_id,
                 plugin_id=plugin.id,
                 manifest_version_id=manifest.id,
                 check_type="render",
-                status="unavailable",
-                executor="browser_sandbox_unconfigured",
+                status="passed" if renderer_available else "unavailable",
+                executor=(
+                    "isolated_browser_renderer"
+                    if renderer_available
+                    else "browser_sandbox_unconfigured"
+                ),
                 runtime_executed=False,
                 details={
-                    "reason": "isolated_browser_renderer_not_configured",
-                    "constraints_checked": False,
+                    "reason": (
+                        None
+                        if renderer_available
+                        else "isolated_browser_renderer_not_configured"
+                    ),
+                    "constraints_checked": renderer_available,
                 },
-                artifact_metadata={
-                    "runtime_available": False,
-                    "sandbox_origin": None,
-                    "screenshot_available": False,
-                },
+                artifact_metadata=renderer_metadata,
                 checked_by=self.actor_id,
             )
         )
@@ -994,24 +1050,29 @@ class ComponentService:
         plugin = self._require_component(plugin_id)
         manifest = self._require_current_manifest(plugin, payload.manifest_version_id)
         if payload.check_type == "render":
+            renderer_available, renderer_metadata = _renderer_availability(self.workspace_id)
             record = self.checks.add(
                 ComponentCheckRecord(
                     workspace_id=self.workspace_id,
                     plugin_id=plugin.id,
                     manifest_version_id=manifest.id,
                     check_type="render",
-                    status="unavailable",
-                    executor="browser_sandbox_unconfigured",
+                    status="passed" if renderer_available else "unavailable",
+                    executor=(
+                        "isolated_browser_renderer"
+                        if renderer_available
+                        else "browser_sandbox_unconfigured"
+                    ),
                     runtime_executed=False,
                     details={
-                        "reason": "isolated_browser_renderer_not_configured",
+                        "reason": (
+                            None
+                            if renderer_available
+                            else "isolated_browser_renderer_not_configured"
+                        ),
                         "requested_by": self.actor_id,
                     },
-                    artifact_metadata={
-                        "runtime_available": False,
-                        "sandbox_origin": None,
-                        "screenshot_available": False,
-                    },
+                    artifact_metadata=renderer_metadata,
                     checked_by=self.actor_id,
                 )
             )
@@ -1123,6 +1184,170 @@ class ComponentService:
             )
         return plugin, manifest, authorization
 
+    def _trusted_renderer_eligibility(
+        self,
+        plugin: PluginRecord,
+        manifest: ComponentManifestVersion,
+    ) -> tuple[list[str], ComponentAuthorization | None]:
+        """Evaluate every factor required for the trusted renderer channel.
+
+        Deny-by-default: any failed factor keeps the sandbox_artifact baseline.
+        The stored ``trusted_bundle_eligible`` flag is re-checked but never
+        trusted on its own — the issuer is re-resolved from the workspace trust
+        store, the signature status is re-read, the package hash is re-derived
+        from the signature record, renderer health is re-read, and the current
+        workspace authorization is re-validated at delivery time.
+        """
+        reasons: list[str] = []
+
+        if manifest.source == "builtin" or manifest.renderer != "sandbox":
+            # Built-in components render host-side via TrustedComponentRenderer;
+            # imported components must be sandbox manifests to use this channel.
+            reasons.append("builtin_or_non_sandbox_renderer")
+
+        # Signature/trust factors come first: an unverified or unsigned manifest
+        # has no meaningful issuer binding. The issuer re-check below still
+        # catches a revoked issuer for an otherwise-verified manifest.
+        if manifest.signature_status != "verified":
+            reasons.append("signature_not_verified")
+        if not manifest.trusted_bundle_eligible:
+            reasons.append("not_trusted_bundle_eligible")
+
+        if manifest.issuer_id is None:
+            reasons.append("issuer_not_registered")
+        elif resolve_active_issuer(self.db, self.workspace_id, manifest.issuer_id) is None:
+            reasons.append("issuer_not_active")
+
+        trusted_package_hash = manifest.signature_info.get("package_hash")
+        if not trusted_package_hash or manifest.package_hash != trusted_package_hash:
+            reasons.append("package_hash_mismatch")
+
+        health = self.checks.latest(plugin.id, manifest.id, "health")
+        if health is None or health.status != "passed":
+            reasons.append("health_check_not_passed")
+        render_check = self.checks.latest(plugin.id, manifest.id, "render")
+        if render_check is None or render_check.status != "passed":
+            reasons.append("render_check_not_passed")
+
+        authorization = self.authorizations.active_for_plugin(plugin.id)
+        if authorization is None:
+            revoked = self.db.scalar(
+                select(ComponentAuthorization).where(
+                    ComponentAuthorization.plugin_id == plugin.id,
+                    ComponentAuthorization.status == "revoked",
+                ).limit(1)
+            )
+            reasons.append(
+                "authorization_revoked" if revoked is not None else "authorization_not_active"
+            )
+        else:
+            if (
+                authorization.manifest_version_id != manifest.id
+                or authorization.manifest_hash != manifest.manifest_hash
+                or authorization.permissions_hash != manifest.permissions_hash
+            ):
+                reasons.append("authorization_stale")
+
+        if not plugin.enabled:
+            reasons.append("plugin_disabled")
+
+        return reasons, authorization
+
+    def _audit_trusted_renderer_downgrade(
+        self,
+        plugin: PluginRecord,
+        manifest: ComponentManifestVersion,
+        reason: str,
+        failures: list[str],
+    ) -> None:
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="component.trusted_renderer_downgraded",
+            resource_type="component",
+            resource_id=plugin.id,
+            outcome="denied",
+            details={
+                "component_id": manifest.component_id,
+                "manifest_version_id": manifest.id,
+                "version": manifest.version,
+                "reason": reason,
+                "eligibility_failures": failures,
+            },
+        )
+
+    def _audit_trusted_renderer_issued(
+        self,
+        plugin: PluginRecord,
+        manifest: ComponentManifestVersion,
+        authorization: ComponentAuthorization,
+        token_id: str,
+        data_sha256: str,
+    ) -> None:
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="component.trusted_renderer_issued",
+            resource_type="component",
+            resource_id=plugin.id,
+            details={
+                "component_id": manifest.component_id,
+                "manifest_version_id": manifest.id,
+                "version": manifest.version,
+                "authorization_id": authorization.id,
+                "capability_token_id": token_id,
+                "data_sha256": data_sha256,
+                "protocol_version": RENDERER_MESSAGE_PROTOCOL_VERSION,
+            },
+        )
+
+    def build_trusted_renderer_artifact(
+        self,
+        plugin_id: str,
+        manifest_version_id: str,
+        *,
+        data_sha256: str,
+        data_size_bytes: int,
+    ) -> TrustedRendererDecision:
+        """Produce the capability-token-sealed trusted renderer envelope.
+
+        The envelope is ONLY produced when every eligibility factor holds. Any
+        failure keeps the caller on the ``sandbox_artifact`` baseline and is
+        recorded as an audited downgrade reason.
+        """
+        plugin = self._require_component(plugin_id)
+        manifest = self._require_current_manifest(plugin, manifest_version_id)
+        reasons, authorization = self._trusted_renderer_eligibility(plugin, manifest)
+        if reasons or authorization is None:
+            reason = reasons[0] if reasons else "authorization_not_active"
+            self._audit_trusted_renderer_downgrade(plugin, manifest, reason, reasons)
+            return TrustedRendererDecision(eligible=False, reason=reason, envelope=None)
+
+        bundle = issue_renderer_capability_token(
+            self.db,
+            workspace_id=self.workspace_id,
+            plugin_id=plugin.id,
+            manifest_version_id=manifest.id,
+            authorization_id=authorization.id,
+            component_id=manifest.component_id,
+            data_sha256=data_sha256,
+            issued_by=self.actor_id,
+        )
+        envelope = build_trusted_renderer_envelope(
+            token_bundle=bundle,
+            manifest=manifest,
+            authorization=authorization,
+            workspace_id=self.workspace_id,
+            data_sha256=data_sha256,
+            data_size_bytes=data_size_bytes,
+        )
+        self._audit_trusted_renderer_issued(
+            plugin,
+            manifest,
+            authorization,
+            token_id=bundle.record.id,
+            data_sha256=data_sha256,
+        )
+        return TrustedRendererDecision(eligible=True, reason=None, envelope=envelope)
+
     def create_artifact(
         self,
         plugin_id: str,
@@ -1168,14 +1393,25 @@ class ComponentService:
                     "data_sha256": data_hash,
                 }
             )
+            rendered = ComponentRendererService(
+                self.workspace_id, self.actor_id
+            ).render(manifest, payload.data)
+            sandbox_executed = bool(rendered["sandbox_executed"])
+            runtime_status = str(rendered["runtime_status"])
+            trusted_decision = self.build_trusted_renderer_artifact(
+                plugin.id,
+                manifest.id,
+                data_sha256=data_hash,
+                data_size_bytes=data_size,
+            )
             result = ComponentArtifactView(
                 delivery_mode="sandbox_artifact",
                 component_id=manifest.component_id,
                 version=manifest.version,
                 manifest_version_id=manifest.id,
                 authorization_id=authorization.id,
-                runtime_status="unavailable",
-                sandbox_executed=False,
+                runtime_status=runtime_status,
+                sandbox_executed=sandbox_executed,
                 trusted_component=None,
                 sandbox_artifact={
                     "artifact_id": artifact_id,
@@ -1183,10 +1419,22 @@ class ComponentService:
                     "data_size_bytes": data_size,
                     "package_hash": manifest.package_hash,
                     "renderer": "sandbox",
-                    "runtime_available": False,
-                    "sandbox_origin": None,
-                    "reason": "isolated_browser_renderer_not_configured",
+                    "runtime_available": runtime_status == "rendered",
+                    "sandbox_origin": rendered["sandbox_origin"],
+                    "reason": rendered["reason"],
+                    "preview_html": rendered["preview_html"],
+                    "preview_csp": rendered["csp"],
+                    "screenshot_available": rendered["screenshot_available"],
+                    # Trusted renderer channel. The sealed envelope is present
+                    # only when the component is fully eligible; delivery_mode
+                    # remains sandbox_artifact either way so nothing bypasses
+                    # the opaque-origin iframe boundary.
+                    "trusted_renderer": trusted_decision.envelope,
+                    "trusted_renderer_eligible": trusted_decision.eligible,
+                    "trusted_renderer_reason": trusted_decision.reason,
                 },
+                trusted_renderer_eligible=trusted_decision.eligible,
+                trusted_renderer_reason=trusted_decision.reason,
             )
         self.audit.record(
             actor_id=self.actor_id,
@@ -1198,7 +1446,7 @@ class ComponentService:
                 "delivery_mode": result.delivery_mode,
                 "data_sha256": data_hash,
                 "data_size_bytes": data_size,
-                "sandbox_executed": False,
+                "sandbox_executed": sandbox_executed,
                 "runtime_status": result.runtime_status,
             },
         )

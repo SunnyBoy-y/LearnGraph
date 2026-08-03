@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from app.providers.ports.sandbox import (
     SandboxBackendPort,
@@ -378,6 +379,26 @@ class DockerSandboxBackend(SandboxBackendPort):
             workspace_path = Path(spec.workspace_path).expanduser().resolve()
             workspace_path.mkdir(parents=True, exist_ok=True)
             shm_size = sandbox_shm_size(spec.runtime_kind)
+            # Default posture is fully offline. Reviewed outbound egress is a
+            # per-session exception: the container joins the internal egress
+            # network and can only reach the reviewed proxy, never the internet
+            # directly. The proxy revalidates every CONNECT against the policy
+            # digest carried here.
+            egress = spec.egress or {}
+            network_kwargs: dict[str, Any]
+            container_env: list[str] = []
+            if egress.get("policy_digest") and egress.get("network") and egress.get("proxy_url"):
+                network_kwargs = {"network": str(egress["network"])}
+                container_env = [
+                    "HTTP_PROXY=" + str(egress["proxy_url"]),
+                    "HTTPS_PROXY=" + str(egress["proxy_url"]),
+                    "NO_PROXY=localhost,127.0.0.1,.local",
+                    "LEARNGRAPH_EGRESS_POLICY_DIGEST=" + str(egress["policy_digest"]),
+                ]
+            else:
+                # Default posture: fully offline. ``dict`` form keeps the
+                # security invariant grep-visible as network_mode="none".
+                network_kwargs = dict(network_mode="none")
             container = client.containers.create(
                 spec.image_ref,
                 command=["sleep", "infinity"],
@@ -390,7 +411,8 @@ class DockerSandboxBackend(SandboxBackendPort):
                     "com.learngraph.workspace_limit_files": "20000",
                     "com.learngraph.workspace_limit_dirs": "5000",
                 },
-                network_mode="none",
+                **network_kwargs,
+                env=container_env or None,
                 read_only=True,
                 user="65532:65532",
                 cap_drop=["ALL"],

@@ -4,8 +4,8 @@
 
 ```text
 并行性   : 可并行（独立后端域：sandbox / 代理 / 策略层；不与 P1-B 抢后端文件，也不碰前端）
-状态     : 待开始 —— 可选，可在 P0-A 前就开
-主要文件 : backend/app/services/sandbox.py、出站代理/网络策略层（待建）、允许主机白名单与防绕过（待建）
+状态     : 已完成 —— 2026-08-03 策略层 + 可执行 CONNECT 代理 + Docker 注入 + 安全测试落地；默认仍完全离线
+主要文件 : backend/app/services/sandbox_network_policy.py、backend/app/services/sandbox_egress_proxy.py、backend/app/providers/remote/sandbox.py、backend/app/services/sandbox.py
 依赖     : 无（可立即开；ROADMAP 明确这是可选扩展，默认离线已经是基线）
 口音标注 : 无
 ```
@@ -42,10 +42,10 @@ allow-list，绝不能让 allow-host 变成通向环回/私网/云元数据的�
 
 ## 实施范围
 
-- [ ] 设计 allow-list 审核与主机规范化流程（含 IP vs 域名、CNAME 展开、端口/协议白名单）。
-- [ ] 落地 DNS 重绑定防护与私网/环回/链路本地/云元数据地址拒绝。
-- [ ] 用可执行出站代理或网络策略层落地，并在审计里记录归属（workspace/task/approval）。
-- [ ] 写 IPv4/IPv6、DNS 变化、重定向链、策略绕过测试。不确定 → 拒绝。
+- [x] 设计 allow-list 审核与主机规范化流程（IP vs 域名、IDNA/尾点规范化、端口/协议白名单、过期与审批字段）。
+- [x] 落地 DNS 重绑定防护与私网/环回/链路本地/云元数据/APIPA 地址拒绝（IPv4 + IPv6，连接时重分类）。
+- [x] 用可执行出站 CONNECT 代理（`SandboxEgressProxy`）落地，并在每次决策里记录归属（workspace/approval/policy_digest/host/port/reason）。
+- [x] 写 IPv4/IPv6、DNS 变化/重绑定、私网/元数据、端口/协议、非法方法、IP 字面量、策略过期/缺失/损坏、跨策略的绕过测试。不确定 → 拒绝。
 
 ## 与其他任务的边界（防冲突）
 
@@ -56,10 +56,10 @@ allow-list，绝不能让 allow-host 变成通向环回/私网/云元数据的�
 
 ## 验收条件
 
-- [ ] 默认策略下沙箱完全离线；仅显式授权后可访问白名单外部队列。
-- [ ] 环回/私网/链路本地/云元数据/重定向绕过全部被拒，且有测试证明。
-- [ ] 每次允许访问可审计归属；不确定即拒。
+- [x] 默认策略下沙箱完全离线（`network_mode="none"`，且 `SandboxCreateSpec.egress=None` 时强制）；仅显式授权、未过期、已审批的策略才注入 egress 网络。
+- [x] 环回/私网/链路本地/云元数据/重定向绕过全部被拒，且有测试证明（策略层 + 代理层 + Docker 注入路径）。
+- [x] 每次允许/拒绝访问可审计归属；不确定即拒（`EgressPolicyDenied` 拒绝闭合）。
 
 ## 产出物交付给谁
 
-- 后端沙箱栈。若最终决定不下发，返回一份「结论：维持默认离线」的说明即可（ROADMAP 允许）。
+- 后端沙箱栈。部署侧如需启用：置 `LEARNGRAPH_SANDBOX_EGRESS_ENABLED=true`，在 `sandbox_egress_policy_dir` 放置 `<workspace_id>.json` 已审批策略，并单独运行 `SandboxEgressProxy` 作为唯一出口。

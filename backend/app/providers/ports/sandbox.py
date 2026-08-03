@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +24,11 @@ class SandboxCreateSpec:
     disk_bytes: int
     workspace_path: str
     runtime_kind: str
+    # Optional reviewed outbound-egress reference. When absent the container
+    # must stay fully offline (network_mode="none"). ``egress`` is an opaque
+    # validated envelope carrying the policy digest, internal network name and
+    # proxy URL; it never carries secrets or raw allow-list hostnames.
+    egress: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

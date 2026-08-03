@@ -4,7 +4,7 @@
 
 ```text
 并行性   : 可并行（独享 frontend 测试配置、测试工具、首批测试文件；不碰 workspace-shell/chat/graph 生产代码）
-状态     : 待开始 —— 可与 P0-A 并行
+状态     : 已完成 —— 2026-08-03
 主要文件 : frontend/package.json、测试运行器配置、frontend/src/test/ 或等价工具、首批 *.test.*
 依赖     : 无（可立即开）
 口音标注 : 无
@@ -45,10 +45,20 @@
 
 ## 实施范围
 
-- [ ] 在 `frontend/` 加测试运行器 + DOM 环境（Vitest + jsdom 或等价），改 `package.json` 加 `test` 脚本。
-- [ ] 建共享测试工具（隔离 QueryClient、workspace 参数注入、API mock、异步/SSE 状态控制）。
-- [ ] 写首批测试（上列三类核心场景；其中「工作区缓存隔离」用例在 P0-A 打通键约定后可写死）。
-- [ ] 把 `test` 纳入本地检查入口；确保与 build、lint 独立可运行。
+- [x] 在 `frontend/` 加测试运行器 + DOM 环境（Vitest + jsdom + Testing Library），改 `package.json` 加 `test` / `test:watch` 脚本。
+- [x] 建共享测试工具（隔离 QueryClient、workspace 参数注入、API mock、异步/SSE 状态控制：`frontend/src/test/render.tsx`、`api.ts`、`async.ts`、`setup.ts`）。
+- [x] 写首批测试（上列三类核心场景；其中「工作区缓存隔离」用例在 P0-A 打通键约定后已写死）。
+- [x] 把 `test` 纳入本地检查入口；确保与 build、lint 独立可运行（`scripts/check.mjs`）。
+
+### 用户可见状态覆盖审计（ROADMAP P1-A 硬约束）
+
+截至 2026-08-03，前端 26 个行为测试覆盖：
+
+- 工作区切换缓存隔离：请求层（`client.test.ts`）+ 生命周期清理（`workspace-cache-isolation.test.ts`）+ mutation 回滚不触碰他租户（`optimistic-mutation.test.tsx`）。
+- R-017：重复文本锚定/异常回退（`text-selection.test.ts`）、划词历史分区（`selection-explanation.test.ts`）、设置页清除按钮（`personalization-page.test.tsx`）。
+- 异步/SSE：分帧去重/重连（`sse.test.ts`）、真实异步 mutation 回滚（`selection-explanation-panel.test.tsx`）。
+- loading/error/empty：`dashboard-page.test.tsx`、`personalization-page.test.tsx`、`selection-explanation-panel.test.tsx`。
+- 其余说明：真实 Docker renderer / MCP runner 的用户可见状态受部署环境门控，由 `backend/scripts/verify_sandbox_container_tasks.py` 覆盖；未另行补前端测试。
 
 ## 与其他任务的边界（防冲突）
 
@@ -60,9 +70,9 @@
 
 ## 验收条件
 
-- [ ] `npm run test` 在本地一键通过，且不依赖真实 Provider。CI 使用同一条命令。
-- [ ] 覆盖：工作区切换、划词解释异常、一个异步 mutation 回滚。
-- [ ] 无 flaky：SSE/异步一律用可注入的受控源，跑 2 次以上稳定。
+- [x] `npm run test` 在本地一键通过，且不依赖真实 Provider。CI 使用同一条命令（`scripts/check.mjs`）。
+- [x] 覆盖：工作区切换、划词解释异常、一个异步 mutation 回滚。
+- [x] 无 flaky：SSE/异步一律用可注入的受控源，跑 2 次以上稳定（26 用例连续多次全绿）。
 
 ## 产出物交付给谁
 

@@ -21,12 +21,12 @@ TODO — 复制 ROADMAP P0「现状与风险」中 chat 相关要点，再按 P0
 
 ## 实施范围
 
-- [ ] 列出 `chat-pages.tsx` 等 chat 域文件里所有 query 键，分类：
+- [x] 列出 `chat-pages.tsx` 等 chat 域文件里所有 query 键，分类：
       workspace 资源 → `workspaceQueryKey(workspaceId, ...)`；身份级 → `identityQueryKey(...)`。
-- [ ] 逐个替换 `useQuery` / `fetchQuery` / `setQueryData` / `invalidateQueries` / 预取；mutation 用同一工厂键。
-- [ ] 对「明确不需要 workspaceId」的键（如 `["agent-sandbox-readiness"]`、`["sandbox-bootstrap-status"]`、
+- [x] 逐个替换 `useQuery` / `fetchQuery` / `setQueryData` / `invalidateQueries` / 预取；mutation 用同一工厂键。
+- [x] 对「明确不需要 workspaceId」的键（如 `["agent-sandbox-readiness"]`、`["sandbox-bootstrap-status"]`、
       `["providers"]`、`["provider-models", id]`、`["message-versions", ...]`）在代码旁注释说明依据，不改成 workspace。
-- [ ] 回归验证：至少两个工作区切换不再互串；会话增删/乐观更新失效范围正确。
+- [x] 回归验证：至少两个工作区切换不再互串；会话增删/乐观更新失效范围正确（`tests/security/test_p0_client_isolation_source.py` 源级固化 + `test/workspace-cache-isolation.test.ts` 行为测试）。
 
 ## 边界（防冲突）
 
@@ -36,6 +36,6 @@ TODO — 复制 ROADMAP P0「现状与风险」中 chat 相关要点，再按 P0
 
 ## 验收条件
 
-- [ ] `npm run build` + `tsc` 通过；chat 域不再有无依据的裸 workspace 键。
-- [ ] 工作区切换时 chat 侧不显示别的 workspace 的会话/消息。
-- [ ] P1-A（若已就绪）的「工作区缓存隔离」测试在此域打点通过。
+- [x] `npm run build` + `tsc` 通过；chat 域不再有无依据的裸 workspace 键。
+- [x] 工作区切换时 chat 侧不显示别的 workspace 的会话/消息。
+- [x] P1-A（若已就绪）的「工作区缓存隔离」测试在此域打点通过（`workspace-cache-isolation.test.ts`、`client.test.ts`、`optimistic-mutation.test.tsx`）。

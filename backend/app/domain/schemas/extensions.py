@@ -136,6 +136,61 @@ class MCPServerCreateRequest(BaseModel):
         return self
 
 
+class MCPStdioLaunchSpecRequest(BaseModel):
+    """Reviewed, immutable stdio launch envelope submitted for approval.
+
+    The command is never executed by the FastAPI process; it is carried into the
+    isolated Docker runner after an explicit approval action.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_digest: str = Field(min_length=7, max_length=100)
+    command: list[str] = Field(min_length=1, max_length=16)
+
+    @field_validator("image_digest")
+    @classmethod
+    def validate_image_digest(cls, value: str) -> str:
+        digest = value.strip()
+        if digest.startswith("sha256:"):
+            hex_part = digest.removeprefix("sha256:")
+        elif "@sha256:" in digest:
+            hex_part = digest.split("@sha256:", 1)[1]
+        else:
+            raise ValueError("runner image must be an immutable sha256 digest")
+        if len(hex_part) != 64 or not all(
+            character in "0123456789abcdef" for character in hex_part
+        ):
+            raise ValueError("runner image digest must be a 64-character lowercase hex value")
+        return f"sha256:{hex_part}"
+
+    @field_validator("command")
+    @classmethod
+    def validate_command(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("launch command must not be empty")
+        if len(value) > 16:
+            raise ValueError("launch command exceeds the 16-argument bound")
+        for part in value:
+            if not part.strip() or "\x00" in part or "\n" in part:
+                raise ValueError("launch command contains an invalid argument")
+        executable = value[0].strip().split("/")[-1]
+        if executable.casefold() not in {"python", "python3", "node", "nodejs"}:
+            raise ValueError("launch command executable must be one of python, python3, node, nodejs")
+        return value
+
+
+class MCPStdioLaunchSpecView(BaseModel):
+    server_id: str
+    workspace_id: str
+    image_digest: str | None
+    command: list[str]
+    launch_spec_hash: str | None
+    launch_status: str
+    launch_approved_by: str | None
+    launch_approved_at: datetime | None
+
+
 class MCPServerUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -185,6 +240,12 @@ class MCPServerView(ORMModel):
     authorization_generation: int
     last_error: str | None
     last_checked_at: datetime | None
+    runner_image_digest: str | None = None
+    launch_command: list[str] = Field(default_factory=list)
+    launch_spec_hash: str | None = None
+    launch_status: str = "unapproved"
+    launch_approved_by: str | None = None
+    launch_approved_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -210,6 +271,70 @@ class MCPCapabilitySnapshotView(ORMModel):
 class MCPRefreshResponse(BaseModel):
     server: MCPServerView
     snapshot: MCPCapabilitySnapshotView
+
+
+class MCPOAuthExchangeRequest(BaseModel):
+    """Complete an authorization-code exchange (P2-B).
+
+    ``code`` and ``state`` arrive from the issuer redirect; the PKCE code
+    verifier and requested scope were bound at authorization-request time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=4000)
+    state: str = Field(min_length=1, max_length=200)
+    token_endpoint: str = Field(min_length=8, max_length=1000)
+    client_id: str | None = Field(default=None, max_length=200)
+    client_secret: SecretStr | None = None
+
+
+class MCPOAuthRefreshRequest(BaseModel):
+    """Refresh a persisted OAuth access token under the single-flight lock."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token_endpoint: str = Field(min_length=8, max_length=1000)
+    requested_scope: str | None = Field(default=None, max_length=500)
+    force: bool = False
+
+
+class MCPOAuthCredentialView(BaseModel):
+    """Redacted projection of an OAuth credential; never contains plaintext."""
+
+    id: str
+    server_id: str
+    auth_kind: str
+    secret_masked: str
+    secret_fingerprint: str
+    token_type: str | None = None
+    scope: str | None = None
+    issuer: str | None = None
+    client_id: str | None = None
+    expires_at: datetime | None = None
+    has_refresh_token: bool = False
+    status: str = "active"
+    revoked_at: datetime | None = None
+
+
+class MCPOAuthClientRegisterRequest(BaseModel):
+    """Dynamic OAuth client registration for an explicitly trusted issuer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    issuer: str = Field(min_length=3, max_length=500)
+    registration_endpoint: str = Field(min_length=8, max_length=1000)
+    client_name: str = Field(min_length=1, max_length=200)
+    redirect_uris: list[str] = Field(min_length=1, max_length=20)
+    grant_types: list[str] | None = Field(default=None, max_length=10)
+
+
+class MCPOAuthClientRegistrationView(BaseModel):
+    id: str
+    issuer: str
+    client_id: str
+    token_endpoint_auth_method: str = "client_secret_post"
+    has_client_secret: bool = False
 
 
 class PermissionDecisionRequest(BaseModel):

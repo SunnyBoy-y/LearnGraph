@@ -24,6 +24,18 @@ class MCPProtocolFailure(MCPTransportFailure):
     code = "mcp_protocol_error"
 
 
+class MCPRunnerTimeout(MCPTransportFailure):
+    """The isolated runner exceeded the invocation deadline."""
+
+    code = "mcp_runner_timeout"
+
+
+class MCPRunnerResourceExceeded(MCPTransportFailure):
+    """The isolated runner hit a resource/output quota."""
+
+    code = "mcp_runner_resource_exceeded"
+
+
 @dataclass(frozen=True)
 class MCPProbeResult:
     protocol_version: str

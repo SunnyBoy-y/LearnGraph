@@ -209,15 +209,33 @@ def test_workspace_scoped_query_keys_include_workspace_id() -> None:
         "features/chat/selection-explanation-panel.tsx",
         "features/resources/document-chat-panel.tsx",
         "features/resources/concept-branch-workspace.tsx",
+        # P0-C graph / learning / goal / dashboard / memory surfaces.
+        "features/graph/graph-pages.tsx",
+        "features/goals/goal-pages.tsx",
+        "features/goals/goal-chat-flow.tsx",
+        "features/learning/learning-pages.tsx",
+        "features/learning/roadmap-page.tsx",
+        "features/dashboard/dashboard-page.tsx",
+        "features/memory/memory-page.tsx",
+        "components/graph/graph-review-dialog.tsx",
+        "components/graph/node-explore-data.ts",
+        "components/shared/activity-heatmap.tsx",
+        "features/settings/personalization-page.tsx",
     ):
         source = (FRONTEND / relative_path).read_text(encoding="utf-8")
-        assert "workspaceQueryKey" in source
+        assert "workspaceQueryKey" in source, relative_path
+        # Legacy suffix form must not reappear on audited surfaces.
+        assert 'queryKey: ["sessions", workspaceId]' not in source, relative_path
+        assert "queryKey: ['sessions', workspaceId]" not in source, relative_path
 
     workspace_shell = (
         FRONTEND / "components" / "layout" / "workspace-shell.tsx"
     ).read_text(encoding="utf-8")
     assert 'workspaceQueryKey(workspaceId, "sessions")' in workspace_shell
     assert 'workspaceQueryKey(workspaceId, "projects")' in workspace_shell
+    assert 'workspaceQueryKey(workspaceId, "settings")' in workspace_shell
+    # createConversation must fetch settings before seeding the default mode.
+    assert "fetchQuery" in workspace_shell
     assert 'workspaceQueryKey(workspaceId, "settings")' in workspace_shell
 
     chat_pages = (FRONTEND / "features" / "chat" / "chat-pages.tsx").read_text(
@@ -226,11 +244,38 @@ def test_workspace_scoped_query_keys_include_workspace_id() -> None:
     assert 'workspaceQueryKey(workspaceId, "sessions")' in chat_pages
     # Explicit workspaceId form preferred over currentWorkspaceQueryKey so the
     # tenant segment stays visible at every call site and matches shell/chat.
-    assert 'workspaceQueryKey(workspaceId, "messages"' in chat_pages or (
-        'workspaceQueryKey(workspaceId,"messages"' in chat_pages
-    )
+    assert 'workspaceQueryKey(workspaceId, "messages"' in chat_pages
     assert 'workspaceQueryKey(workspaceId, "provider-models", provider.id)' in chat_pages
     assert 'queryKey: ["sessions", workspaceId]' not in chat_pages
+    # Closures that write/remove tenant-scoped message caches must rebind when
+    # the route workspace changes; missing workspaceId deps reintroduce bleed.
+    assert (
+        "[history.data, historyHasMoreBefore, queryClient, sessionId, workspaceId]"
+        in chat_pages
+    )
+    assert "[queryClient, sessionId, workspaceId]" in chat_pages
+
+    graph_pages = (FRONTEND / "features" / "graph" / "graph-pages.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert 'workspaceQueryKey(workspaceId, "graph"' in graph_pages
+    assert 'workspaceQueryKey(workspaceId, "graphs")' in graph_pages
+    assert 'workspaceQueryKey(workspaceId, "mastery")' in graph_pages
+
+    dashboard = (
+        FRONTEND / "features" / "dashboard" / "dashboard-page.tsx"
+    ).read_text(encoding="utf-8")
+    assert 'workspaceQueryKey(workspaceId, "dashboard")' in dashboard
+    assert 'workspaceQueryKey(workspaceId, "sessions")' in dashboard
+
+    memory_page = (FRONTEND / "features" / "memory" / "memory-page.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "workspaceQueryKey(workspaceId, 'memory'" in memory_page
+    # Prefer the explicit form so authStore is not an implicit key dependency.
+    assert "currentWorkspaceQueryKey" not in memory_page
+    # /auth/me deliberately omits X-Workspace-ID.
+    assert "identityQueryKey" in memory_page
 
 
 def test_sandbox_quota_limits_file_and_directory_count() -> None:

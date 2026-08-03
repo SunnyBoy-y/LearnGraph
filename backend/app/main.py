@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import asyncio
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +16,15 @@ from app.core.scheduler import (
     mastery_scheduler,
     memory_extraction_scheduler,
     memory_retention_scheduler,
+    mcp_runner_cleanup_scheduler,
     sandbox_cleanup_scheduler,
 )
-from app.services.document_learning import mark_interrupted_document_jobs
+from app.services.durable_queue import (
+    durable_queue_worker,
+    reconcile_research_polling,
+)
 from app.services.chat import mark_interrupted_message_streams
+from app.services.chat_durable import enqueue_interrupted_chat_resumes
 
 
 @asynccontextmanager
@@ -35,8 +41,21 @@ async def lifespan(_: FastAPI):
             "\n  ".join(_profile_warnings),
         )
     ensure_demo_data()
-    mark_interrupted_document_jobs()
     mark_interrupted_message_streams()
+    durable_queue_stop: asyncio.Event | None = None
+    durable_queue_task: asyncio.Task[None] | None = None
+    if settings.durable_queue_enabled:
+        # Re-arm durable research poll jobs for tasks left in-flight by a prior
+        # process before the worker starts claiming work.
+        reconcile_research_polling()
+        # Reschedule interrupted chat streams that reached a checkpoint so the
+        # worker can perform an audited resume attempt (provider continuation
+        # gated by adapter capability; otherwise parked with retry path intact).
+        enqueue_interrupted_chat_resumes()
+        durable_queue_stop = asyncio.Event()
+        durable_queue_task = asyncio.create_task(
+            durable_queue_worker(durable_queue_stop, f"api-{uuid4()}")
+        )
     scheduler_stop: asyncio.Event | None = None
     scheduler_task: asyncio.Task[None] | None = None
     retention_stop: asyncio.Event | None = None
@@ -45,6 +64,8 @@ async def lifespan(_: FastAPI):
     extraction_task: asyncio.Task[None] | None = None
     sandbox_stop: asyncio.Event | None = None
     sandbox_task: asyncio.Task[None] | None = None
+    mcp_runner_stop: asyncio.Event | None = None
+    mcp_runner_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
         scheduler_stop = asyncio.Event()
         scheduler_task = asyncio.create_task(mastery_scheduler(scheduler_stop))
@@ -57,9 +78,15 @@ async def lifespan(_: FastAPI):
     if settings.sandbox_cleanup_scheduler_enabled:
         sandbox_stop = asyncio.Event()
         sandbox_task = asyncio.create_task(sandbox_cleanup_scheduler(sandbox_stop))
+    if settings.mcp_stdio_cleanup_scheduler_enabled:
+        mcp_runner_stop = asyncio.Event()
+        mcp_runner_task = asyncio.create_task(mcp_runner_cleanup_scheduler(mcp_runner_stop))
     try:
         yield
     finally:
+        if durable_queue_stop is not None and durable_queue_task is not None:
+            durable_queue_stop.set()
+            await durable_queue_task
         if scheduler_stop is not None and scheduler_task is not None:
             scheduler_stop.set()
             await scheduler_task
@@ -72,6 +99,9 @@ async def lifespan(_: FastAPI):
         if sandbox_stop is not None and sandbox_task is not None:
             sandbox_stop.set()
             await sandbox_task
+        if mcp_runner_stop is not None and mcp_runner_task is not None:
+            mcp_runner_stop.set()
+            await mcp_runner_task
 
 
 settings = get_settings()

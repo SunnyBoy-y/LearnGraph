@@ -281,6 +281,27 @@ class SandboxTaskService:
         self.storage = object_storage_provider(db, workspace_id, settings)
         self.backend = backend_for_settings(settings)
 
+    def _egress_envelope(self) -> dict[str, Any] | None:
+        """Build the reviewed outbound-egress reference for a sandbox runtime.
+
+        Egress is an explicit, per-workspace reviewed policy; without a valid
+        policy the envelope is ``None`` and the container stays fully offline.
+        """
+        if not self.settings.sandbox_egress_enabled:
+            return None
+        from app.services.sandbox_network_policy import load_workspace_policy_file
+
+        policy = load_workspace_policy_file(
+            self.settings.sandbox_egress_policy_dir, self.workspace_id
+        )
+        if policy is None:
+            return None
+        return {
+            "policy_digest": policy.digest,
+            "network": self.settings.sandbox_egress_network,
+            "proxy_url": self.settings.sandbox_egress_proxy_url,
+        }
+
     def profile(self) -> dict:
         """Single unified runtime profile.
 
@@ -680,6 +701,7 @@ class SandboxTaskService:
                                     )
                                 ),
                                 runtime_kind=session.runtime_kind,
+                                egress=self._egress_envelope(),
                                 )
                             )
                             session.backend_session_ref = handle.backend_ref
@@ -937,6 +959,27 @@ class SandboxAgentWorkspaceService:
         self.workspace_files = SessionWorkspaceService(db, workspace_id, actor_id, settings)
         self.authz = SandboxAuthorizationService(db, workspace_id, actor_id)
 
+    def _egress_envelope(self) -> dict[str, Any] | None:
+        """Build the reviewed outbound-egress reference for an Agent sandbox.
+
+        Without a valid per-workspace reviewed policy the envelope is ``None``
+        and the container stays fully offline.
+        """
+        if not self.settings.sandbox_egress_enabled:
+            return None
+        from app.services.sandbox_network_policy import load_workspace_policy_file
+
+        policy = load_workspace_policy_file(
+            self.settings.sandbox_egress_policy_dir, self.workspace_id
+        )
+        if policy is None:
+            return None
+        return {
+            "policy_digest": policy.digest,
+            "network": self.settings.sandbox_egress_network,
+            "proxy_url": self.settings.sandbox_egress_proxy_url,
+        }
+
     def _require_chat_session(self, session_id: str) -> ChatSession:
         record = self.db.scalar(
             select(ChatSession).where(
@@ -1166,6 +1209,7 @@ class SandboxAgentWorkspaceService:
                             )
                         ),
                         runtime_kind=session.runtime_kind,
+                        egress=self._egress_envelope(),
                     )
                 )
                 session.backend_session_ref = handle.backend_ref

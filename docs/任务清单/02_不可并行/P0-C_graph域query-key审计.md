@@ -22,10 +22,10 @@ TODO —— 复制 ROADMAP P0「现状与风险」graph 相关要点 + 各文件
 
 ## 实施范围
 
-- [ ] 列出各文件 query 键，分类：workspace 资源 → `workspaceQueryKey(...)`；身份级 → `identityQueryKey(...)`。
-- [ ] 替换 `useQuery`/`fetchQuery`/`setQueryData`/`invalidateQueries`/预取；mutation 用同工厂键。
-- [ ] 对明确非工作区的键注释依据（例如 `["current-user"]`、`["provider-models", id]`）。
-- [ ] 回归：目标/图谱/掌握度/练习在不同 workspaces 间不互串；失效范围正确。
+- [x] 列出各文件 query 键，分类：workspace 资源 → `workspaceQueryKey(...)`；身份级 → `identityQueryKey(...)`。
+- [x] 替换 `useQuery`/`fetchQuery`/`setQueryData`/`invalidateQueries`/预取；mutation 用同工厂键。
+- [x] 对明确非工作区的键注释依据（例如 `["current-user"]`、`["provider-models", id]`）。
+- [x] 回归：目标/图谱/掌握度/练习在不同 workspaces 间不互串；失效范围正确（`test_p0_client_isolation_source.py` 源级固化 graph/goal/learning/dashboard/memory 全部表面）。
 
 ## 边界（防冲突）
 
@@ -35,6 +35,6 @@ TODO —— 复制 ROADMAP P0「现状与风险」graph 相关要点 + 各文件
 
 ## 验收条件
 
-- [ ] `npm run build` + `tsc` 通过；本域不再有无依据的裸 workspace 键。
-- [ ] 图谱/掌握度/目标/练习切换 workspace 不互串。
-- [ ] P1-A 若就绪，在 graph 域打点的隔离测试通过。
+- [x] `npm run build` + `tsc` 通过；本域不再有无依据的裸 workspace 键。
+- [x] 图谱/掌握度/目标/练习切换 workspace 不互串。
+- [x] P1-A 若就绪，在 graph 域打点的隔离测试通过（`workspace-cache-isolation.test.ts` 覆盖 query-key 前缀清理生命周期）。

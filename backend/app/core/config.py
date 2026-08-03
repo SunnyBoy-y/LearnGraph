@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     max_document_parse_bytes: int = 50 * 1024 * 1024
     research_poll_seconds: float = 0.25
     research_max_polls: int = 20
+    durable_queue_enabled: bool = True
+    durable_queue_poll_seconds: float = 0.25
+    durable_queue_lease_seconds: int = 300
+    durable_queue_max_attempts: int = 3
     mastery_message_threshold: int = 8
     mastery_idle_seconds: int = 300
     mastery_embedded_scheduler_enabled: bool = True
@@ -110,6 +114,43 @@ class Settings(BaseSettings):
     sandbox_agent_command_args_max: int = 32
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60
+    # --- Reviewed outbound egress (P2-C) -------------------------------------
+    # Default sandbox posture stays fully offline. Enabling egress is a
+    # deployment decision that must point at a reviewed policy directory; every
+    # CONNECT is re-authorized by the egress proxy at connection time.
+    sandbox_egress_enabled: bool = False
+    sandbox_egress_policy_dir: str = "./data/egress-policies"
+    sandbox_egress_network: str = "learngraph-egress"
+    sandbox_egress_proxy_host: str = "127.0.0.1"
+    sandbox_egress_proxy_port: int = 8888
+    # Sandbox-visible proxy endpoint on the internal egress network.
+    sandbox_egress_proxy_url: str = "http://egress-proxy:8888"
+    # --- Isolated component renderer (P2-A) --------------------------------
+    # Third-party component data is rendered into a server-owned, inert HTML
+    # template with a strict CSP and delivered through the existing opaque-origin
+    # iframe. Rendering only becomes executable when the offline Docker sandbox
+    # image is pinned and the backend probes available; otherwise components
+    # keep the safe ``sandbox_artifact`` unavailable baseline.
+    component_renderer_enabled: bool = True
+    component_render_preview_chars: int = 100_000
+    component_render_screenshot_ttl_seconds: int = 3_600
+    # --- Isolated MCP stdio runner (P2-B) ----------------------------------
+    # The FastAPI process never launches a third-party MCP command. stdio
+    # execution only becomes available when this flag is on AND an immutable
+    # pinned sandbox image provides the fixed ``mcp_stdio`` task; otherwise the
+    # default ``UnavailableStdioMCPAdapter`` stays in effect.
+    mcp_stdio_runner_enabled: bool = False
+    mcp_stdio_command_args_max: int = 16
+    mcp_stdio_result_bytes: int = 256 * 1024
+    mcp_stdio_request_bytes: int = 64 * 1024
+    mcp_stdio_timeout_seconds: int = 60
+    mcp_stdio_session_ttl_seconds: int = 900
+    # Best-effort periodic sweep that reaps orphaned MCP stdio runner containers
+    # (a process crash between provision and terminate leaves a durable
+    # ``MCPRunnerSession`` record; the sweep deletes the expired container and
+    # marks it terminated). Offline deny-by-default posture is unchanged.
+    mcp_stdio_cleanup_scheduler_enabled: bool = True
+    mcp_stdio_cleanup_interval_seconds: int = 120
     # --- Skills & extension marketplace -------------------------------------
     # Same-host local skill discovery. Empty string keeps the legacy behavior
     # (also honours the raw LEARNGRAPH_SKILL_LOCAL_PROBE env var); explicit

@@ -148,6 +148,11 @@ async function main() {
       failures.push('Frontend lint')
     }
     if (
+      !(await runCommand('Frontend behavior tests', npmCommand(['run', 'test']), frontendDir))
+    ) {
+      failures.push('Frontend behavior tests')
+    }
+    if (
       !(await runCommand('Frontend production build', npmCommand(['run', 'build']), frontendDir))
     ) {
       failures.push('Frontend production build')

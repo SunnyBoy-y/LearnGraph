@@ -77,6 +77,11 @@ def merge_provider_request_headers(
     user-supplied values.
     """
 
+    # API keys are paste artifacts: strip trailing whitespace/newlines so a
+    # copied key never produces an invalid Authorization header that httpx/h11
+    # rejects as a LocalProtocolError.
+    api_key = api_key.strip()
+
     headers: dict[str, str] = {}
     if extra_headers:
         for raw_key, raw_value in extra_headers.items():

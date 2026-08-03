@@ -64,10 +64,10 @@ P0-D 落盘后，切 P2-A / P2-B（与 P2-C 并行，单窗口逐项）。
 
 | 任务 | 文件 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| [P1-A 前端行为测试基础设施](01_可并行/P1-A_前端行为测试基础设施.md) | `frontend/` 测试配置+工具+首批测试 | 无（可立即开） | 待开始 |
-| [P1-B 后端持久化异步队列](01_可并行/P1-B_后端持久化异步队列.md) | `backend/` | 无（可立即开） | 待开始 |
+| [P1-A 前端行为测试基础设施](01_可并行/P1-A_前端行为测试基础设施.md) | `frontend/` 测试配置+工具+首批测试 | 无（可立即开） | 已完成 |
+| [P1-B 后端持久化异步队列](01_可并行/P1-B_后端持久化异步队列.md) | `backend/` | 无（可立即开） | 已完成 |
 | [P0-A query-key 工厂与身份/工作区键约定](01_可并行/P0-A_query-key工厂与键约定.md) | `frontend/src/lib/query-keys.ts`（+扩 `auth-query-cache.ts` 治理） | 无（可立即开） | 已完成 |
-| [P2-C 受检沙箱出站网络策略](01_可并行/P2-C_受检沙箱出站网络策略.md) | `backend/`（sandbox/proxy/策略） | 无（可立即开） | 待开始 |
+| [P2-C 受检沙箱出站网络策略](01_可并行/P2-C_受检沙箱出站网络策略.md) | `backend/`（sandbox/proxy/策略） | 无（可立即开） | 已完成（默认仍离线，受检出站经代理） |
 
 ### 不可并行（`02_不可并行/`）
 
@@ -76,5 +76,5 @@ P0-D 落盘后，切 P2-A / P2-B（与 P2-C 并行，单窗口逐项）。
 | [P0-B chat 域 query key 审计](02_不可并行/P0-B_chat域query-key审计.md) | `chat-pages.tsx` 等 chat 域 | 依赖 P0-A | 已完成 |
 | [P0-C graph 域 query key 审计](02_不可并行/P0-C_graph域query-key审计.md) | `graph-pages.tsx`、`goal-*`、`learning-*`、`dashboard` | 依赖 P0-A | 已完成 |
 | [P0-D workspace-shell 及上下文轨 + 清理对齐](02_不可并行/P0-D_workspace-shell与清理对齐.md) | `workspace-shell.tsx`、`auth-context.tsx`、`auth-query-cache.ts` | 依赖 P0-A + P0-B/C 落定 | 已完成 |
-| [P2-A 第三方组件隔离 renderer 与签名信任链](02_不可并行/P2-A_第三方组件隔离Renderer与信任链.md) | `components.py` 等后端组件 | 可先开（设计），实现依赖 P1-B 队列 | 待开始 |
-| [P2-B 隔离 MCP stdio runner 与 OAuth 生命周期](02_不可并行/P2-B_隔离MCP_stdioRunner与OAuth.md) | `mcp.py`、runner、OAuth | 可先开（设计），实现依赖 P1-B | 待开始 |
+| [P2-A 第三方组件隔离 renderer 与签名信任链](02_不可并行/P2-A_第三方组件隔离Renderer与信任链.md) | `components.py` 等后端组件 | 可先开（设计），实现依赖 P1-B 队列 | 已完成 |
+| [P2-B 隔离 MCP stdio runner 与 OAuth 生命周期](02_不可并行/P2-B_隔离MCP_stdioRunner与OAuth.md) | `mcp.py`、runner、OAuth | 可先开（设计），实现依赖 P1-B | 已完成 |

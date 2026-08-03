@@ -473,3 +473,70 @@ async def sandbox_cleanup_scheduler(
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
             continue
+
+
+def run_mcp_runner_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
+    """Reap orphaned isolated MCP stdio runner containers.
+
+    A process crash between ``provision`` and ``terminate`` leaves a durable
+    ``MCPRunnerSession`` record in ``running`` state. This sweep deletes every
+    ``running`` container whose ``expires_at`` has passed and marks the record
+    ``terminated``. The offline deny-by-default posture is unchanged — it only
+    removes leaked containers.
+    """
+
+    from app.domain.extension_models import MCPRunnerSession
+    from app.providers.remote.sandbox import DockerSandboxBackend
+    from app.services.sandbox_runtime import resolve_sandbox_image
+
+    settings = get_settings()
+    current = now or utc_now()
+    totals = {"terminated": 0, "deleted": 0, "skipped": 0}
+    image_ref = resolve_sandbox_image(settings)
+    backend = DockerSandboxBackend(
+        enabled=settings.sandbox_enabled,
+        image_ref=image_ref or "",
+        runtime_kind="python-node",
+    )
+    with SessionLocal() as db:
+        sessions = list(
+            db.scalars(
+                select(MCPRunnerSession).where(
+                    MCPRunnerSession.status == "running",
+                    MCPRunnerSession.expires_at <= current,
+                )
+            ).all()
+        )
+        for session in sessions:
+            totals["terminated"] += 1
+            try:
+                backend.delete(
+                    backend.resume(session.session_id, session.backend_ref)
+                )
+                totals["deleted"] += 1
+            except Exception:  # noqa: BLE001 - the container may already be gone
+                totals["skipped"] += 1
+            session.status = "terminated"
+        db.commit()
+    return totals
+
+
+async def mcp_runner_cleanup_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    interval = max(
+        1,
+        interval_seconds
+        if interval_seconds is not None
+        else get_settings().mcp_stdio_cleanup_interval_seconds,
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_mcp_runner_cleanup_sweep)
+        except Exception:
+            logger.exception("Periodic MCP runner cleanup wake-up failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue

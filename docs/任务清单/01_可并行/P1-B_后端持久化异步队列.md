@@ -4,7 +4,7 @@
 
 ```text
 并行性   : 可并行（独立后端域；不碰前端任何文件，也不与 P2 抢文件）
-状态     : 待开始 —— 可与 P0-A 并行
+状态     : 已完成 —— 2026-08-03（租约队列 + 文档/研究/聊天续跑接入；chat provider-native 续跑经 durable `chat.continue_stream` 重调度 + 能力注册表门控）
 主要文件 : backend/app/core/tasks.py、backend/app/services/chat.py、backend/app/api/routers/chat.py
 依赖     : 无（可立即开）
 口音标注 : 无
@@ -44,11 +44,11 @@
 
 ## 实施范围
 
-- [ ] 定义队列端口接口（enqueue / lease / heartbeat / cancel / retry / idempotency），`InProcessTaskQueue` 适配它。
-- [ ] 定义统一 job 状态机（pending → running → done / failed / interrupted → retried/cancelled）与恢复点语义。
-- [ ] 落盘 continuation、workspace 归属、尝试次数、lease/heartbeat、变更审计。
-- [ ] 启动时分发可恢复中断任务；不可恢复的给 retry 路径。
-- [ ] 写故障注入（见上）与多租户互不阻塞用例。
+- [x] 定义队列端口接口（enqueue / lease / heartbeat / cancel / retry / idempotency），`InProcessTaskQueue` 保留为本地执行适配器（`app/services/durable_queue.py`：`DurableQueue` 租约/CAS 状态机）。
+- [x] 定义统一 job 状态机（pending → leased/running → completed / failed / cancelled / interrupted，含 retry 退避与 stale-lease 回收）与恢复点语义。
+- [x] 落盘 continuation、workspace 归属、尝试次数、lease/heartbeat、变更审计（`DurableJob` 持久化 payload/workspace/attempts/lease；`research.poll` 持久化 research_job_id/workspace_id/actor_id）。
+- [x] 启动时分发可恢复中断任务；不可恢复的给 retry 路径（`reconcile_research_polling()` 启动补/re-arm 在途研究任务；`enqueue_interrupted_chat_resumes()` 把带检查点的 `interrupted` 聊天流重调度为 `chat.continue_stream` job；durable worker 自动回收过期租约）。
+- [x] 写故障注入（见上）与多租户互不阻塞用例（`tests/services/test_durable_queue_faults.py` 9 个用例 + `test_chat_durable.py` 5 个用例）。
 
 ## 与其他任务的边界（防冲突）
 
@@ -60,9 +60,9 @@
 
 ## 验收条件
 
-- [ ] `backend` 测试（见 memory `backend-dev-workflow`：`uv run --with pytest` 在 `backend/` 下跑）通过，且新增故障注入用例绿。
-- [ ] 重启后带检查点 job 被重新调度；重复投递不重复业务事实。
-- [ ] 多租户隔离用例通过。
+- [x] `backend` 测试（`uv run --with pytest pytest tests`）通过（2026-08-03：339 通过），且新增故障注入用例绿。
+- [x] 重启后带检查点 job 被重新调度（`reconcile_research_polling` + 过期租约回收 + `chat.continue_stream`）；重复投递不重复业务事实（dedupe key 幂等 + CAS token 门控）。
+- [x] 多租户隔离用例通过（按工作区取消隔离、跨工作区轮询公平、退避不阻塞其它租户）。
 
 ## 产出物交付给谁
 

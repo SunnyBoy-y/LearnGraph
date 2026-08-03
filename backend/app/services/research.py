@@ -569,6 +569,14 @@ class ResearchService:
         )
 
     def _enqueue_poll(self, job: ResearchJob) -> None:
+        if self.settings.durable_queue_enabled:
+            from app.services.durable_queue import enqueue_research_poll
+
+            # Durable poll job: survives process restarts and is re-armed while
+            # the remote task is still active (see run_research_poll_once).
+            enqueue_research_poll(job.id, self.workspace_id, self.actor_id)
+            return
+        # Development/compat path: in-process bounded poller.
         task_queue.submit(
             _poll_research_job,
             job.id,
@@ -598,7 +606,12 @@ def _poll_research_job(
     poll_seconds: float,
     max_polls: int,
 ) -> None:
-    """Poll a remote task with fresh sessions so request sessions never leak to workers."""
+    """Poll a remote task with fresh sessions so request sessions never leak to workers.
+
+    Legacy in-process bounded window used when the durable queue is disabled.
+    The durable queue path uses :func:`poll_research_once` instead, which is
+    lease-bounded and keeps the worker fair across workspaces.
+    """
 
     for _ in range(max(1, max_polls)):
         with SessionLocal() as db:
@@ -618,3 +631,30 @@ def _poll_research_job(
             if job.status in TERMINAL_RESEARCH_STATUSES:
                 return
         time.sleep(max(0.01, min(poll_seconds, 5.0)))
+
+
+def poll_research_once(job_id: str, workspace_id: str, actor_id: str) -> bool:
+    """Poll one remote research task once; True when the task is terminal.
+
+    Fresh sessions prevent request-session leaks into workers. A single
+    refresh per durable lease lets the queue worker cycle through tenants
+    instead of parking on one long polling window.
+    """
+
+    with SessionLocal() as db:
+        settings = get_settings()
+        service = ResearchService(
+            db,
+            workspace_id,
+            actor_id,
+            search_provider_for_workspace(db, workspace_id, settings),
+            deep_research_provider_for_workspace(db, workspace_id, settings),
+            settings,
+        )
+        try:
+            job = service.refresh_research(job_id)
+        except AppError:
+            # Provider disappeared / task unreachable: stop polling this round;
+            # the research job's own status governs any user-facing retry.
+            return True
+        return job.status in TERMINAL_RESEARCH_STATUSES

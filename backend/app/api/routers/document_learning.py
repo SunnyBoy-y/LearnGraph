@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Header, status
+from fastapi import APIRouter, Header, status
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.domain.schemas.files import (
@@ -14,7 +14,8 @@ from app.domain.schemas.files import (
     DocumentRevisionView,
 )
 from app.services.authorization import AuthorizationService
-from app.services.document_learning import DocumentLearningService, run_document_job
+from app.services.document_learning import DocumentLearningService
+from app.services.durable_queue import enqueue_document_job
 
 
 router = APIRouter(tags=["document-learning"])
@@ -48,7 +49,6 @@ def _require_file_access(db: DB, context: CurrentWorkspace, file_id: str, permis
 def create_document_job(
     file_id: str,
     payload: DocumentJobCreate,
-    background_tasks: BackgroundTasks,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
@@ -61,8 +61,8 @@ def create_document_job(
         file_id, payload, idempotency_key
     )
     if created or job.status == "queued":
-        background_tasks.add_task(
-            run_document_job,
+        enqueue_document_job(
+            context.workspace_id,
             job.id,
             DocumentLearningService.execution_token(job),
         )
@@ -120,7 +120,6 @@ def list_document_job_events(
 @router.post("/document-jobs/{job_id}/retry", response_model=DocumentJobView)
 def retry_document_job(
     job_id: str,
-    background_tasks: BackgroundTasks,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
@@ -129,8 +128,8 @@ def retry_document_job(
     job = document_service.get_job(job_id)
     _require_file_access(db, context, job.file_id, "write")
     job = document_service.retry(job_id)
-    background_tasks.add_task(
-        run_document_job,
+    enqueue_document_job(
+        context.workspace_id,
         job.id,
         DocumentLearningService.execution_token(job),
     )

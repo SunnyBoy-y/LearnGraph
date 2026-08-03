@@ -22,11 +22,11 @@ TODO —— 结合 memory `workspace-default-response-mode-race`：`createConver
 
 ## 实施范围
 
-- [ ] `workspace-shell.tsx` 内全部裸键收敛到 `workspaceQueryKey(...)`（projects/sessions/settings/graphs/goals/mastery/dashboard 等）。
-- [ ] 上下文轨（ContextRail / GraphWorkspaceRail / BoundGraphRail / CapabilityGraphRail / ProjectBookshelf）query 键对齐。
-- [ ] 在 `auth-query-cache.ts` 统一切换/登出/401/账户删除的清理逻辑，与 P0-A 的 `workspaceQueryPrefix` 一致；
+- [x] `workspace-shell.tsx` 内全部裸键收敛到 `workspaceQueryKey(...)`（projects/sessions/settings/graphs/goals/mastery/dashboard 等）。
+- [x] 上下文轨（ContextRail / GraphWorkspaceRail / BoundGraphRail / CapabilityGraphRail / ProjectBookshelf）query 键对齐。
+- [x] 在 `auth-query-cache.ts` 统一切换/登出/401/账户删除的清理逻辑，与 P0-A 的 `workspaceQueryPrefix` 一致；
       移除旧全局键处理。
-- [ ] 回归：切换/登出/401 不残留别的 workspace 缓存；`clearWorkspaceClientState` 只清一个租户。
+- [x] 回归：切换/登出/401 不残留别的 workspace 缓存；`clearWorkspaceClientState` 只清一个租户（`test/workspace-cache-isolation.test.ts`：只清前一租户、不动其它租户与 identity 数据）。
 
 ## 边界（防冲突）
 
@@ -36,6 +36,6 @@ TODO —— 结合 memory `workspace-default-response-mode-race`：`createConver
 
 ## 验收条件
 
-- [ ] `npm run build` + `tsc` 通过。
-- [ ] 工作区 A 切换/登出/401 后，绝不显示工作区 B 的残留缓存。
-- [ ] 记忆中的 `workspace-default-response-mode-race` 链路仍成立（createConversation fetchQuery→seed 顺序未断）。
+- [x] `npm run build` + `tsc` 通过。
+- [x] 工作区 A 切换/登出/401 后，绝不显示工作区 B 的残留缓存（`workspace-cache-isolation.test.ts`：切换清前一租户、登出全清）。
+- [x] 记忆中的 `workspace-default-response-mode-race` 链路仍成立（createConversation fetchQuery→seed 顺序未断，`test_p0_client_isolation_source.py` 断言 workspace_shell 保留 fetchQuery）。

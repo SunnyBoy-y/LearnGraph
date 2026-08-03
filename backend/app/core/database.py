@@ -506,6 +506,45 @@ def _apply_sqlite_additive_migrations() -> None:
             "active_command_id": "VARCHAR(36)",
             "command_generation": "INTEGER NOT NULL DEFAULT 0",
         },
+        # P2-A trusted component chain: issuer binding and trust eligibility.
+        "component_manifest_versions": {
+            "issuer_id": "VARCHAR(36)",
+            "trusted_bundle_eligible": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        # P2-B reviewed stdio launch specification on existing MCP servers.
+        "mcp_servers": {
+            "runner_image_digest": "VARCHAR(100)",
+            "launch_command": "JSON NOT NULL DEFAULT '[]'",
+            "launch_spec_hash": "VARCHAR(64)",
+            "launch_status": "VARCHAR(40) NOT NULL DEFAULT 'unapproved'",
+            "launch_approved_by": "VARCHAR(64)",
+            "launch_approved_at": "DATETIME",
+        },
+        # P2-B OAuth authorization-code lifecycle on existing credential rows.
+        # All columns are additive/nullable so legacy static-bearer rows stay
+        # valid; ``auth_kind`` defaults preserve the original encrypted-secret flow.
+        "mcp_server_credentials": {
+            "auth_kind": "VARCHAR(32) NOT NULL DEFAULT 'static_bearer'",
+            "token_type": "VARCHAR(40)",
+            "scope": "VARCHAR(500)",
+            "issuer": "VARCHAR(500)",
+            "client_id": "VARCHAR(200)",
+            "expires_at": "DATETIME",
+            "refresh_token_ciphertext": "TEXT",
+            "status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
+            "revoked_at": "DATETIME",
+            "revoked_reason": "VARCHAR(500)",
+            "pending_state": "VARCHAR(80)",
+            "pending_code_verifier_ciphertext": "TEXT",
+            "pending_scope": "VARCHAR(500)",
+            "pending_redirect_uri": "VARCHAR(1000)",
+            "pending_created_at": "DATETIME",
+        },
+        # Schema revision ledger audit fields.
+        "schema_revisions": {
+            "applied_by": "VARCHAR(64) NOT NULL DEFAULT ''",
+            "duration_ms": "INTEGER NOT NULL DEFAULT 0",
+        },
     }
     with engine.begin() as connection:
         for table_name, columns in additions.items():

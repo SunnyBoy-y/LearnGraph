@@ -41,6 +41,19 @@ class MCPServer(Base, TimestampMixin, WorkspaceScopedMixin):
     authorization_generation: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Reviewed stdio launch specification (P2-B). The FastAPI process never
+    # executes ``launch_command``; the isolated Docker runner consumes it. A
+    # spec stays inert (``launch_status="unapproved"``) until an explicit,
+    # audited approval action marks it active — registration and execution are
+    # deliberately separated, and stdio remains unavailable without one.
+    runner_image_digest: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    launch_command: Mapped[list[str]] = mapped_column(JSON, default=list)
+    launch_spec_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    launch_status: Mapped[str] = mapped_column(String(40), default="unapproved", index=True)
+    launch_approved_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    launch_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class MCPCapabilitySnapshot(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -71,7 +84,13 @@ class MCPCapabilitySnapshot(Base, TimestampMixin, WorkspaceScopedMixin):
 
 
 class MCPServerCredential(Base, TimestampMixin, WorkspaceScopedMixin):
-    """Encrypted static bearer reference; plaintext is never returned or audited."""
+    """Encrypted MCP auth reference; plaintext is never returned or audited.
+
+    ``ciphertext`` carries either a static bearer secret (``auth_kind`` =
+    ``"static_bearer"``) or the Fernet-encrypted OAuth access token
+    (``auth_kind`` = ``"oauth_authorization_code"``). OAuth refresh tokens live
+    in ``refresh_token_ciphertext`` and are likewise never exposed outward.
+    """
 
     __tablename__ = "mcp_server_credentials"
     __table_args__ = (
@@ -85,6 +104,84 @@ class MCPServerCredential(Base, TimestampMixin, WorkspaceScopedMixin):
     ciphertext: Mapped[str] = mapped_column(Text)
     secret_masked: Mapped[str] = mapped_column(String(80))
     secret_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    # --- OAuth authorization-code lifecycle (P2-B) -------------------------
+    # ``static_bearer`` preserves the original encrypted-secret flow exactly;
+    # every OAuth column below is additive/nullable so existing rows stay valid.
+    auth_kind: Mapped[str] = mapped_column(
+        String(32), default="static_bearer", index=True
+    )
+    token_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    scope: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    issuer: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    refresh_token_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Short-lived PKCE + state material bound at authorization-request time.
+    # The code verifier is stored encrypted; both are cleared on exchange.
+    pending_state: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    pending_code_verifier_ciphertext: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    pending_scope: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    pending_redirect_uri: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    pending_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class MCPOAuthClientRegistration(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Dynamically registered OAuth client bound to a trusted issuer (P2-B).
+
+    Only issuers in an explicit allowlist can be registered. The client secret
+    is stored encrypted and never returned through API/agent surfaces.
+    """
+
+    __tablename__ = "mcp_oauth_client_registrations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "issuer", name="uq_mcp_oauth_client_issuer"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    server_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), index=True
+    )
+    issuer: Mapped[str] = mapped_column(String(500))
+    client_id: Mapped[str] = mapped_column(String(200))
+    client_secret_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_endpoint_auth_method: Mapped[str] = mapped_column(
+        String(40), default="client_secret_post"
+    )
+
+
+class MCPRunnerSession(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Durable record of a provisioned isolated MCP stdio runner container.
+
+    Persisted best-effort at provision so the cleanup sweep can reap orphaned
+    containers when a process dies mid-invocation (between provision and the
+    finally-delete). The record is marked ``terminated`` by ``terminate()``; the
+    sweep deletes any ``running`` container whose ``expires_at`` has passed and
+    then marks it ``terminated``. Container references are opaque backend
+    handles; no command output or credential material is stored here.
+    """
+
+    __tablename__ = "mcp_runner_sessions"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "session_id", name="uq_mcp_runner_session"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    server_id: Mapped[str] = mapped_column(String(36), index=True)
+    session_id: Mapped[str] = mapped_column(String(120), index=True)
+    backend_ref: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class SkillRecord(Base, TimestampMixin, WorkspaceScopedMixin):

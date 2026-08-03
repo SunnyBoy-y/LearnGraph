@@ -17,6 +17,8 @@ from app.domain.schemas.extensions import (
     MCPServerCreateRequest,
     MCPServerUpdateRequest,
     MCPServerView,
+    MCPStdioLaunchSpecRequest,
+    MCPStdioLaunchSpecView,
     PermissionDecisionRequest,
     PermissionGrantView,
     SkillCreateRequest,
@@ -164,6 +166,65 @@ def update_mcp_server(
 ) -> MCPServerView:
     manager = service(db, context, settings)
     return server_view(manager.update_server(server_id, payload), manager)
+
+
+@router.post(
+    "/mcp/servers/{server_id}/stdio-launch-spec",
+    response_model=MCPStdioLaunchSpecView,
+)
+def register_stdio_launch_spec(
+    server_id: str,
+    payload: MCPStdioLaunchSpecRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPStdioLaunchSpecView:
+    """注册已审 stdio 启动规范（未审批，不执行）。
+
+    注册与运行分离：此处只记录 digest 固定的命令供后续审批；未审批的
+    stdio 仍保持 UnavailableStdioMCPAdapter 默认拒绝语义。
+    """
+    manager = service(db, context, settings)
+    server = manager.register_stdio_launch_spec(
+        server_id,
+        image_digest=payload.image_digest,
+        command=payload.command,
+    )
+    return MCPStdioLaunchSpecView(
+        server_id=server.id,
+        workspace_id=server.workspace_id,
+        image_digest=server.runner_image_digest,
+        command=list(server.launch_command),
+        launch_spec_hash=server.launch_spec_hash,
+        launch_status=server.launch_status,
+        launch_approved_by=server.launch_approved_by,
+        launch_approved_at=server.launch_approved_at,
+    )
+
+
+@router.post(
+    "/mcp/servers/{server_id}/stdio-launch-spec/approve",
+    response_model=MCPStdioLaunchSpecView,
+)
+def approve_stdio_launch_spec(
+    server_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPStdioLaunchSpecView:
+    """审批已注册的 stdio 启动规范，使其可被隔离 runner 执行（可审计）。"""
+    manager = service(db, context, settings)
+    server = manager.approve_stdio_launch_spec(server_id)
+    return MCPStdioLaunchSpecView(
+        server_id=server.id,
+        workspace_id=server.workspace_id,
+        image_digest=server.runner_image_digest,
+        command=list(server.launch_command),
+        launch_spec_hash=server.launch_spec_hash,
+        launch_status=server.launch_status,
+        launch_approved_by=server.launch_approved_by,
+        launch_approved_at=server.launch_approved_at,
+    )
 
 
 @router.post("/mcp/servers/{server_id}/refresh", response_model=MCPRefreshResponse)

@@ -121,6 +121,8 @@ class ComponentManifestVersionView(ORMModel):
     schema_hash: str
     permissions_hash: str
     manifest_hash: str
+    issuer_id: str | None = None
+    trusted_bundle_eligible: bool = False
     created_at: datetime
 
 
@@ -202,6 +204,11 @@ class ComponentArtifactView(BaseModel):
     sandbox_executed: bool
     trusted_component: dict[str, Any] | None = None
     sandbox_artifact: dict[str, Any] | None = None
+    # Trusted renderer channel decision for third-party components. ``delivery_mode``
+    # stays ``sandbox_artifact`` for anything not fully eligible; these fields surface
+    # the eligibility decision and the sealed envelope lives in ``sandbox_artifact``.
+    trusted_renderer_eligible: bool = False
+    trusted_renderer_reason: str | None = None
 
 
 class ComponentEventValidationRequest(BaseModel):
