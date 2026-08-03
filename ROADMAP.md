@@ -184,4 +184,5 @@
 - **2026-08-03**：重建沙箱镜像（含 `render_component`/`mcp_stdio` 任务）并经真实 Docker 离线容器端到端验证（`scripts/verify_sandbox_container_tasks.py`）；修复 runner `mcp_stdio` 输出被摘要覆盖的契约 bug；补 P2-C 部署冒烟脚本（`scripts/verify_sandbox_egress.py`）、P0 文档勾选与前端 R-017 设置页清除行为测试。
 - **2026-08-03**：P1-B 聊天续跑接入 durable 队列——重启后带 `ProviderResponseState` 检查点的 `interrupted` 聊天流重调度为 `chat.continue_stream` job，按能力注册表门控续跑；当前无 provider 支持时审计 `chat.continue_unavailable` 并保留上下文与 retry 路径（`chat_durable.py`；后端全量测试 332 通过）。
 - **2026-08-03**：P2-B runner 结构化审计与清理接线完成——`StdioIsolatedMCPAdapter.invoke` 自建隔离容器 one-shot JSON-RPC（修复无 session 接线），超时/配额映射到 `ExtensionInvocation` 审计；OAuth 活 token 经 `runner_only_token` 仅注入容器、revoke/过期 fail-closed；`MCPRunnerSession` 持久化 + `mcp_runner_cleanup_scheduler` 回收孤儿容器（后端全量测试 339 通过）。
+- **2026-08-03**：P2-A 前端消费可信 renderer 通道——`TrustedComponentRenderer` 将 `sandbox_artifact` 第三方部件委托给 `SandboxArtifact`（替代 JSON dump），消费服务端 sealed envelope（可信徽标 / 降级原因 / `renderer.unlock` 握手，`targetOrigin='*'`），不读 iframe DOM、不放宽 CSP（前端 35 测试通过）。
 - **2026-08-02**：基于当前代码、`README.md` 与开发者文档建立首版 P0/P1/P2 路线图。

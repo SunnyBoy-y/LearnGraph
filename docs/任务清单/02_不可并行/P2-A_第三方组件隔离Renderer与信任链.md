@@ -4,7 +4,7 @@
 
 ```text
 并行性   : 不可并行（对 backend/app/services/components.py 的大改动 + 涉及安全边界；实现依赖 P1-B 的队列/恢复底座）
-状态     : 已完成 —— 2026-08-03（签名信任库 + 服务端校验 + 隔离 renderer runtime + 可信 renderer 通道（消费 trusted_bundle_eligible）+ capability token 协议；未验证/撤销仍降级 sandbox_artifact；真实 Docker 容器 E2E 已补：重建镜像含 render_component 任务，scripts/verify_sandbox_container_tasks.py 离线容器内 6 项通过）
+状态     : 已完成 —— 2026-08-03（签名信任库 + 服务端校验 + 隔离 renderer runtime + 可信 renderer 通道（消费 trusted_bundle_eligible）+ capability token 协议 + 前端消费（TrustedComponentRenderer 委托 SandboxArtifact、unlock 握手、可信徽标/降级原因展示）；未验证/撤销仍降级 sandbox_artifact；真实 Docker 容器 E2E 已补）
 主要文件 : backend/app/services/components.py、backend/app/services/component_trust.py、backend/app/services/component_renderer.py、backend/app/services/component_renderer_protocol.py、tests/services/test_component_trusted_renderer.py
 依赖     : P1-B（实现阶段）—— 设计阶段可先行
 口音标注 : 无

@@ -1,4 +1,4 @@
-import { Box, FileCode2, ShieldAlert } from "lucide-react";
+import { Box, FileCode2, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { BundledLanguage } from "shiki";
 
 import {
@@ -8,6 +8,12 @@ import {
 } from "@/components/ai-elements/code-block";
 import { Badge } from "@/components/ui/badge";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import {
+  postRendererUnlock,
+  rendererUnlockMessage,
+  trustedRendererEligible,
+  trustedRendererReason,
+} from "@/lib/trusted-renderer";
 
 const supportedLanguages = new Set<BundledLanguage>([
   "css",
@@ -33,6 +39,12 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const artifactUrl = typeof data.artifact_url === "string" ? data.artifact_url : "";
   const originVerified = data.origin_verified === true;
   const canRenderRemote = originVerified && /^https:\/\//i.test(artifactUrl);
+  // P2-A trusted renderer decision is server-side only. The host surfaces it
+  // and posts the sealed unlock handshake to the inert opaque iframe; it never
+  // relaxes the iframe boundary or executes component code in the main DOM.
+  const trustedEligible = trustedRendererEligible(data);
+  const trustedReason = trustedRendererReason(data);
+  const unlockMessage = rendererUnlockMessage(data);
 
   return (
     <section className="sandbox-artifact" aria-label={title}>
@@ -42,6 +54,11 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           <strong>{title}</strong>
           <span>生成代码不会进入主应用 DOM</span>
         </div>
+        {trustedEligible ? (
+          <Badge variant="default">
+            <ShieldCheck className="size-3" /> 可信发行者
+          </Badge>
+        ) : null}
         <Badge variant="secondary">{status}</Badge>
       </div>
 
@@ -49,6 +66,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         <iframe
           allow=""
           className="sandbox-artifact__preview"
+          onLoad={(event) => postRendererUnlock(event.currentTarget, unlockMessage)}
           referrerPolicy="no-referrer"
           sandbox="allow-scripts"
           srcDoc={sandboxedHtmlPreviewDocument(previewHtml)}
@@ -77,6 +95,13 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         <p className="sandbox-artifact__warning" role="status">
           <ShieldAlert className="size-3.5" />
           产物来源未通过隔离校验，因此没有加载远程页面。
+        </p>
+      ) : null}
+
+      {!trustedEligible && trustedReason ? (
+        <p className="sandbox-artifact__warning" role="status">
+          <ShieldAlert className="size-3.5" />
+          {trustedReason}
         </p>
       ) : null}
 

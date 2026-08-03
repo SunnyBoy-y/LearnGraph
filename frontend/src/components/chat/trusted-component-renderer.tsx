@@ -21,6 +21,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 
 const optionSchema = z.object({
   id: z.string().min(1).max(160),
@@ -227,6 +228,33 @@ export function TrustedComponentRenderer({
 }) {
   const parsed = useMemo(() => trustedComponentSchema.safeParse(data), [data]);
   const [textValue, setTextValue] = useState("");
+
+  // Third-party components are delivered with delivery_mode="sandbox_artifact".
+  // They never match the built-in declarative schema below; delegate them to
+  // SandboxArtifact, which renders the server-owned inert preview inside the
+  // opaque-origin iframe and surfaces the P2-A trusted-renderer decision. This
+  // is the safe downgrade path — third-party code still never enters the main
+  // DOM and the iframe boundary (no allow-same-origin, connect-src 'none') is
+  // never relaxed.
+  const sandboxArtifact =
+    data.delivery_mode === "sandbox_artifact" &&
+    typeof data.sandbox_artifact === "object" &&
+    data.sandbox_artifact !== null &&
+    !Array.isArray(data.sandbox_artifact)
+      ? (data.sandbox_artifact as Record<string, unknown>)
+      : null;
+  if (sandboxArtifact) {
+    const props =
+      typeof data.props === "object" && data.props !== null
+        ? (data.props as Record<string, unknown>)
+        : undefined;
+    const title = typeof props?.title === "string" ? props.title : undefined;
+    return (
+      <SandboxArtifact
+        data={title ? { ...sandboxArtifact, title } : sandboxArtifact}
+      />
+    );
+  }
 
   if (!parsed.success) {
     const componentType =
