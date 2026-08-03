@@ -2023,6 +2023,7 @@ class ProviderService:
                     provider_id=provider.id,
                     base_url=provider.base_url,
                     api_key=self._optional_secret(provider.id),
+                    allow_private_bridge_urls=self.settings.allow_private_bridge_urls,
                 )
             elif provider.provider_type == "anysearch":
                 adapter = AnySearchSearchProvider(
@@ -2036,10 +2037,13 @@ class ProviderService:
                     provider_type=provider.provider_type,
                     base_url=provider.base_url,
                     api_key=self._decrypt_secret(provider.id),
+                    allow_private_bridge_urls=self.settings.allow_private_bridge_urls,
                 )
             return adapter.probe()
         except ValueError as exc:
             raise AppError(409, "provider_not_configured", str(exc)) from exc
+        except FetchProviderError as exc:
+            raise AppError(502, "provider_probe_failed", str(exc)) from exc
         except SearchProviderTimeout as exc:
             raise AppError(504, "provider_probe_timeout", "Search Provider probe timed out") from exc
         except SearchProviderResponseError as exc:
@@ -2058,12 +2062,14 @@ class ProviderService:
                     provider_id=provider.id,
                     base_url=provider.base_url,
                     api_key=self._optional_secret(provider.id),
+                    allow_private_bridge_urls=self.settings.allow_private_bridge_urls,
                 )
             else:
                 adapter = FirecrawlFetchProvider(
                     provider_id=provider.id,
                     base_url=provider.base_url,
                     api_key=self._decrypt_secret(provider.id),
+                    allow_private_bridge_urls=self.settings.allow_private_bridge_urls,
                 )
             return adapter.probe()
         except FetchProviderTimeout as exc:

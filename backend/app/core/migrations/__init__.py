@@ -79,12 +79,29 @@ def _memory_outbox_lease_generation(connection: Connection) -> None:
     )
 
 
+def _record_ledger_baseline(connection: Connection) -> None:
+    """No-op: the v1.0.0 row this migration inserts is the ledger baseline.
+
+    Both fresh and migration-era databases end with this as the latest
+    revision, matching CURRENT_SCHEMA_REVISION in app.core.database, so the
+    startup revision check no longer warns on every boot.
+    """
+    del connection
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
         "0002_memory_outbox_lease_generation",
         "Add generation-aware outbox lease ownership",
         _memory_outbox_lease_generation,
+    ),
+    # Keep revision/description in sync with CURRENT_SCHEMA_REVISION /
+    # CURRENT_SCHEMA_DESCRIPTION in app.core.database.
+    SchemaMigration(
+        "v1.0.0",
+        "Schema Revision Ledger baseline — all tables up to P0 sandbox hardening",
+        _record_ledger_baseline,
     ),
 )
 

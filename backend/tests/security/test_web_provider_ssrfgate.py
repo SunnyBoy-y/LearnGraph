@@ -50,6 +50,30 @@ def test_validate_bridge_url_accepts_public_dns_answer(monkeypatch) -> None:
     assert validate_bridge_url("https://Bridge.Example.com/api/") == "https://Bridge.Example.com/api"
 
 
+def test_validate_bridge_url_allow_private_accepts_private_dns_answer(monkeypatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: _resolved("10.0.0.2"))
+    assert (
+        validate_bridge_url("https://bridge.example.com/", allow_private=True)
+        == "https://bridge.example.com"
+    )
+
+
+def test_validate_bridge_url_allow_private_accepts_loopback_literal() -> None:
+    assert validate_bridge_url("http://127.0.0.1:8000", allow_private=True) == "http://127.0.0.1:8000"
+
+
+def test_validate_bridge_url_allow_private_keeps_structural_checks() -> None:
+    # The escape hatch only relaxes the private/reserved DNS check; the
+    # scheme, userinfo, and port guards must still fire.
+    for url in [
+        "file:///etc/passwd",
+        "http://user:secret@example.com",
+        "http://example.com:0",
+    ]:
+        with pytest.raises(UnsafeFetchURL):
+            validate_bridge_url(url, allow_private=True)
+
+
 def test_source_fetch_rejects_userinfo_and_metadata() -> None:
     with pytest.raises(UnsafeFetchURL):
         require_public_http_url("https://user@example.com", {"example.com"})
@@ -61,5 +85,5 @@ def test_provider_constructors_validate_bridge_url_source() -> None:
     source = __import__("pathlib").Path(__file__).resolve().parents[2]
     fetch_source = (source / "app" / "providers" / "remote" / "fetch.py").read_text(encoding="utf-8")
     search_source = (source / "app" / "providers" / "remote" / "search.py").read_text(encoding="utf-8")
-    assert fetch_source.count("validate_bridge_url(base_url)") >= 2
-    assert search_source.count("validate_bridge_url(base_url)") >= 2
+    assert fetch_source.count("validate_bridge_url(base_url") >= 2
+    assert search_source.count("validate_bridge_url(base_url") >= 2

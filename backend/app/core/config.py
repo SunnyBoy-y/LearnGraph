@@ -198,6 +198,13 @@ class Settings(BaseSettings):
     # etc.). Installs stay commit-pinned and audited; disable to make skills and
     # MCP servers user-click-only.
     agent_extension_self_service_enabled: bool = True
+    # System proxy/VPN clients that answer DNS with synthetic private addresses
+    # (Clash-style "fake-ip", e.g. 198.18.0.0/15) make the provider-bridge SSRF
+    # guard reject otherwise-public hostnames (Firecrawl, Crawl4AI, SearXNG,
+    # cloud search). Opt-in escape hatch for such trusted host networks; URL
+    # scheme/userinfo/port checks still apply. Keep off unless the bridge egress
+    # is trusted — it re-opens the private-address SSRF path the guard closes.
+    allow_private_bridge_urls: bool = False
 
     @property
     def resolved_sandbox_workspace_root(self) -> Path:

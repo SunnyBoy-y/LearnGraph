@@ -85,6 +85,7 @@ from app.providers.remote.research_vendors import (
 )
 from app.providers.remote.fetch import (
     Crawl4AIHTTPFetchProvider,
+    FetchProviderError,
     FirecrawlFetchProvider,
     UnavailableFetchProvider,
 )
@@ -914,11 +915,15 @@ def search_provider_for_workspace(
     from app.providers.remote.search import CloudSearchProvider
 
     if provider.provider_type == "searxng":
-        return SearXNGSearchProvider(
-            provider_id=provider.id,
-            base_url=provider.base_url,
-            api_key=api_key,
-        )
+        try:
+            return SearXNGSearchProvider(
+                provider_id=provider.id,
+                base_url=provider.base_url,
+                api_key=api_key,
+                allow_private_bridge_urls=settings.allow_private_bridge_urls,
+            )
+        except (ValueError, FetchProviderError) as exc:
+            return UnavailableSearchProvider(provider.id, f"Configured SearchProvider is unavailable: {exc}")
     if not api_key:
         return UnavailableSearchProvider(provider.id, "Configured cloud SearchProvider has no encrypted secret")
     if provider.provider_type == "anysearch":
@@ -930,12 +935,16 @@ def search_provider_for_workspace(
             )
         except ValueError as exc:
             return UnavailableSearchProvider(provider.id, str(exc))
-    return CloudSearchProvider(
-        provider_id=provider.id,
-        provider_type=provider.provider_type,
-        base_url=provider.base_url,
-        api_key=api_key,
-    )
+    try:
+        return CloudSearchProvider(
+            provider_id=provider.id,
+            provider_type=provider.provider_type,
+            base_url=provider.base_url,
+            api_key=api_key,
+            allow_private_bridge_urls=settings.allow_private_bridge_urls,
+        )
+    except (ValueError, FetchProviderError) as exc:
+        return UnavailableSearchProvider(provider.id, f"Configured SearchProvider is unavailable: {exc}")
 
 
 def transcription_provider_for_workspace(
@@ -1186,16 +1195,24 @@ def fetch_provider_for_workspace(
     if provider.provider_type == "firecrawl_fetch":
         if not api_key:
             return UnavailableFetchProvider(provider.id, "Configured Firecrawl provider has no encrypted secret")
-        return FirecrawlFetchProvider(
+        try:
+            return FirecrawlFetchProvider(
+                provider_id=provider.id,
+                base_url=provider.base_url,
+                api_key=api_key,
+                allow_private_bridge_urls=settings.allow_private_bridge_urls,
+            )
+        except FetchProviderError as exc:
+            return UnavailableFetchProvider(provider.id, f"Configured fetch provider is unavailable: {exc}")
+    try:
+        return Crawl4AIHTTPFetchProvider(
             provider_id=provider.id,
             base_url=provider.base_url,
             api_key=api_key,
+            allow_private_bridge_urls=settings.allow_private_bridge_urls,
         )
-    return Crawl4AIHTTPFetchProvider(
-        provider_id=provider.id,
-        base_url=provider.base_url,
-        api_key=api_key,
-    )
+    except FetchProviderError as exc:
+        return UnavailableFetchProvider(provider.id, f"Configured fetch provider is unavailable: {exc}")
 
 
 def _qwen_companion_for_workspace(

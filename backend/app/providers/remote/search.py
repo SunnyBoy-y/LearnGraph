@@ -51,13 +51,14 @@ class SearXNGSearchProvider:
         api_key: str | None = None,
         transport: httpx.BaseTransport | None = None,
         timeout_seconds: float = 15.0,
+        allow_private_bridge_urls: bool = False,
     ) -> None:
         self.provider_id = provider_id
         # Local import avoids a module cycle: fetch.py reuses domain_is_allowed
         # from this module while this constructor validates bridge egress.
         from app.providers.remote.fetch import validate_bridge_url
 
-        self.base_url = validate_bridge_url(base_url)
+        self.base_url = validate_bridge_url(base_url, allow_private=allow_private_bridge_urls)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds
@@ -150,6 +151,7 @@ class CloudSearchProvider:
         api_key: str,
         transport: httpx.BaseTransport | None = None,
         timeout_seconds: float = 15.0,
+        allow_private_bridge_urls: bool = False,
     ) -> None:
         if provider_type not in {"tavily", "exa", "brave_search", "firecrawl_search"}:
             raise ValueError("Unsupported cloud search provider type")
@@ -158,7 +160,7 @@ class CloudSearchProvider:
         # Local import avoids a module cycle; see SearXNGSearchProvider above.
         from app.providers.remote.fetch import validate_bridge_url
 
-        self.base_url = validate_bridge_url(base_url)
+        self.base_url = validate_bridge_url(base_url, allow_private=allow_private_bridge_urls)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds

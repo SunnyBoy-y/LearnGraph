@@ -88,15 +88,17 @@ def _parse_public_http_url(url: str, *, label: str) -> tuple[str, str]:
     return normalize_domain(parsed.hostname), parsed.geturl()
 
 
-def validate_bridge_url(url: str) -> str:
+def validate_bridge_url(url: str, *, allow_private: bool = False) -> str:
     """Validate an admin-configured provider bridge URL before connecting to it.
 
     Unlike document fetch targets, bridge URLs do not have a caller-provided
-    domain allowlist. They still must be public HTTP(S), credential-free, and
-    resolve exclusively to public addresses.
+    domain allowlist. They still must be HTTP(S), credential-free, and have a
+    valid port; unless ``allow_private`` is set for a trusted host network they
+    must also resolve exclusively to public addresses.
     """
     hostname, normalized_url = _parse_public_http_url(url, label="provider bridge")
-    _resolve_public_host(hostname)
+    if not allow_private:
+        _resolve_public_host(hostname)
     return normalized_url.rstrip("/")
 
 
@@ -127,9 +129,10 @@ class Crawl4AIHTTPFetchProvider:
         transport: httpx.BaseTransport | None = None,
         timeout_seconds: float = 30.0,
         max_content_chars: int = 2_000_000,
+        allow_private_bridge_urls: bool = False,
     ) -> None:
         self.provider_id = provider_id
-        self.base_url = validate_bridge_url(base_url)
+        self.base_url = validate_bridge_url(base_url, allow_private=allow_private_bridge_urls)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds
@@ -200,9 +203,10 @@ class FirecrawlFetchProvider:
         transport: httpx.BaseTransport | None = None,
         timeout_seconds: float = 30.0,
         max_content_chars: int = 2_000_000,
+        allow_private_bridge_urls: bool = False,
     ) -> None:
         self.provider_id = provider_id
-        self.base_url = validate_bridge_url(base_url)
+        self.base_url = validate_bridge_url(base_url, allow_private=allow_private_bridge_urls)
         self.api_key = api_key
         self.transport = transport
         self.timeout_seconds = timeout_seconds

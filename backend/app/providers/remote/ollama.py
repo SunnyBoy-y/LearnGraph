@@ -23,6 +23,44 @@ DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_OLLAMA_API_KEY = "ollama"
 
 
+def _ollama_httpx_client(
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+    transport: httpx.BaseTransport | None = None,
+) -> httpx.Client:
+    """Build an httpx client for a local Ollama endpoint.
+
+    Ollama almost always runs on the loopback origin the admin pasted in, so the
+    request must not be funnelled through an ambient HTTP(S)_PROXY. A system
+    VPN/Clash client answering DNS with synthetic private addresses returns
+    HTTP 502 for ``127.0.0.1:11434`` when httpx honours env proxies (the
+    default ``trust_env=True``); ``trust_env=False`` keeps local traffic local.
+    """
+
+    return httpx.Client(
+        headers=headers or {},
+        timeout=timeout,
+        transport=transport,
+        trust_env=False,
+    )
+
+
+def _ollama_transport(transport: httpx.BaseTransport | None) -> httpx.BaseTransport:
+    """Return a transport that ignores ambient HTTP(S)_PROXY for Ollama.
+
+    Used when an Ollama adapter reuses a parent class's ``httpx.Client(...)``
+    builder (chat ``_client`` / embedding ``embed``): those builders honour env
+    proxies by default, which routes ``127.0.0.1:11434`` through a Clash-style
+    fake-ip client and returns HTTP 502. An explicit transport carrying
+    ``trust_env=False`` overrides that without duplicating the parent builder.
+    """
+
+    if transport is not None:
+        return transport
+    return httpx.HTTPTransport(trust_env=False)
+
+
 def is_ollama_provider_type(provider_type: str | None) -> bool:
     return (provider_type or "").strip().casefold() in {"ollama", "ollama_embedding"}
 
@@ -85,7 +123,7 @@ def discover_ollama_models(
         extra_headers=extra_headers,
     )
     try:
-        with httpx.Client(
+        with _ollama_httpx_client(
             headers=headers,
             timeout=timeout_seconds,
             transport=transport,
@@ -266,6 +304,11 @@ class OllamaChatProvider(OpenAICompatibleChatProvider):
         if "base_url" in kwargs and isinstance(kwargs["base_url"], str):
             kwargs["base_url"] = normalize_ollama_api_base_url(kwargs["base_url"])
         kwargs["api_key"] = resolve_ollama_api_key(kwargs.get("api_key"))
+        # Local Ollama must bypass ambient HTTP(S)_PROXY (a Clash-style fake-ip
+        # client returns HTTP 502 for 127.0.0.1:11434 when httpx honours env
+        # proxies). Inject an env-ignoring transport unless the caller already
+        # supplied one; the inherited _client()/stream_chat reuse self.transport.
+        kwargs["transport"] = _ollama_transport(kwargs.get("transport"))
         # Prefer json_object: many local models do not implement strict json_schema.
         kwargs.setdefault("structured_output_mode", "json_object")
         super().__init__(**kwargs)
@@ -491,4 +534,8 @@ class OllamaEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
         if "base_url" in kwargs and isinstance(kwargs["base_url"], str):
             kwargs["base_url"] = normalize_ollama_api_base_url(kwargs["base_url"])
         kwargs["api_key"] = resolve_ollama_api_key(kwargs.get("api_key"))
+        # Same proxy bypass as the chat adapter: the inherited embed() builds
+        # httpx.Client(transport=self._transport), so an env-ignoring transport
+        # keeps local embedding traffic off the Clash fake-ip path.
+        kwargs["transport"] = _ollama_transport(kwargs.get("transport"))
         super().__init__(**kwargs)
