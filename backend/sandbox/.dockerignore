@@ -1,0 +1,8 @@
+# Keep the build context small: the toolchain stage regenerates node_modules
+# from package-lock.json inside the image, and local dev junk has no business
+# in the Docker daemon's context upload.
+**/node_modules
+**/__pycache__
+**/*.pyc
+.git
+*.log

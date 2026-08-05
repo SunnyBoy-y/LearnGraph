@@ -60,15 +60,29 @@ RUN apt-get update \
     && chown 65532:65532 /workspace
 
 # Document/media libraries importable from agent scripts (python -I keeps
-# system site-packages on the path).
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
+# system site-packages on the path). pip is the build step most exposed to
+# transient mirror/network failures: a single dropped wheel download used to
+# abort the whole image build with a bare non-zero exit and no retry. The
+# until-loop retries the whole install a few times (each retry reuses pip's
+# own cache for already-downloaded wheels), and --timeout/--retries raise the
+# per-connection tolerance for slow mirrors.
+RUN attempts=4; \
+    until pip install --no-cache-dir --timeout 60 --retries 10 --index-url "${PIP_INDEX_URL}" \
         mammoth==1.9.0 \
         pypdf==5.1.0 \
         openpyxl==3.1.5 \
         Pillow==11.1.0 \
         pydub==0.25.1 \
         httpx==0.28.1 \
-        trafilatura==2.2.0
+        trafilatura==2.2.0; do \
+        attempts=$((attempts - 1)); \
+        if [ "$attempts" -le 0 ]; then \
+            echo "pip install failed after repeated attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "pip install failed, retrying ($attempts attempts left)…"; \
+        sleep 5; \
+    done
 
 # Frontend toolchain built in the `toolchain` stage. Node resolves imports
 # upward from /workspace, so per-session workspaces use vue/react/vite with

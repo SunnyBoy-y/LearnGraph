@@ -9672,7 +9672,13 @@ class ChatService:
         if key_hash:
             existing = self._submission_for_key(session_id, key_hash)
             if existing is not None:
-                return self._replay_submission(existing, request_hash, last_event_id)
+                # ``create_stream`` is a generator (the fetch gate delegates with
+                # ``yield from``), so returning the replay generator here would
+                # only set its return value and silently drop every replay event.
+                yield from self._replay_submission(
+                    existing, request_hash, last_event_id
+                )
+                return
             if last_event_id:
                 raise AppError(
                     404,
@@ -10396,7 +10402,10 @@ class ChatService:
             if key_hash:
                 existing = self._submission_for_key(session_id, key_hash)
                 if existing is not None:
-                    return self._replay_submission(existing, request_hash, last_event_id)
+                    yield from self._replay_submission(
+                        existing, request_hash, last_event_id
+                    )
+                    return
             raise
 
         sequence = 1
@@ -12020,7 +12029,11 @@ class ChatService:
                 yield self._encode_event(part_failed_event)
                 yield self._encode_event(failed_event)
 
-        return stream()
+        # ``create_stream`` is a generator, so ``return stream()`` would discard
+        # the stream generator; delegate into it so its events actually reach the
+        # SSE transport (this was broken when the fetch gate's ``yield from``
+        # turned ``create_stream`` into a generator).
+        yield from stream()
 
     def close_session(self, session_id: str) -> ChatSession:
         session = self.sessions.require(session_id, "session")
