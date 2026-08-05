@@ -256,16 +256,16 @@ class ImageChatService:
             raise AppError(
                 422,
                 "image_mode_combination_unsupported",
-                "Image generation currently accepts a prompt, optional gpt-image-2 source images, and no search, Agent tools, nodes, or graph actions",
+                "Image generation currently accepts a prompt, optional reference images, and no search, Agent tools, nodes, or graph actions",
             )
         source_ids = list(dict.fromkeys(payload.source_file_ids))
         if not source_ids:
             return
-        if self.image_provider.model_id.casefold() != "gpt-image-2":
+        if not getattr(self.image_provider, "supports_image_edit", False):
             raise AppError(
                 422,
                 "image_edit_model_unsupported",
-                "Image editing is only supported with gpt-image-2",
+                "Image editing requires a supported image-edit model (gpt-image-2 or qwen-image-edit-max)",
             )
         files = list(
             self.db.scalars(

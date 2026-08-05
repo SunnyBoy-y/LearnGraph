@@ -468,6 +468,10 @@ export interface ProviderModelCapabilities {
   supports_video_input?: boolean;
   supports_structured_output?: boolean;
   supports_agent_tools?: boolean;
+  /** True for image generation/editing models (gpt-image-2, qwen-image-edit-*). */
+  supports_image_edit?: boolean;
+  /** False for image-only output models that cannot be used as text chat models. */
+  supports_text_output?: boolean;
   /** How image attachments should reach this model. Default auto. */
   image_input_mode?: ImageInputMode;
   default_search_route: SearchRoute;

@@ -18,6 +18,23 @@ from app.providers.qwen_catalog import is_dashscope_api_base_url
 from app.providers.remote.openai import normalize_openai_api_base_url
 
 
+_IMAGE_EDIT_MODEL_PREFIXES = ("qwen-image", "wanx")
+
+
+def _is_image_edit_model(model_id: str) -> bool:
+    """Return whether a model ID is a known image-generation/editing model.
+
+    ``gpt-image-2`` is the OpenAI-compatible edit model.  DashScope image
+    models (``qwen-image``, ``qwen-image-edit-max``, ``wanx-*``) accept
+    reference images on the native multimodal-generation endpoint; those are
+    routed through :func:`dashscope_native_generation_url` rather than the
+    OpenAI ``/images/edits`` transport.
+    """
+
+    model = model_id.strip().casefold()
+    return model == "gpt-image-2" or model.startswith(_IMAGE_EDIT_MODEL_PREFIXES)
+
+
 class ImageGenerationProviderError(RuntimeError):
     pass
 
@@ -466,6 +483,21 @@ class OpenAIImagesProvider:
         self.last_usage: dict[str, int | float] = {}
         self.last_request_id: str | None = None
 
+    @property
+    def supports_image_edit(self) -> bool:
+        """Whether this provider can edit/regenerate from reference images.
+
+        DashScope gateways accept reference images on the native multimodal
+        endpoint for any image model; OpenAI editing is limited to
+        ``gpt-image-2``.
+        """
+
+        if self.model_id.casefold() == "gpt-image-2":
+            return True
+        return self.native_generation_url is not None and _is_image_edit_model(
+            self.model_id
+        )
+
     # Streaming is an OpenAI-only extension of /images/generations.  These
     # statuses mean the gateway rejected the request shape itself (for example
     # DashScope refusing `stream` / `partial_images` / `output_format`), so a
@@ -489,9 +521,10 @@ class OpenAIImagesProvider:
                 "partial_images must be an integer from 0 to 3"
             )
         size = _validate_size(request.size)
-        if request.source_images and self.model_id.casefold() != "gpt-image-2":
+        if request.source_images and not self.supports_image_edit:
             raise ImageGenerationProviderResponseError(
-                "Image editing is only supported with gpt-image-2"
+                "Image editing is only supported with gpt-image-2 or a "
+                "DashScope image-edit model (qwen-image-edit-max)"
             )
         self.last_usage = {}
         self.last_request_id = None
@@ -612,7 +645,9 @@ class OpenAIImagesProvider:
             "model": self.model_id,
             "input": {"messages": [{"role": "user", "content": content}]},
         }
-        if size != "auto":
+        if size != "auto" and not source_images:
+            # Image-edit models (qwen-image-edit-max) inherit the source image
+            # dimensions; ``size`` is only a generation-model parameter.
             payload["parameters"] = {"size": size}
         try:
             with httpx.Client(

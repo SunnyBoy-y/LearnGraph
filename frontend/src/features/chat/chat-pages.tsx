@@ -312,6 +312,26 @@ const IMAGE_EDIT_MIME_TYPES = new Set([
   "image/webp",
 ]);
 
+/** Whether a model can edit/regenerate from reference images. */
+function isImageEditModel(
+  model: { id: string; capabilities?: ProviderModel["capabilities"] } | undefined,
+): boolean {
+  if (!model) return false;
+  const id = model.id.toLowerCase();
+  return (
+    model.capabilities?.supports_image_edit === true ||
+    id === "gpt-image-2" ||
+    id.startsWith("qwen-image-edit")
+  );
+}
+
+/** Whether a model can serve as a text chat model (not image-only output). */
+function isTextChatModel(
+  model: { capabilities?: ProviderModel["capabilities"] } | undefined,
+): boolean {
+  return model?.capabilities?.supports_text_output !== false;
+}
+
 const IMAGE_SIZE_OPTIONS: ReadonlyArray<{
   value: ImageSize;
   label: string;
@@ -2924,17 +2944,23 @@ export function ChatCanvasPage() {
       ? providerModelQueries[activeModelProviderIndex]
       : undefined;
   const modelOptions = useMemo(
-    () => providerModelOptions(activeModelProvider, discoveredModels?.data?.models),
+    () =>
+      providerModelOptions(
+        activeModelProvider,
+        discoveredModels?.data?.models,
+      ).filter((model) => isTextChatModel(model)),
     [activeModelProvider, discoveredModels?.data?.models],
   );
   const availableModelChoices = useMemo(
     () =>
-      modelProviders.flatMap((provider, index) =>
-        providerModelOptions(
-          provider,
-          providerModelQueries[index]?.data?.models,
-        ).map((model) => ({ provider, model })),
-      ),
+      modelProviders
+        .flatMap((provider, index) =>
+          providerModelOptions(
+            provider,
+            providerModelQueries[index]?.data?.models,
+          ).map((model) => ({ provider, model })),
+        )
+        .filter(({ model }) => isTextChatModel(model)),
     [modelProviders, providerModelQueries],
   );
   const filteredAvailableModelChoices = useMemo(
@@ -2997,6 +3023,7 @@ export function ChatCanvasPage() {
             "exa",
             "brave_search",
             "firecrawl_search",
+            "ollama_cloud_search",
           ].includes(provider.provider_type) ||
           (provider.provider_type === "qwen" &&
             Array.isArray(provider.capabilities.companion_capabilities) &&
@@ -3722,7 +3749,6 @@ export function ChatCanvasPage() {
       ),
     [settings.data],
   );
-  const dictationCleanupEnabled = isChatDictationCleanupEnabled(settings.data);
   const dictationCleanupModel = useMemo(
     () =>
       readChatFeatureModelSetting(
@@ -5249,9 +5275,9 @@ export function ChatCanvasPage() {
         if (
           requestedGenerationMode === "image" &&
           (message.files.length > 0 || pendingFiles.length > 0) &&
-          selectedImageModel.id.toLowerCase() !== "gpt-image-2"
+          !isImageEditModel(selectedImageModel)
         ) {
-          toast.error("图生图和图片编辑仅支持 gpt-image-2。");
+          toast.error("图生图和图片编辑仅支持支持参考图的绘图模型。");
           return false;
         }
         if (
@@ -5315,7 +5341,7 @@ export function ChatCanvasPage() {
         );
         const attachmentFileIds = attachmentFiles.map((file) => file.id);
         if (requestedGenerationMode === "image" && attachmentFileIds.length > 4) {
-          toast.error("gpt-image-2 最多支持 4 张参考图片。");
+          toast.error("当前绘图模型最多支持 4 张参考图片。");
           return false;
         }
         const fileIds =
