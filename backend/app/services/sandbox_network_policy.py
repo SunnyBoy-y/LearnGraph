@@ -19,8 +19,10 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
+import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -30,6 +32,16 @@ HOSTNAME_MAX_LENGTH = 253
 LABEL_MAX_LENGTH = 63
 PROTOCOL_HTTPS = "https"
 DEFAULT_PORT = 443
+
+# Derived fetch egress: the unified ``web_fetch.policy`` allowlist is the single
+# source of truth, and fetch egress is derived from it into a *separate* policy
+# file with its own provenance. This keeps the generic per-workspace reviewed
+# policy (and therefore generic Agent egress) untouched by fetch approvals.
+WEB_FETCH_POLICY_ISSUER = "web_fetch_policy"
+WEB_FETCH_POLICY_APPROVAL_ID = "web_fetch_policy"
+WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS = 600
+WEB_FETCH_POLICY_MAX_TTL_SECONDS = 86400
+WEB_FETCH_POLICY_FILE_SUFFIX = ".web_fetch.json"
 
 # RFC 5737 documentation ranges and RFC 3849 IPv6 documentation range are not
 # reachable on the public internet; treating them as unreachable keeps the
@@ -376,3 +388,116 @@ def load_workspace_policy_file(policy_dir: str | Path, workspace_id: str, *, now
             exc.reason,
         )
         return None
+
+
+def derive_egress_policy_for_fetch(
+    *,
+    workspace_id: str,
+    allowed_domains: Iterable[str],
+    ttl_seconds: int = WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS,
+    now: datetime | None = None,
+) -> EgressPolicy:
+    """Derive a narrow, short-lived egress policy from the unified fetch allowlist.
+
+    The shared ``web_fetch.policy.allowed_domains`` list is the single source of
+    truth; this function turns it into an ``EgressPolicy`` that is HTTPS-443-only,
+    expires quickly (so a stale derivation cannot outlive an allowlist change),
+    and records ``issuer=web_fetch_policy`` so the egress proxy and audit trail
+    can distinguish it from a separately-reviewed generic policy. An empty or
+    invalid allowlist fails closed.
+    """
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise EgressPolicyInvalid("policy_missing_workspace")
+    if (
+        not isinstance(ttl_seconds, int)
+        or isinstance(ttl_seconds, bool)
+        or not 0 < ttl_seconds <= WEB_FETCH_POLICY_MAX_TTL_SECONDS
+    ):
+        raise EgressPolicyInvalid("policy_ttl_invalid")
+    domains = list(
+        dict.fromkeys(normalize_hostname(str(value)) for value in allowed_domains)
+    )
+    if not domains:
+        raise EgressPolicyInvalid("policy_empty_hosts")
+    issued = now or _utc_now()
+    data = {
+        "workspace_id": workspace_id,
+        "approval_id": WEB_FETCH_POLICY_APPROVAL_ID,
+        "issuer": WEB_FETCH_POLICY_ISSUER,
+        "issued_at": issued.isoformat(),
+        "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
+        "hosts": [
+            {"host": domain, "ports": [DEFAULT_PORT], "protocols": [PROTOCOL_HTTPS]}
+            for domain in domains
+        ],
+    }
+    return validate_egress_policy(data, now=now)
+
+
+def store_workspace_fetch_policy_file(policy_dir: str | Path, policy: EgressPolicy) -> Path:
+    """Atomically persist the derived fetch policy to its own workspace file."""
+    directory = Path(policy_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    policy_path = directory / f"{policy.workspace_id}{WEB_FETCH_POLICY_FILE_SUFFIX}"
+    temporary = policy_path.with_name(
+        f".{policy_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                json.dumps(policy.raw, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, policy_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return policy_path
+
+
+def load_workspace_fetch_policy_file(
+    policy_dir: str | Path,
+    workspace_id: str,
+    *,
+    now: datetime | None = None,
+) -> EgressPolicy | None:
+    """Load and validate the derived fetch policy for one workspace.
+
+    This reads a file *separate* from the generic reviewed policy
+    (``{workspace_id}.web_fetch.json``) so fetch approvals never widen generic
+    Agent egress. Missing, malformed, expired, or wrong-provenance files return
+    ``None`` and the fetch container stays offline.
+    """
+    directory = Path(policy_dir)
+    policy_path = directory / f"{workspace_id}{WEB_FETCH_POLICY_FILE_SUFFIX}"
+    try:
+        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.error(
+            "Sandbox web_fetch policy %s is unreadable; fetch egress denied for workspace %s: %s",
+            policy_path,
+            workspace_id,
+            exc,
+        )
+        return None
+    try:
+        policy = validate_egress_policy(raw, now=now)
+    except EgressPolicyInvalid as exc:
+        logger.error(
+            "Sandbox web_fetch policy %s is invalid; fetch egress denied for workspace %s: %s",
+            policy_path,
+            workspace_id,
+            exc.reason,
+        )
+        return None
+    if policy.issuer != WEB_FETCH_POLICY_ISSUER:
+        logger.error(
+            "Sandbox web_fetch policy %s has unexpected issuer %r; fetch egress denied for workspace %s",
+            policy_path,
+            policy.issuer,
+            workspace_id,
+        )
+        return None
+    return policy

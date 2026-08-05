@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 from dataclasses import dataclass, field
-from datetime import date, timedelta
-from urllib.parse import urlsplit
+from datetime import UTC, date, datetime, timedelta
+from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -347,5 +351,141 @@ def fetch_gateway_billing_balance(
         notice=(
             f"按 one-api/new-api 账单惯例估算：站点配额 ${_fmt(hard_limit)}，"
             f"近 100 天已用 ${_fmt(used)}。数值口径以站点面板为准。"
+        ),
+    )
+
+
+def _rfc3986(value: object) -> str:
+    """RFC 3986 percent-encoding used by Aliyun RPC signatures.
+
+    Unreserved characters ``A-Z a-z 0-9 - . _ ~`` stay literal; everything
+    else becomes ``%XX`` with uppercase hex digits and spaces become ``%20``
+    (never ``+``).
+    """
+    return quote(str(value), safe="-_.~")
+
+
+def _bss_signed_url(
+    *,
+    access_key_id: str,
+    access_key_secret: str,
+    now: datetime | None = None,
+) -> str:
+    """Build a signed Aliyun BSS ``QueryAccountBalance`` RPC URL.
+
+    The string-to-sign is ``GET&%2F&<canonicalized-query>`` and the HMAC key
+    is ``<AccessKeySecret>&``.  The signature is appended as the final query
+    parameter so a transport test can assert both the RPC action and that a
+    signature was produced without ever holding the secret.
+    """
+    params = {
+        "Action": "QueryAccountBalance",
+        "Format": "JSON",
+        "Version": "2017-12-14",
+        "AccessKeyId": access_key_id,
+        "SignatureMethod": "HMAC-SHA1",
+        "SignatureVersion": "1.0",
+        "SignatureNonce": uuid4().hex,
+        "Timestamp": (now or datetime.now(UTC)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
+    canonical = "&".join(
+        f"{_rfc3986(key)}={_rfc3986(value)}"
+        for key, value in sorted(params.items())
+    )
+    string_to_sign = "GET&%2F&" + _rfc3986(canonical)
+    signature = base64.b64encode(
+        hmac.new(
+            (access_key_secret + "&").encode("utf-8"),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha1,
+        ).digest()
+    ).decode("ascii")
+    return f"https://business.aliyuncs.com/?{canonical}&Signature={_rfc3986(signature)}"
+
+
+def _optional_amount(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return _as_amount(value, label="amount")
+    except ProviderBalanceError:
+        return None
+
+
+def fetch_dashscope_balance(
+    *,
+    access_key_id: str,
+    access_key_secret: str,
+    timeout_seconds: float = 15.0,
+    transport: httpx.BaseTransport | None = None,
+    now: datetime | None = None,
+) -> BalanceReport:
+    """Query the Aliyun account balance via the BSS ``QueryAccountBalance`` RPC.
+
+    DashScope API keys cannot read account balance; the account balance is
+    exposed through the Aliyun BSS OpenAPI using an AccessKey pair.  The
+    request is signed per the RPC signature protocol (HMAC-SHA1) and the
+    AccessKey secret never leaves the server.
+    """
+    url = _bss_signed_url(
+        access_key_id=access_key_id,
+        access_key_secret=access_key_secret,
+        now=now,
+    )
+    try:
+        with httpx.Client(
+            timeout=timeout_seconds, transport=transport
+        ) as client:
+            response = client.get(url)
+    except httpx.TimeoutException as exc:
+        raise ProviderBalanceError("Balance request timed out") from exc
+    except httpx.HTTPError as exc:
+        raise ProviderBalanceError("Balance request could not be sent") from exc
+    if not response.is_success:
+        raise ProviderBalanceError(
+            f"Balance request failed with HTTP {response.status_code}"
+        )
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ProviderBalanceError("Balance response was not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ProviderBalanceError("Balance response had an invalid schema")
+    code = str(payload.get("Code") or payload.get("code") or "").strip()
+    if code not in {"200", "OK"}:
+        message = str(
+            payload.get("Message")
+            or payload.get("message")
+            or code
+            or "unknown error"
+        )
+        raise ProviderBalanceError(f"Aliyun BSS returned: {message}")
+    data = payload.get("Data")
+    if not isinstance(data, dict):
+        raise ProviderBalanceError("Balance response had no Data object")
+    available = _as_amount(data.get("AvailableAmount"), label="AvailableAmount")
+    raw_currency = str(data.get("Currency") or "CNY").strip().upper()
+    currency = "USD" if raw_currency == "USD" else "CNY"
+    cash = _optional_amount(data.get("CashAmount"))
+    granted = _optional_amount(data.get("CreditAmount"))
+    frozen = _optional_amount(data.get("FreezeAmount"))
+    return BalanceReport(
+        vendor="dashscope",
+        vendor_label="阿里云百炼（账户余额）",
+        is_available=available > 0,
+        infos=[
+            BalanceInfo(
+                currency=currency,
+                total_balance=_fmt(available),
+                granted_balance=_fmt(granted) if granted is not None else None,
+                topped_up_balance=_fmt(cash) if cash is not None else None,
+            )
+        ],
+        notice=(
+            f"账户可用余额 {_fmt(available)} {currency}"
+            + (f"（冻结 {_fmt(frozen)}）" if frozen else "")
+            + "，来自 BSS QueryAccountBalance。"
         ),
     )

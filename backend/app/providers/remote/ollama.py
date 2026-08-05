@@ -14,6 +14,7 @@ from app.providers.remote.openai import (
     ProviderTimeoutError,
     merge_provider_request_headers,
     normalize_openai_api_base_url,
+    validate_http_base_url,
 )
 
 
@@ -116,6 +117,9 @@ def discover_ollama_models(
 ) -> list[str]:
     """List local Ollama models via OpenAI ``/v1/models``, falling back to ``/api/tags``."""
 
+    # Reject protocol-less URLs up front so the probe surfaces a clear 422
+    # instead of a generic transport failure (see validate_http_base_url).
+    validate_http_base_url(base_url)
     openai_base = normalize_ollama_api_base_url(base_url)
     bearer = resolve_ollama_api_key(api_key)
     headers = merge_provider_request_headers(
@@ -167,6 +171,96 @@ def discover_ollama_models(
     models = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(models, list):
         raise ProviderResponseError("Ollama /api/tags response has no models array")
+    model_ids: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("model")
+        if isinstance(name, str) and name.strip():
+            model_ids.append(name.strip())
+    if not model_ids:
+        return []
+    return sorted(set(model_ids))
+
+
+def ollama_think_value(mode: str | None, actual: Any) -> bool | str:
+    """Resolve a LearnGraph thinking mode into Ollama's ``think`` field value.
+
+    Ollama accepts booleans (``true``/``false``) or levels
+    (``low``/``medium``/``high``/``max``).  Shared by the local OpenAI-compatible
+    adapter and the Cloud native adapter so both speak the same wire semantics.
+    """
+
+    if mode == "off":
+        return False
+    if isinstance(actual, bool):
+        return actual
+    if isinstance(actual, str) and actual.casefold() in {
+        "low",
+        "medium",
+        "high",
+        "max",
+        "true",
+        "false",
+    }:
+        lowered = actual.casefold()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        return lowered
+    # Default mapping when capability snapshots have no explicit value.
+    return {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "max",
+    }.get(mode or "", True)
+
+
+def discover_ollama_cloud_models(
+    *,
+    base_url: str,
+    api_key: str,
+    transport: httpx.BaseTransport | None = None,
+    timeout_seconds: float = 15.0,
+    extra_headers: dict[str, str] | None = None,
+) -> list[str]:
+    """List Ollama Cloud models via the native ``GET /api/tags`` endpoint.
+
+    Unlike the local discovery this trusts the ambient environment proxy (Cloud
+    is reached over normal HTTPS) and requires the real ``OLLAMA_API_KEY``.
+    """
+
+    validate_http_base_url(base_url)
+    native = ollama_native_origin(base_url)
+    headers = merge_provider_request_headers(
+        api_key=api_key,
+        extra_headers=extra_headers,
+    )
+    try:
+        with httpx.Client(
+            headers=headers,
+            timeout=timeout_seconds,
+            transport=transport,
+        ) as client:
+            response = client.get(f"{native}/api/tags")
+    except httpx.TimeoutException as exc:
+        raise ProviderTimeoutError("Ollama Cloud model discovery timed out") from exc
+    except httpx.HTTPError as exc:
+        raise ProviderHTTPError(f"Ollama Cloud model discovery failed: {exc}") from exc
+    if not response.is_success:
+        raise ProviderHTTPError(
+            f"Ollama Cloud model discovery returned HTTP {response.status_code}",
+            status_code=response.status_code,
+        )
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise ProviderResponseError("Ollama Cloud /api/tags returned non-JSON data") from exc
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        raise ProviderResponseError("Ollama Cloud /api/tags response has no models array")
     model_ids: list[str] = []
     for item in models:
         if not isinstance(item, dict):
@@ -318,36 +412,10 @@ class OllamaChatProvider(OpenAICompatibleChatProvider):
         options = self.call_options
         if options is None or responses:
             return payload
-        mode = options.thinking_mode
-        if mode == "off":
-            payload["think"] = False
-        else:
-            actual = options.actual_reasoning_effort
-            if isinstance(actual, bool):
-                payload["think"] = actual
-            elif isinstance(actual, str) and actual.casefold() in {
-                "low",
-                "medium",
-                "high",
-                "max",
-                "true",
-                "false",
-            }:
-                lowered = actual.casefold()
-                if lowered == "true":
-                    payload["think"] = True
-                elif lowered == "false":
-                    payload["think"] = False
-                else:
-                    payload["think"] = lowered
-            else:
-                # Default mapping when capability snapshots have no explicit value.
-                payload["think"] = {
-                    "low": "low",
-                    "medium": "medium",
-                    "high": "high",
-                    "xhigh": "max",
-                }.get(mode, True)
+        payload["think"] = ollama_think_value(
+            options.thinking_mode,
+            options.actual_reasoning_effort,
+        )
         # Surface any extra provider_options except OpenAI-only thinking keys.
         for key, value in options.provider_options.items():
             if key in {"enable_thinking", "thinking_budget", "thinking", "think"}:

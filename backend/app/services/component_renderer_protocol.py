@@ -56,13 +56,14 @@ RENDERER_EVENT_EVENT = "component.event"
 RENDERER_LOG_EVENT = "component.log"
 RENDERER_ERROR_EVENT = "component.error"
 
-# Host -> iframe handshake (unlock). Never accepted inbound.
+# Host -> iframe handshake and state delivery. Never accepted inbound.
 RENDERER_UNLOCK_EVENT = "renderer.unlock"
+RENDERER_STATE_EVENT = "renderer.state"
 
 ALLOWED_IFRAME_EVENT_TYPES = frozenset(
     {RENDERER_READY_EVENT, RENDERER_EVENT_EVENT, RENDERER_LOG_EVENT, RENDERER_ERROR_EVENT}
 )
-HOST_TO_IFRAME_EVENT_TYPES = frozenset({RENDERER_UNLOCK_EVENT})
+HOST_TO_IFRAME_EVENT_TYPES = frozenset({RENDERER_UNLOCK_EVENT, RENDERER_STATE_EVENT})
 ALLOWED_RENDERER_EVENT_TYPES = ALLOWED_IFRAME_EVENT_TYPES | HOST_TO_IFRAME_EVENT_TYPES
 
 # Bounded protocol limits. A renderer can never exceed these regardless of the
@@ -72,6 +73,13 @@ MAX_RENDERER_MESSAGES_PER_RENDER = 128
 MAX_RENDERER_EVENT_VALUE_CHARS = 10_000
 MAX_RENDERER_EVENT_ARRAY_ITEMS = 100
 MAX_RENDERER_EVENT_ID_CHARS = 64
+
+# Session-level sub-application budgets. Persistence and rate tracking are
+# enforced by the sub-application session service; these are the shared limits.
+MAX_SUBAPP_STATE_BYTES = 64 * 1024
+MAX_SUBAPP_STATES_PER_SESSION = 500
+MAX_SUBAPP_EVENTS_PER_SESSION = 1_000
+MAX_SUBAPP_STATE_RATE_PER_MINUTE = 60
 
 # The only accepted message source: the sandboxed iframe renders as an opaque
 # origin, so ``event.origin`` is ``"null"`` in a browser. The server-side
@@ -146,6 +154,19 @@ RENDERER_PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
             "token": {"type": "string", "minLength": 32, "maxLength": 128},
             "component_id": {"type": "string", "maxLength": 120},
             "render_ref": {"type": "string", "maxLength": 64},
+        },
+    },
+    RENDERER_STATE_EVENT: {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["state_version", "state_sha256", "state"],
+        "properties": {
+            "state_version": {"type": "integer", "minimum": 1},
+            "state_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$",
+            },
+            "state": {"type": "object"},
         },
     },
 }
@@ -262,6 +283,45 @@ def _validate_message_structure(
     )
 
 
+def validate_renderer_state_payload(
+    payload: Any,
+    *,
+    state_schema: dict[str, Any],
+) -> RendererMessageView | str:
+    """Validate a host-bound ``renderer.state`` payload before it is sent.
+
+    ``renderer.state`` is host -> iframe only and is never accepted on the
+    inbound renderer-message path. The host validates the protocol payload
+    schema and the registered sub-application ``state_schema`` before
+    forwarding a versioned state snapshot.
+    """
+    renderer_state_schema = RENDERER_PAYLOAD_SCHEMAS[RENDERER_STATE_EVENT]
+    try:
+        validator_for(renderer_state_schema).check_schema(renderer_state_schema)
+        validator_for(renderer_state_schema)(renderer_state_schema).validate(payload)
+    except ValidationError:
+        return "render_state_payload_schema_rejected"
+
+    state = payload["state"]
+    if len(_canonical_json(state)) > MAX_SUBAPP_STATE_BYTES:
+        return "render_state_too_large"
+    if payload["state_sha256"].lower() != _sha256(state):
+        return "render_state_sha256_mismatch"
+
+    try:
+        validator_for(state_schema).check_schema(state_schema)
+        validator_for(state_schema)(state_schema).validate(state)
+    except ValidationError:
+        return "render_state_schema_rejected"
+
+    return RendererMessageView(
+        version=RENDERER_MESSAGE_PROTOCOL_VERSION,
+        event_type=RENDERER_STATE_EVENT,
+        payload=payload,
+        source="host",
+    )
+
+
 def validate_renderer_message(
     db: Session,
     *,
@@ -274,7 +334,7 @@ def validate_renderer_message(
     """Server-side validation of an inbound renderer message.
 
     Rejects unsupported versions, unknown event types, schema-invalid payloads,
-    oversized messages, non-opaque sources, host->iframe unlock attempts, and
+    oversized messages, non-opaque sources, host->iframe message attempts, and
     any message that cannot redeem a valid capability token for this component
     in this workspace.
     """
@@ -283,7 +343,7 @@ def validate_renderer_message(
         return RendererMessageResult(accepted=False, reason=view)
 
     if view.event_type in HOST_TO_IFRAME_EVENT_TYPES:
-        # The unlock handshake is host->iframe only; it is never accepted inbound.
+        # Host -> iframe messages are never accepted on the inbound channel.
         return RendererMessageResult(accepted=False, reason="render_unlock_not_accepting")
 
     token = message.get("token") if isinstance(message, dict) else None

@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func as sql_func, select
+from sqlalchemy import delete, func as sql_func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -80,6 +80,7 @@ _QUERY_CHAR_CAP = 2_000
 _MEMORY_TEXT_CHAR_CAP = 2_000
 _BACKFILL_PER_CALL = 24
 _REINDEX_CAP = 500
+_REINDEX_TOTAL_CAP = 10_000
 _TRANSCRIPT_MESSAGE_CAP = 40
 _TRANSCRIPT_CHARS_PER_MESSAGE = 600
 _EXTRACTION_MAX_PROPOSALS = 5
@@ -104,6 +105,7 @@ def default_enhancement_config() -> dict[str, Any]:
             "enabled": False,
             "provider_id": "",
             "model_id": "",
+            "follow_conversation": False,
             "auto_commit": True,
         },
         "embedding": {
@@ -119,6 +121,7 @@ def default_enhancement_config() -> dict[str, Any]:
             "enabled": False,
             "provider_id": "",
             "model_id": "",
+            "follow_conversation": False,
         },
     }
 
@@ -158,7 +161,16 @@ def load_enhancement_config(db: Session, workspace_id: str) -> dict[str, Any]:
 
 def save_enhancement_config(
     db: Session, workspace_id: str, updates: dict[str, Any]
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Persist enhancement settings; return ``(config, cache_invalidated)``.
+
+    ``cache_invalidated`` is non-None only when the embedding provider/model
+    changed *and* the previous model still had cached vectors — so the caller
+    can surface "reindex required + old cache to prune" without a second
+    round trip. Old-model vector rows are projections, not fact sources: they
+    are safe to prune once the switch is confirmed.
+    """
+
     setting = db.scalar(
         select(WorkspaceSetting).where(
             WorkspaceSetting.workspace_id == workspace_id,
@@ -166,6 +178,10 @@ def save_enhancement_config(
         )
     )
     current = _normalize_config(setting.value if setting is not None else None)
+    previous_embedding = {
+        "provider_id": current["embedding"]["provider_id"],
+        "model_id": current["embedding"]["model_id"],
+    }
     for section in tuple(current):
         patch = updates.get(section)
         if isinstance(patch, dict):
@@ -184,7 +200,30 @@ def save_enhancement_config(
     else:
         setting.value = normalized
     db.commit()
-    return normalized
+
+    cache_invalidated: dict[str, Any] | None = None
+    embedding = normalized["embedding"]
+    previous_key = _model_key(
+        previous_embedding["provider_id"], previous_embedding["model_id"]
+    )
+    current_key = _model_key(embedding["provider_id"], embedding["model_id"])
+    if previous_key != current_key:
+        previous_count = (
+            db.scalar(
+                select(sql_func.count(MemoryEmbedding.id)).where(
+                    MemoryEmbedding.workspace_id == workspace_id,
+                    MemoryEmbedding.model_key == previous_key,
+                )
+            )
+            or 0
+        )
+        if previous_count:
+            cache_invalidated = {
+                "previous_model_key": previous_key,
+                "previous_indexed_count": previous_count,
+                "current_model_key": current_key,
+            }
+    return normalized, cache_invalidated
 
 
 def _workspace_memory_enabled(db: Session, workspace_id: str) -> bool:
@@ -384,9 +423,20 @@ def semantic_boosts_for_records(
 
 
 def reindex_memory_embeddings(
-    db: Session, workspace_id: str, settings: Settings
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    *,
+    prune_stale: bool = False,
 ) -> dict[str, Any]:
-    """Embed every active memory under the configured model (best-effort)."""
+    """Embed every active memory under the configured model (best-effort).
+
+    Batches over *all* active memories (each batch up to ``_REINDEX_CAP``
+    rows) so a workspace larger than the old single-pass cap converges in one
+    call. When ``prune_stale`` is set, vector rows for embedding models other
+    than the currently configured one are deleted afterwards — use this after
+    a provider/model switch to reclaim the previous model's cache.
+    """
 
     config = load_enhancement_config(db, workspace_id)
     embedding_cfg = config["embedding"]
@@ -405,6 +455,7 @@ def reindex_memory_embeddings(
             "memory_embedding_provider_unavailable",
             "The configured embedding provider/model cannot be constructed",
         )
+    model_key = _model_key(provider.provider_id, provider.model_id)
     records = list(
         db.scalars(
             select(MemoryRecord)
@@ -413,22 +464,29 @@ def reindex_memory_embeddings(
                 MemoryRecord.state == "active",
             )
             .order_by(MemoryRecord.updated_at.desc())
-            .limit(_REINDEX_CAP)
         ).all()
     )
-    model_key = _model_key(provider.provider_id, provider.model_id)
-    existing = _embedding_rows(db, workspace_id, model_key, [r.id for r in records])
-    pending = [
-        record
-        for record in records
-        if (
-            (row := existing.get(record.id)) is None
-            or not row.vector
-            or row.content_hash != record.content_hash
-        )
-    ]
     embedded = 0
-    if pending:
+    already_indexed = 0
+    truncated = False
+    for start in range(0, len(records), _REINDEX_CAP):
+        if start >= _REINDEX_TOTAL_CAP:
+            truncated = True
+            break
+        batch = records[start : start + _REINDEX_CAP]
+        existing = _embedding_rows(db, workspace_id, model_key, [r.id for r in batch])
+        pending = [
+            record
+            for record in batch
+            if (
+                (row := existing.get(record.id)) is None
+                or not row.vector
+                or row.content_hash != record.content_hash
+            )
+        ]
+        if not pending:
+            already_indexed += len(batch)
+            continue
         texts = _memory_texts(db, workspace_id, pending)
         billing = BillingService(db, workspace_id, "system:memory-embedding")
         quote = billing.preflight_model_call(
@@ -459,13 +517,49 @@ def reindex_memory_embeddings(
         )
         _upsert_embeddings(db, workspace_id, model_key, pending, vectors, existing)
         db.commit()
-        embedded = len(pending)
+        embedded += len(pending)
+        already_indexed += len(batch) - len(pending)
+    stale_freed = 0
+    if prune_stale:
+        stale_freed = prune_stale_embeddings(db, workspace_id).get("freed_count", 0)
     return {
         "model_key": model_key,
         "total_active": len(records),
         "embedded": embedded,
-        "already_indexed": len(records) - embedded,
+        "already_indexed": already_indexed,
+        "stale_freed": stale_freed,
+        "truncated": truncated,
     }
+
+
+def prune_stale_embeddings(
+    db: Session, workspace_id: str, *, keep_model_key: str | None = None
+) -> dict[str, Any]:
+    """Delete cached vectors for embedding models other than the configured one.
+
+    Embedding rows are projections, never fact sources — pruning only forces
+    a lazy re-embed under the active model later. Returns how many rows were
+    freed.
+    """
+
+    config = load_enhancement_config(db, workspace_id)
+    embedding_cfg = config["embedding"]
+    if (
+        keep_model_key is None
+        and embedding_cfg["provider_id"]
+        and embedding_cfg["model_id"]
+    ):
+        keep_model_key = _model_key(
+            embedding_cfg["provider_id"], embedding_cfg["model_id"]
+        )
+    statement = delete(MemoryEmbedding).where(
+        MemoryEmbedding.workspace_id == workspace_id
+    )
+    if keep_model_key:
+        statement = statement.where(MemoryEmbedding.model_key != keep_model_key)
+    freed = db.execute(statement).rowcount or 0
+    db.commit()
+    return {"freed_count": freed, "keep_model_key": keep_model_key}
 
 
 def embedding_index_status(db: Session, workspace_id: str) -> dict[str, Any]:
@@ -479,18 +573,40 @@ def embedding_index_status(db: Session, workspace_id: str) -> dict[str, Any]:
             )
         ).all()
     )
+    current_key: str | None = None
     indexed = 0
     if embedding_cfg["provider_id"] and embedding_cfg["model_id"]:
-        model_key = _model_key(embedding_cfg["provider_id"], embedding_cfg["model_id"])
+        current_key = _model_key(embedding_cfg["provider_id"], embedding_cfg["model_id"])
         indexed = len(
             db.scalars(
                 select(MemoryEmbedding.id).where(
                     MemoryEmbedding.workspace_id == workspace_id,
-                    MemoryEmbedding.model_key == model_key,
+                    MemoryEmbedding.model_key == current_key,
                 )
             ).all()
         )
-    return {"active_memories": active_total, "indexed_memories": indexed}
+    counts = {
+        str(row[0]): int(row[1])
+        for row in db.execute(
+            select(
+                MemoryEmbedding.model_key,
+                sql_func.count(MemoryEmbedding.id),
+            )
+            .where(MemoryEmbedding.workspace_id == workspace_id)
+            .group_by(MemoryEmbedding.model_key)
+        ).all()
+    }
+    stale_model_keys = [
+        {"model_key": key, "indexed_count": count}
+        for key, count in sorted(counts.items())
+        if key != current_key
+    ]
+    return {
+        "active_memories": active_total,
+        "indexed_memories": indexed,
+        "current_model_key": current_key,
+        "stale_model_keys": stale_model_keys,
+    }
 
 
 # ---------------------------------------------------------------------------

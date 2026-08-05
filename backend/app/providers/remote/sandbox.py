@@ -129,8 +129,11 @@ def sandbox_runtime_policy(runtime_kind: str) -> tuple[Path, str]:
 
     sandbox_dir = Path(__file__).resolve().parents[3] / "sandbox"
     if runtime_kind == CODE_RUNTIME_KIND:
+        # Code sessions retain ordinary fork/exec but exclude Chromium's
+        # user-namespace/chroot primitives.
         return sandbox_dir / "seccomp_profile_code.json", CODE_SHM_SIZE
     if runtime_kind == BROWSER_RUNTIME_KIND:
+        # Browser sessions receive the Chromium user-namespace/chroot allowlist.
         return sandbox_dir / "seccomp_profile.json", BROWSER_SHM_SIZE
     raise SandboxCapabilityMismatch(f"Unsupported sandbox runtime kind: {runtime_kind}")
 

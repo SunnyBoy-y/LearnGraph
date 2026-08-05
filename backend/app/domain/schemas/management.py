@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from app.domain.schemas.common import ORMModel
 
@@ -374,6 +374,7 @@ class MemoryExtractionSettingsView(BaseModel):
     enabled: bool
     provider_id: str
     model_id: str
+    follow_conversation: bool = False
     auto_commit: bool
 
 
@@ -388,6 +389,7 @@ class MemorySummarizationSettingsView(BaseModel):
     enabled: bool
     provider_id: str
     model_id: str
+    follow_conversation: bool = False
 
 
 class MemoryEnhancementView(BaseModel):
@@ -399,12 +401,20 @@ class MemoryEnhancementView(BaseModel):
     summarization: MemorySummarizationSettingsView
     active_memories: int = 0
     indexed_memories: int = 0
+    # Embedding index introspection: which model the cached vectors belong to,
+    # and which older-model caches still occupy rows (safe to prune).
+    current_model_key: str | None = None
+    stale_model_keys: list[dict[str, Any]] = []
+    # Filled only by the PUT that actually switched the embedding model, so the
+    # frontend can surface an immediate "reindex required" banner.
+    cache_invalidated: dict[str, Any] | None = None
 
 
 class MemoryExtractionSettingsUpdate(BaseModel):
     enabled: bool | None = None
     provider_id: str | None = Field(default=None, max_length=64)
     model_id: str | None = Field(default=None, max_length=200)
+    follow_conversation: bool | None = None
     auto_commit: bool | None = None
 
 
@@ -419,6 +429,7 @@ class MemorySummarizationSettingsUpdate(BaseModel):
     enabled: bool | None = None
     provider_id: str | None = Field(default=None, max_length=64)
     model_id: str | None = Field(default=None, max_length=200)
+    follow_conversation: bool | None = None
 
 
 class MemoryEnhancementUpdateRequest(BaseModel):
@@ -689,6 +700,7 @@ class CodexDeviceLoginPollView(BaseModel):
 
 class ProviderUpdateRequest(BaseModel):
     enabled: bool | None = None
+    provider_type: str | None = Field(default=None, min_length=1, max_length=80)
     base_url: str | None = Field(default=None, max_length=500)
     default_model: str | None = Field(default=None, min_length=1, max_length=160)
     default_image_generation_model_id: str | None = Field(
@@ -1116,6 +1128,37 @@ class MigrationJobView(ORMModel):
     status: str
     report: dict[str, Any]
     created_at: datetime
+
+
+class WebFetchPolicySettingValue(BaseModel):
+    """Workspace-wide approvals for agent and source web fetching."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_without_confirmation: bool = Field(default=False, strict=True)
+    allowed_domains: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def validate_domains(cls, domains: list[str]) -> list[str]:
+        from app.domain.schemas.components import DOMAIN_PATTERN
+
+        normalized: list[str] = []
+        for domain in domains:
+            candidate = domain.strip().casefold().rstrip(".")
+            if (
+                not candidate
+                or "://" in candidate
+                or "/" in candidate
+                or candidate == "*"
+                or not DOMAIN_PATTERN.fullmatch(candidate)
+            ):
+                raise ValueError(
+                    "allowed_domains must contain exact DNS hostnames without schemes or wildcards"
+                )
+            if candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
 
 
 class ChatSuggestedPromptsSettingValue(BaseModel):

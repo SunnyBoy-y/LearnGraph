@@ -13,7 +13,7 @@ non-root container that is the only component with internet egress).
 """
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 from app.services.sandbox_network_policy import (
     EgressPolicy,
@@ -24,6 +24,36 @@ from app.services.sandbox_network_policy import (
 )
 
 DecisionCallback = Callable[[dict[str, Any]], None]
+PolicyProvider = Callable[[], Optional[EgressPolicy]]
+
+# CONNECT header carrying the container's approved policy digest (multi-tenant).
+# The fetch runner reads LEARNGRAPH_EGRESS_POLICY_DIGEST from its environment
+# and echoes it here so the proxy can resolve the right per-workspace policy.
+POLICY_DIGEST_HEADER = b"x-learngraph-policy-digest"
+
+# Standard HTTP CONNECT proxy authentication. Playwright / Chromium cannot send
+# custom CONNECT headers, so browser rendering (web_render) authenticates via
+# Proxy-Authorization: Basic base64("<digest>:<anything>") — the digest rides
+# the username field, which is the only per-workspace credential the proxy
+# accepts. Both channels are equivalent and neither is ever a fallback to a
+# different policy.
+PROXY_AUTH_HEADER = b"proxy-authorization"
+
+
+def _policy_digest_from_proxy_auth(value: bytes) -> str | None:
+    """Extract the policy digest from ``Proxy-Authorization: Basic ...``."""
+    import base64
+
+    scheme, _, credential = value.partition(b" ")
+    if scheme.strip().lower() != b"basic" or not credential.strip():
+        return None
+    try:
+        decoded = base64.b64decode(credential.strip()).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    username, _, _ = decoded.partition(":")
+    username = username.strip()
+    return username or None
 
 DEFAULT_MAX_HEADER_BYTES = 8 * 1024
 DEFAULT_MAX_IDLE_SECONDS = 30.0
@@ -32,7 +62,16 @@ DEFAULT_TUNNEL_CHUNK = 64 * 1024
 
 
 class SandboxEgressProxy:
-    """HTTP CONNECT proxy that enforces one reviewed policy.
+    """HTTP CONNECT proxy that enforces one reviewed policy per connection.
+
+    Policy resolution, most specific first:
+    1. ``policy_registry`` (multi-tenant): a dict keyed by policy digest. The
+       client must identify itself with the ``X-LearnGraph-Policy-Digest``
+       CONNECT header (the container's ``LEARNGRAPH_EGRESS_POLICY_DIGEST``);
+       an absent or unknown digest is denied with 403.
+    2. ``policy_provider``: a zero-argument callable returning the policy for
+       the current connection (reload seam for single-tenant deployments).
+    3. ``policy``: one immutable policy for the simplest deployments.
 
     ``on_decision`` is an optional audit sink invoked for every allow/deny with
     a small, non-secret payload (policy digest, approval id, host, port, reason).
@@ -40,15 +79,21 @@ class SandboxEgressProxy:
 
     def __init__(
         self,
-        policy: EgressPolicy,
+        policy: EgressPolicy | None = None,
         *,
+        policy_provider: PolicyProvider | None = None,
+        policy_registry: dict[str, EgressPolicy] | None = None,
         resolver: AddressResolver = system_resolver,
         on_decision: DecisionCallback | None = None,
         max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES,
         max_idle_seconds: float = DEFAULT_MAX_IDLE_SECONDS,
         max_tunnel_bytes: int = DEFAULT_MAX_TUNNEL_BYTES,
     ) -> None:
+        if policy is None and policy_provider is None and not policy_registry:
+            raise ValueError("SandboxEgressProxy requires a policy, policy_provider, or policy_registry")
         self.policy = policy
+        self.policy_provider = policy_provider
+        self.policy_registry = policy_registry
         self.resolver = resolver
         self.on_decision = on_decision
         self.max_header_bytes = max_header_bytes
@@ -87,6 +132,17 @@ class SandboxEgressProxy:
         if self.on_decision is not None:
             self.on_decision(event)
 
+    def _resolve_policy(self, digest: str | None) -> EgressPolicy | None:
+        if self.policy_registry is not None:
+            # Multi-tenant: the digest IS the identity. Absent or unknown digest
+            # fails closed (403) — never falls back to another policy.
+            if not digest or digest not in self.policy_registry:
+                return None
+            return self.policy_registry[digest]
+        if self.policy_provider is not None:
+            return self.policy_provider()
+        return self.policy
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         peer_address = f"{peer[0]}:{peer[1]}" if peer else "unknown"
@@ -101,7 +157,7 @@ class SandboxEgressProxy:
             writer.close()
             return
 
-        first_line, *_ = header.split(b"\r\n", 1)
+        first_line, *rest_lines = header.split(b"\r\n")
         parts = first_line.decode("latin-1").split()
         if len(parts) != 3 or parts[0] != "CONNECT" or parts[2] != "HTTP/1.1":
             self._audit({"decision": "denied", "reason": "non_connect_method", "peer": peer_address})
@@ -109,6 +165,25 @@ class SandboxEgressProxy:
             await writer.drain()
             writer.close()
             return
+
+        # The policy digest is the only per-workspace credential. It may ride
+        # the X-LearnGraph-Policy-Digest CONNECT header (httpx fetch runner) or
+        # Proxy-Authorization Basic (browser rendering via Chromium); both must
+        # resolve to a registered policy or the CONNECT fails closed.
+        policy_digest: str | None = None
+        for line in rest_lines:
+            if b":" not in line:
+                continue
+            name, _, value = line.partition(b":")
+            lowered = name.strip().lower()
+            if lowered == POLICY_DIGEST_HEADER:
+                policy_digest = value.strip().decode("latin-1") or None
+                break
+            if lowered == PROXY_AUTH_HEADER:
+                auth_digest = _policy_digest_from_proxy_auth(value.strip())
+                if auth_digest is not None:
+                    policy_digest = auth_digest
+                break
 
         authority = parts[1]
         try:
@@ -121,9 +196,25 @@ class SandboxEgressProxy:
             writer.close()
             return
 
+        resolved_policy = self._resolve_policy(policy_digest)
+        if resolved_policy is None:
+            self._audit(
+                {
+                    "decision": "denied",
+                    "reason": "policy_unavailable",
+                    "target": authority,
+                    "peer": peer_address,
+                    "policy_digest": policy_digest or None,
+                }
+            )
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            return
+
         try:
             target_ip, audit = authorize_connect(
-                self.policy,
+                resolved_policy,
                 host,
                 port,
                 resolver=self.resolver,

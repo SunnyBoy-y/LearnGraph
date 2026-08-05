@@ -56,6 +56,7 @@ import {
   listSettings,
   listWorkspaces,
   preflightMigration,
+  pruneMemoryEmbeddings,
   reindexMemoryEmbeddings,
   rollbackMigration,
   restoreFullBackup,
@@ -130,7 +131,11 @@ import type { ResponseMode } from "@/lib/session-composer-prefs";
 import { cn } from "@/lib/utils";
 import { DatabaseConfigurationSheet } from "@/features/settings/database-configuration-sheet";
 import type { AuditEvent } from "@/types/audit";
-import type { MemoryEnhancementUpdateRequest } from "@/types/memory";
+import type {
+  MemoryEmbeddingStaleInfo,
+  MemoryEnhancement,
+  MemoryEnhancementUpdateRequest,
+} from "@/types/memory";
 import type {
   MigrationDatabaseKind,
   MigrationJob,
@@ -2240,25 +2245,86 @@ export function WorkspaceSettingsPage() {
     queryKey: ["memory-enhancement"],
     queryFn: getMemoryEnhancement,
   });
+  const [pendingEmbeddingSwitch, setPendingEmbeddingSwitch] =
+    useState<MemoryEnhancementUpdateRequest | null>(null);
   const saveMemoryEnhancement = useMutation({
     mutationFn: (updates: MemoryEnhancementUpdateRequest) =>
       updateMemoryEnhancement(updates),
     onError: (error) => toast.error(error.message),
     onSuccess: (view) => {
       queryClient.setQueryData(["memory-enhancement"], view);
-      toast.success("记忆设置已更新");
+      toast.success(
+        view.cache_invalidated
+          ? "已切换 Embedding 模型：语义召回已降级，需重建索引"
+          : "记忆设置已更新",
+      );
     },
   });
   const reindexEmbeddings = useMutation({
-    mutationFn: reindexMemoryEmbeddings,
+    mutationFn: ({ pruneStale = false }: { pruneStale?: boolean } = {}) =>
+      reindexMemoryEmbeddings(pruneStale),
     onError: (error) => toast.error(error.message),
     onSuccess: async (result) => {
+      const pruneNote =
+        result.stale_freed > 0 ? `，清理旧缓存 ${result.stale_freed} 条` : "";
+      const truncatedNote = result.truncated
+        ? "（记忆过多，仅处理部分，请再次重建）"
+        : "";
       toast.success(
-        `索引完成：新嵌入 ${result.embedded} 条 / 已有 ${result.already_indexed} 条`,
+        `索引完成：新嵌入 ${result.embedded} 条 / 已有 ${result.already_indexed} 条${pruneNote}${truncatedNote}`,
       );
       await queryClient.invalidateQueries({ queryKey: ["memory-enhancement"] });
     },
   });
+  const pruneEmbeddings = useMutation({
+    mutationFn: pruneMemoryEmbeddings,
+    onError: (error) => toast.error(error.message),
+    onSuccess: async (result) => {
+      toast.success(
+        result.freed_count > 0
+          ? `已清理旧模型缓存 ${result.freed_count} 条`
+          : "没有可清理的旧模型缓存",
+      );
+      await queryClient.invalidateQueries({ queryKey: ["memory-enhancement"] });
+    },
+  });
+  /** Switching the embedding provider/model while cached vectors exist must
+   *  be confirmed: the new model starts unindexed (recall degrades until a
+   *  rebuild) and the previous model's cache is left to be pruned. */
+  const embeddingSwitchInvalidates = (
+    patch: MemoryEnhancementUpdateRequest,
+  ): boolean => {
+    const current = memoryEnhancement.data;
+    if (!current || !(current.indexed_memories > 0)) return false;
+    const target = patch.embedding;
+    if (!target) return false;
+    const providerChanged =
+      target.provider_id !== undefined &&
+      target.provider_id !== current.embedding.provider_id;
+    const modelChanged =
+      target.model_id !== undefined &&
+      target.model_id !== current.embedding.model_id;
+    return providerChanged || modelChanged;
+  };
+  const applyEmbeddingPatch = (patch: MemoryEnhancementUpdateRequest) => {
+    if (embeddingSwitchInvalidates(patch)) {
+      setPendingEmbeddingSwitch(patch);
+      return;
+    }
+    saveMemoryEnhancement.mutate(patch);
+  };
+  const cacheInvalidated = memoryEnhancement.data?.cache_invalidated ?? null;
+  const staleModelKeys: MemoryEmbeddingStaleInfo[] =
+    memoryEnhancement.data?.stale_model_keys ?? [];
+  const dismissCacheInvalidated = () => {
+    const current = memoryEnhancement.data;
+    if (current) {
+      queryClient.setQueryData<MemoryEnhancement>(["memory-enhancement"], {
+        ...current,
+        cache_invalidated: null,
+      });
+    }
+  };
   const providerCatalog = useQuery({
     queryKey: ["provider-catalog"],
     queryFn: listProviderCatalog,
@@ -2288,9 +2354,6 @@ export function WorkspaceSettingsPage() {
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
     },
   });
-  const [embeddingModelDraft, setEmbeddingModelDraft] = useState<string | null>(
-    null,
-  );
   const embeddingProviders = useMemo(() => {
     const roleByType = new Map(
       (providerCatalog.data ?? []).map((item) => [item.provider_type, item.role]),
@@ -2311,6 +2374,32 @@ export function WorkspaceSettingsPage() {
     }
     return rows;
   }, [providerCatalog.data, providers.data, memoryEnhancement.data]);
+  const selectedEmbeddingProvider = embeddingProviders.find(
+    (provider) => provider.id === memoryEnhancement.data?.embedding.provider_id,
+  );
+  const embeddingDiscovery = useQuery({
+    queryKey: ["settings-embedding-models", selectedEmbeddingProvider?.id],
+    queryFn: () => discoverProviderModels(selectedEmbeddingProvider!.id),
+    enabled: Boolean(selectedEmbeddingProvider?.id),
+  });
+  const embeddingModels = (embeddingDiscovery.data?.models ?? []).filter(
+    (model) => model.enabled !== false,
+  );
+  const configuredEmbeddingModelId = memoryEnhancement.data?.embedding.model_id ?? "";
+  const visibleEmbeddingModels =
+    configuredEmbeddingModelId &&
+    !embeddingModels.some((model) => model.id === configuredEmbeddingModelId)
+      ? [
+          ...embeddingModels,
+          {
+            id: configuredEmbeddingModelId,
+            roles: ["embedding"],
+            streaming: false,
+            remote: true,
+            enabled: false,
+          },
+        ]
+      : embeddingModels;
   const saveFeatureModel = useMutation({
     mutationFn: ({
       key,
@@ -2423,10 +2512,13 @@ export function WorkspaceSettingsPage() {
   }
 
   const memoryExtractionCfg = memoryEnhancement.data?.extraction;
-  const memoryModelValue = featureModelValue(
-    memoryExtractionCfg?.provider_id || null,
-    memoryExtractionCfg?.model_id || null,
-  );
+  const memoryFollowsConversation = memoryExtractionCfg?.follow_conversation === true;
+  const memoryModelValue = memoryFollowsConversation
+    ? "follow-conversation"
+    : featureModelValue(
+        memoryExtractionCfg?.provider_id || null,
+        memoryExtractionCfg?.model_id || null,
+      );
   // A configured extraction model that discovery no longer lists must stay
   // visible in the select instead of silently falling back to "未配置".
   const memoryModelChoices =
@@ -2947,7 +3039,7 @@ export function WorkspaceSettingsPage() {
           <div className="rounded-xl border p-4">
             <p className="text-sm font-medium">记忆整理模型</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              自动记忆抽取与会话摘要共用此模型；未配置时两项功能不会运行
+              自动记忆抽取与会话摘要共用此模型；可跟随每个会话的对话模型，未配置时两项功能不会运行
             </p>
             <Select
               disabled={
@@ -2956,10 +3048,12 @@ export function WorkspaceSettingsPage() {
                 providers.isPending
               }
               onValueChange={(value) => {
+                const follow_conversation = value === "follow-conversation";
                 const parsed = parseFeatureModelValue(value);
                 const patch = {
-                  provider_id: parsed.provider_id ?? "",
-                  model_id: parsed.model_id ?? "",
+                  provider_id: follow_conversation ? "" : (parsed.provider_id ?? ""),
+                  model_id: follow_conversation ? "" : (parsed.model_id ?? ""),
+                  follow_conversation,
                 };
                 saveMemoryEnhancement.mutate({
                   extraction: patch,
@@ -2973,6 +3067,7 @@ export function WorkspaceSettingsPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="default">未配置</SelectItem>
+                <SelectItem value="follow-conversation">跟随对话模型</SelectItem>
                 {memoryModelChoices.map((choice) => (
                   <SelectItem key={choice.value} value={choice.value}>
                     {choice.label}
@@ -3014,11 +3109,17 @@ export function WorkspaceSettingsPage() {
                 memoryEnhancement.isPending ||
                 providers.isPending
               }
-              onValueChange={(value) =>
-                saveMemoryEnhancement.mutate({
-                  embedding: { provider_id: value === "none" ? "" : value },
-                })
-              }
+              onValueChange={(provider_id) => {
+                const provider = embeddingProviders.find((item) => item.id === provider_id);
+                const defaultModel = provider?.capabilities.default_embedding_model_id;
+                applyEmbeddingPatch({
+                  embedding: {
+                    provider_id: provider_id === "none" ? "" : provider_id,
+                    model_id:
+                      typeof defaultModel === "string" ? defaultModel : "",
+                  },
+                });
+              }}
               value={memoryEnhancement.data?.embedding.provider_id || "none"}
             >
               <SelectTrigger aria-label="Embedding Provider" className="mt-3">
@@ -3033,64 +3134,176 @@ export function WorkspaceSettingsPage() {
                 ))}
               </SelectContent>
             </Select>
-            <div className="mt-2 flex gap-2">
-              <Input
-                aria-label="Embedding 模型 ID"
-                onChange={(event) => setEmbeddingModelDraft(event.target.value)}
-                placeholder="Embedding 模型 ID，如 text-embedding-v4"
-                value={
-                  embeddingModelDraft ??
-                  memoryEnhancement.data?.embedding.model_id ??
-                  ""
-                }
-              />
-              <Button
-                disabled={
-                  saveMemoryEnhancement.isPending ||
-                  embeddingModelDraft === null ||
-                  embeddingModelDraft.trim() ===
-                    (memoryEnhancement.data?.embedding.model_id ?? "")
-                }
-                onClick={() =>
-                  saveMemoryEnhancement.mutate(
-                    {
-                      embedding: {
-                        model_id: (embeddingModelDraft ?? "").trim(),
-                      },
-                    },
-                    { onSuccess: () => setEmbeddingModelDraft(null) },
-                  )
-                }
-                size="sm"
-                variant="outline"
-              >
-                保存
-              </Button>
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3 border-t pt-3">
-              <span className="text-xs text-muted-foreground">
-                已索引 {memoryEnhancement.data?.indexed_memories ?? 0} /{" "}
-                {memoryEnhancement.data?.active_memories ?? 0} 条活跃记忆
-              </span>
-              <Button
-                disabled={
-                  reindexEmbeddings.isPending ||
-                  !(memoryEnhancement.data?.embedding.enabled ?? false)
-                }
-                onClick={() => reindexEmbeddings.mutate()}
-                size="sm"
-                variant="outline"
-              >
-                <RefreshCcw
-                  className={
-                    reindexEmbeddings.isPending
-                      ? "size-4 animate-spin"
-                      : "size-4"
+            <Select
+              disabled={
+                saveMemoryEnhancement.isPending ||
+                memoryEnhancement.isPending ||
+                !selectedEmbeddingProvider ||
+                embeddingDiscovery.isPending ||
+                visibleEmbeddingModels.length === 0
+              }
+              onValueChange={(model_id) =>
+                applyEmbeddingPatch({ embedding: { model_id } })
+              }
+              value={memoryEnhancement.data?.embedding.model_id || undefined}
+            >
+              <SelectTrigger aria-label="Embedding 模型" className="mt-2">
+                <SelectValue
+                  placeholder={
+                    !selectedEmbeddingProvider
+                      ? "请先选择 Embedding Provider"
+                      : embeddingDiscovery.isPending
+                        ? "正在发现 Embedding 模型…"
+                        : visibleEmbeddingModels.length === 0
+                        ? "该 Provider 尚无已启用的已发现模型"
+                        : "选择 Embedding 模型"
                   }
                 />
-                重建索引
-              </Button>
+              </SelectTrigger>
+              <SelectContent>
+                {visibleEmbeddingModels.map((model) => (
+                  <SelectItem disabled={model.enabled === false} key={model.id} value={model.id}>
+                    {model.id}{model.enabled === false ? "（当前配置，未发现或已停用）" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {cacheInvalidated ? (
+              <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50/70 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+                <p className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    已切换到{" "}
+                    <code className="font-mono">
+                      {cacheInvalidated.current_model_key}
+                    </code>
+                    ：新模型下的记忆尚未索引（已索引 0 /{" "}
+                    {memoryEnhancement.data?.active_memories ?? 0}），语义召回暂时降级。
+                    旧模型缓存{" "}
+                    <code className="font-mono">
+                      {cacheInvalidated.previous_model_key}
+                    </code>{" "}
+                    共 {cacheInvalidated.previous_indexed_count} 条待清理。
+                  </span>
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button
+                    disabled={reindexEmbeddings.isPending}
+                    onClick={() => reindexEmbeddings.mutate({ pruneStale: true })}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <RefreshCcw
+                      className={
+                        reindexEmbeddings.isPending
+                          ? "size-4 animate-spin"
+                          : "size-4"
+                      }
+                    />
+                    重建索引并清理旧缓存
+                  </Button>
+                  <Button
+                    disabled={reindexEmbeddings.isPending}
+                    onClick={dismissCacheInvalidated}
+                    size="sm"
+                    variant="ghost"
+                  >
+                    稍后处理
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t pt-3">
+              <div className="min-w-0">
+                <p className="text-xs text-muted-foreground">
+                  已索引 {memoryEnhancement.data?.indexed_memories ?? 0} /{" "}
+                  {memoryEnhancement.data?.active_memories ?? 0} 条活跃记忆
+                  {memoryEnhancement.data?.current_model_key ? (
+                    <>
+                      {" · "}当前模型{" "}
+                      <code className="font-mono">
+                        {memoryEnhancement.data.current_model_key}
+                      </code>
+                    </>
+                  ) : null}
+                </p>
+                {staleModelKeys.length > 0 ? (
+                  <p className="mt-0.5 text-[10px] text-muted-foreground">
+                    旧模型缓存待清理：{" "}
+                    {staleModelKeys
+                      .map(
+                        (item) =>
+                          `${item.model_key} ${item.indexed_count} 条`,
+                      )
+                      .join("、")}
+                  </p>
+                ) : null}
+              </div>
+              <div className="flex flex-none items-center gap-2">
+                <Button
+                  disabled={
+                    pruneEmbeddings.isPending ||
+                    staleModelKeys.length === 0 ||
+                    !(memoryEnhancement.data?.embedding.enabled ?? false)
+                  }
+                  onClick={() => pruneEmbeddings.mutate()}
+                  size="sm"
+                  variant="outline"
+                >
+                  <Trash2 className="size-3.5" />
+                  清理旧缓存
+                </Button>
+                <Button
+                  disabled={
+                    reindexEmbeddings.isPending ||
+                    !(memoryEnhancement.data?.embedding.enabled ?? false)
+                  }
+                  onClick={() => reindexEmbeddings.mutate({ pruneStale: false })}
+                  size="sm"
+                  variant="outline"
+                >
+                  <RefreshCcw
+                    className={
+                      reindexEmbeddings.isPending
+                        ? "size-4 animate-spin"
+                        : "size-4"
+                    }
+                  />
+                  重建索引
+                </Button>
+              </div>
             </div>
+            <AlertDialog
+              open={pendingEmbeddingSwitch !== null}
+              onOpenChange={(open) => {
+                if (!open) setPendingEmbeddingSwitch(null);
+              }}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>
+                    切换 Embedding 模型会使现有向量缓存失效
+                  </AlertDialogTitle>
+                  <AlertDialogDescription>
+                    新模型下的记忆需要重新生成索引（切换后已索引数量会归零，
+                    语义召回暂时降级，可一键重建）；旧模型的缓存可一并清理。
+                    记忆内容本身不会丢失。
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>取消</AlertDialogCancel>
+                  <AlertDialogAction
+                    onClick={() => {
+                      const patch = pendingEmbeddingSwitch;
+                      setPendingEmbeddingSwitch(null);
+                      if (patch) saveMemoryEnhancement.mutate(patch);
+                    }}
+                  >
+                    确认切换
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
         </div>
       </Surface>

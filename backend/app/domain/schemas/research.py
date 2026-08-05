@@ -21,6 +21,9 @@ class SearchResult(BaseModel):
     snippet: str
     source_type: str
     fetched_at: datetime
+    # Optional provider-supplied thumbnail. Untrusted display reference only —
+    # the backend never proxies/downloads it.
+    image_url: str | None = None
 
 
 class SearchResponse(BaseModel):

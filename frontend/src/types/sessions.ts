@@ -23,6 +23,8 @@ export type MessagePartType =
   | 'component'
   | 'magic_card'
   | 'user_confirmation'
+  | 'fetch_authorization'
+  | 'fetch_setup_notice'
   | 'error'
 
 export type MessagePartStatus = 'pending' | 'streaming' | 'completed' | 'failed'

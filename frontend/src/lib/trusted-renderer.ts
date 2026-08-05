@@ -10,9 +10,9 @@
  * The deliverable stays `sandbox_artifact` and renders through the existing
  * opaque-origin iframe (`sandbox="allow-scripts"`, NO `allow-same-origin`,
  * `connect-src 'none'`). This module only surfaces the trust decision and posts
- * the protocol `renderer.unlock` handshake to the inert iframe — it never relaxes
- * CSP, never grants same-origin, never reads iframe DOM, and never treats an
- * iframe message as a host instruction.
+ * the protocol `renderer.unlock` / `renderer.state` handshakes to the inert
+ * iframe — it never relaxes CSP, never grants same-origin, never reads iframe
+ * DOM, and never treats an iframe message as a host instruction.
  */
 
 export interface TrustedRendererEnvelope {
@@ -22,6 +22,10 @@ export interface TrustedRendererEnvelope {
   token?: string
   token_id?: string
   unlock_message?: Record<string, unknown>
+  /** Server-provided verbatim `renderer.state` message (mirrors unlock_message). */
+  state_message?: Record<string, unknown>
+  /** Server-approved raw state payload; rendererStateMessage wraps it when state_message is absent. */
+  state?: Record<string, unknown>
   iframe_boundary?: Record<string, unknown>
   [key: string]: unknown
 }
@@ -70,6 +74,38 @@ export function rendererUnlockMessage(
 }
 
 /**
+ * The protocol `renderer.state` message to post into the subapp iframe.
+ *
+ * Mirrors the `unlock_message` envelope pattern: the server's sealed envelope
+ * may carry a verbatim `state_message` (preferred, host never fabricates a
+ * token-bearing payload), or a server-approved `state` payload that this seam
+ * wraps into a `renderer.state` handshake. Returns null when there is no sealed
+ * envelope or no state to deliver.
+ *
+ * `renderer.state` is host→iframe only. The server rejects it inbound (same
+ * branch as unlock), so this is a construction/read seam — T2.6 wires the actual
+ * dispatch into the subapp runtime.
+ */
+export function rendererStateMessage(
+  data: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const envelope = trustedRendererEnvelope(data)
+  if (!envelope) return null
+  const verbatim = asRecord(envelope.state_message)
+  if (verbatim) return verbatim
+  const state = asRecord(envelope.state)
+  if (!state) return null
+  return {
+    version:
+      typeof envelope.protocol_version === 'string' && envelope.protocol_version !== ''
+        ? envelope.protocol_version
+        : '1',
+    event_type: 'renderer.state',
+    payload: state,
+  }
+}
+
+/**
  * Post the unlock handshake into the sandboxed iframe (forward-compatible seam).
  * The iframe content is server-owned and inert (`script-src 'none'`), so the
  * message has no receiver today; a future trusted renderer runtime reads it.
@@ -84,6 +120,25 @@ export function postRendererUnlock(
     iframe.contentWindow?.postMessage(message, '*')
   } catch {
     // Inert opaque iframe / jsdom: there is no receiver, and the handshake is
+    // a forward seam — never let a post failure break the artifact render.
+  }
+}
+
+/**
+ * Post a `renderer.state` message into the subapp iframe. Pairs with
+ * `postRendererUnlock` and uses the identical `targetOrigin '*'` — the only
+ * option for an opaque-origin iframe. Never throws, so a forward seam cannot
+ * break the artifact render. T2.6 wires actual dispatch; this is the seam.
+ */
+export function postRendererState(
+  iframe: HTMLIFrameElement | null,
+  message: Record<string, unknown> | null,
+): void {
+  if (!iframe || !message) return
+  try {
+    iframe.contentWindow?.postMessage(message, '*')
+  } catch {
+    // Inert opaque iframe / jsdom: there is no receiver, and the state push is
     // a forward seam — never let a post failure break the artifact render.
   }
 }

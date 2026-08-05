@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
@@ -40,6 +42,7 @@ from app.domain.schemas.management import (
     ChatResponseStyleSettingValue,
     ChatSuggestedPromptsSettingValue,
     FunctionalModelDefaultsSettingValue,
+    WebFetchPolicySettingValue,
     MigrationPreflightRequest,
     PluginToggleRequest,
     ProviderBalanceQueryConfig,
@@ -73,6 +76,7 @@ from app.providers.catalog import (
     provider_catalog,
     provider_type_spec,
 )
+from app.providers.model_catalog import unified_model_defaults
 from app.providers.remote.fetch import (
     Crawl4AIHTTPFetchProvider,
     FetchProviderError,
@@ -81,6 +85,7 @@ from app.providers.remote.fetch import (
 )
 from app.providers.remote.openai import (
     ProviderHTTPError,
+    ProviderInvalidUrlError,
     ProviderResponseError,
     ProviderTimeoutError,
     discover_remote_models,
@@ -122,6 +127,7 @@ from app.providers.remote.balance import (
     BalanceReport,
     ProviderBalanceError,
     detect_balance_vendor,
+    fetch_dashscope_balance,
     fetch_gateway_billing_balance,
     fetch_moonshot_balance,
     fetch_openrouter_balance,
@@ -156,6 +162,39 @@ from app.services.provider_secrets import (
     decrypt_provider_secret,
     encrypt_provider_secret,
 )
+
+# Roles whose models are manageable through the discovery snapshot.  This is
+# exactly the set ``models()`` supports, so model enablement, capability
+# snapshots, catalog sync, and default-model fallbacks stay coherent for
+# image / vision / ASR / embedding / deep-research Providers — not just
+# chat-model Providers.
+_MODEL_MANAGEMENT_PROVIDER_TYPES = frozenset(
+    {
+        *MODEL_PROVIDER_TYPES,
+        *IMAGE_GENERATION_PROVIDER_TYPES,
+        *VISION_PROVIDER_TYPES,
+        *TRANSCRIPTION_PROVIDER_TYPES,
+        *EMBEDDING_PROVIDER_TYPES,
+        "qwen_deep_research",
+    }
+)
+
+# DashScope official hosts.  API keys cannot read account balance there; a
+# workspace-configured Aliyun AccessKey (secret reference, purpose
+# ``aliyun_access_key``) is required for the BSS RPC.
+_DASHSCOPE_BALANCE_HOSTS = frozenset(
+    {"dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"}
+)
+
+
+def _is_dashscope_host(base_url: str | None) -> bool:
+    if not base_url:
+        return False
+    try:
+        host = (urlsplit(base_url.strip()).hostname or "").casefold()
+    except ValueError:
+        return False
+    return host in _DASHSCOPE_BALANCE_HOSTS or host.endswith(".maas.aliyuncs.com")
 
 
 class ProviderService:
@@ -329,6 +368,28 @@ class ProviderService:
                 "provider_family": "ollama",
                 "capability_source": "official_catalog",
                 "provider_role": "embedding",
+            }
+        if payload.provider_type == "ollama_cloud":
+            ollama_defaults = {
+                "brand_id": "ollama",
+                "model_family": "ollama",
+                "provider_family": "ollama",
+                "capability_source": "official_catalog",
+                "supports_agent_tools": True,
+                # Ollama Cloud currently does not support structured outputs.
+                "supports_structured_output": False,
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "thinking_mapping": {
+                    "off": False,
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                    "xhigh": "max",
+                },
+                "default_thinking_mode": "off",
+                "reasoning_parameter": "thinking",
+                "hosted_web_search": False,
+                "default_search_route": "external",
             }
         copilot_defaults: dict[str, object] = {}
         if payload.provider_type == "github_copilot":
@@ -617,6 +678,30 @@ class ProviderService:
         was_enabled = provider.enabled
         capabilities = dict(provider.capabilities or {})
         fields_set = payload.model_fields_set
+        if payload.provider_type is not None and payload.provider_type != provider.provider_type:
+            next_spec = provider_type_spec(payload.provider_type)
+            current_spec = provider_type_spec(provider.provider_type)
+            if (
+                next_spec is None
+                or not next_spec.create_allowed
+                or current_spec is None
+                or next_spec.role != current_spec.role
+            ):
+                raise AppError(
+                    422,
+                    "provider_protocol_incompatible",
+                    "Provider protocol changes must use a supported type with the same role",
+                )
+            if payload.provider_type in {"codex_chatgpt", "github_copilot"}:
+                raise AppError(
+                    409,
+                    "provider_protocol_requires_device_login",
+                    "Switch to this protocol by creating a Provider through its device-login flow",
+                )
+            provider.provider_type = payload.provider_type
+            capabilities["remote_calls_enabled"] = False
+            provider.remote_capability = False
+            provider.status = "configured_disabled"
         if "base_url" in fields_set:
             updated_base_url = (
                 payload.base_url.strip().rstrip("/")
@@ -636,6 +721,18 @@ class ProviderService:
                 payload.extra_headers
             )
         if payload.default_model is not None:
+            if (
+                provider.provider_type in MODEL_PROVIDER_TYPES
+                and unified_model_defaults(
+                    payload.default_model, provider_type=provider.provider_type
+                ).get("supports_text_output", True)
+                is False
+            ):
+                raise AppError(
+                    422,
+                    "provider_model_not_text_capable",
+                    "This model only outputs images and cannot be used as a text chat model",
+                )
             model_states = dict(capabilities.get("model_states") or {})
             if (
                 provider.provider_type in MODEL_PROVIDER_TYPES
@@ -679,6 +776,7 @@ class ProviderService:
                 resource_id=provider.id,
                 details={
                     "base_url_changed": "base_url" in fields_set,
+                    "provider_type_changed": "provider_type" in fields_set,
                     "extra_headers_changed": "extra_headers" in fields_set,
                     "default_model": capabilities.get("default_model"),
                     "default_image_generation_model_id": capabilities.get(
@@ -948,11 +1046,11 @@ class ProviderService:
         payload: ProviderModelCapabilityUpdateRequest,
     ) -> dict:
         provider = self.providers.require(provider_id, "provider")
-        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
-                "Model capabilities can only be configured on a model Provider",
+                "Model capabilities can only be configured on a Provider that exposes a model discovery endpoint",
             )
         try:
             raw_payload = payload.model_dump()
@@ -993,11 +1091,11 @@ class ProviderService:
         payload: ProviderModelCapabilityUpdateRequest,
     ) -> dict:
         provider = self.providers.require(provider_id, "provider")
-        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
-                "Model capabilities can only be configured on a model Provider",
+                "Model capabilities can only be configured on a Provider that exposes a model discovery endpoint",
             )
         try:
             raw_payload = payload.model_dump()
@@ -1038,11 +1136,11 @@ class ProviderService:
         """Write official catalog defaults as the per-model snapshot of every model."""
 
         provider = self.providers.require(provider_id, "provider")
-        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
-                "Model capabilities can only be configured on a model Provider",
+                "Model capabilities can only be configured on a Provider that exposes a model discovery endpoint",
             )
         capabilities = dict(provider.capabilities or {})
         models = dict(capabilities.get("models") or {})
@@ -1089,15 +1187,72 @@ class ProviderService:
         self.db.commit()
         return {"provider_id": provider.id, "models": synced}
 
+    @staticmethod
+    def _model_default_field(provider: ProviderConfig) -> str:
+        """Return the capability field that holds a Provider's default model.
+
+        Image / vision / transcription / embedding / deep-research Providers
+        keep their default in a role-specific field instead of ``default_model``
+        (which stays a mirror only for vision and embedding).
+        """
+        provider_type = provider.provider_type
+        if provider_type in IMAGE_GENERATION_PROVIDER_TYPES:
+            return "default_image_generation_model_id"
+        if provider_type in VISION_PROVIDER_TYPES:
+            return "default_vision_model_id"
+        if provider_type in TRANSCRIPTION_PROVIDER_TYPES:
+            return "default_transcription_model_id"
+        if provider_type in EMBEDDING_PROVIDER_TYPES:
+            return "default_embedding_model_id"
+        if provider_type == "qwen_deep_research":
+            return "deep_research_model"
+        return "default_model"
+
+    @staticmethod
+    def _read_model_default(capabilities: dict, default_field: str) -> str:
+        return str(
+            capabilities.get(default_field)
+            or capabilities.get("default_model")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _write_model_default(
+        capabilities: dict, default_field: str, model_id: str
+    ) -> None:
+        capabilities[default_field] = model_id
+        if default_field in {
+            "default_vision_model_id",
+            "default_embedding_model_id",
+        }:
+            capabilities["default_model"] = model_id
+
+    @staticmethod
+    def _known_model_ids(capabilities: dict, discovered: list[str]) -> list[str]:
+        """Every model id a workspace may toggle or configure.
+
+        The discovery snapshot is authoritative for what the vendor reported,
+        but workspaces also pin models manually through a catalog-defaults sync
+        (``capabilities.models`` keys) or a typed default model.  Those must
+        stay toggleable even though the vendor never listed them.
+        """
+        snapshot_keys = [
+            str(item).strip()
+            for item in (dict(capabilities.get("models") or {}))
+            if str(item).strip()
+        ]
+        default_id = str(capabilities.get("default_model") or "").strip()
+        return list(dict.fromkeys([*discovered, default_id, *snapshot_keys]))
+
     def update_model_state(
         self, provider_id: str, model_id: str, enabled: bool
     ) -> dict:
         provider = self.providers.require(provider_id, "provider")
-        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
-                "Model state can only be configured on a model Provider",
+                "Model state can only be configured on a Provider that exposes a model discovery endpoint",
             )
         normalized_model_id = model_id.strip()
         capabilities = dict(provider.capabilities or {})
@@ -1106,12 +1261,16 @@ class ProviderService:
             for item in capabilities.get("discovered_model_ids") or []
             if str(item).strip()
         ]
-        configured_default = str(capabilities.get("default_model") or "").strip()
-        if normalized_model_id not in discovered and normalized_model_id != configured_default:
+        default_field = self._model_default_field(provider)
+        configured_default = self._read_model_default(capabilities, default_field)
+        if normalized_model_id not in self._known_model_ids(
+            capabilities, discovered
+        ):
             raise AppError(
                 404,
                 "provider_model_not_found",
-                "The model is not present in the latest Provider discovery snapshot",
+                "The model is not present in the latest Provider discovery "
+                "snapshot or a saved per-model snapshot",
             )
         states = {
             str(key): value is not False
@@ -1120,12 +1279,26 @@ class ProviderService:
         states[normalized_model_id] = enabled
         capabilities["model_states"] = states
         if enabled and not configured_default:
-            capabilities["default_model"] = normalized_model_id
+            self._write_model_default(capabilities, default_field, normalized_model_id)
             configured_default = normalized_model_id
         elif not enabled and configured_default == normalized_model_id:
-            capabilities["default_model"] = next(
-                (item for item in discovered if states.get(item, True)), ""
+            next_default = next(
+                (
+                    item
+                    for item in self._known_model_ids(capabilities, discovered)
+                    if states.get(item, True)
+                ),
+                "",
             )
+            if next_default:
+                self._write_model_default(capabilities, default_field, next_default)
+            else:
+                capabilities.pop(default_field, None)
+                if default_field in {
+                    "default_vision_model_id",
+                    "default_embedding_model_id",
+                }:
+                    capabilities.pop("default_model", None)
         provider.capabilities = capabilities
         self.audit.record(
             actor_id=self.actor_id,
@@ -1136,7 +1309,11 @@ class ProviderService:
                 "provider_id": provider.id,
                 "model_id": normalized_model_id,
                 "enabled": enabled,
-                "default_model": capabilities.get("default_model") or None,
+                "default_model": (
+                    capabilities.get(default_field)
+                    or capabilities.get("default_model")
+                    or None
+                ),
             },
         )
         self.db.commit()
@@ -1144,18 +1321,20 @@ class ProviderService:
             "provider_id": provider.id,
             "model_id": normalized_model_id,
             "enabled": enabled,
-            "is_default": capabilities.get("default_model") == normalized_model_id,
+            "is_default": (
+                capabilities.get(default_field) == normalized_model_id
+            ),
         }
 
     def update_model_states(
         self, provider_id: str, requested_states: dict[str, bool]
     ) -> dict:
         provider = self.providers.require(provider_id, "provider")
-        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
-                "Model state can only be configured on a model Provider",
+                "Model state can only be configured on a Provider that exposes a model discovery endpoint",
             )
         capabilities = dict(provider.capabilities or {})
         discovered = [
@@ -1163,24 +1342,44 @@ class ProviderService:
             for item in capabilities.get("discovered_model_ids") or []
             if str(item).strip()
         ]
-        unknown = sorted(set(requested_states) - set(discovered))
+        known_ids = self._known_model_ids(capabilities, discovered)
+        unknown = sorted(set(requested_states) - set(known_ids))
         if unknown:
             raise AppError(
                 404,
                 "provider_model_not_found",
-                "One or more models are not present in the latest discovery snapshot",
+                "One or more models are not present in the latest discovery "
+                "snapshot or a saved per-model snapshot",
                 {"model_ids": unknown},
             )
+        previous_states = {
+            str(key): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+        }
         states = {
-            model_id: bool(requested_states.get(model_id, False))
-            for model_id in discovered
+            model_id: bool(
+                requested_states.get(
+                    model_id, previous_states.get(model_id, True)
+                )
+            )
+            for model_id in known_ids
         }
         capabilities["model_states"] = states
-        configured_default = str(capabilities.get("default_model") or "").strip()
+        default_field = self._model_default_field(provider)
+        configured_default = self._read_model_default(capabilities, default_field)
         if not configured_default or not states.get(configured_default, False):
-            capabilities["default_model"] = next(
-                (model_id for model_id in discovered if states[model_id]), ""
+            next_default = next(
+                (model_id for model_id in known_ids if states[model_id]), ""
             )
+            if next_default:
+                self._write_model_default(capabilities, default_field, next_default)
+            else:
+                capabilities.pop(default_field, None)
+                if default_field in {
+                    "default_vision_model_id",
+                    "default_embedding_model_id",
+                }:
+                    capabilities.pop("default_model", None)
         provider.capabilities = capabilities
         self.audit.record(
             actor_id=self.actor_id,
@@ -1192,23 +1391,388 @@ class ProviderService:
                 "enabled_model_ids": [
                     model_id for model_id, enabled in states.items() if enabled
                 ],
-                "default_model": capabilities.get("default_model") or None,
+                "default_model": (
+                    capabilities.get(default_field)
+                    or capabilities.get("default_model")
+                    or None
+                ),
             },
         )
         self.db.commit()
         return {
             "provider_id": provider.id,
             "states": states,
-            "default_model": capabilities.get("default_model") or None,
+            "default_model": (
+                capabilities.get(default_field)
+                or capabilities.get("default_model")
+                or None
+            ),
+        }
+
+    def refresh_models(self, provider_id: str) -> dict:
+        """Force a fresh discovery snapshot and prune stale model state.
+
+        Stale ``model_states`` entries (models no longer reported) are dropped,
+        new models default to enabled, and the role-specific default is moved to
+        the first enabled model when the previous default vanished or was
+        disabled.  This is the Agent-visible "clear + rediscover" path.
+        """
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "This provider does not expose a model discovery endpoint",
+            )
+        model_ids = self._discover(provider)
+        capabilities = dict(provider.capabilities or {})
+        previous_states = {
+            str(key): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+        }
+        known_ids = self._known_model_ids(capabilities, model_ids)
+        states: dict[str, bool] = {}
+        for model_id in known_ids:
+            states[model_id] = previous_states.get(model_id, True)
+        capabilities["discovered_model_ids"] = list(model_ids)
+        capabilities["discovered_model_count"] = len(model_ids)
+        capabilities["model_states"] = states
+        default_field = self._model_default_field(provider)
+        configured_default = self._read_model_default(capabilities, default_field)
+        if (
+            not configured_default
+            or configured_default not in model_ids
+            or states.get(configured_default, True) is False
+        ):
+            next_default = next(
+                (item for item in model_ids if states.get(item, True)), ""
+            )
+            if next_default:
+                self._write_model_default(capabilities, default_field, next_default)
+            else:
+                capabilities.pop(default_field, None)
+                if default_field in {
+                    "default_vision_model_id",
+                    "default_embedding_model_id",
+                }:
+                    capabilities.pop("default_model", None)
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.models.refresh",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_id": provider.id,
+                "discovered_model_count": len(model_ids),
+                "removed_stale_models": len(set(previous_states) - set(known_ids)),
+                "default_model": (
+                    capabilities.get(default_field)
+                    or capabilities.get("default_model")
+                    or None
+                ),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        return {
+            "provider_id": provider.id,
+            "status": "refreshed",
+            "discovered_model_ids": list(model_ids),
+            "discovered_model_count": len(model_ids),
+            "enabled_model_ids": [
+                model_id for model_id in model_ids if states.get(model_id, True)
+            ],
+            "default_model": (
+                capabilities.get(default_field)
+                or capabilities.get("default_model")
+                or None
+            ),
+        }
+
+    def probe_connectivity(self, provider_id: str) -> dict:
+        """Non-destructive connectivity check for one Provider.
+
+        Unlike ``probe()`` this never flips ``enabled``/``status`` and never
+        disables same-role peers.  Chat / image / vision Providers are verified
+        through model discovery (GET /models — zero-cost); search / fetch /
+        deep-research / memory Providers use their role-specific health probe.
+        """
+        provider = self.providers.require(provider_id, "provider")
+        role = (
+            (provider.capabilities or {}).get("provider_role")
+            or provider_type_spec(provider.provider_type).role
+        )
+        details: dict[str, object]
+        if provider.provider_type == "local_mock":
+            details = {"capability": "development_demo", "remote": False}
+            result: dict[str, object] = {
+                "provider_id": provider.id,
+                "role": "development",
+                "status": "healthy_local",
+                "zero_cost": True,
+                "details": details,
+            }
+        elif provider.provider_type in {
+            *MODEL_PROVIDER_TYPES,
+            *IMAGE_GENERATION_PROVIDER_TYPES,
+            *VISION_PROVIDER_TYPES,
+        }:
+            model_ids = self._discover(provider)
+            result = {
+                "provider_id": provider.id,
+                "role": role,
+                "status": "healthy",
+                "zero_cost": True,
+                "discovered_model_count": len(model_ids),
+                "discovered_model_ids": list(model_ids)[:100],
+                "details": {
+                    "capability": "model_discovery",
+                    "discovered_model_count": len(model_ids),
+                },
+            }
+        elif provider.provider_type in SEARCH_PROVIDER_TYPES:
+            result = {
+                "provider_id": provider.id,
+                "role": role,
+                "status": "healthy",
+                "zero_cost": False,
+                "details": self._probe_search(provider),
+            }
+        elif provider.provider_type in FETCH_PROVIDER_TYPES:
+            result = {
+                "provider_id": provider.id,
+                "role": role,
+                "status": "healthy",
+                "zero_cost": False,
+                "details": self._probe_fetch(provider),
+            }
+        elif provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
+            result = {
+                "provider_id": provider.id,
+                "role": role,
+                "status": "healthy",
+                "zero_cost": False,
+                "details": self._probe_deep_research(provider),
+            }
+        elif provider.provider_type in MEMORY_PROVIDER_TYPES:
+            health = self._mem0_adapter(provider).health()
+            result = {
+                "provider_id": provider.id,
+                "role": role,
+                "status": "healthy",
+                "zero_cost": False,
+                "details": dict(health.details),
+            }
+        else:
+            raise AppError(
+                409,
+                "provider_probe_not_supported",
+                "The provider requires a task-specific probe and cannot be verified by a connectivity check",
+            )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.connectivity.probe",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "role": role,
+                "zero_cost": result.get("zero_cost") is True,
+                "status": result.get("status"),
+            },
+        )
+        self.db.commit()
+        return result
+
+    _DECLARATION_STATUSES = frozenset(
+        {"unverified_user_input", "user_confirmed", "verified_by_probe"}
+    )
+
+    def update_declaration_status(self, provider_id: str, status: str) -> dict:
+        """Confirm or re-flag the Provider's declared capabilities.
+
+        ``user_confirmed`` means the workspace owner reviewed the declared
+        role/capabilities; ``verified_by_probe`` records that a live probe
+        matched the declaration.
+        """
+        provider = self.providers.require(provider_id, "provider")
+        if status not in self._DECLARATION_STATUSES:
+            raise AppError(
+                422,
+                "invalid_declaration_status",
+                "declaration_status must be one of: unverified_user_input, user_confirmed, verified_by_probe",
+            )
+        capabilities = dict(provider.capabilities or {})
+        capabilities["declaration_status"] = status
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.declaration.update",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={"declaration_status": status},
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        return {"provider_id": provider.id, "declaration_status": status}
+
+    def validate_default_models(
+        self,
+        provider_id: str | None = None,
+        *,
+        repair: bool = False,
+    ) -> dict:
+        """Audit every discovery-capable Provider's default model.
+
+        A default is consistent when it names a model present in the latest
+        discovery snapshot and that model is enabled.  ``repair=True`` moves a
+        broken default to the first enabled model (no other state changes).
+        """
+        if provider_id is None:
+            providers = [
+                item
+                for item in self.providers.list()
+                if item.provider_type in _MODEL_MANAGEMENT_PROVIDER_TYPES
+            ]
+        else:
+            providers = [self.providers.require(provider_id, "provider")]
+        entries: list[dict[str, object]] = []
+        repaired_count = 0
+        for provider in providers:
+            capabilities = dict(provider.capabilities or {})
+            discovered = [
+                str(item).strip()
+                for item in capabilities.get("discovered_model_ids") or []
+                if str(item).strip()
+            ]
+            states = {
+                str(key): value is not False
+                for key, value in dict(capabilities.get("model_states") or {}).items()
+            }
+            default_field = self._model_default_field(provider)
+            role = str(capabilities.get("provider_role") or "").strip()
+            if not role:
+                spec = provider_type_spec(provider.provider_type)
+                role = spec.role if spec is not None else provider.provider_type
+            primary = self._read_model_default(capabilities, default_field)
+            issues: list[str] = []
+            if not primary:
+                issues.append("no_default_configured")
+            elif primary not in discovered:
+                issues.append("default_not_in_discovery")
+            elif states.get(primary, True) is False:
+                issues.append("default_model_disabled")
+            if default_field in {
+                "default_vision_model_id",
+                "default_embedding_model_id",
+            }:
+                alias = str(capabilities.get("default_model") or "").strip()
+                if primary and alias and alias != primary:
+                    issues.append("alias_mismatch")
+            repaired = False
+            if repair and issues:
+                next_default = next(
+                    (model_id for model_id in discovered if states.get(model_id, True)),
+                    "",
+                )
+                if next_default:
+                    self._write_model_default(
+                        capabilities, default_field, next_default
+                    )
+                    provider.capabilities = capabilities
+                    repaired = True
+                    repaired_count += 1
+            entries.append(
+                {
+                    "provider_id": provider.id,
+                    "display_name": provider.display_name,
+                    "role": role,
+                    "default_field": default_field,
+                    "default_model": primary,
+                    "discovered_model_count": len(discovered),
+                    "enabled_model_count": sum(
+                        1 for model_id in discovered if states.get(model_id, True)
+                    ),
+                    "issues": issues,
+                    "repaired": repaired,
+                }
+            )
+        if repair and repaired_count:
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="provider.default_models.repaired",
+                resource_type="provider",
+                resource_id=provider_id or self.workspace_id,
+                details={"repaired_count": repaired_count},
+            )
+            self.db.commit()
+        return {
+            "providers": entries,
+            "repair_requested": repair,
+            "repaired_count": repaired_count,
+        }
+
+    def configure_balance_credential(
+        self, provider_id: str, secret_label: str
+    ) -> dict:
+        """Associate an Aliyun AccessKey secret reference with a Provider.
+
+        The label must resolve (purpose ``aliyun_access_key``) to JSON with
+        ``access_key_id`` and ``access_key_secret``.  Only the label is stored
+        on the Provider; the plaintext never leaves the secret store.
+        """
+        from app.services.secret_references import SecretReferenceService
+
+        provider = self.providers.require(provider_id, "provider")
+        refs = SecretReferenceService(
+            self.db, self.workspace_id, self.actor_id, self.settings
+        )
+        raw = refs.resolve(secret_label, purpose="aliyun_access_key")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AppError(
+                422,
+                "invalid_balance_credential",
+                "The labelled secret must be JSON containing access_key_id and access_key_secret",
+            ) from exc
+        if (
+            not isinstance(parsed, dict)
+            or not parsed.get("access_key_id")
+            or not parsed.get("access_key_secret")
+        ):
+            raise AppError(
+                422,
+                "invalid_balance_credential",
+                "The labelled secret must contain non-empty access_key_id and access_key_secret",
+            )
+        label = refs.normalize_label(secret_label)
+        capabilities = dict(provider.capabilities or {})
+        capabilities["balance_access_key_reference"] = label
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.balance_credential.configured",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={"reference_label": label},
+        )
+        self.db.commit()
+        self.db.refresh(provider)
+        return {
+            "provider_id": provider.id,
+            "balance_credential_configured": True,
+            "reference_label": label,
+            "secret_masked": True,
         }
 
     def model_capabilities(self, provider_id: str, model_id: str) -> dict:
         provider = self.providers.require(provider_id, "provider")
-        if provider.provider_type not in MODEL_PROVIDER_TYPES:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
-                "Model capabilities can only be read from a model Provider",
+                "Model capabilities can only be read from a Provider that exposes a model discovery endpoint",
             )
         capabilities = dict(provider.capabilities or {})
         models = dict(capabilities.get("models") or {})
@@ -1406,6 +1970,102 @@ class ProviderService:
             "plan_type": credentials.plan_type,
         }
 
+    def _dashscope_balance(self, provider: ProviderConfig) -> dict:
+        """Query Aliyun account balance via the BSS RPC using a configured AccessKey.
+
+        DashScope API keys cannot read account balance.  The workspace owner
+        injects an Aliyun AccessKey as a secret reference (purpose
+        ``aliyun_access_key``) through the trusted UI; only its label is stored
+        on the Provider, so the plaintext never enters a transcript or the DB.
+        """
+        from app.services.secret_references import SecretReferenceService
+
+        capabilities = dict(provider.capabilities or {})
+        label = capabilities.get("balance_access_key_reference")
+        if not isinstance(label, str) or not label.strip():
+            raise AppError(
+                409,
+                "provider_balance_unsupported",
+                official_no_balance_notice(provider.base_url)
+                or "DashScope 账户余额需配置阿里云 AccessKey 后查询",
+            )
+        refs = SecretReferenceService(
+            self.db, self.workspace_id, self.actor_id, self.settings
+        )
+        try:
+            raw = refs.resolve(label, purpose="aliyun_access_key")
+        except AppError:
+            raise AppError(
+                409,
+                "provider_balance_unsupported",
+                "配置的阿里云 AccessKey 标签不可用，请重新注入",
+            ) from None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AppError(
+                409,
+                "provider_balance_unsupported",
+                "配置的阿里云 AccessKey 标签内容无效",
+            ) from exc
+        access_key_id = (
+            str(parsed.get("access_key_id") or "").strip()
+            if isinstance(parsed, dict)
+            else ""
+        )
+        access_key_secret = (
+            str(parsed.get("access_key_secret") or "").strip()
+            if isinstance(parsed, dict)
+            else ""
+        )
+        if not access_key_id or not access_key_secret:
+            raise AppError(
+                409,
+                "provider_balance_unsupported",
+                "配置的阿里云 AccessKey 标签缺少 access_key_id 或 access_key_secret",
+            )
+        try:
+            report = fetch_dashscope_balance(
+                access_key_id=access_key_id,
+                access_key_secret=access_key_secret,
+            )
+        except ProviderBalanceError as exc:
+            raise AppError(
+                502,
+                "provider_balance_unavailable",
+                str(exc),
+                {"provider_id": provider.id},
+            ) from exc
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.balance.read",
+            resource_type="provider",
+            resource_id=provider.id,
+            details={
+                "provider_type": provider.provider_type,
+                "vendor": "dashscope",
+                "is_available": report.is_available,
+            },
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "vendor": report.vendor,
+            "vendor_label": report.vendor_label,
+            "is_available": report.is_available,
+            "balance_infos": [
+                {
+                    "currency": item.currency,
+                    "total_balance": item.total_balance,
+                    "granted_balance": item.granted_balance,
+                    "topped_up_balance": item.topped_up_balance,
+                }
+                for item in report.infos
+            ],
+            "notice": report.notice,
+            "queried_at": utc_now(),
+        }
+
     def balance(self, provider_id: str) -> dict:
         provider = self.providers.require(provider_id, "provider")
         capabilities = dict(provider.capabilities or {})
@@ -1423,6 +2083,8 @@ class ProviderService:
             return self._codex_usage(provider)
         if not provider.base_url:
             raise AppError(409, "provider_not_configured", "Provider base URL is missing")
+        if _is_dashscope_host(provider.base_url):
+            return self._dashscope_balance(provider)
         # Balance requests carry the saved key, so each vendor implementation
         # only ever talks to its verified official origin; everything else may
         # at most use the relay-station billing convention against the same
@@ -1735,50 +2397,62 @@ class ProviderService:
             or capabilities.get("brand_id") == "deepseek"
             or provider.provider_type == "deepseek_chat"
         )
-        # Persist static catalogues (Codex / Qwen Deep Research) so the list
-        # UI can render without another discover click after reload.
-        if provider.provider_type in {"codex_chatgpt", "qwen_deep_research"}:
-            capabilities["discovered_model_ids"] = list(model_ids)
-            capabilities["discovered_model_count"] = len(model_ids)
-            states = {
-                str(key): value is not False
-                for key, value in dict(capabilities.get("model_states") or {}).items()
-            }
-            for model_id in model_ids:
-                states.setdefault(model_id, True)
-            if provider.provider_type == "codex_chatgpt":
-                # Drop ChatGPT-auth rejects from older static catalogues so the
-                # model picker no longer offers ids the backend will 400 on.
-                for stale_id in list(states):
-                    if (
-                        stale_id not in model_ids
-                        and stale_id in CODEX_UNSUPPORTED_CHATGPT_MODELS
-                    ):
-                        states.pop(stale_id, None)
-            capabilities["model_states"] = states
-            configured_default = str(capabilities.get("default_model") or "").strip()
-            if (
-                not configured_default
-                or configured_default not in model_ids
-                or states.get(configured_default, True) is False
-            ):
-                capabilities["default_model"] = next(
-                    (
-                        model_id
-                        for model_id in model_ids
-                        if states.get(model_id, True)
-                    ),
-                    CODEX_DEFAULT_MODEL if provider.provider_type == "codex_chatgpt" else "",
-                )
-            if provider.provider_type == "qwen_deep_research":
-                capabilities.setdefault(
-                    "deep_research_model",
-                    capabilities.get("default_model")
-                    or QwenDeepResearchProvider.DEFAULT_MODEL,
-                )
-            provider.capabilities = capabilities
-            self.db.commit()
-            self.db.refresh(provider)
+        # Persist every discovery snapshot so model pickers—including local
+        # Ollama embedding configuration—survive a page reload.
+        capabilities["discovered_model_ids"] = list(model_ids)
+        capabilities["discovered_model_count"] = len(model_ids)
+        # Workspace-pinned manual models (per-model capability snapshots) keep
+        # their toggle state across a re-discovery; only models neither
+        # discovered nor saved as a snapshot are pruned here.
+        known_ids = self._known_model_ids(capabilities, model_ids)
+        states = {
+            str(key): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+            if str(key) in known_ids
+        }
+        for model_id in model_ids:
+            states.setdefault(model_id, True)
+        if provider.provider_type == "codex_chatgpt":
+            # Drop ChatGPT-auth rejects from older static catalogues so the
+            # model picker no longer offers ids the backend will 400 on.
+            for stale_id in list(states):
+                if (
+                    stale_id not in model_ids
+                    and stale_id in CODEX_UNSUPPORTED_CHATGPT_MODELS
+                ):
+                    states.pop(stale_id, None)
+        capabilities["model_states"] = states
+        configured_default = str(
+            (
+                capabilities.get("default_embedding_model_id")
+                or capabilities.get("default_model")
+                or ""
+            )
+            if provider.provider_type in EMBEDDING_PROVIDER_TYPES
+            else capabilities.get("default_model") or ""
+        ).strip()
+        if (
+            not configured_default
+            or configured_default not in known_ids
+            or states.get(configured_default, True) is False
+        ):
+            configured_default = next(
+                (model_id for model_id in known_ids if states.get(model_id, True)),
+                CODEX_DEFAULT_MODEL if provider.provider_type == "codex_chatgpt" else "",
+            )
+        if provider.provider_type in EMBEDDING_PROVIDER_TYPES:
+            capabilities["default_embedding_model_id"] = configured_default
+            capabilities["default_model"] = configured_default
+        else:
+            capabilities["default_model"] = configured_default
+        if provider.provider_type == "qwen_deep_research":
+            capabilities.setdefault(
+                "deep_research_model",
+                capabilities.get("default_model") or QwenDeepResearchProvider.DEFAULT_MODEL,
+            )
+        provider.capabilities = capabilities
+        self.db.commit()
+        self.db.refresh(provider)
         return {
             "provider_id": provider.id,
             "status": "discovered",
@@ -1930,7 +2604,9 @@ class ProviderService:
                 capabilities["default_model"] = next(
                     (
                         model_id
-                        for model_id in discovered_model_ids
+                        for model_id in self._known_model_ids(
+                            capabilities, discovered_model_ids
+                        )
                         if states.get(model_id, True)
                     ),
                     "",
@@ -2115,6 +2791,14 @@ class ProviderService:
                     api_key=self._optional_secret(provider.id),
                     extra_headers=extra_headers,
                 )
+            if provider.provider_type == "ollama_cloud":
+                from app.providers.remote.ollama import discover_ollama_cloud_models
+
+                return discover_ollama_cloud_models(
+                    base_url=provider.base_url,
+                    api_key=self._optional_secret(provider.id) or "",
+                    extra_headers=extra_headers,
+                )
             api_key = self._decrypt_secret(provider.id)
             if provider.provider_type == "github_copilot":
                 return discover_copilot_models(
@@ -2135,6 +2819,12 @@ class ProviderService:
                 api_key=api_key,
                 extra_headers=extra_headers,
             )
+        except ProviderInvalidUrlError as exc:
+            # User-facing configuration mistakes (missing http(s):// protocol,
+            # unusable hosts) must surface as a clear 4xx instead of a 500.
+            # Kept first: copilot.py re-exports the same ProviderHTTPError
+            # classes, so the Copilot* aliases below would otherwise match.
+            raise AppError(422, "provider_base_url_invalid", str(exc)) from exc
         except CopilotProviderTimeoutError as exc:
             raise AppError(504, "provider_timeout", "Provider model discovery timed out") from exc
         except CopilotProviderResponseError as exc:
@@ -2683,6 +3373,11 @@ class SettingsService:
             "default": {"response_mode": "agentic"},
             "risk": "low",
         },
+        "web_fetch.policy": {
+            "description": "Workspace web-fetch confirmation and domain allowlist policy",
+            "default": {"allow_without_confirmation": False, "allowed_domains": []},
+            "risk": "high",
+        },
         "usage.display_currency": {
             "description": "Display currency for usage views",
             "default": "CNY",
@@ -2863,6 +3558,19 @@ class SettingsService:
                     (
                         "chat.default_response_mode must contain response_mode "
                         "as one of: fast, thinking, agentic"
+                    ),
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key == "web_fetch.policy":
+            try:
+                value = WebFetchPolicySettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    (
+                        "web_fetch.policy must contain allow_without_confirmation and "
+                        "a list of exact DNS allowed_domains"
                     ),
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc

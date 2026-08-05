@@ -29,6 +29,8 @@ MessagePartType = Literal[
     "component",
     "magic_card",
     "user_confirmation",
+    "fetch_authorization",
+    "fetch_setup_notice",
     "error",
 ]
 

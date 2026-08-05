@@ -35,3 +35,4 @@ export * from "./settings";
 export * from "./workflow";
 export * from "./extensions";
 export * from "./control";
+export * from "./fetch-authorizations";

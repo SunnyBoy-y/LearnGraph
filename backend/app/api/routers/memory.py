@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Response, status
 
@@ -36,6 +36,7 @@ from app.services.memory_enhancement import (
     embedding_index_status,
     extract_session_memories,
     load_enhancement_config,
+    prune_stale_embeddings,
     reindex_memory_embeddings,
     save_enhancement_config,
     summarize_session_context,
@@ -259,7 +260,12 @@ def get_effective_memory_package(
     )
 
 
-def _enhancement_view(db: DB, workspace_id: str) -> MemoryEnhancementView:
+def _enhancement_view(
+    db: DB,
+    workspace_id: str,
+    *,
+    cache_invalidated: dict[str, Any] | None = None,
+) -> MemoryEnhancementView:
     config = load_enhancement_config(db, workspace_id)
     stats = embedding_index_status(db, workspace_id)
     return MemoryEnhancementView(
@@ -269,6 +275,9 @@ def _enhancement_view(db: DB, workspace_id: str) -> MemoryEnhancementView:
         summarization=MemorySummarizationSettingsView(**config["summarization"]),
         active_memories=stats["active_memories"],
         indexed_memories=stats["indexed_memories"],
+        current_model_key=stats["current_model_key"],
+        stale_model_keys=stats["stale_model_keys"],
+        cache_invalidated=cache_invalidated,
     )
 
 
@@ -288,12 +297,14 @@ def update_memory_enhancement(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> MemoryEnhancementView:
-    save_enhancement_config(
+    _config, cache_invalidated = save_enhancement_config(
         db,
         context.workspace_id,
         payload.model_dump(exclude_none=True),
     )
-    return _enhancement_view(db, context.workspace_id)
+    return _enhancement_view(
+        db, context.workspace_id, cache_invalidated=cache_invalidated
+    )
 
 
 @router.post("/enhancement/reindex")
@@ -301,8 +312,21 @@ def reindex_memory_embedding_index(
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
+    prune_stale: Annotated[bool, Query()] = False,
 ) -> dict:
-    return reindex_memory_embeddings(db, context.workspace_id, settings)
+    return reindex_memory_embeddings(
+        db, context.workspace_id, settings, prune_stale=prune_stale
+    )
+
+
+@router.post("/enhancement/prune-embeddings")
+def prune_memory_embedding_cache(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    """Delete cached vectors for embedding models other than the configured one."""
+    return prune_stale_embeddings(db, context.workspace_id)
 
 
 @router.post("/enhancement/extract/{session_id}")

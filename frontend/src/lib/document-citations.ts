@@ -22,6 +22,8 @@ export type DocumentCitation = {
 export type WebCitation = {
   index: number;
   raw: string;
+  /** false when the model cited a source index missing from the list. */
+  known?: boolean;
 };
 
 const FILE_ID =
@@ -76,13 +78,16 @@ export function parseDocumentCitationHref(href: string): {
   }
 }
 
-export function parseWebCitationHref(href: string): { index: number } | null {
+export function parseWebCitationHref(href: string): {
+  index: number;
+  missing?: boolean;
+} | null {
   if (!isWebCitationHref(href)) return null;
   try {
     const url = new URL(href, "https://learngraph.local");
     const index = Number(url.pathname.slice(WEB_CITE_PREFIX.length) || "0") || 0;
     if (index < 1) return null;
-    return { index };
+    return { index, missing: url.searchParams.get("missing") === "1" };
   } catch {
     return null;
   }
@@ -145,20 +150,20 @@ export function rewriteWebCitations(
     const index = Number(g1 || g2 || "0") || 0;
     if (index < 1) return match;
     const isBareNumeric = match.startsWith("[");
-    // Bare [n] only becomes a badge when the source list has that index.
-    if (isBareNumeric && (!allowed || !allowed.has(index))) {
-      return match;
-    }
-    // Explicit 网页引用 markers are always rewritten when allowed is unknown,
-    // or when the index is known.
-    if (!isBareNumeric && allowed && !allowed.has(index)) {
+    const isKnown = !allowed || allowed.has(index);
+    // A bare [n] with no source list at all stays untouched (it may be an
+    // ordinary markdown reference). Once a source list exists, every numeric
+    // marker is a citation intent — a known index becomes a live badge, an
+    // unknown index still renders as a grey "来源不可用" badge instead of
+    // leaking raw [n] text into the answer.
+    if (isBareNumeric && !allowed) {
       return match;
     }
     if (!seen.has(index)) {
       seen.add(index);
-      citations.push({ index, raw: match });
+      citations.push({ index, raw: match, known: isKnown });
     }
-    return `[${index}](${WEB_CITE_PREFIX}${index})`;
+    return `[${index}](${WEB_CITE_PREFIX}${index}${isKnown ? "" : "?missing=1"})`;
   });
   return { markdown, citations };
 }

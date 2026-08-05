@@ -3,6 +3,12 @@ import { AlertTriangle, Box, Sparkles } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import {
+  createSubappChannel,
+  subappFailureText,
+  subappSessionTrigger,
+} from "@/lib/subapp-bridge";
+import type { SubappChannel } from "@/lib/subapp-bridge";
 
 type MagicCardData = {
   card_instance_id?: string;
@@ -102,6 +108,52 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   const lastHeartbeatRef = useRef(Date.now());
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
+  // T2.6 interactive sub-application mode: an artifact carrying a sub-app session
+  // marker (or an interactive contract/version) runs the bidirectional
+  // user → component.event → AI → renderer.state → render loop instead of the
+  // static card host below. Absent the marker, the existing card paths are
+  // untouched.
+  const subappTrigger = useMemo(() => subappSessionTrigger(data), [data]);
+  const chatSessionId = useMemo(
+    () => (typeof data.chat_session_id === "string" ? data.chat_session_id : null),
+    [data],
+  );
+  const subappIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const subappLoadedRef = useRef(false);
+  const subappChannelRef = useRef<SubappChannel | null>(null);
+  const [subappFailed, setSubappFailed] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!subappTrigger) return;
+    setSubappFailed(null);
+    const channel = createSubappChannel({
+      getIframe: () => subappIframeRef.current,
+      getIframeLoaded: () => subappLoadedRef.current,
+      artifactVersionId:
+        subappTrigger.kind === "instantiate" ? subappTrigger.artifactVersionId : undefined,
+      provisioned:
+        subappTrigger.kind === "provisioned"
+          ? {
+              sessionId: subappTrigger.sessionId,
+              token: subappTrigger.token,
+              unlockMessage: subappTrigger.unlockMessage,
+            }
+          : undefined,
+      chatSessionId,
+      onFailed: (reason) => setSubappFailed(reason),
+    });
+    subappChannelRef.current = channel;
+    return () => {
+      channel.destroy();
+      subappChannelRef.current = null;
+    };
+  }, [subappTrigger, chatSessionId]);
+
+  const handleSubappLoad = () => {
+    subappLoadedRef.current = true;
+    subappChannelRef.current?.handleIframeLoad();
+  };
+
   useEffect(() => {
     setFailed(false);
     setFailureReason("卡片运行时不可用。");
@@ -161,6 +213,46 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
       window.clearInterval(timer);
     };
   }, [canRenderRemote, failed]);
+
+  if (subappTrigger) {
+    const hasSubappContent = Boolean(previewHtml || canRenderRemote);
+    return (
+      <section aria-label={title} className="magic-card">
+        <div className="magic-card__heading">
+          <Sparkles className="size-4" />
+          <div>
+            <strong>{title}</strong>
+            <span>双向交互子应用</span>
+          </div>
+          <Badge variant="secondary">subapp</Badge>
+        </div>
+        {hasSubappContent ? (
+          <iframe
+            allow=""
+            className="magic-card__frame"
+            onLoad={handleSubappLoad}
+            ref={subappIframeRef}
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
+            src={!previewHtml && canRenderRemote ? artifactUrl : undefined}
+            style={{ height }}
+            title={`${title} 子应用`}
+          />
+        ) : (
+          <MagicCardFallback
+            reason="子应用尚未准备好，没有可加载的交互式页面内容。"
+            title={title}
+          />
+        )}
+        {subappFailed ? (
+          <p className="magic-card__reason" role="status">
+            {subappFailureText(subappFailed)}
+          </p>
+        ) : null}
+      </section>
+    );
+  }
 
   if (failed) {
     return <MagicCardFallback reason={failureReason} title={title} />;

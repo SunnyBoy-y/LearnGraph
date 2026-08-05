@@ -1,6 +1,7 @@
 import * as React from "react"
 import { Popover as PopoverPrimitive } from "radix-ui"
 
+import { withScrollLockBypass } from "@/lib/scroll-lock"
 import { cn } from "@/lib/utils"
 
 function Popover({ ...props }: React.ComponentProps<typeof PopoverPrimitive.Root>) {
@@ -19,6 +20,8 @@ function PopoverContent({
   className,
   align = "center",
   sideOffset = 4,
+  onWheel,
+  onTouchMove,
   ...props
 }: React.ComponentProps<typeof PopoverPrimitive.Content>) {
   return (
@@ -31,6 +34,8 @@ function PopoverContent({
         )}
         data-slot="popover-content"
         sideOffset={sideOffset}
+        onTouchMove={withScrollLockBypass(onTouchMove)}
+        onWheel={withScrollLockBypass(onWheel)}
         {...props}
       />
     </PopoverPrimitive.Portal>

@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 from datetime import timedelta, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -104,6 +104,26 @@ def _initialize_workspace(
     target = _sandbox_workspace_path(settings, relative)
     for directory in ("inputs", "work", "outputs"):
         (target / directory).mkdir(parents=True, exist_ok=True)
+    if settings.sandbox_workspace_uid is not None:
+        managed_directories = (
+            target,
+            target / "inputs",
+            target / "work",
+            target / "outputs",
+        )
+        for directory in managed_directories:
+            try:
+                os.chown(directory, settings.sandbox_workspace_uid, -1)
+                os.chmod(directory, 0o750)
+            except OSError:
+                logger.warning(
+                    "Unable to apply sandbox workspace uid and permissions",
+                    extra={
+                        "workspace_path": str(directory),
+                        "sandbox_workspace_uid": settings.sandbox_workspace_uid,
+                    },
+                    exc_info=True,
+                )
     return relative
 
 
@@ -199,6 +219,45 @@ def _enforce_retained_workspace_capacity(
         )
 
 
+def web_fetch_egress_envelope(
+    settings: Settings,
+    workspace_id: str,
+    allowed_domains: Iterable[str],
+) -> dict[str, Any] | None:
+    """Build the egress envelope for a fixed ``web_fetch`` runner container.
+
+    Fetch egress is gated by the unified ``web_fetch.policy`` allowlist alone.
+    The generic per-workspace reviewed policy (``_egress_envelope``) is NOT
+    consulted here, so fetch approvals never widen generic Agent egress. A
+    non-empty derived policy is persisted to its own file and the container
+    joins the egress network with that policy's digest. Returns ``None``
+    (the container stays offline) when egress is disabled or the allowlist
+    cannot produce a valid policy.
+    """
+    if not settings.sandbox_egress_enabled:
+        return None
+    from app.services.sandbox_network_policy import (
+        EgressPolicyInvalid,
+        derive_egress_policy_for_fetch,
+        store_workspace_fetch_policy_file,
+    )
+
+    try:
+        policy = derive_egress_policy_for_fetch(
+            workspace_id=workspace_id,
+            allowed_domains=allowed_domains,
+        )
+    except EgressPolicyInvalid:
+        logger.exception("Web fetch egress policy could not be derived; fetch stays offline")
+        return None
+    store_workspace_fetch_policy_file(settings.sandbox_egress_policy_dir, policy)
+    return {
+        "policy_digest": policy.digest,
+        "network": settings.sandbox_egress_network,
+        "proxy_url": settings.sandbox_egress_proxy_url,
+    }
+
+
 def agent_sandbox_readiness(settings: Settings, *, authorized: bool) -> dict[str, Any]:
     """Return the single readiness contract used by Agent UI and execution."""
 
@@ -207,14 +266,14 @@ def agent_sandbox_readiness(settings: Settings, *, authorized: bool) -> dict[str
         return {
             "available": False,
             "code": "sandbox_permission_required",
-            "message": "当前账号缺少智能体沙箱执行权限（需要 workspace.manage）。",
+            "message": "当前账号缺少智能体沙箱使用权限（需要 workspace.write）。",
             "authorized": False,
             "sandbox_enabled": settings.sandbox_enabled,
             "agent_enabled": settings.sandbox_agent_enabled,
             "backend_id": backend.backend_id,
             "platform": backend.platform,
             "capabilities": [],
-            "remediation_steps": ["请由工作区管理员授予管理权限后重试。"],
+            "remediation_steps": ["请由工作区管理员授予工作区写入权限后重试。"],
         }
     if not settings.sandbox_agent_enabled:
         return {

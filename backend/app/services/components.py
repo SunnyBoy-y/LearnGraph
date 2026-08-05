@@ -195,6 +195,25 @@ def _schema_guard(schema: dict[str, Any], *, label: str) -> None:
         ) from exc
 
 
+def _interaction_contract_guard(
+    interaction_contract: dict[str, Any] | None,
+    *,
+    label: str = "interaction_contract",
+) -> None:
+    """Validate optional subapp schemas before they become immutable manifest data."""
+
+    if interaction_contract is None:
+        return
+    _schema_guard(
+        interaction_contract["event_schema"],
+        label=f"{label}.event_schema",
+    )
+    _schema_guard(
+        interaction_contract["state_schema"],
+        label=f"{label}.state_schema",
+    )
+
+
 def _assert_no_executable_content(value: Any, *, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, nested in value.items():
@@ -323,6 +342,11 @@ def _manifest_material(
         "uninstall_behavior": payload.uninstall_behavior,
         "data_schema": payload.data_schema,
         "event_schema": payload.event_schema,
+        "interaction_contract": (
+            payload.interaction_contract.model_dump()
+            if payload.interaction_contract is not None
+            else None
+        ),
         "permissions": permissions,
         "size_limits": payload.size_limits.model_dump(),
         "skill_triggers": payload.skill_triggers,
@@ -733,6 +757,11 @@ class ComponentService:
                 )
             _schema_guard(payload.data_schema, label="data_schema")
             _schema_guard(payload.event_schema, label="event_schema")
+            _interaction_contract_guard(
+                payload.interaction_contract.model_dump()
+                if payload.interaction_contract is not None
+                else None
+            )
             _validate_instance(
                 payload.data_schema,
                 payload.example_data,
@@ -763,7 +792,15 @@ class ComponentService:
         permissions = payload.permissions.model_dump()
         material = _manifest_material(payload, renderer="sandbox", permissions=permissions)
         schema_hash = _sha256(
-            {"data_schema": payload.data_schema, "event_schema": payload.event_schema}
+            {
+                "data_schema": payload.data_schema,
+                "event_schema": payload.event_schema,
+                "interaction_contract": (
+                    payload.interaction_contract.model_dump()
+                    if payload.interaction_contract is not None
+                    else None
+                ),
+            }
         )
         permissions_hash = _sha256(permissions)
         manifest_hash = _sha256(material)
@@ -844,6 +881,11 @@ class ComponentService:
                 uninstall_behavior=payload.uninstall_behavior,
                 data_schema=payload.data_schema,
                 event_schema=payload.event_schema,
+                interaction_contract=(
+                    payload.interaction_contract.model_dump()
+                    if payload.interaction_contract is not None
+                    else None
+                ),
                 permissions=permissions,
                 size_limits=payload.size_limits.model_dump(),
                 skill_triggers=payload.skill_triggers,
@@ -1085,6 +1127,7 @@ class ComponentService:
             try:
                 _schema_guard(manifest.data_schema, label="data_schema")
                 _schema_guard(manifest.event_schema, label="event_schema")
+                _interaction_contract_guard(manifest.interaction_contract)
                 _validate_instance(
                     manifest.data_schema,
                     payload.sample_data

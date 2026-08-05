@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.models import SourceCitation, SourceLink, SourceRecord
+from app.domain.models import SourceCitation, SourceLink, SourceRecord, WorkspaceSetting
 from app.domain.schemas.sources import FetchSourceRequest
 from app.domain.schemas.workflow import DeleteImpact, ImpactItem
 from app.providers.ports.fetch import FetchProviderPort
@@ -125,11 +125,33 @@ class SourceService:
                 "fetch_provider_unavailable",
                 "No Crawl4AI fetch provider is configured for this workspace",
             )
-        allowed_domains = {
+        policy_setting = self.db.scalar(
+            select(WorkspaceSetting).where(
+                WorkspaceSetting.workspace_id == self.workspace_id,
+                WorkspaceSetting.key == "web_fetch.policy",
+            )
+        )
+        policy = (
+            policy_setting.value
+            if policy_setting is not None and isinstance(policy_setting.value, dict)
+            else {}
+        )
+        policy_domains = {
+            domain
+            for value in policy.get("allowed_domains", [])
+            if isinstance(value, str) and (domain := normalize_domain(value))
+        }
+        requested_domains = {
             domain
             for value in payload.authorized_domains
             if (domain := normalize_domain(value))
         }
+        allowed_domains = policy_domains or requested_domains
+        if policy.get("allow_without_confirmation") is True and not allowed_domains:
+            try:
+                allowed_domains = {require_public_http_url(payload.url, None)}
+            except UnsafeFetchURL as exc:
+                raise AppError(422, "fetch_url_blocked", "The source URL is not allowed by the fetch safety policy") from exc
         if not allowed_domains:
             raise AppError(422, "authorized_domain_required", "At least one valid authorized domain is required")
         try:

@@ -276,6 +276,7 @@ export interface MemoryExtractionSettings {
   enabled: boolean
   provider_id: string
   model_id: string
+  follow_conversation: boolean
   auto_commit: boolean
 }
 
@@ -290,6 +291,18 @@ export interface MemorySummarizationSettings {
   enabled: boolean
   provider_id: string
   model_id: string
+  follow_conversation: boolean
+}
+
+export interface MemoryEmbeddingStaleInfo {
+  model_key: string
+  indexed_count: number
+}
+
+export interface MemoryEmbeddingCacheInvalidated {
+  previous_model_key: string
+  previous_indexed_count: number
+  current_model_key: string
 }
 
 export interface MemoryEnhancement {
@@ -299,6 +312,9 @@ export interface MemoryEnhancement {
   summarization: MemorySummarizationSettings
   active_memories: number
   indexed_memories: number
+  current_model_key: string | null
+  stale_model_keys: MemoryEmbeddingStaleInfo[]
+  cache_invalidated: MemoryEmbeddingCacheInvalidated | null
 }
 
 export interface MemoryEnhancementUpdateRequest {
@@ -312,6 +328,13 @@ export interface MemoryEmbeddingReindexResult {
   total_active: number
   embedded: number
   already_indexed: number
+  stale_freed: number
+  truncated: boolean
+}
+
+export interface MemoryEmbeddingPruneResult {
+  freed_count: number
+  keep_model_key: string | null
 }
 
 export interface MemoryExtractionRunResult {

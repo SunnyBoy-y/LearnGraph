@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     sandbox_workspace_idle_ttl_seconds: int = 1_800
     sandbox_workspace_absolute_ttl_seconds: int = 86_400
     sandbox_workspace_root: str = "./data/sandbox-workspaces"
+    # Opt-in Linux deployment hardening. None preserves the host process owner
+    # and permissions used by source/desktop development.
+    sandbox_workspace_uid: int | None = None
     sandbox_wall_time_seconds: int = 180
     sandbox_cpu_count: float = 2.0
     sandbox_memory_bytes: int = 2 * 1024 * 1024 * 1024
@@ -126,6 +129,11 @@ class Settings(BaseSettings):
     sandbox_host_max_allocated_cpu_ratio: float = 0.80
     sandbox_host_minimum_free_disk_bytes: int = 20 * 1024 * 1024 * 1024
     sandbox_agent_enabled: bool = True
+    # Sandbox runtime bootstrap defaults to self-service: any workspace member
+    # (workspace.write) may trigger the local image build. Administrators can
+    # flip the runtime toggle (GET/PUT /sandbox/bootstrap/policy) to restrict
+    # bootstrap to admins; this env flag sets the initial deployment default.
+    sandbox_bootstrap_member_allowed: bool = True
     sandbox_agent_file_bytes: int = 1 * 1024 * 1024
     sandbox_agent_command_args_max: int = 32
     sandbox_cleanup_scheduler_enabled: bool = True
@@ -141,6 +149,20 @@ class Settings(BaseSettings):
     sandbox_egress_proxy_port: int = 8888
     # Sandbox-visible proxy endpoint on the internal egress network.
     sandbox_egress_proxy_url: str = "http://egress-proxy:8888"
+    # Generic Agent egress approval channel (D2.1). Even with egress enabled,
+    # the approval queue/API stays off until explicitly opened: enabling the
+    # sandbox must not automatically expose an approval channel. Off by default.
+    sandbox_agent_egress_approvals_enabled: bool = False
+    # Sandbox-isolated web fetch: when enabled together with sandbox_egress_enabled,
+    # page retrieval and untrusted-HTML parsing happen inside a short-lived fixed
+    # web_fetch container (never the host). Requires a non-empty workspace
+    # web_fetch.policy allowlist; otherwise the explicit remote FetchProvider /
+    # Qwen companion path is used. Off by default (opt-in, like egress).
+    sandbox_web_fetch_enabled: bool = False
+    # Hard bounds for a single web_fetch container job (independent of the
+    # generic sandbox resource limits).
+    sandbox_web_fetch_timeout_seconds: float = 30.0
+    sandbox_web_fetch_max_bytes: int = 2 * 1024 * 1024
     # --- Isolated component renderer (P2-A) --------------------------------
     # Third-party component data is rendered into a server-owned, inert HTML
     # template with a strict CSP and delivered through the existing opaque-origin

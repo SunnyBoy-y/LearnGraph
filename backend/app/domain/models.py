@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -359,6 +359,62 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
     # LLM-generated "learning event" description for the dashboard activity view.
     # Falls back to ``title`` when absent or when the provider is unavailable.
     activity_summary: Mapped[str | None] = mapped_column(String(240), nullable=True)
+
+
+class SubAppSession(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Workspace-scoped, replay-resistant runtime for one published sub-application."""
+
+    __tablename__ = "subapp_sessions"
+    __table_args__ = (
+        Index(
+            "ix_subapp_sessions_workspace_actor_status",
+            "workspace_id",
+            "actor_id",
+            "status",
+        ),
+        Index(
+            "ix_subapp_sessions_workspace_chat_session",
+            "workspace_id",
+            "chat_session_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    # These references intentionally remain application-validated until their
+    # table lifecycles are stable across all supported SQLite installations.
+    chat_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    artifact_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Contract snapshots prevent an artifact version edit from changing an
+    # already-instantiated session's accepted events or states.
+    event_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    state_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    # Persist only a digest and a non-secret display prefix; raw capabilities
+    # never enter this model or the database.
+    current_token_hash: Mapped[str] = mapped_column(String(64), default="")
+    current_token_prefix: Mapped[str] = mapped_column(String(24), default="")
+    state_version: Mapped[int] = mapped_column(Integer, default=0)
+    state_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SubAppState(Base, WorkspaceScopedMixin):
+    """Immutable, versioned state snapshot for a :class:`SubAppSession`."""
+
+    __tablename__ = "subapp_states"
+    __table_args__ = (
+        UniqueConstraint("session_id", "version", name="uq_subapp_state_session_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_sessions.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class Message(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -1154,6 +1210,33 @@ class AnswerRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     is_correct: Mapped[bool] = mapped_column(Boolean)
     feedback: Mapped[str] = mapped_column(Text)
     actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+
+class SubAppInteractionEvent(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Persist one sub-application event, following the AnswerRecord audit pattern.
+
+    The raw event is retained for agent analysis; answer-like events are later
+    projected into AnswerRecord by the service layer for learning workflows.
+    """
+
+    __tablename__ = "subapp_interaction_events"
+    __table_args__ = (
+        Index(
+            "ix_subapp_interaction_events_workspace_session",
+            "workspace_id",
+            "session_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    # Deliberately not a foreign key until T2.3 creates subapp_sessions.
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    chat_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    artifact_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(120))
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class MemoryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -2073,6 +2156,7 @@ class ComponentManifestVersion(Base, TimestampMixin, WorkspaceScopedMixin):
     uninstall_behavior: Mapped[str] = mapped_column(String(80), default="retain_data")
     data_schema: Mapped[dict[str, Any]] = mapped_column(JSON)
     event_schema: Mapped[dict[str, Any]] = mapped_column(JSON)
+    interaction_contract: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     permissions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     size_limits: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     skill_triggers: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -2233,9 +2317,203 @@ class AuditEvent(Base, TimestampMixin, WorkspaceScopedMixin):
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class FetchAuthorizationRequest(Base, TimestampMixin, WorkspaceScopedMixin):
+    """A user decision required before a single agent web-fetch call may run."""
+
+    __tablename__ = "fetch_authorization_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "chat_session_id",
+            "tool_call_id",
+            name="uq_fetch_authorization_tool_call",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chat_session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    tool_call_id: Mapped[str] = mapped_column(String(160))
+    tool_name: Mapped[str] = mapped_column(String(80), default="fetch_web_page")
+    requested_url: Mapped[str] = mapped_column(Text)
+    hostname: Mapped[str] = mapped_column(String(253), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    decision: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Serialized original 极速/思考 request (MessageCreateRequest + idempotency
+    # key + resolved provider options) so a non-agent authorization pause can be
+    # resumed server-side after the user approves.  Agent-mode challenges (the
+    # model re-calls fetch_web_page itself) leave this empty.
+    resume_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    # Assistant message the non-agent pause created; the resumed generation
+    # updates this same message in place so the transcript keeps one bubble.
+    assistant_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+
+
+class UserWebFetchPolicy(Base, TimestampMixin, WorkspaceScopedMixin):
+    """User-scoped web-fetch whitelist, unioned with the workspace policy.
+
+    ``allow_always`` in the authorization card writes here instead of the
+    workspace setting, so an ordinary user's choice affects only themselves and
+    no ``workspace.manage`` permission is required.  The effective domains for a
+    fetch decision are ``user allowed_domains ∪ workspace allowed_domains``.
+    """
+
+    __tablename__ = "user_web_fetch_policies"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "user_id",
+            name="uq_user_web_fetch_policy",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    allowed_domains: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allow_without_confirmation: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class WorkspaceSetting(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "workspace_settings"
     __table_args__ = (UniqueConstraint("workspace_id", "key"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     key: Mapped[str] = mapped_column(String(120))
     value: Mapped[Any] = mapped_column(JSON)
+
+
+# --- Generic Agent egress approval queue (D2.1) ---------------------------
+# Durable control-plane foundation for *generic* Agent outbound authorization,
+# parallel to (and deliberately separate from) the web_fetch approval
+# machinery. These tables never read/write ``web_fetch.policy``,
+# ``UserWebFetchPolicy``, or the reviewed ``{workspace_id}.json`` policy files.
+EGRESS_APPROVAL_CAPABILITY = "agent_egress"
+EGRESS_APPROVAL_DEFAULT_TTL_SECONDS = 900  # pending deadline: 15 minutes
+EGRESS_APPROVAL_MAX_TTL_SECONDS = 86400
+
+
+class EgressAuthorizationRequest(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Async user approval before a generic Agent egress host may be used.
+
+    Contract A: the only authorization resource is a canonical exact hostname
+    (via ``normalize_hostname``). There is deliberately NO command/argv/prompt/
+    URL-path field that participates in authorization; ``request_context`` is
+    display/audit context only and must never be used for matching.
+
+    Contract B: a decision only puts a host into the allowlist. It never writes
+    an IP, CIDR, ``allow_private`` or classifier exception. The runtime egress
+    proxy still resolves and re-classifies every CONNECT, so an approved host
+    that later resolves to a private/loopback/metadata address is still denied.
+
+    ``pending`` is a suspension, not a failure: a pending request never blocks
+    or fails the caller, and becomes ``expired`` once ``expires_at`` passes.
+    """
+
+    __tablename__ = "egress_authorization_requests"
+    __table_args__ = (
+        # One *pending* request per workspace/host/source (SQLite partial unique
+        # index). Terminal rows are allowed to repeat so a later deny ->
+        # re-request cycle can start a fresh approval instead of being blocked.
+        Index(
+            "uq_egress_auth_request_pending",
+            "workspace_id",
+            "hostname",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_egress_auth_requests_workspace_status",
+            "workspace_id",
+            "status",
+        ),
+        Index(
+            "ix_egress_auth_requests_workspace_requested_by",
+            "workspace_id",
+            "requested_by",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    hostname: Mapped[str] = mapped_column(String(253), index=True)
+    capability: Mapped[str] = mapped_column(
+        String(24), default=EGRESS_APPROVAL_CAPABILITY
+    )
+    requested_by: Mapped[str] = mapped_column(String(64), index=True)
+    # Deliberately a plain string, not a foreign key: the chat-session lifecycle
+    # is application-validated, and an approval must survive session cleanup.
+    chat_session_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    # Display/audit context only (tool name, purpose summary, provenance). Not a
+    # matching key and never used for authorization. (Contract A.)
+    request_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    decision: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    allow_always: Mapped[bool] = mapped_column(Boolean, default=False)
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+    ttl_seconds: Mapped[int] = mapped_column(
+        Integer, default=EGRESS_APPROVAL_DEFAULT_TTL_SECONDS
+    )
+    # Idempotency/source key: the chat session id (or an explicit caller token).
+    # The partial unique index only constrains pending rows.
+    dedupe_key: Mapped[str] = mapped_column(String(80), default="")
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class HostAuthorizationGrant(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Persistent, auditable host-level allowlist row for one capability.
+
+    One row is one exact canonical hostname granted to one subject
+    (``workspace`` or ``user``) for one capability. Capability isolation means a
+    ``web_fetch`` approval can never widen generic Agent egress and vice-versa
+    (D2.1 namespace isolation). ``allow_always`` in the egress approval card
+    upserts a ``subject_type='workspace'`` row here instead of writing to
+    ``web_fetch.policy`` or ``UserWebFetchPolicy``.
+    """
+
+    __tablename__ = "host_authorization_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "capability",
+            "subject_type",
+            "subject_id",
+            "hostname",
+            name="uq_host_authorization_grant",
+        ),
+        Index(
+            "ix_host_authorization_grants_workspace_capability",
+            "workspace_id",
+            "capability",
+            "subject_type",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    capability: Mapped[str] = mapped_column(
+        String(24), default=EGRESS_APPROVAL_CAPABILITY, index=True
+    )
+    subject_type: Mapped[str] = mapped_column(String(16), default="workspace")
+    subject_id: Mapped[str] = mapped_column(String(64), index=True)
+    hostname: Mapped[str] = mapped_column(String(253), index=True)
+    # v1 fixed shape, server-generated, kept for future extension and display.
+    ports: Mapped[list[int]] = mapped_column(JSON, default=lambda: [443])
+    protocols: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["https"])
+    source_request_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    granted_by: Mapped[str] = mapped_column(String(64))
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)

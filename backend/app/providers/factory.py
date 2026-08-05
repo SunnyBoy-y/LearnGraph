@@ -71,6 +71,10 @@ from app.providers.remote.ollama import (
     normalize_ollama_api_base_url,
     resolve_ollama_api_key,
 )
+from app.providers.remote.ollama_cloud import (
+    OllamaCloudChatProvider,
+    OllamaCloudSearchProvider,
+)
 from app.providers.remote.research import (
     HTTPDeepResearchProvider,
     UnavailableDeepResearchProvider,
@@ -90,8 +94,13 @@ from app.providers.remote.fetch import (
     FirecrawlFetchProvider,
     UnavailableFetchProvider,
 )
+from app.providers.sandbox_fetch import SandboxFetchProvider
 from app.providers.remote.qwen_tools import QwenResponsesToolProvider
-from app.providers.remote.search import SearXNGSearchProvider, UnavailableSearchProvider
+from app.providers.remote.search import (
+    SearXNGSearchProvider,
+    UnavailableSearchProvider,
+    normalize_domain,
+)
 from app.providers.remote.memory import (
     Mem0PlatformAdapter,
     UnavailableMemoryProvider,
@@ -115,6 +124,32 @@ def _secret_for_provider(
     if secret_record is None:
         return None
     return decrypt_provider_secret(settings, secret_record)
+
+
+def _web_fetch_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
+    """Load the unified fetch allowlist from ``web_fetch.policy`` (single source of truth).
+
+    Returns a normalized exact-host set. An empty result means the workspace has
+    no persistent web-fetch allowlist, so the sandbox fetch path stays disabled
+    and the caller falls back to the explicit remote / Qwen provider.
+    """
+    setting = db.scalar(
+        select(WorkspaceSetting).where(
+            WorkspaceSetting.workspace_id == workspace_id,
+            WorkspaceSetting.key == "web_fetch.policy",
+        )
+    )
+    value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    raw = value.get("allowed_domains")
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(
+        {
+            domain
+            for item in raw
+            if isinstance(item, str) and (domain := normalize_domain(item))
+        }
+    )
 
 
 def _functional_model_target(
@@ -286,7 +321,7 @@ def model_provider_for_workspace(
             effective_base_url = "https://api.githubcopilot.com"
         elif provider.provider_type == "anthropic_messages":
             effective_base_url = normalize_anthropic_api_base_url(provider.base_url)
-        elif is_ollama_provider_type(provider.provider_type):
+        elif is_ollama_provider_type(provider.provider_type) or provider.provider_type == "ollama_cloud":
             effective_base_url = normalize_ollama_api_base_url(provider.base_url)
         else:
             effective_base_url = provider.base_url
@@ -392,6 +427,8 @@ def model_provider_for_workspace(
                 structured_output_mode="json_object",
                 supports_structured_chat=True,
             )
+        if provider.provider_type == "ollama_cloud":
+            return OllamaCloudChatProvider(**common)
         if provider.provider_type == "deepseek_chat" or (
             provider.provider_type == "openai_compatible_chat" and is_deepseek
         ):
@@ -950,6 +987,15 @@ def search_provider_for_workspace(
             )
         except ValueError as exc:
             return UnavailableSearchProvider(provider.id, str(exc))
+    if provider.provider_type == "ollama_cloud_search":
+        try:
+            return OllamaCloudSearchProvider(
+                provider_id=provider.id,
+                base_url=provider.base_url,
+                api_key=api_key,
+            )
+        except ValueError as exc:
+            return UnavailableSearchProvider(provider.id, str(exc))
     try:
         return CloudSearchProvider(
             provider_id=provider.id,
@@ -1174,6 +1220,24 @@ def fetch_provider_for_workspace(
     workspace_id: str,
     settings: Settings,
 ) -> FetchProviderPort | None:
+    # Sandbox-isolated fetch is the secure primary path when the deployment has
+    # opted in (egress + web fetch enabled) and the unified allowlist is
+    # non-empty. It is a settings-gated built-in, so it needs no ProviderConfig
+    # row, base URL, or secret. When the gate is off / the allowlist is empty /
+    # the runtime image is missing, we fall through to the explicit remote
+    # FetchProvider or the Qwen companion exactly as before.
+    if settings.sandbox_web_fetch_enabled and settings.sandbox_egress_enabled:
+        domains = _web_fetch_policy_domains(db, workspace_id)
+        if domains:
+            from app.services.sandbox_runtime import resolve_sandbox_image
+
+            if resolve_sandbox_image(settings):
+                return SandboxFetchProvider(
+                    provider_id="sandbox_web_fetch",
+                    settings=settings,
+                    workspace_id=workspace_id,
+                    allowed_domains=domains,
+                )
     default_provider_id, _ = _functional_model_target(
         db, workspace_id, "fetch"
     )

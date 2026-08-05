@@ -25,7 +25,6 @@ import {
   BookOpen,
   Brain,
   CalendarDays,
-  Check,
   ChevronDown,
   ChevronRight,
   CircleDot,
@@ -2794,15 +2793,11 @@ function TopBar({
     graphTitle?: string;
     modelConnected: boolean;
   }>();
-  const [density, setDensity] = useState<"compact" | "comfortable">(() =>
-    window.localStorage.getItem("lg-information-density") === "compact"
-      ? "compact"
-      : "comfortable",
-  );
   useEffect(() => {
-    document.documentElement.dataset.density = density;
-    window.localStorage.setItem("lg-information-density", density);
-  }, [density]);
+    // 信息密度固定为「舒适」，不再提供切换：清掉旧偏好与残留样式。
+    delete document.documentElement.dataset.density;
+    window.localStorage.removeItem("lg-information-density");
+  }, []);
   useEffect(() => {
     const updateHeader = (event: Event) => {
       const detail = (
@@ -2888,16 +2883,6 @@ function TopBar({
               ) : (
                 <DropdownMenuItem disabled>正在读取运行状态…</DropdownMenuItem>
               )}
-              <DropdownMenuSeparator />
-              <DropdownMenuLabel>信息密度</DropdownMenuLabel>
-              <DropdownMenuItem onSelect={() => setDensity("compact")}>
-                {density === "compact" ? <Check className="size-4" /> : <span className="size-4" />}
-                紧凑
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setDensity("comfortable")}>
-                {density === "comfortable" ? <Check className="size-4" /> : <span className="size-4" />}
-                舒适
-              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
           {onToggleRail ? (
@@ -2982,24 +2967,6 @@ function TopBar({
             ) : (
               <DropdownMenuItem disabled>正在读取运行状态…</DropdownMenuItem>
             )}
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>信息密度</DropdownMenuLabel>
-            <DropdownMenuItem onSelect={() => setDensity("compact")}>
-              {density === "compact" ? (
-                <Check className="size-4" />
-              ) : (
-                <span className="size-4" />
-              )}
-              紧凑
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => setDensity("comfortable")}>
-              {density === "comfortable" ? (
-                <Check className="size-4" />
-              ) : (
-                <span className="size-4" />
-              )}
-              舒适
-            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>

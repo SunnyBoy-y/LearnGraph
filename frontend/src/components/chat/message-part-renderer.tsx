@@ -55,6 +55,7 @@ import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
 import { downloadFile } from "@/api/files";
 import { confirmSkillDeletion } from "@/api/extensions";
 import { approveResearch } from "@/api/research";
+import { decideFetchAuthorization, resumeFetchAuthorization } from "@/api/fetch-authorizations";
 import {
   TrustedComponentRenderer,
   type TrustedComponentAction,
@@ -83,6 +84,7 @@ import {
 import { decodeUrlForDisplay } from "@/lib/url-display";
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
+import type { FetchAuthorizationData, FetchAuthorizationDecision } from "@/types/fetch-authorization";
 
 type PartData = Record<string, unknown> | undefined;
 
@@ -96,6 +98,8 @@ type SourceItem = {
   quote: string;
   isDocument: boolean;
   index?: number;
+  /** Optional provider thumbnail (http(s) only). Display reference, not proxied. */
+  imageUrl?: string;
 };
 
 function graphLabels(value: unknown): string[] {
@@ -283,6 +287,10 @@ function collectSourceItems(data: PartData, workspaceId: string): SourceItem[] {
       typeof record.index === "number" && Number.isFinite(record.index)
         ? record.index
         : undefined;
+    const imageUrl =
+      typeof record.image_url === "string" && record.image_url.trim()
+        ? safeHref(record.image_url)
+        : "";
     return [
       {
         title,
@@ -294,6 +302,7 @@ function collectSourceItems(data: PartData, workspaceId: string): SourceItem[] {
         quote,
         isDocument: Boolean(fileId),
         index,
+        ...(imageUrl ? { imageUrl } : {}),
       },
     ];
   });
@@ -340,6 +349,29 @@ function SourceListPart({ data }: { data: PartData }) {
               </span>
               <ExternalLink className="ml-auto size-3.5 flex-none opacity-60" />
             </button>
+          ) : item.imageUrl ? (
+            <a
+              className="message-source-item"
+              href={item.href}
+              key={`${item.title}-${item.href}`}
+              rel="noreferrer"
+              target="_blank"
+            >
+              <img
+                alt=""
+                className="size-8 flex-none rounded object-cover"
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                src={item.imageUrl}
+              />
+              <span className="min-w-0">
+                <strong className="block truncate font-medium">{item.title}</strong>
+                <small className="block truncate font-mono text-[10px] text-muted-foreground">
+                  {decodeUrlForDisplay(item.href)}
+                </small>
+              </span>
+              <ExternalLink className="ml-auto size-3.5 flex-none opacity-60" />
+            </a>
           ) : (
             <Source
               href={item.href}
@@ -359,7 +391,10 @@ type CitationLookup = {
   webIndexes: Set<number>;
 };
 
-function buildCitationLookup(parts: MessagePart[] | undefined): CitationLookup {
+function buildCitationLookup(
+  parts: MessagePart[] | undefined,
+  workspaceId: string,
+): CitationLookup {
   const byFileId = new Map<string, SourceItem[]>();
   const byWebIndex = new Map<number, SourceItem>();
   const webIndexes = new Set<number>();
@@ -367,8 +402,7 @@ function buildCitationLookup(parts: MessagePart[] | undefined): CitationLookup {
   let webOrdinal = 0;
   for (const part of parts) {
     if (part.type !== "source_list") continue;
-    // workspace id is not needed for grouping; collect with empty path fallback
-    const items = collectSourceItems(part.data, "");
+    const items = collectSourceItems(part.data, workspaceId);
     for (const item of items) {
       if (item.fileId) {
         const list = byFileId.get(item.fileId) ?? [];
@@ -475,11 +509,13 @@ function CitationBadge({
 function WebCitationBadge({
   index,
   lookup,
+  missing = false,
 }: {
   index: number;
   lookup: CitationLookup;
+  missing?: boolean;
 }) {
-  const source = lookup.byWebIndex.get(index);
+  const source = missing ? undefined : lookup.byWebIndex.get(index);
   const title = source?.title || source?.filename || `来源 ${index}`;
   const href = source?.href ? safeHref(source.href) : "";
   const quote = source?.quote || "";
@@ -501,8 +537,11 @@ function WebCitationBadge({
             </a>
           ) : (
             <button
-              aria-label={`网页来源 ${index}`}
-              className="message-citation-badge"
+              aria-label={missing ? `网页来源 ${index} 不可用` : `网页来源 ${index}`}
+              className={cn(
+                "message-citation-badge",
+                missing && "message-citation-badge--missing",
+              )}
               type="button"
             >
               {index}
@@ -519,7 +558,7 @@ function WebCitationBadge({
               <ExternalLink className="mt-0.5 size-3.5 flex-none opacity-80" />
               <div className="min-w-0">
                 <strong className="block truncate text-[12px] font-semibold">
-                  {title}
+                  {missing ? `来源 ${index} 不可用` : title}
                 </strong>
                 {href ? (
                   <span className="block truncate font-mono text-[10px] opacity-80">
@@ -528,7 +567,9 @@ function WebCitationBadge({
                 ) : null}
               </div>
             </div>
-            {quote ? (
+            {missing ? (
+              <p className="text-[11px] opacity-80">该引用未对应到本次提供的来源列表</p>
+            ) : quote ? (
               <p className="line-clamp-4 text-[11px] leading-4 opacity-90">
                 {quote}
               </p>
@@ -577,7 +618,13 @@ function TextWithCitations({
         if (isWebCitationHref(href)) {
           const parsed = parseWebCitationHref(href ?? "");
           if (parsed) {
-            return <WebCitationBadge index={parsed.index} lookup={lookup} />;
+            return (
+              <WebCitationBadge
+                index={parsed.index}
+                lookup={lookup}
+                missing={parsed.missing}
+              />
+            );
           }
         }
         const safe =
@@ -621,9 +668,9 @@ function TextWithCitations({
 
   return (
     <div data-message-selectable-text>
-      <MessageResponse className={cn("min-w-0 text-[15px] leading-7", className)} components={components}></MessageResponse>
-      <MessageResponse 
-
+      <MessageResponse
+        className={cn("min-w-0 text-[15px] leading-7", className)}
+        components={components}
       >
         {markdown}
       </MessageResponse>
@@ -1387,6 +1434,119 @@ function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) 
   );
 }
 
+function WebFetchAuthorizationCard({ data }: { data: FetchAuthorizationData }) {
+  const requestId = data.authorization_request_id ?? "";
+  const [state, setState] = useState<"pending" | "submitting" | "approved" | "denied">(
+    data.authorization_status === "approved" || data.decision === "allow_once" || data.decision === "allow_always"
+      ? "approved"
+      : data.authorization_status === "denied" || data.decision === "deny"
+        ? "denied"
+        : "pending",
+  );
+  const [error, setError] = useState("");
+  const decide = async (decision: FetchAuthorizationDecision) => {
+    if (!requestId) return;
+    setState("submitting");
+    setError("");
+    try {
+      await decideFetchAuthorization(requestId, decision);
+      if (decision !== "deny" && data.resume_mode === "server") {
+        await resumeFetchAuthorization(requestId);
+      } else if (decision !== "deny" && data.requested_url && data.resume_mode !== "server") {
+        window.dispatchEvent(new CustomEvent("learngraph:compose", {
+          detail: { content: `已批准抓取 ${data.requested_url}，请继续使用 fetch_web_page 获取网页内容。`, autoSend: true },
+        }));
+      }
+      // Refresh persisted history after every decision (including deny) so a
+      // remount or a second browser shows the terminal card, not a live one.
+      window.dispatchEvent(
+        new CustomEvent("learngraph:refresh-messages"),
+      );
+      setState(decision === "deny" ? "denied" : "approved");
+      toast.success(
+        decision === "allow_always"
+          ? "已加入你的网页抓取白名单"
+          : decision === "allow_once"
+            ? "已允许本次抓取"
+            : "已拒绝网页抓取",
+      );
+    } catch (cause) {
+      setState("pending");
+      setError(cause instanceof Error ? cause.message : "授权操作失败");
+    }
+  };
+  if (!requestId) return null;
+  if (state === "approved" || state === "denied") {
+    return <section className="mt-3 rounded-xl border border-muted p-4 text-sm text-muted-foreground">{state === "approved" ? "网页抓取已获授权。" : "已拒绝本次网页抓取。"}</section>;
+  }
+  return (
+    <section aria-label="网页抓取授权" className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20">
+      <div>
+        <strong className="text-amber-700 dark:text-amber-400">需要网页抓取授权</strong>
+        <p className="mt-1 break-words text-sm text-foreground">{data.message_zh || `我将使用${data.tool_label || "网页抓取工具"}抓取${data.requested_url || "该"}网页，是否批准？`}</p>
+        {data.hostname ? <p className="mt-1 text-xs text-muted-foreground">域名：{data.hostname}</p> : null}
+      </div>
+      {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
+      <div className="flex flex-wrap gap-2">
+        <Button disabled={state === "submitting"} onClick={() => void decide("allow_once")} size="sm">{state === "submitting" ? "处理中…" : "本次允许"}</Button>
+        <Button disabled={state === "submitting"} onClick={() => void decide("allow_always")} size="sm" variant="outline">以后都允许</Button>
+        <Button disabled={state === "submitting"} onClick={() => void decide("deny")} size="sm" variant="ghost">拒绝</Button>
+      </div>
+    </section>
+  );
+}
+
+function FetchSetupNoticePart({ data }: { data: PartData }) {
+  const { workspaceId } = useAuth();
+  const navigate = useNavigate();
+  const storageKey = `learngraph:fetch-setup-dismissed:${workspaceId}`;
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return localStorage.getItem(storageKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  if (dismissed) return null;
+  const settingsPath =
+    typeof data?.settings_path === "string" && data.settings_path
+      ? data.settings_path
+      : `/w/${workspaceId}/settings/providers`;
+  return (
+    <section
+      aria-label="网页抓取未配置提示"
+      className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-muted bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+    >
+      <span className="min-w-0 flex-1">
+        本轮已用联网搜索回答。配置网页抓取工具后，可直接读取你发送的网页全文，回答更精准。
+      </span>
+      <Button
+        onClick={() => navigate(settingsPath)}
+        size="sm"
+        variant="outline"
+        className="h-7 px-2 text-xs"
+      >
+        去配置
+      </Button>
+      <Button
+        onClick={() => {
+          try {
+            localStorage.setItem(storageKey, "1");
+          } catch {
+            /* ignore quota/security errors */
+          }
+          setDismissed(true);
+        }}
+        size="sm"
+        variant="ghost"
+        className="h-7 px-2 text-xs"
+      >
+        不再提示
+      </Button>
+    </section>
+  );
+}
+
 function AcknowledgementPart({
   content,
   streaming,
@@ -1425,9 +1585,10 @@ export function MessagePartRenderer({
   streaming?: boolean;
 }) {
   const content = part.content ?? part.content_delta ?? "";
+  const { workspaceId } = useAuth();
   const citationLookup = useMemo(
-    () => buildCitationLookup(siblingParts),
-    [siblingParts],
+    () => buildCitationLookup(siblingParts, workspaceId),
+    [siblingParts, workspaceId],
   );
   switch (part.type) {
     case "acknowledgement":
@@ -1480,6 +1641,10 @@ export function MessagePartRenderer({
       );
     case "tool_call":
       return <ToolCallPart content={content} part={part} streaming={streaming} />;
+    case "fetch_authorization":
+      return <WebFetchAuthorizationCard data={(part.data ?? {}) as FetchAuthorizationData} />;
+    case "fetch_setup_notice":
+      return <FetchSetupNoticePart data={part.data} />;
     case "graph_context":
       return <GraphContextPart data={part.data} />;
     case "quiz":

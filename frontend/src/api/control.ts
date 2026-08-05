@@ -14,6 +14,7 @@ import type {
   Permission,
   Role,
   SandboxAgentReadiness,
+  SandboxBootstrapPolicy,
   SandboxBootstrapStartResult,
   SandboxBootstrapStatus,
   SandboxExecution,
@@ -301,6 +302,19 @@ export function listSandboxProfiles(): Promise<SandboxProfile[]> {
 
 export function getSandboxBootstrapStatus(): Promise<SandboxBootstrapStatus> {
   return apiClient.get<SandboxBootstrapStatus>("/sandbox/bootstrap/status");
+}
+
+export function getSandboxBootstrapPolicy(): Promise<SandboxBootstrapPolicy> {
+  return apiClient.get<SandboxBootstrapPolicy>("/sandbox/bootstrap/policy");
+}
+
+export function updateSandboxBootstrapPolicy(
+  memberAllowed: boolean,
+): Promise<SandboxBootstrapPolicy> {
+  return apiClient.put<SandboxBootstrapPolicy, { member_allowed: boolean }>(
+    "/sandbox/bootstrap/policy",
+    { member_allowed: memberAllowed },
+  );
 }
 
 export function getAgentSandboxReadiness(): Promise<SandboxAgentReadiness> {

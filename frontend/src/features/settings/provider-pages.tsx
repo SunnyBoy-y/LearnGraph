@@ -28,7 +28,22 @@ import { toast } from "sonner";
 import { AnimatePresence, motion } from "motion/react";
 
 import deepseekMark from "@/assets/deepseek.svg";
+import deepseekBrandMark from "@/assets/brands/si-deepseek.svg";
+import anthropicMark from "@/assets/brands/si-anthropic.svg";
+import baiduMark from "@/assets/brands/si-baidu.svg";
+import bytedanceMark from "@/assets/brands/si-bytedance.svg";
+import githubMark from "@/assets/brands/si-github.svg";
+import googleGeminiMark from "@/assets/brands/si-googlegemini.svg";
+import longcatMark from "@/assets/brands/longcat.svg";
+import minimaxMark from "@/assets/brands/si-minimax.svg";
+import modelscopeMark from "@/assets/brands/si-modelscope.svg";
+import moonshotMark from "@/assets/brands/si-moonshot.svg";
+import ollamaMark from "@/assets/brands/si-ollama.svg";
+import openrouterMark from "@/assets/brands/si-openrouter.svg";
+import qwenMark from "@/assets/brands/si-qwen.svg";
+import xiaomiMark from "@/assets/brands/si-xiaomi.svg";
 import openAiMark from "@/assets/openai.svg";
+import { brandIcon } from "@/lib/brand-icons";
 import {
   createProvider,
   deleteProvider,
@@ -106,9 +121,16 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { ChevronDown } from "lucide-react";
 import {
   isAnthropicProvider,
-  isDeepSeekProvider,
+  isOfficialDeepSeekProvider,
   providerBalanceQueryConfig,
   providerBalanceQueryLastResult,
   providerSupportsBalance,
@@ -144,13 +166,12 @@ import { isRealtimeTranscriptionModel } from "@/lib/model-choices";
 function persistedProviderModels(
   provider: Provider,
 ): ProviderModelsResponse | undefined {
-  const ids = Array.isArray(provider.capabilities.discovered_model_ids)
+  const discoveredIds = Array.isArray(provider.capabilities.discovered_model_ids)
     ? provider.capabilities.discovered_model_ids.filter(
         (item): item is string =>
           typeof item === "string" && Boolean(item.trim()),
       )
     : [];
-  if (!ids.length) return undefined;
   const rawStates =
     provider.capabilities.model_states &&
     typeof provider.capabilities.model_states === "object" &&
@@ -166,6 +187,14 @@ function persistedProviderModels(
           ProviderModelCapabilities
         >)
       : {};
+  // Models pinned manually through a catalog-defaults sync live as per-model
+  // capability snapshots even when the vendor never reported them, so they
+  // belong in the persisted list too.
+  const ids = [
+    ...discoveredIds,
+    ...Object.keys(rawCapabilities).filter((id) => !discoveredIds.includes(id)),
+  ];
+  if (!ids.length) return undefined;
   return {
     provider_id: provider.id,
     status: "persisted_discovery",
@@ -180,6 +209,68 @@ function persistedProviderModels(
   };
 }
 
+/**
+ * Workspace-pinned manual models: per-model capability snapshots whose id the
+ * vendor never listed (so it is absent from ``discovered_model_ids``).
+ */
+function manualProviderModels(provider: Provider): ProviderModelsResponse["models"] {
+  const rawCapabilities = provider.capabilities.models;
+  const snapshots =
+    rawCapabilities &&
+    typeof rawCapabilities === "object" &&
+    !Array.isArray(rawCapabilities)
+      ? (rawCapabilities as Record<string, ProviderModelCapabilities>)
+      : {};
+  const rawStates = provider.capabilities.model_states;
+  const states =
+    rawStates && typeof rawStates === "object" && !Array.isArray(rawStates)
+      ? (rawStates as Record<string, unknown>)
+      : {};
+  const discoveredIds = new Set(
+    Array.isArray(provider.capabilities.discovered_model_ids)
+      ? provider.capabilities.discovered_model_ids.filter(
+          (item): item is string =>
+            typeof item === "string" && Boolean(item.trim()),
+        )
+      : [],
+  );
+  return Object.entries(snapshots)
+    .filter(([id]) => !discoveredIds.has(id))
+    .map(([id, capabilities]) => ({
+      id,
+      roles: ["llm"],
+      streaming: true,
+      remote: true,
+      enabled: states[id] !== false,
+      capabilities,
+    }));
+}
+
+/**
+ * Effective model list for the provider dialog: the fresh discovery response
+ * plus workspace-pinned manual models.  Manual models are computed straight
+ * from the persisted capability snapshots so a stale discovery in the
+ * providers query can never resurrect removed vendor models.
+ */
+function mergeProviderModelLists(
+  fresh: ProviderModelsResponse | undefined,
+  provider: Provider,
+): ProviderModelsResponse | undefined {
+  const manual = manualProviderModels(provider);
+  if (!fresh) {
+    if (!manual.length) return undefined;
+    return {
+      provider_id: provider.id,
+      status: "persisted_discovery",
+      models: manual,
+    };
+  }
+  const known = new Set(fresh.models.map((model) => model.id));
+  const additions = manual.filter((model) => !known.has(model.id));
+  if (!additions.length) return fresh;
+  return { ...fresh, models: [...fresh.models, ...additions] };
+}
+
 function SearchableModelSelect({
   ariaLabel,
   children,
@@ -192,6 +283,7 @@ function SearchableModelSelect({
   value: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
   const models = (() => {
     const values = new Map<string, boolean>();
     const visit = (nodes: ReactNode) => {
@@ -215,11 +307,31 @@ function SearchableModelSelect({
     visit(children);
     return [...values].map(([id, disabled]) => ({ disabled, id }));
   })();
+  // 过滤与排序在本地完成；cmdk 内建排序会移动 DOM 节点，与 ScrollArea 的包裹结构冲突
+  const query = search.trim().toLowerCase();
+  const visibleModels = query
+    ? models
+        .map((model) => {
+          const id = model.id.toLowerCase();
+          const score = id.includes(query)
+            ? 0
+            : fuzzyMatchesModelId(id, query)
+              ? 1
+              : -1;
+          return { model, score };
+        })
+        .filter((entry) => entry.score >= 0)
+        .sort((left, right) => left.score - right.score)
+        .map((entry) => entry.model)
+    : models;
   const selectedLabel = value || "选择已发现的模型";
 
   return (
     <Popover
-      onOpenChange={(nextOpen) => setOpen(nextOpen)}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        setSearch("");
+      }}
       open={open}
     >
       <PopoverTrigger asChild>
@@ -236,44 +348,64 @@ function SearchableModelSelect({
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-64 p-0">
-        <Command>
-          <CommandInput placeholder="搜索模型名称…" />
-          <CommandList className="max-h-64">
-            <CommandEmpty>没有匹配的模型</CommandEmpty>
-            {models.map(({ disabled, id: modelId }) => (
-              <CommandItem
-                disabled={disabled}
-                key={modelId}
-                onSelect={() => {
-                  if (disabled) return;
-                  onValueChange(modelId);
-                  setOpen(false);
-                }}
-                title={disabled ? "该模型已在供应商配置中停用" : undefined}
-                value={modelId}
-              >
-                <span
-                  className={`truncate font-mono text-xs ${
-                    disabled ? "text-muted-foreground" : ""
-                  }`}
+        <Command shouldFilter={false}>
+          <CommandInput
+            onValueChange={setSearch}
+            placeholder="搜索模型名称…"
+            value={search}
+          />
+          {/* CommandList 自带 no-scrollbar，改由 ScrollArea 承担滚动并常驻显示滚动条 */}
+          <CommandList className="max-h-none">
+            <ScrollArea
+              className="[&>[data-slot=scroll-area-viewport]]:max-h-64"
+              type="always"
+            >
+              <CommandEmpty>没有匹配的模型</CommandEmpty>
+              {visibleModels.map(({ disabled, id: modelId }) => (
+                <CommandItem
+                  className="pr-4"
+                  disabled={disabled}
+                  key={modelId}
+                  onSelect={() => {
+                    if (disabled) return;
+                    onValueChange(modelId);
+                    setOpen(false);
+                  }}
+                  title={disabled ? "该模型已在供应商配置中停用" : undefined}
+                  value={modelId}
                 >
-                  {modelId}
-                </span>
-                {disabled ? (
-                  <span className="ml-auto flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
-                    <LockKeyhole className="size-3" />
-                    已停用
+                  <span
+                    className={`truncate font-mono text-xs ${
+                      disabled ? "text-muted-foreground" : ""
+                    }`}
+                  >
+                    {modelId}
                   </span>
-                ) : modelId === value ? (
-                  <span className="ml-auto text-xs">✓</span>
-                ) : null}
-              </CommandItem>
-            ))}
+                  {disabled ? (
+                    <span className="ml-auto flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+                      <LockKeyhole className="size-3" />
+                      已停用
+                    </span>
+                  ) : modelId === value ? (
+                    <span className="ml-auto text-xs">✓</span>
+                  ) : null}
+                </CommandItem>
+              ))}
+            </ScrollArea>
           </CommandList>
         </Command>
       </PopoverContent>
     </Popover>
   );
+}
+
+/** 子序列式模糊匹配："glm5" 可命中 "glm-5.1"。 */
+function fuzzyMatchesModelId(text: string, query: string): boolean {
+  let index = 0;
+  for (const char of text) {
+    if (index < query.length && char === query[index]) index += 1;
+  }
+  return index === query.length;
 }
 
 export function ProvidersPage() {
@@ -650,7 +782,10 @@ export function ProvidersPage() {
               <AnimatePresence initial={false}>
               {filteredProviders.map((provider) => {
                 const providerSpec = catalogByType.get(provider.provider_type);
-                const isDeepSeek = isDeepSeekProvider(provider);
+                // Identity display (brand mark / "DeepSeek" badge) belongs to
+                // the official channel only — relay stations that merely host
+                // DeepSeek models must not be labelled DeepSeek.
+                const isDeepSeek = isOfficialDeepSeekProvider(provider);
                 const isAnthropic = isAnthropicProvider(provider);
                 const isOfficialOpenAi = isOfficialOpenAiProvider(provider);
                 const isModelProvider = providerSpec?.role === "model";
@@ -760,7 +895,9 @@ export function ProvidersPage() {
                               className="size-4"
                               src={openAiMark}
                             />
-                          ) : providerSpec?.brand_icon_url ? (
+                          ) : providerSpec &&
+                            (brandIcon(providerSpec.brand_id) ??
+                              providerSpec.brand_icon_url) ? (
                             <img
                               alt=""
                               aria-hidden="true"
@@ -768,7 +905,11 @@ export function ProvidersPage() {
                               onError={(event) => {
                                 event.currentTarget.style.display = "none";
                               }}
-                              src={providerSpec.brand_icon_url}
+                              src={
+                                brandIcon(providerSpec.brand_id) ??
+                                providerSpec.brand_icon_url ??
+                                undefined
+                              }
                             />
                           ) : isOfficialOpenAi ? (
                             <img
@@ -1329,18 +1470,25 @@ export function ProvidersPage() {
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              if (endpointTarget) {
-                updateEndpoint.mutate({
-                  id: endpointTarget.id,
-                  baseUrl: endpointValue,
-                });
+              if (!endpointTarget) return;
+              const trimmed = endpointValue.trim();
+              if (trimmed && !isValidHttpUrl(trimmed)) {
+                toast.error(invalidBaseUrlMessage(trimmed));
+                return;
               }
+              updateEndpoint.mutate({
+                id: endpointTarget.id,
+                baseUrl: endpointValue,
+              });
             }}
           >
             {(() => {
               const spec = endpointTarget
                 ? catalogByType.get(endpointTarget.provider_type)
                 : undefined;
+              const trimmedEndpoint = endpointValue.trim();
+              const endpointValid =
+                !trimmedEndpoint || isValidHttpUrl(trimmedEndpoint);
               return (
                 <>
                   <DialogHeader>
@@ -1353,12 +1501,17 @@ export function ProvidersPage() {
                     <div className="space-y-2">
                       <Label htmlFor="provider-endpoint-edit">Base URL</Label>
                       <Input
+                        aria-invalid={Boolean(trimmedEndpoint) && !endpointValid}
                         id="provider-endpoint-edit"
                         onChange={(event) => setEndpointValue(event.currentTarget.value)}
                         placeholder={spec?.default_base_url ?? "https://provider.example/v1"}
                         value={endpointValue}
                       />
-                      {spec?.default_base_url ? (
+                      {trimmedEndpoint && !endpointValid ? (
+                        <p className="text-xs text-destructive" role="alert">
+                          {invalidBaseUrlMessage(trimmedEndpoint)}
+                        </p>
+                      ) : spec?.default_base_url ? (
                         <p className="text-xs text-muted-foreground">
                           官方默认地址：
                           <button
@@ -1417,7 +1570,8 @@ export function ProvidersPage() {
                     <Button
                       disabled={
                         updateEndpoint.isPending ||
-                        !endpointValue.trim()
+                        !endpointValue.trim() ||
+                        !endpointValid
                       }
                       type="submit"
                     >
@@ -1586,8 +1740,10 @@ export function ProvidersPage() {
           key={`${capabilityTarget.provider.id}:${capabilityTarget.modelId}`}
           modelId={capabilityTarget.modelId}
           models={
-            models[capabilityTarget.provider.id] ??
-            persistedProviderModels(capabilityTarget.provider) ?? {
+            mergeProviderModelLists(
+              models[capabilityTarget.provider.id],
+              capabilityTarget.provider,
+            ) ?? {
               provider_id: capabilityTarget.provider.id,
               status: "manual",
               models: capabilityTarget.modelId
@@ -1611,15 +1767,30 @@ export function ProvidersPage() {
             setModels((current) => {
               const discovered = current[snapshot.provider_id];
               if (!discovered) return current;
+              const exists = discovered.models.some(
+                (model) => model.id === snapshot.model_id,
+              );
               return {
                 ...current,
                 [snapshot.provider_id]: {
                   ...discovered,
-                  models: discovered.models.map((model) =>
-                    model.id === snapshot.model_id
-                      ? { ...model, capabilities: snapshot.capabilities }
-                      : model,
-                  ),
+                  models: exists
+                    ? discovered.models.map((model) =>
+                        model.id === snapshot.model_id
+                          ? { ...model, capabilities: snapshot.capabilities }
+                          : model,
+                      )
+                    : [
+                        ...discovered.models,
+                        {
+                          id: snapshot.model_id,
+                          roles: ["llm"],
+                          streaming: true,
+                          remote: true,
+                          enabled: true,
+                          capabilities: snapshot.capabilities,
+                        },
+                      ],
                 },
               };
             });
@@ -1917,21 +2088,21 @@ type QuickProvider = {
 
 const QUICK_PROVIDERS: QuickProvider[] = [
   { id: "openai", name: "OpenAI", description: "官方 Responses API", baseUrl: "https://api.openai.com/v1", brandId: "openai", iconUrl: openAiMark, protocol: "openai", keyUrl: "https://platform.openai.com/api-keys" },
-  { id: "deepseek", name: "DeepSeek", description: "OpenAI 兼容接口", baseUrl: "https://api.deepseek.com", brandId: "deepseek", iconUrl: "https://cdn.simpleicons.org/deepseek/4D6BFE", protocol: "openai", keyUrl: "https://platform.deepseek.com/api_keys" },
-  { id: "qwen", name: "通义千问", description: "阿里云 Model Studio", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", brandId: "qwen", iconUrl: "https://cdn.simpleicons.org/qwen", protocol: "openai", keyUrl: "https://bailian.console.aliyun.com/?tab=model#/api-key" },
-  { id: "gemini", name: "Google Gemini", description: "OpenAI 兼容接口", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", brandId: "gemini", iconUrl: "https://cdn.simpleicons.org/googlegemini", protocol: "openai", keyUrl: "https://aistudio.google.com/apikey" },
-  { id: "mimo", name: "Xiaomi MiMo", description: "OpenAI / Anthropic 兼容", baseUrl: "https://api.xiaomimimo.com/v1", brandId: "mimo", iconUrl: "https://cdn.simpleicons.org/xiaomi", protocol: "openai", keyUrl: "https://platform.xiaomimimo.com/#/console/api-keys", defaultModel: "mimo-v2.5-pro", endpoints: { openai: "https://api.xiaomimimo.com/v1", anthropic: "https://api.xiaomimimo.com/anthropic" }, models: { openai: "mimo-v2.5-pro", anthropic: "mimo-v2.5-pro" } },
-  { id: "anthropic", name: "Anthropic", description: "Claude Messages API", baseUrl: "https://api.anthropic.com", brandId: "anthropic", iconUrl: "https://cdn.simpleicons.org/anthropic", protocol: "anthropic", keyUrl: "https://platform.claude.com/settings/keys" },
-  { id: "github_copilot", name: "GitHub Copilot", description: "GitHub 账号设备授权", baseUrl: "https://api.githubcopilot.com", brandId: "github", iconUrl: "https://cdn.simpleicons.org/github", protocol: "openai", defaultModel: "claude-sonnet-5", models: { openai: "claude-sonnet-5" } },
-  { id: "qianfan", name: "Baidu Qianfan Coding Plan", description: "Anthropic 兼容接口", baseUrl: "https://qianfan.baidubce.com/anthropic/coding", brandId: "qianfan", iconUrl: "https://cdn.simpleicons.org/baidu", protocol: "anthropic", keyUrl: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application", defaultModel: "qianfan-code-latest", models: { anthropic: "qianfan-code-latest" } },
-  { id: "volc_agentplan", name: "火山 Agentplan", description: "Anthropic 兼容接口", baseUrl: "https://ark.cn-beijing.volces.com/api/coding", brandId: "volc_agentplan", iconUrl: "https://cdn.simpleicons.org/bytedance", protocol: "anthropic", keyUrl: "https://www.volcengine.com/activity/codingplan", defaultModel: "ark-code-latest", models: { anthropic: "ark-code-latest" } },
-  { id: "openrouter", name: "OpenRouter", description: "Anthropic 兼容接口", baseUrl: "https://openrouter.ai/api", brandId: "openrouter", iconUrl: "https://cdn.simpleicons.org/openrouter", protocol: "anthropic", keyUrl: "https://openrouter.ai/keys", defaultModel: "anthropic/claude-sonnet-5", models: { anthropic: "anthropic/claude-sonnet-5" } },
-  { id: "longcat", name: "Longcat", description: "Anthropic 兼容接口", baseUrl: "https://api.longcat.chat/anthropic", brandId: "longcat", iconUrl: "https://cdn.simpleicons.org/cat", protocol: "anthropic", keyUrl: "https://longcat.chat/platform/api_keys", defaultModel: "LongCat-2.0", models: { anthropic: "LongCat-2.0" }, capabilityOverrides: { max_output_tokens: 131072 } },
-  { id: "kimi", name: "Kimi", description: "Anthropic 兼容接口", baseUrl: "https://api.moonshot.cn/anthropic", brandId: "kimi", iconUrl: "https://cdn.simpleicons.org/moonshot", protocol: "anthropic", keyUrl: "https://platform.kimi.com/console/api-keys", defaultModel: "kimi-k2.7-code", models: { anthropic: "kimi-k2.7-code" } },
-  { id: "kimi_coding", name: "Kimi For Coding", description: "Anthropic 兼容 Coding Plan", baseUrl: "https://api.kimi.com/coding/", brandId: "kimi_coding", iconUrl: "https://cdn.simpleicons.org/moonshot", protocol: "anthropic", keyUrl: "https://www.kimi.com/code/", defaultModel: "kimi-for-coding", models: { anthropic: "kimi-for-coding" }, capabilityOverrides: { context_window_tokens: 262144, context_limit_tokens: 262144 } },
-  { id: "modelscope", name: "ModelScope", description: "Anthropic 兼容接口", baseUrl: "https://api-inference.modelscope.cn", brandId: "modelscope", iconUrl: "https://cdn.simpleicons.org/modelscope", protocol: "anthropic", keyUrl: "https://modelscope.cn/my/myaccesstoken", defaultModel: "ZhipuAI/GLM-5.1", models: { anthropic: "ZhipuAI/GLM-5.1" } },
-  { id: "minimax", name: "MiniMax", description: "OpenAI 兼容接口", baseUrl: "https://api.minimaxi.com/v1", brandId: "minimax", iconUrl: "https://cdn.simpleicons.org/minimax", protocol: "openai", keyUrl: "https://platform.minimaxi.com/user-center/basic-information/interface-key" },
-  { id: "ollama", name: "Ollama", description: "本地模型（无需 API Key）", baseUrl: "http://127.0.0.1:11434/v1", brandId: "ollama", iconUrl: "https://cdn.simpleicons.org/ollama", protocol: "openai" },
+  { id: "deepseek", name: "DeepSeek", description: "OpenAI 兼容接口", baseUrl: "https://api.deepseek.com", brandId: "deepseek", iconUrl: deepseekBrandMark, protocol: "openai", keyUrl: "https://platform.deepseek.com/api_keys" },
+  { id: "qwen", name: "通义千问", description: "阿里云 Model Studio", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", brandId: "qwen", iconUrl: qwenMark, protocol: "openai", keyUrl: "https://bailian.console.aliyun.com/?tab=model#/api-key" },
+  { id: "gemini", name: "Google Gemini", description: "OpenAI 兼容接口", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", brandId: "gemini", iconUrl: googleGeminiMark, protocol: "openai", keyUrl: "https://aistudio.google.com/apikey" },
+  { id: "mimo", name: "Xiaomi MiMo", description: "OpenAI / Anthropic 兼容", baseUrl: "https://api.xiaomimimo.com/v1", brandId: "mimo", iconUrl: xiaomiMark, protocol: "openai", keyUrl: "https://platform.xiaomimimo.com/#/console/api-keys", defaultModel: "mimo-v2.5-pro", endpoints: { openai: "https://api.xiaomimimo.com/v1", anthropic: "https://api.xiaomimimo.com/anthropic" }, models: { openai: "mimo-v2.5-pro", anthropic: "mimo-v2.5-pro" } },
+  { id: "anthropic", name: "Anthropic", description: "Claude Messages API", baseUrl: "https://api.anthropic.com", brandId: "anthropic", iconUrl: anthropicMark, protocol: "anthropic", keyUrl: "https://platform.claude.com/settings/keys" },
+  { id: "github_copilot", name: "GitHub Copilot", description: "GitHub 账号设备授权", baseUrl: "https://api.githubcopilot.com", brandId: "github", iconUrl: githubMark, protocol: "openai", defaultModel: "claude-sonnet-5", models: { openai: "claude-sonnet-5" } },
+  { id: "qianfan", name: "Baidu Qianfan Coding Plan", description: "Anthropic 兼容接口", baseUrl: "https://qianfan.baidubce.com/anthropic/coding", brandId: "qianfan", iconUrl: baiduMark, protocol: "anthropic", keyUrl: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application", defaultModel: "qianfan-code-latest", models: { anthropic: "qianfan-code-latest" } },
+  { id: "volc_agentplan", name: "火山 Agentplan", description: "Anthropic 兼容接口", baseUrl: "https://ark.cn-beijing.volces.com/api/coding", brandId: "volc_agentplan", iconUrl: bytedanceMark, protocol: "anthropic", keyUrl: "https://www.volcengine.com/activity/codingplan", defaultModel: "ark-code-latest", models: { anthropic: "ark-code-latest" } },
+  { id: "openrouter", name: "OpenRouter", description: "Anthropic 兼容接口", baseUrl: "https://openrouter.ai/api", brandId: "openrouter", iconUrl: openrouterMark, protocol: "anthropic", keyUrl: "https://openrouter.ai/keys", defaultModel: "anthropic/claude-sonnet-5", models: { anthropic: "anthropic/claude-sonnet-5" } },
+  { id: "longcat", name: "Longcat", description: "Anthropic 兼容接口", baseUrl: "https://api.longcat.chat/anthropic", brandId: "longcat", iconUrl: longcatMark, protocol: "anthropic", keyUrl: "https://longcat.chat/platform/api_keys", defaultModel: "LongCat-2.0", models: { anthropic: "LongCat-2.0" }, capabilityOverrides: { max_output_tokens: 131072 } },
+  { id: "kimi", name: "Kimi", description: "Anthropic 兼容接口", baseUrl: "https://api.moonshot.cn/anthropic", brandId: "kimi", iconUrl: moonshotMark, protocol: "anthropic", keyUrl: "https://platform.kimi.com/console/api-keys", defaultModel: "kimi-k2.7-code", models: { anthropic: "kimi-k2.7-code" } },
+  { id: "kimi_coding", name: "Kimi For Coding", description: "Anthropic 兼容 Coding Plan", baseUrl: "https://api.kimi.com/coding/", brandId: "kimi_coding", iconUrl: moonshotMark, protocol: "anthropic", keyUrl: "https://www.kimi.com/code/", defaultModel: "kimi-for-coding", models: { anthropic: "kimi-for-coding" }, capabilityOverrides: { context_window_tokens: 262144, context_limit_tokens: 262144 } },
+  { id: "modelscope", name: "ModelScope", description: "Anthropic 兼容接口", baseUrl: "https://api-inference.modelscope.cn", brandId: "modelscope", iconUrl: modelscopeMark, protocol: "anthropic", keyUrl: "https://modelscope.cn/my/myaccesstoken", defaultModel: "ZhipuAI/GLM-5.1", models: { anthropic: "ZhipuAI/GLM-5.1" } },
+  { id: "minimax", name: "MiniMax", description: "OpenAI 兼容接口", baseUrl: "https://api.minimaxi.com/v1", brandId: "minimax", iconUrl: minimaxMark, protocol: "openai", keyUrl: "https://platform.minimaxi.com/user-center/basic-information/interface-key" },
+  { id: "ollama", name: "Ollama", description: "本地模型（无需 API Key）", baseUrl: "http://127.0.0.1:11434/v1", brandId: "ollama", iconUrl: ollamaMark, protocol: "openai" },
 ];
 
 type RoleQuickProvider = {
@@ -2024,7 +2195,7 @@ function roleQuickProviders(
         description: "DashScope ASR（qwen3-asr-flash）",
         baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         brandId: "qwen",
-        iconUrl: "https://cdn.simpleicons.org/qwen",
+        iconUrl: qwenMark,
         keyUrl:
           "https://bailian.console.aliyun.com/?tab=model#/api-key",
         providerType: compatibleTranscription.provider_type,
@@ -2050,7 +2221,7 @@ function roleQuickProviders(
         description: "text-embedding-v4（DashScope）",
         baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         brandId: "qwen",
-        iconUrl: "https://cdn.simpleicons.org/qwen",
+        iconUrl: qwenMark,
         keyUrl:
           "https://bailian.console.aliyun.com/?tab=model#/api-key",
         providerType: compatibleEmbedding.provider_type,
@@ -2073,7 +2244,7 @@ function roleQuickProviders(
               description: "本地 Embeddings（nomic-embed-text 等）",
               baseUrl: "http://127.0.0.1:11434/v1",
               brandId: "ollama",
-              iconUrl: "https://cdn.simpleicons.org/ollama",
+              iconUrl: ollamaMark,
               providerType: ollamaEmbedding.provider_type,
             },
           ]
@@ -2094,7 +2265,7 @@ function roleQuickProviders(
         iconUrl:
           item.brand_id === "openai" || item.brand_id === "openai_compatible"
             ? openAiMark
-            : (item.brand_icon_url ?? undefined),
+            : (brandIcon(item.brand_id) ?? item.brand_icon_url ?? undefined),
         keyUrl: item.key_management_url ?? undefined,
         providerType: item.provider_type,
       }));
@@ -2119,7 +2290,7 @@ function roleQuickProviders(
       iconUrl:
         item.brand_id === "openai" || item.brand_id === "openai_compatible"
           ? openAiMark
-          : (item.brand_icon_url ?? undefined),
+          : (brandIcon(item.brand_id) ?? item.brand_icon_url ?? undefined),
       keyUrl: item.key_management_url ?? undefined,
       providerType: item.provider_type,
     }));
@@ -2150,31 +2321,52 @@ function CodexDeviceLoginPanel({
   useEffect(() => {
     if (!login || !waiting) return;
     let cancelled = false;
+    let polling = false;
+    let consecutiveFailures = 0;
     // The device code expires after 15 minutes upstream; stop polling then so
     // a forgotten dialog cannot keep calling the login endpoint forever.
     const deadline = Date.now() + 15 * 60 * 1000;
     const timer = window.setInterval(async () => {
-      if (cancelled) return;
+      if (cancelled || polling) return;
       if (Date.now() > deadline) {
         setWaiting(false);
         setError("设备码已过期，请重新发起直登。");
         return;
       }
+      polling = true;
       try {
         const result = await pollCodexDeviceLogin({
           device_auth_id: login.device_auth_id,
           user_code: login.user_code,
         });
-        if (cancelled || result.status !== "authorized" || !result.api_key) return;
+        if (cancelled) return;
+        consecutiveFailures = 0;
+        setError(undefined);
+        if (result.status !== "authorized" || !result.api_key) return;
         setWaiting(false);
         onAuthorized(result.api_key, result.plan_type);
         toast.success("Codex 直登成功，凭据已填入");
       } catch (pollError) {
         if (cancelled) return;
-        setWaiting(false);
-        setError(
-          pollError instanceof Error ? pollError.message : "Codex 直登轮询失败",
-        );
+        consecutiveFailures += 1;
+        // A single proxy/network hiccup must not abort the device-code login:
+        // keep polling and only give up after repeated consecutive failures.
+        if (consecutiveFailures >= 3) {
+          setWaiting(false);
+          setError(
+            pollError instanceof Error
+              ? pollError.message
+              : "Codex 直登轮询失败",
+          );
+        } else {
+          setError(
+            pollError instanceof Error
+              ? `直登轮询暂时失败（${pollError.message}），正在重试…`
+              : "直登轮询暂时失败，正在重试…",
+          );
+        }
+      } finally {
+        polling = false;
       }
     }, Math.max(1, login.interval_seconds) * 1000);
     return () => {
@@ -2254,31 +2446,50 @@ function CopilotDeviceLoginPanel({
   useEffect(() => {
     if (!login || !waiting) return;
     let cancelled = false;
+    let polling = false;
+    let consecutiveFailures = 0;
     const deadline = Date.now() + 15 * 60 * 1000;
     const timer = window.setInterval(async () => {
-      if (cancelled) return;
+      if (cancelled || polling) return;
       if (Date.now() > deadline) {
         setWaiting(false);
         setError("GitHub 设备码已过期，请重新授权。");
         return;
       }
+      polling = true;
       try {
         const result = await pollCopilotDeviceLogin({
           device_auth_id: login.device_auth_id,
           user_code: login.user_code,
         });
-        if (cancelled || result.status !== "authorized" || !result.api_key) return;
+        if (cancelled) return;
+        consecutiveFailures = 0;
+        setError(undefined);
+        if (result.status !== "authorized" || !result.api_key) return;
         setWaiting(false);
         onAuthorized(result.api_key);
         toast.success("GitHub Copilot 授权成功，凭据已填入");
       } catch (pollError) {
         if (cancelled) return;
-        setWaiting(false);
-        setError(
-          pollError instanceof Error
-            ? pollError.message
-            : "GitHub Copilot 授权轮询失败",
-        );
+        consecutiveFailures += 1;
+        // A single proxy/network hiccup must not abort the device-code login:
+        // keep polling and only give up after repeated consecutive failures.
+        if (consecutiveFailures >= 3) {
+          setWaiting(false);
+          setError(
+            pollError instanceof Error
+              ? pollError.message
+              : "GitHub Copilot 授权轮询失败",
+          );
+        } else {
+          setError(
+            pollError instanceof Error
+              ? `授权轮询暂时失败（${pollError.message}），正在重试…`
+              : "授权轮询暂时失败，正在重试…",
+          );
+        }
+      } finally {
+        polling = false;
       }
     }, Math.max(1, login.interval_seconds) * 1000);
     return () => {
@@ -2346,6 +2557,28 @@ function normalizedQuickEndpoint(value: string) {
   return value.trim().replace(/\/+$/, "").toLowerCase();
 }
 
+/** Client-side interception of Base URLs the backend could never issue. */
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value.trim());
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      Boolean(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function invalidBaseUrlMessage(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "Base URL 不能为空";
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(trimmed) && !trimmed.startsWith("//")) {
+    return `Base URL 缺少协议前缀，请填写以 http:// 或 https:// 开头的完整地址（如 https://${trimmed.split(/\s+/)[0]}）`;
+  }
+  return "Base URL 必须以 http:// 或 https:// 开头，且包含有效的主机名";
+}
+
 function isKnownQuickEndpoint(preset: RoleQuickProvider, value: string) {
   const normalized = normalizedQuickEndpoint(value);
   return Boolean(normalized) && Object.values(
@@ -2357,18 +2590,27 @@ function isKnownQuickEndpoint(preset: RoleQuickProvider, value: string) {
 }
 
 function providerQuickBrand(provider: Provider): QuickProvider | undefined {
-  const brandId = String(provider.capabilities.brand_id ?? "").toLowerCase();
-  const baseUrl = normalizedQuickEndpoint(provider.base_url ?? "");
-  const name = provider.display_name.toLowerCase();
-  return QUICK_PROVIDERS.find(
-    (item) =>
+  // The DeepSeek quick preset is the official-channel identity. Relay
+  // stations whose base URL or display name merely mentions DeepSeek must
+  // fall back to the generic icon instead of the DeepSeek brand mark.
+  const preset = QUICK_PROVIDERS.find((item) => {
+    const brandId = String(provider.capabilities.brand_id ?? "").toLowerCase();
+    const baseUrl = normalizedQuickEndpoint(provider.base_url ?? "");
+    const name = provider.display_name.toLowerCase();
+    return (
       item.brandId === brandId ||
       Object.values(item.endpoints ?? { [item.protocol]: item.baseUrl }).some(
         (endpoint) => normalizedQuickEndpoint(endpoint ?? "") === baseUrl,
       ) ||
       name.includes(item.id) ||
-      name.includes(item.name.toLowerCase()),
-  );
+      name.includes(item.name.toLowerCase())
+    );
+  });
+  if (!preset) return undefined;
+  if (preset.id === "deepseek" && !isOfficialDeepSeekProvider(provider)) {
+    return undefined;
+  }
+  return preset;
 }
 
 function ProviderDialog({
@@ -2588,6 +2830,16 @@ function ProviderDialog({
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!selected) return;
+    // Intercept unusable endpoints before the request reaches the backend
+    // probe: a URL without an http(s) protocol can never be issued.
+    if (selected.requires_base_url && !trimmedBaseUrl) {
+      toast.error("该 Provider 需要填写 Base URL 才能创建");
+      return;
+    }
+    if (trimmedBaseUrl && !baseUrlValid) {
+      toast.error(invalidBaseUrlMessage(trimmedBaseUrl));
+      return;
+    }
     let extraHeaders: Record<string, string> = {};
     try {
       extraHeaders = parseExtraHeadersInput(headersText);
@@ -2642,13 +2894,18 @@ function ProviderDialog({
     onCreate({
       display_name: name.trim(),
       provider_type: selected.provider_type,
-      base_url: baseUrl.trim() || undefined,
+      base_url: trimmedBaseUrl || undefined,
       api_key: key || undefined,
       capabilities: Object.keys(capabilities).length ? capabilities : undefined,
     });
   }
 
   const isDeepSeekQuick = deepSeekPresetActive && quickPreset === "deepseek";
+  const trimmedBaseUrl = baseUrl.trim();
+  // The backend probe can never issue an endpoint without an http(s) protocol;
+  // intercept such URLs before submission instead of surfacing a 500.
+  const baseUrlValid =
+    !trimmedBaseUrl || isValidHttpUrl(trimmedBaseUrl);
 
   return (
     <Dialog
@@ -2843,6 +3100,11 @@ function ProviderDialog({
                     ? `官方默认：${selected.default_base_url}。也可填写兼容网关或代理地址。`
                     : "支持官方 API 或兼容网关地址。"}
               </p>
+              {trimmedBaseUrl && !baseUrlValid ? (
+                <p className="text-xs text-destructive" role="alert">
+                  {invalidBaseUrlMessage(trimmedBaseUrl)}
+                </p>
+              ) : null}
             </div>
             <div className="space-y-2">
               <div className="flex items-center justify-between gap-2">
@@ -2941,7 +3203,7 @@ function ProviderDialog({
           <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none">
             <Button
               disabled={
-                busy || catalogPending || Boolean(catalogError) || !name.trim() || !selected
+                busy || catalogPending || Boolean(catalogError) || !name.trim() || !selected || !baseUrlValid
               }
               type="submit"
             >
@@ -3101,15 +3363,31 @@ function ModelCapabilitiesDialog({
   provider: Provider;
 }) {
   const queryClient = useQueryClient();
+  const protocolCatalog = useQuery({
+    queryKey: ["provider-catalog"],
+    queryFn: listProviderCatalog,
+  });
+  const protocolOptions = (protocolCatalog.data ?? []).filter((item) => {
+    const current = (protocolCatalog.data ?? []).find(
+      (candidate) => candidate.provider_type === provider.provider_type,
+    );
+    return item.create_allowed && current && item.role === current.role;
+  });
   // "none" keeps the dialog lightweight: the template form only appears after
   // an explicit edit action. Per-model parameters open in a nested dialog.
   const [editScope, setEditScope] = useState<"none" | "group">("none");
   const [editModelId, setEditModelId] = useState<string | null>(null);
   const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
+  const [protocolType, setProtocolType] = useState(provider.provider_type);
   const [headers, setHeaders] = useState(() => stringifyExtraHeaders(providerExtraHeaders(provider)));
   const [secret, setSecret] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
+  // The dialog can grow the list by pinning models manually, so it keeps its
+  // own copy instead of reading the discovery-derived prop directly.
+  const [modelsList, setModelsList] = useState(models);
+  const [manualModelId, setManualModelId] = useState("");
   const [modelStates, setModelStates] = useState<Record<string, boolean>>(
-    Object.fromEntries(models.models.map((model) => [model.id, model.enabled !== false])),
+    Object.fromEntries(modelsList.models.map((model) => [model.id, model.enabled !== false])),
   );
   const [capabilities, setCapabilities] =
     useState<ProviderModelCapabilities>(emptyModelCapabilities);
@@ -3170,7 +3448,7 @@ function ModelCapabilitiesDialog({
     mutationFn: () =>
       syncProviderModelCatalogDefaults(
         provider.id,
-        models.models.map((model) => model.id),
+        modelsList.models.map((model) => model.id),
       ),
     onSuccess: (result) => {
       for (const snapshot of result.models) {
@@ -3185,8 +3463,45 @@ function ModelCapabilitiesDialog({
     },
     onError: (error) => toast.error(error.message),
   });
+  const addManualModel = useMutation({
+    mutationFn: (modelId: string) =>
+      syncProviderModelCatalogDefaults(provider.id, [modelId]),
+    onSuccess: (result) => {
+      const snapshot = result.models[0];
+      if (!snapshot) return;
+      setModelsList((current) => {
+        if (current.models.some((model) => model.id === snapshot.model_id)) {
+          return current;
+        }
+        return {
+          ...current,
+          models: [
+            ...current.models,
+            {
+              id: snapshot.model_id,
+              roles: ["llm"],
+              streaming: true,
+              remote: true,
+              enabled: true,
+              capabilities: snapshot.capabilities,
+            },
+          ],
+        };
+      });
+      setModelStates((current) => ({ ...current, [snapshot.model_id]: true }));
+      setManualModelId("");
+      onSaved(snapshot);
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      toast.success(`已添加模型 ${snapshot.model_id}，可继续设置上下文窗口`);
+      // Open the per-model editor immediately so the context window can be
+      // configured right away instead of hunting for the new row.
+      setEditModelId(snapshot.model_id);
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const updateConnection = useMutation({
     mutationFn: () => updateProvider(provider.id, {
+      provider_type: protocolType === provider.provider_type ? undefined : protocolType,
       base_url: baseUrl.trim() || null,
       extra_headers: parseExtraHeadersInput(headers),
     }),
@@ -3246,6 +3561,23 @@ function ModelCapabilitiesDialog({
       .catch((error: Error) => toast.error(error.message));
   }
 
+  function addManualModelHandler() {
+    const name = manualModelId.trim();
+    if (!name) {
+      toast.error("请输入模型名称");
+      return;
+    }
+    if (name.length > 160) {
+      toast.error("模型名称不能超过 160 个字符");
+      return;
+    }
+    if (modelsList.models.some((model) => model.id === name)) {
+      toast.error(`模型 ${name} 已在列表中`);
+      return;
+    }
+    addManualModel.mutate(name);
+  }
+
   const overridesRaw = provider.capabilities.models;
   const overrideModelIds =
     overridesRaw &&
@@ -3253,6 +3585,22 @@ function ModelCapabilitiesDialog({
     !Array.isArray(overridesRaw)
       ? Object.keys(overridesRaw as Record<string, unknown>)
       : [];
+  const visibleModels = (() => {
+    const query = modelSearch.trim().toLowerCase();
+    if (!query) return modelsList.models;
+    return modelsList.models
+      .map((model) => ({
+        model,
+        score: model.id.toLowerCase().includes(query)
+          ? 0
+          : fuzzyMatchesModelId(model.id.toLowerCase(), query)
+            ? 1
+            : -1,
+      }))
+      .filter((entry) => entry.score >= 0)
+      .sort((left, right) => left.score - right.score)
+      .map((entry) => entry.model);
+  })();
   const balanceConfig = providerBalanceQueryConfig(provider);
   const balanceLast = balanceConfig?.enabled
     ? providerBalanceQueryLastResult(provider)
@@ -3277,14 +3625,15 @@ function ModelCapabilitiesDialog({
                   <div className="flex flex-wrap items-center gap-2">
                     <Button
                       disabled={
-                        models.models.length === 0 || syncCatalogDefaults.isPending
+                        modelsList.models.length === 0 ||
+                        syncCatalogDefaults.isPending
                       }
                       onClick={() => syncCatalogDefaults.mutate()}
                       size="xs"
                       title={
-                        models.models.length > 0
+                        modelsList.models.length > 0
                           ? "为模型列表中的全部模型写入官方目录默认参数"
-                          : "请先发现模型"
+                          : "请先发现模型，或手动添加模型"
                       }
                       type="button"
                       variant="outline"
@@ -3347,14 +3696,45 @@ function ModelCapabilitiesDialog({
                 ) : null}
               </section>
               <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => setModelStates(Object.fromEntries(models.models.map((model) => [model.id, true])))} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => setModelStates(Object.fromEntries(models.models.map((model) => [model.id, false])))} size="xs" type="button" variant="outline">全部停用</Button></div></div>
-                <div className="max-h-48 divide-y overflow-y-auto rounded-lg border">
-                  {models.models.length === 0 ? (
-                    <p className="px-3 py-4 text-xs text-muted-foreground">
-                      尚未发现模型。可先在列表中「发现模型」，或直接编辑全局模板。
-                    </p>
-                  ) : null}
-                  {models.models.map((model) => (
+                <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true])))} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false])))} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="flex items-center gap-2">
+                  <Input
+                    aria-label="手动添加模型"
+                    className="h-8 flex-1 font-mono text-xs"
+                    disabled={addManualModel.isPending}
+                    onChange={(event) => setManualModelId(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addManualModelHandler();
+                      }
+                    }}
+                    placeholder="手动输入模型名称，例如 my-private-model-v1"
+                    value={manualModelId}
+                  />
+                  <Button
+                    disabled={addManualModel.isPending || !manualModelId.trim()}
+                    onClick={addManualModelHandler}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    <Plus className="size-3" />
+                    {addManualModel.isPending ? "添加中…" : "手动添加"}
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  厂商未在列表暴露的模型（新发布型号 / 私有模型 / 中继别名）可手动添加，随后点击「编辑」设置上下文窗口。
+                </p>
+                <Input aria-label="搜索模型" onChange={(event) => setModelSearch(event.target.value)} placeholder="模糊搜索模型名称…" value={modelSearch} />
+                <ScrollArea className="rounded-lg border [&>[data-slot=scroll-area-viewport]]:max-h-48" type="always">
+                  <div className="divide-y">
+                    {modelsList.models.length === 0 ? (
+                      <p className="px-3 py-4 text-xs text-muted-foreground">尚未发现模型。可先在上方手动添加模型名称，或返回列表「发现模型」。</p>
+                    ) : visibleModels.length === 0 ? (
+                      <p className="px-3 py-4 text-xs text-muted-foreground">没有匹配的模型。</p>
+                    ) : null}
+                    {visibleModels.map((model) => (
                     <div
                       className="flex items-center gap-3 px-3 py-2 text-xs"
                       key={model.id}
@@ -3386,7 +3766,8 @@ function ModelCapabilitiesDialog({
                       ) : null}
                     </div>
                   ))}
-                </div>
+                  </div>
+                </ScrollArea>
               </section>
               {editScope === "group" ? (
                 <CapabilityFormFields
@@ -3401,11 +3782,52 @@ function ModelCapabilitiesDialog({
                   <p className="text-sm font-semibold">连接配置</p>
                   <p className="mt-1 text-xs text-muted-foreground">URL、请求头和 Secret 统一在这里维护。</p>
                 </div>
-                <Label>Base URL<Input className="mt-2" onChange={(event) => setBaseUrl(event.target.value)} value={baseUrl} /></Label>
+                <Label>
+                  协议类型
+                  <Select onValueChange={setProtocolType} value={protocolType}>
+                    <SelectTrigger className="mt-2"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {protocolOptions.map((item) => (
+                        <SelectItem key={item.provider_type} value={item.provider_type}>
+                          {item.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Label>
+                <Label>
+                  Base URL
+                  <Input className="mt-2" onChange={(event) => setBaseUrl(event.target.value)} value={baseUrl} />
+                  {(() => {
+                    const trimmedConnectionUrl = baseUrl.trim();
+                    if (trimmedConnectionUrl && !isValidHttpUrl(trimmedConnectionUrl)) {
+                      return (
+                        <span className="mt-1 block text-xs text-destructive" role="alert">
+                          {invalidBaseUrlMessage(trimmedConnectionUrl)}
+                        </span>
+                      );
+                    }
+                    return null;
+                  })()}
+                </Label>
                 <Label>请求头（JSON 对象）<Textarea className="mt-2 min-h-20 font-mono text-xs" onChange={(event) => setHeaders(event.target.value)} value={headers} /></Label>
                 <div className="flex flex-wrap items-end gap-2">
                   <Label className="min-w-52 flex-1">替换 Secret<Input className="mt-2" onChange={(event) => setSecret(event.target.value)} placeholder="输入新 Secret" type="password" value={secret} /></Label>
-                  <Button disabled={updateConnection.isPending} onClick={() => updateConnection.mutate()} type="button" variant="outline">保存连接</Button>
+                  <Button
+                    disabled={updateConnection.isPending}
+                    onClick={() => {
+                      const trimmedConnectionUrl = baseUrl.trim();
+                      if (trimmedConnectionUrl && !isValidHttpUrl(trimmedConnectionUrl)) {
+                        toast.error(invalidBaseUrlMessage(trimmedConnectionUrl));
+                        return;
+                      }
+                      updateConnection.mutate();
+                    }}
+                    type="button"
+                    variant="outline"
+                  >
+                    保存连接
+                  </Button>
                   <Button disabled={!secret.trim() || rotateSecretHere.isPending} onClick={() => rotateSecretHere.mutate()} type="button" variant="outline">更新 Secret</Button>
                 </div>
               </section>
@@ -3597,6 +4019,8 @@ function CapabilityFormFields({
   providerType: string;
   setCapabilities: Dispatch<SetStateAction<ProviderModelCapabilities>>;
 }) {
+  const [showThinkingAdvanced, setShowThinkingAdvanced] = useState(false);
+
   function toggleReasoningEffort(
     effort: Exclude<ThinkingMode, "off">,
     checked: boolean,
@@ -3689,6 +4113,22 @@ function CapabilityFormFields({
         </div>
       </section>
       <section className="space-y-3 rounded-xl border p-4">
+        <Collapsible
+          open={showThinkingAdvanced}
+          onOpenChange={setShowThinkingAdvanced}
+        >
+          <CollapsibleTrigger asChild>
+            <button className="group flex w-full items-center justify-between gap-3 rounded-lg text-left">
+              <span>
+                <p className="text-sm font-semibold">推理强度与映射（高级）</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  已按官方文档自动适配，一般无需修改；展开可覆盖该模型实际接受的参数形状与档位映射。
+                </p>
+              </span>
+              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+            </button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="space-y-3 pt-3">
         <div>
           <p className="text-sm font-semibold">推理强度与映射</p>
           <p className="mt-1 text-xs text-muted-foreground">
@@ -3787,6 +4227,8 @@ function CapabilityFormFields({
             />
           </div>
         </div>
+          </CollapsibleContent>
+        </Collapsible>
       </section>
       <section className="space-y-4 rounded-xl border p-4">
         <div>

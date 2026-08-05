@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from io import BytesIO
 from threading import Lock
+from typing import Any
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
@@ -84,9 +86,16 @@ from app.domain.schemas.files import (
     FileReferenceCreate,
 )
 from app.providers.ports.model import ModelProviderPort, ProviderChatMessage
+from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.storage_factory import object_storage_provider
 from app.providers.model_options import resolve_image_input_mode
+from app.providers.remote.fetch import (
+    FetchProviderError,
+    FetchProviderTimeout,
+    UnsafeFetchURL,
+    require_public_http_url,
+)
 from app.providers.remote.openai import (
     ProviderHTTPError,
     ProviderResponseError,
@@ -122,6 +131,7 @@ from app.services.chat_attachment_policy import (
 )
 from app.services.session_workspace import SessionWorkspaceService
 from app.services.token_estimate import estimate_tokens
+from app.services.text_utils import truncate_without_splitting_urls
 
 
 SSE_SCHEMA_VERSION = "1.0"
@@ -147,6 +157,26 @@ MAX_AGENT_TOOL_ROUNDS: int | None = None
 # so long tool loops are not starved; pure timeout backoff is still capped
 # separately via ``retry_delays``.
 MAX_PROVIDER_STREAM_ATTEMPTS = 256
+# Leading question/filler phrases stripped when deriving a second search query
+# for 思考-mode multi-search. Order matters: longest/most specific first.
+_SEARCH_QUERY_LEAD_PREFIXES = (
+    "请帮我",
+    "帮我看一下",
+    "请问一下",
+    "帮忙查一下",
+    "帮查一下",
+    "帮我查一下",
+    "查一下",
+    "请问",
+    "帮我",
+    "帮忙",
+    "介绍一下",
+    "我想知道",
+    "什么是",
+    "为什么",
+    "如何",
+    "怎么",
+)
 # Tool arguments can contain generated files or other large payloads. Keep the
 # durable MessagePart data complete for provider continuation, but bound the
 # copy persisted in/replayed through the SSE event log.
@@ -1702,7 +1732,9 @@ class ChatService:
 
         def mechanical(items: list[Message]) -> str:
             return "\n".join(
-                f"- {item.role} {item.id}: {item.content[:400]}" for item in items
+                f"- {item.role} {item.id}: "
+                f"{truncate_without_splitting_urls(item.content, 400)}"
+                for item in items
             )
 
         if not older:
@@ -1867,6 +1899,7 @@ class ChatService:
         additional_context: str = "",
         history_before_message_id: str | None = None,
         agent_mode: bool = False,
+        web_search_results_present: bool = False,
         audio_transcripts: list[tuple[FileRecord, AudioTranscription]] | None = None,
     ) -> tuple[str, ContextSummary | None]:
         history = self._session_timeline(session_id)
@@ -1920,7 +1953,7 @@ class ChatService:
         authorized_context = "\n\n".join(section for section in context_sections if section)
         style_instructions = (
             f"{self._style_instructions()}\n\n"
-            f"{self._mode_tool_policy(agent_mode_enabled=agent_mode)}"
+            f"{self._mode_tool_policy(agent_mode_enabled=agent_mode, web_search_results_present=web_search_results_present)}"
         )
         if not history:
             prompt = f"当前用户消息：\n{current_content}"
@@ -2239,6 +2272,7 @@ class ChatService:
         additional_context: str = "",
         history_before_message_id: str | None = None,
         agent_mode_enabled: bool = False,
+        web_search_results_present: bool = False,
         audio_transcripts: list[tuple[FileRecord, AudioTranscription]] | None = None,
     ) -> tuple[list[ProviderChatMessage], ContextSummary | None]:
         session = self.sessions.require(session_id, "session")
@@ -2290,6 +2324,7 @@ class ChatService:
                 role="system",
                 content=self._mode_tool_policy(
                     agent_mode_enabled=agent_mode_enabled,
+                    web_search_results_present=web_search_results_present,
                 ),
             )
         )
@@ -2836,6 +2871,7 @@ class ChatService:
                 "magic_card",
                 "image",
                 "chart",
+                "fetch_authorization",
                 "user_confirmation",
             }:
                 part_type = "sandbox_artifact"
@@ -2852,6 +2888,24 @@ class ChatService:
             normalized_status = status if status in {"completed", "failed", "streaming", "pending"} else "completed"
             if isinstance(data, dict):
                 candidates.append((part_type, normalized_status, data))
+
+        fetch_auth = result_meta.get("fetch_authorization_required")
+        if isinstance(fetch_auth, dict):
+            candidates.append(
+                (
+                    "fetch_authorization",
+                    "pending",
+                    {
+                        "authorization_request_id": fetch_auth.get("authorization_request_id"),
+                        "tool_call_id": fetch_auth.get("tool_call_id"),
+                        "tool_name": fetch_auth.get("tool_name") or "fetch_web_page",
+                        "tool_label": fetch_auth.get("tool_label") or "网页抓取工具",
+                        "requested_url": fetch_auth.get("requested_url") or "",
+                        "hostname": fetch_auth.get("hostname") or "",
+                        "message_zh": fetch_auth.get("message_zh") or "网页抓取需要用户授权。",
+                    },
+                )
+            )
 
         auth = result_meta.get("sandbox_auth_required")
         if isinstance(auth, dict):
@@ -2903,6 +2957,8 @@ class ChatService:
                 content = str(data.get("title") or data.get("path") or "沙箱产物")
             elif part_type == "sandbox_status":
                 content = str(data.get("message_zh") or data.get("phase") or "沙箱执行")
+            elif part_type == "fetch_authorization":
+                content = str(data.get("message_zh") or "网页抓取需要授权")
             elif part_type == "component":
                 props = data.get("props") if isinstance(data.get("props"), dict) else {}
                 content = str(
@@ -2964,7 +3020,13 @@ class ChatService:
                 message_version_id=assistant_version_id,
                 part_id=record.id,
                 sequence=sequence,
-                event_type="part.completed" if record.status == "completed" else "part.failed",
+                event_type=(
+                    "part.completed"
+                    if record.status == "completed"
+                    else "part.started"
+                    if record.status == "pending"
+                    else "part.failed"
+                ),
                 payload={
                     "part": self._part_snapshot(
                         record.id,
@@ -3682,7 +3744,53 @@ class ChatService:
                 {"provider_id": self.search_provider.provider_id},
             )
 
-    def _run_web_search(self, payload: MessageCreateRequest) -> tuple[list[dict], str]:
+    @staticmethod
+    def _derive_search_queries(content: str) -> list[str]:
+        """Deterministic query variants for 思考-mode multi-search.
+
+        Avoids an extra LLM round-trip; the rewrite only strips a leading
+        question/filler phrase and splits on sentence punctuation, so URLs in
+        the message are never split or rewritten.
+        """
+        text = content.strip()
+        if not text:
+            return [text]
+        # A URL is an atomic user reference. Keep URL-bearing messages as a
+        # single query rather than splitting punctuation inside paths/query
+        # strings (e.g. ?a=1,b=2) into broken search variants.
+        if ChatService._EXPLICIT_URL_RE.search(text):
+            return [text]
+        derived = text
+        for prefix in _SEARCH_QUERY_LEAD_PREFIXES:
+            if derived.startswith(prefix) and len(derived) > len(prefix) + 2:
+                derived = derived[len(prefix):]
+                break
+        derived = derived.strip("，,。！？?；;：:、 ")
+        clauses = [
+            part.strip()
+            for part in re.split(r"[，,。！？?；;]", derived)
+            if part.strip()
+        ]
+        variants = [text]
+        for clause in clauses:
+            if clause != text and clause not in variants:
+                variants.append(clause)
+            if len(variants) >= 2:
+                break
+        return variants
+
+    @staticmethod
+    def _search_multi_enabled(payload: MessageCreateRequest) -> bool:
+        """思考 mode runs two queries (原文 + 派生关键词)；极速 stays single."""
+        thinking = getattr(payload, "thinking_mode", None)
+        return bool(thinking) and thinking != "off"
+
+    def _run_web_search(
+        self,
+        payload: MessageCreateRequest,
+        *,
+        multi: bool = False,
+    ) -> tuple[list[dict], str]:
         if not payload.web_search:
             return [], ""
         effective_route = getattr(
@@ -3693,12 +3801,25 @@ class ChatService:
         self._ensure_web_search_available(payload)
         assert self.search_provider is not None
         allowed_domains = {item.strip().casefold() for item in payload.allowed_domains if item.strip()}
+        queries = self._derive_search_queries(payload.content) if multi else [payload.content]
         try:
-            results = self.search_provider.search(
-                payload.content,
-                5,
-                allowed_domains=allowed_domains or None,
-            )
+            results: list[SearchResult] = []
+            seen_urls: set[str] = set()
+            for query in queries[:2]:
+                chunk = self.search_provider.search(
+                    query,
+                    5,
+                    allowed_domains=allowed_domains or None,
+                )
+                for item in chunk:
+                    if item.url in seen_urls:
+                        continue
+                    seen_urls.add(item.url)
+                    results.append(item)
+                    if len(results) >= 8:
+                        break
+                if len(results) >= 8:
+                    break
         except SearchProviderTimeout as exc:
             raise AppError(504, "search_provider_timeout", "Search provider timed out") from exc
         except SearchProviderError as exc:
@@ -3708,17 +3829,829 @@ class ChatService:
                 "Search provider failed",
                 {"provider_id": self.search_provider.provider_id},
             ) from exc
-        source_data = [item.model_dump(mode="json") for item in results]
+        source_data = [
+            {
+                **item.model_dump(mode="json"),
+                "index": index,
+            }
+            for index, item in enumerate(results, start=1)
+        ]
         source_lines = [
             f"[{index}] {item.title}\nURL: {item.url}\n摘要: {item.snippet}"
             for index, item in enumerate(results, start=1)
         ]
         context = (
             "联网检索来源：以下是已授权 SearchProvider 返回的发现线索；"
-            "回答中只能将其作为带 URL 的来源线索，不能把摘要冒充原网页全文。\n"
+            "回答中只能将其作为带 URL 的来源线索，不能把摘要冒充原网页全文。"
+            "凡是依据某条来源作出的事实性判断，必须紧随该判断使用对应编号 [N]"
+            "（N 为每条来源开头的编号）；不要编造、跳号或引用未提供的编号。\n"
             + "\n\n".join(source_lines)
         )
         return source_data, context
+
+    # ------------------------------------------------------------------
+    # 极速/思考 fetch gate: explicit URLs trigger a fetch+search mix when
+    # authorized, an authorization card when not, and search-only otherwise.
+    # ------------------------------------------------------------------
+
+    _EXPLICIT_URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
+    _FETCH_CONTENT_BUDGET = 6_000
+
+    def _workspace_fetch_policy(self) -> dict[str, Any]:
+        setting = self.db.scalar(
+            select(WorkspaceSetting).where(
+                WorkspaceSetting.workspace_id == self.workspace_id,
+                WorkspaceSetting.key == "web_fetch.policy",
+            )
+        )
+        value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+        domains = value.get("allowed_domains")
+        return {
+            "allow_without_confirmation": bool(
+                value.get("allow_without_confirmation", False)
+            ),
+            "allowed_domains": [item for item in domains if isinstance(item, str)]
+            if isinstance(domains, list)
+            else [],
+        }
+
+    def _user_fetch_policy(self) -> dict[str, Any]:
+        from app.domain.models import UserWebFetchPolicy
+
+        row = self.db.scalar(
+            select(UserWebFetchPolicy).where(
+                UserWebFetchPolicy.workspace_id == self.workspace_id,
+                UserWebFetchPolicy.user_id == self.actor_id,
+            )
+        )
+        if row is None:
+            return {"allow_without_confirmation": False, "allowed_domains": []}
+        return {
+            "allow_without_confirmation": bool(row.allow_without_confirmation),
+            "allowed_domains": [
+                item for item in row.allowed_domains if isinstance(item, str)
+            ],
+        }
+
+    def _effective_fetch_policy(self) -> dict[str, Any]:
+        workspace = self._workspace_fetch_policy()
+        user = self._user_fetch_policy()
+        return {
+            "allow_without_confirmation": bool(
+                workspace["allow_without_confirmation"]
+                or user["allow_without_confirmation"]
+            ),
+            "allowed_domains": list(
+                dict.fromkeys(
+                    [*workspace["allowed_domains"], *user["allowed_domains"]]
+                )
+            ),
+        }
+
+    def _explicit_urls(self, text: str) -> list[str]:
+        urls: list[str] = []
+        for match in self._EXPLICIT_URL_RE.finditer(text or ""):
+            url = match.group(0).rstrip(".,;:!?）)]】\"'")
+            if url and url not in urls:
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    def _hostname_of(url: str) -> str:
+        from urllib.parse import urlparse
+
+        host = urlparse(url.strip()).hostname
+        return host.casefold() if host else ""
+
+    def _fetch_provider(self) -> FetchProviderPort | None:
+        if getattr(self, "_resolved_fetch_provider", None) is not None:
+            return getattr(self, "_resolved_fetch_provider", None)
+        from app.core.config import get_settings
+        from app.providers.factory import fetch_provider_for_workspace
+
+        provider = fetch_provider_for_workspace(
+            self.db, self.workspace_id, get_settings()
+        )
+        self._resolved_fetch_provider = provider
+        return provider
+
+    def _fetch_available(self) -> bool:
+        provider = self._fetch_provider()
+        if provider is not None and not getattr(provider, "reason", None):
+            return True
+        return callable(getattr(self.search_provider, "fetch", None))
+
+    def _consumable_allow_once(
+        self, session_id: str, url: str
+    ) -> FetchAuthorizationRequest | None:
+        from app.domain.models import FetchAuthorizationRequest
+
+        return self.db.scalar(
+            select(FetchAuthorizationRequest).where(
+                FetchAuthorizationRequest.workspace_id == self.workspace_id,
+                FetchAuthorizationRequest.chat_session_id == session_id,
+                FetchAuthorizationRequest.status == "approved",
+                FetchAuthorizationRequest.decision == "allow_once",
+                FetchAuthorizationRequest.requested_url == url.strip(),
+            )
+        )
+
+    def _is_host_authorized(
+        self,
+        session_id: str,
+        url: str,
+        host: str,
+        payload: MessageCreateRequest,
+        policy: dict[str, Any],
+    ) -> bool:
+        if policy["allow_without_confirmation"]:
+            return True
+        if host in {
+            item.strip().casefold() for item in policy["allowed_domains"]
+        }:
+            return True
+        if host in {
+            item.strip().casefold()
+            for item in payload.allowed_domains
+            if item.strip()
+        }:
+            return True
+        return self._consumable_allow_once(session_id, url) is not None
+
+    def _fetch_gate_plan(
+        self,
+        session_id: str,
+        payload: MessageCreateRequest,
+    ) -> tuple[str, tuple[str, str] | None]:
+        """Decide how a non-agent ``web_search`` turn handles explicit URLs.
+
+        Returns ``(plan, target)`` where ``target`` is ``(url, hostname)`` for
+        the gating URL.  Plans:
+          ``search_only``  — no explicit URL; plain web search.
+          ``mixed``        — URL(s) already authorized; fetch + search together.
+          ``pending_auth`` — first un-authorized URL gates the turn; show card.
+          ``unavailable``  — explicit URL but no usable FetchProvider.
+        """
+
+        urls = self._explicit_urls(payload.content)
+        if not urls:
+            return "search_only", None
+        if not self._fetch_available():
+            return "unavailable", (urls[0], self._hostname_of(urls[0]))
+        policy = self._effective_fetch_policy()
+        for url in urls:
+            host = self._hostname_of(url)
+            if not host:
+                continue
+            if self._is_host_authorized(
+                session_id, url, host, payload, policy
+            ):
+                continue
+            return "pending_auth", (url, host)
+        return "mixed", None
+
+    def _fetch_document(
+        self, url: str, domains: set[str]
+    ) -> FetchedDocument | None:
+        provider = self._fetch_provider()
+        if provider is not None and not getattr(provider, "reason", None):
+            try:
+                document = provider.fetch(url)
+                require_public_http_url(document.final_url, domains)
+                return document
+            except UnsafeFetchURL:
+                return None
+            except (FetchProviderTimeout, FetchProviderError):
+                return None
+        if callable(getattr(self.search_provider, "fetch", None)):
+            try:
+                document = self.search_provider.fetch(url)
+                require_public_http_url(document.final_url, domains)
+                return document
+            except UnsafeFetchURL:
+                return None
+            except (FetchProviderTimeout, FetchProviderError):
+                return None
+        return None
+
+    def _run_mixed_fetch_search(
+        self,
+        session_id: str,
+        payload: MessageCreateRequest,
+        urls: list[str],
+    ) -> tuple[list[dict], str, list[dict]]:
+        """Search plus fetch of already-authorized explicit URLs.
+
+        Returns ``(source_results, source_context, fetch_entries)``.
+        ``fetch_entries`` are URL sources merged into the assistant
+        ``source_list`` so fetched pages are citable like search hits.
+        """
+
+        policy = self._effective_fetch_policy()
+        policy_domains = {
+            item.strip().casefold() for item in policy["allowed_domains"]
+        }
+        payload_domains = {
+            item.strip().casefold()
+            for item in payload.allowed_domains
+            if item.strip()
+        }
+        domains = policy_domains | payload_domains
+        try:
+            search_results, search_context = self._run_web_search(payload)
+        except AppError as exc:
+            # A mixed turn can still be answered from the fetched page when no
+            # SearchProvider is configured; degrade search to empty instead of
+            # failing the whole turn.
+            if exc.code == "search_provider_unavailable":
+                search_results, search_context = [], ""
+            else:
+                raise
+        fetch_entries: list[dict] = []
+        fetched_lines: list[str] = []
+        for url in urls[:1]:
+            host = self._hostname_of(url)
+            if not host:
+                continue
+            effective_domains = set(domains)
+            one_time = self._consumable_allow_once(session_id, url)
+            if (
+                host in effective_domains
+                or policy["allow_without_confirmation"]
+                or one_time is not None
+            ):
+                effective_domains.add(host)
+                if one_time is not None:
+                    # allow_once is single-use: consume it so a later re-run of
+                    # the same URL asks again instead of silently reusing the grant.
+                    one_time.status = "consumed"
+                    self.db.commit()
+                document = self._fetch_document(url, effective_domains)
+                if document is None:
+                    continue
+                body = truncate_without_splitting_urls(
+                    document.content, self._FETCH_CONTENT_BUDGET
+                )
+                source_index = len(search_results) + len(fetch_entries) + 1
+                fetched_lines.append(
+                    f"[{source_index}] 抓取的网页全文（{document.final_url}）：\n"
+                    f"标题：{document.title}\n正文：\n{body}"
+                )
+                fetch_entries.append(
+                    {
+                        "url": document.final_url,
+                        "title": str(document.title or document.final_url)[:1_000],
+                        "index": source_index,
+                    }
+                )
+        if not fetched_lines:
+            return search_results, search_context, []
+        fetch_context = "已授权网页抓取结果（可据此回答并带 URL 引用）：\n" + "\n\n".join(
+            fetched_lines
+        )
+        merged_context = (
+            fetch_context
+            if not search_context
+            else f"{search_context}\n\n{fetch_context}"
+        )
+        return search_results, merged_context, fetch_entries
+
+    def _stream_fetch_pending_turn(
+        self,
+        *,
+        session_id: str,
+        payload: MessageCreateRequest,
+        attached_files: list[FileRecord],
+        url: str,
+        hostname: str,
+        normalized_key: str | None,
+        key_hash: str | None,
+        request_hash: str,
+    ) -> Iterable[str]:
+        """Pause a 极速/思考 turn on an un-authorized URL authorization card.
+
+        Persists the user message and a pending assistant placeholder carrying
+        the ``fetch_authorization`` part, then ends the stream without calling
+        the model.  After the user decides, ``resume_fetch_generation`` updates
+        the same assistant message in place.
+        """
+
+        from app.domain.models import FetchAuthorizationRequest
+
+        user_part_id = str(uuid4())
+        attachment_snapshots = [
+            self._part_snapshot(
+                str(uuid4()),
+                "attachment",
+                "completed",
+                file.original_name,
+                data={
+                    "file_id": file.id,
+                    "filename": file.original_name,
+                    "media_type": file.mime_type,
+                    "parse_status": file.parse_status,
+                    "input_mode": "workspace_input",
+                },
+            )
+            for file in attached_files
+        ]
+        user_message = self.messages.add(
+            Message(
+                workspace_id=self.workspace_id,
+                session_id=session_id,
+                parent_message_id=payload.parent_message_id,
+                role="user",
+                content=payload.content,
+                status="completed",
+                parts=[
+                    self._part_snapshot(
+                        user_part_id, "text", "completed", payload.content
+                    ),
+                    *attachment_snapshots,
+                ],
+            )
+        )
+        user_version = self.message_versions.add(
+            MessageVersion(
+                workspace_id=self.workspace_id,
+                message_id=user_message.id,
+                version=1,
+                status="completed",
+            )
+        )
+        self.message_parts.add(
+            MessagePartRecord(
+                id=user_part_id,
+                workspace_id=self.workspace_id,
+                message_version_id=user_version.id,
+                ordinal=0,
+                part_type="text",
+                status="completed",
+                content=payload.content,
+            )
+        )
+        for ordinal, snapshot in enumerate(attachment_snapshots, start=1):
+            self.message_parts.add(
+                MessagePartRecord(
+                    id=snapshot["id"],
+                    workspace_id=self.workspace_id,
+                    message_version_id=user_version.id,
+                    ordinal=ordinal,
+                    part_type=snapshot["type"],
+                    status="completed",
+                    content=snapshot["content"] or "",
+                    data=snapshot["data"] or {},
+                )
+            )
+        for file_id in dict.fromkeys(payload.file_ids):
+            FileReferenceService(self.db, self.workspace_id).add(
+                file_id,
+                FileReferenceCreate(
+                    target_type="message",
+                    target_id=user_message.id,
+                    relation="chat_context",
+                ),
+            )
+
+        auth_part_id = str(uuid4())
+        auth_part_data = {
+            "authorization_request_id": "",
+            "tool_call_id": "non-agent-fetch-gate",
+            "tool_name": "fetch_web_page",
+            "tool_label": "网页抓取工具",
+            "requested_url": url,
+            "hostname": hostname,
+            "message_zh": (
+                f"这条消息包含未授权的网址 {url}。是否允许抓取该网页，"
+                "以获得更准确的回答？"
+            ),
+            "resume_mode": "server",
+        }
+        assistant_message = self.messages.add(
+            Message(
+                workspace_id=self.workspace_id,
+                session_id=session_id,
+                parent_message_id=user_message.id,
+                role="assistant",
+                version=1,
+                status="completed",
+                content="",
+                parts=[
+                    self._part_snapshot(
+                        auth_part_id,
+                        "fetch_authorization",
+                        "pending",
+                        "网页抓取需要授权。",
+                        data=auth_part_data,
+                    ),
+                ],
+            )
+        )
+        assistant_version = self.message_versions.add(
+            MessageVersion(
+                workspace_id=self.workspace_id,
+                message_id=assistant_message.id,
+                version=1,
+                status="completed",
+            )
+        )
+        self.message_parts.add(
+            MessagePartRecord(
+                id=auth_part_id,
+                workspace_id=self.workspace_id,
+                message_version_id=assistant_version.id,
+                ordinal=0,
+                part_type="fetch_authorization",
+                status="pending",
+                content="网页抓取需要授权。",
+                data=auth_part_data,
+            )
+        )
+
+        fetch_request = FetchAuthorizationRequest(
+            workspace_id=self.workspace_id,
+            chat_session_id=session_id,
+            actor_id=self.actor_id,
+            tool_call_id="non-agent-fetch-gate",
+            tool_name="fetch_web_page",
+            requested_url=url,
+            hostname=hostname,
+            status="pending",
+            resume_payload={
+                "request": payload.model_dump(mode="json"),
+                "idempotency_key": normalized_key,
+                "key_hash": key_hash,
+                "request_hash": request_hash,
+                "session_id": session_id,
+                "user_message_id": user_message.id,
+                "assistant_message_id": assistant_message.id,
+            },
+            assistant_message_id=assistant_message.id,
+            user_message_id=user_message.id,
+        )
+        self.db.add(fetch_request)
+        self.db.flush()
+        # JSON columns do not persist an in-place nested-dict mutation. Replace
+        # both durable snapshots so a reload keeps an actionable request id.
+        auth_part_data = {
+            **auth_part_data,
+            "authorization_request_id": fetch_request.id,
+        }
+        auth_part_record = self.db.get(MessagePartRecord, auth_part_id)
+        if auth_part_record is None:
+            raise RuntimeError("Fetch authorization part was not persisted")
+        auth_part_record.data = auth_part_data
+        assistant_message.parts = [
+            self._part_snapshot(
+                auth_part_id,
+                "fetch_authorization",
+                "pending",
+                "网页抓取需要授权。",
+                data=auth_part_data,
+            )
+        ]
+        if key_hash:
+            self.submissions.add(
+                MessageSubmission(
+                    workspace_id=self.workspace_id,
+                    session_id=session_id,
+                    idempotency_key_hash=key_hash,
+                    request_hash=request_hash,
+                    user_message_id=user_message.id,
+                    assistant_message_id=assistant_message.id,
+                    message_version_id=assistant_version.id,
+                    status="pending_authorization",
+                )
+            )
+        self.db.commit()
+
+        sequence = 1
+        envelopes = [
+            self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=None,
+                sequence=sequence,
+                event_type="message.accepted",
+                payload={"status": "accepted", "user_message_id": user_message.id},
+            ),
+        ]
+        sequence += 1
+        envelopes.append(
+            self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=None,
+                sequence=sequence,
+                event_type="message.started",
+                payload={"status": "streaming", "user_message_id": user_message.id},
+            )
+        )
+        sequence += 1
+        envelopes.append(
+            self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=auth_part_id,
+                sequence=sequence,
+                event_type="part.started",
+                payload={
+                    "part": self._part_snapshot(
+                        auth_part_id,
+                        "fetch_authorization",
+                        "pending",
+                        "网页抓取需要授权。",
+                        auth_part_data,
+                    )
+                },
+            )
+        )
+        sequence += 1
+        envelopes.append(
+            self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=auth_part_id,
+                sequence=sequence,
+                event_type="part.completed",
+                payload={
+                    "part": self._part_snapshot(
+                        auth_part_id,
+                        "fetch_authorization",
+                        "completed",
+                        "网页抓取需要授权。",
+                        auth_part_data,
+                    )
+                },
+            )
+        )
+        sequence += 1
+        envelopes.append(
+            self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=None,
+                sequence=sequence,
+                event_type="message.completed",
+                payload={
+                    "status": "completed",
+                    "fetch_authorization_pending": True,
+                },
+            )
+        )
+        self._touch_session(session_id)
+        for envelope in envelopes:
+            yield self._encode_event(envelope)
+
+    def resume_fetch_generation(self, request_id: str) -> dict[str, str]:
+        """Resume a paused 极速/思考 fetch turn after the user approved.
+
+        Runs the authorized fetch+search mix and updates the pending assistant
+        message in place, then marks the submission completed.  Synchronous —
+        the frontend refetches session history once the decision resolves.
+        """
+
+        from app.domain.models import FetchAuthorizationRequest
+
+        request = self.db.scalar(
+            select(FetchAuthorizationRequest).where(
+                FetchAuthorizationRequest.id == request_id,
+                FetchAuthorizationRequest.workspace_id == self.workspace_id,
+            )
+        )
+        if request is None or request.status != "approved":
+            raise AppError(
+                409,
+                "fetch_authorization_not_approved",
+                "网页抓取授权尚未批准，无法恢复。",
+            )
+        if request.assistant_message_id is None or not request.resume_payload:
+            raise AppError(
+                409,
+                "fetch_authorization_not_resumable",
+                "该授权不在服务端恢复流程内。",
+            )
+        payload = MessageCreateRequest.model_validate(
+            request.resume_payload["request"]
+        )
+        session_id = request.chat_session_id
+        plan, _ = self._fetch_gate_plan(session_id, payload)
+        if plan != "mixed":
+            raise AppError(
+                409,
+                "fetch_authorization_not_satisfied",
+                "该网址仍不在授权范围内，无法恢复。",
+            )
+        self._ensure_model_provider_available()
+        structured_chat = bool(
+            getattr(self.model_provider, "supports_structured_chat", False)
+        )
+        source_results, source_context, fetch_entries = self._run_mixed_fetch_search(
+            session_id, payload, self._explicit_urls(payload.content)
+        )
+        assistant_message = self.db.get(Message, request.assistant_message_id)
+        if (
+            assistant_message is None
+            or assistant_message.workspace_id != self.workspace_id
+            or assistant_message.session_id != session_id
+        ):
+            raise AppError(
+                404,
+                "pending_assistant_message_not_found",
+                "等待授权的消息已不存在。",
+            )
+        assistant_version = self._latest_version(assistant_message.id)
+        user_message_id = request.user_message_id
+
+        additional_context = source_context or ""
+        if structured_chat:
+            provider_messages, _ = self._build_structured_messages(
+                session_id,
+                payload.content,
+                node_ids=payload.node_ids,
+                file_ids=payload.file_ids,
+                document_selection=payload.document_selection,
+                additional_context=additional_context,
+                history_before_message_id=user_message_id,
+                agent_mode_enabled=False,
+                web_search_results_present=bool(source_context),
+            )
+            provider_prompt = "\n".join(
+                message.content or "" for message in provider_messages
+            )
+        else:
+            provider_prompt, _ = self._build_model_prompt(
+                session_id,
+                payload.content,
+                node_ids=payload.node_ids,
+                file_ids=payload.file_ids,
+                document_selection=payload.document_selection,
+                additional_context=additional_context,
+                history_before_message_id=user_message_id,
+                agent_mode=False,
+                web_search_results_present=bool(source_context),
+            )
+
+        final_text = ""
+        try:
+            if structured_chat:
+                for provider_event in self.model_provider.stream_chat(
+                    provider_messages
+                ):
+                    if provider_event.type == "text_delta":
+                        final_text += provider_event.content or ""
+            else:
+                for chunk in self.model_provider.stream_answer(provider_prompt):
+                    if chunk:
+                        final_text += chunk
+        except Exception:
+            assistant_message.status = "failed"
+            assistant_message.content = ""
+            assistant_version.status = "failed"
+            self.db.commit()
+            raise
+        final_text = final_text.strip()
+
+        # Replace the pending authorization card with the completed answer. The
+        # snapshot loader reads MessagePartRecord rows (not Message.parts), so
+        # retaining the card would make it reappear after a refresh and collide
+        # with the answer's ordinal zero.
+        pending_auth_part = self.db.scalar(
+            select(MessagePartRecord).where(
+                MessagePartRecord.workspace_id == self.workspace_id,
+                MessagePartRecord.message_version_id == assistant_version.id,
+                MessagePartRecord.part_type == "fetch_authorization",
+            )
+        )
+        if pending_auth_part is not None:
+            self.db.delete(pending_auth_part)
+            self.db.flush()
+
+        next_ordinal = 0
+        text_record = self.message_parts.add(
+            MessagePartRecord(
+                workspace_id=self.workspace_id,
+                message_version_id=assistant_version.id,
+                ordinal=next_ordinal,
+                part_type="text",
+                status="completed",
+                content=final_text,
+            )
+        )
+        next_ordinal += 1
+        source_record: MessagePartRecord | None = None
+        if source_results or fetch_entries:
+            all_sources = [*source_results, *fetch_entries]
+            source_record = self.message_parts.add(
+                MessagePartRecord(
+                    workspace_id=self.workspace_id,
+                    message_version_id=assistant_version.id,
+                    ordinal=next_ordinal,
+                    part_type="source_list",
+                    status="completed",
+                    content=f"已获取 {len(all_sources)} 条授权来源。",
+                    data={
+                        "provider_id": (
+                            self.search_provider.provider_id
+                            if source_results and self.search_provider is not None
+                            else "local_fts5"
+                        ),
+                        "remote_capability": bool(
+                            source_results
+                            and self.search_provider is not None
+                            and self.search_provider.remote_capability
+                        ),
+                        "results": all_sources,
+                    },
+                )
+            )
+
+        parts = [
+            self._part_snapshot(
+                text_record.id, "text", "completed", final_text
+            ),
+        ]
+        if source_record is not None:
+            parts.append(
+                self._part_snapshot(
+                    source_record.id,
+                    "source_list",
+                    "completed",
+                    source_record.content,
+                    source_record.data,
+                )
+            )
+        provider_trace = {
+            "provider_id": self.model_provider.provider_id,
+            "provider_type": getattr(self.model_provider, "provider_type", "unknown"),
+            "model_id": self.model_provider.model_id,
+            "remote_capability": self.model_provider.remote_capability,
+            "attempts": 1,
+            "usage_is_estimate": False,
+            "cost_usd": 0,
+            "thinking_mode": getattr(self.model_provider, "thinking_mode", "off"),
+            "search_route": getattr(self.model_provider, "search_route", "disabled"),
+            "agent_mode": False,
+            "resumed_from_fetch_authorization": True,
+        }
+        assistant_message.content = final_text
+        assistant_message.parts = parts
+        assistant_message.status = "completed"
+        assistant_message.provider_trace = provider_trace
+        assistant_version.status = "completed"
+        assistant_version.provider_trace = provider_trace
+
+        if request.resume_payload.get("key_hash"):
+            submission = self._submission_for_key(
+                session_id, request.resume_payload["key_hash"]
+            )
+            if submission is not None:
+                submission.status = "completed"
+
+        sequence = (
+            self.db.scalar(
+                select(func.max(MessageStreamEvent.sequence)).where(
+                    MessageStreamEvent.workspace_id == self.workspace_id,
+                    MessageStreamEvent.message_version_id == assistant_version.id,
+                )
+            )
+            or 0
+        ) + 1
+        if source_record is not None:
+            self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=source_record.id,
+                sequence=sequence,
+                event_type="part.completed",
+                payload={
+                    "part": self._part_snapshot(
+                        source_record.id,
+                        "source_list",
+                        "completed",
+                        source_record.content,
+                        source_record.data,
+                    )
+                },
+            )
+            sequence += 1
+        self._append_event(
+            session_id=session_id,
+            message_id=assistant_message.id,
+            message_version_id=assistant_version.id,
+            part_id=text_record.id,
+            sequence=sequence,
+            event_type="message.completed",
+            payload={"status": "completed", "provider_trace": provider_trace},
+        )
+        self._touch_session(session_id)
+        return {"status": "completed", "assistant_message_id": assistant_message.id}
 
     def _generate_conversation_graph_proposal(
         self,
@@ -4850,12 +5783,25 @@ class ChatService:
         return build_style_instructions(self._response_style_config())
 
     @staticmethod
-    def _mode_tool_policy(*, agent_mode_enabled: bool) -> str:
+    def _mode_tool_policy(
+        *,
+        agent_mode_enabled: bool,
+        web_search_results_present: bool = False,
+    ) -> str:
         """Transient per-turn tool policy sent only to the Provider.
 
         This instruction is deliberately constructed outside Message and
         MessagePart persistence. A user's own tool-related request remains part
         of their durable message; mode-switch guidance never enters history.
+
+        The non-agent branches must state only that this turn exposes no
+        *callable tool interface* — never that the model "cannot use the
+        internet". In 极速/思考 mode an external SearchProvider may still have
+        pre-retrieved results into the authorized context, so a categorical
+        "no tools / no network" instruction makes the model claim it cannot
+        use web search even though the retrieved sources are right in front of
+        it. ``web_search_results_present`` signals that case so the prompt can
+        instead point the model at the pre-retrieved sources.
         """
 
         if agent_mode_enabled:
@@ -4863,10 +5809,16 @@ class ChatService:
                 "当前为智能体模式。你可以调用本轮请求中实际提供且已授权的工具；"
                 "仅在完成用户请求确有需要时调用，并依据真实工具结果回答。"
             )
+        if web_search_results_present:
+            return (
+                "当前为极速或思考模式。本轮不提供可调用的工具接口，请勿发出工具调用，"
+                "也不要假装完成过工具操作。下方上下文已包含预检索的联网结果"
+                "（联网检索来源），回答时可以直接引用其中的 URL 与摘要，"
+                "但不要把摘要冒充原网页全文。"
+            )
         return (
-            "当前为极速或思考模式。本模式禁止调用任何工具，也不要输出、伪造或请求"
-            "工具调用；请只使用本轮已提供的消息与授权上下文直接回答。即使此前会话曾"
-            "使用工具，本轮也不得继续调用。"
+            "当前为极速或思考模式。本轮不提供可调用的工具接口，请勿发出工具调用，"
+            "也不要假装完成过工具操作；请只使用本轮已提供的消息与授权上下文直接回答。"
         )
 
     def _require_suggested_prompt_context_access(
@@ -6799,6 +7751,7 @@ class ChatService:
                 additional_context=retry_additional_context,
                 history_before_message_id=parent.id,
                 agent_mode_enabled=retry_agent_mode,
+                web_search_results_present=bool(source_context),
                 audio_transcripts=retry_audio_transcripts,
             )
             provider_messages, image_input_trace = self._with_image_inputs(
@@ -6822,6 +7775,7 @@ class ChatService:
                 additional_context=retry_additional_context,
                 history_before_message_id=parent.id,
                 agent_mode=retry_agent_mode,
+                web_search_results_present=bool(source_context),
                 audio_transcripts=retry_audio_transcripts,
             )
             # Text-only primary path: still allow external_vision captions.
@@ -8582,7 +9536,11 @@ class ChatService:
                 ),
             )
         if not existing_submission and not payload.agent_mode:
-            self._ensure_web_search_available(payload)
+            # A message with an explicit URL may be servable by the fetch gate
+            # (authorized fetch+search or an authorization card) even without a
+            # SearchProvider; only require one for ordinary search-only turns.
+            if not (self._explicit_urls(payload.content) and self._fetch_available()):
+                self._ensure_web_search_available(payload)
         if payload.document_selection is not None and not existing_submission:
             self._preview_document_selection(
                 payload.document_selection,
@@ -8771,6 +9729,9 @@ class ChatService:
                 session_id,
                 payload.selection_context,
             )
+        # Non-agent fetch gate state (极速/思考): merged fetched sources.
+        fetch_source_entries: list[dict] = []
+        fetch_setup_notice = False
         if payload.agent_mode and payload.web_search:
             # Mirrors the preflight gate: model_native needs no SearchProvider.
             if not self._uses_model_native_search(payload) and (
@@ -8794,7 +9755,41 @@ class ChatService:
                 )
             source_results, source_context = [], ""
         else:
-            source_results, source_context = self._run_web_search(payload)
+            # Non-agent (极速/思考): an explicit URL triggers the fetch gate —
+            # already-authorized URLs fetch + search together, an un-authorized
+            # URL pauses on an authorization card (server resumes after the
+            # user decides), and everything else is plain web search.
+            fetch_setup_notice = False
+            fetch_plan, fetch_target = self._fetch_gate_plan(session_id, payload)
+            if fetch_plan == "pending_auth" and fetch_target is not None:
+                yield from self._stream_fetch_pending_turn(
+                    session_id=session_id,
+                    payload=payload,
+                    attached_files=attached_files,
+                    url=fetch_target[0],
+                    hostname=fetch_target[1],
+                    normalized_key=normalized_key,
+                    key_hash=key_hash,
+                    request_hash=request_hash,
+                )
+                return
+            elif fetch_plan == "mixed":
+                source_results, source_context, fetch_source_entries = (
+                    self._run_mixed_fetch_search(
+                        session_id,
+                        payload,
+                        self._explicit_urls(payload.content),
+                    )
+                )
+            else:
+                source_results, source_context = self._run_web_search(
+                    payload, multi=self._search_multi_enabled(payload)
+                )
+                # Explicit URL but no usable FetchProvider: answer from search
+                # only, and surface a one-time gentle "configure fetch" notice
+                # after the answer (dismissible client-side).
+                if self._explicit_urls(payload.content) and not self._fetch_available():
+                    fetch_setup_notice = True
         prepared_graph_proposal = self._generate_conversation_graph_proposal(session, payload)
         graph_proposal_context = prepared_graph_proposal[-1] if prepared_graph_proposal else ""
         skill_package_context = self._agent_skill_package_instructions(
@@ -8823,6 +9818,7 @@ class ChatService:
                 document_selection=payload.document_selection,
                 additional_context=additional_context,
                 agent_mode_enabled=bool(payload.agent_mode),
+                web_search_results_present=bool(source_context),
                 audio_transcripts=audio_transcripts,
             )
             provider_messages, image_input_trace = self._with_image_inputs(
@@ -8845,6 +9841,7 @@ class ChatService:
                 document_selection=payload.document_selection,
                 additional_context=additional_context,
                 agent_mode=bool(payload.agent_mode),
+                web_search_results_present=bool(source_context),
                 audio_transcripts=audio_transcripts,
             )
             if any(self._is_image_attachment(file) for file in attached_files):
@@ -8856,7 +9853,11 @@ class ChatService:
                 if caption_block:
                     provider_prompt = f"{provider_prompt}\n\n{caption_block}"
             provider_billing_input = provider_prompt
-        all_source_results = [*source_results, *self.document_source_results]
+        all_source_results = [
+            *source_results,
+            *fetch_source_entries,
+            *self.document_source_results,
+        ]
         initial_chat_quote = self._preflight_model_call(provider_billing_input, "chat")
 
         user_part_id = str(uuid4())
@@ -9277,6 +10278,22 @@ class ChatService:
                 )
             )
             next_ordinal += 1
+        fetch_notice_record: MessagePartRecord | None = None
+        if fetch_setup_notice:
+            fetch_notice_record = self.message_parts.add(
+                MessagePartRecord(
+                    workspace_id=self.workspace_id,
+                    message_version_id=assistant_version.id,
+                    ordinal=next_ordinal,
+                    part_type="fetch_setup_notice",
+                    status="completed",
+                    content="未配置网页抓取工具；本轮仅使用联网搜索回答。",
+                    data={
+                        "settings_path": f"/w/{self.workspace_id}/settings/providers",
+                    },
+                )
+            )
+            next_ordinal += 1
         graph_change_set = None
         graph_component_record: MessagePartRecord | None = None
         if prepared_graph_proposal is not None:
@@ -9483,6 +10500,17 @@ class ChatService:
                         sequence=graph_component_record.ordinal,
                     )
                 )
+            if fetch_notice_record is not None:
+                parts.append(
+                    self._part_snapshot(
+                        fetch_notice_record.id,
+                        "fetch_setup_notice",
+                        "completed",
+                        fetch_notice_record.content,
+                        fetch_notice_record.data,
+                        sequence=fetch_notice_record.ordinal,
+                    )
+                )
             for streamed_part in streamed_parts:
                 parts.append(
                     self._part_snapshot(
@@ -9558,6 +10586,25 @@ class ChatService:
                         "completed",
                         source_record.content,
                         source_record.data,
+                    )
+                },
+            ))
+            sequence += 1
+        if fetch_notice_record is not None:
+            initial_events.append(self._append_event(
+                session_id=session_id,
+                message_id=assistant_message.id,
+                message_version_id=assistant_version.id,
+                part_id=fetch_notice_record.id,
+                sequence=sequence,
+                event_type="part.started",
+                payload={
+                    "part": self._part_snapshot(
+                        fetch_notice_record.id,
+                        "fetch_setup_notice",
+                        "completed",
+                        fetch_notice_record.content,
+                        fetch_notice_record.data,
                     )
                 },
             ))

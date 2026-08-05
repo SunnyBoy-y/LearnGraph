@@ -40,6 +40,8 @@ export interface ProviderCreateRequest {
 
 export interface ProviderUpdateRequest {
   enabled?: boolean;
+  /** Catalog provider type, which determines the connection protocol. */
+  provider_type?: string;
   base_url?: string | null;
   default_model?: string | null;
   default_image_generation_model_id?: string | null;
@@ -95,10 +97,47 @@ export function isModelProviderType(providerType: string): boolean {
 }
 
 /**
- * DeepSeek is OpenAI-compatible at the wire level. Official DeepSeek features
- * (balance lookup, native thinking stream) activate when the provider points at
- * api.deepseek.com, is a legacy deepseek_chat row, or declares model_family /
- * brand_id deepseek, or the selected model id looks like a DeepSeek model.
+ * Official DeepSeek channel, used for identity display (brand mark, "DeepSeek"
+ * badge, protocol column). Mirrors the backend's narrow trust boundary
+ * (`is_deepseek_chat_configuration` in backend/app/providers/remote/deepseek.py):
+ * only the documented official origin or a legacy native catalog row counts.
+ * Custom gateways and relay stations that merely serve DeepSeek models must
+ * never be upgraded to official identity implicitly.
+ */
+export function isOfficialDeepSeekProvider(
+  provider: Pick<Provider, "provider_type" | "base_url">,
+): boolean {
+  // Legacy native catalog row: the official DeepSeek integration.
+  if (provider.provider_type === "deepseek_chat") return true;
+  if (
+    provider.provider_type !== "openai_compatible_chat" ||
+    !provider.base_url
+  ) {
+    return false;
+  }
+  try {
+    const url = new URL(provider.base_url);
+    return (
+      url.protocol === "https:" &&
+      url.hostname.toLowerCase() === "api.deepseek.com" &&
+      !url.port &&
+      !url.username &&
+      !url.password &&
+      (url.pathname === "/" || url.pathname === "") &&
+      !url.search &&
+      !url.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * DeepSeek is OpenAI-compatible at the wire level. This is the behavioral
+ * "DeepSeek family" check (thinking-mode fallbacks, balance routing); it also
+ * matches relay stations that host DeepSeek models. It must not be used for
+ * identity display — use `isOfficialDeepSeekProvider` for the brand mark and
+ * badge so custom channels are never labelled DeepSeek.
  */
 export function isDeepSeekProvider(
   provider: Pick<Provider, "provider_type" | "base_url" | "capabilities">,
@@ -122,27 +161,7 @@ export function isDeepSeekProvider(
       return true;
     }
   }
-  if (
-    !["deepseek_chat", "openai_compatible_chat"].includes(provider.provider_type) ||
-    !provider.base_url
-  ) {
-    return false;
-  }
-  try {
-    const url = new URL(provider.base_url);
-    return (
-      url.protocol === "https:" &&
-      url.hostname.toLowerCase() === "api.deepseek.com" &&
-      !url.port &&
-      !url.username &&
-      !url.password &&
-      url.pathname === "/" &&
-      !url.search &&
-      !url.hash
-    );
-  } catch {
-    return false;
-  }
+  return isOfficialDeepSeekProvider(provider);
 }
 
 export function isAnthropicProvider(

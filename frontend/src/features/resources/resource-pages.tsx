@@ -72,6 +72,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { listSettings, updateSetting } from "@/api/settings";
+import type { WebFetchPolicy } from "@/types/settings";
 import { Label } from "@/components/ui/label";
 import {
   Dialog,
@@ -1065,6 +1068,29 @@ export function SearchPage() {
   const [query, setQuery] = useState("");
   const [result, setResult] = useState<SearchResponse | null>(null);
   const [saved, setSaved] = useState<SourceRecord | null>(null);
+  const [domainInput, setDomainInput] = useState("");
+  const queryClient = useQueryClient();
+  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
+  const fetchPolicy = useMemo<WebFetchPolicy>(() => {
+    const raw = settings.data?.find((item) => item.key === "web_fetch.policy")?.value;
+    if (!raw || typeof raw !== "object") return { allow_without_confirmation: false, allowed_domains: [] };
+    const value = raw as Partial<WebFetchPolicy>;
+    return {
+      allow_without_confirmation: value.allow_without_confirmation === true,
+      allowed_domains: Array.isArray(value.allowed_domains) ? value.allowed_domains.filter((item): item is string => typeof item === "string") : [],
+    };
+  }, [settings.data]);
+  const updateFetchPolicy = useMutation({
+    mutationFn: (policy: WebFetchPolicy) => updateSetting("web_fetch.policy", policy),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["settings"], (current: unknown) =>
+        Array.isArray(current)
+          ? [...current.filter((item) => item?.key !== updated.key), updated]
+          : [updated],
+      );
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "网页抓取权限更新失败"),
+  });
   const search = useMutation({
     mutationFn: () => searchWeb({ query, max_results: 6 }),
     onSuccess: setResult,
@@ -1125,6 +1151,56 @@ export function SearchPage() {
             {fetchUrl.isPending ? "抓取中…" : "抓全文"}
           </Button>
         </form>
+      </Surface>
+      <Surface className="space-y-4 p-5">
+        <SectionHeading
+          description="管理当前工作区的网页抓取确认规则；即使关闭确认，仍会保留公共 URL 与重定向安全校验。"
+          title="网页抓取权限"
+        />
+        <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
+          <div className="min-w-0">
+            <Label htmlFor="allow-web-fetch-without-confirmation">允许抓取任意网页，不再询问</Label>
+            <p className="mt-1 text-xs text-muted-foreground">默认关闭。开启后，智能体抓取公共网页时不显示授权卡片。</p>
+          </div>
+          <Switch
+            checked={fetchPolicy.allow_without_confirmation}
+            disabled={updateFetchPolicy.isPending}
+            id="allow-web-fetch-without-confirmation"
+            onCheckedChange={(checked) => updateFetchPolicy.mutate({ ...fetchPolicy, allow_without_confirmation: checked })}
+          />
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Input
+            onChange={(event) => setDomainInput(event.target.value)}
+            placeholder="添加域名，例如 github.com"
+            value={domainInput}
+          />
+          <Button
+            disabled={updateFetchPolicy.isPending || !domainInput.trim()}
+            onClick={() => {
+              const domain = domainInput.trim();
+              if (!domain) return;
+              updateFetchPolicy.mutate({ ...fetchPolicy, allowed_domains: [...fetchPolicy.allowed_domains, domain] }, { onSuccess: () => setDomainInput("") });
+            }}
+            variant="outline"
+          >添加</Button>
+        </div>
+        {fetchPolicy.allowed_domains.length ? (
+          <div className="flex flex-wrap gap-2">
+            {fetchPolicy.allowed_domains.map((domain) => (
+              <Badge className="gap-1.5 py-1" key={domain} variant="secondary">
+                {domain}
+                <button
+                  aria-label={`移除 ${domain}`}
+                  className="text-muted-foreground hover:text-destructive"
+                  disabled={updateFetchPolicy.isPending}
+                  onClick={() => updateFetchPolicy.mutate({ ...fetchPolicy, allowed_domains: fetchPolicy.allowed_domains.filter((item) => item !== domain) })}
+                  type="button"
+                >×</button>
+              </Badge>
+            ))}
+          </div>
+        ) : <p className="text-sm text-muted-foreground">尚未设置永久允许的域名。需要时可在聊天授权卡片中选择“以后都允许”。</p>}
       </Surface>
       {result ? (
         <div className="rounded-xl border border-blue-200 bg-blue-50/55 px-4 py-3 text-sm text-blue-800 dark:border-blue-900 dark:bg-blue-950/25 dark:text-blue-200">

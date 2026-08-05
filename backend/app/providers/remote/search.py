@@ -38,6 +38,17 @@ def domain_is_allowed(url: str, allowed_domains: set[str] | None) -> bool:
     return any(hostname == domain or hostname.endswith(f".{domain}") for domain in allowed_domains)
 
 
+def _safe_image_url(value: Any) -> str | None:
+    """Return a bounded public http(s) URL for a vendor thumbnail, else None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    return candidate[:2_000]
+
+
 class SearXNGSearchProvider:
     """SearXNG JSON search adapter for an explicitly configured instance."""
 
@@ -122,6 +133,11 @@ class SearXNGSearchProvider:
                     snippet=str(snippet).strip()[:8_000],
                     source_type="web_search",
                     fetched_at=now,
+                    image_url=_safe_image_url(
+                        item.get("img_src")
+                        or item.get("thumbnail_src")
+                        or item.get("image_url")
+                    ),
                 )
             )
             if len(results) >= max_results:
@@ -257,6 +273,19 @@ class CloudSearchProvider:
                     snippet=str(snippet).strip()[:8_000],
                     source_type=f"{self.provider_type}_web_search",
                     fetched_at=now,
+                    image_url=_safe_image_url(
+                        item.get("image_url")
+                        or (
+                            item.get("thumbnail", {}).get("src")
+                            if isinstance(item.get("thumbnail"), dict)
+                            else None
+                        )
+                        or (
+                            (item.get("meta") or {}).get("image")
+                            if isinstance(item.get("meta"), dict)
+                            else None
+                        )
+                    ),
                 )
             )
             if len(results) >= max_results:

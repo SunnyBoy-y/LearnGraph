@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, FileCode2, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { BundledLanguage } from "shiki";
 
@@ -8,6 +9,12 @@ import {
 } from "@/components/ai-elements/code-block";
 import { Badge } from "@/components/ui/badge";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import {
+  createSubappChannel,
+  subappFailureText,
+  subappSessionTrigger,
+} from "@/lib/subapp-bridge";
+import type { SubappChannel } from "@/lib/subapp-bridge";
 import {
   postRendererUnlock,
   rendererUnlockMessage,
@@ -46,13 +53,60 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const trustedReason = trustedRendererReason(data);
   const unlockMessage = rendererUnlockMessage(data);
 
+  // T2.6 interactive sub-application mode: an artifact carrying a sub-app
+  // session marker (or an interactive contract/version) runs the bidirectional
+  // user → component.event → AI → renderer.state → render loop instead of the
+  // static preview below. Absent the marker, the static path is untouched.
+  const subappTrigger = useMemo(() => subappSessionTrigger(data), [data]);
+  const chatSessionId = useMemo(
+    () => (typeof data.chat_session_id === "string" ? data.chat_session_id : null),
+    [data],
+  );
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const subappLoadedRef = useRef(false);
+  const subappChannelRef = useRef<SubappChannel | null>(null);
+  const [subappFailed, setSubappFailed] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!subappTrigger) return;
+    setSubappFailed(null);
+    const channel = createSubappChannel({
+      getIframe: () => iframeRef.current,
+      getIframeLoaded: () => subappLoadedRef.current,
+      artifactVersionId:
+        subappTrigger.kind === "instantiate" ? subappTrigger.artifactVersionId : undefined,
+      provisioned:
+        subappTrigger.kind === "provisioned"
+          ? {
+              sessionId: subappTrigger.sessionId,
+              token: subappTrigger.token,
+              unlockMessage: subappTrigger.unlockMessage,
+            }
+          : undefined,
+      chatSessionId,
+      onFailed: (reason) => setSubappFailed(reason),
+    });
+    subappChannelRef.current = channel;
+    return () => {
+      channel.destroy();
+      subappChannelRef.current = null;
+    };
+  }, [subappTrigger, chatSessionId]);
+
+  const handleSubappLoad = () => {
+    subappLoadedRef.current = true;
+    subappChannelRef.current?.handleIframeLoad();
+  };
+
+  const hasSubappContent = Boolean(previewHtml || canRenderRemote);
+
   return (
     <section className="sandbox-artifact" aria-label={title}>
       <div className="sandbox-artifact__heading">
         <FileCode2 className="size-4" />
         <div>
           <strong>{title}</strong>
-          <span>生成代码不会进入主应用 DOM</span>
+          <span>{subappTrigger ? "双向交互子应用" : "生成代码不会进入主应用 DOM"}</span>
         </div>
         {trustedEligible ? (
           <Badge variant="default">
@@ -62,7 +116,29 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         <Badge variant="secondary">{status}</Badge>
       </div>
 
-      {previewHtml ? (
+      {subappTrigger ? (
+        hasSubappContent ? (
+          <iframe
+            allow=""
+            className="sandbox-artifact__preview"
+            onLoad={handleSubappLoad}
+            ref={iframeRef}
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
+            src={!previewHtml && canRenderRemote ? artifactUrl : undefined}
+            title={`${title}子应用`}
+          />
+        ) : (
+          <div className="sandbox-artifact__empty">
+            <Box className="size-6" />
+            <div>
+              <strong>子应用尚未准备好</strong>
+              <span>没有可加载的交互式页面内容。</span>
+            </div>
+          </div>
+        )
+      ) : previewHtml ? (
         <iframe
           allow=""
           className="sandbox-artifact__preview"
@@ -90,6 +166,13 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           </div>
         </div>
       )}
+
+      {subappTrigger && subappFailed ? (
+        <p className="sandbox-artifact__warning" role="status">
+          <ShieldAlert className="size-3.5" />
+          {subappFailureText(subappFailed)}
+        </p>
+      ) : null}
 
       {artifactUrl && !canRenderRemote ? (
         <p className="sandbox-artifact__warning" role="status">

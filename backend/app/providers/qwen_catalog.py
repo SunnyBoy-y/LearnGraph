@@ -17,8 +17,17 @@ MODELS_DEV_SOURCE = "https://models.dev/api.json"
 QWEN_THINKING_SOURCE = (
     "https://platform.qianwenai.com/docs/developer-guides/text-generation/thinking"
 )
+QWEN_CHAT_COMPLETIONS_SOURCE = (
+    "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions"
+)
+QWEN_RESPONSES_SOURCE = (
+    "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-responses"
+)
 QWEN_VISION_SOURCE = (
     "https://platform.qianwenai.com/docs/developer-guides/getting-started/vision-models"
+)
+QWEN_IMAGE_EDIT_SOURCE = (
+    "https://help.aliyun.com/zh/model-studio/qwen-image-edit-api"
 )
 
 LEARNGRAPH_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
@@ -140,6 +149,7 @@ def _is_hybrid_default_on(model: str) -> bool:
         _starts(
             model,
             (
+                "qwen3.8-max",
                 "qwen3.7-max",
                 "qwen3.7-plus",
                 "qwen3.7-flash",
@@ -402,10 +412,47 @@ def _is_native_qwen_model(model: str) -> bool:
     return _starts(model, ("qwen", "qwq"))
 
 
+def _is_image_generation_model(model: str) -> bool:
+    """Return whether a model is a DashScope image generation/editing model.
+
+    These models produce images (not text) and are used through the image
+    generation Provider rather than the chat stream.  ``supports_text_output``
+    being False is what keeps them out of text-chat model selection.
+    """
+
+    return _starts(model, ("qwen-image", "wanx"))
+
+
 def qwen_model_defaults(model_id: str) -> dict[str, Any]:
     """Return official overrides in the project-wide capability shape."""
 
     model = _model_key(model_id)
+    if _is_image_generation_model(model):
+        return {
+            "context_window_tokens": 8_192,
+            "context_limit_tokens": 8_192,
+            "max_output_tokens": 4_096,
+            "reasoning_efforts": [],
+            "thinking_mapping": {"off": None},
+            "default_thinking_mode": "off",
+            "reasoning_parameter": "enable_thinking",
+            "thinking_required": False,
+            "hosted_web_search": False,
+            "hosted_web_fetch": False,
+            "hosted_image_search": False,
+            "supports_image_input": True,
+            "supports_video_input": False,
+            "supports_image_edit": True,
+            "supports_text_output": False,
+            "supports_structured_output": False,
+            "supports_agent_tools": False,
+            "image_input_mode": "native",
+            "native_tool_protocol": "chat_completions",
+            "default_search_route": "disabled",
+            "capability_source": "official_catalog",
+            "catalog_base_source": MODELS_DEV_SOURCE,
+            "source_url": QWEN_IMAGE_EDIT_SOURCE,
+        }
     context, output = _context_defaults(model)
     pure = _is_pure_reasoning(model)
     hybrid_on = _is_hybrid_default_on(model) and not pure
@@ -537,10 +584,15 @@ def qwen_model_defaults(model_id: str) -> dict[str, Any]:
         return result
 
     if _starts(model, ("deepseek-v4-", "glm-5.2", "glm-5.1")) or model == "glm-5":
+        # Alibaba Cloud documents reasoning_effort for these as ``high`` /
+        # ``max`` only: ``low`` and ``medium`` map to ``high``, ``xhigh`` maps
+        # to ``max``, and ``high`` stays ``high``.  (A proportional spread of
+        # {high, max} would wrongly push the ``high`` tier up to ``max``.)
         result["reasoning_parameter"] = "reasoning_effort"
         result["thinking_mapping"] = {
             "off": None,
-            **proportional_effort_mapping(("high", "max")),
+            **{effort: "high" for effort in ("low", "medium", "high")},
+            "xhigh": "max",
         }
         return result
 

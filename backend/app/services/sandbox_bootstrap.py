@@ -22,6 +22,8 @@ from app.providers.remote.sandbox import (
     BROWSER_RUNTIME_KIND,
 )
 from app.services.sandbox_runtime import (
+    effective_member_bootstrap_allowed,
+    load_bootstrap_policy,
     load_runtime_config,
     resolve_sandbox_image,
     resolve_sandbox_image_for_runtime,
@@ -165,6 +167,10 @@ class SandboxBootstrapService:
                 if load_runtime_config(settings)
                 else None
             ),
+            "member_bootstrap_allowed": effective_member_bootstrap_allowed(settings),
+            "bootstrap_policy": load_bootstrap_policy(settings).to_dict()
+            if load_bootstrap_policy(settings)
+            else None,
             "image_source": (
                 "environment"
                 if (settings.sandbox_image or "").strip()

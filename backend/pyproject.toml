@@ -22,6 +22,10 @@ dependencies = [
   "xlrd>=2.0.2,<3",
   "pillow>=10,<12",
   "docker>=7.1,<8",
+  # Pure-Python HTML→Markdown main-text extraction. Used by the sandbox
+  # web_fetch task (and its unit tests) to turn untrusted HTML into inert
+  # Markdown before it ever reaches the host.
+  "trafilatura>=1.12,<3",
   # IANA zone database for zoneinfo on Windows (and minimal Linux images).
   # Required by Agent get_current_time (e.g. Asia/Shanghai).
   "tzdata>=2024.1",

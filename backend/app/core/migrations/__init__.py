@@ -8,7 +8,7 @@ from sqlalchemy import inspect
 from sqlalchemy.engine import Connection
 
 from app.domain.migration_models import SchemaRevision
-from app.domain.models import utc_now
+from app.domain.models import SubAppInteractionEvent, utc_now
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,12 +89,23 @@ def _record_ledger_baseline(connection: Connection) -> None:
     del connection
 
 
+def _subapp_interaction_events(connection: Connection) -> None:
+    """Create the additive sub-application interaction event ledger."""
+
+    SubAppInteractionEvent.__table__.create(bind=connection, checkfirst=True)
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
         "0002_memory_outbox_lease_generation",
         "Add generation-aware outbox lease ownership",
         _memory_outbox_lease_generation,
+    ),
+    SchemaMigration(
+        "0003_subapp_interaction_events",
+        "Create sub-application interaction event ledger",
+        _subapp_interaction_events,
     ),
     # Keep revision/description in sync with CURRENT_SCHEMA_REVISION /
     # CURRENT_SCHEMA_DESCRIPTION in app.core.database.

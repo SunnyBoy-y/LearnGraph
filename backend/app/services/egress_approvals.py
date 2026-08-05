@@ -1,0 +1,414 @@
+from __future__ import annotations
+
+"""Generic Agent egress approval queue — durable control-plane foundation.
+
+D2.1: this is the persistence/API basis for *generic* Agent egress approvals,
+parallel to (and deliberately separate from) the web_fetch authorization
+machinery. See ``doc/md-D2-1_通用审批通道设计.md``.
+
+Two non-negotiable contracts:
+
+* Contract A — the only authorization resource is a canonical exact hostname.
+  This service never saves or matches commands, argv, prompts, URL paths or
+  request bodies. ``request_context`` is display/audit context only.
+
+* Contract B — a user decision only adds a host to the allowlist. It never
+  writes IPs, CIDRs, ``allow_private`` or classifier exceptions. The runtime
+  ``SandboxEgressProxy.authorize_connect`` still resolves every CONNECT and
+  re-classifies addresses, so an approved host that later resolves to a
+  private/loopback/metadata address is still denied. This implementation does
+  NOT bypass the classifier.
+
+This module does not touch ``web_fetch.policy``, ``UserWebFetchPolicy``, or the
+reviewed ``{workspace_id}.json`` policy files. The persistent allowlist is the
+``host_authorization_grants`` table in the ``agent_egress`` capability
+namespace; nothing here shares the web_fetch namespace.
+"""
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session
+
+from app.core.config import Settings
+from app.core.errors import AppError
+from app.domain.models import (
+    EGRESS_APPROVAL_CAPABILITY,
+    EGRESS_APPROVAL_DEFAULT_TTL_SECONDS,
+    EGRESS_APPROVAL_MAX_TTL_SECONDS,
+    EgressAuthorizationRequest,
+    HostAuthorizationGrant,
+)
+from app.repositories.audit import AuditRepository
+from app.services.sandbox_network_policy import EgressPolicyInvalid, normalize_hostname
+
+ALLOWED_DECISIONS = frozenset({"allow_once", "allow_always", "deny"})
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes for ``DateTime(timezone=True)`` columns;
+    normalize before comparing with a tz-aware ``now``."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+class EgressApprovalService:
+    """Workspace-scoped control plane for the generic egress approval queue."""
+
+    def __init__(
+        self,
+        db: Session,
+        workspace_id: str,
+        settings: Settings | None = None,
+    ) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.settings = settings
+        self.audit = AuditRepository(db, workspace_id)
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _load(self, request_id: str) -> EgressAuthorizationRequest:
+        request = self.db.scalar(
+            select(EgressAuthorizationRequest).where(
+                EgressAuthorizationRequest.id == request_id,
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+            )
+        )
+        if request is None:
+            raise AppError(
+                404,
+                "egress_authorization_not_found",
+                "Egress authorization request was not found",
+            )
+        return request
+
+    def _upsert_workspace_grant(
+        self,
+        *,
+        request: EgressAuthorizationRequest,
+        granted_by: str,
+        now: datetime,
+    ) -> None:
+        """Persist (or re-grant) a workspace-scoped ``agent_egress`` host grant.
+
+        ``allow_always`` writes the *workspace* baseline for capability
+        ``agent_egress`` only; it never touches ``web_fetch.policy`` or
+        ``UserWebFetchPolicy``. Upserting keeps one row per
+        (workspace, capability, subject, hostname) so a revoke -> re-approval
+        cycle is idempotent (design doc §4.2).
+        """
+        grant = self.db.scalar(
+            select(HostAuthorizationGrant).where(
+                HostAuthorizationGrant.workspace_id == self.workspace_id,
+                HostAuthorizationGrant.capability == EGRESS_APPROVAL_CAPABILITY,
+                HostAuthorizationGrant.subject_type == "workspace",
+                HostAuthorizationGrant.subject_id == self.workspace_id,
+                HostAuthorizationGrant.hostname == request.hostname,
+            )
+        )
+        if grant is None:
+            grant = HostAuthorizationGrant(
+                workspace_id=self.workspace_id,
+                capability=EGRESS_APPROVAL_CAPABILITY,
+                subject_type="workspace",
+                subject_id=self.workspace_id,
+                hostname=request.hostname,
+                ports=[443],
+                protocols=["https"],
+                source_request_id=request.id,
+                granted_by=granted_by,
+                granted_at=now,
+            )
+            self.db.add(grant)
+        else:
+            grant.revoked_at = None
+            grant.revoked_by = None
+            grant.source_request_id = request.id
+            grant.granted_by = granted_by
+            grant.granted_at = now
+        self.db.flush()
+
+    # -- queue operations -----------------------------------------------------
+
+    def create_request(
+        self,
+        *,
+        hostname: str,
+        requested_by: str,
+        chat_session_id: str | None = None,
+        purpose: str | None = None,
+        request_context: dict[str, Any] | None = None,
+        ttl_seconds: int = EGRESS_APPROVAL_DEFAULT_TTL_SECONDS,
+        dedupe_key: str | None = None,
+        now: datetime | None = None,
+    ) -> EgressAuthorizationRequest:
+        """Create (or return the existing) pending approval request.
+
+        Only a canonical exact hostname is accepted (contract A): IP literals,
+        URL forms and wildcards are rejected by ``normalize_hostname``. The
+        request is idempotent per ``(workspace_id, hostname, source)`` for
+        still-pending rows, so repeated tool calls do not duplicate cards.
+        Pending never blocks the caller: it is a durable suspension, expired
+        asynchronously once ``expires_at`` passes.
+        """
+        try:
+            canonical = normalize_hostname(hostname)
+        except EgressPolicyInvalid as exc:
+            raise AppError(
+                422,
+                "egress_authorization_hostname_invalid",
+                f"Approval hostname must be a canonical public DNS name: {exc.reason}",
+            ) from exc
+        if (
+            not isinstance(ttl_seconds, int)
+            or isinstance(ttl_seconds, bool)
+            or not 0 < ttl_seconds <= EGRESS_APPROVAL_MAX_TTL_SECONDS
+        ):
+            ttl_seconds = EGRESS_APPROVAL_DEFAULT_TTL_SECONDS
+        source = dedupe_key if dedupe_key is not None else (chat_session_id or "")
+        current = now or _utc_now()
+        existing = self.db.scalar(
+            select(EgressAuthorizationRequest).where(
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.hostname == canonical,
+                EgressAuthorizationRequest.dedupe_key == source,
+                EgressAuthorizationRequest.status == "pending",
+            )
+        )
+        if existing is not None:
+            return existing
+
+        context = dict(request_context or {})
+        if purpose:
+            context.setdefault("purpose", purpose)
+        request = EgressAuthorizationRequest(
+            workspace_id=self.workspace_id,
+            hostname=canonical,
+            capability=EGRESS_APPROVAL_CAPABILITY,
+            requested_by=requested_by,
+            chat_session_id=chat_session_id,
+            request_context=context or None,
+            status="pending",
+            decision=None,
+            allow_always=False,
+            expires_at=current + timedelta(seconds=ttl_seconds),
+            ttl_seconds=ttl_seconds,
+            dedupe_key=source,
+        )
+        self.db.add(request)
+        self.db.flush()
+        self.audit.record(
+            actor_id=requested_by,
+            action="agent_egress.authorization_requested",
+            resource_type="egress_authorization_request",
+            resource_id=request.id,
+            outcome="pending",
+            details={"hostname": canonical, "capability": EGRESS_APPROVAL_CAPABILITY},
+        )
+        self.db.commit()
+        self.db.refresh(request)
+        return request
+
+    def decide(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        actor_id: str,
+        is_manager: bool = False,
+        now: datetime | None = None,
+    ) -> EgressAuthorizationRequest:
+        """Record a user decision on a pending request.
+
+        Visibility/authority (design doc §6.3): only the requesting user, or a
+        workspace manager deciding on their behalf, may decide. ``allow_always``
+        additionally requires ``workspace.manage`` and persists the host into
+        the workspace ``agent_egress`` allowlist. A request past its pending
+        deadline is expired, not decided. Re-deciding a terminal request is
+        idempotent and returns the existing row.
+        """
+        request = self._load(request_id)
+        if request.status != "pending":
+            return request
+        if decision not in ALLOWED_DECISIONS:
+            raise AppError(
+                422,
+                "egress_authorization_decision_invalid",
+                "decision must be one of: allow_once, allow_always, deny",
+            )
+        if actor_id != request.requested_by and not is_manager:
+            raise AppError(
+                403,
+                "egress_authorization_not_decider",
+                "Only the requesting user or a workspace manager may decide this request",
+            )
+        if decision == "allow_always" and not is_manager:
+            raise AppError(
+                403,
+                "egress_authorization_require_manage",
+                "allow_always requires the workspace.manage permission",
+            )
+        current = now or _utc_now()
+        if _as_utc(request.expires_at) <= current:
+            # Stale pending request: expired, not decided (async deadline).
+            request.status = "expired"
+            self.db.commit()
+            self.db.refresh(request)
+            return request
+
+        request.decision = decision
+        request.allow_always = decision == "allow_always"
+        request.status = "approved" if decision != "deny" else "denied"
+        request.decided_by = actor_id
+        request.decided_at = current
+        if decision == "allow_always":
+            # Only a hostname is added to the allowlist (contract B): no IP,
+            # CIDR, ``allow_private`` or classifier exception is ever written.
+            self._upsert_workspace_grant(request=request, granted_by=actor_id, now=current)
+        self.audit.record(
+            actor_id=actor_id,
+            action="agent_egress.authorization_decided",
+            resource_type="egress_authorization_request",
+            resource_id=request.id,
+            outcome=request.status,
+            details={
+                "decision": decision,
+                "hostname": request.hostname,
+                "allow_always": request.allow_always,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(request)
+        return request
+
+    def list_requests(
+        self,
+        *,
+        actor_id: str,
+        is_manager: bool = False,
+        status: str | None = None,
+        requested_by: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[EgressAuthorizationRequest], int]:
+        """List workspace-visible approval requests (paged, status-filterable).
+
+        Ordinary members only see their own requests; workspace managers see
+        the whole workspace queue. Pending requests past ``expires_at`` are
+        expired opportunistically so the UI never shows a stale card as
+        actionable.
+        """
+        self.expire_stale()
+        query = select(EgressAuthorizationRequest).where(
+            EgressAuthorizationRequest.workspace_id == self.workspace_id
+        )
+        if not is_manager:
+            query = query.where(EgressAuthorizationRequest.requested_by == actor_id)
+        if requested_by:
+            query = query.where(EgressAuthorizationRequest.requested_by == requested_by)
+        if status:
+            query = query.where(EgressAuthorizationRequest.status == status)
+        total = int(
+            self.db.scalar(
+                select(func.count()).select_from(query.subquery())
+            )
+            or 0
+        )
+        rows = self.db.scalars(
+            query.order_by(
+                EgressAuthorizationRequest.created_at.desc(),
+                EgressAuthorizationRequest.id.desc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        ).all()
+        return list(rows), total
+
+    def expire_stale(self, *, now: datetime | None = None) -> int:
+        """Flip pending requests past their deadline to ``expired``.
+
+        Called opportunistically by the list/decision paths and intended to be
+        invoked by a background sweep as well. A stale pending request never
+        blocks a caller; it just stops being actionable. Idempotent.
+        """
+        current = now or _utc_now()
+        result = self.db.execute(
+            update(EgressAuthorizationRequest)
+            .where(
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.status == "pending",
+                EgressAuthorizationRequest.expires_at <= current,
+            )
+            .values(status="expired")
+            # The bulk UPDATE must not re-evaluate the WHERE predicate against
+            # already-loaded ORM objects (naive-vs-aware datetime) or block on
+            # stale identity-map rows; subsequent reads re-select fresh state.
+            .execution_options(synchronize_session=False)
+        )
+        self.db.commit()
+        return result.rowcount or 0
+
+    def consume_once(
+        self,
+        *,
+        request_id: str,
+        now: datetime | None = None,
+    ) -> EgressAuthorizationRequest:
+        """Consume an ``approved`` allow-once request after its host was used to
+        derive a policy (T4.1 hook).
+
+        ``allow_once`` is a single-use lease; once a derived policy consumed it,
+        this marks it ``consumed`` so it cannot be reused. Idempotent and a
+        no-op for ``allow_always`` (persistent grants are not leases).
+        """
+        request = self._load(request_id)
+        if request.status != "approved" or request.decision != "allow_once":
+            return request
+        request.status = "consumed"
+        request.consumed_at = now or _utc_now()
+        self.audit.record(
+            actor_id=request.requested_by,
+            action="agent_egress.authorization_consumed",
+            resource_type="egress_authorization_request",
+            resource_id=request.id,
+            outcome="consumed",
+            details={"hostname": request.hostname, "decision": "allow_once"},
+        )
+        self.db.commit()
+        self.db.refresh(request)
+        return request
+
+    # -- allowlist resolution (T4.1 / Phase 2 consumption point) --------------
+
+    def effective_allowed_hosts(self, *, actor_id: str | None = None) -> frozenset[str]:
+        """Resolve the effective exact-host set for one actor's Agent egress.
+
+        ``workspace baseline ∪ the actor's personal agent_egress grants`` for
+        capability ``agent_egress`` only. Never unions ``web_fetch.policy`` or
+        ``UserWebFetchPolicy`` (design doc §3.2). This is the host set a future
+        ``derive_egress_policy_for_agent()`` consumes; it does not itself create
+        an ``EgressPolicy`` or bypass ``authorize_connect()``.
+        """
+        grants = self.db.scalars(
+            select(HostAuthorizationGrant).where(
+                HostAuthorizationGrant.workspace_id == self.workspace_id,
+                HostAuthorizationGrant.capability == EGRESS_APPROVAL_CAPABILITY,
+                HostAuthorizationGrant.revoked_at.is_(None),
+            )
+        ).all()
+        hosts = {
+            grant.hostname
+            for grant in grants
+            if grant.subject_type == "workspace"
+            or (
+                grant.subject_type == "user"
+                and actor_id is not None
+                and grant.subject_id == actor_id
+            )
+        }
+        return frozenset(hosts)

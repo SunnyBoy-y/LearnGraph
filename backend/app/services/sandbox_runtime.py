@@ -32,6 +32,84 @@ def runtime_config_path(settings: Settings) -> Path:
     return storage.parent / "sandbox-runtime.json"
 
 
+def bootstrap_policy_path(settings: Settings) -> Path:
+    """Sibling of sandbox-runtime.json; deployment-scoped bootstrap gate."""
+
+    return runtime_config_path(settings).with_name("sandbox-bootstrap-policy.json")
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxBootstrapPolicy:
+    """Deployment-level gate for sandbox runtime bootstrap.
+
+    ``member_allowed=True`` lets ordinary workspace members trigger the local
+    image build; ``False`` restricts it to administrators.  The deployment
+    default comes from ``Settings.sandbox_bootstrap_member_allowed`` until an
+    administrator persists an explicit choice here.
+    """
+
+    member_allowed: bool
+    updated_at: str | None
+    updated_by: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "member_allowed": self.member_allowed,
+            "updated_at": self.updated_at,
+            "updated_by": self.updated_by,
+        }
+
+
+def load_bootstrap_policy(settings: Settings) -> SandboxBootstrapPolicy | None:
+    path = bootstrap_policy_path(settings)
+    with _lock:
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("member_allowed"), bool):
+        return None
+    return SandboxBootstrapPolicy(
+        member_allowed=raw["member_allowed"],
+        updated_at=str(raw.get("updated_at")) if raw.get("updated_at") else None,
+        updated_by=str(raw.get("updated_by")) if raw.get("updated_by") else None,
+    )
+
+
+def save_bootstrap_policy(
+    settings: Settings, *, member_allowed: bool, actor_id: str | None
+) -> SandboxBootstrapPolicy:
+    policy = SandboxBootstrapPolicy(
+        member_allowed=member_allowed,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+        updated_by=(actor_id or "").strip() or None,
+    )
+    path = bootstrap_policy_path(settings)
+    with _lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(json.dumps(policy.to_dict(), ensure_ascii=False, indent=2) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return policy
+
+
+def effective_member_bootstrap_allowed(settings: Settings) -> bool:
+    """Persisted administrator choice wins; otherwise the deployment default."""
+
+    persisted = load_bootstrap_policy(settings)
+    if persisted is not None:
+        return persisted.member_allowed
+    return settings.sandbox_bootstrap_member_allowed
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxRuntimeConfig:
     image_digest: str

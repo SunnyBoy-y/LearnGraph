@@ -211,7 +211,7 @@ def seed_demo_data(db: Session) -> None:
     setting = WorkspaceSetting(
         workspace_id=DEMO_WORKSPACE_ID,
         key="ui.preferences",
-        value={"theme": "light", "high_density": True, "reduced_motion": False},
+        value={"theme": "light", "reduced_motion": False},
     )
     usage = UsageEvent(
         workspace_id=DEMO_WORKSPACE_ID,

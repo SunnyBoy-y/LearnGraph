@@ -3,6 +3,7 @@ import type {
   EffectiveMemoryPackage,
   MemoryCreateRequest,
   MemoryBinding,
+  MemoryEmbeddingPruneResult,
   MemoryEmbeddingReindexResult,
   MemoryEnhancement,
   MemoryEnhancementUpdateRequest,
@@ -166,8 +167,19 @@ export function updateMemoryEnhancement(
   )
 }
 
-export function reindexMemoryEmbeddings(): Promise<MemoryEmbeddingReindexResult> {
-  return apiClient.post<MemoryEmbeddingReindexResult>('/memory/enhancement/reindex')
+export function reindexMemoryEmbeddings(
+  pruneStale = false,
+): Promise<MemoryEmbeddingReindexResult> {
+  const query = pruneStale ? '?prune_stale=true' : ''
+  return apiClient.post<MemoryEmbeddingReindexResult>(
+    `/memory/enhancement/reindex${query}`,
+  )
+}
+
+export function pruneMemoryEmbeddings(): Promise<MemoryEmbeddingPruneResult> {
+  return apiClient.post<MemoryEmbeddingPruneResult>(
+    '/memory/enhancement/prune-embeddings',
+  )
 }
 
 export function extractSessionMemories(sessionId: string): Promise<MemoryExtractionRunResult> {

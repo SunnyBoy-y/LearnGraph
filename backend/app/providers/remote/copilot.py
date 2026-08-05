@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,20 +78,61 @@ def _request_error(operation: str, exc: httpx.HTTPError) -> ProviderTimeoutError
     return ProviderResponseError(f"{operation} request failed")
 
 
+_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _with_retries(
+    request: Callable[[], httpx.Response],
+    *,
+    operation: str,
+    attempts: int = 3,
+) -> httpx.Response:
+    """Issue a GitHub/Copilot HTTP request with retries for transient failures.
+
+    Ambient proxy clients (Clash-style fake-ip setups) intermittently answer
+    these outbound calls with HTTP 502 or reset the connection; without a
+    retry the device-code login freezes ("no response after authorizing") and
+    model discovery fails with ``provider_http_error`` before the provider
+    ever becomes usable. Retries cover request timeouts, transport errors,
+    and 429/5xx responses (including proxy-injected error pages); the final
+    attempt surfaces the same typed provider errors the previous
+    single-attempt code raised.
+    """
+
+    last_exception: ProviderHTTPError | None = None
+    for attempt in range(max(1, attempts)):
+        response: httpx.Response | None = None
+        try:
+            response = request()
+        except httpx.HTTPError as exc:
+            last_exception = _request_error(operation, exc)
+        if response is not None:
+            if response.is_success or response.status_code not in _RETRY_STATUS_CODES:
+                return response
+            last_exception = ProviderHTTPError(
+                f"{operation} returned HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
+        if attempt + 1 < attempts:
+            time.sleep(min(0.5 * (2 ** attempt), 2.0))
+    assert last_exception is not None
+    raise last_exception
+
+
 def start_copilot_device_login(
     *,
     transport: httpx.BaseTransport | None = None,
     timeout_seconds: float = 15.0,
 ) -> CopilotDeviceLogin:
-    try:
-        with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
-            response = client.post(
+    with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
+        response = _with_retries(
+            lambda: client.post(
                 GITHUB_DEVICE_CODE_URL,
                 data={"client_id": GITHUB_COPILOT_CLIENT_ID, "scope": "read:user"},
                 headers={"Accept": "application/json", "User-Agent": COPILOT_HEADERS["user-agent"]},
-            )
-    except httpx.HTTPError as exc:
-        raise _request_error("GitHub device login", exc) from exc
+            ),
+            operation="GitHub device login",
+        )
     if not response.is_success:
         raise ProviderHTTPError(
             f"GitHub device login returned HTTP {response.status_code}",
@@ -125,9 +167,9 @@ def poll_copilot_device_login(
     device_code = device_auth_id.strip()
     if not _DEVICE_CODE_RE.fullmatch(device_code) or not user_code.strip():
         raise ProviderHTTPError("Unknown or expired GitHub device login", status_code=400)
-    try:
-        with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
-            response = client.post(
+    with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
+        response = _with_retries(
+            lambda: client.post(
                 GITHUB_OAUTH_TOKEN_URL,
                 data={
                     "client_id": GITHUB_COPILOT_CLIENT_ID,
@@ -135,9 +177,9 @@ def poll_copilot_device_login(
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 },
                 headers={"Accept": "application/json", "User-Agent": COPILOT_HEADERS["user-agent"]},
-            )
-    except httpx.HTTPError as exc:
-        raise _request_error("GitHub device login polling", exc) from exc
+            ),
+            operation="GitHub device login polling",
+        )
     if not response.is_success:
         raise ProviderHTTPError(
             f"GitHub device login polling returned HTTP {response.status_code}",
@@ -184,9 +226,9 @@ def exchange_github_token_for_copilot_token(
     transport: httpx.BaseTransport | None = None,
     timeout_seconds: float = 15.0,
 ) -> CopilotToken:
-    try:
-        with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
-            response = client.get(
+    with httpx.Client(transport=transport, timeout=timeout_seconds) as client:
+        response = _with_retries(
+            lambda: client.get(
                 GITHUB_COPILOT_TOKEN_URL,
                 headers={
                     "Authorization": f"token {github_token}",
@@ -196,9 +238,9 @@ def exchange_github_token_for_copilot_token(
                     "user-agent": COPILOT_HEADERS["user-agent"],
                     "x-github-api-version": COPILOT_HEADERS["x-github-api-version"],
                 },
-            )
-    except httpx.HTTPError as exc:
-        raise _request_error("Copilot token exchange", exc) from exc
+            ),
+            operation="Copilot token exchange",
+        )
     if not response.is_success:
         raise ProviderHTTPError(
             f"Copilot token exchange returned HTTP {response.status_code}",
@@ -228,15 +270,15 @@ def discover_copilot_models(
         transport=transport,
         timeout_seconds=timeout_seconds,
     )
-    try:
-        with httpx.Client(
-            transport=transport,
-            timeout=timeout_seconds,
-            headers=_copilot_headers(token.value, extra_headers),
-        ) as client:
-            response = client.get(f"{base_url.rstrip('/')}/models")
-    except httpx.HTTPError as exc:
-        raise _request_error("Copilot model discovery", exc) from exc
+    with httpx.Client(
+        transport=transport,
+        timeout=timeout_seconds,
+        headers=_copilot_headers(token.value, extra_headers),
+    ) as client:
+        response = _with_retries(
+            lambda: client.get(f"{base_url.rstrip('/')}/models"),
+            operation="Copilot model discovery",
+        )
     if not response.is_success:
         raise ProviderHTTPError(
             f"Copilot model discovery returned HTTP {response.status_code}",
@@ -274,20 +316,57 @@ class GitHubCopilotChatProvider(OpenAICompatibleChatProvider):
     def _valid_copilot_token(self) -> str:
         if self._copilot_token.value and time.time() < self._copilot_token.expires_at - 60:
             return self._copilot_token.value
-        self._copilot_token = exchange_github_token_for_copilot_token(
-            self.github_token,
-            transport=self.transport,
-            timeout_seconds=min(self.timeout_seconds, 15.0),
-        )
+        self._copilot_token = self._refresh_copilot_token()
         return self._copilot_token.value
 
+    def _refresh_copilot_token(self) -> CopilotToken:
+        """Exchange the GitHub token, retrying once on transient failures.
+
+        Chat calls inherit the ambient proxy just like discovery; a proxy
+        hiccup during the exchange should not fail a user-visible request
+        when the very next attempt would succeed. Definitive errors (401
+        invalid GitHub token, 4xx) surface immediately.
+        """
+
+        try:
+            return exchange_github_token_for_copilot_token(
+                self.github_token,
+                transport=self.transport,
+                timeout_seconds=min(self.timeout_seconds, 15.0),
+            )
+        except ProviderHTTPError as exc:
+            status = getattr(exc, "status_code", None)
+            if status is not None and status not in _RETRY_STATUS_CODES:
+                raise
+            time.sleep(0.5)
+            return exchange_github_token_for_copilot_token(
+                self.github_token,
+                transport=self.transport,
+                timeout_seconds=min(self.timeout_seconds, 15.0),
+            )
+
     def _client(self) -> httpx.Client:
-        return httpx.Client(
-            headers=_copilot_headers(
-                self._valid_copilot_token(),
-                self.extra_headers,
-                accept="text/event-stream",
-            ),
-            timeout=self.timeout_seconds,
-            transport=self.transport,
-        )
+        last_error: ProviderHTTPError | None = None
+        for _attempt in range(2):
+            try:
+                return httpx.Client(
+                    headers=_copilot_headers(
+                        self._valid_copilot_token(),
+                        self.extra_headers,
+                        accept="text/event-stream",
+                    ),
+                    timeout=self.timeout_seconds,
+                    transport=self.transport,
+                )
+            except ProviderHTTPError as exc:
+                # _refresh_copilot_token already retried transient failures
+                # once; retry a further round before failing the chat request,
+                # but let definitive errors (e.g. 401 invalid GitHub token)
+                # surface immediately.
+                status = getattr(exc, "status_code", None)
+                if status is not None and status not in _RETRY_STATUS_CODES:
+                    raise
+                last_error = exc
+                time.sleep(0.5)
+        assert last_error is not None
+        raise last_error

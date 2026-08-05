@@ -4,4 +4,9 @@ __pycache__/
 *.py[cod]
 .env
 data/
+# Generated sandbox/egress test artifacts.
+tests/.pytest-tmp/
+.egress-smoke/
+sandbox/.spec-test.json
+/tests/
 

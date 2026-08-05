@@ -32,6 +32,10 @@ class SandboxBootstrapStatusView(BaseModel):
     progress_percent: int
     message: str
     can_initialize: bool
+    # Whether ordinary workspace members may trigger the bootstrap; defaults
+    # to True and can be restricted by administrators via the policy endpoint.
+    member_bootstrap_allowed: bool = True
+    bootstrap_policy: dict[str, Any] | None = None
     active_job: dict[str, Any] | None = None
     last_failed_job: dict[str, Any] | None = None
     remediation_steps: list[str] = Field(default_factory=list)
@@ -72,6 +76,17 @@ class SandboxBootstrapStartResponse(BaseModel):
     error_message: str | None = None
     job: SandboxBootstrapJobView | None = None
     status: SandboxBootstrapStatusView
+
+
+class SandboxBootstrapPolicyView(BaseModel):
+    member_allowed: bool
+    persisted: bool = False
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class SandboxBootstrapPolicyUpdateRequest(BaseModel):
+    member_allowed: bool
 
 
 class SandboxTaskCreateRequest(BaseModel):

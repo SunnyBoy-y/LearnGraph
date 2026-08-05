@@ -63,8 +63,23 @@ export function providerModelOptions(
     enabled: true,
     capabilities: persistedCapabilities[id],
   }));
+  // Workspace-pinned manual models live as per-model capability snapshots even
+  // when the vendor never reported them; keep them selectable in the composer.
+  const manualModels: ProviderModel[] = Object.keys(persistedCapabilities)
+    .filter((id) => !persistedIds.includes(id))
+    .map((id) => ({
+      id,
+      roles: ["llm"],
+      streaming: true,
+      remote: true,
+      enabled: true,
+      capabilities: persistedCapabilities[id],
+    }));
   const byId = new Map(
-    (discovered ?? persistedModels).map((model) => [model.id, model]),
+    [...(discovered ?? persistedModels), ...manualModels].map((model) => [
+      model.id,
+      model,
+    ]),
   );
   const configured = providerCapabilityString(provider, defaultModelCapability);
   if (configured && !byId.has(configured))

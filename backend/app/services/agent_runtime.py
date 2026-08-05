@@ -16,11 +16,12 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 # memory_tools is duck-typed (MemoryService) to avoid circular imports.
 
@@ -78,6 +79,17 @@ AGENT_IMAGE_FORMAT_MIME_TYPES = {
     "WEBP": "image/webp",
     "GIF": "image/gif",
 }
+# subapp_observe (T1.4): read-only observation of SubAppInteractionEvent rows.
+# Hard caps keep the tool pure-observation: bounded row count, bounded
+# per-type map, and a size/field-limited payload digest (payloads are
+# untrusted data and never returned verbatim).
+SUBAPP_OBSERVE_MAX_LIMIT = 50
+SUBAPP_OBSERVE_MAX_EVENT_TYPES = 50
+SUBAPP_OBSERVE_SESSION_ID_MAX = 36
+SUBAPP_OBSERVE_EVENT_TYPE_MAX = 120
+SUBAPP_OBSERVE_PAYLOAD_SUMMARY_KEYS = 20
+SUBAPP_OBSERVE_PAYLOAD_SCALAR_CHARS = 80
+SUBAPP_OBSERVE_PAYLOAD_PREVIEW_CHARS = 200
 
 
 class AgentToolRuntime:
@@ -137,6 +149,13 @@ class AgentToolRuntime:
         definitions.extend(self._model_invocation_tool_definitions())
         definitions.extend(self._chart_tool_definitions())
         definitions.extend(self._learning_orchestration_tool_definitions())
+        # Read-only observation of interactive sub-application events (T1.4).
+        # The write-side subapp_patch_state (T2.5) is registered through its
+        # own method right below so the observe list stays pure observation.
+        # Both tools share the Agent-mode gate: definitions() returns [] when
+        # agent mode is off, so neither subapp tool is exposed otherwise.
+        definitions.extend(self._subapp_observe_tool_definitions())
+        definitions.extend(self._subapp_patch_state_tool_definitions())
         # Durable session files (attachments + generated images) are always
         # addressable in Agent mode; without these tools the model cannot see
         # or reference an image from an earlier turn.
@@ -792,6 +811,158 @@ class AgentToolRuntime:
             },
         ]
 
+    @staticmethod
+    def _subapp_observe_tool_definitions() -> list[dict[str, Any]]:
+        """Read-only observation of interactive sub-application events (T1.4).
+
+        Always available in Agent mode (independent of provider toggles). Pure
+        observe: no data is written, no state is patched.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "subapp_observe",
+                    "description": (
+                        "Read-only: observe interaction events emitted by "
+                        "interactive sub-applications (forms, practice cards, "
+                        "planners) in this workspace. Returns the total matching "
+                        "event count, a count breakdown per event_type, and a "
+                        "bounded digest of the most recent events (ids, event "
+                        "types, created_at timestamps, actor, payload byte size "
+                        "and a size/field-limited payload summary). Payloads are "
+                        "untrusted data: do not infer semantic correctness from "
+                        "them. This tool never writes or mutates any data. "
+                        "Optional filters: session_id (sub-application "
+                        "interaction session), event_type, time_range, limit."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": SUBAPP_OBSERVE_SESSION_ID_MAX,
+                                "description": (
+                                    "Optional sub-application interaction session "
+                                    "id. Omit to observe events across this "
+                                    "workspace."
+                                ),
+                            },
+                            "event_type": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": SUBAPP_OBSERVE_EVENT_TYPE_MAX,
+                                "description": (
+                                    "Optional event-type filter (e.g. "
+                                    "exercise.completed). Omit to observe all "
+                                    "event types."
+                                ),
+                            },
+                            "time_range": {
+                                "type": "object",
+                                "properties": {
+                                    "from": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                    },
+                                    "to": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                    },
+                                },
+                                "additionalProperties": False,
+                                "description": (
+                                    "Optional ISO-8601 time window on the events' "
+                                    "created_at timestamps."
+                                ),
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": SUBAPP_OBSERVE_MAX_LIMIT,
+                                "description": (
+                                    "Optional number of most recent events to "
+                                    "return in the digest (default 20)."
+                                ),
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+    @staticmethod
+    def _subapp_patch_state_tool_definitions() -> list[dict[str, Any]]:
+        """Write-side state patch for interactive sub-application sessions (T2.5).
+
+        Always available in Agent mode (independent of provider toggles). This
+        is the agent's ONLY path to change a sub-application's state: the write
+        goes through the server (contract validation + optimistic versioning +
+        renderer push). The agent never holds an iframe reference and must not
+        try to postMessage or mutate the renderer directly.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "subapp_patch_state",
+                    "description": (
+                        "Write a new state snapshot to an interactive "
+                        "sub-application session in this workspace. The write "
+                        "MUST go through the server: the state is validated "
+                        "against the session's contract schema, versioned with "
+                        "an optimistic lock, and pushed to the renderer by the "
+                        "host. The agent cannot operate the iframe directly — "
+                        "no postMessage, no direct state mutation. "
+                        "expected_version is an optimistic-lock integer that "
+                        "must equal the session's current state_version, which "
+                        "you must read first with subapp_observe (or the "
+                        "session's current state). If the version has moved, "
+                        "the write fails with a version conflict and the "
+                        "current version is returned so you can retry. Returns "
+                        "the new state version and the canonical-JSON sha256 "
+                        "of the state that was persisted."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": SUBAPP_OBSERVE_SESSION_ID_MAX,
+                                "description": (
+                                    "Sub-application interaction session id to "
+                                    "patch. Must belong to this workspace."
+                                ),
+                            },
+                            "state": {
+                                "type": "object",
+                                "description": (
+                                    "Full new state snapshot (not a diff). "
+                                    "Must satisfy the session's contract "
+                                    "state_schema or the write is rejected."
+                                ),
+                            },
+                            "expected_version": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": (
+                                    "Optimistic lock: the session's current "
+                                    "state_version read before writing. The "
+                                    "write is rejected with a version conflict "
+                                    "if the session has moved on."
+                                ),
+                            },
+                        },
+                        "required": ["session_id", "state", "expected_version"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
     def _provider_tool_definitions(self) -> list[dict[str, Any]]:
         """D-084: discover model/provider capabilities; manage when authorized."""
 
@@ -844,7 +1015,10 @@ class AgentToolRuntime:
                     "name": "get_model_capabilities",
                     "description": (
                         "Read the saved capability snapshot for a model "
-                        "(reasoning efforts, search route, image input, etc.)."
+                        "(reasoning efforts, search route, image input, etc.). "
+                        "Works on every discovery-capable Provider role: chat "
+                        "model, image generation, vision, transcription, "
+                        "embedding, and deep research."
                     ),
                     "parameters": {
                         "type": "object",
@@ -872,11 +1046,137 @@ class AgentToolRuntime:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe_provider",
+                    "description": (
+                        "Run a non-destructive connectivity check for one Provider. "
+                        "For chat / image / vision Providers this lists models via "
+                        "the official GET /models endpoint (zero-cost; it never "
+                        "generates content). For search / fetch / deep-research / "
+                        "memory Providers it runs their role-specific health probe. "
+                        "It never enables a Provider, changes its status, or "
+                        "disables same-role peers."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "provider_id": {"type": "string"},
+                        },
+                        "required": ["provider_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "validate_provider_default_models",
+                    "description": (
+                        "Audit the default model of one or every discovery-capable "
+                        "Provider: a default is consistent when it names a model "
+                        "present in the latest discovery snapshot and that model is "
+                        "enabled. Pass repair=true (requires workspace.manage) to "
+                        "move broken defaults to the first enabled model. "
+                        "Read-only when repair is false."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "provider_id": {"type": "string"},
+                            "repair": {
+                                "type": "boolean",
+                                "default": False,
+                                "description": "Fix broken defaults (workspace.manage required).",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
         if not self.can_manage_providers:
             return definitions
         definitions.extend(
             [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "refresh_provider_models",
+                        "description": (
+                            "Force a fresh model-discovery snapshot for one Provider "
+                            "and prune stale model entries: models no longer reported "
+                            "are dropped, new models are enabled by default, and the "
+                            "role-specific default model is repaired if it pointed at "
+                            "a missing or disabled model. Requires workspace.manage."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                            },
+                            "required": ["provider_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "verify_provider_declaration",
+                        "description": (
+                            "Confirm or re-flag a Provider's declared capabilities: "
+                            "unverified_user_input (default), user_confirmed (the "
+                            "workspace owner reviewed the declared role and "
+                            "capabilities), or verified_by_probe (a live probe "
+                            "matched the declaration). Requires workspace.manage."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "unverified_user_input",
+                                        "user_confirmed",
+                                        "verified_by_probe",
+                                    ],
+                                },
+                            },
+                            "required": ["provider_id", "status"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "configure_dashscope_balance",
+                        "description": (
+                            "Associate an Aliyun AccessKey secret label with a "
+                            "DashScope Provider so get_provider_balance can query "
+                            "the account balance through the BSS OpenAPI. The label "
+                            "must resolve (purpose aliyun_access_key) to JSON with "
+                            "access_key_id and access_key_secret. Only the label is "
+                            "stored; the plaintext is never returned. Requires "
+                            "workspace.manage."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "provider_id": {"type": "string"},
+                                "secret_label": {
+                                    "type": "string",
+                                    "description": "Opaque secret://workspace/... label injected by the trusted UI.",
+                                },
+                            },
+                            "required": ["provider_id", "secret_label"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
                 {
                     "type": "function",
                     "function": {
@@ -976,7 +1276,10 @@ class AgentToolRuntime:
                         "name": "put_model_capabilities",
                         "description": (
                             "Create or replace a model capability snapshot "
-                            "(thinking, search, image input). Requires workspace.manage."
+                            "(thinking, search, image input). Requires workspace.manage. "
+                            "Works on every discovery-capable Provider role; on "
+                            "non-chat roles the snapshot is stored as per-model "
+                            "metadata and does not affect chat reasoning."
                         ),
                         "parameters": {
                             "type": "object",
@@ -1123,6 +1426,67 @@ class AgentToolRuntime:
                 "List safe secret labels that can be injected into Provider updates. Never returns secret values or fingerprints.",
                 {},
             ),
+            self._function_definition(
+                "list_budget_policies",
+                "List workspace token-cost budget policies with their scope, period, limits, and enabled state.",
+                {},
+            ),
+            self._function_definition(
+                "get_budget_status",
+                "Read the current spending vs. limit status of every workspace budget policy.",
+                {},
+            ),
+            self._function_definition(
+                "list_budget_alerts",
+                "List workspace budget alerts (soft/hard threshold hits) and whether each is acknowledged.",
+                {},
+            ),
+            self._function_definition(
+                "get_exchange_rate",
+                "Read the currently effective USD/CNY exchange rate used for cost conversion.",
+                {},
+            ),
+            self._function_definition(
+                "list_manual_prices",
+                "List workspace-defined manual model prices that override catalog defaults.",
+                {},
+            ),
+            self._function_definition(
+                "get_usage_summary",
+                "Read persisted token and cost usage aggregates (optional provider/model/feature filter).",
+                {
+                    "provider_id": {"type": "string", "maxLength": 80},
+                    "model_id": {"type": "string", "maxLength": 160},
+                    "feature": {"type": "string", "maxLength": 80},
+                },
+            ),
+            self._function_definition(
+                "list_usage_events",
+                "List persisted usage events (optional provider/model/feature filter). Returns the most recent events first.",
+                {
+                    "provider_id": {"type": "string", "maxLength": 80},
+                    "model_id": {"type": "string", "maxLength": 160},
+                    "feature": {"type": "string", "maxLength": 80},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            ),
+            self._function_definition(
+                "get_memory_policy",
+                "Read the workspace (and optional session) shared-memory policy: enabled, recall, and learning switches.",
+                {
+                    "session_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                },
+            ),
+            self._function_definition(
+                "list_plugins",
+                "List workspace plugins (including trusted-component plugins) with their enabled state and status.",
+                {},
+            ),
+            self._function_definition(
+                "get_local_probe_policy",
+                "Read the local Skill probe policy: whether local scanning is enabled and which roots are allowed.",
+                {},
+            ),
         ]
         if not self.can_manage_providers:
             return definitions
@@ -1218,6 +1582,138 @@ class AgentToolRuntime:
                         "model_id": {"type": ["string", "null"]},
                     },
                     required=["capability", "provider_id", "model_id"],
+                ),
+                self._function_definition(
+                    "set_models_enabled",
+                    "Enable or disable many models of one Provider at once. Works on every discovery-capable role (chat, image generation, vision, transcription, embedding, deep research). Requires workspace.manage.",
+                    {
+                        "provider_id": {"type": "string"},
+                        "states": {
+                            "type": "object",
+                            "description": "Mapping of model_id to a boolean enable flag.",
+                        },
+                    },
+                    required=["provider_id", "states"],
+                ),
+                self._function_definition(
+                    "test_alert_email",
+                    "Send a test email through the configured SMTP alert configuration. Requires workspace.manage.",
+                    {},
+                ),
+                self._function_definition(
+                    "delete_budget_policy",
+                    "Permanently delete a workspace budget policy by id. Requires workspace.manage.",
+                    {"policy_id": {"type": "string", "minLength": 1, "maxLength": 36}},
+                    required=["policy_id"],
+                ),
+                self._function_definition(
+                    "acknowledge_budget_alert",
+                    "Acknowledge a budget alert by id so it no longer surfaces as unhandled. Requires workspace.manage.",
+                    {"alert_id": {"type": "string", "minLength": 1, "maxLength": 36}},
+                    required=["alert_id"],
+                ),
+                self._function_definition(
+                    "set_exchange_rate",
+                    "Set the workspace USD/CNY exchange rate used for cost conversion. Requires workspace.manage.",
+                    {"rate": {"type": "number", "minimum": 0.01}},
+                    required=["rate"],
+                ),
+                self._function_definition(
+                    "refresh_exchange_rate",
+                    "Refresh the USD/CNY exchange rate from the network. Requires workspace.manage.",
+                    {},
+                ),
+                self._function_definition(
+                    "upsert_manual_price",
+                    "Create or replace a workspace manual model price overriding the catalog. Requires workspace.manage.",
+                    {
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": 160},
+                        "provider_id": {"type": "string", "minLength": 1, "maxLength": 80},
+                        "currency": {"type": "string", "enum": ["USD", "CNY"]},
+                        "input_per_million": {"type": "number", "minimum": 0},
+                        "cached_input_per_million": {
+                            "type": ["number", "null"],
+                            "minimum": 0,
+                        },
+                        "output_per_million": {"type": "number", "minimum": 0},
+                        "fixed_per_call": {"type": "number", "minimum": 0},
+                    },
+                    required=["model_id", "input_per_million", "output_per_million"],
+                ),
+                self._function_definition(
+                    "remove_manual_price",
+                    "Remove a workspace manual model price by model_id. Requires workspace.manage.",
+                    {"model_id": {"type": "string", "minLength": 1, "maxLength": 160}},
+                    required=["model_id"],
+                ),
+                self._function_definition(
+                    "refresh_models_dev_snapshot",
+                    "Re-fetch the models.dev price snapshot from the network. Requires workspace.manage.",
+                    {},
+                ),
+                self._function_definition(
+                    "update_memory_policy",
+                    "Change the workspace or a session shared-memory policy: enabled, recall, and learning switches. Requires workspace.manage.",
+                    {
+                        "workspace_enabled": {"type": "boolean"},
+                        "workspace_recall_enabled": {"type": "boolean"},
+                        "workspace_learning_enabled": {"type": "boolean"},
+                        "session_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                        "session_enabled": {"type": "boolean"},
+                        "session_recall_enabled": {"type": "boolean"},
+                        "session_learning_enabled": {"type": "boolean"},
+                    },
+                ),
+                self._function_definition(
+                    "reindex_memory_embeddings",
+                    "Re-embed every active memory under the configured embedding model (best-effort). Requires workspace.manage.",
+                    {},
+                ),
+                self._function_definition(
+                    "toggle_plugin",
+                    "Enable or disable a workspace plugin by id. Requires workspace.manage.",
+                    {
+                        "plugin_id": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                    },
+                    required=["plugin_id", "enabled"],
+                ),
+                self._function_definition(
+                    "update_local_probe_policy",
+                    "Enable or disable local Skill probing and set the allowed scan roots. Requires workspace.manage.",
+                    {
+                        "enabled": {"type": "boolean"},
+                        "allowed_roots": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+                        },
+                    },
+                    required=["enabled"],
+                ),
+                self._function_definition(
+                    "refresh_mcp_server",
+                    "Re-discover the capability snapshot of a registered MCP server. Requires workspace.manage.",
+                    {
+                        "server_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 36,
+                        }
+                    },
+                    required=["server_id"],
+                ),
+                self._function_definition(
+                    "update_skill_manifest",
+                    "Update a declarative Skill's manifest (instructions, required tools, permissions, steps). Changing the manifest invalidates the skill's authorization. Requires workspace.manage.",
+                    {
+                        "skill_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                        "name": {"type": "string", "minLength": 1, "maxLength": 160},
+                        "source": {"type": "string", "minLength": 1, "maxLength": 255},
+                        "version": {"type": "string", "minLength": 1, "maxLength": 80},
+                        "manifest": {"type": "object"},
+                    },
+                    required=["skill_id", "manifest"],
                 ),
             ]
         )
@@ -1647,6 +2143,94 @@ class AgentToolRuntime:
             )
         return definitions
 
+    def _web_fetch_policy(self) -> dict[str, Any]:
+        from app.domain.models import UserWebFetchPolicy, WorkspaceSetting
+
+        setting = self.extensions.db.scalar(
+            select(WorkspaceSetting).where(
+                WorkspaceSetting.workspace_id == self.workspace_id,
+                WorkspaceSetting.key == "web_fetch.policy",
+            )
+        )
+        value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+        workspace_domains = value.get("allowed_domains")
+        user_policy = self.extensions.db.scalar(
+            select(UserWebFetchPolicy).where(
+                UserWebFetchPolicy.workspace_id == self.workspace_id,
+                UserWebFetchPolicy.user_id == self.actor_id,
+            )
+        )
+        workspace_domain_list = (
+            [item for item in workspace_domains if isinstance(item, str)]
+            if isinstance(workspace_domains, list)
+            else []
+        )
+        user_domains = (
+            user_policy.allowed_domains if user_policy is not None else []
+        )
+        return {
+            "allow_without_confirmation": bool(
+                value.get("allow_without_confirmation", False)
+                or (user_policy is not None and user_policy.allow_without_confirmation)
+            ),
+            "allowed_domains": list(
+                dict.fromkeys(
+                    [
+                        *workspace_domain_list,
+                        *(item for item in user_domains if isinstance(item, str)),
+                    ]
+                )
+            ),
+        }
+
+    def _fetch_authorization_challenge(
+        self,
+        tool_call: dict[str, Any],
+        arguments: dict[str, Any],
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        raw_url = arguments.get("url")
+        hostname = urlparse(raw_url.strip()).hostname if isinstance(raw_url, str) else None
+        hostname = hostname.casefold() if hostname else ""
+        from app.domain.models import FetchAuthorizationRequest
+
+        tool_call_id = str(tool_call.get("id") or "")
+        pending = self.extensions.db.scalar(
+            select(FetchAuthorizationRequest).where(
+                FetchAuthorizationRequest.workspace_id == self.workspace_id,
+                FetchAuthorizationRequest.chat_session_id == chat_session_id,
+                FetchAuthorizationRequest.tool_call_id == tool_call_id,
+            )
+        )
+        if pending is None:
+            pending = FetchAuthorizationRequest(
+                workspace_id=self.workspace_id,
+                chat_session_id=chat_session_id,
+                actor_id=self.actor_id,
+                tool_call_id=tool_call_id,
+                requested_url=raw_url.strip() if isinstance(raw_url, str) else "",
+                hostname=hostname,
+            )
+            self.extensions.db.add(pending)
+            self.extensions.db.commit()
+        return self._failure(
+            "fetch_domain_authorization_required",
+            "网页抓取需要用户授权",
+            data={
+                "authorization_request_id": pending.id,
+                "tool_call_id": tool_call_id,
+                "tool_name": "fetch_web_page",
+                "tool_label": "网页抓取工具",
+                "requested_url": raw_url.strip() if isinstance(raw_url, str) else "",
+                "hostname": hostname,
+                "message_zh": (
+                    f"我将使用网页抓取工具抓取 {raw_url.strip()} 网页，是否批准？"
+                    if isinstance(raw_url, str)
+                    else "我将使用网页抓取工具抓取网页，是否批准？"
+                ),
+            },
+        )
+
     def execute(
         self,
         tool_call: dict[str, Any],
@@ -1732,6 +2316,10 @@ class AgentToolRuntime:
                     assistant_message_id=assistant_message_id,
                     source_message_id=source_message_id,
                 )
+            if name == "subapp_observe":
+                return self._execute_subapp_observe(arguments)
+            if name == "subapp_patch_state":
+                return self._execute_subapp_patch_state(arguments)
             if name in {
                 "list_providers",
                 "list_provider_models",
@@ -1742,6 +2330,11 @@ class AgentToolRuntime:
                 "rotate_provider_secret",
                 "delete_provider",
                 "put_model_capabilities",
+                "refresh_provider_models",
+                "probe_provider",
+                "verify_provider_declaration",
+                "validate_provider_default_models",
+                "configure_dashscope_balance",
             }:
                 return self._execute_provider_tool(name, arguments)
             if name in {
@@ -1753,11 +2346,39 @@ class AgentToolRuntime:
                 "get_provider_balance_query_config",
                 "update_provider_balance_query_config",
                 "set_model_enabled",
+                "set_models_enabled",
                 "get_alert_email_config",
                 "update_alert_email_config",
+                "test_alert_email",
                 "get_functional_model_defaults",
                 "set_functional_model_default",
                 "list_secret_labels",
+                # Billing / usage settings.
+                "list_budget_policies",
+                "delete_budget_policy",
+                "get_budget_status",
+                "list_budget_alerts",
+                "acknowledge_budget_alert",
+                "get_exchange_rate",
+                "set_exchange_rate",
+                "refresh_exchange_rate",
+                "list_manual_prices",
+                "upsert_manual_price",
+                "remove_manual_price",
+                "get_usage_summary",
+                "list_usage_events",
+                "refresh_models_dev_snapshot",
+                # Memory settings.
+                "get_memory_policy",
+                "update_memory_policy",
+                "reindex_memory_embeddings",
+                # Plugins / local Skill probe / MCP refresh / Skill manifest.
+                "list_plugins",
+                "toggle_plugin",
+                "get_local_probe_policy",
+                "update_local_probe_policy",
+                "refresh_mcp_server",
+                "update_skill_manifest",
             }:
                 return self._execute_management_tool(
                     name,
@@ -1785,7 +2406,60 @@ class AgentToolRuntime:
                     sources,
                 )
             if name == "fetch_web_page":
-                return self._fetch_web_page(arguments, allowed_domains)
+                policy = self._web_fetch_policy()
+                policy_domains = policy["allowed_domains"]
+                effective_domains = list(
+                    dict.fromkeys([*allowed_domains, *policy_domains])
+                )
+                if not effective_domains and not policy["allow_without_confirmation"]:
+                    from app.domain.models import FetchAuthorizationRequest
+
+                    requested_url = arguments.get("url")
+                    one_time = self.extensions.db.scalar(
+                        select(FetchAuthorizationRequest).where(
+                            FetchAuthorizationRequest.workspace_id == self.workspace_id,
+                            FetchAuthorizationRequest.chat_session_id == chat_session_id,
+                            FetchAuthorizationRequest.status == "approved",
+                            FetchAuthorizationRequest.decision == "allow_once",
+                            FetchAuthorizationRequest.requested_url == (
+                                requested_url.strip() if isinstance(requested_url, str) else ""
+                            ),
+                        )
+                    )
+                    if one_time is not None:
+                        one_time.status = "consumed"
+                        self.extensions.db.commit()
+                        effective_domains = [one_time.hostname]
+                    else:
+                        # Tool-runtime unit callers may supply a synthetic
+                        # session id. A real chat authorization card requires a
+                        # durable ChatSession foreign-key target; without one,
+                        # preserve the legacy hard refusal rather than trying
+                        # to insert an invalid authorization request.
+                        session_exists = self.extensions.db.scalar(
+                            select(ChatSession.id).where(
+                                ChatSession.id == chat_session_id,
+                                ChatSession.workspace_id == self.workspace_id,
+                            )
+                        )
+                        if session_exists is None:
+                            return self._failure(
+                                "fetch_domain_not_authorized",
+                                "Full-page extraction requires an explicitly authorized domain",
+                            )
+                        return self._fetch_authorization_challenge(
+                            tool_call, arguments, chat_session_id
+                        )
+                if policy["allow_without_confirmation"] and not effective_domains:
+                    requested_url = arguments.get("url")
+                    hostname = (
+                        urlparse(requested_url.strip()).hostname
+                        if isinstance(requested_url, str)
+                        else None
+                    )
+                    if hostname:
+                        effective_domains = [hostname.casefold()]
+                return self._fetch_web_page(arguments, effective_domains)
             if name == "search_images":
                 return self._search_images(arguments, allowed_domains)
             if name == "list_session_files":
@@ -2036,6 +2710,376 @@ class AgentToolRuntime:
             },
             [],
         )
+
+    def _execute_subapp_observe(
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Read-only observation of workspace sub-application interaction events.
+
+        Returns bounded aggregates (total count, per-event-type counts) plus a
+        small, size/field-limited digest of the most recent events. Payloads are
+        treated as untrusted data: only a bounded top-level key list, truncated
+        scalar values, byte sizes, and a sha256 are surfaced — never verbatim
+        content. This tool performs SELECTs only and never writes.
+        """
+        from app.domain.models import SubAppInteractionEvent
+
+        db = self.extensions.db
+        workspace_id = self.workspace_id
+
+        # --- validate / bound arguments (defensive; never trust the model) ---
+        session_id = arguments.get("session_id")
+        if session_id is not None and not isinstance(session_id, str):
+            raise AppError(422, "invalid_tool_arguments", "session_id must be a string")
+        session_id = session_id.strip() if isinstance(session_id, str) else None
+        if session_id and len(session_id) > SUBAPP_OBSERVE_SESSION_ID_MAX:
+            raise AppError(422, "invalid_tool_arguments", "session_id is too long")
+
+        event_type = arguments.get("event_type")
+        if event_type is not None and not isinstance(event_type, str):
+            raise AppError(422, "invalid_tool_arguments", "event_type must be a string")
+        event_type = event_type.strip() if isinstance(event_type, str) else None
+        if event_type and len(event_type) > SUBAPP_OBSERVE_EVENT_TYPE_MAX:
+            raise AppError(422, "invalid_tool_arguments", "event_type is too long")
+
+        limit = arguments.get("limit", 20)
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise AppError(422, "invalid_tool_arguments", "limit must be an integer")
+        limit = max(1, min(limit, SUBAPP_OBSERVE_MAX_LIMIT))
+
+        time_from: datetime | None = None
+        time_to: datetime | None = None
+        time_range = arguments.get("time_range")
+        if time_range is not None:
+            if not isinstance(time_range, dict):
+                raise AppError(422, "invalid_tool_arguments", "time_range must be an object")
+            unknown = set(time_range) - {"from", "to"}
+            if unknown:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    f"time_range has unexpected field(s): {sorted(unknown)}",
+                )
+            time_from = self._parse_iso_datetime(time_range.get("from"), "time_range.from")
+            time_to = self._parse_iso_datetime(time_range.get("to"), "time_range.to")
+        if (
+            time_from is not None
+            and time_to is not None
+            and time_from > time_to
+        ):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "time_range.from must not be after time_range.to",
+            )
+
+        # --- scope: workspace only, optional filters ---
+        filters = [SubAppInteractionEvent.workspace_id == workspace_id]
+        if session_id:
+            filters.append(SubAppInteractionEvent.session_id == session_id)
+        if event_type:
+            filters.append(SubAppInteractionEvent.event_type == event_type)
+        if time_from is not None:
+            filters.append(SubAppInteractionEvent.created_at >= time_from)
+        if time_to is not None:
+            filters.append(SubAppInteractionEvent.created_at <= time_to)
+
+        # --- aggregates via SQL (bounded output) ---
+        total_count = int(
+            db.scalar(
+                select(func.count(SubAppInteractionEvent.id)).where(*filters)
+            )
+            or 0
+        )
+
+        type_rows = db.execute(
+            select(
+                SubAppInteractionEvent.event_type,
+                func.count(SubAppInteractionEvent.id),
+            )
+            .where(*filters)
+            .group_by(SubAppInteractionEvent.event_type)
+            .order_by(func.count(SubAppInteractionEvent.id).desc())
+        ).all()
+        count_by_type: dict[str, int] = {}
+        other_count = 0
+        for row in type_rows:
+            key = str(row[0] or "unknown")
+            if len(count_by_type) < SUBAPP_OBSERVE_MAX_EVENT_TYPES:
+                count_by_type[key] = int(row[1])
+            else:
+                other_count += int(row[1])
+        if other_count:
+            count_by_type["__other_types__"] = other_count
+
+        recent_rows = list(
+            db.scalars(
+                select(SubAppInteractionEvent)
+                .where(*filters)
+                .order_by(
+                    SubAppInteractionEvent.created_at.desc(),
+                    SubAppInteractionEvent.id.desc(),
+                )
+                .limit(limit)
+            ).all()
+        )
+        recent_events: list[dict[str, Any]] = [
+            self._subapp_event_digest(event) for event in recent_rows
+        ]
+
+        return self._success(
+            {
+                "filters_applied": {
+                    "session_id": session_id,
+                    "event_type": event_type,
+                    "time_range": {
+                        "from": time_from.isoformat() if time_from else None,
+                        "to": time_to.isoformat() if time_to else None,
+                    },
+                    "limit": limit,
+                },
+                "total_events": total_count,
+                "events_by_type": count_by_type,
+                "recent_events": recent_events,
+                "recent_events_truncated": total_count > len(recent_events),
+            },
+            {
+                "tool": "subapp_observe",
+                "total_events": total_count,
+                "event_type_count": len(count_by_type),
+                "recent_events_returned": len(recent_events),
+            },
+            [],
+        )
+
+    def _execute_subapp_patch_state(
+        self,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Write one state snapshot to an interactive sub-application session (T2.5).
+
+        This is the agent's ONLY write path for sub-application state. It goes
+        through ``SubAppService.propose_state``, which contract-validates the
+        state against the session's snapshotted ``state_schema``, CAS-advances
+        the optimistic-lock ``state_version``, and persists an immutable
+        snapshot (with a canonical-JSON sha256). The agent never holds an
+        iframe reference and must not try to postMessage or otherwise mutate
+        the renderer directly.
+
+        ``expected_version`` is mandatory: the caller must read the session's
+        current ``state_version`` first (e.g. via ``subapp_observe`` or the
+        session view). A stale expectation fails fast here with the current
+        version so the caller can re-read and retry; the authoritative race
+        guard remains the CAS inside ``propose_state``.
+        """
+        from app.services.subapps import SubAppService
+
+        db = self.extensions.db
+        workspace_id = self.workspace_id
+        actor_id = self.actor_id
+
+        # --- validate / bound arguments (defensive; never trust the model) ---
+        session_id = arguments.get("session_id")
+        if not isinstance(session_id, str):
+            raise AppError(422, "invalid_tool_arguments", "session_id must be a string")
+        session_id = session_id.strip()
+        if not session_id:
+            raise AppError(422, "invalid_tool_arguments", "session_id must not be empty")
+        if len(session_id) > SUBAPP_OBSERVE_SESSION_ID_MAX:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "session_id is too long",
+                {"max_length": SUBAPP_OBSERVE_SESSION_ID_MAX},
+            )
+
+        state = arguments.get("state")
+        if not isinstance(state, dict):
+            raise AppError(422, "invalid_tool_arguments", "state must be an object")
+
+        expected_version = arguments.get("expected_version")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "expected_version must be an integer >= 0",
+            )
+
+        service = SubAppService(db, workspace_id, actor_id)
+
+        # --- pre-read the current version: scope the session to this workspace
+        # and give the caller the exact version to retry with on a conflict.
+        # This is a helper, not the race guard — propose_state's CAS UPDATE is
+        # the authoritative check against a concurrent writer. ---
+        try:
+            current = service.get_session(session_id)
+        except AppError as exc:
+            return self._failure(
+                exc.code,
+                exc.message,
+                data={"session_id": session_id},
+            )
+        if current.state_version != expected_version:
+            return self._failure(
+                "subapp_state_version_conflict",
+                "Sub-application state version moved; re-read the current "
+                "state_version and retry",
+                data={
+                    "session_id": session_id,
+                    "current_version": current.state_version,
+                    "expected_version": expected_version,
+                },
+            )
+
+        # --- CAS write through the server (contract + protocol validation) ---
+        try:
+            new_version = service.propose_state(
+                session_id,
+                state,
+                expected_version=expected_version,
+            )
+        except AppError as exc:
+            details = dict(exc.details or {})
+            details.setdefault("session_id", session_id)
+            return self._failure(exc.code, exc.message, data=details)
+
+        # --- read back the persisted sha256 for the write confirmation ---
+        try:
+            after = service.get_session(session_id)
+        except AppError:
+            after = None
+        state_sha256 = (
+            getattr(after, "state_sha256", None) if after is not None else None
+        )
+
+        return self._success(
+            {
+                "session_id": session_id,
+                "new_state_version": new_version,
+                "state_sha256": state_sha256,
+            },
+            {
+                "tool": "subapp_patch_state",
+                "new_state_version": new_version,
+                "state_sha256": state_sha256,
+            },
+            [],
+        )
+
+    def _subapp_event_digest(self, event: Any) -> dict[str, Any]:
+        """One bounded summary row for a SubAppInteractionEvent.
+
+        Serializes created_at to ISO-8601 (JSON-safe) and reduces the payload to
+        a size/field-limited digest.
+        """
+        created_at = getattr(event, "created_at", None)
+        return {
+            "event_id": getattr(event, "id", None),
+            "session_id": getattr(event, "session_id", None),
+            "event_type": getattr(event, "event_type", None),
+            "actor_id": getattr(event, "actor_id", None),
+            "chat_session_id": getattr(event, "chat_session_id", None),
+            "artifact_version_id": getattr(event, "artifact_version_id", None),
+            "created_at": (
+                created_at.isoformat() if isinstance(created_at, datetime) else None
+            ),
+            "payload": self._bounded_payload_summary(
+                getattr(event, "payload_json", None),
+                getattr(event, "payload_sha256", None),
+            ),
+        }
+
+    def _bounded_payload_summary(self, raw: Any, sha: Any) -> dict[str, Any]:
+        """Reduce an untrusted payload to a bounded, field-limited digest.
+
+        Never echoes arbitrary payload text back verbatim: object payloads
+        expose a bounded top-level key list and truncated scalar values;
+        non-object payloads expose a short truncated preview; oversized or
+        unparseable payloads are reduced to size + sha256 only.
+        """
+        sha = str(sha) if sha else None
+        if not isinstance(raw, str) or not raw:
+            return {"state": "empty", "size_bytes": 0, "sha256": sha}
+        try:
+            size_bytes = len(raw.encode("utf-8"))
+        except Exception:
+            size_bytes = len(raw)
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {
+                "state": "unparseable",
+                "size_bytes": size_bytes,
+                "preview": raw[:SUBAPP_OBSERVE_PAYLOAD_PREVIEW_CHARS],
+                "sha256": sha,
+            }
+        if isinstance(payload, dict):
+            keys = list(payload.keys())[:SUBAPP_OBSERVE_PAYLOAD_SUMMARY_KEYS]
+            scalars: dict[str, str] = {}
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, (str, int, float, bool)) and value is not None:
+                    scalars[key] = self._summarize_scalar(value)
+            return {
+                "state": "object",
+                "size_bytes": size_bytes,
+                "keys": keys,
+                "scalars": scalars,
+                "sha256": sha,
+            }
+        if isinstance(payload, (list, str, int, float, bool)):
+            preview = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            return {
+                "state": type(payload).__name__,
+                "size_bytes": size_bytes,
+                "preview": preview[:SUBAPP_OBSERVE_PAYLOAD_PREVIEW_CHARS],
+                "sha256": sha,
+            }
+        return {"state": "unknown", "size_bytes": size_bytes, "sha256": sha}
+
+    @staticmethod
+    def _summarize_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        text = str(value)
+        if len(text) > SUBAPP_OBSERVE_PAYLOAD_SCALAR_CHARS:
+            return text[:SUBAPP_OBSERVE_PAYLOAD_SCALAR_CHARS] + "…"
+        return text
+
+    @staticmethod
+    def _parse_iso_datetime(value: Any, label: str) -> datetime | None:
+        """Parse an optional ISO-8601 date-time into a tz-aware UTC datetime.
+
+        Returns None when the value is missing/blank; raises AppError on any
+        malformed or non-string input so invalid filters fail loudly.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise AppError(422, "invalid_tool_arguments", f"{label} must be an ISO-8601 string")
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        elif raw.endswith("z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                f"{label} is not a valid ISO-8601 date-time",
+            ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     def _provider_service(self):
         from app.core.config import get_settings
@@ -2503,6 +3547,92 @@ class AgentToolRuntime:
                 },
                 [],
             )
+        if name == "refresh_provider_models":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(422, "invalid_tool_arguments", "provider_id is required")
+            result = service.refresh_models(provider_id)
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "mutated": True,
+                },
+                [],
+            )
+        if name == "probe_provider":
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            if not provider_id:
+                raise AppError(422, "invalid_tool_arguments", "provider_id is required")
+            result = service.probe_connectivity(provider_id)
+            return self._success(
+                result,
+                {"tool": name, "provider_id": provider_id},
+                [],
+            )
+        if name == "verify_provider_declaration":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            status = str(arguments.get("status") or "").strip()
+            if not provider_id or not status:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and status are required",
+                )
+            result = service.update_declaration_status(provider_id, status)
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "mutated": True,
+                },
+                [],
+            )
+        if name == "validate_provider_default_models":
+            repair = arguments.get("repair") is True
+            if repair:
+                self._require_provider_manage()
+            provider_id = (
+                str(arguments["provider_id"]).strip()
+                if isinstance(arguments.get("provider_id"), str)
+                and arguments["provider_id"].strip()
+                else None
+            )
+            result = service.validate_default_models(provider_id, repair=repair)
+            return self._success(
+                result,
+                {"tool": name, "provider_id": provider_id, "repair": repair},
+                [],
+            )
+        if name == "configure_dashscope_balance":
+            self._require_provider_manage()
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            secret_label = arguments.get("secret_label")
+            if (
+                not provider_id
+                or not isinstance(secret_label, str)
+                or not secret_label.strip()
+            ):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and secret_label are required",
+                )
+            result = service.configure_balance_credential(provider_id, secret_label)
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "mutated": True,
+                    "secret_redacted": True,
+                },
+                [],
+            )
         raise AppError(404, "unknown_provider_tool", f"Unknown provider tool: {name}")
 
     def _execute_management_tool(
@@ -2514,13 +3644,20 @@ class AgentToolRuntime:
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         from app.domain.schemas.chat import SessionUpdateRequest
         from app.domain.schemas.management import (
-            ProviderModelStateUpdateRequest,
+            BudgetAlertView,
+            BudgetPolicyView,
+            MemoryPolicyUpdateRequest,
+            ManualPriceView,
+            PluginToggleRequest,
+            PluginView,
             SettingUpdateRequest,
+            UsageEventView,
         )
         from app.domain.settings import FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY
         from app.providers.catalog import provider_type_spec
         from app.services import alert_email
-        from app.services.management import SettingsService
+        from app.services.billing import BillingService
+        from app.services.management import PluginService, SettingsService, UsageService
         from app.services.secret_references import SecretReferenceService
         from app.services.workflow import WorkflowService
 
@@ -2565,12 +3702,17 @@ class AgentToolRuntime:
             )
         if name == "get_provider_balance":
             self._require_provider_manage()
+            from app.domain.schemas.management import ProviderBalanceView
+
             provider_id = str(arguments.get("provider_id") or "").strip()
             if not provider_id:
                 raise AppError(
                     422, "invalid_tool_arguments", "provider_id is required"
                 )
-            result = self._provider_service().balance(provider_id)
+            raw = self._provider_service().balance(provider_id)
+            # balance() returns a datetime queried_at; serialize through the
+            # view schema so the transcript stays JSON-safe.
+            result = ProviderBalanceView.model_validate(raw).model_dump(mode="json")
             return self._success(
                 result,
                 {"tool": name, "provider_id": provider_id},
@@ -2725,7 +3867,7 @@ class AgentToolRuntime:
             result = self._provider_service().update_model_state(
                 provider_id,
                 model_id,
-                ProviderModelStateUpdateRequest(enabled=enabled),
+                enabled,
             )
             return self._success(
                 result,
@@ -2733,6 +3875,39 @@ class AgentToolRuntime:
                     "tool": name,
                     "provider_id": provider_id,
                     "model_id": model_id,
+                    "mutated": True,
+                },
+                [],
+            )
+        if name == "set_models_enabled":
+            provider_id = str(arguments.get("provider_id") or "").strip()
+            states = arguments.get("states")
+            if not provider_id or not isinstance(states, dict) or not states:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "provider_id and a non-empty states object are required",
+                )
+            normalized = {
+                str(model_id): bool(value)
+                for model_id, value in states.items()
+                if isinstance(model_id, str) and model_id.strip()
+            }
+            if not normalized:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "states must map model ids to booleans",
+                )
+            result = self._provider_service().update_model_states(
+                provider_id, normalized
+            )
+            return self._success(
+                result,
+                {
+                    "tool": name,
+                    "provider_id": provider_id,
+                    "updated_models": len(normalized),
                     "mutated": True,
                 },
                 [],
@@ -2827,6 +4002,407 @@ class AgentToolRuntime:
             return self._success(
                 {"key": item.key, "defaults": item.value},
                 {"tool": name, "capability": capability, "mutated": True},
+                [],
+            )
+
+        # --- Billing / usage settings -------------------------------------------------
+        if name in {"list_budget_policies", "get_budget_status", "list_budget_alerts"}:
+            from app.domain.schemas.management import BudgetStatusView
+
+            billing = BillingService(db, self.workspace_id, self.actor_id)
+            if name == "list_budget_policies":
+                items = [
+                    BudgetPolicyView.model_validate(item).model_dump(mode="json")
+                    for item in billing.list_budget_policies()
+                ]
+            elif name == "get_budget_status":
+                items = [
+                    BudgetStatusView.model_validate(item).model_dump(mode="json")
+                    for item in billing.budget_statuses()
+                ]
+            else:
+                items = [
+                    BudgetAlertView.model_validate(item).model_dump(mode="json")
+                    for item in billing.list_alerts()
+                ]
+            return self._success(
+                {"items": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+        if name == "delete_budget_policy":
+            self._require_provider_manage()
+            policy_id = str(arguments.get("policy_id") or "").strip()
+            if not policy_id:
+                raise AppError(422, "invalid_tool_arguments", "policy_id is required")
+            BillingService(db, self.workspace_id, self.actor_id).delete_budget_policy(
+                policy_id
+            )
+            return self._success(
+                {"policy_id": policy_id, "deleted": True},
+                {"tool": name, "policy_id": policy_id, "mutated": True},
+                [],
+            )
+        if name == "acknowledge_budget_alert":
+            self._require_provider_manage()
+            alert_id = str(arguments.get("alert_id") or "").strip()
+            if not alert_id:
+                raise AppError(422, "invalid_tool_arguments", "alert_id is required")
+            alert = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).acknowledge_alert(alert_id)
+            return self._success(
+                BudgetAlertView.model_validate(alert).model_dump(mode="json"),
+                {"tool": name, "alert_id": alert_id, "mutated": True},
+                [],
+            )
+        if name == "get_exchange_rate":
+            from app.domain.schemas.management import ExchangeRateInfo
+
+            rate = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).current_exchange_rate()
+            return self._success(
+                ExchangeRateInfo.model_validate(rate, from_attributes=True).model_dump(
+                    mode="json"
+                ),
+                {"tool": name},
+                [],
+            )
+        if name == "set_exchange_rate":
+            self._require_provider_manage()
+            rate = arguments.get("rate")
+            if not isinstance(rate, (int, float)) or rate <= 0:
+                raise AppError(
+                    422, "invalid_tool_arguments", "rate must be a positive number"
+                )
+            from app.domain.schemas.management import ExchangeRateInfo
+
+            result = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).set_exchange_rate(float(rate))
+            return self._success(
+                ExchangeRateInfo.model_validate(
+                    result, from_attributes=True
+                ).model_dump(mode="json"),
+                {"tool": name, "mutated": True},
+                [],
+            )
+        if name == "refresh_exchange_rate":
+            self._require_provider_manage()
+            from app.domain.schemas.management import ExchangeRateInfo
+
+            result = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).refresh_exchange_rate_from_network()
+            return self._success(
+                ExchangeRateInfo.model_validate(
+                    result, from_attributes=True
+                ).model_dump(mode="json"),
+                {"tool": name, "mutated": True},
+                [],
+            )
+        if name == "list_manual_prices":
+            raw = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).list_manual_prices()
+            items = [
+                ManualPriceView.model_validate(item).model_dump(mode="json")
+                for item in raw
+            ]
+            return self._success(
+                {"items": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+        if name == "upsert_manual_price":
+            self._require_provider_manage()
+            from app.domain.schemas.management import ManualPriceUpsertRequest
+
+            model_id = str(arguments.get("model_id") or "").strip()
+            if not model_id:
+                raise AppError(422, "invalid_tool_arguments", "model_id is required")
+            try:
+                payload = ManualPriceUpsertRequest(
+                    model_id=model_id,
+                    provider_id=str(arguments.get("provider_id") or "*").strip(),
+                    currency=str(arguments.get("currency") or "USD").strip(),
+                    input_per_million=float(arguments.get("input_per_million", 0)),
+                    cached_input_per_million=(
+                        float(arguments["cached_input_per_million"])
+                        if arguments.get("cached_input_per_million") is not None
+                        else None
+                    ),
+                    output_per_million=float(arguments.get("output_per_million", 0)),
+                    fixed_per_call=float(arguments.get("fixed_per_call", 0)),
+                )
+            except (TypeError, ValueError) as exc:
+                raise AppError(
+                    422, "invalid_tool_arguments", f"Invalid manual price: {exc}"
+                ) from exc
+            result = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).upsert_manual_price(**payload.model_dump())
+            return self._success(
+                ManualPriceView.model_validate(result).model_dump(mode="json"),
+                {"tool": name, "model_id": model_id, "mutated": True},
+                [],
+            )
+        if name == "remove_manual_price":
+            self._require_provider_manage()
+            model_id = str(arguments.get("model_id") or "").strip()
+            if not model_id:
+                raise AppError(422, "invalid_tool_arguments", "model_id is required")
+            removed = BillingService(
+                db, self.workspace_id, self.actor_id
+            ).remove_manual_price(model_id)
+            return self._success(
+                {"model_id": model_id, "removed_count": removed},
+                {"tool": name, "model_id": model_id, "mutated": True},
+                [],
+            )
+        if name in {"get_usage_summary", "list_usage_events"}:
+            usage_service = UsageService(db, self.workspace_id)
+            provider_id = (
+                str(arguments["provider_id"]).strip()
+                if isinstance(arguments.get("provider_id"), str)
+                else None
+            )
+            model_id = (
+                str(arguments["model_id"]).strip()
+                if isinstance(arguments.get("model_id"), str)
+                else None
+            )
+            feature = (
+                str(arguments["feature"]).strip()
+                if isinstance(arguments.get("feature"), str)
+                else None
+            )
+            if name == "get_usage_summary":
+                summary = usage_service.summary(
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    feature=feature,
+                )
+                return self._success(
+                    summary.model_dump(mode="json"),
+                    {"tool": name},
+                    [],
+                )
+            events = usage_service.events(
+                provider_id=provider_id,
+                model_id=model_id,
+                feature=feature,
+            )
+            limit = (
+                int(arguments["limit"]) if isinstance(arguments.get("limit"), int) else 100
+            )
+            items = [
+                UsageEventView.model_validate(item).model_dump(mode="json")
+                for item in events[: min(max(limit, 1), 200)]
+            ]
+            return self._success(
+                {"items": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+        if name == "refresh_models_dev_snapshot":
+            self._require_provider_manage()
+            from app.domain.schemas.management import ModelsDevSnapshotStatus
+            from app.providers.models_dev import refresh_snapshot
+
+            try:
+                status = ModelsDevSnapshotStatus.model_validate(
+                    refresh_snapshot()
+                ).model_dump(mode="json")
+            except Exception as exc:  # noqa: BLE001 - network and payload faults alike
+                raise AppError(
+                    502,
+                    "models_dev_refresh_failed",
+                    f"Refreshing tariffs from models.dev failed: {exc}",
+                ) from exc
+            return self._success(
+                status,
+                {"tool": name, "mutated": True},
+                [],
+            )
+        if name == "test_alert_email":
+            self._require_provider_manage()
+            config = alert_email.load_config(db, self.workspace_id)
+            try:
+                alert_email.send_mail(
+                    config,
+                    "[LearnGraph] 预算告警测试邮件",
+                    "这是一封来自 LearnGraph 用量预算模块的测试邮件；收到即表示 SMTP 配置可用。",
+                )
+            except AppError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - report SMTP faults verbatim
+                return self._success(
+                    {"ok": False, "detail": str(exc)},
+                    {"tool": name, "sent": False},
+                    [],
+                )
+            return self._success(
+                {"ok": True, "detail": "测试邮件已发送"},
+                {"tool": name, "sent": True},
+                [],
+            )
+
+        # --- Memory settings -----------------------------------------------------------
+        if name in {"get_memory_policy", "update_memory_policy"}:
+            if self.memory_tools is None:
+                return self._failure(
+                    "memory_tools_unavailable", "Memory tools are unavailable"
+                )
+            if name == "get_memory_policy":
+                session_id = (
+                    str(arguments["session_id"]).strip()
+                    if isinstance(arguments.get("session_id"), str)
+                    and arguments["session_id"].strip()
+                    else None
+                )
+                view = self.memory_tools.policy(session_id=session_id)
+            else:
+                self._require_provider_manage()
+                try:
+                    payload = MemoryPolicyUpdateRequest.model_validate(arguments)
+                except Exception as exc:
+                    raise AppError(
+                        422,
+                        "invalid_tool_arguments",
+                        "Memory policy arguments are invalid",
+                        {"validation_error": str(exc)},
+                    ) from exc
+                view = self.memory_tools.update_policy(payload)
+            return self._success(
+                view.model_dump(mode="json"),
+                {"tool": name, "mutated": name == "update_memory_policy"},
+                [],
+            )
+        if name == "reindex_memory_embeddings":
+            self._require_provider_manage()
+            from app.services.memory_enhancement import reindex_memory_embeddings
+
+            result = reindex_memory_embeddings(
+                db, self.workspace_id, self.settings or get_settings()
+            )
+            return self._success(
+                result,
+                {"tool": name, "mutated": True},
+                [],
+            )
+
+        # --- Plugins / local Skill probe / MCP refresh / Skill manifest ---------------
+        if name == "list_plugins":
+            plugins = PluginService(db, self.workspace_id, self.actor_id).list()
+            items = [
+                PluginView.model_validate(item).model_dump(mode="json")
+                for item in plugins
+            ]
+            return self._success(
+                {"plugins": items, "count": len(items)},
+                {"tool": name, "count": len(items)},
+                [],
+            )
+        if name == "toggle_plugin":
+            self._require_provider_manage()
+            plugin_id = str(arguments.get("plugin_id") or "").strip()
+            enabled = arguments.get("enabled")
+            if not plugin_id or not isinstance(enabled, bool):
+                raise AppError(
+                    422, "invalid_tool_arguments", "plugin_id and enabled are required"
+                )
+            plugin = PluginService(db, self.workspace_id, self.actor_id).toggle(
+                plugin_id, PluginToggleRequest(enabled=enabled)
+            )
+            return self._success(
+                PluginView.model_validate(plugin).model_dump(mode="json"),
+                {"tool": name, "plugin_id": plugin_id, "mutated": True},
+                [],
+            )
+        if name in {"get_local_probe_policy", "update_local_probe_policy"}:
+            from app.domain.schemas.extensions import SkillLocalProbePolicyUpdate
+            from app.services.skill_local_probe import SkillLocalProbeService
+
+            probe_service = SkillLocalProbeService(
+                db, self.workspace_id, self.actor_id, self.settings or get_settings()
+            )
+            if name == "get_local_probe_policy":
+                view = probe_service.get_policy()
+                return self._success(
+                    view.model_dump(mode="json"),
+                    {"tool": name},
+                    [],
+                )
+            self._require_provider_manage()
+            view = probe_service.update_policy(
+                SkillLocalProbePolicyUpdate(
+                    enabled=bool(arguments.get("enabled")),
+                    allowed_roots=[
+                        str(item)
+                        for item in (arguments.get("allowed_roots") or [])
+                        if isinstance(item, str) and item.strip()
+                    ],
+                )
+            )
+            return self._success(
+                view.model_dump(mode="json"),
+                {"tool": name, "mutated": True},
+                [],
+            )
+        if name == "refresh_mcp_server":
+            self._require_provider_manage()
+            server_id = str(arguments.get("server_id") or "").strip()
+            if not server_id:
+                raise AppError(422, "invalid_tool_arguments", "server_id is required")
+            snapshot = self.extensions.refresh_server(server_id)
+            return self._success(
+                {
+                    "server_id": server_id,
+                    "snapshot": snapshot.model_dump(mode="json"),
+                },
+                {"tool": name, "server_id": server_id, "mutated": True},
+                [],
+            )
+        if name == "update_skill_manifest":
+            self._require_provider_manage()
+            from app.domain.schemas.extensions import SkillUpdateRequest, SkillView
+
+            skill_id = str(arguments.get("skill_id") or "").strip()
+            manifest = arguments.get("manifest")
+            if not skill_id or not isinstance(manifest, dict):
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "skill_id and manifest are required",
+                )
+            try:
+                payload = SkillUpdateRequest(
+                    name=(
+                        str(arguments.get("name") or "").strip()
+                        if arguments.get("name")
+                        else None
+                    ),
+                    source=str(arguments.get("source") or "agent_manifest_update").strip(),
+                    version=str(arguments.get("version") or "1.0.0").strip(),
+                    manifest=manifest,
+                )
+            except Exception as exc:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    f"Skill manifest failed validation: {exc}",
+                ) from exc
+            skill = self.extensions.update_skill(skill_id, payload)
+            return self._success(
+                SkillView.model_validate(skill).model_dump(mode="json"),
+                {
+                    "tool": name,
+                    "skill_id": skill_id,
+                    "mutated": True,
+                    "reauthorization_required": True,
+                },
                 [],
             )
         raise AppError(404, "unknown_management_tool", f"Unknown management tool: {name}")
@@ -4459,10 +6035,12 @@ class AgentToolRuntime:
                 "The selected image generation model is not configured and enabled",
             )
 
-        if source_file_ids and image_provider.model_id.casefold() != "gpt-image-2":
+        if source_file_ids and not getattr(
+            image_provider, "supports_image_edit", False
+        ):
             return self._failure(
                 "image_edit_model_unsupported",
-                "Image editing is only supported with gpt-image-2. The active text LLM may still be DeepSeek; select gpt-image-2 for this image tool call.",
+                "Image editing requires a supported image-edit model (gpt-image-2 or qwen-image-edit-max). The active text LLM may still be DeepSeek; select an image-edit model for this image tool call.",
             )
 
         images = ImageGenerationService(
@@ -4634,6 +6212,16 @@ class AgentToolRuntime:
             "details": details,
             "result_truncated": truncated,
         }
+        if code == "fetch_domain_authorization_required":
+            meta["fetch_authorization_required"] = {
+                "authorization_request_id": details.get("authorization_request_id"),
+                "tool_call_id": details.get("tool_call_id"),
+                "tool_name": details.get("tool_name") or "fetch_web_page",
+                "tool_label": details.get("tool_label") or "网页抓取工具",
+                "requested_url": details.get("requested_url"),
+                "hostname": details.get("hostname"),
+                "message_zh": details.get("message_zh") or "网页抓取需要用户授权。",
+            }
         # Surface structured sandbox authorization challenges to the Chat SSE
         # assembler so the client can open an explicit grant dialog.
         if code == "sandbox_auth_required":

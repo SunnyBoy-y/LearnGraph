@@ -597,6 +597,46 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         ),
     ),
     ProviderTypeSpec(
+        provider_type="ollama_cloud",
+        role="model",
+        label="Ollama Cloud",
+        description=(
+            "ollama.com 的 Cloud API（原生 /api/chat），无需本地 GPU。"
+            "需要 OLLAMA_API_KEY；Cloud 当前不支持 structured outputs。"
+            "与本地 Ollama 独立，使用真实 Bearer Key 并走正常网络代理。"
+        ),
+        requires_base_url=True,
+        requires_secret=True,
+        supports_model_discovery=True,
+        supports_probe=True,
+        default_base_url="https://ollama.com/v1",
+        probe_notice=(
+            "探测会调用 GET /api/tags 列出 Cloud 模型，不生成内容。"
+            "请先在 ollama.com 创建 API Key。"
+        ),
+        brand_id="ollama",
+        brand_icon_url="https://cdn.simpleicons.org/ollama",
+        documentation_url="https://docs.ollama.com/cloud",
+        key_management_url="https://ollama.com/settings/keys",
+    ),
+    ProviderTypeSpec(
+        provider_type="ollama_cloud_search",
+        role="search",
+        label="Ollama Cloud Search",
+        description=(
+            "ollama.com 的 Web Search REST API。"
+            "需要 OLLAMA_API_KEY，返回搜索结果（title/url/snippet）。"
+        ),
+        requires_base_url=True,
+        requires_secret=True,
+        default_base_url="https://ollama.com/api",
+        probe_notice="探测会调用一次 bounded web search（max_results=1）。",
+        brand_id="ollama",
+        brand_icon_url="https://cdn.simpleicons.org/ollama",
+        documentation_url="https://docs.ollama.com/capabilities/web-search",
+        key_management_url="https://ollama.com/settings/keys",
+    ),
+    ProviderTypeSpec(
         provider_type="mem0_platform",
         role="memory",
         label="Mem0 Platform",

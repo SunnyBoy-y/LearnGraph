@@ -15,6 +15,8 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileWriteRequest,
     SandboxAgentSessionCreateRequest,
     SandboxBootstrapJobView,
+    SandboxBootstrapPolicyUpdateRequest,
+    SandboxBootstrapPolicyView,
     SandboxBootstrapStartResponse,
     SandboxBootstrapStatusView,
     SandboxDestructiveGrantRequest,
@@ -30,6 +32,7 @@ from app.domain.schemas.sandbox import (
     SessionWorkspacePublishResponse,
 )
 from app.core.errors import AppError
+from app.repositories.audit import AuditRepository
 from app.services.sandbox import (
     SandboxAgentWorkspaceService,
     SandboxTaskService,
@@ -37,6 +40,11 @@ from app.services.sandbox import (
 )
 from app.services.sandbox_authz import SandboxAuthorizationService
 from app.services.sandbox_bootstrap import get_bootstrap_service
+from app.services.sandbox_runtime import (
+    effective_member_bootstrap_allowed,
+    load_bootstrap_policy,
+    save_bootstrap_policy,
+)
 from app.services.session_workspace import SessionWorkspaceService
 
 
@@ -97,11 +105,62 @@ def bootstrap_status(
 def agent_readiness(
     context: CurrentWorkspace, settings: AppSettings
 ) -> SandboxAgentReadinessView:
+    # Readiness is informational UX for every workspace member; the separate
+    # bootstrap policy decides whether members may initialize the runtime.
     return SandboxAgentReadinessView.model_validate(
         agent_sandbox_readiness(
             settings,
-            authorized="workspace.manage" in context.permissions,
+            authorized="workspace.write" in context.permissions,
         )
+    )
+
+
+@router.get("/bootstrap/policy", response_model=SandboxBootstrapPolicyView)
+def get_bootstrap_policy(
+    context: CurrentWorkspace, settings: AppSettings
+) -> SandboxBootstrapPolicyView:
+    # Any workspace reader can see whether member bootstrap is enabled, so
+    # banners and buttons can reflect the gate without failing.
+    policy = load_bootstrap_policy(settings)
+    return SandboxBootstrapPolicyView(
+        member_allowed=effective_member_bootstrap_allowed(settings),
+        persisted=policy is not None,
+        updated_at=policy.updated_at if policy else None,
+        updated_by=policy.updated_by if policy else None,
+    )
+
+
+@router.put("/bootstrap/policy", response_model=SandboxBootstrapPolicyView)
+def update_bootstrap_policy(
+    payload: SandboxBootstrapPolicyUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxBootstrapPolicyView:
+    if not context.principal.is_system_admin:
+        raise AppError(
+            403,
+            "deployment_admin_required",
+            "Sandbox bootstrap policy requires a deployment administrator",
+        )
+    policy = save_bootstrap_policy(
+        settings,
+        member_allowed=payload.member_allowed,
+        actor_id=context.principal.user_id,
+    )
+    AuditRepository(db, context.workspace_id).record(
+        actor_id=context.principal.user_id,
+        action="sandbox.bootstrap.policy_updated",
+        resource_type="deployment_setting",
+        resource_id="sandbox-bootstrap-policy",
+        details={"member_allowed": policy.member_allowed},
+    )
+    db.commit()
+    return SandboxBootstrapPolicyView(
+        member_allowed=policy.member_allowed,
+        persisted=True,
+        updated_at=policy.updated_at,
+        updated_by=policy.updated_by,
     )
 
 
@@ -109,12 +168,18 @@ def agent_readiness(
 def start_bootstrap(
     context: CurrentWorkspace, settings: AppSettings
 ) -> SandboxBootstrapStartResponse:
-    if not context.principal.is_system_admin:
-        raise AppError(
-            403,
-            "deployment_admin_required",
-            "Sandbox runtime bootstrap requires a deployment administrator",
-        )
+    # Members may initialize the sandbox runtime by default; administrators
+    # can restrict it via the bootstrap policy toggle (default: allowed).
+    if not effective_member_bootstrap_allowed(settings):
+        if not (
+            context.principal.is_system_admin
+            or "workspace.manage" in context.permissions
+        ):
+            raise AppError(
+                403,
+                "sandbox_bootstrap_admin_required",
+                "当前工作区已限制沙箱初始化权限，请联系管理员开启「允许普通成员初始化沙箱」后重试。",
+            )
     result = get_bootstrap_service().start(
         settings, actor_id=context.principal.user_id
     )

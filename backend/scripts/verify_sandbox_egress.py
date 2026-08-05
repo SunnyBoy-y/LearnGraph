@@ -20,14 +20,19 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import shutil
 import sys
 from datetime import timedelta
 
 from app.services.sandbox_egress_proxy import SandboxEgressProxy
 from app.services.sandbox_network_policy import (
     EgressPolicyDenied,
+    EgressPolicyInvalid,
     authorize_connect,
+    derive_egress_policy_for_fetch,
+    load_workspace_fetch_policy_file,
     load_workspace_policy_file,
+    store_workspace_fetch_policy_file,
     utc_now,
     validate_egress_policy,
 )
@@ -106,6 +111,60 @@ def check_policy_layer() -> None:
         check("non-allowlisted port refused", exc.reason == "port_not_allowed")
 
 
+def check_derived_fetch_policy_layer() -> None:
+    print("[derived fetch policy layer]")
+    # Empty allowlist -> no derived policy (fetch stays offline).
+    try:
+        derive_egress_policy_for_fetch(workspace_id="ws-f", allowed_domains=[])
+        check("empty fetch allowlist fails closed", False)
+    except EgressPolicyInvalid:
+        check("empty fetch allowlist fails closed", True)
+    # Valid allowlist derives and persists to its own file.
+    policy = derive_egress_policy_for_fetch(
+        workspace_id="ws-f", allowed_domains=["docs.example.com", "api.example.com"]
+    )
+    store_workspace_fetch_policy_file(TMP, policy)
+    loaded = load_workspace_fetch_policy_file(TMP, "ws-f")
+    check("derived fetch policy loads", loaded is not None and loaded.digest == policy.digest)
+    # Generic reviewed policy file must NOT gate fetch egress (separate provenance).
+    (TMP / "ws-f.json").write_text(
+        json.dumps(valid_policy_data("ws-f")), encoding="utf-8"
+    )
+    check(
+        "generic reviewed policy does not widen fetch egress",
+        load_workspace_fetch_policy_file(TMP, "ws-f").digest == policy.digest,
+    )
+    # Derived policy is HTTPS-443-only and exact-host.
+    try:
+        authorize_connect(policy, "api.example.com", 443, resolver=lambda h: ["93.184.216.34"])
+        check("derived policy allows approved host", True)
+    except EgressPolicyDenied:
+        check("derived policy allows approved host", False)
+    try:
+        authorize_connect(policy, "sub.example.com", 443, resolver=lambda h: ["93.184.216.34"])
+        check("derived policy refuses unlisted subdomain", False)
+    except EgressPolicyDenied as exc:
+        check("derived policy refuses unlisted subdomain", exc.reason == "host_not_in_allowlist")
+    # DNS-rebinding answer against a derived policy host is still refused.
+    try:
+        authorize_connect(policy, "docs.example.com", 443, resolver=lambda h: ["169.254.169.254"])
+        check("derived policy refuses metadata answer", False)
+    except EgressPolicyDenied as exc:
+        check("derived policy refuses metadata answer", exc.reason == "dns_address_classified_forbidden")
+    # Expired derived policy stays offline.
+    expired = derive_egress_policy_for_fetch(
+        workspace_id="ws-f",
+        allowed_domains=["docs.example.com"],
+        ttl_seconds=1,
+        now=utc_now() - timedelta(seconds=10),
+    )
+    store_workspace_fetch_policy_file(TMP, expired)
+    check(
+        "expired derived fetch policy stays offline",
+        load_workspace_fetch_policy_file(TMP, "ws-f", now=utc_now()) is None,
+    )
+
+
 def check_proxy_layer() -> None:
     print("[proxy layer]")
 
@@ -169,9 +228,13 @@ def check_sandbox_image() -> None:
 
 
 def main() -> int:
+    # Refresh the scratch dir so "missing policy stays offline" is deterministic
+    # across runs (a leftover policy file from a prior run must not register).
+    shutil.rmtree(TMP, ignore_errors=True)
     TMP.mkdir(exist_ok=True)
     print("P2-C sandbox egress smoke check")
     check_policy_layer()
+    check_derived_fetch_policy_layer()
     check_proxy_layer()
     check_sandbox_image()
     print(f"\n{FAIL} failed, {PASS} passed")

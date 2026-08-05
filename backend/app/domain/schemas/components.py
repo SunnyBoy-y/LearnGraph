@@ -75,6 +75,15 @@ class ComponentSignatureDeclaration(BaseModel):
     signature_base64: str = Field(min_length=16, max_length=16_384)
 
 
+class ComponentInteractionContract(BaseModel):
+    """Schemas for the isolated subapp event and server-authored state channels."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_schema: dict[str, Any]
+    state_schema: dict[str, Any]
+
+
 class ComponentManifestImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -90,6 +99,7 @@ class ComponentManifestImportRequest(BaseModel):
     uninstall_behavior: Literal["retain_data", "delete_plugin_data"] = "retain_data"
     data_schema: dict[str, Any]
     event_schema: dict[str, Any]
+    interaction_contract: ComponentInteractionContract | None = None
     permissions: ComponentPermissions = Field(default_factory=ComponentPermissions)
     size_limits: ComponentSizeLimits = Field(default_factory=ComponentSizeLimits)
     skill_triggers: list[str] = Field(default_factory=list, max_length=64)
@@ -114,6 +124,7 @@ class ComponentManifestVersionView(ORMModel):
     uninstall_behavior: str
     data_schema: dict[str, Any]
     event_schema: dict[str, Any]
+    interaction_contract: ComponentInteractionContract | None = None
     permissions: dict[str, Any]
     size_limits: dict[str, Any]
     skill_triggers: list[str]

@@ -93,10 +93,26 @@ def init_database() -> None:
     from app.core.migrations import apply_schema_migrations
 
     Base.metadata.create_all(bind=engine)
+    _apply_sqlite_subapp_persistence_migration()
     with engine.begin() as connection:
         apply_schema_migrations(connection)
     _ensure_sqlite_skill_package_columns()
     _verify_schema_revisions()
+
+
+def _apply_sqlite_subapp_persistence_migration() -> None:
+    """T2.3 additive tables; never rebuild existing SQLite tables or foreign keys."""
+
+    if not is_sqlite:
+        return
+
+    # ``create(checkfirst=True)`` makes this safe for already-initialized local
+    # databases while keeping this migration independent from the legacy
+    # additive-column ledger below.  In particular, do not rebuild the existing
+    # ``subapp_interaction_events`` table merely to add a foreign key.
+    with engine.begin() as connection:
+        for table_name in ("subapp_sessions", "subapp_states"):
+            Base.metadata.tables[table_name].create(connection, checkfirst=True)
 
 
 # Current schema revision identifier.  Bump this whenever an additive or
@@ -560,6 +576,8 @@ def _apply_sqlite_additive_migrations() -> None:
         "component_manifest_versions": {
             "issuer_id": "VARCHAR(36)",
             "trusted_bundle_eligible": "BOOLEAN NOT NULL DEFAULT 0",
+            # T2.2 optional subapp interaction contract (event/state schemas).
+            "interaction_contract": "JSON",
         },
         # P2-B reviewed stdio launch specification on existing MCP servers.
         "mcp_servers": {
@@ -594,6 +612,13 @@ def _apply_sqlite_additive_migrations() -> None:
         "schema_revisions": {
             "applied_by": "VARCHAR(64) NOT NULL DEFAULT ''",
             "duration_ms": "INTEGER NOT NULL DEFAULT 0",
+        },
+        # Non-agent (极速/思考) fetch authorization pause: the serialized original
+        # request needed to resume generation after approval.
+        "fetch_authorization_requests": {
+            "resume_payload": "JSON",
+            "assistant_message_id": "VARCHAR(36)",
+            "user_message_id": "VARCHAR(36)",
         },
     }
     with engine.begin() as connection:

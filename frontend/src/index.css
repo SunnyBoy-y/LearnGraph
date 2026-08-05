@@ -2147,6 +2147,17 @@ body.is-resizing .workspace-resizer {
   outline: 2px solid color-mix(in srgb, var(--primary) 50%, transparent);
   outline-offset: 1px;
 }
+.message-citation-badge--missing {
+  border-color: color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+  background: color-mix(in srgb, var(--muted-foreground) 10%, transparent);
+  color: var(--muted-foreground);
+  cursor: default;
+}
+.message-citation-badge--missing:hover {
+  background: color-mix(in srgb, var(--muted-foreground) 14%, transparent);
+  border-color: color-mix(in srgb, var(--muted-foreground) 40%, transparent);
+  transform: none;
+}
 .message-citation-tooltip {
   text-wrap: pretty;
 }
@@ -2874,12 +2885,6 @@ body.is-resizing .workspace-resizer {
     font-size: 1.25rem !important;
   }
 }
-
-html[data-density='compact'] .surface { --surface-density: compact; }
-html[data-density='compact'] .workspace-main :where(.surface.p-5, .surface.p-6) { padding: 14px !important; }
-html[data-density='compact'] .workspace-main table :where(th, td) { padding-block: 8px !important; }
-html[data-density='compact'] .roadmap-day { padding-block: 14px !important; }
-html[data-density='compact'] .sidebar-project__session > button:first-child { padding-block: 4px; }
 
 @media (max-width: 640px) {
   .resource-file-table-wrap { overflow: visible; }

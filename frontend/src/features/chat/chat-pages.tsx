@@ -66,6 +66,7 @@ import {
   discoverProviderModels,
   generateSessionSuggestedPrompts,
   getAgentSandboxReadiness,
+  getCurrentUser,
   getSandboxBootstrapStatus,
   getMessageSnapshot,
   getSessionContextUsage,
@@ -229,7 +230,9 @@ import type { FileRecord } from "@/types/files";
 import {
   isDeepSeekProvider,
   isModelProviderType,
+  type ProviderModel,
 } from "@/types/providers";
+import type { WorkspaceSetting } from "@/types/settings";
 import {
   clearDraftSessionId,
   getDraftSessionId,
@@ -269,6 +272,7 @@ import {
   readChatFeatureModelSetting,
   CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+  CHAT_DICTATION_CLEANUP_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
 } from "@/lib/workspace-settings";
 import { ContextUsageRing } from "@/components/chat/context-usage-ring";
@@ -431,6 +435,12 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
         description: error instanceof Error ? error.message : "请稍后重试",
       }),
   });
+  const currentUser = useQuery({
+    queryKey: ["auth-me"],
+    queryFn: getCurrentUser,
+    staleTime: 5 * 60_000,
+  });
+  const isAdmin = Boolean(currentUser.data?.is_system_admin);
 
   useEffect(() => {
     if (!bootstrap.data?.image_ready) return;
@@ -454,6 +464,8 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
   const needsInitialization =
     status?.docker_reachable === true && status.image_ready === false;
   const activeJob = status?.active_job;
+  const memberGateRestricted = status?.member_bootstrap_allowed === false;
+  const canTriggerInit = !memberGateRestricted || isAdmin;
   const title = dockerMissing
     ? "智能体需要 Docker 环境"
     : dockerStopped
@@ -468,7 +480,9 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
       : activeJob
         ? `${activeJob.message}（${activeJob.progress_percent}%）`
         : needsInitialization
-          ? "已检测到可用的 Docker。是否现在构建并初始化智能体沙箱？首次初始化可能需要几分钟。未初始化前，沙箱工具不可用，但智能体对话仍可发送。"
+          ? canTriggerInit
+            ? "已检测到可用的 Docker。是否现在构建并初始化智能体沙箱？首次初始化可能需要几分钟。未初始化前，沙箱工具不可用，但智能体对话仍可发送。"
+            : "已检测到可用的 Docker，但当前账号暂未被允许初始化沙箱。请联系工作区管理员在沙箱设置中开启「允许普通成员初始化沙箱」。"
           : readiness.data.message;
 
   return (
@@ -493,7 +507,7 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
           ) : null}
         </div>
         <div className="flex shrink-0 flex-wrap gap-2">
-          {needsInitialization && !activeJob ? (
+          {needsInitialization && !activeJob && canTriggerInit ? (
             <Button
               disabled={initialize.isPending || !status?.can_initialize}
               onClick={() => setConfirmOpen(true)}
@@ -765,6 +779,19 @@ const DICTATION_CLEANUP_MAX_FAILURES = 2;
 
 function dictationCleanupActive(session: DictationCleanupSession): boolean {
   return session.cleanupEnabled && !session.degraded;
+}
+
+/** 浏览器本地引擎(webkitSpeechRecognition)不识别标点,转写结果没有
+ * 标点符号:本次听写结束时若原始文本仍无标点,用智能整理按语境补标点。
+ * 开关已存在(含被管理员显式关闭)时尊重现状不自动开启;仅在从未设置
+ * 过时写入默认值启用。云端 ASR 自带标点,不使用该兜底。 */
+function shouldFallbackEnableDictationCleanup(
+  settings: WorkspaceSetting[] | undefined,
+): boolean {
+  if (isChatDictationCleanupEnabled(settings)) return true;
+  return !(settings ?? []).some(
+    (item) => item.key === CHAT_DICTATION_CLEANUP_SETTING_KEY,
+  );
 }
 
 function readLearningNodeContext(): LearningNodeContext | undefined {
@@ -2895,8 +2922,7 @@ export function ChatCanvasPage() {
   const selectedImageModel =
     imageModelOptions.find((model) => model.id === selectedImageModelId) ??
     imageModelOptions[0];
-  const imageEditEnabled =
-    selectedImageModel?.id.toLowerCase() === "gpt-image-2";
+  const imageEditEnabled = isImageEditModel(selectedImageModel);
   const imageSizeOption =
     IMAGE_SIZE_OPTIONS.find((option) => option.value === imageSize) ??
     IMAGE_SIZE_OPTIONS[0];
@@ -2914,7 +2940,7 @@ export function ChatCanvasPage() {
         toast.message(
           imageEditEnabled
             ? "已移除绘图模式不支持的附件。"
-            : "已移除参考图：图生图仅支持 gpt-image-2。",
+            : "已移除参考图：当前绘图模型不支持参考图。",
         );
       }
       return retained;
@@ -5711,6 +5737,19 @@ export function ChatCanvasPage() {
   }, [send]);
 
   useEffect(() => {
+    const listener = () => {
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "sessions"),
+      });
+    };
+    window.addEventListener("learngraph:refresh-messages", listener);
+    return () => window.removeEventListener("learngraph:refresh-messages", listener);
+  }, [queryClient, sessionId, workspaceId]);
+
+  useEffect(() => {
     const selectLearningNode = (event: Event) => {
       const detail = (event as CustomEvent<LearningNodeContext>).detail;
       if (!detail || typeof detail.graphId !== "string") return;
@@ -5898,7 +5937,7 @@ export function ChatCanvasPage() {
         active: "",
         pending: "",
         interim: "",
-        cleanupEnabled: dictationCleanupEnabled,
+        cleanupEnabled: isChatDictationCleanupEnabled(settings.data),
         degraded: false,
         failures: 0,
         inFlight: false,
@@ -6005,7 +6044,13 @@ export function ChatCanvasPage() {
       speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
     if (!SpeechRecognition) {
       toast.message("当前浏览器不支持语音转写", {
-        description: "可使用支持麦克风权限的 Chrome 或 Edge。",
+        description:
+          "语音输入需要 Chrome 或 Edge。也可以在工作区设置中配置转写模型，改由云端 ASR 提供语音输入。",
+        duration: 8000,
+        action: {
+          label: "前往设置",
+          onClick: () => void navigate(`/w/${workspaceId}/settings/providers`),
+        },
       });
       return;
     }
@@ -6019,7 +6064,7 @@ export function ChatCanvasPage() {
       active: "",
       pending: "",
       interim: "",
-      cleanupEnabled: dictationCleanupEnabled,
+      cleanupEnabled: shouldFallbackEnableDictationCleanup(settings.data),
       degraded: false,
       failures: 0,
       inFlight: false,
@@ -6108,14 +6153,15 @@ export function ChatCanvasPage() {
     asrAvailable,
     asrRealtimeConfigured,
     composerText,
-    dictationCleanupEnabled,
     dictationCleanupModel,
     dictationEngine,
     finishDictationSession,
     isListening,
+    navigate,
     realtimeAudioTranscriptionModel,
     realtimeAudioTranscriptionProvider,
     selectedModelId,
+    settings.data,
     storedAudioTranscriptionProvider,
   ]);
 
@@ -6622,6 +6668,12 @@ export function ChatCanvasPage() {
       }
       return "disabled";
     });
+    if (!canUseNetworkSearch) {
+      toast.message("无法开启联网搜索", {
+        description:
+          "当前没有已启用的 SearchProvider，且模型不托管联网能力。请到 Provider 管理中启用搜索服务后重试。",
+      });
+    }
     focusComposer();
   }, [
     activeModelProvider?.capabilities.hosted_web_search,
@@ -6817,7 +6869,7 @@ export function ChatCanvasPage() {
         if (current.some((item) => item.id === file.id)) return current;
         if (generationMode === "image") {
           if (!imageEditEnabled) {
-            toast.error("图生图仅支持 gpt-image-2。");
+            toast.error("当前绘图模型不支持图生图。");
             return current;
           }
           if (!IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase())) {
@@ -6825,7 +6877,7 @@ export function ChatCanvasPage() {
             return current;
           }
           if (current.length >= 4) {
-            toast.error("gpt-image-2 最多支持 4 张参考图片。");
+            toast.error("当前绘图模型最多支持 4 张参考图片。");
             return current;
           }
         }
@@ -7629,8 +7681,8 @@ export function ChatCanvasPage() {
               size="xs"
               title={
                 imageEditEnabled
-                  ? "添加参考图片，使用 gpt-image-2 编辑"
-                  : "图生图仅支持 gpt-image-2"
+                  ? "添加参考图片，使用当前绘图模型编辑"
+                  : "当前绘图模型不支持图生图"
               }
               variant="outline"
             >
@@ -7743,7 +7795,7 @@ export function ChatCanvasPage() {
                 generationMode === "image"
                   ? imageEditEnabled
                     ? "参考图仅支持 PNG、JPEG、WEBP 等图片格式。"
-                    : "图生图仅支持 gpt-image-2，请先切换绘图模型。"
+                    : "当前绘图模型不支持参考图，请先切换绘图模型。"
                   : error.message,
               );
               return;

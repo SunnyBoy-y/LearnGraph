@@ -202,6 +202,15 @@ export interface SandboxBootstrapJob {
   finished_at: number | null;
 }
 
+export interface SandboxBootstrapPolicy {
+  /** Whether ordinary workspace members may initialize the sandbox runtime. */
+  member_allowed: boolean;
+  /** False when no administrator has persisted an explicit choice yet. */
+  persisted: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
 export interface SandboxBootstrapStatus {
   docker_installed: boolean;
   docker_reachable: boolean;
@@ -216,6 +225,13 @@ export interface SandboxBootstrapStatus {
   progress_percent: number;
   message: string;
   can_initialize: boolean;
+  /** Whether ordinary members may trigger bootstrap (admin-controllable). */
+  member_bootstrap_allowed: boolean;
+  bootstrap_policy: {
+    member_allowed: boolean;
+    updated_at: string | null;
+    updated_by: string | null;
+  } | null;
   active_job: SandboxBootstrapJob | null;
   last_failed_job: SandboxBootstrapJob | null;
   remediation_steps: string[];

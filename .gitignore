@@ -74,7 +74,7 @@ coverage.xml
 htmlcov/
 *.egg-info/
 build/
-
+/tests/
 # LearnGraph runtime state and user data
 /data/
 /memory/
@@ -148,9 +148,11 @@ temp/
 **/*_test.py
 **/test_*.py
 **/*.test.*
+**/test/**/*.{ts,tsx,js,jsx}
 !backend/tests/
 !backend/tests/security/
 !backend/tests/security/test_*.py
+!backend/tests/security/**/test_*.py
 
 # Long-term memory architecture regression tests are an explicit tracked exception.
 !backend/tests/memory/
@@ -184,5 +186,14 @@ Desktop.ini
 /backend/README.md
 /image/
 /doc/
+/ROADMAP.md
+
+# One-off verification/smoke scripts and scratch specs
+/backend/scripts/*_smoke*.py
+/backend/scripts/t2_4_smoke.py
+/backend/scripts/verify_*_web_fetch_e2e.py
+/backend/scripts/run_sandbox_egress_proxy.py
+backend/sandbox/.spec-test.json
+.spec-test.json
 
 
