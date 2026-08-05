@@ -88,6 +88,20 @@ def test_agentic_send_does_not_hard_block_without_docker() -> None:
     assert "文档问答仍可继续" in doc
 
 
+def test_document_chat_fast_mode_explicitly_disables_thinking() -> None:
+    """极速文档问答必须传 off，不能回退到模型的默认思考力度。"""
+
+    source = (FRONTEND / "features" / "resources" / "document-chat-panel.tsx").read_text(
+        encoding="utf-8"
+    )
+    request_idx = source.index("const request: MessageCreateRequest")
+    request_block = source[request_idx : request_idx + 1_200]
+
+    assert 'responseMode === "fast" && !thinkingRequired' in request_block
+    assert '? "off"' in request_block
+    assert "default_thinking_mode" in request_block
+
+
 def test_selection_explanations_partitioned_by_user_and_workspace() -> None:
     """R-017: private selection history must be isolated per (user, workspace)."""
 

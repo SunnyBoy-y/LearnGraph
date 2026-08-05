@@ -184,4 +184,15 @@ def unified_model_defaults(
     overlay = capability_overlay(model_id, base)
     if overlay:
         base.update(overlay)
+    # Local Ollama deployments: the official docs confirm DeepSeek-R1 (and its
+    # distilled variants) accept ``think: false`` to disable reasoning
+    # (``ollama run deepseek-r1 --think=false``). ``qwen_model_defaults`` marks
+    # them thinking-only because the Alibaba Cloud *hosted* DeepSeek-R1 cannot
+    # turn thinking off; on Ollama they are hybrid and 极速 must stay available.
+    if normalized_provider == "ollama" and (
+        normalized_model in {"deepseek-r1", "deepseek-r1-0528"}
+        or "deepseek-r1-distill" in normalized_model
+    ):
+        base["thinking_required"] = False
+        base["default_thinking_mode"] = "off"
     return base

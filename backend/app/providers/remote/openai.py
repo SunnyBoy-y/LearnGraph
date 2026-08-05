@@ -36,6 +36,31 @@ class ProviderResponseError(ProviderHTTPError):
     pass
 
 
+class ProviderInvalidUrlError(ProviderHTTPError):
+    """The configured base URL cannot be issued as an HTTP(S) request."""
+
+
+def _is_aliyun_responses_endpoint(base_url: str) -> bool:
+    """Return whether ``base_url`` addresses Alibaba Cloud Model Studio Responses.
+
+    Both the classic ``dashscope.aliyuncs.com/compatible-mode/v1`` origin and the
+    newer workspace form ``{WorkspaceId}.cn-beijing.maas.aliyuncs.com/...`` live
+    under ``aliyuncs.com``.  This is consulted only on the Responses protocol
+    (``OpenAIResponsesProvider``), where Alibaba Cloud documents a
+    ``reasoning.effort`` ``none`` tier that disables thinking; native OpenAI's
+    ``api.openai.com`` never matches.
+    """
+
+    if not base_url:
+        return False
+    try:
+        parsed = urlsplit(base_url.strip())
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold()
+    return bool(host) and host.endswith(".aliyuncs.com")
+
+
 def normalize_openai_api_base_url(base_url: str) -> str:
     """Return the documented ``/v1`` root for the official OpenAI hostname.
 
@@ -43,6 +68,10 @@ def normalize_openai_api_base_url(base_url: str) -> str:
     already ``https://api.openai.com/v1``.  Normalizing the historical/root
     spelling here keeps both model discovery and the native Responses adapter
     on the documented API root without rewriting custom compatible endpoints.
+
+    This stays pure (never raises): provider construction also routes through
+    it, where a stored-but-unusable URL must not crash adapter wiring.
+    Discovery validates the URL with :func:`validate_http_base_url` first.
     """
 
     normalized = base_url.strip().rstrip("/")
@@ -59,6 +88,31 @@ def normalize_openai_api_base_url(base_url: str) -> str:
         and not parsed.fragment
     ):
         return urlunsplit((parsed.scheme, parsed.netloc, "/v1", "", ""))
+    return normalized
+
+
+def validate_http_base_url(base_url: str) -> str:
+    """Reject Base URLs that httpx could never issue as an HTTP(S) request.
+
+    A missing scheme (``api.deepseek.com``) or a non-HTTP scheme used to crash
+    discovery with ``httpcore.UnsupportedProtocol`` and turn a user input
+    mistake into a backend 500.  Raises :class:`ProviderInvalidUrlError` so the
+    service layer can map it to a clear 4xx instead.
+    """
+
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        raise ProviderInvalidUrlError("Provider base URL is missing")
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        raise ProviderInvalidUrlError(
+            f"Provider base URL is not a valid URL (got {normalized!r})"
+        ) from None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ProviderInvalidUrlError(
+            f"Provider base URL must start with http:// or https:// (got {normalized!r})"
+        )
     return normalized
 
 
@@ -115,6 +169,7 @@ def discover_remote_models(
     timeout_seconds: float = 15.0,
     extra_headers: dict[str, str] | None = None,
 ) -> list[str]:
+    validate_http_base_url(base_url)
     normalized_base_url = normalize_openai_api_base_url(base_url)
     try:
         with httpx.Client(
@@ -128,6 +183,11 @@ def discover_remote_models(
             response = client.get(f"{normalized_base_url}/models")
     except httpx.TimeoutException as exc:
         raise ProviderTimeoutError("Provider model discovery timed out") from exc
+    except httpx.HTTPError as exc:
+        # Transport-level failures after URL validation (connection refused,
+        # DNS, resets); without this catch they would escape as a raw 500.
+        # Protocol-less URLs are rejected earlier by validate_http_base_url.
+        raise ProviderHTTPError(f"Provider model discovery failed: {exc}") from exc
     if not response.is_success:
         raise ProviderHTTPError(
             f"Provider returned HTTP {response.status_code}",
@@ -250,7 +310,18 @@ class _StreamingHTTPProvider:
         if options is None:
             return payload
         actual = options.actual_reasoning_effort
-        if actual is not None and options.reasoning_parameter in {
+        thinking_mode = options.thinking_mode
+        if thinking_mode == "off" and responses and _is_aliyun_responses_endpoint(
+            self.base_url
+        ):
+            # Alibaba Cloud Model Studio's Responses-compatible endpoint exposes
+            # ``none`` as the lowest reasoning.effort tier and documents it as
+            # the way to disable thinking (it also outranks ``enable_thinking``).
+            # Send it so 极速 really turns reasoning off. Native OpenAI's API has
+            # no ``none`` tier; its reasoning models are flagged thinking_required
+            # so fast mode never reaches here for them.
+            payload["reasoning"] = {"effort": "none"}
+        elif actual is not None and options.reasoning_parameter in {
             "reasoning_effort",
             "reasoning.effort",
         }:

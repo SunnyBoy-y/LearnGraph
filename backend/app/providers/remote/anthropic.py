@@ -15,6 +15,7 @@ from app.providers.remote.openai import (
     ProviderTimeoutError,
     _StreamingHTTPProvider,
     merge_provider_request_headers,
+    validate_http_base_url,
 )
 
 
@@ -37,6 +38,9 @@ def discover_anthropic_models(
     timeout_seconds: float = 15.0,
     extra_headers: dict[str, str] | None = None,
 ) -> list[str]:
+    # Reject protocol-less URLs up front so the probe surfaces a clear 422
+    # instead of a generic transport failure (see validate_http_base_url).
+    validate_http_base_url(base_url)
     root = normalize_anthropic_api_base_url(base_url)
     # Accept both ``https://api.anthropic.com`` and ``…/v1``.
     models_url = f"{root}/v1/models" if not root.endswith("/v1") else f"{root}/models"
@@ -53,6 +57,10 @@ def discover_anthropic_models(
             response = client.get(models_url)
     except httpx.TimeoutException as exc:
         raise ProviderTimeoutError("Anthropic model discovery timed out") from exc
+    except httpx.HTTPError as exc:
+        # Transport-level failures after URL validation (connection refused,
+        # DNS, resets); without this catch they would escape as a raw 500.
+        raise ProviderHTTPError(f"Anthropic model discovery failed: {exc}") from exc
     if not response.is_success:
         raise ProviderHTTPError(
             f"Provider returned HTTP {response.status_code}",
@@ -155,30 +163,40 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
     _MODEL_VERSION_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d+))?")
 
     @classmethod
-    def _thinking_capabilities(cls, model_id: str) -> tuple[bool, bool]:
-        """Return ``(adaptive_thinking, supports_xhigh_effort)`` for a model id.
+    def _thinking_capabilities(cls, model_id: str) -> tuple[bool, bool, bool]:
+        """Return ``(adaptive_thinking, supports_xhigh_effort, needs_explicit_disable)``.
 
         Claude Opus 4.7+/Opus 5, Sonnet 5, and Fable/Mythos 5 reject the legacy
         ``{"type": "enabled", "budget_tokens": N}`` config with HTTP 400 and use
         adaptive thinking with ``output_config.effort`` instead. Opus/Sonnet 4.6
         accept adaptive but not the ``xhigh`` effort tier (introduced with Opus
         4.7). Everything older keeps the enabled+budget form.
+
+        ``needs_explicit_disable`` is true only for models that default to
+        adaptive thinking when the ``thinking`` field is *omitted* — Claude
+        Opus 5 / Sonnet 5. A fast/off request on those must send an explicit
+        ``{"type": "disabled"}`` to really turn reasoning off. Fable/Mythos 5
+        also default to adaptive on omission but reject ``{"type": "disabled"}``
+        with HTTP 400 and are flagged ``thinking_required`` upstream, so fast
+        mode never reaches the adapter for them.
         """
 
         match = cls._MODEL_VERSION_RE.search((model_id or "").strip().lower())
         if not match:
-            return False, False
+            return False, False, False
         family = match.group(1)
         major = int(match.group(2))
         minor = int(match.group(3) or 0)
         if family in {"fable", "mythos"}:
-            return True, True
+            return True, True, False
         if family in {"opus", "sonnet"}:
-            if major >= 5 or (major == 4 and minor >= 7):
-                return True, True
+            if major >= 5:
+                return True, True, True
+            if major == 4 and minor >= 7:
+                return True, True, False
             if major == 4 and minor == 6:
-                return True, False
-        return False, False
+                return True, False, False
+        return False, False, False
 
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
         del responses
@@ -187,26 +205,35 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
             return payload
         actual = options.actual_reasoning_effort
         thinking_mode = options.thinking_mode
-        if thinking_mode and thinking_mode != "off":
-            tier = str(actual or thinking_mode)
-            if tier not in {"low", "medium", "high", "xhigh"}:
-                tier = str(thinking_mode)
-            adaptive, supports_xhigh = self._thinking_capabilities(self.model_id)
-            if adaptive:
-                payload["thinking"] = {"type": "adaptive"}
-                effort = tier
-                if effort == "xhigh" and not supports_xhigh:
-                    effort = "high"
-                if effort in {"low", "medium", "high", "xhigh"}:
-                    payload["output_config"] = {"effort": effort}
-            else:
-                budget = {
-                    "low": 4_000,
-                    "medium": 10_000,
-                    "high": 20_000,
-                    "xhigh": 32_000,
-                }.get(tier, 10_000)
-                payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        if thinking_mode == "off":
+            _, _, needs_explicit_disable = self._thinking_capabilities(self.model_id)
+            if needs_explicit_disable:
+                # Claude Opus 5 / Sonnet 5 run adaptive thinking when the field
+                # is omitted, so 极速 must send an explicit disable to really
+                # turn reasoning off instead of hiding it.
+                payload["thinking"] = {"type": "disabled"}
+            return payload
+        if not thinking_mode:
+            return payload
+        tier = str(actual or thinking_mode)
+        if tier not in {"low", "medium", "high", "xhigh"}:
+            tier = str(thinking_mode)
+        adaptive, supports_xhigh, _ = self._thinking_capabilities(self.model_id)
+        if adaptive:
+            payload["thinking"] = {"type": "adaptive"}
+            effort = tier
+            if effort == "xhigh" and not supports_xhigh:
+                effort = "high"
+            if effort in {"low", "medium", "high", "xhigh"}:
+                payload["output_config"] = {"effort": effort}
+        else:
+            budget = {
+                "low": 4_000,
+                "medium": 10_000,
+                "high": 20_000,
+                "xhigh": 32_000,
+            }.get(tier, 10_000)
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
         return payload
 
     @staticmethod

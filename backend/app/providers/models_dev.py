@@ -321,12 +321,40 @@ def _thinking_overlay(record: dict[str, Any], base: dict[str, Any]) -> dict[str,
     return overlay
 
 
+def _is_always_thinking_claude(model_id: str) -> bool:
+    """Claude Fable/Mythos always think and reject ``thinking: disabled`` (400)."""
+    model = model_id.strip().casefold()
+    return model.startswith(("claude-fable-", "claude-mythos-"))
+
+
+def _is_openai_undisablable_reasoning(model_id: str) -> bool:
+    """OpenAI reasoning models that cannot turn thinking off on the wire.
+
+    The Responses / Chat Completions protocols expose no ``disabled`` tier for
+    these — ``reasoning.effort`` only lowers depth.  The product therefore marks
+    them ``thinking_required`` so 极速 is disabled in the UI instead of silently
+    still reasoning.  DashScope-hosted reasoning models (qwen*, deepseek*, …)
+    never match these prefixes.
+    """
+    model = model_id.strip().casefold()
+    return model.startswith(("gpt-5", "o1", "o3", "o4", "gpt-oss"))
+
+
 def capability_overlay(model_id: str, base: dict[str, Any]) -> dict[str, Any]:
     """Project-shape defaults derived from the models.dev record, if any."""
 
     record = lookup_model(model_id)
     if record is None:
-        return {}
+        # Unknown models still need the thinking-only override so 极速 is
+        # disabled for protocols/models that cannot turn reasoning off.
+        overlay: dict[str, Any] = {}
+        if _is_always_thinking_claude(model_id) or _is_openai_undisablable_reasoning(
+            model_id
+        ):
+            overlay["thinking_required"] = True
+            overlay["reasoning_efforts"] = list(LEARNGRAPH_EFFORTS)
+            overlay["default_thinking_mode"] = "medium"
+        return overlay
     overlay: dict[str, Any] = {}
     limit = record.get("limit") or {}
     context = limit.get("context")
@@ -360,11 +388,38 @@ def capability_overlay(model_id: str, base: dict[str, Any]) -> dict[str, Any]:
         overlay["supports_audio_input"] = "audio" in inputs
         overlay["supports_pdf_input"] = "pdf" in inputs or record.get("attachment") is True
         overlay["image_input_mode"] = "native" if supports_image else "auto"
+    outputs = {
+        str(value).casefold()
+        for value in (modalities.get("output") or [])
+        if str(value).strip()
+    }
+    if outputs:
+        # Image-only models (gpt-image-2, qwen-image-edit, ...) must not be
+        # selected as text chat models, and they edit from reference images.
+        overlay["supports_text_output"] = "text" in outputs
+        overlay["supports_image_edit"] = "image" in inputs and "text" not in outputs
     if isinstance(record.get("tool_call"), bool):
         overlay["supports_agent_tools"] = record["tool_call"]
     if isinstance(record.get("structured_output"), bool):
         overlay["supports_structured_output"] = record["structured_output"]
     overlay.update(_thinking_overlay(record, base))
+    # Fast mode is unavailable on models the protocol cannot turn thinking off
+    # for.  Flag them so the UI disables 极速 and shows the reasoning normally
+    # instead of a silent no-op.  This is id-based (not provider-based) so
+    # DashScope-hosted reasoning models stay configurable.  A thinking-only
+    # model must carry a non-off default and at least one effort level to pass
+    # validate_model_capability_update.
+    if _is_always_thinking_claude(model_id) or _is_openai_undisablable_reasoning(
+        model_id
+    ):
+        overlay["thinking_required"] = True
+        efforts = overlay.get("reasoning_efforts")
+        if not isinstance(efforts, list) or not efforts:
+            overlay["reasoning_efforts"] = list(LEARNGRAPH_EFFORTS)
+        if not overlay.get("default_thinking_mode") or overlay.get(
+            "default_thinking_mode"
+        ) == "off":
+            overlay["default_thinking_mode"] = "medium"
     overlay["capability_source"] = "models_dev"
     overlay["models_dev"] = {
         "provider": record.get("provider"),

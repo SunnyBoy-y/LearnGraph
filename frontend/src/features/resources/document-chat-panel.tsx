@@ -604,8 +604,15 @@ export function DocumentChatPanel({
         (typeof activeProvider.capabilities.default_model === "string"
           ? activeProvider.capabilities.default_model
           : undefined),
-      // Only send an explicit intensity when the model declares reasoning support.
-      thinking_mode: responseMode !== "fast" && thinkingModes.length ? thinkingMode : undefined,
+      // Fast mode must be explicit: omitting the field makes the backend use a
+      // model's configured default_thinking_mode (often "medium"), which
+      // silently turns a 极速 document chat into a thinking request.
+      thinking_mode:
+        responseMode === "fast" && !thinkingRequired
+          ? "off"
+          : responseMode !== "fast" && thinkingModes.length
+            ? thinkingMode
+            : undefined,
       agent_mode: responseMode === "agentic",
       document_selection: documentSelection,
     };

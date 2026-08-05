@@ -38,6 +38,7 @@ from app.providers.model_options import (
     model_capabilities_for_model,
     resolve_model_call_options,
 )
+from app.providers.model_catalog import unified_model_defaults
 from app.providers.qwen_catalog import is_dashscope_api_base_url
 from app.providers.remote.deepseek import (
     DeepSeekChatProvider,
@@ -170,6 +171,20 @@ def model_provider_for_workspace(
         capabilities = dict(provider.capabilities or {})
         configured_model_id = str(capabilities.get("default_model") or "").strip()
         resolved_model_id = selected_model_id or configured_model_id
+        if resolved_model_id:
+            # Image-only models (qwen-image-edit-max, gpt-image-2) answer on a
+            # generation endpoint, never /chat/completions.  Reject them as
+            # text chat models up front instead of failing the stream mid-turn.
+            defaults = unified_model_defaults(
+                resolved_model_id, provider_type=provider.provider_type
+            )
+            if defaults.get("supports_text_output", True) is False:
+                return UnavailableModelProvider(
+                    "This model only outputs images and cannot be used as a "
+                    "text chat model",
+                    provider_id=provider.id,
+                    model_id=resolved_model_id,
+                )
         model_states = capabilities.get("model_states")
         if (
             isinstance(model_states, dict)

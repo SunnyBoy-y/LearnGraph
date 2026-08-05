@@ -41,9 +41,9 @@ _REFRESH_WINDOW_SECONDS = 300
 
 # The ChatGPT Codex backend does not expose a public GET /models endpoint, so
 # discovery falls back to this reviewed ChatGPT-account catalog. Several API /
-# docs slugs (including the Power default ``gpt-5.6-sol`` and older 5.2/5.3
-# ids) are rejected by the ChatGPT-auth path with HTTP 400. Users can still
-# type an unlisted model id manually if their plan later unlocks it.
+# docs slugs (including the Power default ``gpt-5.6-sol`` and older 5.2 ids)
+# are rejected by the ChatGPT-auth path with HTTP 400. Users can still type an
+# unlisted model id manually if their plan later unlocks it.
 #
 # Verified against the free ChatGPT Codex backend with stream=true (2026-07-29):
 # terra / luna / gpt-5.5 / gpt-5.4-mini succeed; sol / pro / nano / 5.2–5.3 fail.
@@ -55,6 +55,12 @@ CODEX_KNOWN_MODELS: tuple[str, ...] = (
     # Plan-gated / Power flagship: listed for paid accounts that can select it,
     # but not used as the default because free ChatGPT accounts reject it.
     "gpt-5.6-sol",
+    # ChatGPT-auth slugs reviewed for the catalog (2026-08-05).
+    "codex-auto-review",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+    "gpt-5.6",
+    "gpt-image-2",
 )
 CODEX_DEFAULT_MODEL = "gpt-5.6-terra"
 # Models that OpenAI still documents for Codex but the ChatGPT-auth backend
@@ -62,18 +68,15 @@ CODEX_DEFAULT_MODEL = "gpt-5.6-terra"
 CODEX_UNSUPPORTED_CHATGPT_MODELS: frozenset[str] = frozenset(
     {
         "gpt-5.5-pro",
-        "gpt-5.4",
         "gpt-5.4-nano",
         "gpt-5.4-pro",
         "gpt-5.3-codex",
         "gpt-5.3-codex-xhigh",
-        "gpt-5.3-codex-spark",
         "gpt-5.3-chat-latest",
         "gpt-5.2",
         "gpt-5.2-codex",
         "gpt-5.2-pro",
         "gpt-5.2-chat-latest",
-        "gpt-5.6",
         "codex-mini-latest",
     }
 )
