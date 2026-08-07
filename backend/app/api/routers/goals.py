@@ -29,6 +29,38 @@ def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> GoalSer
     return GoalService(db, context.workspace_id, context.principal.user_id, model_provider_for_workspace(db, context.workspace_id, settings))
 
 
+def service_with_model(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    *,
+    provider_id: str | None,
+    model_id: str | None,
+    thinking_mode: str | None,
+) -> GoalService:
+    """Build a GoalService that uses the chat-selected model when provided.
+
+    The Goal wizard and the unified Agent chat should agree on the same
+    provider/model; without this the wizard silently falls back to the
+    workspace's implicit provider-priority default, which is how a model that
+    works in normal chat could still fail the goal/graph endpoints.
+    """
+
+    return GoalService(
+        db,
+        context.workspace_id,
+        context.principal.user_id,
+        model_provider_for_workspace(
+            db,
+            context.workspace_id,
+            settings,
+            provider_id=provider_id,
+            model_id=model_id,
+            thinking_mode=thinking_mode,
+        ),
+    )
+
+
 def require_goal_access(
     goal_id: str,
     permission: str,
@@ -71,7 +103,14 @@ def list_goals(db: DB, context: CurrentWorkspace, settings: AppSettings) -> list
 
 @router.post("/clarify", response_model=GoalClarifyResponse, status_code=status.HTTP_201_CREATED)
 def clarify_goal(payload: GoalClarifyRequest, db: DB, context: CurrentWorkspace, settings: AppSettings) -> GoalClarifyResponse:
-    return service(db, context, settings).clarify(payload)
+    return service_with_model(
+        db,
+        context,
+        settings,
+        provider_id=payload.provider_id,
+        model_id=payload.model_id,
+        thinking_mode=payload.thinking_mode,
+    ).clarify(payload)
 
 
 @router.get("/{goal_id}/delete-impact", response_model=DeleteImpact)
@@ -131,7 +170,16 @@ def candidate_graph(
     settings: AppSettings,
 ) -> GraphSummary:
     require_goal_access(goal_id, "write", db, context)
-    return GraphSummary.model_validate(service(db, context, settings).generate_candidate_graph(goal_id, payload))
+    return GraphSummary.model_validate(
+        service_with_model(
+            db,
+            context,
+            settings,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+            thinking_mode=payload.thinking_mode,
+        ).generate_candidate_graph(goal_id, payload)
+    )
 
 
 @router.post("/{goal_id}/publish", response_model=PublishGoalResponse)

@@ -21,6 +21,10 @@ export interface GoalClarifyRequest {
   prompt: string
   file_ids?: string[]
   graph_context_ids?: string[]
+  /** Optional model selection so the Goal wizard reuses the chat-selected model. */
+  provider_id?: string
+  model_id?: string
+  thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | null
 }
 
 export interface ClarificationQuestion {
@@ -77,6 +81,9 @@ export interface GoalConfirmRequest {
 
 export interface CandidateGraphRequest {
   seed_concepts?: string[]
+  provider_id?: string
+  model_id?: string
+  thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | null
 }
 
 export interface PublishGoalRequest {

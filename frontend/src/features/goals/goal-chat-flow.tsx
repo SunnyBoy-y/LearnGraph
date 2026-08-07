@@ -64,6 +64,10 @@ type GoalSetupOptions = {
   onPublished: (result: { goal: Goal; graph: Graph }) => Promise<void> | void;
   scopeKey: string;
   workspaceId: string;
+  /** Reuse the chat-selected model so the wizard and normal chat agree. */
+  providerId?: string | null;
+  modelId?: string | null;
+  thinkingMode?: "off" | "low" | "medium" | "high" | "xhigh" | null;
 };
 
 function initialGoalDraft(goal: Goal): GoalConfirmRequest {
@@ -138,6 +142,9 @@ export function useGoalSetupFlow({
   onPublished,
   scopeKey,
   workspaceId,
+  providerId,
+  modelId,
+  thinkingMode,
 }: GoalSetupOptions) {
   const queryClient = useQueryClient();
   const wasEnabled = useRef(enabled);
@@ -166,6 +173,9 @@ export function useGoalSetupFlow({
         prompt: content,
         file_ids: fileIds,
         graph_context_ids: [],
+        provider_id: providerId ?? undefined,
+        model_id: modelId ?? undefined,
+        thinking_mode: thinkingMode ?? undefined,
       }),
   });
   const graph = useQuery({
@@ -195,7 +205,11 @@ export function useGoalSetupFlow({
     mutationFn: async () => {
       if (!result || !draft) throw new Error("Goal 草稿尚未准备完成。");
       const savedGoal = await confirmGoal(result.goal.id, draft);
-      const graphSummary = await generateCandidateGraph(result.goal.id);
+      const graphSummary = await generateCandidateGraph(result.goal.id, {
+        provider_id: providerId ?? undefined,
+        model_id: modelId ?? undefined,
+        thinking_mode: thinkingMode ?? undefined,
+      });
       return { graphSummary, savedGoal };
     },
     onSuccess: async ({ graphSummary, savedGoal }) => {

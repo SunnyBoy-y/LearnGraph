@@ -4219,6 +4219,11 @@ export function ChatCanvasPage() {
     onPublished: completeGoalSetup,
     scopeKey: conversationResetKey,
     workspaceId,
+    // Reuse the chat-selected provider/model/thinking so the wizard and the
+    // unified Agent chat never disagree about which model is in use.
+    providerId: activeModelProvider?.id ?? null,
+    modelId: selectedModel?.id ?? null,
+    thinkingMode: effectiveThinkingMode,
   });
   useEffect(() => {
     if (!goalMode) return;
@@ -5422,6 +5427,22 @@ export function ChatCanvasPage() {
           return false;
         }
         if (goalMode && requestedGenerationMode === "text") {
+          if (responseMode === "agentic") {
+            // 智能体目标模式走统一聊天流：Agent 通过工具从会话上下文中
+            // 挖掘学习需求与方向，创建/确认 Goal，再生成待审核的图谱提案，
+            // 与普通对话共用同一套 provider/model/thinking 协议。
+            const sending = send(content, {
+              fileIds,
+              attachmentFiles,
+              generationMode: "text",
+              sandboxPreflighted: true,
+            });
+            setPendingFiles([]);
+            setComposerText("");
+            setGenerationMode("text");
+            void sending.catch(() => undefined);
+            return true;
+          }
           if (goalFlow.stage !== "capture" || goalFlow.busy) {
             toast.message("请先完成上方的目标审核。");
             return false;
@@ -6569,7 +6590,9 @@ export function ChatCanvasPage() {
     staleTime: 15_000,
   });
   const goalComposerLocked = Boolean(
-    goalMode && goalFlow.stage !== "capture",
+    goalMode &&
+      responseMode !== "agentic" &&
+      goalFlow.stage !== "capture",
   );
   const goalStageLabel =
     goalFlow.stage === "capture"
@@ -7386,7 +7409,7 @@ export function ChatCanvasPage() {
               {streamConnectionNotice ? (
                 <StreamConnectionFeedback notice={streamConnectionNotice} />
               ) : null}
-              {goalMode ? (
+              {goalMode && responseMode !== "agentic" ? (
                 <GoalSetupConversation
                   flow={goalFlow}
                   hasConversationMessages={!isEmptySession}

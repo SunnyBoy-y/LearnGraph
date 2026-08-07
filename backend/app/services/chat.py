@@ -2250,23 +2250,13 @@ class ChatService:
                 and response_state.provider_id == self.model_provider.provider_id
                 and response_state.provider_type
                 == getattr(self.model_provider, "provider_type", "unknown")
-            )
-            if (
-                response_state is not None
-                and not state_belongs_to_active_provider
-                and isinstance(response_state.agent_response_items, dict)
-                and response_state.agent_response_items
-            ):
-                # An OpenAI Responses agent transaction includes opaque
-                # reasoning continuation state. It is meaningful only to the
-                # provider configuration that produced it; rebuilding that
-                # tool loop for a different Provider would silently discard the
-                # state required by the protocol.
-                raise AppError(
-                    409,
-                    "structured_provider_history_mismatch",
-                    "This Agent session contains native continuation state from a different model provider. Switch back to that provider or start a new session.",
+                and (
+                    not isinstance(version.provider_trace, dict)
+                    or not version.provider_trace.get("model_id")
+                    or version.provider_trace.get("model_id")
+                    == getattr(self.model_provider, "model_id", "unknown")
                 )
+            )
             final_response_items = (
                 response_state.response_items
                 if state_belongs_to_active_provider

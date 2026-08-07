@@ -332,7 +332,147 @@ class AgentToolRuntime:
                         "additionalProperties": False,
                     },
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_goal_read",
+                    "description": (
+                        "Read the Goal currently bound to this session (and the Graph "
+                        "bound to it, if any). Use before creating or proposing anything "
+                        "so you never duplicate an existing Goal or propose a graph for "
+                        "the wrong target. This tool is read-only."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "goal_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 36,
+                                "description": "Optional explicit Goal id; defaults to the session-bound Goal.",
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_goal_create",
+                    "description": (
+                        "Create a Goal draft from the current conversation and bind it to "
+                        "this session, so later Goal/Graph tools can act on it. Only call "
+                        "this after the user's intent is clear enough to name a subject "
+                        "title; ask 1-3 targeted questions first when key facts are "
+                        "missing. The Goal stays a reviewable draft (status "
+                        "\"clarifying\") unless auto_confirm=true and the user has "
+                        "explicitly agreed in this conversation. Never fabricate the "
+                        "user's deadline, availability, or desired outcome."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 240,
+                                "description": "Clean subject/topic phrase, e.g. \"数据库原理与应用\".",
+                            },
+                            "raw_prompt": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 10_000,
+                                "description": "Optional original user request; defaults to the source user message.",
+                            },
+                            "intent": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 240,
+                                "description": "Main learning scenario, e.g. \"考试\", \"项目\", \"面试\".",
+                            },
+                            "time_limit": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 120,
+                                "description": "Narrative time budget the user stated, e.g. \"每天 2 小时\".",
+                            },
+                            "desired_outcome": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 4_000,
+                                "description": "How the user wants to verify learning.",
+                            },
+                            "constraints": {
+                                "type": "object",
+                                "description": "Structured constraints (file ids, clarification answers, etc.).",
+                            },
+                            "assumptions": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                                "description": "Transparent assumptions made; each entry needs source/field/assumption keys.",
+                            },
+                            "auto_confirm": {
+                                "type": "boolean",
+                                "description": "Set the Goal to confirmed only when the user explicitly agreed in this conversation.",
+                            },
+                        },
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_goal_confirm",
+                    "description": (
+                        "Confirm the Goal bound to this session (draft -> confirmed). "
+                        "Call only after the user explicitly agreed to the Goal in this "
+                        "conversation. Optionally update Goal fields in the same call. "
+                        "Once confirmed, lg_graph_propose_change becomes available."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 240,
+                            },
+                            "intent": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 240,
+                            },
+                            "time_limit": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 120,
+                            },
+                            "desired_outcome": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 4_000,
+                            },
+                            "target_weight": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 100,
+                            },
+                            "availability": {"type": "object"},
+                            "preferences": {"type": "object"},
+                            "constraints": {"type": "object"},
+                            "assumptions": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
 
     @property
@@ -2341,6 +2481,14 @@ class AgentToolRuntime:
                     assistant_message_id=assistant_message_id,
                     source_message_id=source_message_id,
                 )
+            if name in {"lg_goal_read", "lg_goal_create", "lg_goal_confirm"}:
+                return self._execute_goal_tool(
+                    name,
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    source_message_id=source_message_id,
+                )
             if name == "subapp_observe":
                 return self._execute_subapp_observe(arguments)
             if name == "subapp_patch_state":
@@ -2735,6 +2883,299 @@ class AgentToolRuntime:
                     "status": "completed",
                     "data": component,
                 },
+            },
+            [],
+        )
+
+
+    def _execute_goal_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        assistant_message_id: str | None,
+        source_message_id: str | None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Goal tools: read / create / confirm the session-bound Goal.
+
+        ``lg_goal_create`` binds a reviewable Goal draft to the session so the
+        Goal/Graph orchestration loop can act on it. ``lg_goal_confirm`` moves
+        it to ``confirmed`` (required before ``lg_graph_propose_change``). Both
+        write through the workspace-scoped session row and keep an audit trail.
+        """
+
+        if name == "lg_goal_read":
+            return self._execute_goal_read(arguments, chat_session_id=chat_session_id)
+        if name == "lg_goal_create":
+            return self._execute_goal_create(
+                arguments,
+                chat_session_id=chat_session_id,
+                assistant_message_id=assistant_message_id,
+                source_message_id=source_message_id,
+            )
+        if name == "lg_goal_confirm":
+            return self._execute_goal_confirm(
+                arguments,
+                chat_session_id=chat_session_id,
+            )
+        raise AppError(400, "unknown_goal_tool", f"Unknown goal tool: {name}")
+
+    def _load_session_goal(
+        self,
+        chat_session_id: str,
+        *,
+        goal_id: str | None = None,
+    ):
+        from sqlalchemy import select
+
+        from app.domain.models import ChatSession, Goal, Graph
+
+        db = self.extensions.db
+        session = db.scalar(
+            select(ChatSession).where(
+                ChatSession.workspace_id == self.workspace_id,
+                ChatSession.id == chat_session_id,
+            )
+        )
+        if session is None:
+            raise AppError(404, "session_not_found", "Session was not found")
+        resolved_goal_id = goal_id or session.goal_id
+        if not resolved_goal_id:
+            return session, None, None
+        goal = db.scalar(
+            select(Goal).where(
+                Goal.workspace_id == self.workspace_id,
+                Goal.id == resolved_goal_id,
+            )
+        )
+        if goal is None:
+            raise AppError(404, "goal_not_found", "The session Goal was not found")
+        graph = None
+        if session.graph_id:
+            graph = db.scalar(
+                select(Graph).where(
+                    Graph.workspace_id == self.workspace_id,
+                    Graph.id == session.graph_id,
+                    Graph.goal_id == goal.id,
+                )
+            )
+        return session, goal, graph
+
+    def _goal_tool_summary(self, goal, graph=None, *, session_id: str) -> dict[str, Any]:
+        return {
+            "goal_id": goal.id,
+            "title": goal.title,
+            "status": goal.status,
+            "intent": goal.intent,
+            "time_limit": goal.time_limit,
+            "desired_outcome": goal.desired_outcome,
+            "raw_prompt": (goal.raw_prompt or "")[:2_000],
+            "target_weight": goal.target_weight,
+            "assumptions": goal.assumptions or [],
+            "session_id": session_id,
+            "graph_id": graph.id if graph else None,
+            "graph_status": getattr(graph, "status", None),
+        }
+
+    def _execute_goal_read(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        goal_id = arguments.get("goal_id") if isinstance(arguments.get("goal_id"), str) else None
+        session, goal, graph = self._load_session_goal(
+            chat_session_id, goal_id=goal_id
+        )
+        if goal is None:
+            return self._success(
+                {
+                    "session_id": session.id,
+                    "goal_bound": False,
+                    "message": "This session has no confirmed Goal yet. Use lg_goal_create to bind one.",
+                },
+                {"goal_bound": False},
+                [],
+            )
+        summary = self._goal_tool_summary(goal, graph, session_id=session.id)
+        return self._success(
+            summary,
+            {
+                "goal_id": goal.id,
+                "goal_status": goal.status,
+                "graph_bound": graph is not None,
+            },
+            [],
+        )
+
+    def _execute_goal_create(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        assistant_message_id: str | None,
+        source_message_id: str | None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from sqlalchemy import select
+
+        from app.domain.models import Goal, Message
+
+        db = self.extensions.db
+        session, existing_goal, graph = self._load_session_goal(chat_session_id)
+        if existing_goal is not None:
+            summary = self._goal_tool_summary(existing_goal, graph, session_id=session.id)
+            return self._success(
+                {**summary, "already_bound": True},
+                {"goal_id": existing_goal.id, "already_bound": True, "goal_status": existing_goal.status},
+                [],
+            )
+
+        if not assistant_message_id or not source_message_id:
+            raise AppError(
+                409,
+                "goal_create_message_context_missing",
+                "Creating a Goal requires the current persisted user and assistant messages",
+            )
+        source_user_message = db.scalar(
+            select(Message).where(
+                Message.workspace_id == self.workspace_id,
+                Message.id == source_message_id,
+                Message.session_id == session.id,
+                Message.role == "user",
+            )
+        )
+        if source_user_message is None:
+            raise AppError(
+                409,
+                "goal_create_message_context_invalid",
+                "The source user message does not belong to the current session",
+            )
+
+        title = str(arguments.get("title") or "").strip()
+        if not title:
+            raise AppError(422, "invalid_tool_arguments", "title is required")
+        auto_confirm = bool(arguments.get("auto_confirm", False))
+        raw_prompt = (
+            str(arguments.get("raw_prompt") or "").strip()
+            or (source_user_message.content or "").strip()
+        )
+        goal = Goal(
+            workspace_id=self.workspace_id,
+            title=title[:240],
+            raw_prompt=raw_prompt[:10_000],
+            status="confirmed" if auto_confirm else "clarifying",
+            intent=str(arguments.get("intent") or "")[:240],
+            time_limit=str(arguments.get("time_limit") or "")[:120],
+            desired_outcome=str(arguments.get("desired_outcome") or "")[:4_000],
+            constraints=(
+                arguments.get("constraints")
+                if isinstance(arguments.get("constraints"), dict)
+                else {}
+            ),
+            assumptions=(
+                arguments.get("assumptions")
+                if isinstance(arguments.get("assumptions"), list)
+                else []
+            ),
+        )
+        db.add(goal)
+        db.flush()
+        session.goal_id = goal.id
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="goal.create",
+            resource_type="goal",
+            resource_id=goal.id,
+            details={"source": "agent_tool", "tool": "lg_goal_create"},
+        )
+        db.commit()
+        db.refresh(goal)
+        summary = self._goal_tool_summary(goal, None, session_id=session.id)
+        return self._success(
+            {**summary, "already_bound": False},
+            {
+                "goal_id": goal.id,
+                "goal_status": goal.status,
+                "bound_session_id": session.id,
+                "review_required": goal.status != "confirmed",
+            },
+            [],
+        )
+
+    def _execute_goal_confirm(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        from app.domain.models import Goal
+
+        db = self.extensions.db
+        session, goal, graph = self._load_session_goal(chat_session_id)
+        if goal is None:
+            raise AppError(
+                409,
+                "goal_not_found",
+                "This session has no Goal bound yet; use lg_goal_create first",
+            )
+        if goal.status == "approved":
+            raise AppError(
+                409,
+                "goal_already_published",
+                "Published goals cannot be silently rewritten",
+            )
+        changed = False
+        updates = {
+            "title": (str, 240),
+            "intent": (str, 240),
+            "time_limit": (str, 120),
+            "desired_outcome": (str, 4_000),
+        }
+        for field, (kind, limit) in updates.items():
+            if field in arguments and arguments[field] is not None:
+                value = str(arguments[field]).strip()
+                if value:
+                    setattr(goal, field, value[:limit])
+                    changed = True
+        if isinstance(arguments.get("target_weight"), int) and 1 <= arguments["target_weight"] <= 100:
+            goal.target_weight = arguments["target_weight"]
+            changed = True
+        for nested_field in ("availability", "preferences", "constraints"):
+            value = arguments.get(nested_field)
+            if isinstance(value, dict):
+                setattr(goal, nested_field, value)
+                changed = True
+        if isinstance(arguments.get("assumptions"), list):
+            goal.assumptions = arguments["assumptions"]
+            changed = True
+        if goal.status != "confirmed":
+            goal.status = "confirmed"
+            changed = True
+        if not changed:
+            # Still surface a stable result for the model.
+            summary = self._goal_tool_summary(goal, graph, session_id=session.id)
+            return self._success(
+                {**summary, "already_confirmed": True},
+                {"goal_id": goal.id, "goal_status": goal.status},
+                [],
+            )
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="goal.confirm",
+            resource_type="goal",
+            resource_id=goal.id,
+            details={"source": "agent_tool", "tool": "lg_goal_confirm"},
+        )
+        db.commit()
+        db.refresh(goal)
+        summary = self._goal_tool_summary(goal, graph, session_id=session.id)
+        return self._success(
+            {**summary, "already_confirmed": False},
+            {
+                "goal_id": goal.id,
+                "goal_status": goal.status,
+                "graph_propose_available": True,
             },
             [],
         )
