@@ -16,7 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -4731,6 +4731,17 @@ class ChatService:
             )
         )
         if pending_auth_part is not None:
+            # The card's part.started / part.completed stream events still hold
+            # a FK to this part (message_stream_events.part_id has no
+            # ondelete); clear them first so the DELETE does not trip SQLite's
+            # foreign-key enforcement.
+            self.db.execute(
+                delete(MessageStreamEvent).where(
+                    MessageStreamEvent.workspace_id == self.workspace_id,
+                    MessageStreamEvent.message_version_id == assistant_version.id,
+                    MessageStreamEvent.part_id == pending_auth_part.id,
+                )
+            )
             self.db.delete(pending_auth_part)
             self.db.flush()
 
