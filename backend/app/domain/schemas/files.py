@@ -238,7 +238,7 @@ class DocumentCollectionView(ORMModel):
     updated_at: datetime
 
 
-DocumentQueryScope = Literal["selection", "page", "section", "file", "files"]
+DocumentQueryScope = Literal["selection", "page", "section", "file", "files", "full_document"]
 
 
 class DocumentQueryPreviewRequest(BaseModel):
@@ -255,8 +255,8 @@ class DocumentQueryPreviewRequest(BaseModel):
     def validate_scope_locator(self):
         if not self.file_ids and not self.collection_ids:
             raise ValueError("at least one file_id or collection_id is required")
-        if self.scope == "file" and len(set(self.file_ids)) != 1:
-            raise ValueError("file scope requires exactly one file_id")
+        if self.scope in {"file", "full_document"} and len(set(self.file_ids)) != 1:
+            raise ValueError(f"{self.scope} scope requires exactly one file_id")
         if self.scope == "page" and not isinstance(self.locator.get("page"), int):
             raise ValueError("page scope requires locator.page")
         if self.scope == "section" and not (

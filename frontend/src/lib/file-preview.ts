@@ -17,6 +17,13 @@ const TEXT_EXTENSIONS = new Set([
   "jsx", "ts", "tsx", "py", "sql", "sh",
 ]);
 
+const CODE_EXTENSIONS = new Set([
+  "bash", "bat", "c", "cc", "cjs", "cpp", "cs", "css", "dart", "go", "h",
+  "hpp", "java", "js", "jsx", "kt", "kts", "less", "lua", "mjs", "php",
+  "pl", "pm", "ps1", "py", "pyi", "r", "rb", "rs", "scala", "scss", "sh",
+  "sql", "svelte", "swift", "ts", "tsx", "vue", "zsh",
+]);
+
 function extensionOf(filename: string) {
   const leaf = filename.split(/[\\/]/).pop() ?? "";
   const dot = leaf.lastIndexOf(".");
@@ -61,4 +68,28 @@ export function resolveFilePreviewKind(
     TEXT_EXTENSIONS.has(extension)
   ) return "text";
   return "unsupported";
+}
+
+/**
+ * Whether the learning page should offer document indexing for this file.
+ * Media, code, HTML, and attachment-only files remain directly usable without
+ * presenting an index as a prerequisite.
+ */
+export function requiresLearningIndex(
+  filename: string,
+  mimeType = "",
+  parseCapability = "",
+) {
+  if (parseCapability === "attachment_only") return false;
+
+  const extension = extensionOf(filename);
+  const previewKind = resolveFilePreviewKind(filename, mimeType);
+  if (
+    CODE_EXTENSIONS.has(extension) ||
+    ["audio", "video", "image", "html", "unsupported"].includes(previewKind)
+  ) {
+    return false;
+  }
+
+  return true;
 }

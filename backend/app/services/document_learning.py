@@ -795,19 +795,26 @@ class DocumentLearningService:
             file_ids,
         )
         repaired_index_file_ids = self._repair_sparse_index_if_needed(file_ids)
-        rows = self._fts_rows(
-            payload.query,
-            file_ids,
-            payload.max_results,
-            scoped_chunk_ids=scoped_chunk_ids,
-        )
+        full_document = payload.scope == "full_document"
+        if full_document:
+            rows = self._all_rows(
+                file_ids,
+                scoped_chunk_ids=scoped_chunk_ids,
+            )
+        else:
+            rows = self._fts_rows(
+                payload.query,
+                file_ids,
+                payload.max_results,
+                scoped_chunk_ids=scoped_chunk_ids,
+            )
         used_head_context_fallback = False
         # A query such as "summarize this file" often has no lexical overlap
         # with the uploaded document.  Returning an empty result in that case
         # made an indexed file look unavailable to ChatService.  The fallback
         # remains scoped to the files explicitly authorized by the caller and
         # is recorded on the retrieval trace; it is not a synthetic answer.
-        if not rows and payload.scope in {"file", "files", "selection"}:
+        if not full_document and not rows and payload.scope in {"file", "files", "selection"}:
             rows = self._head_rows(
                 file_ids,
                 payload.max_results,
@@ -831,7 +838,8 @@ class DocumentLearningService:
                     "raw_score": -1.0,
                 },
             )
-        rows = rows[: payload.max_results]
+        if not full_document:
+            rows = rows[: payload.max_results]
         if selected_chunk is not None:
             selection_status: DocumentSelectionStatus = "verified"
         elif payload.selected_text:
@@ -843,8 +851,10 @@ class DocumentLearningService:
             actor_id=self.actor_id,
             query_hash=_hash(payload.query),
             file_ids=file_ids,
-            strategy=(
-                "fts5_bm25+head_context"
+            strategy= (
+                "fts5_full_document"
+                if full_document
+                else "fts5_bm25+head_context"
                 if used_head_context_fallback
                 else "fts5_bm25"
             ),
@@ -888,7 +898,11 @@ class DocumentLearningService:
                     locator=row["locator"],
                     locator_json=_json_object(row["locator_json"]),
                     section_path=[str(item) for item in _json_list(row["section_path"])],
-                    quote=str(row["content"])[:800],
+                    quote=(
+                        str(row["content"])
+                        if full_document
+                        else str(row["content"])[:800]
+                    ),
                     content_hash=row["content_hash"],
                 )
             )
@@ -1005,6 +1019,44 @@ class DocumentLearningService:
                 continue
             repaired.append(file_id)
         return repaired
+
+    def _all_rows(
+        self,
+        file_ids: list[str],
+        *,
+        scoped_chunk_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return every authorized chunk in document order for full coverage."""
+
+        if scoped_chunk_ids == []:
+            return []
+        statement = (
+            select(FileTextChunk, FileRecord.original_name)
+            .join(FileRecord, FileRecord.id == FileTextChunk.file_id)
+            .where(
+                FileTextChunk.workspace_id == self.workspace_id,
+                FileTextChunk.file_id.in_(file_ids),
+                FileTextChunk.lifecycle_status == "active",
+            )
+            .order_by(FileTextChunk.file_id, FileTextChunk.ordinal)
+        )
+        if scoped_chunk_ids is not None:
+            statement = statement.where(FileTextChunk.id.in_(scoped_chunk_ids))
+        return [
+            {
+                "chunk_id": chunk.id,
+                "file_id": chunk.file_id,
+                "document_revision_id": chunk.document_revision_id,
+                "filename": filename,
+                "locator": chunk.locator,
+                "locator_json": chunk.locator_json,
+                "section_path": chunk.section_path,
+                "content": chunk.content,
+                "content_hash": chunk.content_hash,
+                "raw_score": float(index),
+            }
+            for index, (chunk, filename) in enumerate(self.db.execute(statement).all(), start=1)
+        ]
 
     def _head_rows(
         self,

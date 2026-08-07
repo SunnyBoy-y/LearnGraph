@@ -1008,7 +1008,7 @@ export const PromptInputAttachments = ({ className, ...props }: HTMLAttributes<H
             <iframe className="h-[70svh] w-full border" sandbox="" src={preview.url} title={preview.filename ?? "PDF 附件预览"} />
           ) : preview ? (
             <div className="grid min-h-56 place-items-center border-y p-8 text-center text-sm text-muted-foreground">
-              <div><FileTextIcon className="mx-auto mb-3 size-7" /><p>{preview.filename}</p><small>该类型不在对话框内执行；发送后可从受保护的资料学习页查看。</small></div>
+              <div><FileTextIcon className="mx-auto mb-3 size-7" /><p>{preview.filename}</p><small>该类型不在对话框内执行；发送后可从资料学习页查看。</small></div>
             </div>
           ) : null}
         </DialogContent>

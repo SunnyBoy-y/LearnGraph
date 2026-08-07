@@ -88,6 +88,7 @@ import {
 import { lookupFile, uploadFile } from "@/api/files";
 import { ApiError } from "@/api/client";
 import { hashFileSha256 } from "@/lib/file-hash";
+import { requiresLearningIndex } from "@/lib/file-preview";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { FileRecord } from "@/types/files";
 import type {
@@ -323,6 +324,11 @@ export function DocumentChatPanel({
   const thinkingRequired =
     selectedModel?.capabilities?.thinking_required === true;
   const activeSession = sessions.data?.find((item) => item.id === sessionId);
+  const indexRequired = requiresLearningIndex(
+    file.original_name,
+    file.mime_type,
+    file.parse_capability,
+  );
   const messages = useMemo(
     () => [...(history.data ?? []), ...localMessages],
     [history.data, localMessages],
@@ -468,14 +474,14 @@ export function DocumentChatPanel({
     }
     const fileIsImage = file.mime_type.toLowerCase().startsWith("image/");
     const needsIndex =
-      !fileIsImage &&
+      indexRequired &&
       file.parse_status !== "indexed" &&
       !embeddedImages.length;
     if (needsIndex && !selection) {
       toast.error("请先完成文档索引，再把原文证据发送到学习对话。");
       return;
     }
-    if (file.parse_status !== "indexed" && selection) {
+    if (indexRequired && file.parse_status !== "indexed" && selection) {
       toast.error("请先完成文档索引，再发送划词证据。");
       return;
     }

@@ -53,7 +53,7 @@ import {
 import {
   FilePreviewCanvas,
 } from "@/components/resources/file-preview";
-import { resolveFilePreviewKind } from "@/lib/file-preview";
+import { requiresLearningIndex, resolveFilePreviewKind } from "@/lib/file-preview";
 import {
   isRealtimeTranscriptionModel,
   providerCapabilityString,
@@ -418,7 +418,16 @@ export function DocumentLearningPage() {
     const fallbackRevisionId = revisions.data?.[0]?.id;
     const revisionId = chunk?.document_revision_id ?? fallbackRevisionId;
     if (!revisionId) {
-      toast.error("该选区尚未绑定可验证的文档 Revision，请先建立索引。");
+      if (
+        file &&
+        requiresLearningIndex(
+          file.original_name,
+          file.mime_type,
+          file.parse_capability,
+        )
+      ) {
+        toast.error("该选区尚未绑定可验证的文档 Revision，请先建立索引。");
+      }
       return;
     }
     if (!chunk) {
@@ -594,6 +603,11 @@ export function DocumentLearningPage() {
 
   const previewKind = resolveFilePreviewKind(file.original_name, file.mime_type);
   const isAudio = previewKind === "audio";
+  const indexRequired = requiresLearningIndex(
+    file.original_name,
+    file.mime_type,
+    file.parse_capability,
+  );
   const hasOriginalPreview = previewKind !== "unsupported";
   // 仅 PDF / DOCX / DOC 支持证据检索与图谱构建；其余格式隐藏这两个标签页。
   const supportsEvidenceAndGraph =
@@ -645,7 +659,7 @@ export function DocumentLearningPage() {
           <PanelLeft className="size-3.5" />
           {outlineOpen ? "隐藏目录" : "显示目录"}
         </Button>
-        {file.parse_status !== "indexed" && !jobId && !isAudio ? (
+        {file.parse_status !== "indexed" && !jobId && indexRequired ? (
           <Button disabled={startJob.isPending} onClick={() => startJob.mutate()} size="sm">
             {startJob.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
             建立索引
@@ -850,7 +864,7 @@ export function DocumentLearningPage() {
                 </button>
               ))}
             </nav>
-            {!chunks.data?.length ? (
+            {!chunks.data?.length && indexRequired ? (
               <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
                 原文件仍可预览；建立索引后这里会显示可验证定位。
               </p>
@@ -1007,17 +1021,19 @@ export function DocumentLearningPage() {
           ) : null}
           {originalUnavailable && hasOriginalPreview && !chunks.data?.length ? (
             <div className="grid min-h-[28rem] place-items-center px-8 text-center text-sm text-muted-foreground">
-              原文件读取失败，且尚无可用的索引文本。请重试或重新建立索引。
-            </div>
-          ) : null}
-          {!chunks.data?.length && hasOriginalPreview ? (
-            <div className="border-t bg-amber-50/70 px-4 py-2 text-center text-[11px] text-amber-900">
-              当前展示受保护的原文件；建立索引后才能验证选区并用于问答。
+              {indexRequired
+                ? "原文件读取失败，且尚无可用的索引文本。请重试或重新建立索引。"
+                : "原文件读取失败，请重试。"}
             </div>
           ) : null}
           {!chunks.data?.length && !hasOriginalPreview ? (
             <div className="grid min-h-[36rem] place-items-center p-8 text-center text-sm text-muted-foreground">
-              <div><FileQuestion className="mx-auto mb-3 size-7" />先建立索引，才能阅读可定位文本并进行文档问答。</div>
+              <div>
+                <FileQuestion className="mx-auto mb-3 size-7" />
+                {indexRequired
+                  ? "先建立索引，才能阅读可定位文本并进行文档问答。"
+                  : "该文件暂不支持在学习页中预览。"}
+              </div>
             </div>
           ) : null}
         </main>
