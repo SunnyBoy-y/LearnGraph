@@ -60,6 +60,8 @@
             <div class="nav-group">
               <p>核心架构</p>
               <a href="#architecture">系统架构</a>
+              <a href="#evolution">版本演进与设计原则</a>
+              <a href="#media-inputs">媒体与文档输入</a>
               <a href="#gateway">API 网关与请求边界</a>
               <a href="#persistence">持久化与事实源</a>
               <a href="#providers">Provider 层</a>
@@ -67,6 +69,7 @@
             <div class="nav-group">
               <p>Agent Runtime</p>
               <a href="#agent">Agent 执行循环</a>
+              <a href="#progressive-disclosure">渐进式披露</a>
               <a href="#prompt-strategy">系统提示词策略</a>
               <a href="#tools">Tool 注册与调用</a>
               <a href="#skills">Skills</a>
@@ -75,6 +78,7 @@
             <div class="nav-group">
               <p>运行与数据</p>
               <a href="#sandbox">沙箱</a>
+              <a href="#atomic-tools">原子工具</a>
               <a href="#memory">记忆系统</a>
               <a href="#streaming">消息与 SSE</a>
               <a href="#trusted-components">可信组件</a>
@@ -297,9 +301,43 @@ npm.cmd run check</code></pre>
           <div class="source-ref">来源：<code>backend/app/main.py</code> · <code>backend/app/api/router.py</code> · <code>backend/app/providers/ports/</code></div>
         </section>
 
+        <section id="evolution" class="doc-section doc-section-accent" data-title="版本演进与设计原则">
+          <div class="section-heading">
+            <span class="section-index">04A</span>
+            <div><p class="overline">Architecture evolution</p><h2>从转录修复到可治理 Runtime</h2></div>
+          </div>
+          <p>以 <code>c173b36</code>「修复音频、视频等转录 bug」为基线，当前版本不只是增加功能，而是把媒体输入、工具执行、沙箱和记忆都推进到可观察、可恢复、可审计的边界。</p>
+          <div class="timeline-rail">
+            <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>基线 · c173b36</small><strong>先让媒体可靠进入系统</strong><p>修复 transcription model routing、音视频附件策略、解析器、文件服务和验证脚本；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
+            <div class="timeline-item timeline-current"><span class="timeline-dot"></span><div><small>当前 · HEAD</small><strong>再让能力可治理地运行</strong><p>增加 sandbox readiness、网络/egress 授权、原子工具、能力按需装配、记忆事件投影、断线恢复和媒体描述缓存。</p></div></div>
+          </div>
+          <div class="principle-grid">
+            <article><span class="principle-icon">01</span><strong>能力先于格式</strong><p>按 MIME、解析能力和 Provider capability 路由；音频、视频、图片和文本文档不共享一条假设链。</p></article>
+            <article><span class="principle-icon">02</span><strong>边界先于便利</strong><p>沙箱、工具、Grant、工作区和 Provider 都是独立边界；没有能力就明确 unavailable，不静默落回宿主。</p></article>
+            <article><span class="principle-icon">03</span><strong>事实先于投影</strong><p>数据库事件、revision 和 audit 是事实；SSE、Memory Provider、UI 面板和缓存都是可重建投影。</p></article>
+            <article><span class="principle-icon">04</span><strong>按需披露</strong><p>模型先看到能力摘要和授权范围，再在需要时发现工具、读取大结果或展开上下文，减少噪声与权限面。</p></article>
+          </div>
+          <div class="compare evolution-compare">
+            <div><span class="compare-label">baseline</span><h3>转录修复版</h3><ul><li>重点是音视频能否被正确解析和路由</li><li>附件策略与 Provider 失败边界开始显式化</li><li>验证以脚本和单次请求为主</li></ul></div>
+            <div><span class="compare-label">current</span><h3>当前治理版</h3><ul><li>输入、工具、沙箱、记忆均有稳定事实和生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
+          </div>
+          <div class="source-ref">对比基线：<code>git show c173b36</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/memory_projector.py</code></div>
+        </section>
+
+        <section id="media-inputs" class="doc-section" data-title="媒体与文档输入">
+          <div class="section-heading"><span class="section-index">04B</span><div><p class="overline">Media pipeline</p><h2>媒体输入：转录、视觉与文档证据</h2></div></div>
+          <p>媒体不是“把文件塞进 prompt”。当前输入管线先判断文件能力，再选择原生模型、转录 Provider、索引检索或外挂视觉描述，并把每一步的状态保留下来。</p>
+          <div class="media-pipeline" data-demo-pipeline>
+            <div class="media-step is-active"><span>01</span><strong>识别</strong><small>MIME · size · storage</small></div><i>→</i><div class="media-step"><span>02</span><strong>路由</strong><small>native · transcription · vision</small></div><i>→</i><div class="media-step"><span>03</span><strong>解析</strong><small>caption · transcript · chunks</small></div><i>→</i><div class="media-step"><span>04</span><strong>持久化</strong><small>trace · cache · revision</small></div><i>→</i><div class="media-step"><span>05</span><strong>回答</strong><small>evidence · SSE · retry</small></div>
+          </div>
+          <button class="demo-button" type="button" data-run-pipeline>播放一次输入管线</button>
+          <div class="definition-list compact"><div><span class="status status-current">音频 / 视频</span><p>先验证 MIME、存储状态和大小，再走 transcription Provider；模型 ID 由能力快照和路由器统一决定，不能由前端拼接。</p></div><div><span class="status status-current">图片</span><p>已确认原生视觉能力则直接发送；未知私有模型先探测，遇到明确“不支持图像”错误时记录 runtime observation 并回退视觉模型，描述按内容 hash 缓存。</p></div><div><span class="status status-conditional">文档</span><p>可索引格式进入 chunk/retrieval；全文总结请求使用有上限的 full-document strategy，超出安全上下文时建议切换 Agent 分段读取，不静默截断。</p></div></div>
+          <div class="callout callout-warning"><span class="callout-icon">!</span><div><strong>不要把“可预览”当成“可检索”</strong><p>媒体可直接预览不代表需要建立文档索引；同样，转录成功也不代表已建立可引用的 revision。显示能力、检索能力和回答证据必须分开。</p></div></div>
+          <div class="source-ref">来源：<code>backend/app/providers/remote/transcription.py</code> · <code>backend/app/services/document_parsers.py</code> · <code>backend/app/services/document_learning.py</code> · <code>backend/app/services/chat.py</code></div>
+        </section>
+
         <section id="gateway" class="doc-section" data-title="API 网关与请求边界">
           <div class="section-heading">
-            <span class="section-index">04</span>
             <div>
               <p class="overline">Request gateway</p>
               <h2>API 网关与请求边界</h2>
@@ -454,9 +492,26 @@ npm.cmd run check</code></pre>
           </div>
         </section>
 
+        <section id="progressive-disclosure" class="doc-section doc-section-accent" data-title="渐进式披露">
+          <div class="section-heading"><span class="section-index">09A</span><div><p class="overline">Progressive disclosure</p><h2>先给能力地图，再展开执行细节</h2></div></div>
+          <p>渐进式披露不是隐藏能力，而是控制每一轮进入模型上下文的内容和权限面。默认只注册当前模式、角色、授权和资源真正需要的工具；复杂工具通过 Skill/MCP 快照或能力族按需激活。</p>
+          <div class="disclosure-demo" data-disclosure-demo>
+            <div class="disclosure-stage is-visible"><span>01</span><strong>Capability map</strong><p>能力族、状态、来源、授权范围</p></div><div class="disclosure-stage"><span>02</span><strong>Tool contract</strong><p>schema、限制、错误和结果句柄</p></div><div class="disclosure-stage"><span>03</span><strong>Execution trace</strong><p>调用、审批、结果、审计和产物</p></div>
+          </div>
+          <button class="demo-button" type="button" data-run-disclosure>逐层展开工具上下文</button>
+          <div class="callout callout-note"><span class="callout-icon">i</span><div><strong>原子工具的边界</strong><p>一个工具只负责一个可验证动作，例如读文件、写文件、列举文件、执行命令、转录或发布产物。组合逻辑留给 Agent；授权、幂等、审计和结果裁剪留在服务端。</p></div></div>
+          <div class="source-ref">来源：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/mcp_skills.py</code> · <code>backend/app/services/sandbox.py</code></div>
+        </section>
+
+        <section id="atomic-tools" class="doc-section" data-title="原子工具">
+          <div class="section-heading"><span class="section-index">15A</span><div><p class="overline">Atomic capabilities</p><h2>工具是权限边界，不是模型的万能遥控器</h2></div></div>
+          <div class="tool-matrix"><article><span class="tool-family family-read">READ</span><strong>观察</strong><p>read_file、list_files、subapp_observe 等只读能力返回有限摘要，不直接暴露不可信 payload。</p></article><article><span class="tool-family family-write">WRITE</span><strong>修改</strong><p>write_file、publish_file 等改变状态的能力需要明确作用域、大小限制和可追踪结果。</p></article><article><span class="tool-family family-run">RUN</span><strong>执行</strong><p>exec、transcribe_audio 运行在受控 Provider/沙箱中，保留超时、退出码、截断和审计。</p></article><article><span class="tool-family family-approve">APPROVE</span><strong>破坏性动作</strong><p>删除、外发、网络访问等操作与 Grant/egress approval 绑定，拒绝也是完整结果。</p></article></div>
+          <div class="flow-row"><span>capability snapshot</span><i>→</i><span>enabled + grant</span><i>→</i><span>schema validation</span><i>→</i><span>execution</span><i>→</i><span>normalized result</span><i>→</i><span>audit / MessagePart</span></div>
+          <div class="source-ref">来源：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
+        </section>
+
         <section id="prompt-strategy" class="doc-section" data-title="系统提示词策略">
           <div class="section-heading">
-            <span class="section-index">08</span>
             <div>
               <p class="overline">Prompt compiler</p>
               <h2>系统提示词策略</h2>
@@ -799,17 +854,25 @@ npm.cmd run check</code></pre>
 
           <div class="memory-layout">
             <div class="memory-canonical">
-              <span>Canonical</span>
-              <strong>SQLite</strong>
-              <small>ID · Revision · Hash · Journal · Policy</small>
+              <span>Canonical facts</span>
+              <strong>Events + Revision</strong>
+              <small>SQLite · scope · journal · audit</small>
             </div>
-            <div class="memory-arrow">verified projection →</div>
+            <div class="memory-arrow">project →</div>
             <div class="memory-provider">
-              <span>Active Provider</span>
-              <strong>Markdown 或 Mem0</strong>
-              <small>Binding · provider_epoch · read-back hash</small>
+              <span>Derived views</span>
+              <strong>Provider / Retrieval</strong>
+              <small>Markdown · Mem0 · embeddings · context manifest</small>
             </div>
           </div>
+          <div class="memory-event-preview" data-memory-preview>
+            <div class="memory-event is-done"><span>01</span><strong>capture</strong><small>user/session evidence</small></div><i>→</i>
+            <div class="memory-event is-done"><span>02</span><strong>append</strong><small>immutable event</small></div><i>→</i>
+            <div class="memory-event"><span>03</span><strong>project</strong><small>canonical memory</small></div><i>→</i>
+            <div class="memory-event"><span>04</span><strong>retrieve</strong><small>scored package</small></div><i>→</i>
+            <div class="memory-event"><span>05</span><strong>govern</strong><small>draft · commit · reject</small></div>
+          </div>
+          <button class="demo-button" type="button" data-run-memory>播放记忆事件流</button>
 
           <h3>记忆类型注册表</h3>
           <p>

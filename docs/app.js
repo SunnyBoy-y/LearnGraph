@@ -155,4 +155,67 @@
       }
     });
   });
+
+  const animateSequence = (elements, activeClass, button, labels) => {
+    let runId = Number(button.dataset.runId || 0) + 1;
+    button.dataset.runId = String(runId);
+    button.disabled = true;
+    elements.forEach((element) => element.classList.remove(activeClass));
+    elements.forEach((element, index) => {
+      setTimeout(() => {
+        if (Number(button.dataset.runId) !== runId) return;
+        element.classList.add(activeClass);
+        if (index === elements.length - 1) {
+          button.disabled = false;
+          button.textContent = labels.done;
+          showToast(labels.toast);
+          setTimeout(() => (button.textContent = labels.idle), 1400);
+        }
+      }, index * 420);
+    });
+  };
+
+  const pipelineButton = document.querySelector("[data-run-pipeline]");
+  pipelineButton?.addEventListener("click", () =>
+    animateSequence(
+      [...document.querySelectorAll("[data-demo-pipeline] .media-step")],
+      "is-active",
+      pipelineButton,
+      { idle: "播放一次输入管线", done: "管线已完成", toast: "媒体输入已完成路由与持久化" }
+    )
+  );
+
+  const disclosureButton = document.querySelector("[data-run-disclosure]");
+  disclosureButton?.addEventListener("click", () =>
+    animateSequence(
+      [...document.querySelectorAll("[data-disclosure-demo] .disclosure-stage")],
+      "is-visible",
+      disclosureButton,
+      { idle: "逐层展开工具上下文", done: "上下文已展开", toast: "能力地图、工具契约与执行轨迹已展开" }
+    )
+  );
+
+  const memoryButton = document.querySelector("[data-run-memory]");
+  memoryButton?.addEventListener("click", () =>
+    animateSequence(
+      [...document.querySelectorAll("[data-memory-preview] .memory-event")],
+      "is-done",
+      memoryButton,
+      { idle: "播放记忆事件流", done: "投影已同步", toast: "Canonical event 已投影到检索与治理视图" }
+    )
+  );
+
+  const revealTargets = document.querySelectorAll(
+    ".timeline-item, .principle-grid article, .tool-matrix article, .callout"
+  );
+  revealTargets.forEach((element) => element.setAttribute("data-reveal", ""));
+  const revealObserver = new IntersectionObserver(
+    (entries) => entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      entry.target.classList.add("is-revealed");
+      revealObserver.unobserve(entry.target);
+    }),
+    { threshold: 0.12 }
+  );
+  revealTargets.forEach((element) => revealObserver.observe(element));
 })();
