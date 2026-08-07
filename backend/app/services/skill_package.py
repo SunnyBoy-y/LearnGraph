@@ -223,6 +223,18 @@ class OfficialSkillSpec:
     contextual_activation: str | None = None
     allowed_components: tuple[str, ...] = ()
     fallback_md: str | None = None
+    # --- Built-in sandbox capability skills ---------------------------------
+    # Category bucket used for capability-search discovery and the prompt
+    # catalog (e.g. "document", "pdf", "pptx", "spreadsheet", "media",
+    # "frontend", "data", "archive", "web"). Empty for workflow-only skills.
+    category: str = ""
+    capability_ids: tuple[str, ...] = ()
+    keywords: tuple[str, ...] = ()
+    # Runtime prerequisite: "sandbox" for offline scripts, "sandbox+egress"
+    # for anything that needs the reviewed outbound proxy (e.g. web fetch).
+    requires_runtime: str = ""
+    required_tools: tuple[str, ...] = ()
+    required_permissions: tuple[str, ...] = ()
 
 
 OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
@@ -294,6 +306,135 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         ),
         grant_reason="official_skill_auto_enable",
     ),
+    # ------------------------------------------------------------------
+    # Built-in sandbox capability skills. Every workspace gets the same set
+    # (idempotent per-workspace install with a durable system grant). The
+    # packages ship as SKILL.md + references/ + scripts/ under
+    # backend/app/skills/<dir>/; scripts run only inside the offline Docker
+    # sandbox via skill.sandbox-run and are never registered as tools.
+    # ------------------------------------------------------------------
+    OfficialSkillSpec(
+        key="document-conversion",
+        display_name="文档转换与文本抽取",
+        version="1.0.0",
+        dir_name="document_conversion",
+        description=(
+            "DOC/DOCX/RTF/HTML 文档转 HTML、纯文本、PDF、PNG，并抽取正文供下游分析。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        category="document",
+        capability_ids=("docx.read", "doc.read", "rtf.read", "html.read", "document.convert"),
+        keywords=("docx", "doc", "rtf", "html", "word", "转换", "文本抽取", "pdf预览"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="pdf-processing",
+        display_name="PDF 解析与处理",
+        version="1.0.0",
+        dir_name="pdf_processing",
+        description="PDF 元信息、正文/页抽取、合并拆分、页面渲染为 PNG。",
+        grant_reason="official_skill_auto_enable",
+        category="pdf",
+        capability_ids=("pdf.read", "pdf.merge", "pdf.split", "pdf.render"),
+        keywords=("pdf", "合并", "拆分", "提取文本", "页数", "渲染", "pdf转图片"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="pptx-generation",
+        display_name="PPT 生成与检查",
+        version="1.0.0",
+        dir_name="pptx_generation",
+        description="从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览。",
+        grant_reason="official_skill_auto_enable",
+        category="pptx",
+        capability_ids=("pptx.build", "pptx.read", "pptx.preview"),
+        keywords=("pptx", "ppt", "演示", "幻灯片", "生成", "大纲", "deck"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="spreadsheet-analysis",
+        display_name="表格分析与处理",
+        version="1.0.0",
+        dir_name="spreadsheet_analysis",
+        description="CSV/XLS/XLSX/XLSB/ODS 表格的读取、探查、清洗、汇总与写出。",
+        grant_reason="official_skill_auto_enable",
+        category="spreadsheet",
+        capability_ids=("xlsx.read", "csv.read", "xls.read", "sheet.analyze", "xlsx.write"),
+        keywords=("xlsx", "xls", "csv", "tsv", "ods", "表格", "数据分析", "pandas", "openpyxl"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="media-processing",
+        display_name="音视频处理",
+        version="1.0.0",
+        dir_name="media_processing",
+        description="音视频元信息、转码、抽取音频、抽帧与媒体报告。",
+        grant_reason="official_skill_auto_enable",
+        category="media",
+        capability_ids=("media.probe", "audio.transcode", "video.frames", "media.report"),
+        keywords=("ffmpeg", "ffprobe", "音视频", "音频", "视频", "转码", "抽帧", "元数据"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="frontend-build-preview",
+        display_name="前端构建与预览",
+        version="1.0.0",
+        dir_name="frontend_build_preview",
+        description="离线创建 Vite/React/Vue 项目、构建静态产物并渲染 PNG/PDF 预览。",
+        grant_reason="official_skill_auto_enable",
+        category="frontend",
+        capability_ids=("frontend.scaffold", "frontend.build", "frontend.preview", "frontend.publish"),
+        keywords=("vite", "react", "vue", "前端", "构建", "预览", "spa", "dist"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="data-processing",
+        display_name="数据批处理与转换",
+        version="1.0.0",
+        dir_name="data_processing",
+        description="JSON/CSV/文本批处理、转换、统计与 Markdown 报告生成。",
+        grant_reason="official_skill_auto_enable",
+        category="data",
+        capability_ids=("json.transform", "csv.profile", "files.rename", "report.generate"),
+        keywords=("json", "csv", "批处理", "转换", "统计", "报告", "rename"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="archive-workspace",
+        display_name="归档与解压",
+        version="1.0.0",
+        dir_name="archive_workspace",
+        description="安全创建/解压归档并生成成员清单，防止 zip-slip 与路径逃逸。",
+        grant_reason="official_skill_auto_enable",
+        category="archive",
+        capability_ids=("archive.create", "archive.extract", "archive.manifest"),
+        keywords=("zip", "解压", "压缩", "归档", "7z", "tar", "打包"),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
+        key="web-fetch-render",
+        display_name="受审网页抓取与渲染",
+        version="1.0.0",
+        dir_name="web_fetch_render",
+        description=(
+            "在沙箱容器内按统一权限清单抓取网页并可选 chromium 渲染；"
+            "仅当 egress 门开启且授权域名非空时使用。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        category="web",
+        capability_ids=("web.fetch", "web.render"),
+        keywords=("网页", "抓取", "web_fetch", "渲染", "html", "fetch"),
+        requires_runtime="sandbox+egress",
+        required_tools=("fetch_web_page",),
+    ),
 )
 
 OFFICIAL_SKILL_KEYS: frozenset[str] = frozenset(spec.key for spec in OFFICIAL_SKILLS)
@@ -363,6 +504,79 @@ def official_skill_md(spec: OfficialSkillSpec) -> str:
     )
 
 
+def _official_skill_source_dir(spec: OfficialSkillSpec) -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parents[1] / "skills" / spec.dir_name,
+        Path(__file__).resolve().parents[2] / "app" / "skills" / spec.dir_name,
+    ]
+    for path in candidates:
+        try:
+            if path.is_dir():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+# Bounded cache so per-turn official-skill refresh does not re-read the tree
+# on every Agent stream. Keyed by (resolved dir, newest file mtime); rebuilt
+# lazily and capped to a single entry.
+_OFFICIAL_PACKAGE_CACHE: dict[tuple[str, int], dict[str, bytes]] = {}
+
+
+def official_skill_package_files(spec: OfficialSkillSpec) -> dict[str, bytes]:
+    """Materialize the versioned source tree for an official skill package.
+
+    Only ``SKILL.md`` and the controlled ``references/``, ``scripts/`` and
+    ``examples/`` directories are included; everything else in the source
+    directory is ignored. This function never reads an arbitrary host path.
+    Each file is UTF-8 text and bounded by ``MAX_SKILL_FILE_BYTES``.
+    """
+
+    root = _official_skill_source_dir(spec)
+    if root is None:
+        return {"SKILL.md": official_skill_md(spec).encode("utf-8")}
+    try:
+        mtime = max(
+            (path.stat().st_mtime_ns for path in root.rglob("*") if path.is_file()),
+            default=0,
+        )
+    except OSError:
+        mtime = 0
+    key = (str(root), mtime)
+    cached = _OFFICIAL_PACKAGE_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel != "SKILL.md" and not rel.startswith(("references/", "scripts/", "examples/")):
+            continue
+        data = path.read_bytes()
+        if len(data) > MAX_SKILL_FILE_BYTES:
+            raise AppError(
+                400,
+                "official_skill_file_too_large",
+                f"Official skill file {rel} exceeds the 2 MB limit",
+            )
+        files[rel] = data
+    if "SKILL.md" not in files:
+        files["SKILL.md"] = official_skill_md(spec).encode("utf-8")
+    _OFFICIAL_PACKAGE_CACHE.clear()
+    _OFFICIAL_PACKAGE_CACHE[key] = files
+    return dict(files)
+
+
+def _official_package_hash(files: dict[str, bytes]) -> str:
+    payload = [
+        {"path": path, "sha256": hashlib.sha256(data).hexdigest()}
+        for path, data in files.items()
+    ]
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
+
 def ensure_official_skill_package(
     db: Session,
     workspace_id: str,
@@ -373,9 +587,10 @@ def ensure_official_skill_package(
 ) -> SkillRecord:
     """Install/refresh one official skill and keep its durable system grant.
 
-    Idempotent: content refresh is keyed on ``origin_hash == sha256(SKILL.md)``.
-    Instruction-only packages get an automatic durable ``always`` grant so the
-    Agent prompt injection works without a manual authorization step.
+    Idempotent: content refresh is keyed on the package-wide ``origin_hash``
+    (sha256 over every shipped file: SKILL.md + references/ + scripts/ +
+    examples/). Official packages get an automatic durable ``always`` grant so
+    the Agent prompt injection works without a manual authorization step.
     """
 
     from app.domain.extension_models import ExtensionPermissionGrant
@@ -385,14 +600,28 @@ def ensure_official_skill_package(
         spec = official_skill_spec(spec)
     resolved_settings = settings or get_settings()
     service = SkillPackageService(db, workspace_id, actor_id, resolved_settings)
-    skill_md = official_skill_md(spec)
+    files = official_skill_package_files(spec)
+    package_hash = _official_package_hash(files)
+    script_basenames = sorted(
+        path.rsplit("/", 1)[-1]
+        for path in files
+        if path.startswith("scripts/")
+        and path.endswith((".py", ".js", ".mjs", ".cjs"))
+    )
+    manifest_meta = {
+        "category": spec.category,
+        "capability_ids": list(spec.capability_ids),
+        "keywords": list(spec.keywords),
+        "requires_runtime": spec.requires_runtime,
+        "required_tools": list(spec.required_tools),
+        "scripts": script_basenames,
+    }
     existing = db.scalar(
         select(SkillRecord).where(
             SkillRecord.workspace_id == workspace_id,
             SkillRecord.skill_key == spec.key,
         )
     )
-    body_hash = hashlib.sha256(skill_md.encode("utf-8")).hexdigest()
     if existing is None:
         skill = service.skills.add(
             SkillRecord(
@@ -406,7 +635,7 @@ def ensure_official_skill_package(
                 package_format="skill_md_v1",
                 origin_type="system",
                 origin_ref=f"backend/app/skills/{spec.dir_name}",
-                origin_hash=body_hash,
+                origin_hash=package_hash,
                 has_scripts=False,
                 locale_source="zh-CN",
                 is_official=True,
@@ -416,11 +645,12 @@ def ensure_official_skill_package(
                     "kind": "agent_skill_package",
                     "name": spec.display_name,
                     "description": spec.description,
+                    **manifest_meta,
                 },
                 manifest_hash="",
                 instructions_markdown="",
-                required_tools=[],
-                required_permissions=[],
+                required_tools=list(spec.required_tools),
+                required_permissions=list(spec.required_permissions),
                 allowed_components=list(spec.allowed_components),
                 validation_report={"system_skill": True, "official_skill": True},
                 status="authorization_required",
@@ -428,16 +658,19 @@ def ensure_official_skill_package(
             )
         )
         db.flush()
-        service._write_file_bytes(skill, "SKILL.md", skill_md.encode("utf-8"), invalidate=False)
-        service._recompute_package_state(skill)
-        skill.origin_hash = body_hash
+        service.write_official_package_files(skill, files)
+        skill.origin_hash = package_hash
     else:
         skill = existing
-        # Refresh only when the shipped SKILL.md body changes.
-        if skill.origin_hash != body_hash or not (skill.instructions_markdown or "").strip():
-            service._write_file_bytes(skill, "SKILL.md", skill_md.encode("utf-8"), invalidate=False)
-            service._recompute_package_state(skill)
-            skill.origin_hash = body_hash
+        # Refresh only when any shipped file changes or the body was lost.
+        if skill.origin_hash != package_hash or not (skill.instructions_markdown or "").strip():
+            service.write_official_package_files(skill, files)
+            skill.origin_hash = package_hash
+            # Merge capability metadata (category/keywords/scripts) so older
+            # rows created before these fields existed stay current.
+            manifest = dict(skill.manifest_json or {})
+            manifest.update({**manifest_meta, "description": spec.description})
+            skill.manifest_json = manifest
 
     # Instruction-only official skill: durable always grant so prompt injection works.
     grants = ExtensionPermissionGrantRepository(db, workspace_id)
@@ -503,6 +736,10 @@ def ensure_official_skill_package(
     report["auto_enabled"] = True
     if spec.contextual_activation:
         report["contextual_activation"] = spec.contextual_activation
+    if spec.requires_runtime:
+        report["requires_runtime"] = spec.requires_runtime
+    if spec.category:
+        report["category"] = spec.category
     skill.validation_report = report
     db.flush()
     return skill
@@ -630,6 +867,30 @@ class SkillPackageService:
                 "official_skill_protected",
                 "Official LearnGraph skills are managed by the system and cannot be edited",
             )
+
+    def write_official_package_files(
+        self, skill: SkillRecord, files: dict[str, bytes]
+    ) -> None:
+        """(Re)write the versioned source tree of an official skill package.
+
+        Idempotent and reconciles against the shipped source: files no longer
+        present are removed so ``content_hash`` tracks the current tree exactly.
+        The caller recomputes ``origin_hash`` after this call.
+        """
+
+        wanted = set(files)
+        existing = {row.relative_path for row in self._files_for_skill(skill.id)}
+        for rel, data in files.items():
+            self._write_file_bytes(skill, rel, data, invalidate=False)
+        for rel in sorted(existing - wanted):
+            for row in [
+                item
+                for item in self._files_for_skill(skill.id)
+                if item.relative_path == rel or item.relative_path.startswith(rel + "/")
+            ]:
+                self.db.delete(row)
+        self.db.flush()
+        self._recompute_package_state(skill)
 
     def create_package(self, payload: SkillPackageCreateRequest) -> SkillRecord:
         assert_skill_identity_not_reserved(payload.skill_key, payload.source)

@@ -207,6 +207,9 @@ class SkillSandboxRunService:
                 SandboxAgentSessionCreateRequest(chat_session_id=chat_session_id)
             )
             # Materialize package scripts into sandbox workspace under skills/<key>/
+            # plus SKILL.md and the controlled references/examples directories so
+            # a script can read its own docs and templates. Only text files are
+            # copied; the sandbox stays offline and secret-free.
             files = (
                 self.db.query(SkillPackageFile)
                 .filter_by(workspace_id=self.workspace_id, skill_id=skill.id, is_directory=False)
@@ -214,9 +217,8 @@ class SkillSandboxRunService:
             )
             for row in files:
                 if not (
-                    row.relative_path == "scripts"
-                    or row.relative_path.startswith("scripts/")
-                    or row.relative_path == "SKILL.md"
+                    row.relative_path == "SKILL.md"
+                    or row.relative_path.startswith(("scripts/", "references/", "examples/"))
                 ):
                     continue
                 body = self.blobs.read_bytes(row.blob_sha256)

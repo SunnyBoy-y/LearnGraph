@@ -1018,28 +1018,43 @@ class MCPAndSkillService:
 
     def _skill_package_descriptor(self, skill: SkillRecord) -> dict[str, Any]:
         description = ""
+        category = ""
+        capability_ids: list[str] = []
+        extra_keywords: list[str] = []
         if isinstance(skill.manifest_json, dict):
             raw = skill.manifest_json.get("description")
             if isinstance(raw, str):
                 description = raw.strip()
+            raw_cat = skill.manifest_json.get("category")
+            if isinstance(raw_cat, str):
+                category = raw_cat.strip()
+            raw_caps = skill.manifest_json.get("capability_ids")
+            if isinstance(raw_caps, list):
+                capability_ids = [str(item) for item in raw_caps if isinstance(item, str)]
+            raw_kw = skill.manifest_json.get("keywords")
+            if isinstance(raw_kw, list):
+                extra_keywords = [str(item) for item in raw_kw if isinstance(item, str)]
         instructions = (skill.instructions_markdown or "").strip()
         when_to_use = description or _short_summary(instructions, limit=160)
         return {
             "capability_id": f"skill:{skill.skill_key}",
             "kind": "skill_package",
             "family": "skill",
+            "category": category,
             "name": skill.name,
             "title": skill.name,
             "summary": _short_summary(description or instructions),
             "when_to_use": _short_summary(when_to_use),
+            "capability_ids": capability_ids,
             "keywords": [
                 part
                 for part in re.split(
                     r"[^a-z0-9_一-鿿]+",
-                    f"{skill.skill_key} {skill.name} {description} {when_to_use}".lower(),
+                    f"{skill.skill_key} {skill.name} {description} {when_to_use} "
+                    f"{category} {' '.join(extra_keywords)}".lower(),
                 )
                 if part
-            ][:32],
+            ][:40],
             "source": skill.source,
             "version": skill.version,
             "hash": skill.content_hash or skill.manifest_hash,
@@ -1616,10 +1631,18 @@ class MCPAndSkillService:
                 continue
             instructions = (skill.instructions_markdown or "").strip()
             description = ""
+            category = ""
+            requires_runtime = ""
             if isinstance(skill.manifest_json, dict):
                 raw = skill.manifest_json.get("description")
                 if isinstance(raw, str):
                     description = raw.strip()
+                raw_cat = skill.manifest_json.get("category")
+                if isinstance(raw_cat, str):
+                    category = raw_cat.strip()
+                raw_runtime = skill.manifest_json.get("requires_runtime")
+                if isinstance(raw_runtime, str):
+                    requires_runtime = raw_runtime.strip()
             if not instructions:
                 # Fall back to the package description when the body is empty.
                 instructions = description
@@ -1632,23 +1655,27 @@ class MCPAndSkillService:
                 len(instructions) <= inline_limit
                 and used_budget + len(instructions) <= total_budget
             )
+            category_tag = f"[{category}] " if category else ""
+            runtime_note = f" runtime={requires_runtime}" if requires_runtime else ""
             if inline:
                 body = instructions[:8_000]
                 if len(instructions) > 8_000:
                     body = f"{body}\n…(truncated)"
                 used_budget += len(body)
                 sections.append(
-                    f"### Skill: {skill.name} (`{skill.skill_key}`)\n"
+                    f"### Skill: {category_tag}{skill.name} (`{skill.skill_key}`)\n"
                     f"skill_id: {skill.id}\n"
                     f"source: {skill.source}\n"
-                    f"version: {skill.version}\n\n"
+                    f"version: {skill.version}\n"
+                    f"requires_runtime: {requires_runtime or 'agent'}\n\n"
                     f"{body}"
                 )
             elif len(catalog_lines) < catalog_max:
                 summary = " ".join((description or instructions).split())[:200]
                 scripts_note = " · bundled scripts (sandbox-only)" if skill.has_scripts else ""
                 catalog_lines.append(
-                    f"- `{skill.skill_key}` · {skill.name}: {summary}{scripts_note}"
+                    f"- `{skill.skill_key}` · {category_tag}{skill.name}: "
+                    f"{summary}{scripts_note}{runtime_note}"
                 )
         if not sections and not catalog_lines:
             return ""
