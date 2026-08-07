@@ -59,6 +59,7 @@ function parseArguments(argv) {
   const options = {
     backendPort: 8000,
     frontendPort: 5173,
+    previewPort: 8001,
     install: false,
     lan: false,
     help: false,
@@ -81,11 +82,12 @@ function parseArguments(argv) {
     }
 
     const [name, inlineValue] = argument.split('=', 2)
-    if (name === '--frontend-port' || name === '--backend-port') {
+    if (name === '--frontend-port' || name === '--backend-port' || name === '--preview-port') {
       const value = inlineValue ?? argv[++index]
       if (value === undefined) throw new Error(`${name} requires a value.`)
       const port = parsePort(value, name)
       if (name === '--frontend-port') options.frontendPort = port
+      else if (name === '--preview-port') options.previewPort = port
       else options.backendPort = port
       continue
     }
@@ -102,13 +104,14 @@ function parseArguments(argv) {
 function printHelp() {
   console.log(`Usage: node scripts/dev.mjs [options]
 
-Start the LearnGraph backend and frontend together.
+Start the LearnGraph backend, subapp preview, and frontend together.
 
 Options:
   --install                 Install from frontend/package-lock.json and sync backend/uv.lock
-  --lan                     Bind both services to all interfaces (explicit remote access)
+  --lan                     Bind all services to all interfaces (explicit remote access)
   --frontend-port <port>    First Vite port to try; uses the next free port if needed (default: 5173)
-  --backend-port <port>     Uvicorn port (default: 8000)
+  --backend-port <port>     Uvicorn main API port (default: 8000)
+  --preview-port <port>     Uvicorn subapp preview origin port (default: 8001)
   -h, --help                Show this help`)
 }
 
@@ -129,6 +132,22 @@ async function findAvailableFrontendPort(startPort, backendPort) {
     if (await canListenOnPort(port)) return port
   }
   throw new Error(`No available frontend port found from ${startPort} through 65535.`)
+}
+
+/** Find a free port for the subapp preview origin, avoiding both app ports. */
+async function findAvailablePreviewPort(startPort, backendPort, frontendPort) {
+  const envOverride = Number.parseInt(
+    process.env.LEARNGRAPH_SUBAPP_PREVIEW_PORT ?? '',
+    10,
+  )
+  const base = Number.isInteger(envOverride) && envOverride > 0 && envOverride <= 65_535
+    ? envOverride
+    : startPort
+  for (let port = base; port <= 65_535; port += 1) {
+    if (port === backendPort || port === frontendPort) continue
+    if (await canListenOnPort(port)) return port
+  }
+  throw new Error(`No available preview port found from ${base} through 65535.`)
 }
 
 function requireFile(filePath) {
@@ -384,6 +403,19 @@ async function main() {
       frontendOrigin,
     ])
 
+  // Subapp preview origin: a separate process on its own port so the preview
+  // iframe origin is distinct from the main API origin. The main backend mints
+  // bundle capability URLs against this origin.
+  const previewPort = await findAvailablePreviewPort(
+    options.previewPort,
+    options.backendPort,
+    frontendPort,
+  )
+  if (previewPort !== options.previewPort) {
+    console.log(`Preview port ${options.previewPort} is in use; using ${previewPort} instead.`)
+  }
+  const previewOrigin = `http://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${previewPort}`
+
   const startBackend = () => {
     console.log(`\nStarting backend at ${backendOrigin} ...`)
     return spawnTracked(
@@ -410,12 +442,42 @@ async function main() {
         env: {
           ...process.env,
           LEARNGRAPH_CORS_ORIGINS: corsOrigins,
+          // Keep the local preview origin aligned when the operator has not
+          // explicitly configured a real domain (persisted frontend config or
+          // LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN still wins inside the backend).
+          LEARNGRAPH_SUBAPP_PREVIEW_PORT: String(previewPort),
         },
       },
     )
   }
 
-  let backend = startBackend()
+  const startPreview = () => {
+    console.log(`\nStarting subapp preview at ${previewOrigin} ...`)
+    return spawnTracked(
+      'Preview',
+      'uv',
+      [
+        'run',
+        '--locked',
+        'python',
+        '-m',
+        'uvicorn',
+        'app.preview:preview_app',
+        '--reload',
+        '--reload-dir',
+        path.join(backendDir, 'app'),
+        '--host',
+        listenHost,
+        '--port',
+        String(previewPort),
+      ],
+      {
+        cwd: backendDir,
+        detached: true,
+        env: { ...process.env },
+      },
+    )
+  }
 
   console.log(`Starting frontend at ${frontendOrigin} ...`)
   const frontendInvocation = npmCommand([
@@ -443,31 +505,83 @@ async function main() {
     },
   )
 
-  const healthUrl = `${backendOrigin}/api/v1/health`
+  const backendHealthUrl = `${backendOrigin}/api/v1/health`
+  const previewHealthUrl = `${previewOrigin}/api/v1/health`
   let announcedReady = false
-  while (!receivedSignal) {
-    const startup = await Promise.race([
-      pollHealth(healthUrl)
-        .then(() => ({ type: 'healthy' }))
-        .catch((error) => ({ type: 'backend-unhealthy', error })),
-      backend.exited.then((result) => ({ type: 'backend-exit', result })),
-      frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
-      signalReceived.then((signal) => ({ type: 'signal', signal })),
-    ])
 
-    if (startup.type === 'signal') return
-    if (startup.type === 'frontend-exit') {
-      throw new Error(describeExit(startup.result))
-    }
-    if (startup.type === 'backend-exit' || startup.type === 'backend-unhealthy') {
+  // Supervise one child with startup polling + steady-state watch + restart on
+  // failure. Resolves only on signal or frontend exit; child restarts loop
+  // internally so a crashed service is relaunched without tearing everything down.
+  const supervise = async (
+    label,
+    startFn,
+    healthUrl,
+    onRecovered,
+  ) => {
+    let current = startFn()
+    while (!receivedSignal) {
+      const startup = await Promise.race([
+        pollHealth(healthUrl)
+          .then(() => ({ type: 'healthy' }))
+          .catch((error) => ({ type: 'unhealthy', error })),
+        current.exited.then((result) => ({ type: 'exit', result })),
+        frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
+        signalReceived.then((signal) => ({ type: 'signal', signal })),
+      ])
+
+      if (startup.type === 'signal') return
+      if (startup.type === 'frontend-exit') {
+        throw new Error(describeExit(startup.result))
+      }
+      if (startup.type === 'exit' || startup.type === 'unhealthy') {
+        const problem =
+          startup.type === 'exit'
+            ? describeExit(startup.result)
+            : startup.error instanceof Error
+              ? startup.error.message
+              : String(startup.error)
+        console.error(`\n${problem} Restarting ${label} in 1 second...`)
+        if (startup.type === 'unhealthy') await stopChild(current)
+        const pause = await Promise.race([
+          wait(BACKEND_RESTART_DELAY_MS).then(() => ({ type: 'retry' })),
+          frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
+          signalReceived.then((signal) => ({ type: 'signal', signal })),
+        ])
+        if (pause.type === 'signal') return
+        if (pause.type === 'frontend-exit') {
+          throw new Error(describeExit(pause.result))
+        }
+        current = startFn()
+        continue
+      }
+
+      if (!announcedReady) {
+        console.log(`\nLearnGraph is ready: ${frontendOrigin}`)
+        console.log(`API health: ${backendHealthUrl}`)
+        console.log(`Subapp preview: ${previewHealthUrl}`)
+        console.log(`OpenAPI: ${backendOrigin}/docs`)
+        console.log('Press Ctrl+C to stop all services.')
+        announcedReady = true
+      } else if (onRecovered) {
+        onRecovered()
+      }
+
+      const monitor = watchHealth(healthUrl)
+      const outcome = await Promise.race([
+        monitor.unhealthy.then((problem) => ({ type: 'unhealthy', problem })),
+        current.exited.then((result) => ({ type: 'exit', result })),
+        frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
+        signalReceived.then((signal) => ({ type: 'signal', signal })),
+      ])
+      monitor.stop()
+      if (outcome.type === 'signal') return
+      if (outcome.type === 'frontend-exit') {
+        throw new Error(describeExit(outcome.result))
+      }
       const problem =
-        startup.type === 'backend-exit'
-          ? describeExit(startup.result)
-          : startup.error instanceof Error
-            ? startup.error.message
-            : String(startup.error)
-      console.error(`\n${problem} Restarting backend in 1 second...`)
-      if (startup.type === 'backend-unhealthy') await stopChild(backend)
+        outcome.type === 'exit' ? describeExit(outcome.result) : outcome.problem
+      console.error(`\n${problem} Restarting ${label} in 1 second...`)
+      if (outcome.type === 'unhealthy') await stopChild(current)
       const pause = await Promise.race([
         wait(BACKEND_RESTART_DELAY_MS).then(() => ({ type: 'retry' })),
         frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
@@ -477,47 +591,18 @@ async function main() {
       if (pause.type === 'frontend-exit') {
         throw new Error(describeExit(pause.result))
       }
-      backend = startBackend()
-      continue
+      current = startFn()
     }
-
-    if (!announcedReady) {
-      console.log(`\nLearnGraph is ready: ${frontendOrigin}`)
-      console.log(`API health: ${healthUrl}`)
-      console.log(`OpenAPI: ${backendOrigin}/docs`)
-      console.log('Press Ctrl+C to stop both services.')
-      announcedReady = true
-    } else {
-      console.log(`\nBackend recovered and is healthy: ${healthUrl}`)
-    }
-
-    const monitor = watchHealth(healthUrl)
-    const outcome = await Promise.race([
-      monitor.unhealthy.then((problem) => ({ type: 'backend-unhealthy', problem })),
-      backend.exited.then((result) => ({ type: 'backend-exit', result })),
-      frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
-      signalReceived.then((signal) => ({ type: 'signal', signal })),
-    ])
-    monitor.stop()
-    if (outcome.type === 'signal') return
-    if (outcome.type === 'frontend-exit') {
-      throw new Error(describeExit(outcome.result))
-    }
-    const problem =
-      outcome.type === 'backend-exit' ? describeExit(outcome.result) : outcome.problem
-    console.error(`\n${problem} Restarting backend in 1 second...`)
-    if (outcome.type === 'backend-unhealthy') await stopChild(backend)
-    const pause = await Promise.race([
-      wait(BACKEND_RESTART_DELAY_MS).then(() => ({ type: 'retry' })),
-      frontend.exited.then((result) => ({ type: 'frontend-exit', result })),
-      signalReceived.then((signal) => ({ type: 'signal', signal })),
-    ])
-    if (pause.type === 'signal') return
-    if (pause.type === 'frontend-exit') {
-      throw new Error(describeExit(pause.result))
-    }
-    backend = startBackend()
   }
+
+  // Both backends run concurrently; either one surfacing a fatal condition
+  // (signal or frontend exit) propagates to the caller.
+  await Promise.race([
+    supervise('Backend', startBackend, backendHealthUrl, () => {
+      console.log(`\nBackend recovered and is healthy: ${backendHealthUrl}`)
+    }),
+    supervise('Preview', startPreview, previewHealthUrl),
+  ])
 }
 
 try {
