@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -73,6 +73,12 @@ ALLOWED_MIME_TYPES = frozenset(
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes for ``DateTime(timezone=True)`` columns;
+    normalize before comparing with a tz-aware ``now``."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
 def _sha256(value: str | bytes) -> str:
@@ -290,7 +296,7 @@ class SubAppBundleService:
         )
         if validation is None:
             raise AppError(404, "subapp_bundle_validation_not_found", "Bundle validation was not found")
-        if validation.status != "passed" or validation.consumed_at is not None or validation.expires_at < utc_now():
+        if validation.status != "passed" or validation.consumed_at is not None or _as_utc(validation.expires_at) < utc_now():
             raise AppError(409, "subapp_bundle_validation_unusable", "Bundle validation is failed, expired, or already published")
         if sandbox_session_id and validation.sandbox_session_id and sandbox_session_id != validation.sandbox_session_id:
             raise AppError(409, "subapp_bundle_validation_session_mismatch", "Validation belongs to a different sandbox session")
@@ -557,7 +563,7 @@ class SubAppBundleService:
         grant = self.db.scalar(
             select(SubAppBundlePreviewGrant).where(SubAppBundlePreviewGrant.token_hash == token_hash)
         )
-        if grant is None or grant.bundle_id != bundle_id or grant.revoked_at is not None or grant.expires_at < utc_now():
+        if grant is None or grant.bundle_id != bundle_id or grant.revoked_at is not None or _as_utc(grant.expires_at) < utc_now():
             raise AppError(404, "subapp_preview_not_found", "Preview capability is invalid or expired")
         bundle = self.db.scalar(
             select(SubAppBundle).where(
