@@ -106,6 +106,18 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -143,7 +155,52 @@ import type {
 } from "@/types/migrations";
 import type { Provider, ProviderModel } from "@/types/providers";
 import type { WorkspaceSetting } from "@/types/settings";
+import { fuzzyModelMatch } from "@/lib/model-choices";
 
+function SearchableFeatureModelSelect({
+  ariaLabel,
+  disabled,
+  onValueChange,
+  options,
+  placeholder,
+  value,
+}: {
+  ariaLabel: string;
+  disabled?: boolean;
+  onValueChange: (value: string) => void;
+  options: Array<{ value: string; label: string }>;
+  placeholder: string;
+  value: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const selected = options.find((option) => option.value === value);
+  const visible = options.filter((option) => fuzzyModelMatch(`${option.label} ${option.value}`, query));
+  return (
+    <Popover onOpenChange={(next) => { setOpen(next); if (!next) setQuery(""); }} open={open}>
+      <PopoverTrigger asChild>
+        <button aria-expanded={open} aria-label={ariaLabel} className="mt-3 flex h-9 w-full items-center justify-between rounded-md border bg-background px-3 text-left text-sm outline-none transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-50" disabled={disabled} type="button">
+          <span className={selected ? "truncate" : "truncate text-muted-foreground"}>{selected?.label ?? placeholder}</span>
+          <Search className="ml-2 size-4 shrink-0 text-muted-foreground" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-[min(28rem,calc(100vw-3rem))] p-0">
+        <Command shouldFilter={false}>
+          <CommandInput onValueChange={setQuery} placeholder="模糊搜索模型或供应商…" value={query} />
+          <CommandList className="max-h-72">
+            <CommandEmpty>没有匹配的模型</CommandEmpty>
+            {visible.map((option) => (
+              <CommandItem key={option.value} onSelect={() => { onValueChange(option.value); setOpen(false); }} value={option.value}>
+                <span className="truncate">{option.label}</span>
+                {option.value === value ? <span className="ml-auto">✓</span> : null}
+              </CommandItem>
+            ))}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
 const AUDIT_PAGE_SIZE = 20;
 const MODEL_PROVIDER_TYPES = new Set([
   "openai_responses",
@@ -2945,136 +3002,70 @@ export function WorkspaceSettingsPage() {
             <p className="mt-1 text-xs text-muted-foreground">
               首条用户消息后的自动命名
             </p>
-            <Select
+            <SearchableFeatureModelSelect
+              ariaLabel="生成标题模型"
               disabled={saveFeatureModel.isPending || providers.isPending}
               onValueChange={(value) => {
                 const parsed = parseFeatureModelValue(value);
-                saveFeatureModel.mutate({
-                  key: CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
-                  ...parsed,
-                });
+                saveFeatureModel.mutate({ key: CHAT_AUTO_TITLE_MODEL_SETTING_KEY, ...parsed });
               }}
-              value={featureModelValue(
-                autoTitleModel.provider_id,
-                autoTitleModel.model_id,
-              )}
-            >
-              <SelectTrigger aria-label="生成标题模型" className="mt-3">
-                <SelectValue placeholder="跟随对话模型" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">跟随对话模型</SelectItem>
-                {featureModelChoices.map((choice) => (
-                  <SelectItem key={choice.value} value={choice.value}>
-                    {choice.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              options={[{ value: "default", label: "跟随对话模型" }, ...featureModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
+              placeholder="跟随对话模型"
+              value={featureModelValue(autoTitleModel.provider_id, autoTitleModel.model_id)}
+            />
           </div>
           <div className="rounded-xl border p-4">
             <p className="text-sm font-medium">生成下一步问题提示模型</p>
             <p className="mt-1 text-xs text-muted-foreground">
               空会话与每轮完成后的追问建议
             </p>
-            <Select
+            <SearchableFeatureModelSelect
+              ariaLabel="生成下一步问题提示模型"
               disabled={saveFeatureModel.isPending || providers.isPending}
               onValueChange={(value) => {
                 const parsed = parseFeatureModelValue(value);
-                saveFeatureModel.mutate({
-                  key: CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
-                  ...parsed,
-                });
+                saveFeatureModel.mutate({ key: CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY, ...parsed });
               }}
-              value={featureModelValue(
-                suggestedPromptsModel.provider_id,
-                suggestedPromptsModel.model_id,
-              )}
-            >
-              <SelectTrigger aria-label="生成下一步问题提示模型" className="mt-3">
-                <SelectValue placeholder="跟随对话模型" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">跟随对话模型</SelectItem>
-                {featureModelChoices.map((choice) => (
-                  <SelectItem key={choice.value} value={choice.value}>
-                    {choice.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              options={[{ value: "default", label: "跟随对话模型" }, ...featureModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
+              placeholder="跟随对话模型"
+              value={featureModelValue(suggestedPromptsModel.provider_id, suggestedPromptsModel.model_id)}
+            />
           </div>
           <div className="rounded-xl border p-4">
             <p className="text-sm font-medium">语音转写整理模型</p>
             <p className="mt-1 text-xs text-muted-foreground">
               听写时的语气词去除与错字修正；建议选择低价的快速模型
             </p>
-            <Select
+            <SearchableFeatureModelSelect
+              ariaLabel="语音转写整理模型"
               disabled={saveFeatureModel.isPending || providers.isPending}
               onValueChange={(value) => {
                 const parsed = parseFeatureModelValue(value);
-                saveFeatureModel.mutate({
-                  key: CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
-                  ...parsed,
-                });
+                saveFeatureModel.mutate({ key: CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY, ...parsed });
               }}
-              value={featureModelValue(
-                dictationCleanupModel.provider_id,
-                dictationCleanupModel.model_id,
-              )}
-            >
-              <SelectTrigger aria-label="语音转写整理模型" className="mt-3">
-                <SelectValue placeholder="跟随对话模型" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">跟随对话模型</SelectItem>
-                {featureModelChoices.map((choice) => (
-                  <SelectItem key={choice.value} value={choice.value}>
-                    {choice.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              options={[{ value: "default", label: "跟随对话模型" }, ...featureModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
+              placeholder="跟随对话模型"
+              value={featureModelValue(dictationCleanupModel.provider_id, dictationCleanupModel.model_id)}
+            />
           </div>
           <div className="rounded-xl border p-4">
             <p className="text-sm font-medium">记忆整理模型</p>
             <p className="mt-1 text-xs text-muted-foreground">
               自动记忆抽取与会话摘要共用此模型；可跟随每个会话的对话模型，未配置时两项功能不会运行
             </p>
-            <Select
-              disabled={
-                saveMemoryEnhancement.isPending ||
-                memoryEnhancement.isPending ||
-                providers.isPending
-              }
+            <SearchableFeatureModelSelect
+              ariaLabel="记忆整理模型"
+              disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || providers.isPending}
               onValueChange={(value) => {
                 const follow_conversation = value === "follow-conversation";
                 const parsed = parseFeatureModelValue(value);
-                const patch = {
-                  provider_id: follow_conversation ? "" : (parsed.provider_id ?? ""),
-                  model_id: follow_conversation ? "" : (parsed.model_id ?? ""),
-                  follow_conversation,
-                };
-                saveMemoryEnhancement.mutate({
-                  extraction: patch,
-                  summarization: patch,
-                });
+                const patch = { provider_id: follow_conversation ? "" : (parsed.provider_id ?? ""), model_id: follow_conversation ? "" : (parsed.model_id ?? ""), follow_conversation };
+                saveMemoryEnhancement.mutate({ extraction: patch, summarization: patch });
               }}
+              options={[{ value: "default", label: "未配置" }, { value: "follow-conversation", label: "跟随对话模型" }, ...memoryModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
+              placeholder="未配置"
               value={memoryModelValue}
-            >
-              <SelectTrigger aria-label="记忆整理模型" className="mt-3">
-                <SelectValue placeholder="未配置" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="default">未配置</SelectItem>
-                <SelectItem value="follow-conversation">跟随对话模型</SelectItem>
-                {memoryModelChoices.map((choice) => (
-                  <SelectItem key={choice.value} value={choice.value}>
-                    {choice.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            />
             <div className="mt-3 flex items-center justify-between gap-3 border-t pt-3">
               <span className="text-xs text-muted-foreground">
                 高置信新记忆自动写入 Active Memory
@@ -3134,40 +3125,14 @@ export function WorkspaceSettingsPage() {
                 ))}
               </SelectContent>
             </Select>
-            <Select
-              disabled={
-                saveMemoryEnhancement.isPending ||
-                memoryEnhancement.isPending ||
-                !selectedEmbeddingProvider ||
-                embeddingDiscovery.isPending ||
-                visibleEmbeddingModels.length === 0
-              }
-              onValueChange={(model_id) =>
-                applyEmbeddingPatch({ embedding: { model_id } })
-              }
-              value={memoryEnhancement.data?.embedding.model_id || undefined}
-            >
-              <SelectTrigger aria-label="Embedding 模型" className="mt-2">
-                <SelectValue
-                  placeholder={
-                    !selectedEmbeddingProvider
-                      ? "请先选择 Embedding Provider"
-                      : embeddingDiscovery.isPending
-                        ? "正在发现 Embedding 模型…"
-                        : visibleEmbeddingModels.length === 0
-                        ? "该 Provider 尚无已启用的已发现模型"
-                        : "选择 Embedding 模型"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {visibleEmbeddingModels.map((model) => (
-                  <SelectItem disabled={model.enabled === false} key={model.id} value={model.id}>
-                    {model.id}{model.enabled === false ? "（当前配置，未发现或已停用）" : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <SearchableFeatureModelSelect
+              ariaLabel="Embedding 模型"
+              disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || !selectedEmbeddingProvider || embeddingDiscovery.isPending || visibleEmbeddingModels.length === 0}
+              onValueChange={(model_id) => applyEmbeddingPatch({ embedding: { model_id } })}
+              options={visibleEmbeddingModels.map((model) => ({ value: model.id, label: `${model.id}${model.enabled === false ? "（当前配置，未发现或已停用）" : ""}` }))}
+              placeholder={!selectedEmbeddingProvider ? "请先选择 Embedding Provider" : embeddingDiscovery.isPending ? "正在发现 Embedding 模型…" : visibleEmbeddingModels.length === 0 ? "该 Provider 尚无已启用的已发现模型" : "选择 Embedding 模型"}
+              value={memoryEnhancement.data?.embedding.model_id || ""}
+            />
             {cacheInvalidated ? (
               <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50/70 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
                 <p className="flex items-start gap-2">
