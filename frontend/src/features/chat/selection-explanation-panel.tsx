@@ -103,12 +103,6 @@ import type {
 
 type ChatStatus = "ready" | "submitted" | "streaming" | "error";
 
-export type SelectionExplanationPanelProps = {
-  detail: SelectionExplanationOpenDetail;
-  parentSessionId: string;
-  workspaceId: string;
-};
-
 function appendPart(parts: MessagePart[], incoming: MessagePart): MessagePart[] {
   const index = parts.findIndex((part) => part.id === incoming.id);
   if (index === -1) {
@@ -200,9 +194,17 @@ function ensureRecord(
   return upsertSelectionExplanation(record);
 }
 
+export type SelectionExplanationPanelProps = {
+  detail: SelectionExplanationOpenDetail;
+  parentSessionId: string;
+  creationParentSessionId?: string;
+  workspaceId: string;
+};
+
 export function SelectionExplanationPanel({
   detail,
   parentSessionId,
+  creationParentSessionId = parentSessionId,
   workspaceId,
 }: SelectionExplanationPanelProps) {
   const navigate = useNavigate();
@@ -416,7 +418,7 @@ export function SelectionExplanationPanel({
     const created = await createSession({
       title: `划词解释 · ${titleSeed || "选区"}`,
       memory_enabled: false,
-      parent_session_id: parentSessionId,
+      parent_session_id: creationParentSessionId,
       session_kind: "side",
       project_id: sessions.data?.find((item) => item.id === parentSessionId)
         ?.project_id,

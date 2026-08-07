@@ -81,9 +81,11 @@ _MEMORY_TEXT_CHAR_CAP = 2_000
 _BACKFILL_PER_CALL = 24
 _REINDEX_CAP = 500
 _REINDEX_TOTAL_CAP = 10_000
-_TRANSCRIPT_MESSAGE_CAP = 40
-_TRANSCRIPT_CHARS_PER_MESSAGE = 600
-_EXTRACTION_MAX_PROPOSALS = 5
+_TRANSCRIPT_MESSAGE_CAP = 80
+_TRANSCRIPT_CHARS_PER_MESSAGE = 1_200
+# This is a safety ceiling, not a target. The extractor is told to return only
+# durable, high-value atoms, so a small conversation may still yield none.
+_EXTRACTION_MAX_PROPOSALS = 24
 _EXISTING_MEMORY_CONTEXT_CAP = 30
 
 
@@ -618,6 +620,10 @@ def _extraction_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
+            "has_more": {
+                "type": "boolean",
+                "description": "仍有下一批消息值得分析时为 true；没有更多有意义内容时为 false。",
+            },
             "memories": {
                 "type": "array",
                 "items": {
@@ -675,7 +681,7 @@ def _extraction_schema() -> dict[str, Any]:
                 },
             }
         },
-        "required": ["memories"],
+        "required": ["has_more", "memories"],
     }
 
 
@@ -708,6 +714,8 @@ def _extraction_prompt(
         f"已有记忆（避免重复；如需修正请用 operation=UPDATE 并给出 target_memory_id）：\n"
         f"{existing_lines or '（无）'}\n\n"
         f"<eligible_user_evidence>\n{transcript}\n</eligible_user_evidence>\n\n"
+        "本次只处理上述证据。只输出真正值得跨会话保留的原子记忆；不要为了凑数而创造记忆。"
+        "如果证据中没有更多值得保存的内容，has_more=false；如果仍有后续证据值得继续分析，has_more=true。\n"
         f"要求：最多提出 {_EXTRACTION_MAX_PROPOSALS} 条；标题不超过 60 字；"
         "内容用中文、单条不超过 300 字；confidence 取 0-1 并保守估计"
         "（仅当用户明确表达时才 >= 0.75）；每条非 NOOP 原子必须引用输入中的"

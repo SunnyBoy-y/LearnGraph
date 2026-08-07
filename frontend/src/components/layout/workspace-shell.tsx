@@ -2978,11 +2978,13 @@ function SelectionExplanationRail({
   detail,
   onClose,
   parentSessionId,
+  creationParentSessionId,
   workspaceId,
 }: {
   detail: SelectionExplanationOpenDetail;
   onClose: () => void;
   parentSessionId: string;
+  creationParentSessionId: string;
   workspaceId: string;
 }) {
   return (
@@ -3000,6 +3002,7 @@ function SelectionExplanationRail({
         <SelectionExplanationPanel
           detail={detail}
           parentSessionId={parentSessionId}
+          creationParentSessionId={creationParentSessionId}
           workspaceId={workspaceId}
         />
       </div>
@@ -3038,6 +3041,8 @@ function ContextRail({
   const sessionId =
     new URLSearchParams(search).get("sidebarSession") ??
     pathname.match(/\/chat\/([^/]+)/)?.[1];
+  const activeSession = railSessions.data?.find((item) => item.id === sessionId);
+  const creationParentSessionId = activeSession?.parent_session_id ?? sessionId;
   const showActivity = [
     "/home",
     "/sources",
@@ -3175,6 +3180,7 @@ function ContextRail({
           detail={selectionExplanation}
           onClose={() => setSelectionExplanation(null)}
           parentSessionId={sessionId}
+          creationParentSessionId={creationParentSessionId ?? sessionId}
           workspaceId={workspaceId}
         />
       ) : isGoalClarify || isGoalMode ? (
