@@ -879,10 +879,28 @@ def extract_session_memories(
         or not bool(getattr(session, "memory_learning_enabled", True))
     ):
         if force:
+            policy = MemoryService(
+                db,
+                workspace,
+                actor_id,
+                memory_provider_for_workspace(db, workspace, actor_id, settings),
+                settings.memory_root,
+            ).policy(session_id)
+            blockers = [
+                name
+                for name, enabled in (
+                    ("workspace_enabled", policy.workspace_enabled),
+                    ("workspace_learning_enabled", policy.workspace_learning_enabled),
+                    ("session_enabled", policy.session_enabled),
+                    ("session_learning_enabled", policy.session_learning_enabled),
+                )
+                if not enabled
+            ]
             raise AppError(
                 409,
                 "memory_policy_disabled",
-                "Workspace and session memory must both be enabled for extraction",
+                "Enable workspace and session learning before extraction",
+                {"blockers": blockers, "policy": policy.model_dump()},
             )
         return {"status": "policy_disabled", "drafts_created": 0}
 
@@ -1148,6 +1166,7 @@ def extract_session_memories(
         "drafts_created": drafts_created,
         "auto_committed": auto_committed,
         "skipped": skipped,
+        "completion_reason": "model_completed" if not bool(payload.get("has_more")) else "batch_safety_limit",
     }
 
 
@@ -1248,13 +1267,15 @@ def summarize_session_context(
         ).all()
         if (item.content or "").strip()
     ]
-    if len(messages) <= _SUMMARY_KEEP_RECENT_MESSAGES:
+    if len(messages) <= _SUMMARY_KEEP_RECENT_MESSAGES and not force:
         return {"status": "too_short"}
     total_tokens = sum(estimate_tokens(item.content) for item in messages)
     if total_tokens < _SUMMARY_MIN_HISTORY_TOKENS and not force:
         return {"status": "below_threshold"}
 
     prefix = messages[:-_SUMMARY_KEEP_RECENT_MESSAGES]
+    if force and not prefix:
+        prefix = messages
     prefix_ids = [item.id for item in prefix]
     latest = db.scalar(
         select(ContextSummary)
@@ -1360,21 +1381,21 @@ def summarize_session_context(
     source_hash = hashlib.sha256(
         "\n".join(f"{item.id}:{item.content}" for item in covered_messages).encode("utf-8")
     ).hexdigest()
-    db.add(
-        ContextSummary(
-            workspace_id=workspace.id,
-            session_id=session_id,
-            version=version,
-            kind="model",
-            source_message_ids=new_covered_ids,
-            source_hash=source_hash,
-            summary=summary_text,
-            estimated_tokens_before=sum(
-                estimate_tokens(item.content) for item in covered_messages
-            ),
-            estimated_tokens_after=estimate_tokens(summary_text),
-        )
+    summary = ContextSummary(
+        workspace_id=workspace.id,
+        session_id=session_id,
+        version=version,
+        kind="model",
+        source_message_ids=new_covered_ids,
+        source_hash=source_hash,
+        summary=summary_text,
+        estimated_tokens_before=sum(
+            estimate_tokens(item.content) for item in covered_messages
+        ),
+        estimated_tokens_after=estimate_tokens(summary_text),
     )
+    db.add(summary)
+    db.flush()
     db.commit()
     return {
         "status": "ok",
@@ -1382,6 +1403,17 @@ def summarize_session_context(
         "version": version,
         "covered_messages": len(new_covered_ids),
         "newly_summarized": len(fresh_messages),
+        "summary": {
+            "id": summary.id,
+            "session_id": summary.session_id,
+            "version": summary.version,
+            "kind": summary.kind,
+            "source_message_ids": summary.source_message_ids,
+            "summary": summary.summary,
+            "estimated_tokens_before": summary.estimated_tokens_before,
+            "estimated_tokens_after": summary.estimated_tokens_after,
+            "created_at": summary.created_at,
+        },
     }
 
 

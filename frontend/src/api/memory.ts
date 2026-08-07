@@ -1,5 +1,6 @@
 import type {
   ContextSummarizationRunResult,
+  ContextSummary,
   EffectiveMemoryPackage,
   MemoryCreateRequest,
   MemoryBinding,
@@ -185,6 +186,12 @@ export function pruneMemoryEmbeddings(): Promise<MemoryEmbeddingPruneResult> {
 export function extractSessionMemories(sessionId: string): Promise<MemoryExtractionRunResult> {
   return apiClient.post<MemoryExtractionRunResult>(
     `/memory/enhancement/extract/${encodeURIComponent(sessionId)}`,
+  )
+}
+
+export function getSessionContextSummary(sessionId: string): Promise<ContextSummary | null> {
+  return apiClient.get<ContextSummary | null>(
+    `/memory/enhancement/summarize/${encodeURIComponent(sessionId)}`,
   )
 }
 

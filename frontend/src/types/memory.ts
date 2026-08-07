@@ -205,6 +205,7 @@ export interface MemoryPolicyUpdateRequest {
   session_enabled?: boolean
   session_recall_enabled?: boolean
   session_learning_enabled?: boolean
+  all_sessions_shared?: boolean
 }
 
 export interface MemoryProfile {
@@ -344,6 +345,20 @@ export interface MemoryExtractionRunResult {
   drafts_created: number
   auto_committed?: number
   skipped?: number
+  blockers?: string[]
+  completion_reason?: string
+}
+
+export interface ContextSummary {
+  id: string
+  session_id: string
+  version: number
+  kind: string
+  source_message_ids: string[]
+  summary: string
+  estimated_tokens_before: number
+  estimated_tokens_after: number
+  created_at: string
 }
 
 export interface ContextSummarizationRunResult {
@@ -352,6 +367,7 @@ export interface ContextSummarizationRunResult {
   version?: number
   covered_messages?: number
   newly_summarized?: number
+  summary?: ContextSummary | null
 }
 
 export interface EffectiveMemoryPackage {

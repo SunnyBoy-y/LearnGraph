@@ -276,6 +276,7 @@ class MemoryPolicyUpdateRequest(BaseModel):
     session_enabled: bool | None = None
     session_recall_enabled: bool | None = None
     session_learning_enabled: bool | None = None
+    all_sessions_shared: bool | None = None
 
     @model_validator(mode="after")
     def require_policy_change(self) -> "MemoryPolicyUpdateRequest":
@@ -288,6 +289,7 @@ class MemoryPolicyUpdateRequest(BaseModel):
                 self.session_enabled,
                 self.session_recall_enabled,
                 self.session_learning_enabled,
+                self.all_sessions_shared,
             )
         ):
             raise ValueError("A workspace or session policy change is required")
@@ -370,6 +372,18 @@ class MemoryProfileIntentResult(BaseModel):
     profile_status: str = "stale"
 
 
+class ContextSummaryView(ORMModel):
+    id: str
+    session_id: str
+    version: int
+    kind: str
+    source_message_ids: list[str] = Field(default_factory=list)
+    summary: str
+    estimated_tokens_before: int
+    estimated_tokens_after: int
+    created_at: datetime
+
+
 class MemoryExtractionSettingsView(BaseModel):
     enabled: bool
     provider_id: str
@@ -436,6 +450,15 @@ class MemoryEnhancementUpdateRequest(BaseModel):
     extraction: MemoryExtractionSettingsUpdate | None = None
     embedding: MemoryEmbeddingSettingsUpdate | None = None
     summarization: MemorySummarizationSettingsUpdate | None = None
+
+
+class ContextSummarizationRunResult(BaseModel):
+    status: str
+    session_id: str | None = None
+    version: int | None = None
+    covered_messages: int | None = None
+    newly_summarized: int | None = None
+    summary: ContextSummaryView | None = None
 
 
 class MemoryJournalView(ORMModel):
@@ -719,6 +742,7 @@ class ProviderUpdateRequest(BaseModel):
     # Global template switch: on = the group template overrides every model,
     # off = each model uses its own saved snapshot or catalog defaults.
     model_defaults_enabled: bool | None = None
+    provider_priority: int | None = Field(default=None, ge=0, le=10_000)
 
     @model_validator(mode="after")
     def require_change(self) -> "ProviderUpdateRequest":

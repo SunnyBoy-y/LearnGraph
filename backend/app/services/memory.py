@@ -1823,6 +1823,18 @@ class MemoryService:
                 )
             else:
                 setting.value = current
+        session = None
+        bulk_affected = 0
+        if payload.all_sessions_shared is not None:
+            sessions = self.db.scalars(
+                select(ChatSession).where(ChatSession.workspace_id == self.workspace_id)
+            ).all()
+            enabled = payload.all_sessions_shared
+            for candidate in sessions:
+                candidate.memory_enabled = enabled
+                candidate.memory_recall_enabled = enabled
+                candidate.memory_learning_enabled = enabled
+            bulk_affected = len(sessions)
         if payload.session_enabled is not None:
             session = self.sessions.require(payload.session_id or "", "session")
             session.memory_enabled = payload.session_enabled
@@ -1854,6 +1866,8 @@ class MemoryService:
                 "session_enabled": payload.session_enabled,
                 "session_recall_enabled": payload.session_recall_enabled,
                 "session_learning_enabled": payload.session_learning_enabled,
+                "all_sessions_shared": payload.all_sessions_shared,
+                "bulk_affected": bulk_affected,
             },
         )
         self.db.commit()

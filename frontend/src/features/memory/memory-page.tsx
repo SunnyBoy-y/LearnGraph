@@ -33,6 +33,8 @@ import {
   getGraph,
   getMemory,
   getMemoryProfile,
+  getMemoryPolicy,
+  getSessionContextSummary,
   listGoals,
   listGraphs,
   listMemoryBindings,
@@ -812,6 +814,11 @@ function MemoryInjectionPreviewTab({
 }) {
   const queryClient = useQueryClient()
   const [sessionId, setSessionId] = useState(sessions[0]?.id ?? '')
+  const policy = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'policy', sessionId),
+    queryFn: () => getMemoryPolicy(sessionId),
+    enabled: Boolean(sessionId),
+  })
   const preview = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'package', sessionId),
     queryFn: () => getEffectiveMemoryPackage({ session_id: sessionId }),
@@ -824,7 +831,7 @@ function MemoryInjectionPreviewTab({
         toast.info('该会话没有新的可抽取内容')
       } else {
         toast.success(
-          `抽取完成：提炼 ${result.drafts_created} 条（自动写入 ${result.auto_committed ?? 0} 条）`,
+          `抽取完成：提炼 ${result.drafts_created} 条（自动写入 ${result.auto_committed ?? 0} 条）${result.completion_reason ? ` · ${result.completion_reason}` : ''}`,
         )
       }
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory') })
@@ -834,10 +841,21 @@ function MemoryInjectionPreviewTab({
     },
     onError: (error) => toast.error(error.message),
   })
+  const contextSummary = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'context-summary', sessionId),
+    queryFn: () => getSessionContextSummary(sessionId),
+    enabled: Boolean(sessionId),
+  })
   const summarizeNow = useMutation({
     mutationFn: () => summarizeSessionContext(sessionId),
     onSuccess: (result) => {
       if (result.status === 'ok') {
+        if (result.summary) {
+          queryClient.setQueryData(
+            workspaceQueryKey(workspaceId, 'memory', 'context-summary', sessionId),
+            result.summary,
+          )
+        }
         toast.success(
           `摘要已生成 v${result.version}：覆盖 ${result.covered_messages} 条消息（本次新增 ${result.newly_summarized} 条）`,
         )
@@ -851,6 +869,16 @@ function MemoryInjectionPreviewTab({
     },
     onError: (error) => toast.error(error.message),
   })
+
+  const extractionBlocked = policy.data && !policy.data.effective_learning_enabled
+  const extractionBlockers = policy.data
+    ? [
+        !policy.data.workspace_enabled && '工作区共同记忆',
+        !policy.data.workspace_learning_enabled && '工作区学习记忆',
+        !policy.data.session_enabled && 'Session 共同记忆',
+        !policy.data.session_learning_enabled && 'Session 学习记忆',
+      ].filter(Boolean)
+    : []
 
   if (!sessions.length) {
     return (
@@ -887,7 +915,7 @@ function MemoryInjectionPreviewTab({
             刷新
           </Button>
           <Button
-            disabled={!sessionId || extractNow.isPending}
+            disabled={!sessionId || extractNow.isPending || policy.isPending || Boolean(extractionBlocked)}
             onClick={() => extractNow.mutate()}
             size="sm"
             variant="outline"
@@ -905,6 +933,20 @@ function MemoryInjectionPreviewTab({
             立即生成摘要
           </Button>
         </div>
+      </div>
+      {policy.isError ? (
+        <p className="mt-3 text-xs text-destructive">记忆策略读取失败：{policy.error.message}</p>
+      ) : extractionBlocked ? (
+        <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-200">
+          当前未满足自动学习条件：{extractionBlockers.join('、')}。请先在设置中开启后再提取。
+        </p>
+      ) : null}
+      <div className="mt-4 rounded-lg border bg-muted/15 p-4">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-sm font-semibold">会话上下文摘要</p>
+          {contextSummary.data ? <span className="text-xs text-muted-foreground">v{contextSummary.data.version}</span> : null}
+        </div>
+        {contextSummary.isLoading ? <p className="mt-2 text-xs text-muted-foreground">正在读取摘要…</p> : contextSummary.isError ? <p className="mt-2 text-xs text-destructive">摘要读取失败：{contextSummary.error.message}</p> : contextSummary.data ? <div className="mt-3 space-y-2"><p className="whitespace-pre-wrap text-sm leading-6">{contextSummary.data.summary}</p><p className="text-[11px] text-muted-foreground">覆盖 {contextSummary.data.source_message_ids.length} 条消息 · {contextSummary.data.estimated_tokens_before} → {contextSummary.data.estimated_tokens_after} tokens</p></div> : <p className="mt-2 text-xs text-muted-foreground">当前 Session 尚未生成会话摘要。</p>}
       </div>
       {preview.isLoading ? (
         <p className="mt-4 text-xs text-muted-foreground">加载中…</p>
@@ -1332,13 +1374,15 @@ function EditMemoryDialog({
     event.preventDefault()
     try {
       await onUpdate({
-        expected_revision: item.revision,
+        expected_revision: detail.data?.revision ?? item.revision,
         title: title.trim(),
         content: content.trim(),
         zone,
         reason: 'user_edit',
       })
     } catch {
+      await detail.refetch()
+      toast.error('保存未完成：记忆可能已在其他窗口更新，已刷新为最新 Revision 后请检查并重试。')
       return
     }
     setOpen(false)

@@ -3,9 +3,12 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Response, status
+from sqlalchemy import select
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.domain.models import ContextSummary
 from app.domain.schemas.management import (
+    ContextSummaryView,
     EffectiveMemoryPackageView,
     MemoryBindingView,
     MemoryCreateRequest,
@@ -344,6 +347,28 @@ def extract_memories_now(
         actor_id=context.principal.user_id,
         force=True,
     )
+
+
+@router.get("/enhancement/summarize/{session_id}", response_model=ContextSummaryView | None)
+def get_session_context_summary(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ContextSummaryView | None:
+    row = db.scalar(
+        select(ContextSummary)
+        .where(
+            ContextSummary.workspace_id == context.workspace_id,
+            ContextSummary.session_id == session_id,
+            ContextSummary.kind == "model",
+        )
+        .order_by(ContextSummary.version.desc())
+        .limit(1)
+    )
+    if row is None:
+        return None
+    return ContextSummaryView.model_validate(row)
 
 
 @router.post("/enhancement/summarize/{session_id}")
