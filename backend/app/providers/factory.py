@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -24,6 +24,7 @@ from app.providers.catalog import (
     TRANSCRIPTION_PROVIDER_TYPES,
     VISION_PROVIDER_TYPES,
 )
+
 from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.image_generation import ImageGenerationProviderPort
 from app.providers.ports.model import ModelProviderPort
@@ -107,6 +108,15 @@ from app.providers.remote.memory import (
     mem0_entity_id,
 )
 from app.services.provider_secrets import decrypt_provider_secret
+
+
+def _provider_priority_order():
+    return (
+        func.coalesce(
+            ProviderConfig.capabilities["provider_priority"].as_integer(), 0
+        ).desc(),
+        ProviderConfig.updated_at.desc(),
+    )
 
 
 def _secret_for_provider(
@@ -206,7 +216,7 @@ def model_provider_for_workspace(
     )
     if provider_id:
         statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
+    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     if provider_id and provider is None:
         return UnavailableModelProvider(
             "The selected model provider is not enabled in this workspace",
@@ -475,7 +485,7 @@ def model_provider_for_workspace(
             ProviderConfig.workspace_id == workspace_id,
             ProviderConfig.enabled.is_(True),
             ProviderConfig.provider_type == "local_mock",
-        ).order_by(ProviderConfig.updated_at.desc())
+        ).order_by(*_provider_priority_order())
     )
     if local_provider is not None and settings.enable_local_demo_provider:
         selected_model_id = model_id.strip() if model_id else ""
@@ -555,7 +565,7 @@ def image_provider_for_workspace(
     )
     if provider_id:
         statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
+    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     selected_model_id = model_id.strip() if model_id else ""
     if provider is None:
         return UnavailableImageGenerationProvider(
@@ -673,7 +683,7 @@ def vision_provider_for_workspace(
     )
     if provider_id:
         statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
+    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     selected_model_id = model_id.strip() if model_id else ""
     if provider is None:
         if provider_id is None:
@@ -806,7 +816,7 @@ def _qwen_vision_companion_for_workspace(
                 ProviderConfig.remote_capability.is_(True),
                 ProviderConfig.provider_type == "qwen",
             )
-            .order_by(ProviderConfig.updated_at.desc())
+            .order_by(*_provider_priority_order())
         ).all()
     )
     for provider in providers:
@@ -923,7 +933,7 @@ def search_provider_for_workspace(
                 else []
             ),
         )
-        .order_by(ProviderConfig.updated_at.desc())
+        .order_by(*_provider_priority_order())
     ).all())
     provider = providers[0] if providers else None
     if route == "auto" and len(providers) > 1:
@@ -1043,7 +1053,7 @@ def transcription_provider_for_workspace(
     )
     if provider_id:
         statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
+    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     if provider is None or not provider.base_url:
         return None
     capabilities = dict(provider.capabilities or {})
@@ -1159,7 +1169,7 @@ def deep_research_provider_for_workspace(
     )
     if default_provider_id:
         statement = statement.where(ProviderConfig.id == default_provider_id)
-    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
+    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     if provider is None:
         return None
     if not provider.base_url:
@@ -1264,7 +1274,7 @@ def fetch_provider_for_workspace(
     )
     if default_provider_id:
         statement = statement.where(ProviderConfig.id == default_provider_id)
-    provider = db.scalar(statement.order_by(ProviderConfig.updated_at.desc()))
+    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     if provider is None:
         if default_provider_id:
             return UnavailableFetchProvider(
@@ -1343,7 +1353,7 @@ def _qwen_companion_for_workspace(
                 ProviderConfig.remote_capability.is_(True),
                 ProviderConfig.provider_type == "qwen",
             )
-            .order_by(ProviderConfig.updated_at.desc())
+            .order_by(*_provider_priority_order())
         ).all()
     )
     for provider in candidates:
@@ -1400,7 +1410,7 @@ def memory_provider_for_workspace(
             ProviderConfig.enabled.is_(True),
             ProviderConfig.provider_type.in_(MEMORY_PROVIDER_TYPES),
         )
-        .order_by(ProviderConfig.updated_at.desc())
+        .order_by(*_provider_priority_order())
     )
     if provider is None:
         return LocalWorkspaceMemoryProvider(settings.memory_root, workspace.id)

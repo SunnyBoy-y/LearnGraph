@@ -164,6 +164,21 @@ import type {
 import { Textarea } from "@/components/ui/textarea";
 import { isRealtimeTranscriptionModel } from "@/lib/model-choices";
 
+function providerDefaultModelId(provider: Provider): string {
+  const capabilities = provider.capabilities;
+  for (const key of [
+    "default_image_generation_model_id",
+    "default_transcription_model_id",
+    "default_vision_model_id",
+    "default_embedding_model_id",
+    "deep_research_model",
+    "default_model",
+  ]) {
+    const value = capabilities[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
 function persistedProviderModels(
   provider: Provider,
 ): ProviderModelsResponse | undefined {
@@ -603,14 +618,16 @@ export function ProvidersPage() {
       default_transcription_model_id,
       default_realtime_transcription_model_id,
       default_vision_model_id,
+      provider_priority,
     }: {
       id: string;
-      enabled: boolean;
+      enabled?: boolean;
       default_model?: string;
       default_image_generation_model_id?: string;
       default_transcription_model_id?: string;
       default_realtime_transcription_model_id?: string;
       default_vision_model_id?: string;
+      provider_priority?: number;
     }) =>
       updateProvider(id, {
         enabled,
@@ -619,6 +636,7 @@ export function ProvidersPage() {
         default_transcription_model_id,
         default_realtime_transcription_model_id,
         default_vision_model_id,
+        provider_priority,
       }),
     onSuccess: (provider) => {
       toast.success(provider.enabled ? "Provider 已启用" : "Provider 已停用");
@@ -805,6 +823,7 @@ export function ProvidersPage() {
                 const isDeepResearchProvider =
                   providerSpec?.role === "deep_research";
                 const isEmbeddingProvider = providerSpec?.role === "embedding";
+                const supportsManagedModels = providerSpec?.supports_model_discovery === true;
                 const hasConfigurableDefaultModel =
                   isModelProvider ||
                   isImageGenerationProvider ||
@@ -873,6 +892,12 @@ export function ProvidersPage() {
                   : [];
                 const capabilityModelValue =
                   modelValue.trim() || providerModels?.models[0]?.id || "";
+                const priorityValue = (() => {
+                  const value = provider.capabilities.provider_priority;
+                  return typeof value === "number" && Number.isFinite(value)
+                    ? Math.max(0, Math.round(value))
+                    : 0;
+                })();
                 const customHeaderCount = Object.keys(
                   providerExtraHeaders(provider),
                 ).length;
@@ -1197,6 +1222,26 @@ export function ProvidersPage() {
                     </td>
                     <td className="px-5 py-4">
                       <div className="flex justify-end gap-2">
+                        <div className="flex items-center gap-1.5 rounded-lg border px-2 py-1">
+                          <span className="text-[10px] text-muted-foreground">优先级</span>
+                          <Input
+                            aria-label={`${provider.display_name} 供应商优先级`}
+                            className="h-6 w-12 px-1 text-center text-xs"
+                            defaultValue={priorityValue}
+                            min={0}
+                            max={10000}
+                            onBlur={(event) => {
+                              const next = Math.max(0, Math.min(10000, Math.round(Number(event.target.value) || 0)));
+                              if (next !== priorityValue) {
+                                update.mutate({
+                                  id: provider.id,
+                                  provider_priority: next,
+                                });
+                              }
+                            }}
+                            type="number"
+                          />
+                        </div>
                         {supportsModelDiscovery ? (
                           <Button
                             disabled={discover.isPending || !hasProbeConfiguration}
@@ -1271,7 +1316,7 @@ export function ProvidersPage() {
                             余额配置
                           </Button>
                         ) : null}
-                        {isModelProvider ? (
+                        {supportsManagedModels ? (
                           <Button
                             onClick={() =>
                               setCapabilityTarget({
@@ -1804,13 +1849,24 @@ export function ProvidersPage() {
             });
             void queryClient.invalidateQueries({ queryKey: ["providers"] });
           }}
-          onSetDefault={(nextModelId) =>
+                    onSetDefault={(nextModelId) => {
+            const provider = capabilityTarget.provider;
+            const spec = catalogByType.get(provider.provider_type);
             update.mutate({
-              id: capabilityTarget.provider.id,
-              enabled: capabilityTarget.provider.enabled,
-              default_model: nextModelId,
-            })
-          }
+              id: provider.id,
+              enabled: provider.enabled,
+              default_model:
+                spec?.role === "model" || spec?.role === "deep_research" || spec?.role === "embedding"
+                  ? nextModelId
+                  : undefined,
+              default_image_generation_model_id:
+                spec?.role === "image_generation" ? nextModelId : undefined,
+              default_transcription_model_id:
+                spec?.role === "transcription" ? nextModelId : undefined,
+              default_vision_model_id:
+                spec?.role === "vision" ? nextModelId : undefined,
+            });
+          }}
           provider={capabilityTarget.provider}
         />
       ) : null}
@@ -3414,17 +3470,41 @@ function ModelCapabilitiesDialog({
   const [modelSearch, setModelSearch] = useState("");
   // The dialog can grow the list by pinning models manually, so it keeps its
   // own copy instead of reading the discovery-derived prop directly.
-  const [modelsList, setModelsList] = useState(models);
+  const [modelsList, setModelsList] = useState(
+    () => mergeProviderModelLists(models, provider) ?? models,
+  );
   const [manualModelId, setManualModelId] = useState("");
   const [modelStates, setModelStates] = useState<Record<string, boolean>>(
     Object.fromEntries(modelsList.models.map((model) => [model.id, model.enabled !== false])),
   );
-  const [defaultModelId, setDefaultModelId] = useState(
-    String(provider.capabilities.default_model ?? "").trim(),
+  const [defaultModelId, setDefaultModelId] = useState(() =>
+    providerDefaultModelId(provider),
   );
   const [capabilities, setCapabilities] =
     useState<ProviderModelCapabilities>(emptyModelCapabilities);
 
+  const latestModels = useQuery({
+    queryKey: ["provider-models", "capability-dialog", provider.id],
+    queryFn: () => discoverProviderModels(provider.id),
+    retry: false,
+  });
+  useEffect(() => {
+    const discovered = latestModels.data;
+    if (!discovered) return;
+    const merged = mergeProviderModelLists(discovered, provider) ?? discovered;
+    setModelsList((current) => {
+      const byId = new Map(current.models.map((model) => [model.id, model]));
+      for (const model of merged.models) byId.set(model.id, model);
+      return { ...merged, models: [...byId.values()] };
+    });
+    setModelStates((current) => {
+      const next = { ...current };
+      for (const model of merged.models) {
+        if (!(model.id in next)) next[model.id] = model.enabled !== false;
+      }
+      return next;
+    });
+  }, [latestModels.data, provider]);
   const templateRaw = provider.capabilities.model_defaults;
   const templateConfigured = Boolean(
     templateRaw &&

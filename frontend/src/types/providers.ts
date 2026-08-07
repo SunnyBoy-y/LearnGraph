@@ -52,6 +52,8 @@ export interface ProviderUpdateRequest {
   extra_headers?: Record<string, string> | null;
   /** Global template switch: on = template overrides every model, off = per-model configs apply. */
   model_defaults_enabled?: boolean;
+  /** Higher values are preferred when multiple enabled providers can serve the role. */
+  provider_priority?: number;
 }
 
 export interface Provider {

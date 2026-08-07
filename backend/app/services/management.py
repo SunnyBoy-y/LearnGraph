@@ -208,7 +208,19 @@ class ProviderService:
         self.audit = AuditRepository(db, workspace_id)
 
     def list(self) -> list[ProviderConfig]:
-        return list(self.providers.list())
+        providers = list(self.providers.list())
+
+        def priority(provider: ProviderConfig) -> int:
+            raw = (provider.capabilities or {}).get("provider_priority", 0)
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                return 0
+
+        return sorted(
+            providers,
+            key=lambda provider: (-priority(provider), -provider.created_at.timestamp()),
+        )
 
     def catalog(self) -> list[dict[str, object]]:
         return provider_catalog()
@@ -779,6 +791,8 @@ class ProviderService:
             capabilities.setdefault("default_model", payload.default_vision_model_id)
         if payload.model_defaults_enabled is not None:
             capabilities["model_defaults_enabled"] = payload.model_defaults_enabled
+        if payload.provider_priority is not None:
+            capabilities["provider_priority"] = payload.provider_priority
         if "enabled" not in fields_set:
             provider.capabilities = capabilities
             self.audit.record(
