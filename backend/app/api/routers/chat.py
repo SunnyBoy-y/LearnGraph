@@ -6,7 +6,9 @@ import queue
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import (
     APIRouter,
@@ -97,6 +99,7 @@ _DETACHED_STREAM_END = object()
 def _detached_sse_transport(
     producer: Callable[[], Iterable[str]],
     *,
+    session_id: str,
     thread_name: str,
 ):
     output: queue.Queue[str | object | _DetachedStreamFailure] = queue.Queue(
@@ -140,7 +143,40 @@ def _detached_sse_transport(
                 if item is _DETACHED_STREAM_END:
                     return
                 if isinstance(item, _DetachedStreamFailure):
-                    raise item.error
+                    error = item.error
+                    if isinstance(error, AppError):
+                        error_payload = {
+                            "code": error.code,
+                            "message": error.message,
+                            "details": error.details,
+                        }
+                    else:
+                        error_payload = {
+                            "code": "stream_setup_failed",
+                            "message": "The message stream could not be initialized",
+                            "details": {"error_type": type(error).__name__},
+                        }
+                    event_id = str(uuid4())
+                    data = {
+                        "schema_version": "1.0",
+                        "event_id": event_id,
+                        "sequence": 0,
+                        "session_id": session_id,
+                        "message_id": "",
+                        "message_version_id": "",
+                        "part_id": None,
+                        "type": "message.failed",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "payload": {"status": "failed", "error": error_payload},
+                        "event": "message.failed",
+                        "status": "failed",
+                    }
+                    yield (
+                        f"id: {event_id}\n"
+                        "event: message.failed\n"
+                        f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                    )
+                    return
                 yield item
         finally:
             # Do not stop the worker. Clearing this flag only disables the
@@ -214,6 +250,7 @@ def _detached_message_stream(
 
     return _detached_sse_transport(
         produce,
+        session_id=session_id,
         thread_name=f"learngraph-message-{session_id[:8]}",
     )
 
@@ -258,6 +295,7 @@ def _detached_retry_stream(
 
     return _detached_sse_transport(
         produce,
+        session_id=session_id,
         thread_name=f"learngraph-retry-{message_id[:8]}",
     )
 
