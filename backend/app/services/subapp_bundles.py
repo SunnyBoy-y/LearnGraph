@@ -397,6 +397,14 @@ class SubAppBundleService:
                 "subapp_interaction_contract_invalid",
                 "interaction_contract must be an object",
             )
+        event_schema = interaction_contract.get("event_schema")
+        state_schema = interaction_contract.get("state_schema")
+        if not isinstance(event_schema, dict) or not isinstance(state_schema, dict):
+            raise AppError(
+                422,
+                "subapp_interaction_contract_incomplete",
+                "interaction_contract requires both event_schema and state_schema",
+            )
         try:
             _interaction_contract_guard(interaction_contract)
         except AppError as exc:
@@ -407,14 +415,6 @@ class SubAppBundleService:
                 exc.details,
             ) from exc
 
-        event_schema = interaction_contract.get("event_schema")
-        state_schema = interaction_contract.get("state_schema")
-        if not isinstance(event_schema, dict) or not isinstance(state_schema, dict):
-            raise AppError(
-                422,
-                "subapp_interaction_contract_incomplete",
-                "interaction_contract requires both event_schema and state_schema",
-            )
         try:
             validator_for(event_schema).check_schema(event_schema)
             validator_for(state_schema).check_schema(state_schema)
@@ -427,9 +427,10 @@ class SubAppBundleService:
             ) from None
 
         from app.domain.schemas.components import COMPONENT_ID_PATTERN
+        import re
 
         component_id = f"bundle_{bundle.id[:24]}"
-        if not COMPONENT_ID_PATTERN.fullmatch(component_id):
+        if not re.fullmatch(COMPONENT_ID_PATTERN, component_id):
             raise AppError(
                 422,
                 "subapp_component_id_invalid",
