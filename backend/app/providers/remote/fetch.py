@@ -3,10 +3,11 @@ from __future__ import annotations
 import ipaddress
 import socket
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
+from requests import exceptions as requests_exceptions
 
 from app.providers.remote.search import domain_is_allowed, normalize_domain
 
@@ -190,7 +191,7 @@ class Crawl4AIHTTPFetchProvider:
 
 
 class FirecrawlFetchProvider:
-    """Firecrawl scrape adapter used only when explicitly selected as FetchProvider."""
+    """Firecrawl SDK adapter used only when selected as the FetchProvider."""
 
     remote_capability = True
 
@@ -204,58 +205,80 @@ class FirecrawlFetchProvider:
         timeout_seconds: float = 30.0,
         max_content_chars: int = 2_000_000,
         allow_private_bridge_urls: bool = False,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.provider_id = provider_id
         self.base_url = validate_bridge_url(base_url, allow_private=allow_private_bridge_urls)
         self.api_key = api_key
+        # ``firecrawl-py`` owns its HTTP client and cannot accept an httpx
+        # transport. Keep this test seam so tests never need a real key or a
+        # billable outbound request.
         self.transport = transport
         self.timeout_seconds = timeout_seconds
         self.max_content_chars = max_content_chars
+        self.client_factory = client_factory
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    def _client(self) -> Any:
+        if self.client_factory is not None:
+            return self.client_factory(
+                api_key=self.api_key,
+                api_url=self.base_url,
+                timeout=self.timeout_seconds,
+            )
+        try:
+            from firecrawl import Firecrawl
+        except ImportError as exc:
+            raise FetchProviderError("Firecrawl SDK is not installed") from exc
+        return Firecrawl(
+            api_key=self.api_key,
+            api_url=self.base_url,
+            timeout=self.timeout_seconds,
+        )
+
+    @staticmethod
+    def _field(document: Any, name: str, default: Any = None) -> Any:
+        if isinstance(document, dict):
+            return document.get(name, default)
+        return getattr(document, name, default)
 
     def fetch(self, url: str) -> FetchedDocument:
         try:
-            with httpx.Client(
-                headers={
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                },
-                timeout=self.timeout_seconds,
-                transport=self.transport,
-                follow_redirects=False,
-            ) as client:
-                response = client.post(
-                    f"{self.base_url}/v1/scrape",
-                    json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
-                )
-        except httpx.TimeoutException as exc:
-            raise FetchProviderTimeout("Fetch provider timed out") from exc
-        except httpx.HTTPError as exc:
-            raise FetchProviderError("Fetch provider request failed") from exc
-        if not response.is_success:
-            raise FetchProviderError(f"Fetch provider returned HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise FetchProviderError("Fetch provider returned non-JSON data") from exc
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict):
-            raise FetchProviderError("Fetch provider response has no data object")
-        markdown = data.get("markdown")
-        metadata = data.get("metadata") or {}
-        if not isinstance(markdown, str) or not isinstance(metadata, dict):
-            raise FetchProviderError("Fetch provider response lacks markdown content")
+            # Use the documented v2 SDK entry point; its client normalizes the
+            # Firecrawl response into snake_case fields before returning it.
+            document = self._client().scrape(url, formats=["markdown"])
+        except (httpx.TimeoutException, requests_exceptions.Timeout) as exc:
+            raise FetchProviderTimeout("Firecrawl scrape timed out") from exc
+        except TimeoutError as exc:
+            raise FetchProviderTimeout("Firecrawl scrape timed out") from exc
+        except Exception as exc:
+            raise FetchProviderError("Firecrawl scrape request failed") from exc
+
+        markdown = self._field(document, "markdown")
+        metadata = self._field(document, "metadata") or {}
+        if not isinstance(markdown, str) or not markdown.strip():
+            raise FetchProviderError("Firecrawl scrape returned no markdown content")
+        if not isinstance(metadata, dict) and not hasattr(metadata, "source_url"):
+            raise FetchProviderError("Firecrawl scrape returned invalid metadata")
         if len(markdown) > self.max_content_chars:
-            raise FetchProviderError("Fetch provider response exceeds the configured content limit")
-        final_url = metadata.get("sourceURL") or metadata.get("url") or url
+            raise FetchProviderError("Firecrawl scrape exceeds the configured content limit")
+
+        final_url = self._field(metadata, "source_url") or self._field(metadata, "url") or url
         if not isinstance(final_url, str):
-            raise FetchProviderError("Fetch provider returned an invalid final URL")
+            raise FetchProviderError("Firecrawl scrape returned an invalid final URL")
+        status_code = self._field(metadata, "status_code")
+        title = self._field(metadata, "title")
+        content_type = self._field(metadata, "content_type") or "text/markdown"
         return FetchedDocument(
             source_url=url,
             final_url=final_url,
-            title=str(metadata.get("title") or "")[:1_000],
+            title=str(title or "")[:1_000],
             content=markdown,
-            content_type="text/markdown",
-            metadata={"bridge": "firecrawl", "status_code": metadata.get("statusCode")},
+            content_type=str(content_type)[:160],
+            metadata={"bridge": "firecrawl", "status_code": status_code},
         )
 
     def probe(self) -> dict[str, object]:
@@ -270,6 +293,7 @@ class FirecrawlFetchProvider:
 
 class UnavailableFetchProvider:
     remote_capability = True
+    available = False
 
     def __init__(self, provider_id: str, reason: str) -> None:
         self.provider_id = provider_id

@@ -274,10 +274,12 @@ class DockerSandboxBackend(SandboxBackendPort):
         enabled: bool,
         image_ref: str | None,
         runtime_kind: str = "python-node",
+        archive_bytes: int = MAX_AGENT_ARCHIVE_BYTES,
     ) -> None:
         self.enabled = enabled
         self.image_ref = (image_ref or "").strip()
         self.runtime_kind = runtime_kind
+        self._archive_bytes = archive_bytes
         # A Linux container is the runtime in every supported host setup, but
         # surfacing the host makes Windows/macOS deployment diagnostics honest.
         self.platform = f"{host_platform.system().casefold()}_host_linux_container"
@@ -415,7 +417,16 @@ class DockerSandboxBackend(SandboxBackendPort):
                     "com.learngraph.workspace_limit_dirs": "5000",
                 },
                 **network_kwargs,
-                env=container_env or None,
+                # docker SDK uses ``environment``; ``env`` is an invalid kwarg
+                # (offline containers pass None and never hit this path).
+                environment=(
+                    container_env
+                    + [
+                        "HOME=/tmp",
+                        "XDG_CONFIG_HOME=/tmp/.config",
+                        "XDG_CACHE_HOME=/tmp/.cache",
+                    ]
+                ),
                 read_only=True,
                 user="65532:65532",
                 cap_drop=["ALL"],
@@ -824,7 +835,7 @@ class DockerSandboxBackend(SandboxBackendPort):
             "https_proxy": "",
             "HTTP_PROXY": "",
             "HTTPS_PROXY": "",
-            "NODE_PATH": "/usr/local/lib/node_modules",
+            "NODE_PATH": "/node_modules",
         }
         try:
             try:
@@ -897,7 +908,7 @@ class DockerSandboxBackend(SandboxBackendPort):
             stream, _ = container.get_archive(f"/workspace/{candidate}")
             archive_bytes = bytearray()
             archive_limit = min(
-                MAX_AGENT_ARCHIVE_BYTES,
+                self._archive_bytes,
                 limit_bytes + 1024 * 1024,
             )
             for chunk in stream:
@@ -935,7 +946,7 @@ class DockerSandboxBackend(SandboxBackendPort):
             archive_bytes = bytearray()
             for chunk in stream:
                 archive_bytes.extend(chunk)
-                if len(archive_bytes) > MAX_AGENT_ARCHIVE_BYTES:
+                if len(archive_bytes) > self._archive_bytes:
                     raise SandboxBackendError("Sandbox workspace listing exceeds the archive safety limit")
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as bundle:
                 files: list[SandboxWorkspaceFile] = []

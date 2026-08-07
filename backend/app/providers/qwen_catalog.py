@@ -252,8 +252,8 @@ def _thinking_budget_max(model: str) -> int | None:
 
 
 def _context_defaults(model: str) -> tuple[int, int]:
-    # Values follow the unified models.dev-shaped catalogue. Official Qwen
-    # documentation overrides are used where models.dev lacks a current row.
+    if _starts(model, ("qwen-math-plus", "qwen-math-turbo")):
+        return 32_768, 8_192
     if model == "qwen3.8-max-preview":
         return 1_000_000, 131_072
     if _starts(model, ("qwen3.7-",)):

@@ -21,6 +21,7 @@ from app.domain.schemas.management import (
     ProviderModelCapabilityView,
     ProviderModelCatalogSyncRequest,
     ProviderModelCatalogSyncView,
+    ProviderModelDeleteView,
     ProviderModelStateUpdateRequest,
     ProviderModelStateView,
     ProviderModelStatesUpdateRequest,
@@ -480,6 +481,22 @@ def update_model_state(
         service(db, context, settings).update_model_state(
             provider_id, model_id, payload.enabled
         )
+    )
+
+
+@router.delete(
+    "/{provider_id}/models/{model_id:path}",
+    response_model=ProviderModelDeleteView,
+)
+def delete_model(
+    provider_id: str,
+    model_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderModelDeleteView:
+    return ProviderModelDeleteView.model_validate(
+        service(db, context, settings).delete_model(provider_id, model_id)
     )
 
 

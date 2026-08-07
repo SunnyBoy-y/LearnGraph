@@ -96,6 +96,7 @@ class DockerStdioMCPRunner(MCPRunnerPort):
             enabled=self.settings.sandbox_enabled,
             image_ref=self.image_ref or "",
             runtime_kind=RUNTIME_KIND,
+            archive_bytes=self.settings.sandbox_agent_archive_bytes,
         )
 
     def _persist_runner_session(

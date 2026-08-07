@@ -19,7 +19,11 @@ from app.domain.schemas.research import (
     SearchRequest,
     SearchResponse,
 )
-from app.providers.factory import deep_research_provider_for_workspace, search_provider_for_workspace
+from app.providers.factory import (
+    deep_research_provider_for_workspace,
+    research_policy_domains,
+    search_provider_for_workspace,
+)
 from app.providers.ports.research import DeepResearchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.remote.research import (
@@ -69,6 +73,28 @@ class ResearchService:
         self.audit = AuditRepository(db, workspace_id)
         self.billing = BillingService(db, workspace_id, actor_id)
 
+    def _effective_allowed_domains(self, requested: list[str]) -> list[str]:
+        workspace_domains = research_policy_domains(self.db, self.workspace_id)
+        requested_domains = {
+            item.strip().casefold().rstrip(".") for item in requested if item.strip()
+        }
+        if workspace_domains:
+            if requested_domains:
+                outside = sorted(requested_domains - workspace_domains)
+                if outside:
+                    raise AppError(
+                        422,
+                        "research_domain_not_allowed",
+                        "请求包含不在工作区搜索与 Deep Research 白名单中的域名",
+                        {"domains": outside},
+                    )
+                effective = requested_domains
+            else:
+                effective = set(workspace_domains)
+        else:
+            effective = requested_domains
+        return sorted(effective)
+
     def search(self, payload: SearchRequest) -> SearchResponse:
         if getattr(self.search_provider, "available", True) is False:
             raise AppError(
@@ -77,7 +103,7 @@ class ResearchService:
                 getattr(self.search_provider, "reason", "No usable SearchProvider is configured"),
                 {"provider_id": self.search_provider.provider_id},
             )
-        allowed_domains = {item.strip().casefold() for item in payload.allowed_domains if item.strip()}
+        allowed_domains = set(self._effective_allowed_domains(payload.allowed_domains))
         try:
             results = self.search_provider.search(
                 payload.query,
@@ -115,6 +141,7 @@ class ResearchService:
         )
 
     def plan_research(self, payload: ResearchRequest) -> ResearchPlanView:
+        self._effective_allowed_domains(payload.allowed_domains)
         provider = self.deep_research_provider
         if provider is None:
             if getattr(self.search_provider, "available", True) is False:
@@ -154,6 +181,8 @@ class ResearchService:
         )
 
     def create_research(self, payload: ResearchRequest) -> ResearchJob:
+        effective_domains = self._effective_allowed_domains(payload.allowed_domains)
+        payload = payload.model_copy(update={"allowed_domains": effective_domains})
         if self.deep_research_provider is None:
             if getattr(self.search_provider, "available", True) is False:
                 raise AppError(

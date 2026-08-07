@@ -47,6 +47,7 @@ import { brandIcon } from "@/lib/brand-icons";
 import {
   createProvider,
   deleteProvider,
+  deleteProviderModel,
   discoverProviderModels,
   getProviderBalance,
   getProviderModelCapabilities,
@@ -3389,6 +3390,9 @@ function ModelCapabilitiesDialog({
   const [modelStates, setModelStates] = useState<Record<string, boolean>>(
     Object.fromEntries(modelsList.models.map((model) => [model.id, model.enabled !== false])),
   );
+  const [defaultModelId, setDefaultModelId] = useState(
+    String(provider.capabilities.default_model ?? "").trim(),
+  );
   const [capabilities, setCapabilities] =
     useState<ProviderModelCapabilities>(emptyModelCapabilities);
 
@@ -3499,14 +3503,38 @@ function ModelCapabilitiesDialog({
     },
     onError: (error) => toast.error(error.message),
   });
+  const removeModel = useMutation({
+    mutationFn: (modelId: string) => deleteProviderModel(provider.id, modelId),
+    onSuccess: (result) => {
+      setModelsList((current) => ({
+        ...current,
+        models: current.models.filter((model) => model.id !== result.model_id),
+      }));
+      setModelStates((current) => {
+        const next = { ...current };
+        delete next[result.model_id];
+        return next;
+      });
+      setDefaultModelId(result.default_model ?? "");
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      toast.success(`已删除模型 ${result.model_id}`);
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const updateConnection = useMutation({
     mutationFn: () => updateProvider(provider.id, {
       provider_type: protocolType === provider.provider_type ? undefined : protocolType,
       base_url: baseUrl.trim() || null,
       extra_headers: parseExtraHeadersInput(headers),
     }),
-    onSuccess: () => {
+    onSuccess: (updatedProvider) => {
+      queryClient.setQueryData<Provider[]>(["providers"], (current) =>
+        current?.map((item) =>
+          item.id === updatedProvider.id ? updatedProvider : item,
+        ),
+      );
       toast.success("连接配置已保存");
+      onClose();
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
     onError: (error) => toast.error(error.message),
@@ -3748,10 +3776,37 @@ function ModelCapabilitiesDialog({
                           单独配置
                         </span>
                       ) : null}
-                      {provider.capabilities.default_model === model.id ? null : (
-                        <Button onClick={() => onSetDefault(model.id)} size="xs" type="button" variant="ghost">设为默认</Button>
+                      {defaultModelId === model.id ? (
+                        <Button disabled size="xs" type="button" variant="ghost">默认</Button>
+                      ) : (
+                        <Button
+                          disabled={removeModel.isPending}
+                          onClick={() => {
+                            const previous = defaultModelId;
+                            setDefaultModelId(model.id);
+                            onSetDefault(model.id);
+                            void queryClient
+                              .invalidateQueries({ queryKey: ["providers"] })
+                              .catch(() => setDefaultModelId(previous));
+                          }}
+                          size="xs"
+                          type="button"
+                          variant="ghost"
+                        >
+                          设为默认
+                        </Button>
                       )}
                       <Button onClick={() => setEditModelId(model.id)} size="xs" type="button" variant="ghost"><Pencil className="size-3" />编辑</Button>
+                      <Button
+                        disabled={removeModel.isPending}
+                        onClick={() => removeModel.mutate(model.id)}
+                        size="xs"
+                        title="从此供应商的模型列表移除"
+                        type="button"
+                        variant="ghost"
+                      >
+                        <Trash2 className="size-3" />删除
+                      </Button>
                       <Switch
                         checked={modelStates[model.id] === true}
                         onCheckedChange={(checked) =>
@@ -3761,9 +3816,6 @@ function ModelCapabilitiesDialog({
                           }))
                         }
                       />
-                      {provider.capabilities.default_model === model.id ? (
-                        <span className="text-muted-foreground">默认</span>
-                      ) : null}
                     </div>
                   ))}
                   </div>

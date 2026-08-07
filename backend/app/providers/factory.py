@@ -133,10 +133,22 @@ def _web_fetch_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
     no persistent web-fetch allowlist, so the sandbox fetch path stays disabled
     and the caller falls back to the explicit remote / Qwen provider.
     """
+    return _workspace_policy_domains(db, workspace_id, "web_fetch.policy")
+
+
+def research_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
+    """Load the workspace source allowlist shared by search and Deep Research."""
+
+    return _workspace_policy_domains(db, workspace_id, "research.policy")
+
+
+def _workspace_policy_domains(
+    db: Session, workspace_id: str, key: str
+) -> frozenset[str]:
     setting = db.scalar(
         select(WorkspaceSetting).where(
             WorkspaceSetting.workspace_id == workspace_id,
-            WorkspaceSetting.key == "web_fetch.policy",
+            WorkspaceSetting.key == key,
         )
     )
     value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
@@ -1266,14 +1278,20 @@ def fetch_provider_for_workspace(
             capability="hosted_web_fetch",
         )
     if not provider.base_url:
-        return UnavailableFetchProvider(provider.id, "Configured Crawl4AI provider has no base URL")
+        return UnavailableFetchProvider(provider.id, f"Configured {provider.provider_type} has no base URL")
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
     except Exception:
-        return UnavailableFetchProvider(provider.id, "Configured Crawl4AI secret cannot be decrypted")
+        return UnavailableFetchProvider(
+            provider.id,
+            f"Configured {provider.provider_type} secret cannot be decrypted",
+        )
     if provider.provider_type == "firecrawl_fetch":
         if not api_key:
-            return UnavailableFetchProvider(provider.id, "Configured Firecrawl provider has no encrypted secret")
+            return UnavailableFetchProvider(
+                provider.id,
+                "Configured Firecrawl provider has no encrypted secret",
+            )
         try:
             return FirecrawlFetchProvider(
                 provider_id=provider.id,
@@ -1282,7 +1300,10 @@ def fetch_provider_for_workspace(
                 allow_private_bridge_urls=settings.allow_private_bridge_urls,
             )
         except FetchProviderError as exc:
-            return UnavailableFetchProvider(provider.id, f"Configured fetch provider is unavailable: {exc}")
+            return UnavailableFetchProvider(
+                provider.id,
+                f"Configured {provider.provider_type} is unavailable: {exc}",
+            )
     try:
         return Crawl4AIHTTPFetchProvider(
             provider_id=provider.id,
@@ -1291,7 +1312,10 @@ def fetch_provider_for_workspace(
             allow_private_bridge_urls=settings.allow_private_bridge_urls,
         )
     except FetchProviderError as exc:
-        return UnavailableFetchProvider(provider.id, f"Configured fetch provider is unavailable: {exc}")
+        return UnavailableFetchProvider(
+            provider.id,
+            f"Configured {provider.provider_type} is unavailable: {exc}",
+        )
 
 
 def _qwen_companion_for_workspace(

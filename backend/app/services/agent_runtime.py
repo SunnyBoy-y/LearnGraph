@@ -135,6 +135,8 @@ class AgentToolRuntime:
         agent_mode_enabled: bool,
         web_search_enabled: bool,
         memory_enabled: bool = True,
+        capability_families: set[str] | None = None,
+        activated_capabilities: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not agent_mode_enabled:
             return []
@@ -160,7 +162,29 @@ class AgentToolRuntime:
         # addressable in Agent mode; without these tools the model cannot see
         # or reference an image from an earlier turn.
         definitions.extend(self._session_file_tool_definitions())
-        definitions.extend(self.extensions.agent_tool_definitions())
+        # Progressive disclosure is gated by settings so a single feature flag
+        # can restore the previous eager behavior without code changes. When the
+        # flag is off, family/activation args are dropped and every eligible
+        # extension schema is exposed as before. Discovery tools remain available
+        # in Agent mode regardless; they are additive and never hide existing
+        # capabilities.
+        progressive_enabled = True
+        if self.settings is not None:
+            progressive_enabled = bool(
+                getattr(
+                    self.settings,
+                    "agent_progressive_tool_disclosure_enabled",
+                    True,
+                )
+            )
+        effective_families = capability_families if progressive_enabled else None
+        effective_activated = activated_capabilities if progressive_enabled else None
+        definitions.extend(
+            self.extensions.agent_tool_definitions(
+                capability_families=effective_families,
+                activated_capabilities=effective_activated,
+            )
+        )
         # search_web / parallel_web_research / search_images follow the explicit
         # "联网" search toggle — they need an authorized SearchProvider and the
         # user's web_search flag. fetch_web_page is decoupled: a Firecrawl-style
@@ -329,8 +353,9 @@ class AgentToolRuntime:
 
     @property
     def _fetch_available(self) -> bool:
-        return self.fetch_provider is not None and bool(
-            getattr(self.fetch_provider, "available", True)
+        provider = self.fetch_provider
+        return provider is not None and not bool(getattr(provider, "reason", "")) and bool(
+            getattr(provider, "available", True)
         )
 
     @staticmethod
@@ -2517,6 +2542,9 @@ class AgentToolRuntime:
                 "extension_invocation_id": result.get("invocation_id"),
                 "target_type": result.get("target_type"),
             }
+            activation = result.get("capability_activation")
+            if isinstance(activation, dict):
+                extension_meta["capability_activation"] = activation
             if isinstance(result.get("skill_trigger"), dict):
                 extension_meta["skill_trigger"] = result["skill_trigger"]
             extension_result = result.get("result")

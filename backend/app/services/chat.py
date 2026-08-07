@@ -2348,7 +2348,14 @@ class ChatService:
                         "before more tools if it helps the user follow along.\n"
                         "End with the complete answer. Do not claim unfinished "
                         "work is done, and do not emit only tool calls with no "
-                        "visible narration.\n"
+                        "visible narration. For a user-facing teaching deliverable, "
+                        "validate the completed artifact before presenting it. Route "
+                        "trusted learning controls to canvas_emit_trusted_component, "
+                        "small self-contained interactive HTML to canvas_emit_magic_card, "
+                        "downloadable single files to sandbox_publish_file, and explain "
+                        "when a multi-file web app needs the dedicated bundle publication "
+                        "path. After successful validation, publish the appropriate "
+                        "deliverable before giving the final answer. "
                         "Session files: user attachments and generated images "
                         "are durable session files addressed by file_id "
                         "([host …] notes in the transcript list them). When the "
@@ -2521,6 +2528,9 @@ class ChatService:
         agent_mode_enabled: bool,
         web_search_enabled: bool,
         session_id: str | None = None,
+        *,
+        capability_families: set[str] | None = None,
+        activated_capabilities: set[str] | None = None,
     ) -> list[dict]:
         if not agent_mode_enabled:
             return []
@@ -2529,6 +2539,8 @@ class ChatService:
                 agent_mode_enabled=agent_mode_enabled,
                 web_search_enabled=web_search_enabled,
                 memory_enabled=self._session_memory_policy_enabled(session_id),
+                capability_families=capability_families,
+                activated_capabilities=activated_capabilities,
             )
         # Fallback path when the full AgentToolRuntime is not wired: still expose
         # the host clock, canvas emit helpers, and optionally search_web.
@@ -2866,6 +2878,7 @@ class ChatService:
             status = str(artifact.get("status") or "completed")
             if part_type not in {
                 "sandbox_artifact",
+                "subapp_artifact",
                 "sandbox",
                 "component",
                 "magic_card",
@@ -8133,6 +8146,11 @@ class ChatService:
 
                 max_attempts = 5
                 retry_tool_rounds = 0
+                # Turn-local progressive-disclosure state (mirror of the primary
+                # stream). Populated by lg_capability_activate and applied to the
+                # next retry provider invocation; never durable authorization.
+                activated_capability_ids: set[str] = set()
+                activated_capability_families: set[str] = set()
                 for attempt_no in range(1, max_attempts + 1):
                     if cancellation_requested():
                         raise _GenerationCancellationRequested()
@@ -8174,6 +8192,8 @@ class ChatService:
                                 retry_agent_mode,
                                 retry_context.web_search,
                                 session_id=session_id,
+                                capability_families=activated_capability_families,
+                                activated_capabilities=activated_capability_ids,
                             )
                             for provider_event in self.model_provider.stream_chat(
                                 provider_messages,
@@ -8583,6 +8603,19 @@ class ChatService:
                                         "content": result_content,
                                     }
                                 )
+                                if isinstance(result_meta, dict):
+                                    activation = result_meta.get(
+                                        "capability_activation"
+                                    )
+                                    if isinstance(activation, dict):
+                                        for cid in (
+                                            activation.get("capability_ids") or ()
+                                        ):
+                                            if isinstance(cid, str) and cid:
+                                                activated_capability_ids.add(cid)
+                                        for fam in activation.get("families") or ():
+                                            if isinstance(fam, str) and fam:
+                                                activated_capability_families.add(fam)
                                 tool_completed = self._append_event(
                                     session_id=session_id,
                                     message_id=message.id,
@@ -10696,6 +10729,12 @@ class ChatService:
             chunk_sequence = 0
             final_text = ""
             agent_tool_rounds = 0
+            # Turn-local progressive-disclosure state. Populated by the
+            # lg_capability_activate tool; applied to the next provider
+            # invocation's tool definitions. Never persisted and never treated
+            # as durable authorization.
+            activated_capability_ids: set[str] = set()
+            activated_capability_families: set[str] = set()
             terminal_event_persisted = False
             attempt: ProviderAttempt | None = None
             provider_response_state: ProviderResponseState | None = None
@@ -10873,6 +10912,8 @@ class ChatService:
                                 payload.agent_mode,
                                 payload.web_search,
                                 session_id=session_id,
+                                capability_families=activated_capability_families,
+                                activated_capabilities=activated_capability_ids,
                             )
                             for provider_event in self.model_provider.stream_chat(
                                 provider_messages,
@@ -11289,6 +11330,19 @@ class ChatService:
                                         "content": result_content,
                                     }
                                 )
+                                if isinstance(result_meta, dict):
+                                    activation = result_meta.get(
+                                        "capability_activation"
+                                    )
+                                    if isinstance(activation, dict):
+                                        for cid in (
+                                            activation.get("capability_ids") or ()
+                                        ):
+                                            if isinstance(cid, str) and cid:
+                                                activated_capability_ids.add(cid)
+                                        for fam in activation.get("families") or ():
+                                            if isinstance(fam, str) and fam:
+                                                activated_capability_families.add(fam)
                                 tool_completed = self._append_event(
                                     session_id=session_id,
                                     message_id=assistant_message.id,

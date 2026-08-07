@@ -15,6 +15,7 @@ import type {
   ProviderModelCapabilityUpdateRequest,
   ProviderModelCapabilityView,
   ProviderModelCatalogSyncView,
+  ProviderModelDeleteView,
   ProviderModelDefaultsView,
   ProviderModelStateView,
   ProviderModelStatesView,
@@ -205,6 +206,15 @@ export function updateProviderModelStates(
     ProviderModelStatesView,
     { states: Record<string, boolean> }
   >(`/providers/${encodeURIComponent(providerId)}/models`, { states });
+}
+
+export function deleteProviderModel(
+  providerId: string,
+  modelId: string,
+): Promise<ProviderModelDeleteView> {
+  return apiClient.delete<ProviderModelDeleteView>(
+    `/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}`,
+  );
 }
 
 export function updateProviderModelState(

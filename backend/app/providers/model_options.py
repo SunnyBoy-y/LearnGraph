@@ -179,6 +179,36 @@ def resolve_model_call_options(
     )
 
 
+def _context_tokens(value: Any) -> int | None:
+    """Parse a usable context value; provider ``0``/null means unknown."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if 8_000 <= parsed <= 10_000_000 else None
+
+
+def _normalize_context_tokens(
+    payload: dict[str, Any],
+) -> tuple[int, int, str]:
+    provider_window = _context_tokens(payload.get("context_window_tokens"))
+    catalog_window = _context_tokens(
+        unified_model_defaults(
+            str(payload.get("model_id") or ""),
+            provider_type=str(payload.get("provider_family") or ""),
+        ).get("context_window_tokens")
+    )
+    window = provider_window or catalog_window or UNKNOWN_MODEL_CONTEXT_TOKENS
+    provider_limit = _context_tokens(payload.get("context_limit_tokens"))
+    limit = min(provider_limit or window, window)
+    source = "provider" if provider_window else (
+        "official_catalog" if catalog_window else "conservative_default"
+    )
+    return window, limit, source
+
+
 def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate the user-confirmed portion of a per-model capability snapshot."""
 
@@ -236,13 +266,15 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         raise ModelCapabilityError(
             "image_input_mode=native requires supports_image_input=true"
         )
-    context_window_tokens = int(
-        payload.get("context_window_tokens") or UNKNOWN_MODEL_CONTEXT_TOKENS
+    context_window_tokens, context_limit_tokens, context_source = _normalize_context_tokens(
+        payload
     )
-    context_limit_tokens = int(
-        payload.get("context_limit_tokens") or context_window_tokens
+    context_confidence = (
+        "confirmed" if context_source in {"provider", "official_catalog"} else "unknown"
     )
-    max_output_tokens = int(payload.get("max_output_tokens") or 4_096)
+    if context_source == "conservative_default":
+        context_limit_tokens = min(context_limit_tokens, max(8_000, window := context_window_tokens - max_output_tokens - 8_192))
+
     try:
         chat_compaction_ratio = float(payload.get("chat_compaction_ratio", 0.8))
         agent_compaction_ratio = float(payload.get("agent_compaction_ratio", 1 / 3))

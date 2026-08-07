@@ -5,7 +5,8 @@ from typing import Any
 from app.providers.qwen_catalog import qwen_model_defaults
 
 
-UNKNOWN_MODEL_CONTEXT_TOKENS = 256_000
+UNKNOWN_MODEL_CONTEXT_TOKENS = 32_768
+UNKNOWN_MODEL_CONTEXT_SOURCE = "conservative_default"
 
 
 # This is a reviewed defaults catalogue, not a discovery substitute. Provider

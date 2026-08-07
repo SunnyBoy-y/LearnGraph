@@ -533,6 +533,12 @@ export interface ProviderModelStateView {
   is_default: boolean;
 }
 
+export interface ProviderModelDeleteView {
+  provider_id: string;
+  model_id: string;
+  default_model: string | null;
+}
+
 export interface ProviderModelStatesView {
   provider_id: string;
   states: Record<string, boolean>;
