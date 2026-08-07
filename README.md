@@ -61,7 +61,7 @@
 
 ## 📚 开发者文档
 
-开发者文档详细说明当前项目的系统架构、API 网关、Agent Runtime、系统提示词策略、Tools、Skills、MCP、Docker 沙箱、记忆系统、安全边界与真实验收规范。
+开发者文档详细说明当前项目的系统架构、API 网关、Agent Runtime、渐进式工具披露、Tools、Skills、MCP、Docker 沙箱、安全边界与真实验收规范。
 
 - [在线阅读开发者文档](https://sunnyboy-y.github.io/LearnGraph/)
 
@@ -123,9 +123,10 @@ LearnGraph 围绕“**人如何从 AI 学习**”而构建。面对一个陌生�
 | **学习对话** | Session、Message/MessagePart、SSE 流、消息版本、分支和结构化消息渲染 |
 | **资料与来源** | 文件上传、解析状态、本地对象存储、文档学习、联网来源与引用 |
 | **证据与行动** | Evidence、Mastery、练习、作答反馈、复习风险和下一步行动相关流程 |
-| **Agent 与扩展** | 模型、搜索、研究、Memory、MCP、Storage 等 Provider 边界，以及沙箱能力探测 |
+| **Agent 与扩展** | 模型、搜索、研究、MCP、Storage 等 Provider 边界；按当前模式、角色和授权按需装配工具；支持沙箱能力探测与受控执行 |
+| **渐进式工具** | 先向模型提供能力地图，再按需展开工具契约；工具采用原子动作、JSON Schema 参数校验、服务端权限复核、结果裁剪和审计，未授权能力明确不可用 |
+| **沙箱执行** | Docker-only 隔离的 Agent Workspace，默认断网，按会话与用户隔离；支持受限文件读写、列举、命令执行、转录和产物发布，具备配额、超时、幂等、审计与 SSE 状态回传 |
 | **工作区治理** | 登录、Membership、RBAC/ACL、用量、审计、迁移预检和工作区设置 |
-| **长期记忆** | 工作区隔离的 Markdown Memory、稳定 ID、Revision/CAS、恢复期和导出 |
 
 ## 🗺 后续规划
 
@@ -137,7 +138,7 @@ LearnGraph 围绕“**人如何从 AI 学习**”而构建。面对一个陌生�
 
 面向贡献者的工程优先级、已完成基线、P0/P1/P2 验收条件见 [ROADMAP.md](./ROADMAP.md)。其中 P2 是计划中的受限扩展，并不表示当前已提供；沙箱默认拒绝网络是当前已完成的安全基线。
 
-当前版本以 Web 应用为主要入口，远程模型、联网搜索、网页抓取、研究、ASR 和外部 Memory 等能力需要配置对应 Provider。
+当前版本以 Web 应用为主要入口，远程模型、联网搜索、网页抓取、研究、ASR 等能力需要配置对应 Provider。沙箱相关功能还需要 Docker。
 
 ## 🚀 快速开始
 
@@ -195,6 +196,12 @@ Provider API Key 默认由操作系统安全凭据库保护。首次在页面保
 
 </details>
 
+## 🧩 渐进式工具与沙箱执行
+
+LearnGraph 不会把所有工具一次性暴露给模型，而是根据当前模式、用户角色、工作区授权和可用 Provider，先编译能力地图，再按需加入具体工具契约。每个工具都对应一个可验证的原子动作：参数使用 JSON Schema 校验，服务端会再次检查作用域与 Grant，并对结果进行裁剪、持久化和审计。没有授权或运行条件不足时，能力会明确标记为不可用，不会静默回退到宿主机。
+
+Agent 需要执行代码、处理文件或生成产物时，使用 Docker-only 的 Agent Workspace。沙箱按聊天会话和属主用户隔离，默认断网，容器采用只读根文件系统、非 root 用户、能力 drop、超时和资源配额。支持受限文件读写、文件列举、脚本执行、音频转录桥接和产物发布；命令状态、退出码、截断、Artifact 与审计信息可通过持久化记录和 SSE 回传。Docker、镜像 digest 或配置不满足时，系统返回明确的 unavailable 状态，绝不在宿主机执行。
+
 ## 🏗 技术架构
 
 ```text
@@ -209,7 +216,7 @@ FastAPI /api/v1
 ├─ services: Goal、Graph、Chat、File、Learning 等用例
 ├─ repositories: 工作区作用域的数据访问
 └─ provider ports
-   ├─ local: 文件存储、Markdown Memory
+   ├─ local: 文件存储
    └─ remote: 模型、搜索、抓取、研究、Mem0、MCP
                          │
                          ▼
@@ -265,7 +272,7 @@ LearnGraph/
 - Provider Secret 由后端加密保存，不进入浏览器、日志、SSE、审计或导出。
 - 模型、搜索、研究和沙箱能力均采用显式可用性状态，调用结果与失败边界可以追踪。
 - Docker 沙箱不可用时返回明确状态，宿主机不会成为隐式执行环境。
-- 数据库、上传内容、本地 Memory、缓存、构建产物与真实凭据均由 Git 排除。
+- 数据库、上传内容、缓存、构建产物与真实凭据均由 Git 排除。
 - 学习资产面向 Markdown、JSON 等开放格式导出，支持长期持有和迁移。
 
 ## 🤝 参与贡献

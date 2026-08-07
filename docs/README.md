@@ -13,14 +13,11 @@
 - 系统架构与 FastAPI 应用网关
 - Provider Port / Adapter 边界
 - Agent Runtime、渐进式披露与原子工具模型
-- 系统提示词编译策略
-- Tools、Skills 与 MCP 授权模型
 - Docker 沙箱、Agent Workspace、网络与 egress 审批
-- Canonical Memory、事件投影、Provider Binding 与治理
 - Message / SSE 持久化和断线恢复理念
 - 安全、代码地图、扩展与验收规范
 
-页面包含无需后端的交互预览：媒体输入管线、能力渐进式披露和记忆事件投影。所有动画均支持 `prefers-reduced-motion`，不加载外部脚本、字体或图片。
+页面包含无需后端的交互预览：媒体输入管线与能力渐进式披露。所有动画均支持 `prefers-reduced-motion`，不加载外部脚本、字体或图片。
 
 ## 本地预览
 

@@ -195,16 +195,6 @@
     )
   );
 
-  const memoryButton = document.querySelector("[data-run-memory]");
-  memoryButton?.addEventListener("click", () =>
-    animateSequence(
-      [...document.querySelectorAll("[data-memory-preview] .memory-event")],
-      "is-done",
-      memoryButton,
-      { idle: "播放记忆事件流", done: "投影已同步", toast: "Canonical event 已投影到检索与治理视图" }
-    )
-  );
-
   const revealTargets = document.querySelectorAll(
     ".timeline-item, .principle-grid article, .tool-matrix article, .callout"
   );

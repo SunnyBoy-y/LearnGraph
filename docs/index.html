@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="LearnGraph 开发者文档：架构、API 网关、Agent、Tools、Skills、MCP、沙箱、记忆与系统提示词策略。"
+      content="LearnGraph 开发者文档：架构、API 网关、Agent、渐进式工具、Skills、MCP、Docker 沙箱与系统提示词策略。"
     />
     <title>LearnGraph Developer Docs</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23171a18'/%3E%3Cpath d='M8 10.5 16 6l8 4.5v9L16 24l-8-4.5zm0 0 8 4.5 8-4.5M16 15v9' fill='none' stroke='white' stroke-width='1.6'/%3E%3C/svg%3E" />
@@ -79,7 +79,6 @@
               <p>运行与数据</p>
               <a href="#sandbox">沙箱</a>
               <a href="#atomic-tools">原子工具</a>
-              <a href="#memory">记忆系统</a>
               <a href="#streaming">消息与 SSE</a>
               <a href="#trusted-components">可信组件</a>
               <a href="#security">安全与授权</a>
@@ -104,7 +103,7 @@
           <h1>理解 LearnGraph<br />从一条真实调用链开始</h1>
           <p class="hero-lead">
             LearnGraph 是一个目标驱动、证据驱动的学习图谱智能体。本页描述当前仓库中可验证的架构边界，
-            以及 Agent、Tools、Skills、MCP、沙箱、记忆和系统提示词如何协同工作。
+            以及 Agent、渐进式工具、Skills、MCP、Docker 沙箱和系统提示词如何协同工作。
           </p>
           <div class="hero-actions">
             <a class="button button-primary" href="#architecture">阅读架构</a>
@@ -234,7 +233,7 @@ npm.cmd run check</code></pre>
             </div>
           </div>
           <p>
-            当前实现是前后端分离的模块化单体。浏览器只调用 LearnGraph 后端；外部模型、搜索、抓取、研究、Memory、
+            当前实现是前后端分离的模块化单体。浏览器只调用 LearnGraph 后端；外部模型、搜索、抓取、研究、
             MCP 和存储都由后端经 Port/Adapter 边界访问。
           </p>
 
@@ -260,7 +259,7 @@ npm.cmd run check</code></pre>
                 <div class="arch-label">Domain</div>
                 <div class="arch-main">
                   <strong>Services + Repositories</strong>
-                  <span>Goal · Graph · Chat · Evidence · Mastery · Memory</span>
+                  <span>Goal · Graph · Chat · Evidence · Mastery</span>
                 </div>
               </div>
               <div class="arch-layer">
@@ -306,22 +305,22 @@ npm.cmd run check</code></pre>
             <span class="section-index">04A</span>
             <div><p class="overline">Architecture evolution</p><h2>从转录修复到可治理 Runtime</h2></div>
           </div>
-          <p>以 <code>c173b36</code>「修复音频、视频等转录 bug」为基线，当前版本不只是增加功能，而是把媒体输入、工具执行、沙箱和记忆都推进到可观察、可恢复、可审计的边界。</p>
+          <p>以 <code>c173b36</code>「修复音频、视频等转录 bug」为基线，当前版本把媒体输入、工具执行和沙箱推进到可观察、可恢复、可审计的边界。</p>
           <div class="timeline-rail">
             <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>基线 · c173b36</small><strong>先让媒体可靠进入系统</strong><p>修复 transcription model routing、音视频附件策略、解析器、文件服务和验证脚本；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
-            <div class="timeline-item timeline-current"><span class="timeline-dot"></span><div><small>当前 · HEAD</small><strong>再让能力可治理地运行</strong><p>增加 sandbox readiness、网络/egress 授权、原子工具、能力按需装配、记忆事件投影、断线恢复和媒体描述缓存。</p></div></div>
+            <div class="timeline-item timeline-current"><span class="timeline-dot"></span><div><small>当前 · HEAD</small><strong>再让能力可治理地运行</strong><p>增加 sandbox readiness、网络/egress 授权、原子工具、能力按需装配、断线恢复和媒体描述缓存。</p></div></div>
           </div>
           <div class="principle-grid">
             <article><span class="principle-icon">01</span><strong>能力先于格式</strong><p>按 MIME、解析能力和 Provider capability 路由；音频、视频、图片和文本文档不共享一条假设链。</p></article>
             <article><span class="principle-icon">02</span><strong>边界先于便利</strong><p>沙箱、工具、Grant、工作区和 Provider 都是独立边界；没有能力就明确 unavailable，不静默落回宿主。</p></article>
-            <article><span class="principle-icon">03</span><strong>事实先于投影</strong><p>数据库事件、revision 和 audit 是事实；SSE、Memory Provider、UI 面板和缓存都是可重建投影。</p></article>
+            <article><span class="principle-icon">03</span><strong>事实先于视图</strong><p>数据库记录、revision 和 audit 是事实；SSE、UI 面板和缓存都是可恢复或可重建的视图。</p></article>
             <article><span class="principle-icon">04</span><strong>按需披露</strong><p>模型先看到能力摘要和授权范围，再在需要时发现工具、读取大结果或展开上下文，减少噪声与权限面。</p></article>
           </div>
           <div class="compare evolution-compare">
             <div><span class="compare-label">baseline</span><h3>转录修复版</h3><ul><li>重点是音视频能否被正确解析和路由</li><li>附件策略与 Provider 失败边界开始显式化</li><li>验证以脚本和单次请求为主</li></ul></div>
-            <div><span class="compare-label">current</span><h3>当前治理版</h3><ul><li>输入、工具、沙箱、记忆均有稳定事实和生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
+            <div><span class="compare-label">current</span><h3>当前治理版</h3><ul><li>输入、工具和沙箱均有稳定事实与生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
           </div>
-          <div class="source-ref">对比基线：<code>git show c173b36</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/memory_projector.py</code></div>
+          <div class="source-ref">对比基线：<code>git show c173b36</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
         </section>
 
         <section id="media-inputs" class="doc-section" data-title="媒体与文档输入">
@@ -383,7 +382,7 @@ npm.cmd run check</code></pre>
           <div class="route-cloud" aria-label="FastAPI 路由域">
             <code>auth</code><code>dashboard</code><code>goals</code><code>graphs</code><code>sessions</code>
             <code>files</code><code>research</code><code>sources</code><code>evidence</code><code>exercises</code>
-            <code>memory</code><code>mcp-skills</code><code>providers</code><code>usage</code><code>plugins</code>
+            <code>mcp-skills</code><code>providers</code><code>usage</code><code>plugins</code>
             <code>components</code><code>migrations</code><code>audit</code><code>workflow</code><code>sandbox</code>
           </div>
         </section>
@@ -397,7 +396,7 @@ npm.cmd run check</code></pre>
             </div>
           </div>
           <p>
-            SQLite 是 MVP 的规范业务事实源。本地文件系统承载默认对象存储和 Markdown Memory 投影，
+            SQLite 是 MVP 的规范业务事实源。本地文件系统承载默认对象存储，
             但文件路径、外部 UUID 或 SSE 事件都不能替代数据库中的稳定业务身份。
           </p>
           <table>
@@ -406,14 +405,13 @@ npm.cmd run check</code></pre>
               <tr><td>SQLAlchemy / SQLite</td><td>账号、RBAC、Goal、Graph、Session、Evidence、Provider、授权、审计</td><td>当前规范事实源</td></tr>
               <tr><td>Message timeline</td><td>Message、MessageVersion、MessagePart、SSE 事件、Provider Trace</td><td>SSE 只负责传输</td></tr>
               <tr><td>Object Storage</td><td>上传文件、生成产物、内容寻址 Blob</td><td>默认本地，可经迁移边界切换</td></tr>
-              <tr><td>Memory projection</td><td>Workspace 隔离的 Markdown 文件树或 Mem0 记录</td><td>Canonical ID/Revision 仍在 SQLite</td></tr>
             </tbody>
           </table>
           <div class="callout callout-note">
             <span class="callout-icon">i</span>
             <div>
               <strong>迁移不是双写</strong>
-              <p>数据库、对象存储和 Memory Provider 切换需要维护锁、预检、校验、切换点与回滚；不能静默双写或降级。</p>
+              <p>数据库和对象存储切换需要维护锁、预检、校验、切换点与回滚；不能静默双写或降级。</p>
             </div>
           </div>
         </section>
@@ -435,7 +433,6 @@ npm.cmd run check</code></pre>
             <div><span>Search</span><strong>SearXNG · Cloud / AnySearch</strong><small>搜索不可用时显式失败，不生成来源</small></div>
             <div><span>Fetch</span><strong>Crawl4AI HTTP · Firecrawl</strong><small>URL 安全校验、超时和响应结构限制</small></div>
             <div><span>Research</span><strong>Deep Research HTTP</strong><small>独立 Provider，不与普通搜索混淆</small></div>
-            <div><span>Memory</span><strong>Local Markdown · Mem0 Platform</strong><small>Provider Binding 可重建，Stable ID 不变</small></div>
             <div><span>Storage</span><strong>Local filesystem · MinIO</strong><small>通过迁移流程切换</small></div>
             <div><span>Sandbox</span><strong>Docker backend</strong><small>无 Docker 时明确 unavailable，不落回宿主执行</small></div>
           </div>
@@ -473,7 +470,7 @@ npm.cmd run check</code></pre>
           <h3>一次 Agent Turn</h3>
           <ol class="steps">
             <li><span>01</span><div><strong>持久化用户输入</strong><p>用户消息、附件引用、所选节点与 Session 绑定先成为可追踪事实。</p></div></li>
-            <li><span>02</span><div><strong>构建授权上下文</strong><p>只加入本次允许访问的节点、文件、选区、Memory 和 Skill 指令；文档片段被标记为不可信参考数据。</p></div></li>
+            <li><span>02</span><div><strong>构建授权上下文</strong><p>只加入本次允许访问的节点、文件、选区和 Skill 指令；文档片段被标记为不可信参考数据。</p></div></li>
             <li><span>03</span><div><strong>计算工具注册表</strong><p>内置工具按角色开放；声明式 Skill 与 MCP 还必须具有 enabled 状态和持久 <code>always</code> Grant。</p></div></li>
             <li><span>04</span><div><strong>调用模型 Provider</strong><p>适配器把结构化消息与 JSON Schema 工具定义发送给已配置远程模型。</p></div></li>
             <li><span>05</span><div><strong>受控执行 Tool Call</strong><p>服务端解析参数、重新校验作用域与授权、执行领域服务或 Provider，并保存 Invocation / Audit。</p></div></li>
@@ -494,11 +491,18 @@ npm.cmd run check</code></pre>
 
         <section id="progressive-disclosure" class="doc-section doc-section-accent" data-title="渐进式披露">
           <div class="section-heading"><span class="section-index">09A</span><div><p class="overline">Progressive disclosure</p><h2>先给能力地图，再展开执行细节</h2></div></div>
-          <p>渐进式披露不是隐藏能力，而是控制每一轮进入模型上下文的内容和权限面。默认只注册当前模式、角色、授权和资源真正需要的工具；复杂工具通过 Skill/MCP 快照或能力族按需激活。</p>
+          <p>渐进式披露不是隐藏能力，而是控制每一轮进入模型上下文的工具数量、描述体量和权限面。运行时先计算本轮能力地图，只把当前模式、用户角色、工作区 Grant、资源作用域和 Provider 状态允许的工具族放入候选集合；模型需要某项能力时，再读取其精确契约或调用按需发现工具。</p>
           <div class="disclosure-demo" data-disclosure-demo>
-            <div class="disclosure-stage is-visible"><span>01</span><strong>Capability map</strong><p>能力族、状态、来源、授权范围</p></div><div class="disclosure-stage"><span>02</span><strong>Tool contract</strong><p>schema、限制、错误和结果句柄</p></div><div class="disclosure-stage"><span>03</span><strong>Execution trace</strong><p>调用、审批、结果、审计和产物</p></div>
+            <div class="disclosure-stage is-visible"><span>01</span><strong>Capability map</strong><p>工具族 · 状态 · 来源 · 授权范围</p></div><div class="disclosure-stage"><span>02</span><strong>Discover contract</strong><p>按需读取 schema · 限制 · 错误语义</p></div><div class="disclosure-stage"><span>03</span><strong>Execute & trace</strong><p>权限复核 · 结果句柄 · 审计 · 产物</p></div>
           </div>
           <button class="demo-button" type="button" data-run-disclosure>逐层展开工具上下文</button>
+          <h3>披露与调用的三层边界</h3>
+          <div class="plain-grid">
+            <div><strong>可见性边界</strong><p>普通 Chat 不注册函数；Agent 模式也只看到当前任务可能需要且已经启用的工具族。MCP 与 Skill 的旧描述不能替代当前 Capability Snapshot。</p></div>
+            <div><strong>契约边界</strong><p>工具名称、JSON Schema、参数上限、错误语义和结果句柄按需展开；大结果优先返回摘要、文件或 Artifact 引用，不把完整 payload 塞回上下文。</p></div>
+            <div><strong>授权边界</strong><p>工具对模型可见不代表一定可执行。每次调用仍由服务端重新验证 Membership、workspace permission、资源作用域、Grant 和 Provider readiness。</p></div>
+            <div><strong>审计边界</strong><p>调用参数使用脱敏摘要持久化；成功、拒绝、超时、截断和 unavailable 都是规范结果，并与 MessagePart、Invocation 或 Sandbox Command 关联。</p></div>
+          </div>
           <div class="callout callout-note"><span class="callout-icon">i</span><div><strong>原子工具的边界</strong><p>一个工具只负责一个可验证动作，例如读文件、写文件、列举文件、执行命令、转录或发布产物。组合逻辑留给 Agent；授权、幂等、审计和结果裁剪留在服务端。</p></div></div>
           <div class="source-ref">来源：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/mcp_skills.py</code> · <code>backend/app/services/sandbox.py</code></div>
         </section>
@@ -506,7 +510,16 @@ npm.cmd run check</code></pre>
         <section id="atomic-tools" class="doc-section" data-title="原子工具">
           <div class="section-heading"><span class="section-index">15A</span><div><p class="overline">Atomic capabilities</p><h2>工具是权限边界，不是模型的万能遥控器</h2></div></div>
           <div class="tool-matrix"><article><span class="tool-family family-read">READ</span><strong>观察</strong><p>read_file、list_files、subapp_observe 等只读能力返回有限摘要，不直接暴露不可信 payload。</p></article><article><span class="tool-family family-write">WRITE</span><strong>修改</strong><p>write_file、publish_file 等改变状态的能力需要明确作用域、大小限制和可追踪结果。</p></article><article><span class="tool-family family-run">RUN</span><strong>执行</strong><p>exec、transcribe_audio 运行在受控 Provider/沙箱中，保留超时、退出码、截断和审计。</p></article><article><span class="tool-family family-approve">APPROVE</span><strong>破坏性动作</strong><p>删除、外发、网络访问等操作与 Grant/egress approval 绑定，拒绝也是完整结果。</p></article></div>
-          <div class="flow-row"><span>capability snapshot</span><i>→</i><span>enabled + grant</span><i>→</i><span>schema validation</span><i>→</i><span>execution</span><i>→</i><span>normalized result</span><i>→</i><span>audit / MessagePart</span></div>
+          <div class="flow-row"><span>capability map</span><i>→</i><span>discover contract</span><i>→</i><span>enabled + grant</span><i>→</i><span>schema validation</span><i>→</i><span>execution</span><i>→</i><span>normalized result</span><i>→</i><span>audit / MessagePart</span></div>
+          <table>
+            <thead><tr><th>原子工具属性</th><th>服务端要求</th><th>失败时行为</th></tr></thead>
+            <tbody>
+              <tr><td>单一动作</td><td>读、写、列举、执行、转录、发布分别建模，不提供绕过策略的万能 shell 工具</td><td>返回稳定错误码，不猜测替代动作</td></tr>
+              <tr><td>最小输入</td><td>路径、ID、argv 和选项均有类型、长度、数量与作用域限制</td><td>参数校验失败时不进入执行器</td></tr>
+              <tr><td>最小输出</td><td>输出裁剪并优先产生结构化摘要、句柄或 Artifact；敏感字段先脱敏</td><td>截断和脱敏状态随结果返回</td></tr>
+              <tr><td>可重试语义</td><td>改变状态的动作使用幂等键或 revision/CAS，避免模型重试造成重复副作用</td><td>冲突、重复和授权挑战保持可区分</td></tr>
+            </tbody>
+          </table>
           <div class="source-ref">来源：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
         </section>
 
@@ -541,7 +554,7 @@ npm.cmd run check</code></pre>
             </div>
             <div class="prompt-layer">
               <span>优先级 5</span>
-              <div><strong>Authorized Context</strong><p>选中节点、附件、文档选区、Memory 与最多 8 个已授权 Skill 包。</p></div>
+              <div><strong>Authorized Context</strong><p>选中节点、附件、文档选区与最多 8 个已授权 Skill 包。</p></div>
             </div>
             <div class="prompt-layer">
               <span>优先级 6</span>
@@ -584,7 +597,6 @@ npm.cmd run check</code></pre>
               <tr><td>会话与时间</td><td>检索 Session 片段、读取历史区段、读取当前时区时间</td><td>只读</td></tr>
               <tr><td>图谱</td><td>读取目标/能力图谱、候选节点更新、提出图谱变更</td><td>正式图谱须用户审核</td></tr>
               <tr><td>学习闭环</td><td>路线读取/重规划、行动计划、Mastery 读取、Evidence 草稿</td><td>Evidence 只写 pending</td></tr>
-              <tr><td>记忆</td><td>检索会话证据、读取记忆证据、提出 Memory Draft</td><td>草稿与正式记忆分离</td></tr>
               <tr><td>Provider</td><td>列 Provider/模型、能力查询、配置与 Secret 轮换</td><td>管理写入要求 workspace.manage</td></tr>
               <tr><td>Web</td><td><code>search_web</code>、<code>parallel_web_research</code></td><td>仅在 SearchProvider 可用时注册</td></tr>
               <tr><td>内容产物</td><td>图片生成、可信组件、Magic Card、沙箱文件 Artifact</td><td>不允许任意代码进入宿主 DOM</td></tr>
@@ -836,150 +848,6 @@ npm.cmd run check</code></pre>
             </div>
           </div>
           <div class="source-ref">来源：<code>backend/app/services/sandbox.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/services/session_workspace.py</code> · <code>backend/app/providers/remote/sandbox.py</code> · <code>backend/sandbox/</code></div>
-        </section>
-
-        <section id="memory" class="doc-section" data-title="记忆系统">
-          <div class="section-heading">
-            <span class="section-index">13</span>
-            <div>
-              <p class="overline">Durable memory</p>
-              <h2>记忆系统</h2>
-            </div>
-          </div>
-          <p>
-            记忆系统是一套 Goal-Scoped Memory Graph：Canonical 事实存 SQLite，Provider 只做可重建投影。
-            每条记忆由 LearnGraph 生成稳定 <code>lgm_&lt;uuid&gt;</code>；Provider 路径或 Mem0 UUID 只是 Binding。
-            基线召回不依赖任何外部模型；抽取、语义检索、会话摘要三条增强管线按工作区独立开启。
-          </p>
-
-          <div class="memory-layout">
-            <div class="memory-canonical">
-              <span>Canonical facts</span>
-              <strong>Events + Revision</strong>
-              <small>SQLite · scope · journal · audit</small>
-            </div>
-            <div class="memory-arrow">project →</div>
-            <div class="memory-provider">
-              <span>Derived views</span>
-              <strong>Provider / Retrieval</strong>
-              <small>Markdown · Mem0 · embeddings · context manifest</small>
-            </div>
-          </div>
-          <div class="memory-event-preview" data-memory-preview>
-            <div class="memory-event is-done"><span>01</span><strong>capture</strong><small>user/session evidence</small></div><i>→</i>
-            <div class="memory-event is-done"><span>02</span><strong>append</strong><small>immutable event</small></div><i>→</i>
-            <div class="memory-event"><span>03</span><strong>project</strong><small>canonical memory</small></div><i>→</i>
-            <div class="memory-event"><span>04</span><strong>retrieve</strong><small>scored package</small></div><i>→</i>
-            <div class="memory-event"><span>05</span><strong>govern</strong><small>draft · commit · reject</small></div>
-          </div>
-          <button class="demo-button" type="button" data-run-memory>播放记忆事件流</button>
-
-          <h3>记忆类型注册表</h3>
-          <p>
-            九种类型集中定义在 <code>domain/memory_types.py</code>，每种声明默认知识作用域、跨作用域合并策略与衰减策略。
-            权威业务状态（掌握分、路线版本、存储路径等）禁止写入记忆正文，创建时会被 422 拒绝。
-          </p>
-          <table>
-            <thead><tr><th>类型</th><th>默认作用域</th><th>合并策略</th><th>衰减</th></tr></thead>
-            <tbody>
-              <tr><td><code>semantic_memory</code> 语义事实</td><td>workspace</td><td>UNION</td><td>SLOW</td></tr>
-              <tr><td><code>learning_preference</code> 学习偏好</td><td>workspace</td><td>INHERIT_UNTIL_OVERRIDE</td><td>NONE</td></tr>
-              <tr><td><code>teacher_focus</code> 教学侧重</td><td>goal</td><td>UNION</td><td>GOAL_LIFECYCLE</td></tr>
-              <tr><td><code>misconception</code> 错误概念</td><td>node</td><td>LOCAL_ONLY</td><td>FAST（验证驱动）</td></tr>
-              <tr><td><code>strategy_effectiveness</code> 策略有效性</td><td>goal</td><td>KEYED_MERGE</td><td>SLOW</td></tr>
-              <tr><td><code>decision</code> 决定</td><td>goal</td><td>APPEND</td><td>SLOW</td></tr>
-              <tr><td><code>goal_constraint</code> 目标约束</td><td>goal</td><td>OVERRIDE</td><td>GOAL_LIFECYCLE</td></tr>
-              <tr><td><code>ai_observation</code> AI 观察</td><td>session</td><td>LOCAL_ONLY</td><td>FAST（需确认）</td></tr>
-              <tr><td><code>event_summary</code> 事件总结</td><td>workspace</td><td>APPEND</td><td>SLOW</td></tr>
-            </tbody>
-          </table>
-
-          <h3>召回管线（每轮对话）</h3>
-          <ol class="steps">
-            <li><span>01</span><div><strong>策略闸门</strong><p>工作区总开关与 Session 开关必须同时开启，否则返回空包；Agent 的记忆/跨会话检索工具随同一开关一起消失，关记忆等于真隔离。</p></div></li>
-            <li><span>02</span><div><strong>候选筛选</strong><p>只取 <code>active</code> 且位于 <code>hot / recent / topics</code> 区的记录；<code>archive</code> 区不参与召回。会话命名空间只见本 Session。</p></div></li>
-            <li><span>03</span><div><strong>作用域动态继承</strong><p>子作用域不复制父记忆，查询时按 workspace → goal → node 组装有效视图；当前消息与选中节点作为召回上下文传入。</p></div></li>
-            <li><span>04</span><div><strong>打分与语义放大</strong><p>启发式得分乘上可选的 Embedding 余弦相似度放大项；Embedding 未配置、失败或预算耗尽时静默退回纯启发式。</p></div></li>
-            <li><span>05</span><div><strong>类型感知合并</strong><p><code>OVERRIDE / INHERIT_UNTIL_OVERRIDE</code> 只保留最近作用域赢家并记录冲突；<code>LOCAL_ONLY</code> 不跨界。</p></div></li>
-            <li><span>06</span><div><strong>Top-8 + Token 预算</strong><p>注入块受输入预算约 8%（400–3000 tokens，CJK 感知估算）约束，低排名条目被丢弃而非溢出；只有实际注入的记忆才累计访问强化。</p></div></li>
-          </ol>
-          <div class="code-block">
-            <div class="code-header">
-              <span>打分公式 · services/memory.py</span>
-              <button type="button" data-copy-code>复制</button>
-            </div>
-            <pre><code>strength = importance + 0.25·ln(1+access) + 0.30·confirm + 0.20·success
-           + goal_bonus − decay_rate·elapsed_days − conflict_penalty
-score    = strength × proximity × confidence × zone_factor × boost
-<span class="code-comment"># proximity: node 1.0 / goal 0.85 / session 0.8 / workspace 0.55</span>
-<span class="code-comment"># zone_factor: hot 1.0 / recent 0.9 / topics 0.8；resolved 误区降至 0.15</span>
-<span class="code-comment"># 配置 Embedding 后: score ×= 1 + weight·max(cosine, 0)</span></code></pre>
-          </div>
-
-          <h3>草稿流：唯一的自动写入通道</h3>
-          <p>
-            Agent 与后台抽取都不能直写长期记忆，一切变更先落 <code>MemoryDraft</code>（八种操作）。
-            CREATE 在置信度 ≥ 0.75 且类型不要求确认时可自动提交；UPDATE 一律人工审核；
-            SUPERSEDE 会创建新记忆并以 <code>supersedes_id</code> 记录血缘，旧记录移入 <code>archive</code> 冷区留作审计。
-          </p>
-
-          <h3>写入与删除语义</h3>
-          <ol class="steps compact-steps">
-            <li><span>01</span><div><strong>Canonical mutation</strong><p>创建新 Revision、Provider-neutral Journal 与内容 Hash；更新走 <code>expected_revision</code> 乐观锁，冲突返回 409。</p></div></li>
-            <li><span>02</span><div><strong>Provider projection</strong><p>写入 Active Provider，并按稳定 ID + Revision 精确回读校验。</p></div></li>
-            <li><span>03</span><div><strong>Commit binding</strong><p>只有回读 Hash 一致才提交 Binding 与业务事务。</p></div></li>
-            <li><span>04</span><div><strong>Recoverable delete</strong><p>删除后正文以每记忆独立密钥加密保留 30 分钟，密钥落在 SQLite 之外；Revision 正文立即清空。</p></div></li>
-            <li><span>05</span><div><strong>Cryptographic destruction</strong><p>窗口到期由保留期调度器销毁内容密钥与恢复密文；删除 Journal 元数据最长保留 7 天。</p></div></li>
-          </ol>
-
-          <h3>可选增强管线</h3>
-          <p>
-            配置集中在 WorkspaceSetting <code>memory.enhancement</code>，三条管线互相独立、默认关闭；
-            全部调用计入 <code>usage_events</code>（feature 分别为
-            <code>memory_extraction</code>、<code>memory_embedding</code>、<code>context_summarization</code>），常见模型自动落价。
-          </p>
-          <div class="plain-grid">
-            <div>
-              <strong>自动记忆抽取（Dreaming 式）</strong>
-              <p>后台调度器在会话安静（默认 180s）后，用独立配置的模型从新增轮次抽取候选记忆；
-              游标存 <code>memory_extraction_states</code>，按 content hash 去重，严格走草稿流。预算耗尽时跳过且不推进游标。</p>
-            </div>
-            <div>
-              <strong>语义检索插件（Embedding）</strong>
-              <p>任意 OpenAI 兼容 <code>/embeddings</code> 端点（如 Qwen text-embedding-v4）；
-              向量缓存于 <code>memory_embeddings</code> 并在召回时懒回填，支持一键重建索引。移除配置即恢复无 Embedding 行为。</p>
-            </div>
-            <div>
-              <strong>会话滚动摘要</strong>
-              <p>长会话较早内容由模型滚动压缩为 <code>ContextSummary kind='model'</code>；
-              聊天压缩优先复用覆盖前缀，仅对未覆盖尾部降级为机械截断。模型留空时复用抽取模型。热路径零额外延迟。</p>
-            </div>
-            <div>
-              <strong>注入预览（透明度）</strong>
-              <p><code>GET /memory/package</code> 返回某 Session 下一轮实际注入的记忆清单、得分、作用域冲突与完整 prompt 文本；
-              前端记忆页提供「AI 眼中的我」一键预览。</p>
-            </div>
-          </div>
-
-          <h3>API 面</h3>
-          <table>
-            <thead><tr><th>端点组</th><th>职责</th></tr></thead>
-            <tbody>
-              <tr><td><code>/memory</code> · <code>/{id}/revisions</code> · <code>/{id}/journal</code> · <code>/{id}/bindings</code></td><td>CRUD、版本历史与回滚、审计日志、Provider Binding</td></tr>
-              <tr><td><code>/memory/drafts</code> · <code>/drafts/{id}/decision</code></td><td>草稿提交与 commit / reject 审核</td></tr>
-              <tr><td><code>/memory/policy</code> · <code>/memory/package</code></td><td>工作区 / Session 双开关；注入预览</td></tr>
-              <tr><td><code>/memory/enhancement</code> · <code>/reindex</code> · <code>/extract/{sid}</code> · <code>/summarize/{sid}</code></td><td>增强管线配置、向量重建、手动抽取 / 摘要触发</td></tr>
-              <tr><td><code>/memory/export</code> · <code>/maintenance/purge-expired</code></td><td>Markdown ZIP 导出（含 manifest 哈希）；保留期清理</td></tr>
-            </tbody>
-          </table>
-          <div class="callout callout-warning">
-            <span class="callout-icon">!</span>
-            <div>
-              <strong>切换 Provider 必须迁移</strong>
-              <p>记录属于另一 Provider 世代时，Mutation 返回 <code>409 memory_provider_migration_required</code>；不会静默双写到新 Provider。</p>
-            </div>
-          </div>
-          <div class="source-ref">来源：<code>backend/app/services/memory.py</code> · <code>backend/app/services/memory_enhancement.py</code> · <code>backend/app/domain/memory_types.py</code> · <code>backend/tests/test_memory_subsystem.py</code></div>
         </section>
 
         <section id="streaming" class="doc-section" data-title="消息与 SSE">
@@ -1406,7 +1274,7 @@ npm.cmd --prefix frontend run test:e2e
       <section class="search-panel" role="dialog" aria-modal="true" aria-labelledby="search-title">
         <div class="search-field">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.4-3.4"></path></svg>
-          <input id="search-title" type="search" placeholder="搜索架构、Agent、MCP、Memory…" autocomplete="off" data-search-input />
+          <input id="search-title" type="search" placeholder="搜索架构、Agent、MCP、Sandbox…" autocomplete="off" data-search-input />
           <kbd>Esc</kbd>
         </div>
         <div class="search-results" data-search-results>
