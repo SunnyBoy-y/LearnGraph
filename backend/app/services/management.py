@@ -1162,6 +1162,7 @@ class ProviderService:
         }
         models = dict(capabilities.get("models") or {})
         synced: list[dict] = []
+        warnings: list[dict[str, object]] = []
         for raw_id in model_ids:
             model_id = raw_id.strip()
             if not model_id:
@@ -1172,12 +1173,25 @@ class ProviderService:
             try:
                 validated = validate_model_capability_update(snapshot)
             except ModelCapabilityError as exc:
-                raise AppError(
-                    422,
-                    "invalid_model_capabilities",
-                    f"{model_id}: {exc}",
-                ) from exc
+                warnings.append(
+                    {
+                        "model_id": model_id,
+                        "field": "capabilities",
+                        "message": f"能力目录无效，已跳过保存：{exc}",
+                    }
+                )
+                continue
             models[model_id] = validated
+            if validated.get("context_window_source") == "conservative_default":
+                warnings.append(
+                    {
+                        "model_id": model_id,
+                        "field": "context_window_tokens",
+                        "message": "供应商未提供有效上下文长度，已采用默认 256K，可在模型设置中调整",
+                        "fallback_value": validated["context_window_tokens"],
+                        "source": "conservative_default",
+                    }
+                )
             hidden_model_ids.discard(model_id)
             synced.append(
                 {
@@ -1224,7 +1238,7 @@ class ProviderService:
             },
         )
         self.db.commit()
-        return {"provider_id": provider.id, "models": synced}
+        return {"provider_id": provider.id, "models": synced, "warnings": warnings}
 
     @staticmethod
     def _model_default_field(provider: ProviderConfig) -> str:
@@ -2580,14 +2594,17 @@ class ProviderService:
         self.db.refresh(provider)
         # Discovery populates the same persistent catalog snapshots as manual
         # additions, so model selection and supplier configuration stay aligned.
+        warnings: list[dict[str, object]] = []
         if model_ids:
-            self.sync_model_catalog_defaults(provider.id, model_ids)
+            sync_result = self.sync_model_catalog_defaults(provider.id, model_ids)
+            warnings = list(sync_result.get("warnings") or [])
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
             capabilities = dict(provider.capabilities or {})
         return {
             "provider_id": provider.id,
-            "status": "discovered",
+            "status": "discovered_with_warnings" if warnings else "discovered",
+            "warnings": warnings,
             "models": [
                 {
                     "id": model_id,

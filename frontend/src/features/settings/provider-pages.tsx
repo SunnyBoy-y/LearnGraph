@@ -517,6 +517,13 @@ export function ProvidersPage() {
     mutationFn: discoverProviderModels,
     onSuccess: (result) => {
       setModels((current) => ({ ...current, [result.provider_id]: result }));
+      if (result.warnings?.length) {
+        toast.warning(
+          `已发现 ${result.models.length} 个模型，其中 ${result.warnings.length} 个模型未提供上下文长度，已采用默认值，可在模型设置中调整`,
+        );
+      } else {
+        toast.success(`已发现 ${result.models.length} 个模型`);
+      }
       const configuredProvider = providers.data?.find(
         (provider) => provider.id === result.provider_id,
       );
@@ -3256,8 +3263,28 @@ function normalizeLoadedCapabilities(
 ): ProviderModelCapabilities {
   const chatRatio = Number(capabilities.chat_compaction_ratio);
   const agentRatio = Number(capabilities.agent_compaction_ratio);
+  const rawWindow = Number(capabilities.context_window_tokens);
+  const contextWindow =
+    Number.isFinite(rawWindow) && rawWindow >= 8_000 && rawWindow <= 10_000_000
+      ? rawWindow
+      : 256_000;
+  const rawLimit = Number(capabilities.context_limit_tokens);
+  const contextLimit =
+    Number.isFinite(rawLimit) && rawLimit >= 8_000
+      ? Math.min(rawLimit, contextWindow)
+      : 204_000;
   return {
     ...capabilities,
+    context_window_tokens: contextWindow,
+    context_limit_tokens: contextLimit,
+    context_window_source:
+      contextWindow === rawWindow
+        ? capabilities.context_window_source
+        : "conservative_default",
+    context_window_confidence:
+      contextWindow === rawWindow
+        ? capabilities.context_window_confidence
+        : "unknown",
     reasoning_parameter: normalizeReasoningParameter(capabilities.reasoning_parameter),
     default_search_route: normalizeDefaultSearchRoute(capabilities.default_search_route),
     chat_compaction_ratio:
@@ -3291,7 +3318,9 @@ function emptyModelCapabilities(): ProviderModelCapabilities {
     default_search_route: "auto",
     capability_source: "user_declared",
     context_window_tokens: 256_000,
-    context_limit_tokens: 256_000,
+    context_limit_tokens: 204_000,
+    context_window_source: "conservative_default",
+    context_window_confidence: "unknown",
     max_output_tokens: 4_096,
     chat_compaction_ratio: 0.8,
     agent_compaction_ratio: 1 / 3,
@@ -4054,10 +4083,7 @@ function capabilityContextError(capabilities: ProviderModelCapabilities): string
 function capabilitiesForSave(
   capabilities: ProviderModelCapabilities,
 ): ProviderModelCapabilities {
-  return {
-    ...capabilities,
-    context_limit_tokens: capabilities.context_window_tokens,
-  };
+  return capabilities;
 }
 
 function CapabilityFormFields({
@@ -4100,6 +4126,15 @@ function CapabilityFormFields({
           <p className="mt-1 text-xs text-muted-foreground">
             分别设置模型可接收的最大输入和最大输出，并按模式控制历史消息压缩门槛。
           </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            当前输入上限来源：{capabilities.context_window_source === "provider"
+              ? "供应商声明"
+              : capabilities.context_window_source === "official_catalog"
+                ? "模型目录"
+                : capabilities.context_window_source === "user_declared"
+                  ? "手动设置"
+                  : "默认值（供应商未提供，可手动调整）"}
+          </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
           <Label>
@@ -4113,7 +4148,9 @@ function CapabilityFormFields({
                 setCapabilities((current) => ({
                   ...current,
                   context_window_tokens: value,
-                  context_limit_tokens: value,
+                  context_limit_tokens: Math.min(current.context_limit_tokens, value),
+                  context_window_source: "user_declared",
+                  context_window_confidence: "confirmed",
                 }));
               }}
               type="number"

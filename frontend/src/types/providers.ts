@@ -447,11 +447,20 @@ export interface ProviderModel {
   [key: string]: unknown;
 }
 
+export interface ProviderDiscoveryWarning {
+  model_id: string;
+  field: string;
+  message: string;
+  fallback_value?: number;
+  source?: string;
+}
+
 export interface ProviderModelsResponse {
   provider_id: string;
   status: string;
   models: ProviderModel[];
   notice?: string;
+  warnings?: ProviderDiscoveryWarning[];
 }
 
 export type ThinkingMode = "off" | "low" | "medium" | "high" | "xhigh";
@@ -495,6 +504,9 @@ export interface ProviderModelCapabilities {
   image_input_mode?: ImageInputMode;
   default_search_route: SearchRoute;
   capability_source: ModelCapabilitySource;
+  /** Where the context value came from. */
+  context_window_source?: "provider" | "official_catalog" | "user_declared" | "conservative_default";
+  context_window_confidence?: "confirmed" | "inferred" | "unknown";
   /** Maximum input context accepted by the model. */
   context_window_tokens: number;
   /** Legacy alias retained for persisted capability snapshots. */

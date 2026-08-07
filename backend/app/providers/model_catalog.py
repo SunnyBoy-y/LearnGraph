@@ -5,7 +5,7 @@ from typing import Any
 from app.providers.qwen_catalog import qwen_model_defaults
 
 
-UNKNOWN_MODEL_CONTEXT_TOKENS = 32_768
+UNKNOWN_MODEL_CONTEXT_TOKENS = 256_000
 UNKNOWN_MODEL_CONTEXT_SOURCE = "conservative_default"
 
 
@@ -185,6 +185,11 @@ def unified_model_defaults(
     overlay = capability_overlay(model_id, base)
     if overlay:
         base.update(overlay)
+    # Keep a runtime-only provenance bit. It is intentionally not part of the
+    # user-editable capability schema: image routing uses it to distinguish a
+    # catalog-confirmed text model from a private model that still needs one
+    # native vision probe.
+    base["models_dev_known"] = bool(overlay)
     # Local Ollama deployments: the official docs confirm DeepSeek-R1 (and its
     # distilled variants) accept ``think: false`` to disable reasoning
     # (``ollama run deepseek-r1 --think=false``). ``qwen_model_defaults`` marks

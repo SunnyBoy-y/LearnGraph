@@ -762,7 +762,11 @@ class ProviderModelCapabilityUpdateRequest(BaseModel):
         "user_declared", "provider_probe", "official_catalog", "runtime_observation"
     ] = "user_declared"
     context_window_tokens: int = Field(default=256_000, ge=8_000, le=10_000_000)
-    context_limit_tokens: int = Field(default=256_000, ge=8_000, le=10_000_000)
+    context_limit_tokens: int = Field(default=204_000, ge=8_000, le=10_000_000)
+    context_window_source: Literal[
+        "provider", "official_catalog", "user_declared", "conservative_default"
+    ] = "user_declared"
+    context_window_confidence: Literal["confirmed", "inferred", "unknown"] = "unknown"
     max_output_tokens: int = Field(default=4_096, ge=1, le=1_000_000)
     chat_compaction_ratio: float = Field(default=0.8, ge=0.1, le=1.0)
     agent_compaction_ratio: float = Field(default=1 / 3, ge=0.1, le=1.0)

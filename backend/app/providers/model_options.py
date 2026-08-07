@@ -194,6 +194,7 @@ def _normalize_context_tokens(
     payload: dict[str, Any],
 ) -> tuple[int, int, str]:
     provider_window = _context_tokens(payload.get("context_window_tokens"))
+    declared_source = str(payload.get("context_window_source") or "").strip()
     catalog_window = _context_tokens(
         unified_model_defaults(
             str(payload.get("model_id") or ""),
@@ -203,8 +204,14 @@ def _normalize_context_tokens(
     window = provider_window or catalog_window or UNKNOWN_MODEL_CONTEXT_TOKENS
     provider_limit = _context_tokens(payload.get("context_limit_tokens"))
     limit = min(provider_limit or window, window)
-    source = "provider" if provider_window else (
-        "official_catalog" if catalog_window else "conservative_default"
+    source = (
+        declared_source
+        if provider_window and declared_source
+        else "provider"
+        if provider_window
+        else "official_catalog"
+        if catalog_window
+        else "conservative_default"
     )
     return window, limit, source
 
@@ -266,14 +273,18 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         raise ModelCapabilityError(
             "image_input_mode=native requires supports_image_input=true"
         )
+    max_output_tokens = int(payload.get("max_output_tokens") or 4_096)
     context_window_tokens, context_limit_tokens, context_source = _normalize_context_tokens(
         payload
     )
-    context_confidence = (
+    context_confidence = str(payload.get("context_window_confidence") or "").strip() or (
         "confirmed" if context_source in {"provider", "official_catalog"} else "unknown"
     )
     if context_source == "conservative_default":
-        context_limit_tokens = min(context_limit_tokens, max(8_000, window := context_window_tokens - max_output_tokens - 8_192))
+        context_limit_tokens = min(
+            context_limit_tokens,
+            max(8_000, context_window_tokens - max_output_tokens - 8_192),
+        )
 
     try:
         chat_compaction_ratio = float(payload.get("chat_compaction_ratio", 0.8))
@@ -314,6 +325,8 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         "capability_source": payload.get("capability_source", "user_declared"),
         "context_window_tokens": context_window_tokens,
         "context_limit_tokens": context_limit_tokens,
+        "context_window_source": context_source,
+        "context_window_confidence": context_confidence,
         "max_output_tokens": max_output_tokens,
         "chat_compaction_ratio": chat_compaction_ratio,
         "agent_compaction_ratio": agent_compaction_ratio,
@@ -339,7 +352,9 @@ _CATALOG_BASE_CAPABILITIES: dict[str, Any] = {
     "default_search_route": "auto",
     "capability_source": "official_catalog",
     "context_window_tokens": UNKNOWN_MODEL_CONTEXT_TOKENS,
-    "context_limit_tokens": UNKNOWN_MODEL_CONTEXT_TOKENS,
+    "context_limit_tokens": 204_000,
+    "context_window_source": "conservative_default",
+    "context_window_confidence": "unknown",
     "max_output_tokens": 4_096,
     "chat_compaction_ratio": 0.8,
     "agent_compaction_ratio": 1 / 3,
@@ -394,10 +409,14 @@ def catalog_capability_snapshot(
     ):
         merged["image_input_mode"] = "auto"
     merged["capability_source"] = "official_catalog"
+    merged["model_id"] = model_id
+    merged["provider_family"] = provider_type or ""
     window = int(merged.get("context_window_tokens") or UNKNOWN_MODEL_CONTEXT_TOKENS)
     limit = int(merged.get("context_limit_tokens") or window)
     merged["context_window_tokens"] = window
     merged["context_limit_tokens"] = min(limit, window)
+    merged.setdefault("context_window_source", "official_catalog")
+    merged.setdefault("context_window_confidence", "confirmed")
     output = int(merged.get("max_output_tokens") or 4_096)
     merged["max_output_tokens"] = max(1, min(output, 1_000_000))
     merged["chat_compaction_ratio"] = min(
@@ -422,8 +441,9 @@ def resolve_image_input_mode(
       - ``"external_vision"``: describe images via a vision companion first
       - ``None``: no usable path (caller should raise a typed unavailable error)
 
-    ``auto`` prefers native when the selected model snapshot declares
-    ``supports_image_input``, otherwise falls back to an enabled vision Provider.
+    ``auto`` prefers a confirmed native capability, uses an enabled vision
+    Provider for catalog-confirmed text-only models, and returns ``"native"``
+    for unknown private models until a runtime observation proves otherwise.
     """
 
     resolved = _model_capabilities(capabilities, model_id)
@@ -431,12 +451,20 @@ def resolve_image_input_mode(
     if mode not in IMAGE_INPUT_MODES:
         mode = "auto"
     supports_native = resolved.get("supports_image_input") is True
+    runtime_support = resolved.get("runtime_image_input_support")
     if mode == "native":
         return "native" if supports_native else None
     if mode == "external_vision":
         return "external_vision" if vision_available else None
     # auto
-    if supports_native:
+    if runtime_support is True or supports_native:
+        return "native"
+    if runtime_support is False:
+        return "external_vision" if vision_available else None
+    if resolved.get("models_dev_known") is not True:
+        # No catalog declaration exists. Probe the selected model itself once;
+        # ChatService persists the outcome and falls back to external vision on
+        # a classified unsupported-image response.
         return "native"
     if vision_available:
         return "external_vision"
