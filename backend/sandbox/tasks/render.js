@@ -17,7 +17,7 @@ if (!input || !output) fail("usage: render.js <pdf|png> <input.html> <output>");
 
 (async () => {
   const browser = await chromium.launch({
-    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell",
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium",
     headless: true,
     chromiumSandbox: false,
     args: ["--no-sandbox", "--disable-gpu"],

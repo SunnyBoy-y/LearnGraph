@@ -111,7 +111,14 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
     # additive-column ledger below.  In particular, do not rebuild the existing
     # ``subapp_interaction_events`` table merely to add a foreign key.
     with engine.begin() as connection:
-        for table_name in ("subapp_sessions", "subapp_states"):
+        for table_name in (
+            "subapp_sessions",
+            "subapp_states",
+            "subapp_bundle_validations",
+            "subapp_bundles",
+            "subapp_bundle_files",
+            "subapp_bundle_preview_grants",
+        ):
             Base.metadata.tables[table_name].create(connection, checkfirst=True)
 
 

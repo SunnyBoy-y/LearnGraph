@@ -1758,6 +1758,82 @@ class ContentBlob(Base, TimestampMixin, WorkspaceScopedMixin):
     ref_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class SubAppBundleValidation(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Immutable offline validation snapshot for a multi-file teaching application."""
+
+    __tablename__ = "subapp_bundle_validations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    sandbox_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sandbox_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    output_root: Mapped[str] = mapped_column(String(255))
+    entry_path: Mapped[str] = mapped_column(String(255))
+    manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="passed", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SubAppBundle(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Durable immutable multi-file application bundle served only by preview gateway."""
+
+    __tablename__ = "subapp_bundles"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    sandbox_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sandbox_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    validation_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_bundle_validations.id", ondelete="RESTRICT"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(255))
+    entry_path: Mapped[str] = mapped_column(String(255))
+    manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="published", index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    preferred_height: Mapped[int] = mapped_column(Integer, default=420)
+
+
+class SubAppBundleFile(Base, TimestampMixin, WorkspaceScopedMixin):
+    """One immutable normalized bundle path mapped to a content-addressed blob."""
+
+    __tablename__ = "subapp_bundle_files"
+    __table_args__ = (UniqueConstraint("bundle_id", "path", name="uq_subapp_bundle_file_path"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    bundle_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_bundles.id", ondelete="CASCADE"), index=True
+    )
+    path: Mapped[str] = mapped_column(String(255))
+    blob_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    mime_type: Mapped[str] = mapped_column(String(160))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+
+
+class SubAppBundlePreviewGrant(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Short-lived opaque capability for one viewer to fetch one immutable bundle."""
+
+    __tablename__ = "subapp_bundle_preview_grants"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_subapp_bundle_preview_grant_token"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    bundle_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_bundles.id", ondelete="CASCADE"), index=True
+    )
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SessionWorkspaceEntry(Base, TimestampMixin, WorkspaceScopedMixin):
     """Logical path tree for one chat session; points at content blobs / files."""
 

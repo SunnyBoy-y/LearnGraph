@@ -94,7 +94,13 @@ class Settings(BaseSettings):
     # executable; the backend still reports an explicit unavailable state.
     sandbox_enabled: bool = True
     sandbox_backend: str = "docker"
+    # Optional immutable runtime image override for CI/offline deployments.
+    # When empty, runtime resolution uses the digest persisted by Bootstrap.
     sandbox_image: str | None = None
+    # Optional Docker Hub/registry image fetched by Bootstrap instead of locally
+    # building the runner. Tags are resolved to an immutable RepoDigest before
+    # they can become the runtime image reference.
+    sandbox_prebuilt_image: str | None = None
     sandbox_task_ttl_seconds: int = 3_600
     sandbox_container_idle_ttl_seconds: int = 180
     sandbox_container_absolute_ttl_seconds: int = 1_800
@@ -129,12 +135,20 @@ class Settings(BaseSettings):
     sandbox_host_max_allocated_cpu_ratio: float = 0.80
     sandbox_host_minimum_free_disk_bytes: int = 20 * 1024 * 1024 * 1024
     sandbox_agent_enabled: bool = True
-    # Sandbox runtime bootstrap defaults to self-service: any workspace member
-    # (workspace.write) may trigger the local image build. Administrators can
-    # flip the runtime toggle (GET/PUT /sandbox/bootstrap/policy) to restrict
+    # Multi-file teaching application previews are served only through an
+    # independent origin (separate process/port or a real reverse-proxied
+    # domain). This env override is a deployment default; an administrator can
+    # persist the origin from the frontend settings page. Empty means no
+    # configured preview origin (bundle preview fails closed).
+    subapp_preview_origin: str | None = None
+    # Local dev preview port: when no origin is persisted or set via env, the
+    # bundle capability URLs are derived as http://127.0.0.1:<port>. scripts/
+    # dev.mjs starts the preview ASGI process on this port automatically.
+    subapp_preview_port: int | None = None
     # bootstrap to admins; this env flag sets the initial deployment default.
     sandbox_bootstrap_member_allowed: bool = True
     sandbox_agent_file_bytes: int = 1 * 1024 * 1024
+    sandbox_agent_archive_bytes: int = 16 * 1024 * 1024
     sandbox_agent_command_args_max: int = 32
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60
@@ -216,6 +230,12 @@ class Settings(BaseSettings):
     skill_prompt_inline_char_limit: int = 4_000
     skill_prompt_total_char_budget: int = 16_000
     skill_prompt_catalog_max_entries: int = 24
+    # Progressive disclosure for Agent tools (capability catalog): when enabled,
+    # the Agent starts with a small core plus lg_capability_search/activate and
+    # loads tool schemas / Skill contracts on demand in later rounds. Per-turn
+    # activation never mutates durable grants or server/skill enabled state and
+    # never bypasses host authorization. Disabled = eager definitions (current).
+    agent_progressive_tool_disclosure_enabled: bool = False
     # Agent self-service extension management (lg_skill_install / lg_mcp_register
     # etc.). Installs stay commit-pinned and audited; disable to make skills and
     # MCP servers user-click-only.
@@ -280,8 +300,15 @@ class Settings(BaseSettings):
     @field_validator("sandbox_agent_file_bytes")
     @classmethod
     def validate_sandbox_agent_file_bytes(cls, value: int) -> int:
-        if not 1 <= value <= 16 * 1024 * 1024:
-            raise ValueError("Sandbox Agent file bytes must be between 1 and 16777216")
+        if not 1 <= value <= 1024 * 1024 * 1024:
+            raise ValueError("Sandbox Agent file bytes must be between 1 and 1073741824")
+        return value
+
+    @field_validator("sandbox_agent_archive_bytes")
+    @classmethod
+    def validate_sandbox_agent_archive_bytes(cls, value: int) -> int:
+        if not 1 <= value <= 1024 * 1024 * 1024:
+            raise ValueError("Sandbox Agent archive bytes must be between 1 and 1073741824")
         return value
 
     @field_validator("sandbox_agent_command_args_max")

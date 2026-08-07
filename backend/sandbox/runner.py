@@ -208,7 +208,7 @@ def _should_render(html: str, markdown: str) -> bool:
 
 
 def _render_with_chromium(url: str, timeout_seconds: float) -> str:
-    """Render a JS-heavy page with the image's Playwright chromium-headless-shell.
+    """Render a JS-heavy page with the image's Chromium-only Playwright runtime.
 
     Runs in the same container under the same egress proxy: the browser's only
     outbound path is the proxy, a non-persistent launch keeps zero browser state

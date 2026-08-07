@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "runtime": "unified-python-node-browser",
+  "workspace_root": "/workspace",
+  "network": "offline_by_default",
+  "browser": {"name": "chromium", "executable_path": "/usr/bin/chromium"},
+  "binaries": ["python", "node", "npm", "chromium", "ffmpeg", "ffprobe", "antiword", "catppt", "7z", "git", "jq", "zip", "unzip"],
+  "python_packages": ["Pillow", "pypdf", "openpyxl", "pandas", "mammoth", "playwright-core"],
+  "node_packages": ["playwright-core", "vite", "react", "react-dom", "vue", "typescript", "tsx"]
+}

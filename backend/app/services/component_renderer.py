@@ -92,6 +92,7 @@ class ComponentRendererService:
             enabled=self.settings.sandbox_enabled,
             image_ref=image_ref,
             runtime_kind=RUNTIME_KIND,
+            archive_bytes=self.settings.sandbox_agent_archive_bytes,
         )
         capability = backend.probe()
         return bool(capability.available)
@@ -149,6 +150,7 @@ class ComponentRendererService:
             enabled=self.settings.sandbox_enabled,
             image_ref=image_ref,
             runtime_kind=RUNTIME_KIND,
+            archive_bytes=self.settings.sandbox_agent_archive_bytes,
         )
         capability = backend.probe()
         if not capability.available:

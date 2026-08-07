@@ -795,6 +795,12 @@ class ProviderModelStateUpdateRequest(BaseModel):
     enabled: bool
 
 
+class ProviderModelDeleteView(BaseModel):
+    provider_id: str
+    model_id: str
+    default_model: str | None
+
+
 class ProviderModelStatesUpdateRequest(BaseModel):
     states: dict[str, bool] = Field(min_length=1, max_length=2_000)
 
@@ -1141,24 +1147,41 @@ class WebFetchPolicySettingValue(BaseModel):
     @field_validator("allowed_domains")
     @classmethod
     def validate_domains(cls, domains: list[str]) -> list[str]:
-        from app.domain.schemas.components import DOMAIN_PATTERN
+        return normalize_allowed_domains(domains)
 
-        normalized: list[str] = []
-        for domain in domains:
-            candidate = domain.strip().casefold().rstrip(".")
-            if (
-                not candidate
-                or "://" in candidate
-                or "/" in candidate
-                or candidate == "*"
-                or not DOMAIN_PATTERN.fullmatch(candidate)
-            ):
-                raise ValueError(
-                    "allowed_domains must contain exact DNS hostnames without schemes or wildcards"
-                )
-            if candidate not in normalized:
-                normalized.append(candidate)
-        return normalized
+
+class ResearchPolicySettingValue(BaseModel):
+    """Workspace-wide exact-host allowlist for search and Deep Research."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_domains: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def validate_domains(cls, domains: list[str]) -> list[str]:
+        return normalize_allowed_domains(domains)
+
+
+def normalize_allowed_domains(domains: list[str]) -> list[str]:
+    from app.domain.schemas.components import DOMAIN_PATTERN
+
+    normalized: list[str] = []
+    for domain in domains:
+        candidate = domain.strip().casefold().rstrip(".")
+        if (
+            not candidate
+            or "://" in candidate
+            or "/" in candidate
+            or candidate == "*"
+            or not DOMAIN_PATTERN.fullmatch(candidate)
+        ):
+            raise ValueError(
+                "allowed_domains must contain exact DNS hostnames without schemes or wildcards"
+            )
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
 
 
 class ChatSuggestedPromptsSettingValue(BaseModel):

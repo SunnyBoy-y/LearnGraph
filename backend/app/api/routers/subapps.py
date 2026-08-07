@@ -5,7 +5,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Path, Query, status
 
-from app.api.deps import CurrentWorkspace, DB
+from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.services.subapp_bundles import SubAppBundleService
 from app.core.errors import AppError
 from app.domain.schemas.subapps import (
     SubAppEventIngestedView,
@@ -76,9 +77,17 @@ def list_subapp_events(
     )
 
 
-# --------------------------------------------------------------------------- #
-# T2.4 session management
-# --------------------------------------------------------------------------- #
+@router.get("/bundles/{bundle_id}/preview")
+def mint_bundle_preview(
+    bundle_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+):
+    result = SubAppBundleService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).mint_preview(bundle_id)
+    return result
 
 
 @router.post(

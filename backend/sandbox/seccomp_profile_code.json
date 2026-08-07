@@ -12,8 +12,8 @@
   ],
   "syscalls": [
     {
-      "comment": "Code-offline profile: retain ordinary process creation for Python/Node but deny Chromium-specific user namespace, clone3, setns, unshare, and chroot syscalls",
-      "names": ["clone"],
+      "comment": "Code-offline profile: retain ordinary process/thread creation for Python/Node but deny Chromium-specific user namespace, setns, unshare, and chroot syscalls",
+      "names": ["clone", "clone3"],
       "action": "SCMP_ACT_ALLOW",
       "args": []
     },

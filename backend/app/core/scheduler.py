@@ -497,6 +497,7 @@ def run_mcp_runner_cleanup_sweep(*, now: datetime | None = None) -> dict[str, in
         enabled=settings.sandbox_enabled,
         image_ref=image_ref or "",
         runtime_kind="python-node",
+        archive_bytes=settings.sandbox_agent_archive_bytes,
     )
     with SessionLocal() as db:
         sessions = list(

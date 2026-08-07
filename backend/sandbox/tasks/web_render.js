@@ -4,10 +4,10 @@
 // Invoked only by the fixed runner inside the isolated sandbox container:
 //   node /opt/learngraph/tasks/web_render.js <url> <timeout_seconds> <out_path> [profile_root]
 //
-// Uses Playwright's official chromium-headless-shell (glibc, Debian base).
+// Uses the image's Chromium-only Playwright Core runtime (Debian Chromium).
 //
-// Network model: Chromium headless cannot attach credentials to the egress
-// proxy (Proxy-Authorization / proxy-URL userinfo both fail on headless-shell),
+// Network model: Chromium cannot attach credentials to the egress
+// proxy (Proxy-Authorization / proxy-URL userinfo fail with Chromium),
 // and the multi-tenant egress proxy rejects any CONNECT without the approved
 // policy digest. web_render therefore runs a tiny local CONNECT forwarder on
 // 127.0.0.1 that relays browser tunnels to the egress proxy, attaching the
@@ -112,7 +112,7 @@ async function main() {
   try {
     forwarder = await startLocalForwarder(proxyUrl, digest);
     browser = await chromium.launch({
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell",
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium",
       headless: true,
       chromiumSandbox: false,
       args: ["--no-sandbox", "--disable-gpu", `--proxy-server=http://127.0.0.1:${forwarder.port}`],

@@ -42,6 +42,7 @@ from app.domain.schemas.management import (
     ChatResponseStyleSettingValue,
     ChatSuggestedPromptsSettingValue,
     FunctionalModelDefaultsSettingValue,
+    ResearchPolicySettingValue,
     WebFetchPolicySettingValue,
     MigrationPreflightRequest,
     PluginToggleRequest,
@@ -495,6 +496,17 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        if provider.provider_type in _MODEL_MANAGEMENT_PROVIDER_TYPES:
+            known_model_ids = [
+                str(item).strip()
+                for item in (provider.capabilities or {}).get("discovered_model_ids")
+                or []
+                if str(item).strip()
+            ]
+            if known_model_ids:
+                self.sync_model_catalog_defaults(provider.id, known_model_ids)
+                provider = self.providers.require(provider.id, "provider")
+                self.db.refresh(provider)
         if (
             secret
             and spec.supports_probe
@@ -1143,6 +1155,11 @@ class ProviderService:
                 "Model capabilities can only be configured on a Provider that exposes a model discovery endpoint",
             )
         capabilities = dict(provider.capabilities or {})
+        hidden_model_ids = {
+            str(item).strip()
+            for item in capabilities.get("hidden_model_ids") or []
+            if str(item).strip()
+        }
         models = dict(capabilities.get("models") or {})
         synced: list[dict] = []
         for raw_id in model_ids:
@@ -1161,6 +1178,7 @@ class ProviderService:
                     f"{model_id}: {exc}",
                 ) from exc
             models[model_id] = validated
+            hidden_model_ids.discard(model_id)
             synced.append(
                 {
                     "provider_id": provider.id,
@@ -1173,6 +1191,27 @@ class ProviderService:
                 422, "invalid_model_capabilities", "No valid model ids were provided"
             )
         capabilities["models"] = models
+        capabilities["hidden_model_ids"] = sorted(hidden_model_ids)
+        discovered = [
+            str(item).strip()
+            for item in capabilities.get("discovered_model_ids") or []
+            if str(item).strip()
+        ]
+        known_ids = list(
+            dict.fromkeys(
+                [*discovered, *(model_id for model_id in models if model_id not in hidden_model_ids)]
+            )
+        )
+        capabilities["discovered_model_ids"] = known_ids
+        capabilities["discovered_model_count"] = len(known_ids)
+        states = {
+            str(key): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+            if str(key) in known_ids
+        }
+        for model_id in known_ids:
+            states.setdefault(model_id, True)
+        capabilities["model_states"] = states
         provider.capabilities = capabilities
         self.audit.record(
             actor_id=self.actor_id,
@@ -1243,6 +1282,86 @@ class ProviderService:
         ]
         default_id = str(capabilities.get("default_model") or "").strip()
         return list(dict.fromkeys([*discovered, default_id, *snapshot_keys]))
+
+    def delete_model(self, provider_id: str, model_id: str) -> dict:
+        """Remove a workspace-pinned model from the provider's unified model list."""
+
+        provider = self.providers.require(provider_id, "provider")
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
+            raise AppError(
+                409,
+                "provider_has_no_models",
+                "Models can only be deleted on a Provider that exposes a model discovery endpoint",
+            )
+        normalized_model_id = model_id.strip()
+        if not normalized_model_id:
+            raise AppError(422, "invalid_model_id", "A model id is required")
+        capabilities = dict(provider.capabilities or {})
+        discovered = [
+            str(item).strip()
+            for item in capabilities.get("discovered_model_ids") or []
+            if str(item).strip() and str(item).strip() != normalized_model_id
+        ]
+        models = dict(capabilities.get("models") or {})
+        was_known = (
+            normalized_model_id in models
+            or normalized_model_id
+            in {
+                str(item).strip()
+                for item in capabilities.get("discovered_model_ids") or []
+                if str(item).strip()
+            }
+        )
+        if not was_known:
+            raise AppError(404, "provider_model_not_found", "The model is not in this Provider's saved model list")
+        models.pop(normalized_model_id, None)
+        hidden_model_ids = {
+            str(item).strip()
+            for item in capabilities.get("hidden_model_ids") or []
+            if str(item).strip()
+        }
+        hidden_model_ids.add(normalized_model_id)
+        states = {
+            str(key): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+            if str(key).strip() != normalized_model_id
+        }
+        capabilities["models"] = models
+        capabilities["hidden_model_ids"] = sorted(hidden_model_ids)
+        capabilities["discovered_model_ids"] = discovered
+        capabilities["discovered_model_count"] = len(discovered)
+        capabilities["model_states"] = states
+        default_field = self._model_default_field(provider)
+        configured_default = self._read_model_default(capabilities, default_field)
+        known_ids = self._known_model_ids(capabilities, discovered)
+        if configured_default == normalized_model_id:
+            next_default = next(
+                (item for item in known_ids if states.get(item, True)), ""
+            )
+            if next_default:
+                self._write_model_default(capabilities, default_field, next_default)
+            else:
+                capabilities.pop(default_field, None)
+                if default_field in {
+                    "default_vision_model_id",
+                    "default_embedding_model_id",
+                }:
+                    capabilities.pop("default_model", None)
+        provider.capabilities = capabilities
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="provider.model.delete",
+            resource_type="provider_model",
+            resource_id=f"{provider.id}:{normalized_model_id}",
+            details={"provider_id": provider.id, "model_id": normalized_model_id},
+        )
+        self.db.commit()
+        return {
+            "provider_id": provider.id,
+            "model_id": normalized_model_id,
+            "default_model": self._read_model_default(capabilities, default_field)
+            or None,
+        }
 
     def update_model_state(
         self, provider_id: str, model_id: str, enabled: bool
@@ -2389,6 +2508,12 @@ class ProviderService:
             )
         model_ids = self._discover(provider)
         capabilities = dict(provider.capabilities or {})
+        hidden_model_ids = {
+            str(item).strip()
+            for item in capabilities.get("hidden_model_ids") or []
+            if str(item).strip()
+        }
+        model_ids = [model_id for model_id in model_ids if model_id not in hidden_model_ids]
         is_deepseek = is_deepseek_chat_configuration(
             provider.provider_type,
             provider.base_url,
@@ -2453,6 +2578,13 @@ class ProviderService:
         provider.capabilities = capabilities
         self.db.commit()
         self.db.refresh(provider)
+        # Discovery populates the same persistent catalog snapshots as manual
+        # additions, so model selection and supplier configuration stay aligned.
+        if model_ids:
+            self.sync_model_catalog_defaults(provider.id, model_ids)
+            provider = self.providers.require(provider.id, "provider")
+            self.db.refresh(provider)
+            capabilities = dict(provider.capabilities or {})
         return {
             "provider_id": provider.id,
             "status": "discovered",
@@ -2656,6 +2788,10 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        if discovered_model_ids:
+            self.sync_model_catalog_defaults(provider.id, discovered_model_ids)
+            provider = self.providers.require(provider.id, "provider")
+            self.db.refresh(provider)
         return provider
 
     def _probe_after_configuration(self, provider_id: str) -> None:
@@ -3378,6 +3514,11 @@ class SettingsService:
             "default": {"allow_without_confirmation": False, "allowed_domains": []},
             "risk": "high",
         },
+        "research.policy": {
+            "description": "Workspace source-domain allowlist for search and Deep Research",
+            "default": {"allowed_domains": []},
+            "risk": "high",
+        },
         "usage.display_currency": {
             "description": "Display currency for usage views",
             "default": "CNY",
@@ -3572,6 +3713,16 @@ class SettingsService:
                         "web_fetch.policy must contain allow_without_confirmation and "
                         "a list of exact DNS allowed_domains"
                     ),
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
+        elif key == "research.policy":
+            try:
+                value = ResearchPolicySettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "research.policy must contain a list of exact DNS allowed_domains",
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc
         elif key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY:

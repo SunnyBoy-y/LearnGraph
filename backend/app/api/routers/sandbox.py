@@ -13,12 +13,23 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileReadRequest,
     SandboxAgentFileView,
     SandboxAgentFileWriteRequest,
+    SandboxAgentFileAppendRequest,
+    SandboxAgentFileEditRequest,
+    SandboxAgentEnvironmentRequest,
+    SandboxAgentImagePublishRequest,
     SandboxAgentSessionCreateRequest,
     SandboxBootstrapJobView,
     SandboxBootstrapPolicyUpdateRequest,
     SandboxBootstrapPolicyView,
     SandboxBootstrapStartResponse,
     SandboxBootstrapStatusView,
+    SandboxWebAppPublishRequest,
+    SandboxWebAppPublishView,
+    SandboxWebAppValidateRequest,
+    SandboxWebAppValidationView,
+    SandboxPreviewConfigUpdateRequest,
+    SandboxPreviewConfigView,
+    SubAppBundlePreviewView,
     SandboxDestructiveGrantRequest,
     SandboxDestructiveGrantView,
     SandboxExecutionView,
@@ -164,6 +175,76 @@ def update_bootstrap_policy(
     )
 
 
+@router.get("/preview-config", response_model=SandboxPreviewConfigView)
+def get_preview_config(
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxPreviewConfigView:
+    """Return the effective subapp preview origin and its resolution source.
+
+    Any workspace reader may view it so the settings page can surface the value
+    and remediation; only deployment administrators may change it.
+    """
+    from app.services.sandbox_preview_config import (
+        effective_subapp_preview_origin,
+        load_preview_config,
+    )
+
+    persisted = load_preview_config(settings)
+    origin = effective_subapp_preview_origin(settings)
+    if persisted is not None:
+        source = "persisted"
+    elif (settings.subapp_preview_origin or "").strip():
+        source = "env"
+    elif settings.subapp_preview_port:
+        source = "auto"
+    else:
+        source = "none"
+    return SandboxPreviewConfigView(
+        origin=origin,
+        source=source,
+        persisted=persisted is not None,
+        updated_at=persisted.updated_at if persisted else None,
+        updated_by=persisted.updated_by if persisted else None,
+    )
+
+
+@router.put("/preview-config", response_model=SandboxPreviewConfigView)
+def update_preview_config(
+    payload: SandboxPreviewConfigUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxPreviewConfigView:
+    """Persist the deployment-scoped subapp preview origin (admin only)."""
+    if not context.principal.is_system_admin:
+        raise AppError(
+            403,
+            "deployment_admin_required",
+            "Subapp preview origin requires a deployment administrator",
+        )
+    from app.services.sandbox_preview_config import save_preview_config
+
+    config = save_preview_config(
+        settings, origin=payload.origin, actor_id=context.principal.user_id
+    )
+    AuditRepository(db, context.workspace_id).record(
+        actor_id=context.principal.user_id,
+        action="sandbox.preview_origin_updated",
+        resource_type="deployment_setting",
+        resource_id="sandbox-preview-config",
+        details={"origin": config.origin},
+    )
+    db.commit()
+    return SandboxPreviewConfigView(
+        origin=config.origin,
+        source="persisted",
+        persisted=True,
+        updated_at=config.updated_at,
+        updated_by=config.updated_by,
+    )
+
+
 @router.post("/bootstrap", response_model=SandboxBootstrapStartResponse)
 def start_bootstrap(
     context: CurrentWorkspace, settings: AppSettings
@@ -262,6 +343,28 @@ def get_agent_command(
     )
 
 
+@router.post("/agent/environment")
+def get_agent_environment(
+    payload: SandboxAgentEnvironmentRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    require_agent_sandbox_permission(context)
+    return agent_service(db, context, settings).environment_info(payload)
+
+
+@router.post("/agent/files/publish-image")
+def publish_agent_image(
+    payload: SandboxAgentImagePublishRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    require_agent_sandbox_permission(context)
+    return agent_service(db, context, settings).publish_image(payload)
+
+
 @router.post("/agent/files/write", response_model=SandboxAgentFileView)
 def write_agent_file(
     payload: SandboxAgentFileWriteRequest,
@@ -272,6 +375,32 @@ def write_agent_file(
     require_agent_sandbox_permission(context)
     return SandboxAgentFileView.model_validate(
         agent_service(db, context, settings).write_file(payload)
+    )
+
+
+@router.post("/agent/files/append", response_model=SandboxAgentFileView)
+def append_agent_file(
+    payload: SandboxAgentFileAppendRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxAgentFileView:
+    require_agent_sandbox_permission(context)
+    return SandboxAgentFileView.model_validate(
+        agent_service(db, context, settings).append_file(payload)
+    )
+
+
+@router.post("/agent/files/edit", response_model=SandboxAgentFileView)
+def edit_agent_file(
+    payload: SandboxAgentFileEditRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxAgentFileView:
+    require_agent_sandbox_permission(context)
+    return SandboxAgentFileView.model_validate(
+        agent_service(db, context, settings).edit_file(payload)
     )
 
 
@@ -410,6 +539,49 @@ def list_workspace_entries(
         chat_session_id=chat_session_id,
         entries=[SessionWorkspaceEntryView.model_validate(item) for item in entries],
     )
+
+
+@router.post("/workspace/web-app/validate", response_model=SandboxWebAppValidationView)
+def validate_web_app(
+    payload: SandboxWebAppValidateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxWebAppValidationView:
+    require_agent_sandbox_permission(context)
+    from app.services.subapp_bundles import SubAppBundleService
+
+    result = SubAppBundleService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).validate(
+        chat_session_id=payload.chat_session_id,
+        sandbox_session_id=payload.sandbox_session_id,
+        output_root=payload.output_root,
+        entry_path=payload.entry_path,
+    )
+    return SandboxWebAppValidationView.model_validate(result)
+
+
+@router.post("/workspace/web-app/publish", response_model=SandboxWebAppPublishView)
+def publish_web_app(
+    payload: SandboxWebAppPublishRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxWebAppPublishView:
+    require_agent_sandbox_permission(context)
+    from app.services.subapp_bundles import SubAppBundleService
+
+    result = SubAppBundleService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).publish(
+        validation_id=payload.validation_id,
+        chat_session_id=payload.chat_session_id,
+        sandbox_session_id=payload.sandbox_session_id,
+        title=payload.title,
+        preferred_height=payload.preferred_height,
+    )
+    return SandboxWebAppPublishView.model_validate(result)
 
 
 @router.post(

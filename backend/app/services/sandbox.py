@@ -41,6 +41,10 @@ from app.services.sandbox_authz import (
 from app.services.session_workspace import SessionWorkspaceService
 from app.domain.schemas.sandbox import (
     SandboxAgentCommandRequest,
+    SandboxAgentFileEditRequest,
+    SandboxAgentFileAppendRequest,
+    SandboxAgentEnvironmentRequest,
+    SandboxAgentImagePublishRequest,
     SandboxAgentFileListRequest,
     SandboxAgentFileReadRequest,
     SandboxAgentFileWriteRequest,
@@ -1716,6 +1720,70 @@ class SandboxAgentWorkspaceService:
             self.db.commit()
             raise AppError(502, "sandbox_execution_failed", "Sandbox workspace is unavailable") from exc
 
+    def environment_info(self, payload: SandboxAgentEnvironmentRequest) -> dict[str, Any]:
+        self._require_chat_session(payload.chat_session_id)
+        manifest_path = Path(__file__).resolve().parents[2] / "sandbox" / "environment-manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AppError(503, "sandbox_environment_unavailable", "Sandbox environment manifest is unavailable") from exc
+        if not isinstance(manifest, dict) or manifest.get("schema_version") != "1.0":
+            raise AppError(503, "sandbox_environment_unavailable", "Sandbox environment manifest is invalid")
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        return {
+            **manifest,
+            "sandbox_session_id": session.id,
+            "file_limit_bytes": self.settings.sandbox_agent_file_bytes,
+            "workspace_limit_bytes": self.settings.sandbox_disk_bytes,
+            "output_limit_bytes": self.settings.sandbox_output_bytes,
+            "network": session.network_policy.get("mode", "none"),
+            "image_pinned": image_ref_is_pinned(resolve_sandbox_image(self.settings) or ""),
+        }
+
+    def publish_image(self, payload: SandboxAgentImagePublishRequest) -> dict[str, Any]:
+        path = validate_agent_workspace_path(payload.path)
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        try:
+            data = self.workspace_files.materialize_bytes(payload.chat_session_id, path)
+        except AppError:
+            try:
+                handle = self._ensure_backend_session(session)
+                data = self._runtime_backend(session).read(
+                    handle, path, self.settings.sandbox_agent_file_bytes
+                )
+            except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+                raise AppError(422, "sandbox_file_unavailable", "Sandbox image file cannot be read") from exc
+        mime_type = mimetypes.guess_type(path)[0] or ""
+        allowed = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+        if mime_type not in allowed or not data:
+            raise AppError(415, "sandbox_image_type_unsupported", "Only PNG, JPEG, WebP, and GIF sandbox images can be published")
+        try:
+            from PIL import Image
+            from io import BytesIO
+
+            with Image.open(BytesIO(data)) as image:
+                image.verify()
+            with Image.open(BytesIO(data)) as image:
+                width, height = image.size
+        except Exception as exc:
+            raise AppError(422, "sandbox_image_invalid", "Sandbox image bytes are invalid") from exc
+        if width < 1 or height < 1 or width * height > 40_000_000:
+            raise AppError(422, "sandbox_image_dimensions_invalid", "Sandbox image dimensions exceed the preview limit")
+        published = self.workspace_files.publish_path(
+            chat_session_id=payload.chat_session_id,
+            path=path,
+            data=data,
+            sandbox_session_id=session.id,
+            title=payload.title,
+        )
+        artifact = published.get("part")
+        if isinstance(artifact, dict):
+            artifact_data = artifact.get("data")
+            if isinstance(artifact_data, dict):
+                artifact_data.update({"width": width, "height": height, "alt": payload.alt})
+        published.update({"width": width, "height": height, "alt": payload.alt})
+        return published
+
     def write_file(self, payload: SandboxAgentFileWriteRequest) -> dict[str, Any]:
         try:
             path = validate_agent_workspace_path(payload.path)
@@ -1779,6 +1847,7 @@ class SandboxAgentWorkspaceService:
             "sandbox_session_id": session.id,
             "path": path,
             "size_bytes": len(data),
+            "sha256": workspace_view.get("blob_sha256"),
             "blob_sha256": workspace_view.get("blob_sha256"),
             "file_id": workspace_view.get("file_id"),
             "role": workspace_view.get("role"),
@@ -1800,6 +1869,67 @@ class SandboxAgentWorkspaceService:
                 },
             }
         return result
+
+    def _read_text_for_mutation(
+        self, *, chat_session_id: str, path: str, sandbox_session_id: str | None
+    ) -> tuple[str, str]:
+        result = self.read_file(
+            SandboxAgentFileReadRequest(
+                chat_session_id=chat_session_id,
+                path=path,
+                sandbox_session_id=sandbox_session_id,
+            )
+        )
+        content = str(result.get("content") or "")
+        return content, hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def append_file(self, payload: SandboxAgentFileAppendRequest) -> dict[str, Any]:
+        path = validate_agent_workspace_path(payload.path)
+        try:
+            current, digest = self._read_text_for_mutation(
+                chat_session_id=payload.chat_session_id,
+                path=path,
+                sandbox_session_id=payload.sandbox_session_id,
+            )
+        except AppError as exc:
+            if exc.code != "sandbox_file_unavailable":
+                raise
+            current, digest = "", hashlib.sha256(b"").hexdigest()
+        if payload.expected_sha256 and payload.expected_sha256 != digest:
+            raise AppError(409, "sandbox_file_changed", "Sandbox file changed; read it again before appending")
+        return self.write_file(
+            SandboxAgentFileWriteRequest(
+                chat_session_id=payload.chat_session_id,
+                path=path,
+                content=current + payload.content,
+                sandbox_session_id=payload.sandbox_session_id,
+            )
+        )
+
+    def edit_file(self, payload: SandboxAgentFileEditRequest) -> dict[str, Any]:
+        path = validate_agent_workspace_path(payload.path)
+        current, digest = self._read_text_for_mutation(
+            chat_session_id=payload.chat_session_id,
+            path=path,
+            sandbox_session_id=payload.sandbox_session_id,
+        )
+        if payload.expected_sha256 != digest:
+            raise AppError(409, "sandbox_file_changed", "Sandbox file changed; read it again before editing")
+        count = current.count(payload.old_string)
+        if count != 1:
+            raise AppError(
+                422,
+                "sandbox_edit_match_invalid",
+                "old_string must occur exactly once in the sandbox file",
+            )
+        return self.write_file(
+            SandboxAgentFileWriteRequest(
+                chat_session_id=payload.chat_session_id,
+                path=path,
+                content=current.replace(payload.old_string, payload.new_string, 1),
+                sandbox_session_id=payload.sandbox_session_id,
+            )
+        )
 
     def read_file(self, payload: SandboxAgentFileReadRequest) -> dict[str, Any]:
         try:
@@ -1851,6 +1981,7 @@ class SandboxAgentWorkspaceService:
             "sandbox_session_id": session.id,
             "path": path,
             "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
             "content": content,
         }
 
@@ -2194,16 +2325,65 @@ class SandboxAgentWorkspaceService:
             {
                 "type": "function",
                 "function": {
+                    "name": "sandbox_env_info",
+                    "description": "Return the declared safe sandbox runtime, browser path, installed toolchain and current resource limits. This does not execute an arbitrary command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sandbox_session_id": session_property},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "sandbox_write_file",
                     "description": "Write UTF-8 source or data into the isolated Agent workspace.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string", "description": "Relative workspace path."},
-                            "content": {"type": "string", "description": "UTF-8 file content."},
+                            "content": {"type": "string", "description": "Complete UTF-8 file content. Use sandbox_append_file for later chunks and sandbox_edit_file for a unique local change."},
                             "sandbox_session_id": session_property,
                         },
                         "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_append_file",
+                    "description": "Append a UTF-8 chunk to a workspace file. Optionally provide the SHA-256 returned by sandbox_read_file to detect concurrent changes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_edit_file",
+                    "description": "Atomically replace one unique UTF-8 string in a workspace file. First read the file and pass its SHA-256 as expected_sha256.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                            "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path", "old_string", "new_string", "expected_sha256"],
                         "additionalProperties": False,
                     },
                 },
@@ -2247,8 +2427,11 @@ class SandboxAgentWorkspaceService:
                         "make_zip, extract_zip, pdf_merge). The frontend toolchain (vite, vue, react, "
                         "react-dom, @vitejs plugins, vite-plugin-singlefile) resolves from the image's "
                         "/node_modules — write app sources plus a driver script that imports {build} from "
-                        "'vite' (base:'./', singlefile for previewable output), then publish dist output via "
-                        "sandbox_publish_file. Host-path deletes are blocked; session work/ deletes require "
+                        "'vite' (base:'./', singlefile for previewable output), then validate and publish "
+                        "the resulting dist/index.html with sandbox_validate_web_app followed by "
+                        "sandbox_publish_web_app for a multi-file teaching app. Use "
+                        "sandbox_publish_file only for downloadable single-file outputs. "
+                        "Host-path deletes are blocked; session work/ deletes require "
                         "prior user authorization."
                     ),
                     "parameters": {
@@ -2279,6 +2462,50 @@ class SandboxAgentWorkspaceService:
             {
                 "type": "function",
                 "function": {
+                    "name": "sandbox_validate_web_app",
+                    "description": (
+                        "Validate a multi-file HTML/React/Vue teaching app after a successful build. "
+                        "Use output_root (usually dist) and entry_path (usually dist/index.html) before "
+                        "publishing. The server checks safe paths, relative assets, MIME/size limits and "
+                        "returns a validation_id required by sandbox_publish_web_app."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "output_root": {"type": "string"},
+                            "entry_path": {"type": "string"},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["output_root", "entry_path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_publish_web_app",
+                    "description": (
+                        "Publish a validated multi-file teaching app as a durable interactive subapp. "
+                        "Requires a successful validation_id from sandbox_validate_web_app; do not use "
+                        "this for ordinary downloadable files."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "validation_id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "preferred_height": {"type": "integer", "minimum": 160, "maximum": 900},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["validation_id", "title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "sandbox_transcribe_audio",
                     "description": (
                         "Transcribe a workspace audio file with the user's configured ASR "
@@ -2302,6 +2529,24 @@ class SandboxAgentWorkspaceService:
                                 "type": "string",
                                 "description": "Optional language hint such as zh or en.",
                             },
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_publish_image",
+                    "description": "Validate and publish a PNG, JPEG, WebP, or GIF already generated in the sandbox. The result is a downloadable, previewable chat artifact.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "title": {"type": "string"},
+                            "alt": {"type": "string"},
                             "sandbox_session_id": session_property,
                         },
                         "required": ["path"],
@@ -2410,8 +2655,14 @@ class SandboxAgentWorkspaceService:
             else:
                 payload["sandbox_session_id"] = normalized
         try:
+            if name == "sandbox_env_info":
+                return self.environment_info(SandboxAgentEnvironmentRequest.model_validate(payload))
             if name == "sandbox_write_file":
                 return self.write_file(SandboxAgentFileWriteRequest.model_validate(payload))
+            if name == "sandbox_append_file":
+                return self.append_file(SandboxAgentFileAppendRequest.model_validate(payload))
+            if name == "sandbox_edit_file":
+                return self.edit_file(SandboxAgentFileEditRequest.model_validate(payload))
             if name == "sandbox_read_file":
                 return self.read_file(SandboxAgentFileReadRequest.model_validate(payload))
             if name == "sandbox_list_files":
@@ -2446,10 +2697,35 @@ class SandboxAgentWorkspaceService:
                         },
                     },
                 }
+            if name == "sandbox_validate_web_app":
+                from app.services.subapp_bundles import SubAppBundleService
+
+                return SubAppBundleService(
+                    self.db, self.workspace_id, self.actor_id, self.settings
+                ).validate(
+                    chat_session_id=chat_session_id,
+                    sandbox_session_id=payload.get("sandbox_session_id") if isinstance(payload.get("sandbox_session_id"), str) else None,
+                    output_root=str(payload.get("output_root") or "dist"),
+                    entry_path=str(payload.get("entry_path") or "dist/index.html"),
+                )
+            if name == "sandbox_publish_web_app":
+                from app.services.subapp_bundles import SubAppBundleService
+
+                return SubAppBundleService(
+                    self.db, self.workspace_id, self.actor_id, self.settings
+                ).publish(
+                    validation_id=str(payload.get("validation_id") or ""),
+                    chat_session_id=chat_session_id,
+                    sandbox_session_id=payload.get("sandbox_session_id") if isinstance(payload.get("sandbox_session_id"), str) else None,
+                    title=str(payload.get("title") or "交互式教学应用"),
+                    preferred_height=payload.get("preferred_height") if isinstance(payload.get("preferred_height"), int) else None,
+                )
             if name == "sandbox_transcribe_audio":
                 return self.transcribe_workspace_audio(
                     SandboxAgentTranscribeRequest.model_validate(payload)
                 )
+            if name == "sandbox_publish_image":
+                return self.publish_image(SandboxAgentImagePublishRequest.model_validate(payload))
             if name == "sandbox_publish_file":
                 return self.publish_workspace_file(
                     chat_session_id=chat_session_id,

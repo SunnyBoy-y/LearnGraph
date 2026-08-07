@@ -31,6 +31,7 @@ class SandboxBootstrapStatusView(BaseModel):
     phase: str
     progress_percent: int
     message: str
+    detail: str | None = None
     can_initialize: bool
     # Whether ordinary workspace members may trigger the bootstrap; defaults
     # to True and can be restricted by administrators via the policy endpoint.
@@ -59,6 +60,7 @@ class SandboxBootstrapJobView(BaseModel):
     phase: str
     progress_percent: int
     message: str
+    detail: str | None = None
     status: str
     image_digest: str | None = None
     browser_image_digest: str | None = None
@@ -179,6 +181,36 @@ class SandboxAgentFileWriteRequest(BaseModel):
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
+class SandboxAgentFileAppendRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    path: str = Field(min_length=1, max_length=255)
+    content: str = Field(min_length=1, max_length=1_048_576)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentFileEditRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    path: str = Field(min_length=1, max_length=255)
+    old_string: str = Field(min_length=1, max_length=1_048_576)
+    new_string: str = Field(max_length=1_048_576)
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentEnvironmentRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentImagePublishRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    path: str = Field(min_length=1, max_length=255)
+    title: str | None = Field(default=None, max_length=255)
+    alt: str | None = Field(default=None, max_length=500)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
 class SandboxAgentFileReadRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
     path: str = Field(min_length=1, max_length=255)
@@ -211,6 +243,7 @@ class SandboxAgentFileView(BaseModel):
     sandbox_session_id: str
     path: str
     size_bytes: int
+    sha256: str | None = None
     content: str | None = None
     files: list[SandboxAgentWorkspaceFileView] = Field(default_factory=list)
 
@@ -280,6 +313,58 @@ class SessionWorkspacePublishResponse(BaseModel):
     part: dict[str, Any] | None = None
     created_at: str | None = None
     updated_at: str | None = None
+
+
+class SandboxWebAppValidateRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    output_root: str = Field(default="dist", min_length=1, max_length=255)
+    entry_path: str = Field(default="dist/index.html", min_length=1, max_length=255)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxWebAppValidationView(BaseModel):
+    validation_id: str
+    status: str
+    manifest_sha256: str
+    entry_path: str
+    file_count: int
+    size_bytes: int
+    report: dict[str, Any]
+
+
+class SandboxWebAppPublishRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    validation_id: str = Field(min_length=1, max_length=36)
+    title: str = Field(min_length=1, max_length=255)
+    preferred_height: int | None = Field(default=None, ge=160, le=900)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxWebAppPublishView(BaseModel):
+    bundle_id: str
+    title: str
+    entry_path: str
+    manifest_sha256: str
+    status: str
+    part: dict[str, Any]
+
+
+class SubAppBundlePreviewView(BaseModel):
+    bundle_id: str
+    expires_at: datetime
+    url: str
+
+
+class SandboxPreviewConfigView(BaseModel):
+    origin: str | None = None
+    source: str  # persisted | env | auto | none
+    persisted: bool = False
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class SandboxPreviewConfigUpdateRequest(BaseModel):
+    origin: str = Field(min_length=1, max_length=255)
 
 
 class SandboxDestructiveGrantRequest(BaseModel):

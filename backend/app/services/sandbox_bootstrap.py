@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import threading
 import time
@@ -9,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import Settings
 from app.core.file_lock import InterProcessFileLock
@@ -33,6 +34,12 @@ from app.services.sandbox_runtime import (
 
 DEFAULT_TAG = "learngraph-sandbox:local"
 SMOKE_CONTAINER_PREFIX = "learngraph-sandbox-smoke-"
+_URL_CREDENTIALS_RE = re.compile(r"(https?://)([^/@\s]+)@", re.IGNORECASE)
+_URL_QUERY_OR_FRAGMENT_RE = re.compile(r"(https?://[^\s?#]+)[?#][^\s]*", re.IGNORECASE)
+_TOKEN_ASSIGNMENT_RE = re.compile(
+    r"\b(token|password|secret|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -41,6 +48,7 @@ class BootstrapJob:
     phase: str = "queued"
     progress_percent: int = 0
     message: str = "排队中"
+    detail: str | None = None
     status: str = "running"  # running | succeeded | failed
     image_digest: str | None = None
     browser_image_digest: str | None = None
@@ -50,9 +58,24 @@ class BootstrapJob:
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     actor_id: str | None = None
+    # Live docker build tracking. Written only by the bootstrap worker thread
+    # and consumed by ``_refresh_build_progress`` to drive the realistic
+    # percent/detail the UI polls via /sandbox/bootstrap/status; never
+    # serialized directly.
+    context_current: int = 0
+    context_total: int = 0
+    download_current: int = 0
+    download_total: int = 0
+    download_complete: bool = False
+    download_ref: str | None = None
+    extract_current: int = 0
+    extract_total: int = 0
+    step_index: int = 0
+    step_total: int = 0
+    step_command: str = ""
 
     def append_log(self, line: str) -> None:
-        text = line.strip()
+        text = _redact_build_detail(line.strip())
         if not text:
             return
         self.log_lines.append(text[:500])
@@ -65,6 +88,7 @@ class BootstrapJob:
             "phase": self.phase,
             "progress_percent": self.progress_percent,
             "message": self.message,
+            "detail": self.detail,
             "status": self.status,
             "image_digest": self.image_digest,
             "browser_image_digest": self.browser_image_digest,
@@ -74,6 +98,381 @@ class BootstrapJob:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
+
+
+def _redact_build_detail(value: str) -> str:
+    """Keep build diagnostics useful without disclosing registry credentials."""
+
+    value = _URL_CREDENTIALS_RE.sub(r"\1<redacted>@", value)
+    value = _URL_QUERY_OR_FRAGMENT_RE.sub(r"\1<redacted>", value)
+    return _TOKEN_ASSIGNMENT_RE.sub(r"\1=<redacted>", value)
+
+
+_KB = 1024
+_MB = 1024 * 1024
+_BYTES_PER_UNIT = {
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000 * 1000,
+    "gb": 1000 * 1000 * 1000,
+    "kib": _KB,
+    "mib": _MB,
+    "gib": _MB * 1024,
+}
+_BUILDKIT_STEP_RE = re.compile(
+    r"^#\d+\s+\[(\d+)/(\d+)\]\s*"
+    r"(FROM|RUN|COPY|ADD|ENV|ARG|WORKDIR|CMD|ENTRYPOINT|EXPOSE|USER|LABEL|VOLUME|SHELL|HEALTHCHECK|STOPSIGNAL)\b\s*(.*)$",
+    re.IGNORECASE,
+)
+_BUILDKIT_PROGRESS_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(kB|MB|GB|KiB|MiB|GiB)\s*/\s*"
+    r"(\d+(?:\.\d+)?)\s*(kB|MB|GB|KiB|MiB|GiB)",
+    re.IGNORECASE,
+)
+_BUILDKIT_RESOLVE_RE = re.compile(r"^#\d+\s+resolve\s+(\S+)", re.IGNORECASE)
+_CLASSIC_STEP_RE = re.compile(r"^Step\s+(\d+)/(\d+)\s*:?\s*(.*)$", re.IGNORECASE)
+_PREBUILT_IMAGE_REF_RE = re.compile(
+    r"^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::\d+)?/)?"
+    r"[a-z0-9]+(?:[._/-][a-z0-9]+)*(?:(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})|@sha256:[0-9a-f]{64})?$"
+)
+
+
+def _prebuilt_image_ref(value: str | None) -> str | None:
+    """Return a safe pull reference; runtime refs are pinned separately."""
+
+    ref = (value or "").strip()
+    if not ref:
+        return None
+    if any(character.isspace() or ord(character) < 32 for character in ref):
+        raise ValueError("Prebuilt sandbox image reference contains invalid characters")
+    if not _PREBUILT_IMAGE_REF_RE.fullmatch(ref):
+        raise ValueError("Prebuilt sandbox image reference is invalid")
+    return ref
+
+
+def _repository_for_ref(ref: str) -> str:
+    """Drop a tag/digest while retaining the registry-qualified repository."""
+
+    without_digest = ref.split("@", 1)[0]
+    slash = without_digest.rfind("/")
+    colon = without_digest.rfind(":")
+    return without_digest[:colon] if colon > slash else without_digest
+
+
+def _matching_repo_digest(image, configured_ref: str) -> str | None:
+    """Select the pulled registry digest for the configured repository.
+
+    Docker image IDs are local config IDs and cannot be pulled on another
+    device.  Only a RepoDigest is safe to persist as a portable runtime ref.
+    """
+
+    expected = _repository_for_ref(configured_ref)
+    digests = image.attrs.get("RepoDigests") or []
+    if not isinstance(digests, list):
+        return None
+    for digest in digests:
+        if isinstance(digest, str) and digest.startswith(expected + "@sha256:"):
+            return digest if image_ref_is_pinned(digest) else None
+    return None
+
+
+def _friendly_image_ref(ref: str) -> str:
+    ref = (ref or "").strip()
+    if ref.startswith("docker.io/"):
+        ref = ref[len("docker.io/") :]
+    ref = ref.split("@sha256:")[0]
+    return ref or "镜像层"
+
+
+def _clean_stream_line(value: str) -> str:
+    """Strip ANSI CSI codes and \r-based in-place rewrites, keep the newest segment.
+
+    BuildKit rewrites progress with \r and embeds ANSI color/clear codes, so
+    the raw stream is not human-readable; this yields the last visible update
+    of each line.
+    """
+    value = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", value)
+    parts = [part.strip() for part in value.split("\r")]
+    parts = [part for part in parts if part]
+    return parts[-1] if parts else ""
+
+
+def _parse_byte_progress(entry: dict[str, Any]) -> tuple[int, int] | None:
+    detail = entry.get("progressDetail")
+    if not isinstance(detail, dict):
+        return None
+    current, total = detail.get("current"), detail.get("total")
+    if isinstance(current, int) and isinstance(total, int) and total > 0:
+        return current, total
+    return None
+
+
+def _size_to_bytes(value: str, unit: str) -> int:
+    return int(float(value) * _BYTES_PER_UNIT[unit.lower()])
+
+
+def _track_build_entry(job: BootstrapJob, entry: dict[str, Any]) -> None:
+    """Fold one docker build log entry into the job's live progress state."""
+
+    status = entry.get("status")
+    if isinstance(status, str) and status.strip():
+        _track_classic_entry(job, status, entry)
+        return
+    stream = entry.get("stream")
+    if isinstance(stream, str):
+        _track_buildkit_line(job, stream)
+
+
+def _track_classic_entry(
+    job: BootstrapJob, status: str, entry: dict[str, Any]
+) -> None:
+    step_match = _CLASSIC_STEP_RE.match(status)
+    if step_match:
+        job.step_index = int(step_match.group(1))
+        job.step_total = int(step_match.group(2))
+        job.step_command = step_match.group(3).strip()[:80]
+        # A step implies the base layers are pulled/extracted; clear the
+        # download trackers so later steps aren't masked by stale pulls.
+        job.context_current = job.context_total = 0
+        job.download_current = job.download_total = 0
+        job.download_complete = False
+        job.extract_current = job.extract_total = 0
+        _refresh_build_progress(job)
+        return
+    if "Sending build context" in status:
+        progress = _parse_byte_progress(entry)
+        if progress:
+            job.context_current, job.context_total = progress
+            _refresh_build_progress(job)
+        return
+    if "Pulling from" in status:
+        job.download_ref = status.split("Pulling from", 1)[1].strip()
+        _refresh_build_progress(job)
+        return
+    if status == "Downloading":
+        progress = _parse_byte_progress(entry)
+        if progress:
+            job.download_current, job.download_total = progress
+            job.download_complete = job.download_current >= job.download_total
+            if not job.download_ref:
+                layer_id = entry.get("id")
+                if isinstance(layer_id, str) and layer_id:
+                    job.download_ref = layer_id
+            _refresh_build_progress(job)
+        return
+    if status == "Download complete":
+        job.download_complete = True
+        _refresh_build_progress(job)
+        return
+    if status == "Extracting":
+        job.download_complete = True  # extraction implies downloads finished
+        progress = _parse_byte_progress(entry)
+        if progress:
+            job.extract_current, job.extract_total = progress
+        elif not job.extract_total:
+            job.extract_total = 1
+        _refresh_build_progress(job)
+        return
+    if status in ("Waiting", "Pull complete", "Verifying Checksum", "Already exists"):
+        _refresh_build_progress(job)
+        return
+
+
+def _track_buildkit_line(job: BootstrapJob, stream: str) -> None:
+    line = _clean_stream_line(stream)
+    if not line:
+        return
+    step_match = _BUILDKIT_STEP_RE.match(line)
+    if step_match:
+        job.step_index = int(step_match.group(1))
+        job.step_total = int(step_match.group(2))
+        job.step_command = f"{step_match.group(3).upper()} {step_match.group(4)}".strip()[:80]
+        # A step implies the base layers are pulled/extracted; clear the
+        # download trackers so later steps aren't masked by stale pulls.
+        job.context_current = job.context_total = 0
+        job.download_current = job.download_total = 0
+        job.download_complete = False
+        job.extract_current = job.extract_total = 0
+        _refresh_build_progress(job)
+        return
+    resolve_match = _BUILDKIT_RESOLVE_RE.match(line)
+    if resolve_match:
+        job.download_ref = _friendly_image_ref(resolve_match.group(1))
+        return
+    progress_match = _BUILDKIT_PROGRESS_RE.search(line)
+    if progress_match:
+        current = _size_to_bytes(progress_match.group(1), progress_match.group(2))
+        total = _size_to_bytes(progress_match.group(3), progress_match.group(4))
+        if total > 0:
+            if "extracting" in line.lower() or "unpacking" in line.lower():
+                job.download_complete = True  # extraction implies downloads finished
+                job.extract_current, job.extract_total = current, total
+            else:
+                job.download_current, job.download_total = current, total
+                job.download_complete = current >= total
+            _refresh_build_progress(job)
+        return
+    if "DONE" in line and job.download_total:
+        job.download_complete = True
+        _refresh_build_progress(job)
+
+
+def _refresh_build_progress(job: BootstrapJob) -> None:
+    """Recompute the live build percent (40→68) and a human-readable detail.
+
+    ``progress_percent`` only moves forward within the build phase, so the bar
+    never regresses while the daemon switches between downloading layers,
+    extracting them and executing steps.
+    """
+    mb = _MB
+    if job.context_total:
+        frac = max(0.0, min(1.0, job.context_current / job.context_total))
+        detail = (
+            f"正在上传构建上下文 · "
+            f"{job.context_current / mb:.1f} MB / {job.context_total / mb:.1f} MB"
+        )
+        percent = 40 + round(28 * 0.15 * frac)
+    elif job.download_total and not job.download_complete:
+        frac = max(0.0, min(1.0, job.download_current / job.download_total))
+        ref = _friendly_image_ref(job.download_ref or "镜像层")
+        detail = (
+            f"正在下载镜像 {ref} · "
+            f"{job.download_current / mb:.1f} MB / {job.download_total / mb:.1f} MB"
+        )
+        percent = 40 + round(28 * (0.15 + 0.25 * frac))
+    elif job.extract_total:
+        detail = (
+            f"正在解压镜像层 · "
+            f"{job.extract_current / mb:.1f} MB / {job.extract_total / mb:.1f} MB"
+        )
+        percent = 40 + round(28 * 0.45)
+    elif job.step_total:
+        index = max(1, job.step_index)
+        command = job.step_command or "执行构建指令"
+        detail = f"正在构建 · 步骤 {index}/{job.step_total}：{command}"
+        percent = 40 + round(28 * (0.5 + 0.5 * ((index - 1) / job.step_total)))
+    else:
+        detail = "正在构建镜像…"
+        percent = 40
+    job.detail = detail
+    job.progress_percent = min(68, max(40, job.progress_percent, percent))
+
+
+def _append_build_entry(job: BootstrapJob, entry: Any) -> str | None:
+    """Append one docker-py/BuildKit entry and return its failure detail."""
+
+    if not isinstance(entry, dict):
+        if isinstance(entry, str) and entry.strip():
+            job.append_log(_clean_stream_line(entry))
+        return None
+    stream = entry.get("stream")
+    if isinstance(stream, str) and stream.strip():
+        job.append_log(_clean_stream_line(stream))
+    status = entry.get("status")
+    if isinstance(status, str) and status.strip():
+        job.append_log(_clean_stream_line(status))
+    _track_build_entry(job, entry)
+    err = entry.get("error")
+    detail = entry.get("errorDetail")
+    detail_message = (
+        detail.get("message")
+        if isinstance(detail, dict) and isinstance(detail.get("message"), str)
+        else None
+    )
+    failure_detail = err if isinstance(err, str) and err.strip() else detail_message
+    if failure_detail:
+        job.append_log(f"[docker-error] {failure_detail}")
+        return failure_detail
+    return None
+
+
+def _append_exception_build_log(job: BootstrapJob, exc: BaseException) -> str:
+    """Consume BuildError.build_log when docker-py raises after a failed build."""
+
+    detail = _redact_build_detail(str(exc)).strip()
+    build_log = getattr(exc, "build_log", None)
+    if build_log is not None:
+        try:
+            for entry in build_log:
+                failure = _append_build_entry(job, entry)
+                if failure:
+                    detail = failure
+        except Exception as log_exc:  # diagnostic collection must not mask the build error
+            job.append_log(f"[docker-log-read-error] {_redact_build_detail(str(log_exc))}")
+    return detail
+
+
+def _build_failure_code(detail: str) -> str:
+    """Classify a build failure without guessing when evidence is weak."""
+
+    lowered = detail.lower()
+    if "parameter not set" in lowered or "unbound variable" in lowered:
+        return "build_config"
+    if any(
+        marker in lowered
+        for marker in (
+            "could not fetch url",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "connection refused",
+            "connection reset",
+            "timed out",
+            "timeout",
+            "tls",
+            "ssl",
+            "certificate verify failed",
+            "502 bad gateway",
+            "503 service unavailable",
+            "504 gateway timeout",
+        )
+    ):
+        return "build_network"
+    if any(
+        marker in lowered
+        for marker in (
+            "no matching distribution",
+            "no matching package",
+            "could not find a version that satisfies",
+            "only-binary",
+            "requires a different python",
+            "not a supported wheel on this platform",
+        )
+    ):
+        return "build_no_wheel"
+    if any(
+        marker in lowered
+        for marker in (
+            "requires-python",
+            "dependency conflict",
+            "conflicting dependencies",
+            "resolutionimpossible",
+            "invalid requirement",
+            "no such version",
+        )
+    ):
+        return "build_version"
+    return "build_failed"
+
+
+def _build_failure_message(detail: str) -> str:
+    """Summarize common package-fetch failures while retaining a redacted tail."""
+
+    text = _redact_build_detail(detail).strip()
+    lowered = text.lower()
+    if "parameter not set" in lowered or "unbound variable" in lowered:
+        summary = "Dockerfile build argument is unavailable in this stage"
+    elif any(marker in lowered for marker in ("no matching distribution", "could not find a version")):
+        summary = "Python dependency or compatible wheel is unavailable from the configured package index"
+    elif any(marker in lowered for marker in ("hashes", "hash mismatch")):
+        summary = "Python dependency download failed integrity verification"
+    elif any(
+        marker in lowered
+        for marker in ("ssl", "certificate", "tls", "connection", "timed out", "temporary failure", "name resolution")
+    ):
+        summary = "Python dependency download could not reach the configured package index"
+    else:
+        summary = "Docker build failed; inspect the redacted build log tail for the failing instruction"
+    return f"{summary}: {text[:300]}" if text else summary
 
 
 class SandboxBootstrapService:
@@ -183,6 +582,7 @@ class SandboxBootstrapService:
                 if active
                 else ("沙箱运行环境已就绪" if image_ready else "尚未初始化沙箱运行环境")
             ),
+            "detail": active["detail"] if active else None,
             # While a job is running, the UI should join progress rather than start another.
             "can_initialize": bool(can_initialize and active is None),
             "active_job": active,
@@ -245,6 +645,15 @@ class SandboxBootstrapService:
             job.phase = phase
             job.progress_percent = max(0, min(100, percent))
             job.message = message
+            job.detail = None
+            # Reset the docker build tracker for a fresh phase.
+            job.context_current = job.context_total = 0
+            job.download_current = job.download_total = 0
+            job.download_complete = False
+            job.download_ref = None
+            job.extract_current = job.extract_total = 0
+            job.step_index = job.step_total = 0
+            job.step_command = ""
             job.append_log(f"[{phase}] {message}")
 
     def _fail(self, job: BootstrapJob, code: str, message: str) -> None:
@@ -254,6 +663,7 @@ class SandboxBootstrapService:
             job.error_code = code
             job.error_message = message
             job.message = message
+            job.detail = None
             job.finished_at = time.time()
             job.append_log(f"[failed] {code}: {message}")
 
@@ -265,6 +675,7 @@ class SandboxBootstrapService:
             job.image_digest = digest
             job.browser_image_digest = browser_digest
             job.message = "沙箱运行环境已就绪"
+            job.detail = None
             job.finished_at = time.time()
             job.append_log(f"[ready] {digest}")
 
@@ -289,12 +700,111 @@ class SandboxBootstrapService:
                     return
             self._run_job_locked(job, settings)
 
+    def _pull_prebuilt_image(
+        self, job: BootstrapJob, settings: Settings, configured_ref: str
+    ) -> str | None:
+        """Pull a configured registry image, persist only its RepoDigest."""
+
+        self._set_phase(job, "pull_runner", 15, "正在下载预构建沙箱镜像…")
+        client = self._docker_client()
+        try:
+            repository = _repository_for_ref(configured_ref)
+            digest_ref = configured_ref if "@sha256:" in configured_ref else repository
+            for chunk in client.api.pull(digest_ref, stream=True, decode=True):
+                failure = _append_build_entry(job, chunk)
+                if failure:
+                    self._fail(job, "prebuilt_pull_failed", _build_failure_message(failure))
+                    return None
+                with self._lock:
+                    if job.download_total:
+                        fraction = min(1.0, job.download_current / job.download_total)
+                        job.progress_percent = max(job.progress_percent, 15 + round(53 * fraction))
+                        ref = _friendly_image_ref(job.download_ref or configured_ref)
+                        job.detail = (
+                            f"正在下载预构建镜像 {ref} · "
+                            f"{job.download_current / _MB:.1f} MB / {job.download_total / _MB:.1f} MB"
+                        )
+                    elif job.detail is None:
+                        job.detail = f"正在下载预构建镜像 {_friendly_image_ref(configured_ref)}…"
+            self._set_phase(job, "resolve_digest", 70, "正在解析预构建镜像 digest…")
+            image = client.images.get(configured_ref)
+            digest = _matching_repo_digest(image, configured_ref)
+            if not digest:
+                self._fail(
+                    job,
+                    "prebuilt_digest_missing",
+                    "Registry pull completed but Docker did not expose a matching immutable RepoDigest",
+                )
+                return None
+            return digest
+        except Exception as exc:
+            detail = _redact_build_detail(str(exc))
+            job.append_log(f"[docker-pull-exception] {detail}")
+            self._fail(job, "prebuilt_pull_failed", _build_failure_message(detail))
+            return None
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _verify_and_persist_image(
+        self,
+        job: BootstrapJob,
+        settings: Settings,
+        digest: str,
+        *,
+        source: str,
+        tag: str,
+    ) -> None:
+        job.image_digest = digest
+        self._set_phase(
+            job, "smoke_test", 86, "正在做 Python / Node / ffmpeg / Browser 冒烟检查…"
+        )
+
+        def _bump_smoke(detail: str, percent: int) -> None:
+            with self._lock:
+                job.detail = detail
+                job.progress_percent = max(job.progress_percent, percent)
+
+        smoke_error = self._smoke_test(digest, settings, on_progress=_bump_smoke)
+        if smoke_error:
+            self._fail(job, "smoke_failed", smoke_error)
+            return
+        self._set_phase(job, "persist_runtime", 97, "正在保存运行时配置…")
+        try:
+            save_runtime_config(
+                settings,
+                image_digest=digest,
+                source=source,
+                builder_user_id=job.actor_id,
+                tag=tag,
+                browser_image_digest=digest,
+            )
+        except Exception as exc:
+            self._fail(job, "persist_failed", f"Failed to persist runtime config: {exc}")
+            return
+        self._succeed(job, digest, digest)
+
     def _run_job_locked(self, job: BootstrapJob, settings: Settings) -> None:
         try:
             self._set_phase(job, "detect_docker", 10, "正在检测 Docker Engine…")
             ok, detail = self._probe_docker()
             if not ok:
                 self._fail(job, "docker_unavailable", detail or "Docker Engine is unavailable")
+                return
+
+            try:
+                prebuilt_ref = _prebuilt_image_ref(settings.sandbox_prebuilt_image)
+            except ValueError as exc:
+                self._fail(job, "prebuilt_image_invalid", str(exc))
+                return
+            if prebuilt_ref:
+                digest = self._pull_prebuilt_image(job, settings, prebuilt_ref)
+                if digest:
+                    self._verify_and_persist_image(
+                        job, settings, digest, source="prebuilt_pull", tag=prebuilt_ref
+                    )
                 return
 
             sandbox_root = self._sandbox_root()
@@ -320,24 +830,34 @@ class SandboxBootstrapService:
                 buildargs["NPM_REGISTRY"] = settings.sandbox_build_npm_registry.strip()
             client = self._docker_client()
             try:
-                image, build_log = client.images.build(
+                # Stream the build via the low-level API (``images.build``
+                # buffers the whole stream before returning, which would freeze
+                # progress at 40% until the image is done). Each decoded chunk
+                # updates the job's percent/detail from real layer downloads
+                # and steps as the daemon emits them.
+                build_error_detail: str | None = None
+                for chunk in client.api.build(
                     path=str(sandbox_root),
                     tag=DEFAULT_TAG,
                     buildargs=buildargs or None,
                     rm=True,
                     forcerm=True,
-                )
-                for chunk in build_log:
-                    if isinstance(chunk, dict):
-                        stream = chunk.get("stream")
-                        if isinstance(stream, str) and stream.strip():
-                            job.append_log(stream.strip())
-                        err = chunk.get("error")
-                        if isinstance(err, str) and err.strip():
-                            self._fail(job, "build_failed", err.strip())
-                            return
+                    decode=True,
+                ):
+                    failure_detail = _append_build_entry(job, chunk)
+                    if failure_detail:
+                        build_error_detail = failure_detail
+                if build_error_detail:
+                    self._fail(
+                        job,
+                        _build_failure_code(build_error_detail),
+                        _build_failure_message(build_error_detail),
+                    )
+                    return
             except Exception as exc:
-                self._fail(job, "build_failed", f"Docker build failed: {exc}")
+                detail = _append_exception_build_log(job, exc)
+                job.append_log(f"[docker-exception] {detail}")
+                self._fail(job, _build_failure_code(detail), _build_failure_message(detail))
                 return
             finally:
                 try:
@@ -350,32 +870,9 @@ class SandboxBootstrapService:
             if not digest:
                 self._fail(job, "digest_missing", "Docker did not return an immutable image id")
                 return
-            job.image_digest = digest
-
-            self._set_phase(
-                job, "smoke_test", 85, "正在做 Python / Node / ffmpeg / Browser 冒烟检查…"
+            self._verify_and_persist_image(
+                job, settings, digest, source="bootstrap_build", tag=DEFAULT_TAG
             )
-            smoke_error = self._smoke_test(digest, settings)
-            if smoke_error:
-                self._fail(job, "smoke_failed", smoke_error)
-                return
-            # Publish the digest only after smoke passes.  browser_image_digest
-            # mirrors the unified digest for configuration compatibility.
-            self._set_phase(job, "persist_runtime", 97, "正在保存运行时配置…")
-            try:
-                save_runtime_config(
-                    settings,
-                    image_digest=digest,
-                    source="bootstrap_build",
-                    builder_user_id=job.actor_id,
-                    tag=DEFAULT_TAG,
-                    browser_image_digest=digest,
-                )
-            except Exception as exc:
-                self._fail(job, "persist_failed", f"Failed to persist runtime config: {exc}")
-                return
-
-            self._succeed(job, digest, digest)
         except Exception as exc:  # pragma: no cover - defensive
             self._fail(job, "bootstrap_internal_error", str(exc)[:300])
 
@@ -417,7 +914,12 @@ class SandboxBootstrapService:
         finally:
             client.close()
 
-    def _smoke_test(self, image_digest: str, settings: Settings) -> str | None:
+    def _smoke_test(
+        self,
+        image_digest: str,
+        settings: Settings,
+        on_progress: Callable[[str, int], None] | None = None,
+    ) -> str | None:
         """Exercise the unified image under both code-offline and browser-offline hardening.
 
         Creates two short-lived containers, each with its own runtime profile
@@ -425,6 +927,8 @@ class SandboxBootstrapService:
         published.  The container options mirror ``DockerSandboxBackend.create``.
         """
 
+        if on_progress is not None:
+            on_progress("正在冒烟检查 Python / Node / ffmpeg / 文档解析库…", 88)
         code_error = self._smoke_container(
             image_digest,
             settings,
@@ -436,7 +940,7 @@ class SandboxBootstrapService:
                 [
                     "python",
                     "-c",
-                    "import mammoth, pypdf, openpyxl, PIL, pydub, learngraph_tasks",
+                    "import av, bs4, docx, fitz, mammoth, markdown_it, numpy, odf, openpyxl, pandas, pdfplumber, PIL, pydub, pypdf, pptx, pyxlsb, trafilatura, xlsxwriter, learngraph_tasks",
                 ],
                 [
                     "node",
@@ -453,6 +957,8 @@ class SandboxBootstrapService:
         if code_error:
             return code_error
 
+        if on_progress is not None:
+            on_progress("正在冒烟检查 Chromium / 前端构建工具链…", 93)
         browser_error = self._smoke_container(
             image_digest,
             settings,
@@ -501,7 +1007,7 @@ class SandboxBootstrapService:
                 security_opt=sandbox_seccomp_security_options(runtime_kind),
                 mem_limit=settings.sandbox_memory_bytes,
                 memswap_limit=settings.sandbox_memory_swap_bytes,
-                pids_limit=settings.sandbox_pids_max,
+                pids_limit=max(settings.sandbox_pids_max, 1024),
                 shm_size=sandbox_shm_size(runtime_kind),
                 tmpfs={"/tmp": "rw,noexec,nosuid,nodev,size=67108864,mode=1777"},
                 labels={"com.learngraph.sandbox": "smoke"},
@@ -512,7 +1018,11 @@ class SandboxBootstrapService:
                 result = container.exec_run(
                     argv_item,
                     user="65532:65532",
-                    environment={"HOME": "/tmp"},
+                    environment={
+                        "HOME": "/tmp",
+                        "XDG_CONFIG_HOME": "/tmp/.config",
+                        "XDG_CACHE_HOME": "/tmp/.cache",
+                    },
                 )
                 if int(result.exit_code) != 0:
                     out = (result.output or b"").decode("utf-8", errors="replace")[:500]
@@ -551,4 +1061,5 @@ def backend_for_settings(
         enabled=settings.sandbox_enabled,
         image_ref=resolve_sandbox_image_for_runtime(settings, runtime_kind),
         runtime_kind=runtime_kind,
+        archive_bytes=settings.sandbox_agent_archive_bytes,
     )

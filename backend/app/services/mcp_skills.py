@@ -640,6 +640,19 @@ SKILL_MAX_RESULT_BYTES = 256 * 1024
 # per-skill names are always exactly ``lg_skill_`` + 20 hex chars).
 SKILL_READ_FUNCTION_NAME = "lg_skill_read"
 SKILL_READ_MAX_CONTENT_CHARS = 48_000
+# Always-available Agent discovery tools (progressive disclosure).
+CAPABILITY_SEARCH_FUNCTION_NAME = "lg_capability_search"
+CAPABILITY_ACTIVATE_FUNCTION_NAME = "lg_capability_activate"
+CAPABILITY_SEARCH_MAX_QUERY_CHARS = 500
+CAPABILITY_SEARCH_MAX_RESULTS = 8
+CAPABILITY_FAMILIES = ("skill", "mcp", "builtin_extension")
+CAPABILITY_KINDS = (
+    "builtin_tool",
+    "skill_package",
+    "declarative_skill",
+    "mcp_server",
+    "mcp_tool",
+)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -653,6 +666,14 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _hash(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _short_summary(value: Any, limit: int = 220) -> str:
+    """Bound free-text metadata so descriptors never bloat the model context."""
+    text = " ".join((str(value or "").strip() or "").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1].rstrip()}…"
 
 
 def _contains_sensitive_key(value: Any) -> bool:
@@ -820,7 +841,592 @@ class MCPAndSkillService:
             result.append(skill)
         return result
 
-    def agent_tool_definitions(self) -> list[dict[str, Any]]:
+    def _authorized_declarative_skills(self) -> list[tuple[SkillRecord, SkillManifest]]:
+        """Enabled declarative Skills holding a durable ``always`` grant."""
+        result: list[tuple[SkillRecord, SkillManifest]] = []
+        for skill in self.list_skills():
+            if not skill.enabled or skill.status != "enabled":
+                continue
+            if not self._is_declarative_skill(skill):
+                continue
+            grant = self._usable_grant(
+                "skill", skill.id, self._skill_authorization_hash(skill)
+            )
+            if grant is None or grant.decision != "always":
+                continue
+            try:
+                manifest = SkillManifest.model_validate(skill.manifest_json)
+            except Exception:
+                continue
+            result.append((skill, manifest))
+        return result
+
+    def _eligible_mcp_tools(
+        self, server: MCPServer
+    ) -> list[tuple[MCPCapabilitySnapshot, dict[str, Any]]]:
+        """Reviewed requested MCP tools that are currently agent-eligible."""
+        if not server.enabled or not server.agent_auto_invoke:
+            return []
+        snapshot = self._current_snapshot(server)
+        if snapshot is None:
+            return []
+        grant = self._usable_grant(
+            "mcp_server", server.id, self._server_authorization_hash(server, snapshot)
+        )
+        if grant is None or grant.decision != "always":
+            return []
+        result: list[tuple[MCPCapabilitySnapshot, dict[str, Any]]] = []
+        for tool in snapshot.tools:
+            name = str(tool.get("name") or "")
+            if name not in server.requested_tools:
+                continue
+            if not isinstance(tool.get("inputSchema"), dict):
+                continue
+            result.append((snapshot, tool))
+        return result
+
+    @staticmethod
+    def _capability_search_tool_definition() -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": CAPABILITY_SEARCH_FUNCTION_NAME,
+                "description": (
+                    "Search the LearnGraph capability catalog to discover tools, Agent "
+                    "Skills, and MCP capabilities authorized for this workspace. Use this "
+                    "when the current tool list does not obviously cover the task before "
+                    "assuming a capability is unavailable. Returns compact descriptors "
+                    "(names, purpose, when-to-use, activation requirement) — never full "
+                    "schemas, full Skill instructions, or secrets. Discovery is not "
+                    "authorization: activating a capability never grants permissions, and "
+                    "the host still enforces them at execution."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": CAPABILITY_SEARCH_MAX_QUERY_CHARS,
+                            "description": (
+                                "What you are trying to do, in natural language (Chinese or "
+                                "English), e.g. '轮换 Provider 密钥' or 'schedule review'."
+                            ),
+                        },
+                        "family": {
+                            "type": "string",
+                            "enum": list(CAPABILITY_FAMILIES),
+                            "description": "Optional category filter: skill, mcp, builtin_extension.",
+                        },
+                        "kinds": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": list(CAPABILITY_KINDS)},
+                            "description": (
+                                "Optional kind filter: skill_package, declarative_skill, "
+                                "mcp_server, mcp_tool, builtin_tool."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": CAPABILITY_SEARCH_MAX_RESULTS,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    @staticmethod
+    def _capability_activate_tool_definition() -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": CAPABILITY_ACTIVATE_FUNCTION_NAME,
+                "description": (
+                    "Activate one or more catalog capabilities for this Agent turn so their "
+                    "tool schemas or Skill contracts become available on the next model "
+                    "round. Call capability_search first to obtain capability_ids. "
+                    "Activation is per-turn only: it never grants durable permissions, never "
+                    "enables a server or Skill, never refreshes MCP snapshots, and cannot "
+                    "bypass host authorization."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "capability_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": (
+                                "capability_id values from capability_search, e.g. "
+                                "'skill:graph-generation' or 'mcp:github'."
+                            ),
+                        },
+                        "families": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": list(CAPABILITY_FAMILIES)},
+                            "description": (
+                                "Optional: activate every eligible capability in a family "
+                                "(skill, mcp, builtin_extension)."
+                            ),
+                        },
+                    },
+                    "required": ["capability_ids"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    @staticmethod
+    def _skill_activated(
+        skill: SkillRecord, active_ids: set[str], active_families: set[str]
+    ) -> bool:
+        return f"skill:{skill.skill_key}" in active_ids or "skill" in active_families
+
+    @staticmethod
+    def _mcp_tool_activated(
+        server: MCPServer, active_ids: set[str], active_families: set[str]
+    ) -> bool:
+        return f"mcp:{server.server_key}" in active_ids or "mcp" in active_families
+
+    def _builtin_descriptor(self, tool: str, spec: dict[str, Any]) -> dict[str, Any]:
+        description = _short_summary(spec.get("description"))
+        zh = str(BUILTIN_TOOL_DESCRIPTION_ZH.get(tool) or "")
+        return {
+            "capability_id": f"builtin:{tool}",
+            "kind": "builtin_tool",
+            "family": "builtin_extension",
+            "name": spec["function_name"],
+            "title": spec["function_name"],
+            "summary": description,
+            "when_to_use": _short_summary(zh or description),
+            "keywords": [
+                part
+                for part in re.split(r"[^a-z0-9_一-鿿]+", f"{spec['function_name']} {zh} {description}".lower())
+                if part
+            ][:24],
+            "source": "learngraph_system",
+            "version": "builtin",
+            "hash": "",
+            "status": "available",
+            "authorized": True,
+            "activation_required": False,
+            "permissions": list(BUILTIN_TOOL_PERMISSIONS.get(tool, [])),
+            "function_name": spec["function_name"],
+        }
+
+    def _skill_package_descriptor(self, skill: SkillRecord) -> dict[str, Any]:
+        description = ""
+        if isinstance(skill.manifest_json, dict):
+            raw = skill.manifest_json.get("description")
+            if isinstance(raw, str):
+                description = raw.strip()
+        instructions = (skill.instructions_markdown or "").strip()
+        when_to_use = description or _short_summary(instructions, limit=160)
+        return {
+            "capability_id": f"skill:{skill.skill_key}",
+            "kind": "skill_package",
+            "family": "skill",
+            "name": skill.name,
+            "title": skill.name,
+            "summary": _short_summary(description or instructions),
+            "when_to_use": _short_summary(when_to_use),
+            "keywords": [
+                part
+                for part in re.split(
+                    r"[^a-z0-9_一-鿿]+",
+                    f"{skill.skill_key} {skill.name} {description} {when_to_use}".lower(),
+                )
+                if part
+            ][:32],
+            "source": skill.source,
+            "version": skill.version,
+            "hash": skill.content_hash or skill.manifest_hash,
+            "status": skill.status,
+            "authorized": True,
+            "activation_required": True,
+            "permissions": list(skill.required_permissions or []),
+            "has_scripts": bool(skill.has_scripts),
+            "official": bool(skill.is_official),
+            "function_name": None,
+            "reader": SKILL_READ_FUNCTION_NAME,
+        }
+
+    def _declarative_skill_descriptor(
+        self, skill: SkillRecord, manifest: SkillManifest
+    ) -> dict[str, Any]:
+        description = _short_summary(manifest.instructions_markdown)
+        return {
+            "capability_id": f"skill:{skill.skill_key}",
+            "kind": "declarative_skill",
+            "family": "skill",
+            "name": skill.name,
+            "title": skill.name,
+            "summary": description,
+            "when_to_use": description,
+            "keywords": [
+                part
+                for part in re.split(
+                    r"[^a-z0-9_一-鿿]+",
+                    f"{skill.skill_key} {skill.name} {description}".lower(),
+                )
+                if part
+            ][:32],
+            "source": skill.source,
+            "version": skill.version,
+            "hash": skill.manifest_hash,
+            "status": skill.status,
+            "authorized": True,
+            "activation_required": True,
+            "permissions": list(skill.required_permissions or []),
+            "required_tools": list(skill.required_tools or []),
+            "function_name": self._agent_skill_function_name(skill.id),
+        }
+
+    def _mcp_server_descriptor(
+        self, server: MCPServer, snapshot: MCPCapabilitySnapshot, tool_count: int
+    ) -> dict[str, Any]:
+        description = ""
+        manifest = server.manifest_json or {}
+        if isinstance(manifest, dict):
+            raw = manifest.get("description")
+            if isinstance(raw, str):
+                description = raw.strip()
+        return {
+            "capability_id": f"mcp:{server.server_key}",
+            "kind": "mcp_server",
+            "family": "mcp",
+            "name": server.display_name,
+            "title": server.display_name,
+            "summary": _short_summary(description or server.display_name),
+            "when_to_use": _short_summary(description),
+            "keywords": [
+                part
+                for part in re.split(
+                    r"[^a-z0-9_一-鿿]+",
+                    f"{server.server_key} {server.display_name} {description}".lower(),
+                )
+                if part
+            ][:32],
+            "source": server.source,
+            "version": server.version,
+            "hash": snapshot.snapshot_hash,
+            "status": server.status,
+            "authorized": True,
+            "activation_required": True,
+            "permissions": list(server.required_permissions or []),
+            "tool_count": tool_count,
+            "function_name": None,
+        }
+
+    def _mcp_tool_descriptor(
+        self, server: MCPServer, tool: dict[str, Any]
+    ) -> dict[str, Any]:
+        tool_name = str(tool.get("name") or "")
+        description = _short_summary(str(tool.get("description") or ""))
+        return {
+            "capability_id": f"mcp:{server.server_key}:{tool_name}",
+            "kind": "mcp_tool",
+            "family": "mcp",
+            "name": tool_name,
+            "title": tool_name,
+            "summary": description,
+            "when_to_use": description,
+            "keywords": [
+                part
+                for part in re.split(
+                    r"[^a-z0-9_一-鿿]+",
+                    f"{tool_name} {description}".lower(),
+                )
+                if part
+            ][:24],
+            "source": server.source,
+            "version": server.version,
+            "hash": server.manifest_hash,
+            "status": server.status,
+            "authorized": True,
+            "activation_required": True,
+            "permissions": list(server.required_permissions or []),
+            "parent_capability_id": f"mcp:{server.server_key}",
+            "function_name": self._agent_mcp_function_name(server.id, tool_name),
+        }
+
+    def capability_descriptors(self) -> list[dict[str, Any]]:
+        """Return bounded, redacted capability descriptors for this workspace.
+
+        Descriptors never carry full MCP input schemas, full Skill instruction
+        bodies, endpoint URLs, or credentials. They describe only what the model
+        may *know* exists; authorization and execution still go through the
+        existing grant/snapshot/policy gates.
+        """
+        descriptors: list[dict[str, Any]] = []
+        for tool, spec in BUILTIN_TOOL_SPECS.items():
+            descriptors.append(self._builtin_descriptor(tool, spec))
+        for skill in self._authorized_packages():
+            descriptors.append(self._skill_package_descriptor(skill))
+        for skill, manifest in self._authorized_declarative_skills():
+            descriptors.append(self._declarative_skill_descriptor(skill, manifest))
+        for server in self.list_servers():
+            eligible = self._eligible_mcp_tools(server)
+            if not eligible:
+                continue
+            descriptors.append(self._mcp_server_descriptor(server, eligible[0][0], len(eligible)))
+            for _snapshot, tool in eligible:
+                descriptors.append(self._mcp_tool_descriptor(server, tool))
+        return descriptors
+
+    def search_capabilities(
+        self,
+        query: str,
+        *,
+        family: str | None = None,
+        kinds: list[str] | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Deterministic lexical search over redacted capability descriptors.
+
+        This is the high-recall floor: capability_id/name/title/summary/
+        when_to_use/keywords are token-matched (case-insensitive, CJK-aware).
+        An exact capability_id or function name always wins. Semantic ranking
+        can be layered on later without changing the contract.
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = CAPABILITY_SEARCH_MAX_RESULTS
+        limit = max(1, min(limit, CAPABILITY_SEARCH_MAX_RESULTS))
+        descriptors = self.capability_descriptors()
+        if family:
+            descriptors = [d for d in descriptors if d["family"] == family]
+        if kinds:
+            allowed = set(kinds)
+            descriptors = [d for d in descriptors if d["kind"] in allowed]
+        text_query = (query or "").strip().lower()
+        if not text_query:
+            ordered = sorted(descriptors, key=lambda d: (d["family"], d["name"]))
+            return {
+                "query": query or "",
+                "results": [
+                    {"descriptor": d, "matched": []} for d in ordered[:limit]
+                ],
+                "total": len(ordered),
+            }
+        tokens = [
+            t
+            for t in re.split(r"[^a-z0-9_一-鿿]+", text_query)
+            if t
+        ]
+        scored: list[tuple[int, dict[str, Any], list[str]]] = []
+        for d in descriptors:
+            haystack = " ".join(
+                [
+                    d.get("capability_id", ""),
+                    d.get("name", ""),
+                    d.get("title", ""),
+                    d.get("summary", ""),
+                    d.get("when_to_use", ""),
+                    " ".join(d.get("keywords") or []),
+                ]
+            ).lower()
+            score = 0
+            matched: list[str] = []
+            if text_query in {d.get("capability_id"), d.get("name"), d.get("function_name")}:
+                score += 100
+                matched.append("exact")
+            for token in tokens:
+                if token in haystack:
+                    score += 2
+                    if token not in matched:
+                        matched.append(token)
+            if score > 0:
+                scored.append((score, d, matched))
+        scored.sort(key=lambda item: (-item[0], item[1]["family"], item[1]["name"]))
+        results = [
+            {"descriptor": d, "matched": matched}
+            for _score, d, matched in scored[:limit]
+        ]
+        return {
+            "query": query or "",
+            "results": results,
+            "total": len(scored),
+        }
+
+    def activate_capabilities(
+        self,
+        capability_ids: list[str],
+        *,
+        families: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate per-turn activation without mutating durable state.
+
+        Activation only computes which catalog entries the model may load on
+        the next round. It never creates grants, never toggles ``enabled`` or
+        ``agent_auto_invoke``, never refreshes MCP snapshots, and never changes
+        authorization hashes.
+        """
+        if not capability_ids and not families:
+            raise AppError(
+                422,
+                "activation_required",
+                "Provide at least one capability_id or family",
+            )
+        by_id = {d["capability_id"]: d for d in self.capability_descriptors()}
+        resolved: list[str] = []
+        denied: list[dict[str, str]] = []
+        for raw in capability_ids or []:
+            cid = (raw or "").strip()
+            if not cid:
+                continue
+            descriptor = by_id.get(cid)
+            if descriptor is None:
+                denied.append({"capability_id": cid, "reason": "not_found"})
+                continue
+            if not descriptor.get("authorized"):
+                denied.append({"capability_id": cid, "reason": "not_authorized"})
+                continue
+            resolved.append(cid)
+        active_families = sorted(
+            {f for f in (families or []) if f in CAPABILITY_FAMILIES}
+        )
+        if denied:
+            raise AppError(
+                403,
+                "capability_not_authorized",
+                "Some requested capabilities are unavailable for this workspace",
+                {"denied": denied},
+            )
+        return {
+            "activated_capability_ids": sorted(set(resolved)),
+            "activated_families": active_families,
+            "note": (
+                "Activation is per-turn and only affects which schemas/contracts load on "
+                "the next model round; it does not grant durable permissions."
+            ),
+        }
+
+    def _invoke_capability_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        query = str(arguments.get("query") or "")[:CAPABILITY_SEARCH_MAX_QUERY_CHARS]
+        family = str(arguments.get("family") or "").strip() or None
+        if family is not None and family not in CAPABILITY_FAMILIES:
+            family = None
+        raw_kinds = arguments.get("kinds")
+        kinds = None
+        if isinstance(raw_kinds, list):
+            kinds = [k for k in raw_kinds if isinstance(k, str) and k in CAPABILITY_KINDS]
+        limit = arguments.get("limit")
+        input_json = {
+            "query": query,
+            "family": family,
+            "kinds": kinds,
+            "limit": limit,
+        }
+        invocation = self._create_invocation(
+            target_type="capability",
+            target_id="",
+            tool_name="capability.search",
+            input_json=input_json,
+            input_size=len(_canonical_bytes(input_json)),
+            timeout_ms=0,
+        )
+        invocation.status = "running"
+        invocation.started_at = utc_now()
+        result = self.search_capabilities(query, family=family, kinds=kinds, limit=limit)
+        invocation.status = "succeeded"
+        invocation.result_json = result
+        invocation.result_size_bytes = len(_canonical_bytes(result))
+        invocation.result_hash = _hash(result)
+        invocation.finished_at = utc_now()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="capability.search",
+            resource_type="capability",
+            resource_id="",
+            outcome="success",
+            details={
+                "query": query[:200],
+                "family": family,
+                "kinds": kinds,
+                "results": len(result.get("results") or []),
+                "total": int(result.get("total") or 0),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(invocation)
+        return self._invocation_data(invocation)
+
+    def _invoke_capability_activate(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_ids = arguments.get("capability_ids")
+        raw_families = arguments.get("families") or []
+        if not isinstance(raw_ids, list) or not all(isinstance(v, str) for v in raw_ids):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "capability_ids must be a list of strings",
+            )
+        if not isinstance(raw_families, list) or not all(
+            isinstance(v, str) for v in raw_families
+        ):
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "families must be a list of strings",
+            )
+        capability_ids = [v.strip() for v in raw_ids if v.strip()]
+        families = [v.strip() for v in raw_families if v.strip()]
+        input_json = {"capability_ids": capability_ids, "families": families}
+        invocation = self._create_invocation(
+            target_type="capability",
+            target_id="",
+            tool_name="capability.activate",
+            input_json=input_json,
+            input_size=len(_canonical_bytes(input_json)),
+            timeout_ms=0,
+        )
+        invocation.status = "running"
+        invocation.started_at = utc_now()
+        try:
+            result = self.activate_capabilities(capability_ids, families=families)
+        except AppError as exc:
+            self._fail_invocation(
+                invocation,
+                exc.code,
+                exc.message,
+                status="denied",
+                http_status=exc.status_code,
+                details=exc.details or {},
+            )
+        invocation.status = "succeeded"
+        invocation.result_json = result
+        invocation.result_size_bytes = len(_canonical_bytes(result))
+        invocation.result_hash = _hash(result)
+        invocation.finished_at = utc_now()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="capability.activate",
+            resource_type="capability",
+            resource_id="",
+            outcome="success",
+            details={
+                "capability_ids": capability_ids[:20],
+                "families": families,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(invocation)
+        data = self._invocation_data(invocation)
+        data["capability_activation"] = {
+            "capability_ids": result["activated_capability_ids"],
+            "families": result["activated_families"],
+        }
+        return data
+
+    def agent_tool_definitions(
+        self,
+        *,
+        capability_families: set[str] | None = None,
+        activated_capabilities: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return hot-pluggable first-party, declarative Skill, and MCP tools.
 
         A Skill/MCP server reaches an Agent only after its current permission
@@ -836,7 +1442,16 @@ class MCPAndSkillService:
         self_service_enabled = bool(
             getattr(self.settings, "agent_extension_self_service_enabled", True)
         )
+        progressive = capability_families is not None or activated_capabilities is not None
+        active_families = capability_families or set()
+        active_ids = activated_capabilities or set()
+        # Discovery tools are always available in Agent mode so the model can
+        # find capabilities whose schemas are not (yet) loaded.
         definitions = [
+            self._capability_search_tool_definition(),
+            self._capability_activate_tool_definition(),
+        ]
+        definitions.extend(
             {
                 "type": "function",
                 "function": {
@@ -847,7 +1462,7 @@ class MCPAndSkillService:
             }
             for tool, spec in BUILTIN_TOOL_SPECS.items()
             if self_service_enabled or tool not in MANAGEMENT_TOOL_NAMES
-        ]
+        )
         if self._authorized_packages():
             definitions.append(
                 {
@@ -893,6 +1508,10 @@ class MCPAndSkillService:
                 "skill", skill.id, self._skill_authorization_hash(skill)
             )
             if grant is None or grant.decision != "always":
+                continue
+            if progressive and not self._skill_activated(
+                skill, active_ids, active_families
+            ):
                 continue
             try:
                 manifest = SkillManifest.model_validate(skill.manifest_json)
@@ -942,6 +1561,10 @@ class MCPAndSkillService:
                     continue
                 input_schema = tool.get("inputSchema")
                 if not isinstance(input_schema, dict):
+                    continue
+                if progressive and not self._mcp_tool_activated(
+                    server, active_ids, active_families
+                ):
                     continue
                 definitions.append(
                     {
@@ -1055,82 +1678,6 @@ class MCPAndSkillService:
             )
         return "\n\n".join(parts)
 
-    def read_skill_package_file(self, arguments: dict[str, Any]) -> ExtensionInvocation:
-        """Serve one authorized package file to the Agent (``lg_skill_read``)."""
-
-        skill_key = str(arguments.get("skill_key") or "").strip()
-        rel_path = str(arguments.get("path") or "SKILL.md").strip() or "SKILL.md"
-        input_json = {"skill_key": skill_key, "path": rel_path}
-        invocation = self._create_invocation(
-            target_type="skill",
-            target_id=skill_key or "unknown",
-            tool_name="skill.read",
-            input_json=input_json,
-            input_size=len(_canonical_bytes(input_json)),
-            timeout_ms=0,
-        )
-        invocation.status = "running"
-        invocation.started_at = utc_now()
-        try:
-            skill = next(
-                (s for s in self._authorized_packages() if s.skill_key == skill_key),
-                None,
-            )
-            if skill is None:
-                raise AppError(
-                    404,
-                    "skill_not_found",
-                    "No authorized Agent Skill package matches this skill_key",
-                )
-            invocation.skill_id = skill.id
-            invocation.target_id = skill.id
-            from app.services.skill_package import SkillPackageService
-
-            package = SkillPackageService(
-                self.db, self.workspace_id, self.actor_id, self.settings
-            )
-            file_view = package.read_file(skill.id, rel_path)
-            content = file_view.content
-            if len(content) > 48_000:
-                content = f"{content[:48_000]}\n…(truncated)"
-            result = {
-                "skill_key": skill.skill_key,
-                "skill_name": skill.name,
-                "skill_id": skill.id,
-                "path": file_view.relative_path,
-                "mime_type": file_view.mime_type,
-                "content": content,
-            }
-            result_bytes = _canonical_bytes(result)
-            invocation.status = "succeeded"
-            invocation.result_json = result
-            invocation.result_size_bytes = len(result_bytes)
-            invocation.result_hash = hashlib.sha256(result_bytes).hexdigest()
-            invocation.finished_at = utc_now()
-            self.audit.record(
-                actor_id=self.actor_id,
-                action="skill.package.read",
-                resource_type="skill",
-                resource_id=skill.id,
-                details={
-                    "path": file_view.relative_path,
-                    "invocation_id": invocation.id,
-                },
-            )
-            self.db.commit()
-            self.db.refresh(invocation)
-            return invocation
-        except AppError as exc:
-            self._fail_invocation(
-                invocation,
-                exc.code,
-                exc.message,
-                status="failed",
-                http_status=exc.status_code,
-                details=exc.details,
-            )
-        raise AssertionError("unreachable")
-
     @staticmethod
     def _skill_trigger_payload(skill: SkillRecord, origin: str) -> dict[str, Any]:
         return {
@@ -1147,6 +1694,10 @@ class MCPAndSkillService:
     ) -> dict[str, Any]:
         """Dispatch a function exposed by :meth:`agent_tool_definitions`."""
 
+        if function_name == CAPABILITY_SEARCH_FUNCTION_NAME:
+            return self._invoke_capability_search(arguments)
+        if function_name == CAPABILITY_ACTIVATE_FUNCTION_NAME:
+            return self._invoke_capability_activate(arguments)
         if function_name == SKILL_READ_FUNCTION_NAME:
             data = self._invocation_data(self.read_skill_package_file(arguments))
             result = data.get("result") or {}
