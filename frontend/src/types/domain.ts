@@ -117,6 +117,7 @@ export type MessagePartType =
   | 'chart'
   | 'sandbox'
   | 'sandbox_artifact'
+  | 'subapp_artifact'
   | 'sandbox_status'
   | 'component'
   | 'user_confirmation'

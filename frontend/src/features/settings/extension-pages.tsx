@@ -50,6 +50,7 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
+import { DomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -1916,6 +1917,13 @@ export function ResearchSettingsPage() {
             );
           })}
         </div>
+      </Surface>
+      <Surface className="space-y-4 p-5">
+        <SectionHeading
+          description="统一管理普通联网搜索与 Deep Research 可使用的工作区来源域名。"
+          title="搜索与 Deep Research 来源白名单"
+        />
+        <DomainAllowlistEditor />
       </Surface>
       <Surface className="p-5">
         <SectionHeading title="当前配置边界" />

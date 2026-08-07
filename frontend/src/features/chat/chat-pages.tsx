@@ -49,6 +49,7 @@ import {
 } from "lucide-react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { SandboxAuthDialog, type SandboxAuthRequest } from "@/components/chat/sandbox-auth-dialog";
+import { SandboxBuildProgress } from "@/components/shared/sandbox-build-progress";
 
 import { toast } from "sonner";
 
@@ -470,15 +471,17 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
     ? "智能体需要 Docker 环境"
     : dockerStopped
       ? "请先启动 Docker"
-      : needsInitialization
-        ? "智能体沙箱尚未初始化"
-        : "智能体沙箱暂不可用";
+      : activeJob
+        ? "正在初始化智能体沙箱"
+        : needsInitialization
+          ? "智能体沙箱尚未初始化"
+          : "智能体沙箱暂不可用";
   const description = dockerMissing
     ? "当前设备未检测到 Docker。安装并启动 Docker Desktop（Windows/macOS）或 Docker Engine（Linux）后，才能使用文件执行与代码沙箱工具；普通智能体对话仍可继续。"
     : dockerStopped
       ? "已检测到 Docker，但引擎当前不可达。请启动 Docker 后刷新沙箱状态。文件/代码沙箱工具会暂时不可用，对话本身不受阻。"
       : activeJob
-        ? `${activeJob.message}（${activeJob.progress_percent}%）`
+        ? ""
         : needsInitialization
           ? canTriggerInit
             ? "已检测到可用的 Docker。是否现在构建并初始化智能体沙箱？首次初始化可能需要几分钟。未初始化前，沙箱工具不可用，但智能体对话仍可发送。"
@@ -496,14 +499,15 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
         </span>
         <div className="min-w-0 flex-1">
           <p className="text-sm font-semibold">{title}</p>
-          <p className="mt-0.5 text-xs leading-5 opacity-85">{description}</p>
+          {description ? (
+            <p className="mt-0.5 text-xs leading-5 opacity-85">{description}</p>
+          ) : null}
           {activeJob ? (
-            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-amber-200 dark:bg-amber-900">
-              <div
-                className="h-full rounded-full bg-amber-600 transition-[width] dark:bg-amber-400"
-                style={{ width: `${activeJob.progress_percent}%` }}
-              />
-            </div>
+            <SandboxBuildProgress
+              className="mt-2"
+              job={activeJob}
+              tone="amber"
+            />
           ) : null}
         </div>
         <div className="flex shrink-0 flex-wrap gap-2">
@@ -941,6 +945,34 @@ function streamEventFailure(data: Record<string, unknown>): string {
         ? `HTTP ${error.status_code} · `
         : "";
   return `${status}${code} · ${message}`;
+}
+
+/** Read a PromptInput data URL without issuing a CSP-controlled fetch. */
+function dataUrlToBlob(url: string): Blob | null {
+  if (!url.startsWith("data:")) return null;
+  const comma = url.indexOf(",");
+  if (comma < 0) return null;
+  const metadata = url.slice(5, comma);
+  const encoded = url.slice(comma + 1);
+  const mime = metadata.split(";")[0] || "application/octet-stream";
+  try {
+    if (metadata.split(";").includes("base64")) {
+      const binary = atob(encoded);
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      return new Blob([bytes], { type: mime });
+    }
+    return new Blob([decodeURIComponent(encoded)], { type: mime });
+  } catch {
+    return null;
+  }
+}
+
+async function attachmentUrlToBlob(url: string): Promise<Blob> {
+  const local = dataUrlToBlob(url);
+  if (local) return local;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`附件读取失败（HTTP ${response.status}）`);
+  return response.blob();
 }
 
 async function waitForStreamReconnect(
@@ -5345,14 +5377,17 @@ export function ChatCanvasPage() {
             : pendingFiles;
         const uploaded = await Promise.all(
           message.files.map(async (part, index) => {
-            if (!part.url)
+            if (!part.url && !part.localFile)
               throw new Error(
                 `附件 ${part.filename ?? index + 1} 缺少可读取内容`,
               );
-            const response = await fetch(part.url);
-            if (!response.ok)
-              throw new Error(`无法读取附件 ${part.filename ?? index + 1}`);
-            const blob = await response.blob();
+            const blob = part.localFile
+              ? part.localFile
+              : await attachmentUrlToBlob(part.url!).catch((error) => {
+              throw new Error(
+                `无法读取附件 ${part.filename ?? index + 1}：${error instanceof Error ? error.message : "未知错误"}`,
+              );
+            });
             return uploadAndIndex(
               new File([blob], part.filename ?? `attachment-${index + 1}`, {
                 type: part.mediaType || blob.type || "application/octet-stream",

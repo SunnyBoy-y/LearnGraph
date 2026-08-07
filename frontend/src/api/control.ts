@@ -15,6 +15,7 @@ import type {
   Role,
   SandboxAgentReadiness,
   SandboxBootstrapPolicy,
+  SandboxPreviewConfig,
   SandboxBootstrapStartResult,
   SandboxBootstrapStatus,
   SandboxExecution,
@@ -314,6 +315,19 @@ export function updateSandboxBootstrapPolicy(
   return apiClient.put<SandboxBootstrapPolicy, { member_allowed: boolean }>(
     "/sandbox/bootstrap/policy",
     { member_allowed: memberAllowed },
+  );
+}
+
+export function getSandboxPreviewConfig(): Promise<SandboxPreviewConfig> {
+  return apiClient.get<SandboxPreviewConfig>("/sandbox/preview-config");
+}
+
+export function updateSandboxPreviewConfig(
+  origin: string,
+): Promise<SandboxPreviewConfig> {
+  return apiClient.put<SandboxPreviewConfig, { origin: string }>(
+    "/sandbox/preview-config",
+    { origin },
   );
 }
 

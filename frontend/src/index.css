@@ -1630,6 +1630,21 @@ body.is-resizing .workspace-resizer {
 
 @keyframes thinking-sheen { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 @keyframes thinking-pulse { 0%, 100% { opacity: .55; transform: scale(.9); } 50% { opacity: 1; transform: scale(1.12); } }
+@keyframes sandbox-progress-stripes { from { background-position: 0 0; } to { background-position: 1rem 0; } }
+.sandbox-progress-stripes {
+  background-image: linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.28) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.28) 50%,
+    rgba(255, 255, 255, 0.28) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 1rem 1rem;
+  animation: sandbox-progress-stripes 0.9s linear infinite;
+}
 @keyframes chat-selection-in { from { opacity: 0; transform: translate(-50%, calc(-100% + 4px)); } }
 @keyframes chat-image-preview-in { from { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) {
@@ -1641,7 +1656,8 @@ body.is-resizing .workspace-resizer {
   .reasoning-streaming-dot,
   .chat-follow-up-prompts,
   .chat-selection-menu,
-  .chat-generated-image__preview { animation: none; }
+  .chat-generated-image__preview,
+  .sandbox-progress-stripes { animation: none; }
   .chat-acknowledgement--streaming p { color: inherit; background: none; }
 }
 /* ChatGPT-like compact tool rows: no card chrome, one-line trigger. */

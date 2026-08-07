@@ -18,6 +18,7 @@ export type MessagePartType =
   | 'chart'
   | 'sandbox'
   | 'sandbox_artifact'
+  | 'subapp_artifact'
   | 'sandbox_status'
   | 'skill_trigger'
   | 'component'

@@ -1680,6 +1680,8 @@ export function MessagePartRenderer({
       }
       return <SandboxArtifact data={part.data ?? {}} />;
     }
+    case "subapp_artifact":
+      return <SandboxArtifact data={part.data ?? {}} />;
     case "sandbox_artifact":
       return <SandboxFileArtifact data={part.data ?? {}} />;
     case "skill_trigger": {

@@ -9,6 +9,7 @@ import {
 } from "@/components/ai-elements/code-block";
 import { Badge } from "@/components/ui/badge";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import { apiClient } from "@/api/client";
 import {
   createSubappChannel,
   subappFailureText,
@@ -44,6 +45,8 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const sourceCode = typeof data.source_code === "string" ? data.source_code : "";
   const previewHtml = typeof data.preview_html === "string" ? data.preview_html : "";
   const artifactUrl = typeof data.artifact_url === "string" ? data.artifact_url : "";
+  const bundleId = typeof data.bundle_id === "string" ? data.bundle_id : "";
+  const [bundlePreviewUrl, setBundlePreviewUrl] = useState<string | null>(null);
   const originVerified = data.origin_verified === true;
   const canRenderRemote = originVerified && /^https:\/\//i.test(artifactUrl);
   // P2-A trusted renderer decision is server-side only. The host surfaces it
@@ -98,7 +101,22 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
     subappChannelRef.current?.handleIframeLoad();
   };
 
-  const hasSubappContent = Boolean(previewHtml || canRenderRemote);
+  useEffect(() => {
+    let cancelled = false;
+    setBundlePreviewUrl(null);
+    if (!bundleId) return () => { cancelled = true; };
+    void apiClient
+      .get<{ url: string }>(`/subapps/bundles/${bundleId}/preview`)
+      .then((response) => {
+        if (!cancelled && typeof response?.url === "string") setBundlePreviewUrl(response.url);
+      })
+      .catch(() => {
+        if (!cancelled) setBundlePreviewUrl(null);
+      });
+    return () => { cancelled = true; };
+  }, [bundleId]);
+
+  const hasSubappContent = Boolean(previewHtml || bundlePreviewUrl || canRenderRemote);
 
   return (
     <section className="sandbox-artifact" aria-label={title}>
@@ -126,7 +144,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
-            src={!previewHtml && canRenderRemote ? artifactUrl : undefined}
+            src={!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined)) : undefined}
             title={`${title}子应用`}
           />
         ) : (

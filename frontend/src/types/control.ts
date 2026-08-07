@@ -192,6 +192,8 @@ export interface SandboxBootstrapJob {
   phase: string;
   progress_percent: number;
   message: string;
+  /** Real-time build detail derived from the docker stream, e.g. "正在下载镜像 ubuntu:24.04 · 15.1 MB / 28.7 MB". */
+  detail: string | null;
   status: string;
   image_digest: string | null;
   browser_image_digest: string | null;
@@ -211,6 +213,17 @@ export interface SandboxBootstrapPolicy {
   updated_by: string | null;
 }
 
+export interface SandboxPreviewConfig {
+  /** Effective subapp preview origin (persisted, env, or local derivation). */
+  origin: string | null;
+  /** Resolution source: persisted | env | auto | none. */
+  source: "persisted" | "env" | "auto" | "none";
+  /** True when a deployment administrator persisted an explicit origin. */
+  persisted: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
 export interface SandboxBootstrapStatus {
   docker_installed: boolean;
   docker_reachable: boolean;
@@ -224,6 +237,7 @@ export interface SandboxBootstrapStatus {
   phase: string;
   progress_percent: number;
   message: string;
+  detail: string | null;
   can_initialize: boolean;
   /** Whether ordinary members may trigger bootstrap (admin-controllable). */
   member_bootstrap_allowed: boolean;
