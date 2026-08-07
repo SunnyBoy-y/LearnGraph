@@ -456,7 +456,7 @@ def model_provider_for_workspace(
         ):
             return DeepSeekChatProvider(**common)
         if provider.provider_type in {"openai_compatible_chat", "qwen"}:
-            structured_output_mode = capabilities.get("structured_output_mode")
+            structured_output_mode = capabilities.get("structured_output_mode") or "json_object"
             if structured_output_mode not in {None, "json_object", "json_schema"}:
                 return UnavailableModelProvider(
                     "The enabled model provider has an unsupported structured output mode",

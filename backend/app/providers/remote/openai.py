@@ -40,6 +40,87 @@ class ProviderInvalidUrlError(ProviderHTTPError):
     """The configured base URL cannot be issued as an HTTP(S) request."""
 
 
+def _strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Convert a Pydantic schema to the strict structured-output subset."""
+
+    def convert(node: object) -> object:
+        if isinstance(node, list):
+            return [convert(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        result: dict[str, Any] = {}
+        if "$ref" in node and isinstance(node["$ref"], str):
+            result["$ref"] = node["$ref"]
+        if "anyOf" in node and isinstance(node["anyOf"], list):
+            result["anyOf"] = [convert(item) for item in node["anyOf"]]
+        elif "oneOf" in node and isinstance(node["oneOf"], list):
+            result["anyOf"] = [convert(item) for item in node["oneOf"]]
+        elif isinstance(node.get("type"), str):
+            result["type"] = node["type"]
+        elif isinstance(node.get("type"), list):
+            result["anyOf"] = [
+                {"type": item}
+                for item in node["type"]
+                if isinstance(item, str)
+            ]
+
+        if isinstance(node.get("enum"), list):
+            result["enum"] = list(node["enum"])
+
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            result["type"] = "object"
+            result["properties"] = {
+                str(name): convert(value) for name, value in properties.items()
+            }
+            result["required"] = [str(name) for name in properties]
+            result["additionalProperties"] = False
+        elif result.get("type") == "object":
+            result["properties"] = {}
+            result["required"] = []
+            result["additionalProperties"] = False
+
+        if result.get("type") == "array" and "items" in node:
+            result["items"] = convert(node["items"])
+
+        if isinstance(node.get("$defs"), dict):
+            result["$defs"] = {
+                str(name): convert(value) for name, value in node["$defs"].items()
+            }
+        return result
+
+    converted = convert(schema)
+    return converted if isinstance(converted, dict) else {}
+
+
+def _parse_json_object_text(content: object) -> dict[str, Any]:
+    if not isinstance(content, str) or not content.strip():
+        raise ProviderResponseError("Provider response contains no JSON text")
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ProviderResponseError("Provider response does not contain a JSON object") from None
+        try:
+            result = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise ProviderResponseError("Provider response contains invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise ProviderResponseError("Structured result must be an object")
+    return result
+
+
 def _is_aliyun_responses_endpoint(base_url: str) -> bool:
     """Return whether ``base_url`` addresses Alibaba Cloud Model Studio Responses.
 
@@ -961,20 +1042,41 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
 
     def generate_json(self, prompt: str, schema_name: str, schema: dict[str, Any]) -> dict[str, Any]:
         self.last_sources = []
-        payload = self._apply_call_options({
-            "model": self.model_id, "input": prompt, "store": False,
-            "text": {"format": {"type": "json_schema", "name": schema_name, "strict": True, "schema": schema}},
-        }, responses=True)
+        wire_schema = _strict_json_schema(schema)
+        request_input = prompt
+        payload: dict[str, Any] = {
+            "model": self.model_id,
+            "input": request_input,
+            "store": False,
+        }
+        if self.capabilities.get("supports_structured_output") is False:
+            schema_json = json.dumps(
+                wire_schema,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            payload["input"] = (
+                f"{prompt}\n\nReturn exactly one valid JSON object matching the schema "
+                f"named {schema_name}. Do not use Markdown or add commentary. "
+                f"Every field must be present and valid. JSON Schema: {schema_json}"
+            )
+        else:
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": wire_schema,
+                }
+            }
+        payload = self._apply_call_options(payload, responses=True)
         response = self._post_json("responses", payload)
         texts = [content.get("text") for item in response.get("output", []) if isinstance(item, dict) for content in item.get("content", []) if isinstance(content, dict) and content.get("type") == "output_text"]
         if len(texts) != 1 or not isinstance(texts[0], str):
             raise ProviderResponseError("Responses output contains no single structured text result")
-        try:
-            result = json.loads(texts[0])
-        except json.JSONDecodeError as exc:
-            raise ProviderResponseError("Responses structured text is invalid JSON") from exc
+        result = _parse_json_object_text(texts[0])
         self.last_usage = self._usage_from_response(response)
-        return self._validate_structured_result(result, schema)
+        return self._validate_structured_result(result, wire_schema)
 
 
 class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
@@ -1004,7 +1106,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             structured_output_mode = (
                 "json_object"
                 if hostname == "deepseek.com" or hostname.endswith(".deepseek.com")
-                else "json_schema"
+                else "json_object"
             )
         if structured_output_mode not in {"json_object", "json_schema"}:
             raise ValueError("structured_output_mode must be json_object or json_schema")
@@ -1327,9 +1429,48 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             yield ProviderStreamEvent("tool_calls", tool_calls=tool_calls)
         yield ProviderStreamEvent("completed", finish_reason=finish_reason)
 
+    def _generate_prompted_json(
+        self,
+        prompt: str,
+        schema_name: str,
+        wire_schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        schema_json = json.dumps(wire_schema, ensure_ascii=False, separators=(",", ":"))
+        messages = [
+            {
+                "role": "system",
+                "content": "Return exactly one valid JSON object and no Markdown or commentary.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{prompt}\n\nReturn JSON matching the schema named {schema_name}. "
+                    f"Every field must be present and valid. JSON Schema: {schema_json}"
+                ),
+            },
+        ]
+        payload = self._apply_call_options(
+            {
+                "model": self.model_id,
+                "messages": messages,
+            },
+            responses=False,
+        )
+        response = self._post_json("chat/completions", payload)
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderResponseError("Provider response contains no chat text") from exc
+        result = _parse_json_object_text(content)
+        self.last_usage = self._usage_from_chat_chunk(response.get("usage")) or {}
+        return self._validate_structured_result(result, wire_schema)
+
     def generate_json(self, prompt: str, schema_name: str, schema: dict[str, Any]) -> dict[str, Any]:
+        wire_schema = _strict_json_schema(schema)
+        if self.capabilities.get("supports_structured_output") is False:
+            return self._generate_prompted_json(prompt, schema_name, wire_schema)
         if self.structured_output_mode == "json_object":
-            schema_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            schema_json = json.dumps(wire_schema, ensure_ascii=False, separators=(",", ":"))
             messages = [
                 {
                     "role": "system",
@@ -1351,7 +1492,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                 "json_schema": {
                     "name": schema_name,
                     "strict": True,
-                    "schema": schema,
+                    "schema": wire_schema,
                 },
             }
         payload = self._apply_call_options({
@@ -1374,7 +1515,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             "output_tokens": int(usage.get("completion_tokens") or 0),
             "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
         }
-        return self._validate_structured_result(result, schema)
+        return self._validate_structured_result(result, wire_schema)
 
 
 class QwenChatProvider(OpenAICompatibleChatProvider):
@@ -1445,12 +1586,14 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
         schema_name: str,
         schema: dict[str, Any],
     ) -> dict[str, Any]:
-        # Qwen Chat JSON mode rejects enable_thinking=true. Structured output
-        # is therefore an explicit fast sub-call even when the chat preference
-        # uses thinking.
+        # DashScope JSON mode rejects enable_thinking=true. Models that require
+        # thinking must therefore use an ordinary chat completion whose prompt
+        # carries the schema instead of being rejected before the HTTP call.
         if self.capabilities.get("thinking_required") is True:
-            raise ProviderResponseError(
-                "This Qwen-hosted model cannot disable thinking for JSON mode"
+            return self._generate_prompted_json(
+                prompt,
+                schema_name,
+                _strict_json_schema(schema),
             )
         original_options = self.call_options
         if original_options is not None:
