@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.errors import AppError
 from app.core.security import Principal
 from app.domain.models import (
-    ActionItem, AuditEvent, ChatSession, CompositeDraft, ContextSummary, FileReference, Goal, Graph, GraphChangeSet, GraphEdge, GraphNode,
+    ActionItem, AuditEvent, ChatSession, CompositeDraft, ContextSummary, FetchAuthorizationRequest, FileReference, Goal, Graph, GraphChangeSet, GraphEdge, GraphNode,
     ImageGenerationTask, Message, MessageControl, MessagePartRecord, MessageStreamEvent, MessageSubmission,
     MessageVersion, Project, ProviderAttempt, ProviderResponseState, Roadmap, SourceLink, SourceRecord, Workspace,
     SuggestedPromptBatch,
@@ -617,6 +617,18 @@ class WorkflowService:
             delete(GraphChangeSet).where(
                 GraphChangeSet.workspace_id == self.workspace_id,
                 GraphChangeSet.session_id.in_(session_ids),
+            )
+        )
+        self.db.execute(
+            delete(FetchAuthorizationRequest).where(
+                FetchAuthorizationRequest.workspace_id == self.workspace_id,
+                FetchAuthorizationRequest.chat_session_id.in_(session_ids),
+            )
+        )
+        self.db.execute(
+            delete(ImageGenerationTask).where(
+                ImageGenerationTask.workspace_id == self.workspace_id,
+                ImageGenerationTask.session_id.in_(session_ids),
             )
         )
         if suggested_prompt_batch_ids:
