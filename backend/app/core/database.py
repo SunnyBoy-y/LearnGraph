@@ -389,8 +389,17 @@ def _apply_sqlite_additive_migrations() -> None:
             "token_count": "INTEGER NOT NULL DEFAULT 0",
             "lifecycle_status": "VARCHAR(24) NOT NULL DEFAULT 'active'",
         },
+        "image_description_cache": {
+            "image_sha256": "VARCHAR(64) NOT NULL DEFAULT ''",
+            "provider_id": "VARCHAR(36) NOT NULL DEFAULT ''",
+            "model_id": "VARCHAR(160) NOT NULL DEFAULT ''",
+            "media_kind": "VARCHAR(16) NOT NULL DEFAULT 'image'",
+            "prompt_version": "VARCHAR(40) NOT NULL DEFAULT 'v1'",
+            "status": "VARCHAR(24) NOT NULL DEFAULT 'completed'",
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "error_message": "VARCHAR(500) NOT NULL DEFAULT ''",
+        },
         "files": {
-            "active_revision_id": "VARCHAR(36)",
             "logical_version": "INTEGER NOT NULL DEFAULT 0",
             "source": "VARCHAR(40) NOT NULL DEFAULT 'upload'",
             "created_by": "VARCHAR(64)",

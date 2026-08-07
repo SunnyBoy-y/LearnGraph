@@ -34,6 +34,7 @@ from app.domain.models import (
     GraphChangeSet,
     GraphEdge,
     GraphNode,
+    ImageDescriptionCache,
     ImageGenerationTask,
     Message,
     MessagePartRecord,
@@ -42,6 +43,7 @@ from app.domain.models import (
     MessageControl,
     MessageVersion,
     ProviderAttempt,
+    ProviderConfig,
     ProviderResponseState,
     Project,
     RetrievalHit,
@@ -461,6 +463,39 @@ def _provider_stream_error_payload(exc: BaseException) -> dict[str, object]:
 # 502/503/504 are relay (Cloudflare) failures, 500 covers flaky origins,
 # 408/429 are explicit try-again signals, 529 is Anthropic "overloaded".
 _RETRYABLE_PROVIDER_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+_IMAGE_INPUT_UNSUPPORTED_PATTERNS = (
+    "does not support image",
+    "doesn't support image",
+    "image input is not supported",
+    "image input unsupported",
+    "unsupported image input",
+    "unsupported content type: image",
+    "unsupported modality",
+    "does not support multimodal",
+    "multimodal input is not supported",
+    "image_url is not supported",
+    "vision is not supported",
+    "不支持图片",
+    "不支持图像",
+    "不支持多模态",
+)
+
+
+def _is_native_image_input_unsupported(exc: BaseException) -> bool:
+    """Classify a permanent upstream rejection of image input.
+
+    Only explicit image/modality failures qualify. Authentication, malformed
+    requests, rate limits, and generic 4xx responses must remain visible rather
+    than silently switching models and hiding a broken Provider configuration.
+    """
+
+    if not isinstance(exc, ProviderHTTPError):
+        return False
+    if getattr(exc, "status_code", None) not in {400, 404, 415, 422}:
+        return False
+    message = _safe_provider_error_message(exc, limit=1_000).casefold()
+    return any(pattern in message for pattern in _IMAGE_INPUT_UNSUPPORTED_PATTERNS)
 
 
 def _stream_retry_category(exc: BaseException) -> str | None:
@@ -1049,13 +1084,6 @@ class ChatService:
             return "none"
         mode = self._resolved_image_input_mode()
         if mode == "native":
-            if not getattr(self.model_provider, "supports_image_input", False):
-                raise AppError(
-                    409,
-                    "model_image_input_unsupported",
-                    "The selected model has not been confirmed to support image input",
-                    {"provider_id": self.model_provider.provider_id},
-                )
             return mode
         if mode == "external_vision":
             if not self._vision_available():
@@ -1103,6 +1131,30 @@ class ChatService:
         video_files = [file for file in files if self._is_video_attachment(file)]
         if not video_files:
             return
+        for file in video_files:
+            mime_type = (file.mime_type or "").casefold().split(";", 1)[0].strip()
+            if mime_type not in MULTIMODAL_VIDEO_MIME_TYPES:
+                raise AppError(
+                    415,
+                    "unsupported_video_attachment",
+                    "The video MIME type is not supported for direct model input",
+                    {"file_id": file.id, "mime_type": mime_type},
+                )
+            if file.storage_status != "stored":
+                raise AppError(
+                    409,
+                    "video_attachment_unavailable",
+                    "The video attachment is not available in object storage",
+                    {"file_id": file.id},
+                )
+            if file.size_bytes > MULTIMODAL_VIDEO_MAX_BYTES:
+                raise AppError(
+                    413,
+                    "video_attachment_too_large",
+                    "Base64 video attachments must be 10 MiB or smaller; use a public "
+                    "video URL for larger Qwen inputs",
+                    {"file_id": file.id, "max_bytes": MULTIMODAL_VIDEO_MAX_BYTES},
+                )
         if not structured_chat:
             raise AppError(
                 409,
@@ -1226,12 +1278,15 @@ class ChatService:
             )
         return parts
 
+    VISION_DESCRIBE_PROMPT_VERSION = "v1"
+
     def _describe_media_via_vision(
         self,
         files: list[FileRecord],
         *,
         media_kind: str,
         user_prompt_hint: str,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
     ) -> tuple[str, dict]:
         """Call the vision companion once per image/video and return text captions.
 
@@ -1286,7 +1341,26 @@ class ChatService:
         }
         for index, part in enumerate(media_parts, start=1):
             file_label = str(part.get("original_name") or f"{media_kind}-{index}")
+            if progress_callback is not None:
+                progress_callback(file_label, index, len(media_parts), "started")
             file_id = str(part.get("file_id") or "")
+            image_sha256 = next((file.sha256 for file in files if file.id == file_id), "")
+            cached = self.db.scalar(
+                select(ImageDescriptionCache).where(
+                    ImageDescriptionCache.workspace_id == self.workspace_id,
+                    ImageDescriptionCache.image_sha256 == image_sha256,
+                    ImageDescriptionCache.provider_id == vision.provider_id,
+                    ImageDescriptionCache.model_id == getattr(vision, "model_id", ""),
+                    ImageDescriptionCache.media_kind == media_kind,
+                    ImageDescriptionCache.prompt_version == self.VISION_DESCRIBE_PROMPT_VERSION,
+                    ImageDescriptionCache.status == "completed",
+                )
+            ) if image_sha256 else None
+            if cached is not None and cached.description:
+                captions.append(f"[{media_kind.title()}: {file_label}]\n{cached.description}")
+                if progress_callback is not None:
+                    progress_callback(file_label, index, len(media_parts), "cached")
+                continue
             if media_kind == "image":
                 task = (
                     "Describe this learning-related image for a text-only tutor model. "
@@ -1403,7 +1477,24 @@ class ChatService:
                 )
             if len(caption) > VISION_DESCRIBE_MAX_CHARS:
                 caption = caption[:VISION_DESCRIBE_MAX_CHARS].rstrip() + "…"
+            if image_sha256:
+                try:
+                    self.db.add(ImageDescriptionCache(
+                        workspace_id=self.workspace_id,
+                        image_sha256=image_sha256,
+                        provider_id=vision.provider_id,
+                        model_id=getattr(vision, "model_id", ""),
+                        media_kind=media_kind,
+                        prompt_version=self.VISION_DESCRIBE_PROMPT_VERSION,
+                        status="completed",
+                        description=caption,
+                    ))
+                    self.db.commit()
+                except IntegrityError:
+                    self.db.rollback()
             captions.append(f"[{media_kind.title()}: {file_label}]\n{caption}")
+            if progress_callback is not None:
+                progress_callback(file_label, index, len(media_parts), "completed")
 
         block = (
             f"The following {media_kind} descriptions were produced by the workspace "
@@ -1439,6 +1530,84 @@ class ChatService:
         )
         self.db.commit()
         return block, trace
+
+    def _native_image_probe_pending(self) -> bool:
+        capabilities = dict(getattr(self.model_provider, "capabilities", None) or {})
+        return bool(
+            (getattr(self.model_provider, "image_input_mode", None) or "auto") == "auto"
+            and capabilities.get("models_dev_known") is not True
+            and capabilities.get("runtime_image_input_support") is None
+        )
+
+    def _remember_native_image_support(self, supported: bool) -> None:
+        """Persist a runtime observation for the selected Provider model."""
+
+        provider_id = str(getattr(self.model_provider, "provider_id", "") or "")
+        model_id = str(getattr(self.model_provider, "model_id", "") or "").strip()
+        if not provider_id or not model_id:
+            return
+        provider = self.db.scalar(
+            select(ProviderConfig).where(
+                ProviderConfig.id == provider_id,
+                ProviderConfig.workspace_id == self.workspace_id,
+            )
+        )
+        if provider is None:
+            return
+        capabilities = dict(provider.capabilities or {})
+        models = dict(capabilities.get("models") or {})
+        model_capabilities = dict(models.get(model_id) or {})
+        model_capabilities["runtime_image_input_support"] = supported
+        model_capabilities["runtime_image_input_observed"] = True
+        model_capabilities["capability_source"] = "runtime_observation"
+        models[model_id] = model_capabilities
+        capabilities["models"] = models
+        provider.capabilities = capabilities
+        # Make the current request follow the learned route immediately too.
+        current_capabilities = dict(getattr(self.model_provider, "capabilities", None) or {})
+        current_capabilities["runtime_image_input_support"] = supported
+        self.model_provider.capabilities = current_capabilities
+        self.model_provider.image_input_mode = "auto"
+        self.db.commit()
+
+    def _fallback_native_images_to_external(
+        self,
+        messages: list[ProviderChatMessage],
+        files: list[FileRecord],
+        *,
+        user_prompt_hint: str = "",
+    ) -> tuple[list[ProviderChatMessage], dict]:
+        """Replace native image parts with a companion-model description."""
+
+        image_files = [file for file in files if self._is_multimodal_image(file)]
+        caption_block, vision_trace = self._describe_media_via_vision(
+            image_files,
+            media_kind="image",
+            user_prompt_hint=user_prompt_hint,
+        )
+        cleaned: list[ProviderChatMessage] = []
+        for message in messages:
+            if not message.content_parts:
+                cleaned.append(message)
+                continue
+            cleaned.append(
+                replace(
+                    message,
+                    content_parts=[
+                        part
+                        for part in message.content_parts
+                        if part.get("type") != "input_image"
+                    ],
+                )
+            )
+        for index in range(len(cleaned) - 1, -1, -1):
+            if cleaned[index].role != "user":
+                continue
+            message = cleaned[index]
+            merged = "\n\n".join(section for section in (message.content or "", caption_block) if section)
+            cleaned[index] = replace(message, content=merged)
+            break
+        return cleaned, {"image_input_mode": "external_vision", **vision_trace}
 
     def _with_image_only_inputs(
         self,
@@ -1488,32 +1657,15 @@ class ChatService:
                 "No user message is available to attach image inputs",
             )
 
-        # external_vision — describe then inject text only
-        caption_block, vision_trace = self._describe_media_via_vision(
-            image_files,
-            media_kind="image",
-            user_prompt_hint=user_prompt_hint,
-        )
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            if message.role != "user":
-                continue
-            merged = "\n\n".join(
-                section
-                for section in (message.content or "", caption_block)
-                if section
-            )
-            updated = replace(message, content=merged)
-            return [
-                *messages[:index],
-                updated,
-                *messages[index + 1 :],
-            ], {"image_input_mode": "external_vision", **vision_trace}
-        # No user turn: prepend as system-context style user block
-        return [
-            *messages,
-            ProviderChatMessage(role="user", content=caption_block),
-        ], {"image_input_mode": "external_vision", **vision_trace}
+        # external_vision is intentionally deferred until the assistant stream
+        # exists, so the companion work can be represented in the thinking chain.
+        return messages, {
+            "image_input_mode": "external_vision",
+            "external_vision_pending": True,
+            "image_count": len(image_files),
+            "provider_id": getattr(self.vision_provider, "provider_id", None),
+            "model_id": getattr(self.vision_provider, "model_id", None),
+        }
 
     def _with_image_inputs(
         self,
@@ -1614,6 +1766,22 @@ class ChatService:
     @staticmethod
     def _estimate_tokens(text: str) -> int:
         return estimate_tokens(text)
+
+    @staticmethod
+    def _requests_full_document_coverage(query: str) -> bool:
+        normalized = re.sub(r"\s+", "", query).casefold()
+        if not normalized:
+            return False
+        return any(
+            phrase in normalized
+            for phrase in (
+                "全文", "整篇", "整份", "整个文档", "整个文件", "全篇",
+                "总结", "概括", "归纳", "摘要", "核心观点", "主要内容",
+                "主要结论", "章节", "目录", "逐章", "通篇",
+                "summarize", "summary", "overview", "whole document",
+                "entire document", "full document",
+            )
+        )
 
     def _document_context_char_budget(self) -> int:
         """Reserve context for instructions, history, and the model response.
@@ -3567,13 +3735,42 @@ class ChatService:
                 or file_id != document_selection.file_id
             ]
             if remaining_file_ids:
+                use_full_document_coverage = (
+                    document_selection is None
+                    and len(remaining_file_ids) == 1
+                    and self._requests_full_document_coverage(query)
+                )
+                if use_full_document_coverage:
+                    total_document_chars = int(
+                        self.db.scalar(
+                            select(func.coalesce(func.sum(func.length(FileTextChunk.content)), 0)).where(
+                                FileTextChunk.workspace_id == self.workspace_id,
+                                FileTextChunk.file_id == remaining_file_ids[0],
+                                FileTextChunk.lifecycle_status == "active",
+                            )
+                        )
+                        or 0
+                    )
+                    document_budget = self._document_context_char_budget()
+                    if total_document_chars > document_budget:
+                        raise AppError(
+                            409,
+                            "document_context_too_large",
+                            "该文件全文超过极速/思考模式可安全读取的上下文。请切换到智能体模式，以通过沙箱分段读取完整文件并获得更高质量的回答。",
+                            {
+                                "file_ids": remaining_file_ids,
+                                "document_chars": total_document_chars,
+                                "document_context_char_budget": document_budget,
+                                "suggested_response_mode": "agentic",
+                            },
+                        )
                 previews.append(
                     (
                         document_service.preview(
                             DocumentQueryPreviewRequest(
                                 query=query,
                                 file_ids=remaining_file_ids,
-                                scope="files",
+                                scope=("full_document" if use_full_document_coverage else "files"),
                                 max_results=8,
                             )
                         ),
@@ -3619,6 +3816,7 @@ class ChatService:
                             "content_hash": hit.content_hash,
                             "quote": hit.quote,
                             "retrieval_trace_id": preview.trace_id,
+                            "retrieval_strategy": preview.strategy,
                             "retrieval_scope": preview.scope,
                             "selection_verified": selected_hit,
                             "selection_status": (
@@ -6571,6 +6769,7 @@ class ChatService:
         "generation_started_at",
         "generation_completed_at",
         "generation_duration_ms",
+        "image_input",
         "input_tokens",
         "output_tokens",
         "reasoning_tokens",
@@ -10726,6 +10925,7 @@ class ChatService:
 
         def stream() -> Iterable[str]:
             nonlocal sequence, provider_trace, source_record, next_stream_part_ordinal
+            nonlocal provider_messages, image_input_trace
             chunk_sequence = 0
             final_text = ""
             agent_tool_rounds = 0
@@ -10868,6 +11068,73 @@ class ChatService:
             try:
                 for event in initial_events:
                     yield self._encode_event(event)
+
+                if image_input_trace.get("external_vision_pending"):
+                    vision_record = self.message_parts.add(
+                        MessagePartRecord(
+                            workspace_id=self.workspace_id,
+                            message_version_id=assistant_version.id,
+                            ordinal=next_stream_part_ordinal,
+                            part_type="tool_call",
+                            status="streaming",
+                            content=(
+                                f"正在使用 {image_input_trace.get('model_id') or '外挂视觉模型'} "
+                                f"解析图像（0/{image_input_trace.get('image_count') or 0}）"
+                            ),
+                            data={
+                                "tool_name": "external_vision_describe",
+                                "provider_id": image_input_trace.get("provider_id"),
+                                "model_id": image_input_trace.get("model_id"),
+                                "media_kind": "image",
+                            },
+                        )
+                    )
+                    streamed_parts.append(vision_record)
+                    next_stream_part_ordinal += 1
+                    started = self._append_event(
+                        session_id=session_id,
+                        message_id=assistant_message.id,
+                        message_version_id=assistant_version.id,
+                        part_id=vision_record.id,
+                        sequence=sequence,
+                        event_type="part.started",
+                        payload={"part": self._part_snapshot(vision_record.id, "tool_call", "streaming", vision_record.content, vision_record.data, sequence=vision_record.ordinal)},
+                    )
+                    sequence += 1
+                    yield self._encode_event(started)
+
+                    def vision_progress(file_label: str, index: int, total: int, status: str) -> None:
+                        vision_record.content = (
+                            f"{'正在解析' if status == 'started' else '已完成解析'} {file_label} "
+                            f"（{index}/{total}）"
+                        )
+                        vision_record.data = {**vision_record.data, "completed": index if status == "completed" else max(0, index - 1), "total": total}
+
+                    caption_block, vision_trace = self._describe_media_via_vision(
+                        [f for f in attached_files if self._is_multimodal_image(f)],
+                        media_kind="image",
+                        user_prompt_hint=payload.content,
+                        progress_callback=vision_progress,
+                    )
+                    vision_record.status = "completed"
+                    vision_record.content = f"已完成图像解析（{vision_record.data.get('total') or 0}/{vision_record.data.get('total') or 0}）"
+                    image_input_trace = {"image_input_mode": "external_vision", **vision_trace}
+                    provider_trace["image_input"] = {key: value for key, value in image_input_trace.items() if key != "caption_chars"}
+                    for index in range(len(provider_messages) - 1, -1, -1):
+                        if provider_messages[index].role == "user":
+                            provider_messages[index] = replace(provider_messages[index], content="\n\n".join(section for section in (provider_messages[index].content or "", caption_block) if section))
+                            break
+                    completed = self._append_event(
+                        session_id=session_id,
+                        message_id=assistant_message.id,
+                        message_version_id=assistant_version.id,
+                        part_id=vision_record.id,
+                        sequence=sequence,
+                        event_type="part.completed",
+                        payload={"part": self._part_snapshot(vision_record.id, "tool_call", "completed", vision_record.content, vision_record.data, sequence=vision_record.ordinal)},
+                    )
+                    sequence += 1
+                    yield self._encode_event(completed)
 
                 max_attempts = MAX_PROVIDER_STREAM_ATTEMPTS
                 max_agent_tool_rounds = MAX_AGENT_TOOL_ROUNDS
@@ -11710,6 +11977,16 @@ class ChatService:
                                 "agent_final_response_empty",
                                 "The Agent completed its tools but the provider returned no final assistant response.",
                             )
+                        if (
+                            structured_chat
+                            and image_input_trace.get("image_input_mode") == "native"
+                            and self._native_image_probe_pending()
+                        ):
+                            self._remember_native_image_support(True)
+                            provider_trace["image_input"] = {
+                                **dict(provider_trace.get("image_input") or {}),
+                                "runtime_probe": "supported",
+                            }
                         # SQLAlchemy JSON values are not mutable-tracked by default.
                         # Assign a fresh object to both persisted snapshots before
                         # committing so usage/request provenance cannot disappear.
@@ -11719,6 +11996,30 @@ class ChatService:
                         self.db.commit()
                         break
                     except (ProviderHTTPError, TimeoutError) as exc:
+                        if (
+                            structured_chat
+                            and image_input_trace.get("image_input_mode") == "native"
+                            and self._native_image_probe_pending()
+                            and _is_native_image_input_unsupported(exc)
+                            and self._vision_available()
+                        ):
+                            self._remember_native_image_support(False)
+                            provider_messages, image_input_trace = (
+                                self._fallback_native_images_to_external(
+                                    provider_messages,
+                                    attached_files,
+                                    user_prompt_hint=payload.content,
+                                )
+                            )
+                            provider_trace["image_input"] = {
+                                **image_input_trace,
+                                "runtime_probe": "unsupported",
+                                "fallback_from": "native",
+                            }
+                            attempt.status = "failed"
+                            attempt.error_type = "NativeImageInputUnsupported"
+                            self.db.commit()
+                            continue
                         error_category = _stream_retry_category(exc)
                         if error_category is None:
                             raise

@@ -1585,6 +1585,18 @@ function AssistantMessageInner({
     enabled: persisted && Boolean(selectedVersionId),
   });
   const shown = snapshot.data ?? message;
+  const imageInputTrace =
+    shown.provider_trace?.image_input &&
+    typeof shown.provider_trace.image_input === "object" &&
+    !Array.isArray(shown.provider_trace.image_input)
+      ? shown.provider_trace.image_input as Record<string, unknown>
+      : null;
+  const visionModelId =
+    imageInputTrace?.image_input_mode === "external_vision" &&
+    typeof imageInputTrace.model_id === "string" &&
+    imageInputTrace.model_id.trim()
+      ? imageInputTrace.model_id.trim()
+      : null;
   const orderedParts = orderedMessageParts(shown.parts);
   // Thinking chain (reasoning + tools) is always rendered above the final body.
   const displaySegments = groupPartsForDisplay(shown.parts);
@@ -1715,6 +1727,11 @@ function AssistantMessageInner({
         </div>
       ) : null}
       <MessageContent className="w-full gap-1" data-message-content>
+        {visionModelId ? (
+          <p className="text-xs text-muted-foreground">
+            图像由 {visionModelId} 模型提供
+          </p>
+        ) : null}
         <div ref={messageContentRef} className="contents">
         {isThinkingPlaceholder ? (
           <div className="message-thinking" role="status" aria-live="polite">
@@ -3034,10 +3051,6 @@ export function ChatCanvasPage() {
   const selectedModel = modelOptions.find(
     (model) => model.id === selectedModelId,
   );
-  const selectedModelSupportsImageInput =
-    selectedModel
-      ? selectedModel.capabilities?.supports_image_input === true
-      : activeModelProvider?.capabilities.supports_image_input === true;
   const retryProvider = modelProviders.find(
     (provider) => provider.id === retryProviderId,
   );
@@ -4941,7 +4954,15 @@ export function ChatCanvasPage() {
                   typeof errorPayload?.message === "string"
                     ? errorPayload.message
                     : null;
-                if (errorCode === "agent_invocation_limit_reached") {
+                if (errorCode === "document_context_too_large") {
+                  terminalFailure =
+                    errorMessage ??
+                    "该文件全文超过极速/思考模式可安全读取的上下文。请切换到智能体模式，以通过沙箱分段读取完整文件。";
+                  setResponseMode("agentic");
+                  toast.message("已切换到智能体模式", {
+                    description: "附件已保留，请再次发送问题以让智能体完整读取文件。",
+                  });
+                } else if (errorCode === "agent_invocation_limit_reached") {
                   terminalFailure =
                     errorMessage ??
                     "智能体工具调用轮次已达上限，请缩小问题范围或重试。";
@@ -5205,7 +5226,7 @@ export function ChatCanvasPage() {
           return file;
         }
         throw new Error(
-          `“${file.original_name}”解析失败：${error instanceof Error ? error.message : "未知错误"}。请切换到智能体模式，或者删除该文件后再发送。`,
+          `“${file.original_name}”解析失败或为旧格式：${error instanceof Error ? error.message : "未知错误"}。请切换到智能体模式，或者删除该文件后再发送。`,
         );
       } finally {
         await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
@@ -5350,23 +5371,6 @@ export function ChatCanvasPage() {
           toast.error("绘图模式的参考附件只能是图片。");
           return false;
         }
-        const hasImageAttachment =
-          requestedGenerationMode === "text" &&
-          (message.files.some((part) =>
-            isImageNameOrMime(
-              part.filename ?? "",
-              part.mediaType,
-            ),
-          ) ||
-            pendingFiles.some((file) =>
-              isImageNameOrMime(file.original_name, file.mime_type),
-            ));
-        if (hasImageAttachment && !selectedModelSupportsImageInput) {
-          toast.error(
-            "当前模型尚未确认支持图片输入。请在 Provider 设置的模型能力快照中开启并确认该能力后再发送图片。",
-          );
-          return false;
-        }
         const preparedPendingFiles =
           requestedGenerationMode === "text"
             ? await Promise.all(
@@ -5463,7 +5467,6 @@ export function ChatCanvasPage() {
       pendingFiles,
       prepareStoredFile,
       responseMode,
-      selectedModelSupportsImageInput,
       selectedImageModel,
       send,
       storedAudioAsrAvailable,

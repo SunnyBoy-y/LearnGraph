@@ -680,6 +680,33 @@ class FileRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     lifecycle_status: Mapped[str] = mapped_column(String(24), default="active", index=True)
 
 
+class ImageDescriptionCache(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Durable visual description keyed by image content and vision model."""
+
+    __tablename__ = "image_description_cache"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "image_sha256",
+            "provider_id",
+            "model_id",
+            "prompt_version",
+            name="uq_image_description_cache_key",
+        ),
+        Index("ix_image_description_cache_lookup", "workspace_id", "image_sha256"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    image_sha256: Mapped[str] = mapped_column(String(64))
+    provider_id: Mapped[str] = mapped_column(String(36))
+    model_id: Mapped[str] = mapped_column(String(160))
+    media_kind: Mapped[str] = mapped_column(String(16), default="image")
+    prompt_version: Mapped[str] = mapped_column(String(40), default="v1")
+    status: Mapped[str] = mapped_column(String(24), default="completed", index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    error_message: Mapped[str] = mapped_column(String(500), default="")
+
+
 class AudioTranscription(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "audio_transcriptions"
     __table_args__ = (
