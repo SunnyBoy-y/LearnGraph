@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
+from collections.abc import Callable
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import get_settings
@@ -76,6 +79,102 @@ if is_sqlite:
     event.listen(engine, "connect", _configure_sqlite_connection)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def _is_sqlite_locked_error(exc: OperationalError) -> bool:
+    """True when the OperationalError is SQLite write-lock contention."""
+
+    message = str(getattr(exc, "orig", exc))
+    return "database is locked" in message or "database table is locked" in message
+
+
+T = TypeVar("T")
+
+
+def retry_sqlite_locked(
+    db: Session,
+    fn: Callable[[], T],
+    *,
+    attempts: int = 4,
+    base_delay_seconds: float = 0.15,
+) -> T:
+    """Re-run ``fn`` when SQLite write-lock contention interrupted it.
+
+    The engine's busy timeout already waits ``SQLITE_BUSY_TIMEOUT_MS`` before
+    raising; a lock error therefore means another writer (a parallel request or
+    an embedded scheduler sweep) held the single SQLite write lock for the
+    whole wait. ``fn`` must be idempotent and start from a fresh transaction:
+    the session is rolled back before every retry so the retried callable
+    re-reads its inputs and re-applies its writes.
+    """
+
+    last_error: OperationalError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            last_error = exc
+            try:
+                db.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            if attempt >= attempts:
+                break
+            time.sleep(base_delay_seconds * (2 ** (attempt - 1)))
+    assert last_error is not None
+    logger.warning(
+        "SQLite write still locked after %d attempts: %s",
+        attempts,
+        str(getattr(last_error, "orig", last_error))[:200],
+    )
+    raise last_error
+
+
+def commit_with_locked_retry(
+    db: Session,
+    *,
+    redo: Callable[[], None] | None = None,
+    attempts: int = 5,
+    base_delay_seconds: float = 0.2,
+) -> None:
+    """Commit, retrying transient SQLite ``database is locked`` contention.
+
+    The engine already waits ``SQLITE_BUSY_TIMEOUT`` before raising; a lock
+    error therefore means another writer held the single SQLite write lock for
+    the whole wait (for example a background sweep that kept a dirty ORM
+    session across a long model call). Background sweeps should retry briefly
+    instead of dropping a sweep.  ``redo`` re-applies the pending ORM changes
+    after the mandatory rollback so the retried commit writes the same values.
+    """
+
+    for attempt in range(1, attempts + 1):
+        try:
+            db.commit()
+            return
+        except OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            try:
+                db.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            if attempt >= attempts:
+                logger.warning(
+                    "SQLite write still locked after %d attempts: %s",
+                    attempts,
+                    str(getattr(exc, "orig", exc))[:200],
+                )
+                raise
+            if redo is not None:
+                try:
+                    redo()
+                except Exception:  # pragma: no cover - the retry would be futile
+                    logger.warning("redo of a locked SQLite write failed", exc_info=True)
+                    raise
+            time.sleep(base_delay_seconds * (2 ** (attempt - 1)))
+    raise OperationalError("commit retries exhausted", {}, None)  # pragma: no cover
 
 
 def get_db() -> Generator[Session, None, None]:

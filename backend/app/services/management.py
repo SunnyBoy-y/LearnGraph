@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.database import retry_sqlite_locked
 from app.core.errors import AppError
 from app.core.secret_store import SecretStoreUnavailable, secret_store_from_settings
 from app.core.security import SecretCipher, mask_secret
@@ -1161,6 +1162,19 @@ class ProviderService:
     ) -> dict:
         """Write official catalog defaults as the per-model snapshot of every model."""
 
+        # SQLite allows a single writer; parallel discovery requests or an
+        # embedded scheduler sweep can hold the write lock past the busy
+        # timeout. The whole snapshot write (capabilities + audit) is
+        # idempotent, so re-run it from a fresh transaction when the commit
+        # was interrupted by ``database is locked``.
+        return retry_sqlite_locked(
+            self.db,
+            lambda: self._sync_model_catalog_defaults_impl(provider_id, model_ids),
+        )
+
+    def _sync_model_catalog_defaults_impl(
+        self, provider_id: str, model_ids: list[str]
+    ) -> dict:
         provider = self.providers.require(provider_id, "provider")
         if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
@@ -2507,6 +2521,16 @@ class ProviderService:
         return {"status": "deleted", "resource_id": provider_id}
 
     def models(self, provider_id: str) -> dict:
+        # The discovery snapshot write (capabilities + catalog defaults +
+        # audit) can collide with parallel writers on the single SQLite
+        # write lock. Re-run the idempotent snapshot when the commit was
+        # interrupted by ``database is locked`` instead of failing the page.
+        return retry_sqlite_locked(
+            self.db,
+            lambda: self._models_impl(provider_id),
+        )
+
+    def _models_impl(self, provider_id: str) -> dict:
         provider = self.providers.require(provider_id, "provider")
         if provider.provider_type == "local_mock":
             return {

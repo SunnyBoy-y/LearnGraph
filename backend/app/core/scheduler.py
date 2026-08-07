@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, update
 
 from app.core.config import get_settings
-from app.core.database import SessionLocal
+from app.core.database import SessionLocal, commit_with_locked_retry
 from app.domain.models import (
     MemoryProfileSnapshot,
     SandboxAgentCommand,
@@ -374,7 +374,13 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
                         session.cleanup_status = "cleanup_blocked"
                         session.cleanup_error_class = type(exc).__name__
                         totals["cleanup_blocked"] += 1
-                        db.commit()
+                        commit_with_locked_retry(
+                            db,
+                            redo=lambda: (
+                                setattr(session, "cleanup_status", "cleanup_blocked"),
+                                setattr(session, "cleanup_error_class", type(exc).__name__),
+                            ),
+                        )
                         continue
                 if observed_command_id:
                     command = db.get(SandboxAgentCommand, observed_command_id)
@@ -415,7 +421,10 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
             if not workspace_expired and not runtime_expired:
                 continue
             session.cleanup_status = "running"
-            db.commit()
+            commit_with_locked_retry(
+                db,
+                redo=lambda: setattr(session, "cleanup_status", "running"),
+            )
             try:
                 if session.backend_session_ref:
                     backend_for_settings(settings, session.runtime_kind).delete(

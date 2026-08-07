@@ -34,6 +34,7 @@ from sqlalchemy import delete, func as sql_func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.database import commit_with_locked_retry
 from app.core.errors import AppError
 from app.domain.memory_types import MEMORY_TYPE_REGISTRY, get_memory_type
 from app.domain.models import (
@@ -920,6 +921,19 @@ def extract_session_memories(
     now = utc_now()
     state.last_run_at = now
 
+    def _persist_extraction_state() -> None:
+        # Re-attach the bookmark after a locked-commit rollback and re-apply
+        # the same values so the retried commit writes them again.
+        db.add(state)
+        state.last_run_at = now
+
+    # Persist the sweep bookmark BEFORE any remote model call.  Keeping a dirty
+    # ORM session across a long generation holds the single SQLite write lock
+    # for the whole call and starves every other writer (other scheduler
+    # sweeps, chat commits), which then fail with "database is locked" after
+    # the busy timeout.
+    commit_with_locked_retry(db, redo=_persist_extraction_state)
+
     model = model_provider_for_workspace(
         db,
         workspace.id,
@@ -929,7 +943,10 @@ def extract_session_memories(
     )
     if not getattr(model, "available", False):
         state.last_status = "provider_unavailable"
-        db.commit()
+        commit_with_locked_retry(
+            db,
+            redo=lambda: setattr(state, "last_status", "provider_unavailable"),
+        )
         if force:
             raise AppError(
                 503,
@@ -982,7 +999,13 @@ def extract_session_memories(
     except AppError as exc:
         state.last_status = "budget_blocked"
         state.last_error = str(getattr(exc, "message", exc))[:500]
-        db.commit()
+        commit_with_locked_retry(
+            db,
+            redo=lambda: (
+                setattr(state, "last_status", "budget_blocked"),
+                setattr(state, "last_error", str(getattr(exc, "message", exc))[:500]),
+            ),
+        )
         if force:
             raise
         return {"status": "budget_blocked", "drafts_created": 0}
@@ -1008,7 +1031,13 @@ def extract_session_memories(
     if call_error is not None:
         state.last_status = "model_error"
         state.last_error = str(call_error)[:500]
-        db.commit()
+        commit_with_locked_retry(
+            db,
+            redo=lambda: (
+                setattr(state, "last_status", "model_error"),
+                setattr(state, "last_error", str(call_error)[:500]),
+            ),
+        )
         if force:
             raise AppError(
                 502,
@@ -1016,7 +1045,7 @@ def extract_session_memories(
                 f"Extraction model call failed: {call_error}",
             ) from call_error
         return {"status": "model_error", "drafts_created": 0}
-    db.commit()
+    commit_with_locked_retry(db)
 
     memory_service = MemoryService(
         db,
