@@ -50,6 +50,7 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileWriteRequest,
     SandboxAgentSessionCreateRequest,
     SandboxAgentTranscribeRequest,
+    SandboxAgentVideoInfoRequest,
     SandboxTaskCreateRequest,
 )
 from app.providers.factory import transcription_provider_for_workspace
@@ -2038,6 +2039,45 @@ class SandboxAgentWorkspaceService:
             "files": files,
         }
 
+    def video_info(self, payload: SandboxAgentVideoInfoRequest) -> dict[str, Any]:
+        """Return safe metadata for an Agent video reference without materializing it."""
+
+        try:
+            path = validate_agent_workspace_path(payload.path)
+        except SandboxCapabilityMismatch as exc:
+            raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
+        if not path.startswith("inputs/"):
+            raise AppError(
+                403,
+                "sandbox_video_input_required",
+                "Video inspection is limited to registered session inputs",
+            )
+        entry = self.workspace_files.get_entry(payload.chat_session_id, path)
+        mime_type = (entry.mime_type or "").casefold().split(";", 1)[0].strip()
+        if not mime_type.startswith("video/"):
+            raise AppError(415, "video_required", "Only registered video inputs can be inspected")
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.video_info",
+            resource_type="session_workspace_entry",
+            resource_id=entry.id,
+            details={"path": path, "file_id": entry.file_id, "size_bytes": entry.size_bytes},
+        )
+        self.db.commit()
+        return {
+            "path": path,
+            "file_id": entry.file_id,
+            "mime_type": mime_type,
+            "size_bytes": entry.size_bytes,
+            "sha256": entry.blob_sha256,
+            "materialized": False,
+            "guidance": (
+                "Use sandbox_exec with ffprobe/ffmpeg only after materializing a local copy if "
+                "byte-level processing is required. For semantic understanding, use the configured "
+                "video analysis provider when available."
+            ),
+        }
+
     def transcribe_workspace_audio(
         self, payload: SandboxAgentTranscribeRequest
     ) -> dict[str, Any]:
@@ -2275,7 +2315,12 @@ class SandboxAgentWorkspaceService:
                 source="chat_attachment",
             )
             seeded.append(view)
-            # Best-effort Docker dual-write of input bytes.
+            if self._is_video_like(file):
+                # Video is retained as a persistent storage reference. Copying a
+                # multi-gigabyte input into the Docker bind mount is opt-in for
+                # a future materialization tool, not a side effect of sending.
+                continue
+            # Best-effort Docker dual-write of small/non-video input bytes.
             try:
                 if handle is None:
                     session = self._resolve_session(None, chat_session_id)
@@ -2304,6 +2349,10 @@ class SandboxAgentWorkspaceService:
         return file.mime_type.casefold().split(";", 1)[0].strip().startswith("image/")
 
     @staticmethod
+    def _is_video_like(file: FileRecord) -> bool:
+        return file.mime_type.casefold().split(";", 1)[0].strip().startswith("video/")
+
+    @staticmethod
     def agent_tool_definitions() -> list[dict[str, Any]]:
         """OpenAI-compatible function schemas for the Chat agent dispatcher.
 
@@ -2330,6 +2379,22 @@ class SandboxAgentWorkspaceService:
                     "parameters": {
                         "type": "object",
                         "properties": {"sandbox_session_id": session_property},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_video_info",
+                    "description": "Inspect a video registered under inputs/ without loading its bytes into the model context. Use this first for duration, streams, resolution, codecs, and size before deciding whether ffmpeg extraction or a semantic video-analysis tool is needed.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Registered inputs/ video path."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path"],
                         "additionalProperties": False,
                     },
                 },
@@ -2720,6 +2785,8 @@ class SandboxAgentWorkspaceService:
                     title=str(payload.get("title") or "交互式教学应用"),
                     preferred_height=payload.get("preferred_height") if isinstance(payload.get("preferred_height"), int) else None,
                 )
+            if name == "sandbox_video_info":
+                return self.video_info(SandboxAgentVideoInfoRequest.model_validate(payload))
             if name == "sandbox_transcribe_audio":
                 return self.transcribe_workspace_audio(
                     SandboxAgentTranscribeRequest.model_validate(payload)

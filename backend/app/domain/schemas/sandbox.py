@@ -222,6 +222,14 @@ class SandboxAgentFileListRequest(BaseModel):
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
+class SandboxAgentVideoInfoRequest(BaseModel):
+    """Read safe metadata for a video registered as a session input."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    path: str = Field(min_length=1, max_length=255)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
 class SandboxAgentTranscribeRequest(BaseModel):
     """Host-side bridge: transcribe a workspace audio file with the user's ASR
     Provider.  Credentials and network access stay on the host; the sandbox

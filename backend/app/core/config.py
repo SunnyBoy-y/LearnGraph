@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     master_key_version: int = 1
     keyring_service_name: str = "LearnGraph"
     keyring_account_prefix: str = "master-key"
-    max_upload_bytes: int = 200 * 1024 * 1024
+    # Large media is streamed directly into the local persistent file store. The
+    # limit is a policy ceiling, not preallocated disk space.
+    max_upload_bytes: int = 20 * 1024 * 1024 * 1024
     max_backup_bytes: int = 1024 * 1024 * 1024
     max_document_parse_bytes: int = 50 * 1024 * 1024
     research_poll_seconds: float = 0.25
@@ -122,7 +124,9 @@ class Settings(BaseSettings):
     # Dockerfile ARGs.
     sandbox_build_pip_index_url: str | None = None
     sandbox_build_npm_registry: str | None = None
-    sandbox_disk_bytes: int = 256 * 1024 * 1024
+    # This is a logical, actual-usage ceiling for the bind-mounted workspace;
+    # Docker does not preallocate this amount when a sandbox starts.
+    sandbox_disk_bytes: int = 20 * 1024 * 1024 * 1024
     sandbox_file_count: int = 20_000
     sandbox_directory_count: int = 5_000
     sandbox_snapshot_reserve_bytes: int = 256 * 1024 * 1024
@@ -147,8 +151,8 @@ class Settings(BaseSettings):
     subapp_preview_port: int | None = None
     # bootstrap to admins; this env flag sets the initial deployment default.
     sandbox_bootstrap_member_allowed: bool = True
-    sandbox_agent_file_bytes: int = 1 * 1024 * 1024
-    sandbox_agent_archive_bytes: int = 16 * 1024 * 1024
+    sandbox_agent_file_bytes: int = 20 * 1024 * 1024 * 1024
+    sandbox_agent_archive_bytes: int = 1 * 1024 * 1024 * 1024
     sandbox_agent_command_args_max: int = 32
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60
@@ -300,8 +304,8 @@ class Settings(BaseSettings):
     @field_validator("sandbox_agent_file_bytes")
     @classmethod
     def validate_sandbox_agent_file_bytes(cls, value: int) -> int:
-        if not 1 <= value <= 1024 * 1024 * 1024:
-            raise ValueError("Sandbox Agent file bytes must be between 1 and 1073741824")
+        if not 1 <= value <= 20 * 1024 * 1024 * 1024:
+            raise ValueError("Sandbox Agent file bytes must be between 1 and 21474836480")
         return value
 
     @field_validator("sandbox_agent_archive_bytes")

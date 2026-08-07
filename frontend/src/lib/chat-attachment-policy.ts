@@ -169,8 +169,11 @@ export function classifyNonAgentAttachment(options: {
     requireReady = false,
   } = options;
   if (isSpecialBinaryName(name)) return { ok: false, reason: "unsupported" };
-  if (isImageNameOrMime(name, mime) || isVideoNameOrMime(name, mime)) {
+  if (isImageNameOrMime(name, mime)) {
     return { ok: true, reason: null };
+  }
+  if (isVideoNameOrMime(name, mime)) {
+    return { ok: false, reason: "unsupported" };
   }
   if (isAudioNameOrMime(name, mime)) {
     return asrAvailable
@@ -190,5 +193,10 @@ export function nonAgentAttachmentBlockedMessage(names: string[]): string {
   const uniqueNames = [...new Set(names.filter(Boolean))];
   const preview = uniqueNames.slice(0, 5).map((name) => `「${name}」`).join("、");
   const remainder = uniqueNames.length > 5 ? ` 等 ${uniqueNames.length} 个文件` : "";
-  return `极速/思考模式不支持以下附件：${preview}${remainder}。请切换到智能体模式，或者删除不受支持的文件后再发送。`;
+  const videoNames = uniqueNames.filter((name) => VIDEO_EXTENSIONS.has(fileExtension(name)));
+  const others = uniqueNames.filter((name) => !VIDEO_EXTENSIONS.has(fileExtension(name)));
+  if (videoNames.length && !others.length) {
+    return `视频附件仅支持智能体模式：${videoNames.slice(0, 5).map((name) => `「${name}」`).join("、")}。请切换到智能体模式后发送。`;
+  }
+  return `极速/思考模式不支持以下附件：${preview}${remainder}。视频仅支持智能体模式；请切换到智能体模式，或者删除不受支持的文件后再发送。`;
 }

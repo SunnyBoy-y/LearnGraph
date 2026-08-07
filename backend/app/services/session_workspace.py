@@ -325,13 +325,31 @@ class SessionWorkspaceService:
         name = Path(file.original_name).name[:200] or f"{file.sha256[:12]}.bin"
         if role not in {"input", "work", "output"}:
             raise AppError(422, "invalid_workspace_role", "Workspace role must be input, work, or output")
-        storage = object_storage_provider(self.db, self.workspace_id, self.settings)
-        data = storage.read_bytes(
-            file.object_key,
-            limit_bytes=self.settings.max_upload_bytes,
-        )
         mime = file.mime_type or "application/octet-stream"
-        blob = self.blobs.put_bytes(data, mime_type=mime)
+        blob = self.db.scalar(
+            select(ContentBlob).where(
+                ContentBlob.workspace_id == self.workspace_id,
+                ContentBlob.sha256 == file.sha256,
+            )
+        )
+        if blob is None:
+            # Chat attachments already have a durable FileRecord/object key.
+            # Register that object directly instead of reading and duplicating
+            # the complete file through backend memory and workspace storage.
+            blob = ContentBlob(
+                id=new_id(),
+                workspace_id=self.workspace_id,
+                sha256=file.sha256,
+                object_key=file.object_key,
+                size_bytes=file.size_bytes,
+                mime_type=mime,
+                ref_count=1,
+            )
+            self.db.add(blob)
+            self.db.flush()
+        else:
+            blob.ref_count = int(blob.ref_count or 0) + 1
+            self.db.flush()
         # Prefer the caller's FileRecord id so chat attachments stay linked.
         file_id = file.id if file.sha256 == blob.sha256 else None
         if file_id is None:

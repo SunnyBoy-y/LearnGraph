@@ -472,7 +472,6 @@ export function DocumentChatPanel({
         });
       }
     }
-    const fileIsImage = file.mime_type.toLowerCase().startsWith("image/");
     const needsIndex =
       indexRequired &&
       file.parse_status !== "indexed" &&
@@ -597,7 +596,7 @@ export function DocumentChatPanel({
     activeStreamSessionId.current = targetSessionId;
     const fileIds = Array.from(
       new Set([
-        ...(fileIsImage || file.parse_status === "indexed" ? [file.id] : []),
+        ...(file.id ? [file.id] : []),
         ...imageFileIds,
       ]),
     );
