@@ -2553,7 +2553,12 @@ class SandboxAgentWorkspaceService:
                     "description": (
                         "Publish a validated multi-file teaching app as a durable interactive subapp. "
                         "Requires a successful validation_id from sandbox_validate_web_app; do not use "
-                        "this for ordinary downloadable files."
+                        "this for ordinary downloadable files. "
+                        "Pass an optional interaction_contract to make the app a bidirectional "
+                        "sub-application: the user interacts in an isolated iframe, their actions "
+                        "reach you via subapp_observe, and you update the UI via subapp_patch_state. "
+                        "When interaction_contract is omitted the app is published as a static "
+                        "preview bundle (single-file downloads go through sandbox_publish_file)."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2561,6 +2566,24 @@ class SandboxAgentWorkspaceService:
                             "validation_id": {"type": "string"},
                             "title": {"type": "string"},
                             "preferred_height": {"type": "integer", "minimum": 160, "maximum": 900},
+                            "interaction_contract": {
+                                "type": "object",
+                                "description": (
+                                    "Optional bidirectional contract. Shape: "
+                                    "{event_schema: <JSON Schema>, state_schema: <JSON Schema>}. "
+                                    "event_schema describes user actions emitted by the app (e.g. "
+                                    "{question_id, selected}); state_schema describes the complete "
+                                    "state you write via subapp_patch_state (e.g. {view, answers}). "
+                                    "Both schemas must be closed object schemas (top-level "
+                                    "additionalProperties:false) and must not declare executable "
+                                    "content, callbacks, or caller-supplied patterns."
+                                ),
+                                "properties": {
+                                    "event_schema": {"type": "object"},
+                                    "state_schema": {"type": "object"},
+                                },
+                                "additionalProperties": False,
+                            },
                             "sandbox_session_id": session_property,
                         },
                         "required": ["validation_id", "title"],
@@ -2784,6 +2807,7 @@ class SandboxAgentWorkspaceService:
                     sandbox_session_id=payload.get("sandbox_session_id") if isinstance(payload.get("sandbox_session_id"), str) else None,
                     title=str(payload.get("title") or "交互式教学应用"),
                     preferred_height=payload.get("preferred_height") if isinstance(payload.get("preferred_height"), int) else None,
+                    interaction_contract=payload.get("interaction_contract") if isinstance(payload.get("interaction_contract"), dict) else None,
                 )
             if name == "sandbox_video_info":
                 return self.video_info(SandboxAgentVideoInfoRequest.model_validate(payload))

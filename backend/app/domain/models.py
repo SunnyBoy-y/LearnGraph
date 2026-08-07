@@ -1826,6 +1826,13 @@ class SubAppBundle(Base, TimestampMixin, WorkspaceScopedMixin):
     entry_path: Mapped[str] = mapped_column(String(255))
     manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     manifest_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    # Optional bidirectional sub-application contract snapshotted from an Agent
+    # ``sandbox_publish_web_app`` call. When present, the bundle is also linked to
+    # a lightweight ``ComponentManifestVersion`` (``component_manifest_id``) so the
+    # frontend can instantiate a T2.6 interactive session. Absent both fields the
+    # bundle remains a static preview.
+    interaction_contract: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    component_manifest_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="published", index=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     preferred_height: Mapped[int] = mapped_column(Integer, default=420)

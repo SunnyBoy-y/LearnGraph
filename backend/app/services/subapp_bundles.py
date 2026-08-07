@@ -11,11 +11,15 @@ from pathlib import PurePosixPath
 import secrets
 from typing import Any
 
+from jsonschema import ValidationError
+from jsonschema.exceptions import SchemaError
+from jsonschema.validators import validator_for
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.domain.models import (
+    ComponentManifestVersion,
     ContentBlob,
     SubAppBundle,
     SubAppBundleFile,
@@ -274,6 +278,7 @@ class SubAppBundleService:
         sandbox_session_id: str | None,
         title: str,
         preferred_height: int | None = None,
+        interaction_contract: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         validation = self.db.scalar(
             select(SubAppBundleValidation).where(
@@ -300,6 +305,7 @@ class SubAppBundleService:
             manifest_json=validation.manifest_json,
             manifest_sha256=validation.manifest_sha256,
             preferred_height=max(160, min(900, int(preferred_height or 420))),
+            interaction_contract=interaction_contract,
         )
         self.db.add(bundle)
         self.db.flush()
@@ -315,12 +321,24 @@ class SubAppBundleService:
                 )
             )
         validation.consumed_at = utc_now()
+        component_manifest_id: str | None = None
+        if interaction_contract is not None:
+            component_manifest_id = self._create_interactive_manifest(
+                bundle=bundle,
+                interaction_contract=interaction_contract,
+                chat_session_id=chat_session_id,
+            )
+            bundle.component_manifest_id = component_manifest_id
         self.audit.record(
             actor_id=self.actor_id,
             action="subapp.bundle_published",
             resource_type="subapp_bundle",
             resource_id=bundle.id,
-            details={"validation_id": validation.id, "manifest_sha256": bundle.manifest_sha256},
+            details={
+                "validation_id": validation.id,
+                "manifest_sha256": bundle.manifest_sha256,
+                "subapp_mode": component_manifest_id is not None,
+            },
         )
         self.db.commit()
         return {
@@ -329,6 +347,8 @@ class SubAppBundleService:
             "entry_path": bundle.entry_path,
             "manifest_sha256": bundle.manifest_sha256,
             "status": bundle.status,
+            "subapp_mode": component_manifest_id is not None,
+            "artifact_version_id": component_manifest_id,
             "part": {
                 "type": "subapp_artifact",
                 "status": "completed",
@@ -340,9 +360,157 @@ class SubAppBundleService:
                     "chat_session_id": chat_session_id,
                     "sandbox_session_id": bundle.sandbox_session_id,
                     "validation_status": "passed",
+                    "subapp_mode": component_manifest_id is not None,
+                    "artifact_version_id": component_manifest_id,
                 },
             },
         }
+
+    def _create_interactive_manifest(
+        self,
+        *,
+        bundle: SubAppBundle,
+        interaction_contract: dict[str, Any],
+        chat_session_id: str,
+    ) -> str:
+        """Create a lightweight contract-bearing manifest for a bidirectional subapp.
+
+        The bundle is the durable source of truth; this manifest exists only so
+        ``SubAppService.create_session`` can snapshot ``event_schema`` /
+        ``state_schema`` and instantiate a T2.6 interactive session. It deliberately
+        bypasses the third-party component registration flow (no PluginRecord, no
+        health/render checks, no signature metadata) because the Agent is already
+        the authorized publisher of this chat session's sandbox output. Contract
+        validation reuses the same closed-schema guards as component registration.
+        """
+        from app.services.components import _interaction_contract_guard
+
+        if not isinstance(interaction_contract, dict):
+            raise AppError(
+                422,
+                "subapp_interaction_contract_invalid",
+                "interaction_contract must be an object",
+            )
+        try:
+            _interaction_contract_guard(interaction_contract)
+        except AppError as exc:
+            raise AppError(
+                422,
+                "subapp_interaction_contract_invalid",
+                f"Invalid interaction contract: {exc.message}",
+                exc.details,
+            ) from exc
+
+        event_schema = interaction_contract.get("event_schema")
+        state_schema = interaction_contract.get("state_schema")
+        if not isinstance(event_schema, dict) or not isinstance(state_schema, dict):
+            raise AppError(
+                422,
+                "subapp_interaction_contract_incomplete",
+                "interaction_contract requires both event_schema and state_schema",
+            )
+        try:
+            validator_for(event_schema).check_schema(event_schema)
+            validator_for(state_schema).check_schema(state_schema)
+        except (ValidationError, SchemaError) as exc:
+            raise AppError(
+                422,
+                "subapp_interaction_contract_invalid",
+                "Interaction contract contains an invalid JSON Schema",
+                {"validation_error": type(exc).__name__},
+            ) from None
+
+        from app.domain.schemas.components import COMPONENT_ID_PATTERN
+
+        component_id = f"bundle_{bundle.id[:24]}"
+        if not COMPONENT_ID_PATTERN.fullmatch(component_id):
+            raise AppError(
+                422,
+                "subapp_component_id_invalid",
+                "Derived sub-application component id is not a valid component id",
+            )
+        data_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
+        }
+        schema_hash = _sha256(
+            _canonical_json(
+                {
+                    "data_schema": data_schema,
+                    "event_schema": event_schema,
+                    "interaction_contract": interaction_contract,
+                }
+            )
+        )
+        permissions: dict[str, Any] = {
+            "network_domains": [],
+            "file_read": False,
+            "clipboard_write": False,
+            "message_actions": ["submit"],
+        }
+        permissions_hash = _sha256(_canonical_json(permissions))
+        material = {
+            "component_id": component_id,
+            "version": "1.0.0",
+            "display_name": bundle.title,
+            "renderer": "sandbox",
+            "source": "agent_subapp",
+            "author": "LearnGraph Agent",
+            "package_hash": bundle.manifest_sha256,
+            "compatible_learngraph": {"minimum": "0.1.0"},
+            "data_schema": data_schema,
+            "event_schema": event_schema,
+            "interaction_contract": interaction_contract,
+            "permissions": permissions,
+            "size_limits": {
+                "min_height": 80,
+                "max_height": 720,
+            },
+        }
+        manifest_hash = _sha256(_canonical_json(material))
+        manifest = ComponentManifestVersion(
+            workspace_id=self.workspace_id,
+            plugin_id="",
+            component_id=component_id,
+            version="1.0.0",
+            display_name=bundle.title,
+            renderer="sandbox",
+            source="agent_subapp",
+            author="LearnGraph Agent",
+            package_hash=bundle.manifest_sha256,
+            package_hash_status="declared_unverified",
+            signature_status="unsigned",
+            signature_info={},
+            compatible_learngraph={"minimum": "0.1.0"},
+            uninstall_behavior="retain_data",
+            data_schema=data_schema,
+            event_schema=event_schema,
+            interaction_contract=interaction_contract,
+            permissions=permissions,
+            size_limits={"min_height": 80, "max_height": 720},
+            skill_triggers=[],
+            example_data={},
+            schema_hash=schema_hash,
+            permissions_hash=permissions_hash,
+            manifest_hash=manifest_hash,
+            issuer_id=None,
+            trusted_bundle_eligible=False,
+        )
+        self.db.add(manifest)
+        self.db.flush()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="subapp.interactive_manifest_created",
+            resource_type="component_manifest_version",
+            resource_id=manifest.id,
+            details={
+                "bundle_id": bundle.id,
+                "component_id": component_id,
+                "chat_session_id": chat_session_id,
+            },
+        )
+        return manifest.id
 
     def mint_preview(self, bundle_id: str) -> dict[str, Any]:
         bundle = self._bundle(bundle_id)
