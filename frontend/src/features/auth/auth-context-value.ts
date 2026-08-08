@@ -11,6 +11,10 @@ export type AuthContextValue = {
     workspaceId: string
     mustChangePassword: boolean
   }>
+  demoLogin: () => Promise<{
+    workspaceId: string
+    mustChangePassword: boolean
+  }>
   register: (payload: {
     username: string
     email?: string

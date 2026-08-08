@@ -27,6 +27,16 @@ export async function login(payload: DemoLoginRequest): Promise<LoginResponse> {
   return response
 }
 
+export async function demoLogin(): Promise<LoginResponse> {
+  const response = await apiClient.post<LoginResponse, DemoLoginRequest>(
+    '/auth/demo-login',
+    { username: 'demo', password: 'learn-graph-local' },
+    { auth: false, workspace: false },
+  )
+  authStore.setLoginResponse(response)
+  return response
+}
+
 export async function register(payload: RegisterRequest): Promise<LoginResponse> {
   const response = await apiClient.post<LoginResponse, RegisterRequest>('/auth/register', payload, {
     auth: false,

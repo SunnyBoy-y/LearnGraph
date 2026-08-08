@@ -3,26 +3,29 @@ import {
   ArrowRight,
   KeyRound,
   LockKeyhole,
+  Sparkles,
   UserRound,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
-import { apiClient, ApiError } from "@/api/client";
+import { apiClient } from "@/api/client";
 import { KnowledgeGraph } from "@/components/graph/knowledge-graph";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/features/auth/auth-context-value";
-
-function errorMessage(reason: unknown): string {
-  if (reason instanceof ApiError) return reason.message;
-  if (reason instanceof Error) return reason.message;
-  return "无法连接 LearnGraph 后端，请确认 API 已启动。";
-}
+import { authErrorMessage, SESSION_EXPIRED_MESSAGE } from "./auth-messages";
+import {
+  PASSWORD_RULE_SUMMARY,
+  passwordRuleViolations,
+} from "./password-rules";
 
 export function LoginPage() {
   const navigate = useNavigate();
-  const { login, register } = useAuth();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const { demoLogin, login, register } = useAuth();
+  const demoLoginEnabled = import.meta.env.VITE_ENABLE_DEMO_LOGIN !== "false";
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
@@ -30,7 +33,19 @@ export function LoginPage() {
   const [passwordConfirmation, setPasswordConfirmation] = useState("");
   const [registerMode, setRegisterMode] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(() =>
+    searchParams.get("reason") === "session_expired"
+      ? SESSION_EXPIRED_MESSAGE
+      : "",
+  );
+
+  function returnToAfterLogin(workspaceId: string): string {
+    const from = (location.state as { from?: string } | null)?.from;
+    if (from && from.startsWith("/") && !from.startsWith("/auth/")) {
+      return from;
+    }
+    return `/w/${workspaceId}`;
+  }
 
   async function submitLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -46,9 +61,28 @@ export function LoginPage() {
         });
         return;
       }
-      navigate(`/w/${result.workspaceId}`);
+      navigate(returnToAfterLogin(result.workspaceId), { replace: true });
     } catch (reason) {
-      setError(errorMessage(reason));
+      setError(authErrorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitDemoLogin() {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await demoLogin();
+      if (result.mustChangePassword) {
+        navigate("/auth/change-password", {
+          state: { currentPassword: "learn-graph-local" },
+        });
+        return;
+      }
+      navigate(returnToAfterLogin(result.workspaceId), { replace: true });
+    } catch (reason) {
+      setError(authErrorMessage(reason));
     } finally {
       setBusy(false);
     }
@@ -63,6 +97,12 @@ export function LoginPage() {
       setBusy(false);
       return;
     }
+    const violations = passwordRuleViolations(password, username);
+    if (violations.length > 0) {
+      setError(violations[0]);
+      setBusy(false);
+      return;
+    }
     try {
       const result = await register({
         username,
@@ -72,7 +112,7 @@ export function LoginPage() {
       });
       navigate(`/w/${result.workspaceId}`);
     } catch (reason) {
-      setError(errorMessage(reason));
+      setError(authErrorMessage(reason));
     } finally {
       setBusy(false);
     }
@@ -139,6 +179,7 @@ export function LoginPage() {
               <div className="field-with-icon">
                 <KeyRound />
                 <Input
+                  aria-describedby="register-password-hint"
                   autoComplete="new-password"
                   id="register-password"
                   minLength={12}
@@ -148,6 +189,9 @@ export function LoginPage() {
                   value={password}
                 />
               </div>
+              <p className="form-intro" id="register-password-hint">
+                {PASSWORD_RULE_SUMMARY}
+              </p>
             </div>
             <div className="field-stack">
               <Label htmlFor="register-password-confirmation">确认密码</Label>
@@ -222,9 +266,21 @@ export function LoginPage() {
               </div>
             )}
             <Button className="auth-submit" disabled={busy} type="submit">
-              {busy ? "正在验证…" : "继续"}
+              {busy ? "正在验证…" : "登录"}
               <ArrowRight />
             </Button>
+            {demoLoginEnabled && (
+              <Button
+                className="auth-demo"
+                disabled={busy}
+                onClick={submitDemoLogin}
+                type="button"
+                variant="outline"
+              >
+                <Sparkles />
+                试用 Demo
+              </Button>
+            )}
             <Button
               className="auth-demo"
               disabled={busy}

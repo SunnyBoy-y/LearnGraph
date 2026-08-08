@@ -2,18 +2,16 @@ import { useState, type FormEvent } from "react";
 import { ArrowRight, KeyRound, LoaderCircle, ShieldCheck } from "lucide-react";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 
-import { ApiError } from "@/api/client";
 import { KnowledgeGraph } from "@/components/graph/knowledge-graph";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/features/auth/auth-context-value";
-
-function errorMessage(reason: unknown): string {
-  if (reason instanceof ApiError) return reason.message;
-  if (reason instanceof Error) return reason.message;
-  return "无法连接 LearnGraph 后端，请确认 API 已启动。";
-}
+import { authErrorMessage } from "./auth-messages";
+import {
+  PASSWORD_RULE_SUMMARY,
+  passwordRuleViolations,
+} from "./password-rules";
 
 export function ChangePasswordPage() {
   const auth = useAuth();
@@ -51,12 +49,17 @@ export function ChangePasswordPage() {
       setError("两次输入的新密码不一致。");
       return;
     }
+    const violations = passwordRuleViolations(newPassword, auth.username);
+    if (violations.length > 0) {
+      setError(violations[0]);
+      return;
+    }
     setBusy(true);
     try {
       await auth.changePassword(currentPassword, newPassword);
       navigate(`/w/${auth.workspaceId}/home`);
     } catch (reason) {
-      setError(errorMessage(reason));
+      setError(authErrorMessage(reason));
     } finally {
       setBusy(false);
     }
@@ -99,6 +102,7 @@ export function ChangePasswordPage() {
             <div className="field-with-icon">
               <KeyRound />
               <Input
+                aria-describedby="new-password-hint"
                 autoComplete="new-password"
                 id="new-password"
                 minLength={12}
@@ -108,6 +112,9 @@ export function ChangePasswordPage() {
                 value={newPassword}
               />
             </div>
+            <p className="form-intro" id="new-password-hint">
+              {PASSWORD_RULE_SUMMARY}
+            </p>
           </div>
           <div className="field-stack">
             <Label htmlFor="password-confirmation">再次输入新密码</Label>

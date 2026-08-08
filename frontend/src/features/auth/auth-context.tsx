@@ -5,6 +5,7 @@ import { Navigate, useLocation } from "react-router-dom";
 import {
   changePassword as changeAccountPassword,
   deleteAccount as deleteCurrentAccount,
+  demoLogin as demoLoginAccount,
   listWorkspaces,
   login as loginAccount,
   register as registerAccount,
@@ -134,6 +135,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           mustChangePassword: response.must_change_password,
         };
       },
+      async demoLogin() {
+        await clearAuthenticatedClientState();
+        const response = await demoLoginAccount();
+        const nextSession = authStore.getSession();
+        setSession(nextSession);
+        if (!response.default_workspace_id) {
+          throw new Error("This account has no accessible workspace");
+        }
+        return {
+          workspaceId: response.default_workspace_id,
+          mustChangePassword: response.must_change_password,
+        };
+      },
       async register(payload) {
         await clearAuthenticatedClientState();
         const response = await registerAccount(payload);
@@ -186,7 +200,11 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   const location = useLocation();
   if (!auth.authenticated) {
     return (
-      <Navigate replace state={{ from: location.pathname }} to="/auth/login" />
+      <Navigate
+        replace
+        state={{ from: location.pathname + location.search }}
+        to="/auth/login"
+      />
     );
   }
   if (auth.mustChangePassword === null) {

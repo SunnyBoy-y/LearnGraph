@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     demo_username: str = "demo"
     demo_password: str = "learn-graph-local"
     enable_demo_seed: bool = False
+    enable_demo_login: bool = True
     auth_session_hours: int = 12
     auth_max_failed_logins: int = 5
     auth_lockout_minutes: int = 15
@@ -294,6 +295,12 @@ class Settings(BaseSettings):
         if self.env.casefold() not in {"development", "dev", "test", "local"}:
             return False
         return self.enable_demo_seed
+
+    @property
+    def demo_login_enabled(self) -> bool:
+        if self.env.casefold() not in {"development", "dev", "test", "local"}:
+            return False
+        return self.enable_demo_login
 
     @field_validator("sandbox_backend")
     @classmethod

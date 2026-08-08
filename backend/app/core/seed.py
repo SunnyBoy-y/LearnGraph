@@ -98,7 +98,8 @@ def ensure_auth_identities(db: Session) -> None:
             logger.warning(format_bootstrap_credentials(admin_name, bootstrap_password))
 
     demo = db.get(User, "demo-user")
-    if settings.demo_seed_enabled and demo is None:
+    demo_identity_enabled = settings.demo_login_enabled or settings.demo_seed_enabled
+    if demo_identity_enabled and demo is None:
         demo = User(
             id="demo-user",
             tenant_id=LOCAL_TENANT_ID,
@@ -110,22 +111,38 @@ def ensure_auth_identities(db: Session) -> None:
             must_change_password=False,
         )
         db.add(demo)
-    elif demo is not None and not settings.demo_seed_enabled:
+        db.flush()
+    elif demo is not None and not demo_identity_enabled:
         demo.status = "disabled"
+    if demo_identity_enabled and db.get(Workspace, DEMO_WORKSPACE_ID) is None:
+        db.add(
+            Workspace(
+                id=DEMO_WORKSPACE_ID,
+                tenant_id=LOCAL_TENANT_ID,
+                owner_user_id=demo.id if demo is not None else "demo-user",
+                workspace_kind="personal",
+                name="个人学习区",
+                description="LearnGraph 本地演示工作区",
+            )
+        )
     db.commit()
 
 
 def seed_demo_data(db: Session) -> None:
-    if db.get(Workspace, DEMO_WORKSPACE_ID) is not None:
+    if db.get(Goal, "demo-goal") is not None and db.get(ChatSession, "demo-session") is not None:
         return
 
-    workspace = Workspace(
-        id=DEMO_WORKSPACE_ID,
-        tenant_id="local-tenant",
-        owner_user_id="demo-user",
-        name="个人学习区",
-        description="LearnGraph 本地演示工作区",
-    )
+    workspace = db.get(Workspace, DEMO_WORKSPACE_ID)
+    if workspace is None:
+        workspace = Workspace(
+            id=DEMO_WORKSPACE_ID,
+            tenant_id="local-tenant",
+            owner_user_id="demo-user",
+            name="个人学习区",
+            description="LearnGraph 本地演示工作区",
+        )
+        db.add(workspace)
+        db.flush()
     goal = Goal(
         id="demo-goal",
         workspace_id=DEMO_WORKSPACE_ID,

@@ -189,7 +189,7 @@ export class ApiClient {
           typeof window !== 'undefined' &&
           !window.location.pathname.startsWith('/auth/login')
         ) {
-          window.location.replace('/auth/login')
+          window.location.replace('/auth/login?reason=session_expired')
         }
       }
       throw new ApiError({

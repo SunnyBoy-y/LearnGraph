@@ -81,7 +81,7 @@ class AuthService:
         demo_only: bool = False,
     ) -> LoginResponse:
         if demo_only:
-            if not self.settings.demo_seed_enabled:
+            if not self.settings.demo_login_enabled:
                 raise AppError(404, "demo_auth_disabled", "Development demo authentication is disabled")
             if (
                 normalize_identity(payload.username)
