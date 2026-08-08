@@ -273,6 +273,31 @@ class MCPRefreshResponse(BaseModel):
     snapshot: MCPCapabilitySnapshotView
 
 
+class MCPOAuthBeginRequest(BaseModel):
+    """Start an authorization-code flow and return a PKCE authorization URL.
+
+    The backend stores the generated ``state`` and encrypted code verifier on
+    the server credential; the caller only receives the URL and ``state`` so
+    the later exchange can bind them server-side.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    auth_endpoint: str = Field(min_length=8, max_length=1000)
+    redirect_uri: str = Field(min_length=1, max_length=1000)
+    scope: str = Field(min_length=1, max_length=500)
+    client_id: str = Field(min_length=1, max_length=200)
+
+
+class MCPOAuthBeginView(BaseModel):
+    server_id: str
+    authorization_url: str
+    state: str
+    scope: str
+    redirect_uri: str
+    code_challenge_method: str = "S256"
+
+
 class MCPOAuthExchangeRequest(BaseModel):
     """Complete an authorization-code exchange (P2-B).
 

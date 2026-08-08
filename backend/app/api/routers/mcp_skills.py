@@ -13,6 +13,13 @@ from app.domain.schemas.extensions import (
     McpRegistrySearchResponse,
     MCPCapabilitySnapshotView,
     MCPInvokeRequest,
+    MCPOAuthBeginRequest,
+    MCPOAuthBeginView,
+    MCPOAuthClientRegisterRequest,
+    MCPOAuthClientRegistrationView,
+    MCPOAuthCredentialView,
+    MCPOAuthExchangeRequest,
+    MCPOAuthRefreshRequest,
     MCPRefreshResponse,
     MCPServerCreateRequest,
     MCPServerUpdateRequest,
@@ -307,6 +314,151 @@ def revoke_mcp_server(
 ) -> MCPServerView:
     manager = service(db, context, settings)
     return server_view(manager.revoke_server(server_id, payload.reason), manager)
+
+
+@router.post(
+    "/mcp/servers/{server_id}/oauth/begin",
+    response_model=MCPOAuthBeginView,
+    status_code=status.HTTP_201_CREATED,
+)
+def begin_mcp_oauth(
+    server_id: str,
+    payload: MCPOAuthBeginRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPOAuthBeginView:
+    """Start an OAuth authorization-code flow and return the PKCE auth URL."""
+    return MCPOAuthBeginView.model_validate(
+        service(db, context, settings).begin_server_oauth(
+            server_id,
+            auth_endpoint=payload.auth_endpoint,
+            redirect_uri=payload.redirect_uri,
+            scope=payload.scope,
+            client_id=payload.client_id,
+        )
+    )
+
+
+@router.post(
+    "/mcp/servers/{server_id}/oauth/exchange",
+    response_model=MCPOAuthCredentialView,
+)
+def exchange_mcp_oauth(
+    server_id: str,
+    payload: MCPOAuthExchangeRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPOAuthCredentialView:
+    """Exchange an authorization code for a persisted OAuth token."""
+    return MCPOAuthCredentialView.model_validate(
+        service(db, context, settings).exchange_server_oauth(
+            server_id,
+            code=payload.code,
+            state=payload.state,
+            token_endpoint=payload.token_endpoint,
+            client_id=payload.client_id,
+            client_secret=(
+                payload.client_secret.get_secret_value()
+                if payload.client_secret is not None
+                else None
+            ),
+        )
+    )
+
+
+@router.post(
+    "/mcp/servers/{server_id}/oauth/refresh",
+    response_model=MCPOAuthCredentialView,
+)
+def refresh_mcp_oauth(
+    server_id: str,
+    payload: MCPOAuthRefreshRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPOAuthCredentialView:
+    """Refresh an OAuth access token under the single-flight lock."""
+    view = service(db, context, settings).refresh_server_oauth_token(
+        server_id,
+        token_endpoint=payload.token_endpoint,
+        force=payload.force,
+    )
+    if view is None:
+        raise AppError(
+            409,
+            "mcp_oauth_not_configured",
+            "This MCP server does not hold an OAuth authorization-code credential",
+        )
+    return MCPOAuthCredentialView.model_validate(view)
+
+
+@router.post(
+    "/mcp/servers/{server_id}/oauth/register",
+    response_model=MCPOAuthClientRegistrationView,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_mcp_oauth_client(
+    server_id: str,
+    payload: MCPOAuthClientRegisterRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPOAuthClientRegistrationView:
+    """Dynamically register an OAuth client for an explicitly trusted issuer."""
+    return MCPOAuthClientRegistrationView.model_validate(
+        service(db, context, settings).register_server_oauth_client(
+            server_id,
+            issuer=payload.issuer,
+            registration_endpoint=payload.registration_endpoint,
+            client_name=payload.client_name,
+            redirect_uris=payload.redirect_uris,
+            grant_types=payload.grant_types,
+        )
+    )
+
+
+@router.post(
+    "/mcp/servers/{server_id}/oauth/revoke",
+    response_model=MCPOAuthCredentialView,
+)
+def revoke_mcp_oauth(
+    server_id: str,
+    payload: ExtensionRevokeRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPOAuthCredentialView:
+    """Revoke the OAuth credential without disabling the MCP server."""
+    view = service(db, context, settings).revoke_server_oauth(
+        server_id,
+        reason=payload.reason,
+    )
+    if view is None:
+        raise AppError(
+            409,
+            "mcp_oauth_not_configured",
+            "This MCP server does not hold an OAuth credential",
+        )
+    return MCPOAuthCredentialView.model_validate(view)
+
+
+@router.get(
+    "/mcp/servers/{server_id}/oauth/credential",
+    response_model=MCPOAuthCredentialView | None,
+)
+def get_mcp_oauth_credential(
+    server_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MCPOAuthCredentialView | None:
+    """Return the redacted OAuth credential projection for one server."""
+    view = service(db, context, settings).server_oauth_credential(server_id)
+    if view is None:
+        return None
+    return MCPOAuthCredentialView.model_validate(view)
 
 
 @router.delete(

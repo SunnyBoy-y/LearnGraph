@@ -697,7 +697,7 @@ npm.cmd run check</code></pre>
             <div><code>streamable_http</code><p>真实执行 JSON-RPC 初始化、工具发现与调用；公网只允许 HTTPS，本机 HTTP 仅限 loopback。</p></div>
             <div><code>stdio</code><p>当前没有隔离命令运行器，明确返回 <code>available=false</code>；不会在宿主启动任意命令。</p></div>
             <div><code>Bearer</code><p>静态 Token 只保存为加密 Secret 引用，API 响应只返回掩码。</p></div>
-            <div><code>OAuth</code><p>授权码、动态客户端注册与刷新令牌流程尚未实现，不能宣称可用。</p></div>
+            <div><code>OAuth</code><p>授权码（PKCE）、动态客户端注册与刷新令牌流程已提供 API 端点；令牌只以加密引用保存，API 只返回掩码投影。</p></div>
           </div>
 
           <h3>重授权规则</h3>

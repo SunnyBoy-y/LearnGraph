@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -479,6 +479,47 @@ class MCPOAuthLifecycle:
             "redirect_uri": redirect_uri,
         }
 
+    def build_authorization_url(
+        self,
+        server: MCPServer,
+        *,
+        auth_endpoint: str,
+        redirect_uri: str,
+        scope: str,
+        client_id: str,
+    ) -> dict[str, str]:
+        """Start an authorization-code flow and build the PKCE authorization URL.
+
+        The one-time ``state`` and encrypted code verifier stay bound to the
+        server credential; only the URL and ``state`` are returned to callers.
+        """
+
+        material = self.begin_authorization_code(
+            server,
+            redirect_uri=redirect_uri,
+            scope=scope,
+        )
+        endpoint = _validate_token_endpoint(auth_endpoint)
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": material["state"],
+            "code_challenge": material["code_challenge"],
+            "code_challenge_method": "S256",
+            "nonce": material["nonce"],
+        }
+        separator = "&" if "?" in endpoint else "?"
+        return {
+            "server_id": server.id,
+            "authorization_url": f"{endpoint}{separator}{urlencode(params)}",
+            "state": material["state"],
+            "scope": scope,
+            "redirect_uri": redirect_uri,
+            "code_challenge_method": "S256",
+        }
+
     def exchange_authorization_code(
         self,
         server: MCPServer,
@@ -782,7 +823,11 @@ class MCPOAuthLifecycle:
         """
 
         allowlist = (
-            trusted_issuers if trusted_issuers is not None else MCP_OAUTH_TRUSTED_ISSUERS
+            trusted_issuers
+            if trusted_issuers is not None
+            else frozenset(
+                getattr(self.settings, "mcp_oauth_trusted_issuers", frozenset())
+            )
         )
         normalized_issuer = _normalize_issuer(issuer)
         if normalized_issuer not in allowlist:
@@ -996,6 +1041,13 @@ class MCPOAuthLifecycle:
             "scope": record.scope,
             "expires_at": record.expires_at.isoformat() if record.expires_at else None,
         }
+
+    def credential_view(self, server: MCPServer) -> dict[str, Any] | None:
+        """Return the redacted OAuth credential projection for one server."""
+        view = self.redact_for_api(self._credential(server))
+        if view is not None:
+            self.assert_no_secret_leak(view)
+        return view
 
     def redact_for_api(self, record: MCPServerCredential | None) -> dict[str, Any] | None:
         if record is None:

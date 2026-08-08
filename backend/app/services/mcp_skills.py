@@ -3635,6 +3635,103 @@ class MCPAndSkillService:
         lifecycle.assert_no_secret_leak(view)
         return view
 
+    def begin_server_oauth(
+        self,
+        server_id: str,
+        *,
+        auth_endpoint: str,
+        redirect_uri: str,
+        scope: str,
+        client_id: str,
+    ) -> dict[str, Any]:
+        """Start an OAuth authorization-code flow and build the PKCE auth URL."""
+
+        server = self.require_server(server_id)
+        lifecycle = self.oauth_lifecycle()
+        view = lifecycle.build_authorization_url(
+            server,
+            auth_endpoint=auth_endpoint,
+            redirect_uri=redirect_uri,
+            scope=scope,
+            client_id=client_id,
+        )
+        lifecycle.assert_no_secret_leak(view)
+        return view
+
+    def exchange_server_oauth(
+        self,
+        server_id: str,
+        *,
+        code: str,
+        state: str,
+        token_endpoint: str,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+    ) -> dict[str, Any]:
+        """Exchange an authorization code for a persisted, redacted OAuth token."""
+
+        server = self.require_server(server_id)
+        lifecycle = self.oauth_lifecycle()
+        credential = lifecycle.exchange_authorization_code(
+            server,
+            authorization_code=code,
+            returned_state=state,
+            token_endpoint=token_endpoint,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        view = lifecycle.redact_for_api(credential)
+        lifecycle.assert_no_secret_leak(view)
+        return view
+
+    def register_server_oauth_client(
+        self,
+        server_id: str,
+        *,
+        issuer: str,
+        registration_endpoint: str,
+        client_name: str,
+        redirect_uris: list[str],
+        grant_types: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Dynamically register an OAuth client for an explicitly trusted issuer."""
+
+        server = self.require_server(server_id)
+        lifecycle = self.oauth_lifecycle()
+        view = lifecycle.register_oauth_client(
+            server,
+            issuer=issuer,
+            registration_endpoint=registration_endpoint,
+            client_name=client_name,
+            redirect_uris=redirect_uris,
+            grant_types=grant_types,
+            trusted_issuers=frozenset(self.settings.mcp_oauth_trusted_issuers),
+        )
+        lifecycle.assert_no_secret_leak(view)
+        return view
+
+    def revoke_server_oauth(
+        self,
+        server_id: str,
+        *,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Revoke an OAuth credential and return its redacted projection."""
+
+        server = self.require_server(server_id)
+        lifecycle = self.oauth_lifecycle()
+        credential = lifecycle.revoke(server, reason=reason)
+        view = lifecycle.redact_for_api(credential)
+        if view is not None:
+            lifecycle.assert_no_secret_leak(view)
+        return view
+
+    def server_oauth_credential(self, server_id: str) -> dict[str, Any] | None:
+        """Return the redacted OAuth credential projection for one server."""
+
+        server = self.require_server(server_id)
+        return self.oauth_lifecycle().credential_view(server)
+
     def _current_snapshot(self, server: MCPServer) -> MCPCapabilitySnapshot | None:
         if not server.current_snapshot_id:
             return None

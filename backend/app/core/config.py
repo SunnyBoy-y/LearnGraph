@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEPLOYMENT_PROFILES = frozenset({"personal_desktop", "self_hosted_team", "cloud_saas"})
@@ -228,6 +228,10 @@ class Settings(BaseSettings):
     # Official MCP Registry (frozen v0.1 API; anonymous reads).
     mcp_registry_enabled: bool = True
     mcp_registry_url: str = "https://registry.modelcontextprotocol.io"
+    # Explicit allowlist for OAuth dynamic client registration. Empty by
+    # default: registration endpoints exist but stay closed until a deployment
+    # opts in with the exact issuer URLs it trusts.
+    mcp_oauth_trusted_issuers: Annotated[set[str], NoDecode] = Field(default_factory=set)
     external_catalog_timeout_seconds: float = 12.0
     # Progressive disclosure for Agent Skill prompt injection: bodies within
     # these budgets are injected inline; the rest become one-line catalog
@@ -276,6 +280,19 @@ class Settings(BaseSettings):
                     raise ValueError("CORS origins JSON must be an array of strings")
                 return decoded
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("mcp_oauth_trusted_issuers", mode="before")
+    @classmethod
+    def parse_trusted_issuers(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                decoded = json.loads(stripped)
+                if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+                    raise ValueError("MCP OAuth trusted issuers JSON must be an array of strings")
+                return set(decoded)
+            return {item.strip() for item in value.split(",") if item.strip()}
         return value
 
     @property
