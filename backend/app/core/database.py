@@ -735,6 +735,12 @@ def _apply_sqlite_additive_migrations() -> None:
             "assistant_message_id": "VARCHAR(36)",
             "user_message_id": "VARCHAR(36)",
         },
+        # Agent-published bidirectional sub-application: optional interaction
+        # contract snapshot and the linked lightweight ComponentManifestVersion.
+        "subapp_bundles": {
+            "interaction_contract": "JSON",
+            "component_manifest_id": "VARCHAR(36)",
+        },
     }
     with engine.begin() as connection:
         for table_name, columns in additions.items():
