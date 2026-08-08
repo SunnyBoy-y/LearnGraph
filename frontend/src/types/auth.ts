@@ -52,4 +52,5 @@ export interface AuthSession {
   username?: string
   displayName?: string
   sessionId?: string
+  mustChangePassword?: boolean
 }

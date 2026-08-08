@@ -3,7 +3,6 @@ import {
   ArrowRight,
   KeyRound,
   LockKeyhole,
-  ShieldCheck,
   UserRound,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -23,15 +22,12 @@ function errorMessage(reason: unknown): string {
 
 export function LoginPage() {
   const navigate = useNavigate();
-  const { changePassword, login, register } = useAuth();
+  const { login, register } = useAuth();
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
   const [passwordConfirmation, setPasswordConfirmation] = useState("");
-  const [workspaceId, setWorkspaceId] = useState("");
-  const [passwordChangeRequired, setPasswordChangeRequired] = useState(false);
   const [registerMode, setRegisterMode] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -43,29 +39,14 @@ export function LoginPage() {
     try {
       const result = await login(username, password);
       if (result.mustChangePassword) {
-        setWorkspaceId(result.workspaceId);
-        setPasswordChangeRequired(true);
+        // The dedicated page survives refresh and asks for the current
+        // password again if this in-memory value is lost.
+        navigate("/auth/change-password", {
+          state: { currentPassword: password },
+        });
         return;
       }
       navigate(`/w/${result.workspaceId}`);
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function submitPasswordChange(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError("");
-    if (newPassword !== passwordConfirmation) {
-      setError("两次输入的新密码不一致。");
-      return;
-    }
-    setBusy(true);
-    try {
-      await changePassword(password, newPassword);
-      navigate(`/w/${workspaceId}`);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -107,58 +88,7 @@ export function LoginPage() {
           <span className="brand__mark">L</span>
           <strong>LearnGraph</strong>
         </div>
-        {passwordChangeRequired ? (
-          <form onSubmit={submitPasswordChange}>
-            <div className="eyebrow">
-              <ShieldCheck /> 首次登录保护
-            </div>
-            <h1 id="auth-title">设置新密码</h1>
-            <p className="form-intro">
-              引导密码只能使用一次。修改后，其他已登录会话会由服务端立即撤销。
-            </p>
-            <div className="field-stack">
-              <Label htmlFor="new-password">新密码</Label>
-              <div className="field-with-icon">
-                <KeyRound />
-                <Input
-                  autoComplete="new-password"
-                  id="new-password"
-                  minLength={12}
-                  onChange={(event) => setNewPassword(event.target.value)}
-                  required
-                  type="password"
-                  value={newPassword}
-                />
-              </div>
-            </div>
-            <div className="field-stack">
-              <Label htmlFor="password-confirmation">再次输入新密码</Label>
-              <div className="field-with-icon">
-                <KeyRound />
-                <Input
-                  autoComplete="new-password"
-                  id="password-confirmation"
-                  minLength={12}
-                  onChange={(event) =>
-                    setPasswordConfirmation(event.target.value)
-                  }
-                  required
-                  type="password"
-                  value={passwordConfirmation}
-                />
-              </div>
-            </div>
-            {error && (
-              <div className="form-error" role="alert">
-                {error}
-              </div>
-            )}
-            <Button className="auth-submit" disabled={busy} type="submit">
-              {busy ? "正在更新…" : "保存并进入工作区"}
-              <ArrowRight />
-            </Button>
-          </form>
-        ) : registerMode ? (
+        {registerMode ? (
           <form onSubmit={submitRegister}>
             <div className="eyebrow">
               <UserRound /> 创建你的学习空间

@@ -5,6 +5,7 @@ export type AuthContextValue = {
   username: string
   workspaceId: string
   workspaceName: string
+  mustChangePassword: boolean | null
   setWorkspaceId: (workspaceId: string) => Promise<void>
   login: (username: string, password: string) => Promise<{
     workspaceId: string

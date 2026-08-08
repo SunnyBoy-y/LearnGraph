@@ -8,6 +8,7 @@ const USERNAME_KEY = 'learngraph.username'
 const DISPLAY_NAME_KEY = 'learngraph.display_name'
 const SESSION_ID_KEY = 'learngraph.session_id'
 const DEVICE_ID_KEY = 'learngraph.device_id'
+const MUST_CHANGE_PASSWORD_KEY = 'learngraph.must_change_password'
 
 type AuthState = {
   accessToken: string | null
@@ -16,6 +17,7 @@ type AuthState = {
   username: string | null
   displayName: string | null
   sessionId: string | null
+  mustChangePassword: boolean | null
 }
 
 const memoryState: AuthState = {
@@ -25,6 +27,7 @@ const memoryState: AuthState = {
   username: null,
   displayName: null,
   sessionId: null,
+  mustChangePassword: null,
 }
 let memoryDeviceId: string | null = null
 
@@ -72,6 +75,16 @@ function write(key: string, value: string | null): void {
   }
 }
 
+function readBoolean(key: string, fallback: boolean | null): boolean | null {
+  const value = read(key, null)
+  if (value === null) return fallback
+  return value === 'true'
+}
+
+function writeBoolean(key: string, value: boolean | null): void {
+  write(key, value === null ? null : String(value))
+}
+
 export const authStore = {
   getDeviceId(): string {
     const storage = persistentStorage()
@@ -109,6 +122,10 @@ export const authStore = {
     const username = read(USERNAME_KEY, memoryState.username)
     const displayName = read(DISPLAY_NAME_KEY, memoryState.displayName)
     const sessionId = read(SESSION_ID_KEY, memoryState.sessionId)
+    const mustChangePassword = readBoolean(
+      MUST_CHANGE_PASSWORD_KEY,
+      memoryState.mustChangePassword,
+    )
     return {
       accessToken,
       workspaceId,
@@ -116,6 +133,7 @@ export const authStore = {
       ...(username ? { username } : {}),
       ...(displayName ? { displayName } : {}),
       ...(sessionId ? { sessionId } : {}),
+      ...(mustChangePassword === null ? {} : { mustChangePassword }),
     }
   },
 
@@ -136,12 +154,19 @@ export const authStore = {
     memoryState.username = session.username ?? null
     memoryState.displayName = session.displayName ?? null
     memoryState.sessionId = session.sessionId ?? null
+    memoryState.mustChangePassword = session.mustChangePassword ?? null
     write(TOKEN_KEY, memoryState.accessToken)
     write(WORKSPACE_KEY, memoryState.workspaceId)
     write(USER_ID_KEY, memoryState.userId)
     write(USERNAME_KEY, memoryState.username)
     write(DISPLAY_NAME_KEY, memoryState.displayName)
     write(SESSION_ID_KEY, memoryState.sessionId)
+    writeBoolean(MUST_CHANGE_PASSWORD_KEY, memoryState.mustChangePassword)
+  },
+
+  setMustChangePassword(value: boolean | null): void {
+    memoryState.mustChangePassword = value
+    writeBoolean(MUST_CHANGE_PASSWORD_KEY, value)
   },
 
   setLoginResponse(response: LoginResponse): void {
@@ -155,6 +180,7 @@ export const authStore = {
       username: response.username,
       displayName: response.display_name,
       sessionId: response.session_id,
+      mustChangePassword: response.must_change_password,
     })
   },
 
@@ -165,11 +191,13 @@ export const authStore = {
     memoryState.username = null
     memoryState.displayName = null
     memoryState.sessionId = null
+    memoryState.mustChangePassword = null
     write(TOKEN_KEY, null)
     write(WORKSPACE_KEY, null)
     write(USER_ID_KEY, null)
     write(USERNAME_KEY, null)
     write(DISPLAY_NAME_KEY, null)
     write(SESSION_ID_KEY, null)
+    writeBoolean(MUST_CHANGE_PASSWORD_KEY, null)
   },
 }

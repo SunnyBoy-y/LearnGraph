@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { LoaderCircle } from "lucide-react";
 import { Navigate, useLocation } from "react-router-dom";
 
 import {
@@ -70,11 +71,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (checking) return;
       checking = true;
       void getCurrentUser()
+        .then((user) => {
+          const mustChangePassword = user.must_change_password;
+          authStore.setMustChangePassword(mustChangePassword);
+          setSession((current) =>
+            current ? { ...current, mustChangePassword } : current,
+          );
+        })
         .catch(() => undefined)
         .finally(() => {
           checking = false;
         });
     };
+    // Hydrate the password-change requirement immediately after refresh so the
+    // route guard never lets a pending-change session enter the workspace.
+    checkSession();
     const interval = window.setInterval(checkSession, 30_000);
     window.addEventListener('focus', checkSession);
     document.addEventListener('visibilitychange', checkSession);
@@ -92,6 +103,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       username: session?.displayName ?? session?.username ?? "",
       workspaceId: session?.workspaceId ?? "",
       workspaceName: workspaceName || session?.workspaceId || "",
+      mustChangePassword: session?.mustChangePassword ?? null,
       async setWorkspaceId(workspaceId) {
         if (!session || workspaceId === session.workspaceId) return;
         const requestId = workspaceSelectionRequestRef.current + 1;
@@ -137,6 +149,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
       async changePassword(currentPassword, newPassword) {
         await changeAccountPassword(currentPassword, newPassword);
+        // The current session stays valid and no longer requires a change.
+        authStore.setMustChangePassword(false);
+        setSession((current) =>
+          current ? { ...current, mustChangePassword: false } : current,
+        );
       },
       async deleteAccount(currentPassword, confirmation) {
         await deleteCurrentAccount(currentPassword, confirmation);
@@ -171,6 +188,21 @@ export function RequireAuth({ children }: { children: ReactNode }) {
     return (
       <Navigate replace state={{ from: location.pathname }} to="/auth/login" />
     );
+  }
+  if (auth.mustChangePassword === null) {
+    // Hydrating the server-side password requirement after a refresh; do not
+    // let a pending-change session briefly render workspace error states.
+    return (
+      <main aria-live="polite" className="grid min-h-svh place-items-center bg-background">
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <LoaderCircle className="size-4 animate-spin" />
+          正在检查登录状态…
+        </div>
+      </main>
+    );
+  }
+  if (auth.mustChangePassword) {
+    return <Navigate replace to="/auth/change-password" />;
   }
   return children;
 }

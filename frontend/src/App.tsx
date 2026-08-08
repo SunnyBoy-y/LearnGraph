@@ -12,6 +12,7 @@ import { useAuth } from '@/features/auth/auth-context-value'
 import { registerAuthQueryClient } from '@/lib/auth-query-cache'
 
 const LoginPage = lazy(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
+const ChangePasswordPage = lazy(() => import('@/features/auth/change-password-page').then((module) => ({ default: module.ChangePasswordPage })))
 const DashboardPage = lazy(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.DashboardPage })))
 const GoalConfirmPage = lazy(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GoalConfirmPage })))
 const GraphReviewPage = lazy(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GraphReviewPage })))
@@ -58,6 +59,9 @@ registerAuthQueryClient(queryClient)
 
 function RootRedirect() {
   const auth = useAuth()
+  if (auth.mustChangePassword) {
+    return <Navigate replace to="/auth/change-password" />
+  }
   return <Navigate replace to={auth.authenticated ? `/w/${auth.workspaceId}/home` : '/auth/login'} />
 }
 
@@ -100,6 +104,7 @@ function AppRoutes() {
     <Suspense fallback={<RouteLoading />}><Routes>
       <Route element={<RootRedirect />} path="/" />
       <Route element={<LoginPage />} path="/auth/login" />
+      <Route element={<ChangePasswordPage />} path="/auth/change-password" />
       <Route element={<Navigate replace to="/auth/login" />} path="/login" />
       <Route
         element={<RequireAuth><WorkspaceRouteGuard><WorkspaceShell /></WorkspaceRouteGuard></RequireAuth>}
