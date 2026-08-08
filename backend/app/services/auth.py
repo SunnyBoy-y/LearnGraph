@@ -240,6 +240,15 @@ class AuthService:
             user_agent=user_agent,
             details={"workspace_id": workspace.id},
         )
+        # New personal workspaces receive the official first-party Skill set at
+        # creation time, so read-only listing endpoints never need to write.
+        from app.services.skill_package import ensure_official_skill_packages
+
+        ensure_official_skill_packages(
+            self.db,
+            workspace.id,
+            settings=self.settings,
+        )
         self.db.commit()
         return self.login(
             LoginRequest(username=username, password=payload.password),

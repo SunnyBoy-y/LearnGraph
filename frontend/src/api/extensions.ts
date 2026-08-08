@@ -98,6 +98,10 @@ export function listSkills(): Promise<Skill[]> {
   return apiClient.get<Skill[]>("/skills");
 }
 
+export function refreshOfficialSkills(): Promise<Skill[]> {
+  return apiClient.post<Skill[]>("/skills/official-refresh");
+}
+
 export function installSkill(payload: SkillCreate): Promise<Skill> {
   return apiClient.post<Skill, SkillCreate>("/skills", payload);
 }

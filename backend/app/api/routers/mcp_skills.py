@@ -486,14 +486,32 @@ def list_skills(
 ) -> list[SkillView]:
     """列出工作区 Skill。输出 Skill 元数据、版本和当前授权状态。
 
-    官方（第一方）工作流 Skill 会在此惰性安装/刷新，保证非 demo 部署的
-    新工作区也能看到完整的官方能力。
+    GET 保持只读；官方（第一方）Skill 的安装/刷新由注册初始化、
+    Agent 回合或 POST /skills/official-refresh 显式触发。
     """
+    return [
+        SkillView.model_validate(item)
+        for item in service(db, context, settings).list_skills()
+    ]
+
+
+@router.post("/skills/official-refresh", response_model=list[SkillView])
+def refresh_official_skills(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> list[SkillView]:
+    """显式安装/刷新官方 Skill 包（幂等）。
+
+    官方包初始化属于写操作，必须通过 POST 触发，避免读取接口产生提交。
+    """
+    context.require_permission("workspace.write")
     try:
         ensure_official_skill_packages(db, context.workspace_id, settings=settings)
         db.commit()
     except Exception:
         db.rollback()
+        raise
     return [
         SkillView.model_validate(item)
         for item in service(db, context, settings).list_skills()

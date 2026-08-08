@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   FileSearch,
@@ -33,6 +33,7 @@ import {
   listProviders,
   listSkills,
   refreshMcpServer,
+  refreshOfficialSkills,
   registerMcpServer,
   requestSkillDeletion,
   revokeMcpServer,
@@ -1110,6 +1111,25 @@ export function ToolsPage({
     enabled: showMcp,
   });
   const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
+  const refreshOfficialSkillsMutation = useMutation({
+    mutationFn: refreshOfficialSkills,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["skills"] });
+    },
+  });
+  const officialSkillsBootRef = useRef(false);
+  useEffect(() => {
+    if (
+      officialSkillsBootRef.current ||
+      !skills.isSuccess ||
+      !skills.data ||
+      skills.data.length > 0
+    ) {
+      return;
+    }
+    officialSkillsBootRef.current = true;
+    refreshOfficialSkillsMutation.mutate();
+  }, [skills.isSuccess, skills.data, refreshOfficialSkillsMutation]);
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
     void queryClient.invalidateQueries({ queryKey: ["skills"] });
