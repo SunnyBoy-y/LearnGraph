@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.router import api_router
 from app.core.config import get_settings
@@ -115,6 +117,30 @@ async def lifespan(_: FastAPI):
             await outbox_task
 
 
+class SecurityHeadersMiddleware:
+    """Add clickjacking headers without buffering SSE or streaming responses."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_security_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("X-Frame-Options", "DENY")
+                headers.setdefault(
+                    "Content-Security-Policy",
+                    "frame-ancestors 'none'",
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
+
+
 settings = get_settings()
 app = FastAPI(
     title="LearnGraph API",
@@ -166,5 +192,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SecurityHeadersMiddleware)
 install_error_handlers(app)
 app.include_router(api_router)
