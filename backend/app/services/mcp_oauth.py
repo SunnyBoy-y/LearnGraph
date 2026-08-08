@@ -14,8 +14,9 @@ from uuid import uuid4
 import httpx
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.core.errors import AppError
-from app.core.security import SecretCipher
+from app.core.secret_store import SecretStoreUnavailable, secret_store_from_settings
 from app.domain.extension_models import (
     MCPOAuthClientRegistration,
     MCPServer,
@@ -24,6 +25,7 @@ from app.domain.extension_models import (
 from app.repositories.audit import AuditRepository
 from app.repositories.extensions import MCPServerCredentialRepository, MCPServerRepository
 from app.repositories.scoped import ScopedRepository
+from app.services.mcp_secret_store import decrypt_mcp_secret, encrypt_mcp_secret
 
 
 def _utc_now() -> datetime:
@@ -310,13 +312,12 @@ class MCPOAuthLifecycle:
         workspace_id: str,
         actor_id: str,
         *,
-        master_key: str | None = None,
+        settings: Settings,
     ) -> None:
         self.db = db
         self.workspace_id = workspace_id
         self.actor_id = actor_id
-        self.master_key = master_key
-        self._cipher = SecretCipher(master_key) if master_key else None
+        self.settings = settings
         # The lifecycle owns a single SQLAlchemy Session that is shared by every
         # caller. ``_RefreshCoordinator`` single-flights the token-endpoint call
         # across threads, so this lock serializes all DB access on that shared
@@ -332,29 +333,23 @@ class MCPOAuthLifecycle:
 
     # -- encrypted-secret helpers -------------------------------------------------
 
-    def _require_cipher(self) -> SecretCipher:
-        if self._cipher is None:
+    def _require_store(self) -> None:
+        try:
+            secret_store_from_settings(self.settings).active_key(create=True)
+        except SecretStoreUnavailable as exc:
             raise AppError(
                 503,
                 "secret_store_unavailable",
                 "OAuth token encryption requires the configured encrypted secret store",
-            )
-        return self._cipher
+            ) from exc
 
     def _encrypt(self, value: str) -> str:
-        return self._require_cipher().encrypt(value)
+        return encrypt_mcp_secret(self.settings, value)
 
     def _decrypt(self, ciphertext: str | None, *, label: str) -> str:
         if not ciphertext:
             raise AppError(409, "mcp_oauth_material_missing", f"{label} is not available")
-        try:
-            return self._require_cipher().decrypt(ciphertext)
-        except ValueError as exc:
-            raise AppError(
-                500,
-                "mcp_oauth_decrypt_failed",
-                f"{label} cannot be decrypted with this master key",
-            ) from exc
+        return decrypt_mcp_secret(self.settings, ciphertext, label=label)
 
     def _credential(self, server: MCPServer) -> MCPServerCredential | None:
         if not server.auth_reference:
@@ -377,9 +372,9 @@ class MCPOAuthLifecycle:
         )
         fingerprint = _fingerprint(token)
         masked = _mask_secret(token)
-        # Ciphertext is still opaque to ordinary responses; the existing secret
-        # cipher/key lifecycle can wrap this value without exposing plaintext.
-        ciphertext = base64.b64encode(token.encode("utf-8")).decode("ascii")
+        # Ciphertext is opaque to ordinary responses and shares the same
+        # versioned secret-store lifecycle as Provider secrets.
+        ciphertext = encrypt_mcp_secret(self.settings, token)
         if existing is None:
             record = self.credentials.add(
                 MCPServerCredential(
@@ -431,7 +426,7 @@ class MCPOAuthLifecycle:
 
         # OAuth token persistence requires the encrypted secret store; require
         # it up-front so the whole flow fails closed rather than at exchange.
-        self._require_cipher()
+        self._require_store()
         code_verifier = base64.urlsafe_b64encode(uuid4().bytes + uuid4().bytes).decode("ascii").rstrip("=")
         code_challenge = (
             base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())

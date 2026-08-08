@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.errors import AppError
-from app.core.security import Principal, SecretCipher, mask_secret, verify_password
+from app.core.security import Principal, mask_secret, verify_password
 from app.domain.extension_models import (
     ExtensionInvocation,
     ExtensionPermissionGrant,
@@ -79,6 +79,7 @@ from app.services.billing import BillingService
 from app.services.learning import EvidenceService
 from app.services.management import UsageService
 from app.services.mcp_oauth import MCPOAuthLifecycle
+from app.services.mcp_secret_store import decrypt_mcp_secret, encrypt_mcp_secret
 from app.services.skill_package import (
     CONTEXTUAL_OFFICIAL_SKILL_KEYS,
     MAX_SKILL_FILE_BYTES,
@@ -2036,12 +2037,6 @@ class MCPAndSkillService:
             raise AppError(409, "mcp_server_key_exists", "MCP server key already exists")
         self._validate_endpoint_shape(payload.transport, payload.endpoint_url)
         secret = payload.bearer_token.get_secret_value() if payload.bearer_token else None
-        if secret and not self.settings.has_master_key:
-            raise AppError(
-                503,
-                "secret_store_unavailable",
-                "MCP bearer credentials require the configured encrypted secret store",
-            )
         secret_fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16] if secret else None
         manifest = payload.manifest.model_dump(mode="json")
         required_permissions = self._mcp_permissions(payload.manifest.requested_tools, payload.manifest.permissions)
@@ -2090,7 +2085,7 @@ class MCPAndSkillService:
                 MCPServerCredential(
                     workspace_id=self.workspace_id,
                     server_id=server.id,
-                    ciphertext=SecretCipher(self.settings.master_key).encrypt(secret),
+                    ciphertext=encrypt_mcp_secret(self.settings, secret),
                     secret_masked=masked,
                     secret_fingerprint=fingerprint,
                 )
@@ -2132,26 +2127,20 @@ class MCPAndSkillService:
             secret_fingerprint = None
         if payload.bearer_token is not None:
             secret = payload.bearer_token.get_secret_value()
-            if not self.settings.has_master_key:
-                raise AppError(
-                    503,
-                    "secret_store_unavailable",
-                    "MCP bearer credentials require the configured encrypted secret store",
-                )
             masked, fingerprint = mask_secret(secret)
             if credential is None:
                 credential = self.credentials.add(
                     MCPServerCredential(
                         workspace_id=self.workspace_id,
                         server_id=server.id,
-                        ciphertext=SecretCipher(self.settings.master_key).encrypt(secret),
+                        ciphertext=encrypt_mcp_secret(self.settings, secret),
                         secret_masked=masked,
                         secret_fingerprint=fingerprint,
                     )
                 )
                 server.auth_reference = credential.id
             else:
-                credential.ciphertext = SecretCipher(self.settings.master_key).encrypt(secret)
+                credential.ciphertext = encrypt_mcp_secret(self.settings, secret)
                 credential.secret_masked = masked
                 credential.secret_fingerprint = fingerprint
             secret_fingerprint = fingerprint
@@ -3598,14 +3587,12 @@ class MCPAndSkillService:
         credential = self._credential(server)
         if credential is None:
             return None
-        if not self.settings.has_master_key:
-            raise MCPTransportUnavailable(
-                "MCP encrypted auth reference cannot be opened because the master key is unavailable"
-            )
         try:
-            return SecretCipher(self.settings.master_key).decrypt(credential.ciphertext)
-        except ValueError as exc:
-            raise MCPTransportUnavailable("MCP encrypted auth reference cannot be decrypted") from exc
+            return decrypt_mcp_secret(
+                self.settings, credential.ciphertext, label="MCP bearer credential"
+            )
+        except AppError as exc:
+            raise MCPTransportUnavailable(exc.message) from exc
 
     def oauth_lifecycle(self) -> MCPOAuthLifecycle:
         """Construct a workspace-scoped OAuth lifecycle bound to this service.
@@ -3620,7 +3607,7 @@ class MCPAndSkillService:
             self.db,
             self.workspace_id,
             self.actor_id,
-            master_key=self.settings.master_key,
+            settings=self.settings,
         )
 
     def refresh_server_oauth_token(
