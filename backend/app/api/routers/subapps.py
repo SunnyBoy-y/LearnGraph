@@ -46,7 +46,12 @@ def ingest_subapp_event(
     db: DB,
     context: CurrentWorkspace,
 ) -> SubAppEventIngestedView:
-    """Accept a P1 host-relayed event; T2 iframe token enforcement is pending."""
+    """Accept a legacy workspace-scoped host-relayed event.
+
+    Events bound to a sub-application session are rejected here; they must be
+    sent to ``POST /subapps/sessions/{id}/events`` with the rotating session
+    capability token.
+    """
     return SubAppEventIngestedView(event=service(db, context).ingest(payload))
 
 

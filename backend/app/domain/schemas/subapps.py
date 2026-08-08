@@ -13,7 +13,11 @@ EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
 
 
 class SubAppEventIngestRequest(BaseModel):
-    """P1 host-ingested event; T2 capability-token checks are not available yet."""
+    """Legacy host-relayed event without session binding.
+
+    Session-scoped events must use ``SubAppSessionEventRequest`` and the
+    rotating session capability token.
+    """
 
     model_config = ConfigDict(extra="forbid")
 

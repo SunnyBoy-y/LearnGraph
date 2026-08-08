@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import json
@@ -35,6 +35,7 @@ from app.domain.schemas.subapps import (
 from app.repositories.audit import AuditRepository
 from app.services.component_renderer_protocol import (
     MAX_SUBAPP_EVENTS_PER_SESSION,
+    MAX_SUBAPP_STATE_RATE_PER_MINUTE,
     MAX_SUBAPP_STATES_PER_SESSION,
     RENDERER_UNLOCK_EVENT,
     build_renderer_message,
@@ -156,10 +157,12 @@ def _state_view(state: SubAppState) -> SubAppStateView:
 class SubAppService:
     """Persist workspace-scoped sub-application events and sessions.
 
-    P1 stores host-relayed events without a capability token. T2.4 adds
-    instantiated sessions guarded by a rotating session-level capability token
-    and immutable, CAS-versioned state snapshots. The agent may only write
-    state through :meth:`propose_state`; iframes never receive credentials.
+    P1 stores legacy workspace-scoped host-relayed events only when they are
+    not bound to a session. T2.4 provides instantiated sessions guarded by a
+    rotating session-level capability token and immutable, CAS-versioned state
+    snapshots; session-scoped events must redeem the current token. The agent
+    may only write state through :meth:`propose_state`; iframes never receive
+    host credentials.
     """
 
     def __init__(self, db: Session, workspace_id: str, actor_id: str) -> None:
@@ -169,6 +172,14 @@ class SubAppService:
         self.audit = AuditRepository(db, workspace_id)
 
     def ingest(self, payload: SubAppEventIngestRequest) -> SubAppInteractionEventView:
+        if payload.session_id is not None:
+            raise AppError(
+                400,
+                "subapp_session_requires_token",
+                "Session-scoped subapp events must use "
+                "POST /subapps/sessions/{session_id}/events with the rotating "
+                "session capability token",
+            )
         payload_json, payload_sha256 = _payload_json_and_hash(payload.payload)
         event = SubAppInteractionEvent(
             workspace_id=self.workspace_id,
@@ -567,6 +578,25 @@ class SubAppService:
                 "subapp_state_version_conflict",
                 "Sub-application state version moved; retry with the current version",
                 {"current": session.state_version, "expected": expected_version},
+            )
+        recent_state_count = self.db.scalar(
+            select(func.count())
+            .select_from(SubAppState)
+            .where(
+                SubAppState.session_id == session.id,
+                SubAppState.workspace_id == self.workspace_id,
+                SubAppState.created_at >= utc_now() - timedelta(minutes=1),
+            )
+        ) or 0
+        if recent_state_count >= MAX_SUBAPP_STATE_RATE_PER_MINUTE:
+            raise AppError(
+                429,
+                "subapp_state_rate_exceeded",
+                "Sub-application state write rate exceeded",
+                {
+                    "max_per_minute": MAX_SUBAPP_STATE_RATE_PER_MINUTE,
+                    "current_per_minute": recent_state_count,
+                },
             )
         new_version = expected_version + 1
         sha256 = _state_sha256(state)
