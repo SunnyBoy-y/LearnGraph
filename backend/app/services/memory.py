@@ -2347,15 +2347,12 @@ class MemoryService:
         query_text: str | None = None,
         prompt_token_budget: int | None = None,
     ) -> str:
-        from app.services.memory_profile import current_profile_prompt
-
+        # The Profile is a human-readable current-cognition projection, not a
+        # per-turn default injection block (记忆文档2-升级 §二). The recallable
+        # package below ranks hot/recent/topics atoms by scope and relevance
+        # instead of always pasting the whole user summary.
         if not self.policy(session_id).effective_recall_enabled:
             return ""
-        profile_prompt = current_profile_prompt(
-            self.db,
-            self.workspace_id,
-            self.actor_id,
-        )
         package = self.effective_memory_package(
             session_id=session_id,
             goal_id=goal_id,
@@ -2365,19 +2362,7 @@ class MemoryService:
             query_text=query_text,
             prompt_token_budget=prompt_token_budget,
         )
-        if not profile_prompt:
-            return package.prompt_block
-        if not package.prompt_block:
-            return profile_prompt
-        combined = f"{profile_prompt}\n\n{package.prompt_block}"
-        if prompt_token_budget is None or estimate_tokens(combined) <= prompt_token_budget:
-            return combined
-        # The profile is the dense default. When the combined package exceeds
-        # the caller's budget, keep it and let relevant atoms fill remaining
-        # space only if there is room.
-        if estimate_tokens(profile_prompt) >= prompt_token_budget:
-            return profile_prompt[: max(800, prompt_token_budget * 3)]
-        return profile_prompt
+        return package.prompt_block
 
     def list_memory_types(self) -> list[MemoryTypeDefinitionView]:
         return [
@@ -2447,15 +2432,12 @@ class MemoryService:
             source_session = self.sessions.require(payload.session_id, "session")
             if payload.created_by in {"learning_agent", "memory_extraction"}:
                 workspace_policy = self._workspace_policy_values()
+                # Only the workspace memory master switch and the session memory
+                # switch gate contribution; learning sub-switches were removed
+                # so extraction is fully automatic when memory is on.
                 if (
                     not workspace_policy["workspace_enabled"]
-                    or not workspace_policy["workspace_learning_enabled"]
                     or not bool(source_session.memory_enabled)
-                    or not bool(
-                        getattr(
-                            source_session, "memory_learning_enabled", True
-                        )
-                    )
                 ):
                     raise AppError(
                         409,
