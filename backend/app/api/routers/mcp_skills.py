@@ -95,9 +95,12 @@ def server_view(item, manager: MCPAndSkillService) -> MCPServerView:
 
 
 @router.get("/skills/builtin-tools", response_model=list[BuiltinToolView])
-def list_builtin_tools() -> list[BuiltinToolView]:
+def list_builtin_tools(
+    context: CurrentWorkspace,
+) -> list[BuiltinToolView]:
     """List the reviewed LearnGraph domain tools available to declarative Skills."""
 
+    del context
     return [
         BuiltinToolView.model_validate(item)
         for item in MCPAndSkillService.builtin_tool_catalog()
@@ -353,6 +356,7 @@ def install_skill(
     settings: AppSettings,
 ) -> SkillView:
     """安装 Skill。输入 Skill 清单所需字段，输出已持久化的 Skill 元数据；不会执行未知代码。"""
+    context.require_permission("workspace.write")
     return SkillView.model_validate(service(db, context, settings).create_skill(payload))
 
 
@@ -381,6 +385,7 @@ def create_skill_package(
     settings: AppSettings,
 ) -> SkillView:
     """Create an agent_skill_package with a SKILL.md template (and optional sample script)."""
+    context.require_permission("workspace.write")
     manager = package_service(db, context, settings)
     return manager.skill_view(manager.create_package(payload))
 
@@ -551,6 +556,7 @@ def preview_skill_github(
     settings: AppSettings,
 ) -> SkillGitHubPreviewResponse:
     """解析 GitHub 引用并列出可安装的 Skill 目录（含安装前权限预览）。"""
+    context.require_permission("workspace.write")
     return github_service(db, context, settings).preview(payload)
 
 
@@ -579,6 +585,7 @@ def check_skill_update(
     settings: AppSettings,
 ) -> SkillUpdateCheckResponse:
     """对 GitHub 固定导入的 Skill 比较上游 commit，报告是否有更新。"""
+    context.require_permission("workspace.write")
     return github_service(db, context, settings).check_update(skill_id)
 
 
@@ -679,6 +686,7 @@ def write_skill_file(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> SkillFileWriteResponse:
+    context.require_permission("workspace.write")
     manager = package_service(db, context, settings)
     skill, file_view, reauth = manager.write_file(skill_id, file_path, payload)
     return SkillFileWriteResponse(
@@ -696,6 +704,7 @@ def delete_skill_file(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> SkillView:
+    context.require_permission("workspace.write")
     manager = package_service(db, context, settings)
     return manager.skill_view(manager.delete_file(skill_id, file_path))
 
@@ -708,6 +717,7 @@ def mkdir_skill_path(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> SkillFileTreeView:
+    context.require_permission("workspace.write")
     return package_service(db, context, settings).mkdir(skill_id, payload)
 
 
@@ -718,6 +728,7 @@ def validate_skill_package(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> SkillValidateResponse:
+    context.require_permission("workspace.write")
     return package_service(db, context, settings).validate(skill_id)
 
 
@@ -751,6 +762,7 @@ def scan_skill_security(
     settings: AppSettings,
 ) -> SkillSecurityScanResponse:
     """静态安全扫描（审核第二层）：危险命令、注入诱饵、隐藏字符。结果为建议性。"""
+    context.require_permission("workspace.write")
     return SkillSecurityScanResponse.model_validate(
         package_service(db, context, settings).security_scan(skill_id)
     )
@@ -768,6 +780,7 @@ def review_skill_semantics(
     settings: AppSettings,
 ) -> SkillSemanticReviewResponse:
     """模型语义审核（审核第三层）：描述与行为一致性、检索诱饵、越权与隐瞒指令。"""
+    context.require_permission("workspace.write")
     manager = SkillSemanticReviewService(
         db, context.workspace_id, context.principal.user_id, settings
     )
@@ -783,6 +796,7 @@ def translate_skill_view(
     settings: AppSettings,
 ) -> SkillTranslateResponse:
     """Translate skill documentation for viewing only; runtime stays on source text (D-081)."""
+    context.require_permission("workspace.write")
     manager = SkillTranslationService(
         db, context.workspace_id, context.principal.user_id, settings
     )
@@ -807,6 +821,7 @@ def update_skill(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> SkillView:
+    context.require_permission("workspace.write")
     return SkillView.model_validate(
         service(db, context, settings).update_skill(skill_id, payload)
     )
@@ -824,6 +839,8 @@ def authorize_skill(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> PermissionGrantView:
+    # Grants are workspace-wide runtime decisions, not per-user self-service.
+    context.require_permission("workspace.manage")
     return PermissionGrantView.model_validate(
         service(db, context, settings).authorize_skill(skill_id, payload)
     )
@@ -841,6 +858,9 @@ def invoke_skill(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> ExtensionInvocationView:
+    # Invocation executes the Skill's builtin-tool steps, so it stays on the
+    # same workspace.manage boundary as sandbox-run.
+    context.require_permission("workspace.manage")
     return ExtensionInvocationView.model_validate(
         service(db, context, settings).invoke_skill(skill_id, payload)
     )
@@ -854,6 +874,7 @@ def revoke_skill(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> SkillView:
+    context.require_permission("workspace.write")
     return SkillView.model_validate(
         service(db, context, settings).revoke_skill(skill_id, payload.reason)
     )

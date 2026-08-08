@@ -112,7 +112,11 @@ def workspace_context(
         "/api/v1/plugins",
         "/api/v1/components",
         "/api/v1/mcp/",
-        "/api/v1/skills/",
+        # Skill lifecycle endpoints declare their own per-endpoint boundary:
+        # install/edit/validate/scan/revoke require workspace.write, while
+        # authorize/invoke/sandbox-run require workspace.manage. Keeping them
+        # out of the prefix list prevents a trailing-slash mismatch from
+        # silently changing that boundary.
         "/api/v1/migrations",
         "/api/v1/settings",
         "/api/v1/audit",
