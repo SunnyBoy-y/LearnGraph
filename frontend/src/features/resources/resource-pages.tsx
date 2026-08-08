@@ -1311,23 +1311,13 @@ function packList(pack: Record<string, unknown>, key: string): string[] {
     : [];
 }
 
-export function ResearchPage() {
-  const { taskId, workspaceId = "" } = useParams();
+export function ResearchNewTaskPage() {
+  const { workspaceId = "" } = useParams();
   const navigate = useNavigate();
   const [question, setQuestion] = useState("");
   const [budget, setBudget] = useState(0);
   const [plan, setPlan] = useState<ResearchPlan | null>(null);
   const queryClient = useQueryClient();
-  const jobs = useQuery({ queryKey: ["research"], queryFn: listResearchJobs });
-  const job =
-    taskId && taskId !== "new"
-      ? jobs.data?.find((item) => item.id === taskId)
-      : undefined;
-  const events = useQuery({
-    queryKey: ["research-events", job?.id],
-    queryFn: () => listResearchEvents(job!.id),
-    enabled: Boolean(job),
-  });
   const preview = useMutation({
     mutationFn: () =>
       planResearch({ question, budget_cny: budget, source_scope: [] }),
@@ -1351,50 +1341,6 @@ export function ResearchPage() {
     },
     onError: (error) => toast.error(error.message),
   });
-  const approve = useMutation({
-    mutationFn: () => approveResearch(job!.id),
-    onSuccess: () => {
-      toast.success("预算已确认，研究任务已启动");
-      void queryClient.invalidateQueries({ queryKey: ["research"] });
-      void queryClient.invalidateQueries({
-        queryKey: ["research-events", job?.id],
-      });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const cancel = useMutation({
-    mutationFn: () => cancelResearch(job!.id),
-    onSuccess: () => {
-      toast.success("已提交取消");
-      void queryClient.invalidateQueries({ queryKey: ["research"] });
-      void queryClient.invalidateQueries({
-        queryKey: ["research-events", job?.id],
-      });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  if (jobs.isPending)
-    return (
-      <PageFrame>
-        <LoadingState />
-      </PageFrame>
-    );
-  if (jobs.isError)
-    return (
-      <PageFrame>
-        <ErrorState message={jobs.error.message} />
-      </PageFrame>
-    );
-  const pack = (job?.evidence_pack ?? {}) as Record<string, unknown>;
-  const timeline = (events.data ?? []).map((event) => ({
-    time: new Date(event.created_at).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
-    title: event.event_type,
-    detail: JSON.stringify(event.payload),
-    status: "done" as const,
-  }));
   return (
     <PageFrame>
       <PageIntro
@@ -1418,7 +1364,7 @@ export function ResearchPage() {
         }
         description="研究产物是可审核证据包，不会直接发布图谱、路线或授予成长星级。"
         eyebrow="Deep Research"
-        title="研究任务台"
+        title="新建研究任务"
       />
       <Surface className="p-5">
         <SectionHeading
@@ -1459,17 +1405,116 @@ export function ResearchPage() {
       </Surface>
       <div className="grid gap-5 lg:grid-cols-[.85fr_1.15fr]">
         <Surface className="p-5">
+          <SectionHeading title="实时任务流" />
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            创建任务后，这里会显示服务端事件流。
+          </p>
+        </Surface>
+        <Surface className="p-5">
+          <SectionHeading title="证据包摘要" />
+          <p className="py-10 text-center text-sm text-muted-foreground">
+            尚无研究产物。
+          </p>
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/55 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
+            <strong>审核边界：</strong>证据包
+            只进入候选审核，不会直接改写图谱或路线。
+          </div>
+        </Surface>
+      </div>
+    </PageFrame>
+  );
+}
+
+export function ResearchPage() {
+  const { taskId, workspaceId = "" } = useParams();
+  const queryClient = useQueryClient();
+  const jobs = useQuery({ queryKey: ["research"], queryFn: listResearchJobs });
+  const job = taskId
+    ? jobs.data?.find((item) => item.id === taskId)
+    : undefined;
+  const events = useQuery({
+    queryKey: ["research-events", job?.id],
+    queryFn: () => listResearchEvents(job!.id),
+    enabled: Boolean(job),
+  });
+  const approve = useMutation({
+    mutationFn: () => approveResearch(job!.id),
+    onSuccess: () => {
+      toast.success("预算已确认，研究任务已启动");
+      void queryClient.invalidateQueries({ queryKey: ["research"] });
+      void queryClient.invalidateQueries({
+        queryKey: ["research-events", job?.id],
+      });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const cancel = useMutation({
+    mutationFn: () => cancelResearch(job!.id),
+    onSuccess: () => {
+      toast.success("已提交取消");
+      void queryClient.invalidateQueries({ queryKey: ["research"] });
+      void queryClient.invalidateQueries({
+        queryKey: ["research-events", job?.id],
+      });
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  if (jobs.isPending)
+    return (
+      <PageFrame>
+        <LoadingState />
+      </PageFrame>
+    );
+  if (jobs.isError)
+    return (
+      <PageFrame>
+        <ErrorState message={jobs.error.message} />
+      </PageFrame>
+    );
+  if (!job)
+    return (
+      <PageFrame>
+        <ErrorState message="研究任务不存在或无权访问。" />
+      </PageFrame>
+    );
+  const pack = (job.evidence_pack ?? {}) as Record<string, unknown>;
+  const timeline = (events.data ?? []).map((event) => ({
+    time: new Date(event.created_at).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    }),
+    title: event.event_type,
+    detail: JSON.stringify(event.payload),
+    status: "done" as const,
+  }));
+  const canCancel = ![
+    "completed",
+    "completed_local_demo",
+    "completed_source_collection",
+    "failed",
+    "cancelled",
+    "rejected",
+  ].includes(job.status);
+  return (
+    <PageFrame>
+      <PageIntro
+        actions={
+          <Button asChild size="sm" variant="outline">
+            <Link to={`/w/${encodeURIComponent(workspaceId)}/research/tasks/new`}>
+              <Sparkles className="size-4" />
+              新建任务
+            </Link>
+          </Button>
+        }
+        description="研究产物是可审核证据包，不会直接发布图谱、路线或授予成长星级。"
+        eyebrow="Deep Research"
+        title="研究任务详情"
+      />
+      <div className="grid gap-5 lg:grid-cols-[.85fr_1.15fr]">
+        <Surface className="p-5">
           <SectionHeading
             action={
-              job &&
-              ![
-                "completed",
-                "completed_local_demo",
-                "completed_source_collection",
-                "failed",
-                "cancelled",
-                "rejected",
-              ].includes(job.status) ? (
+              canCancel ? (
                 <Button
                   disabled={cancel.isPending}
                   onClick={() => cancel.mutate()}
@@ -1482,7 +1527,7 @@ export function ResearchPage() {
             }
             title="实时任务流"
           />
-          {job?.status === "awaiting_approval" ? (
+          {job.status === "awaiting_approval" ? (
             <div className="mt-4 rounded-xl border border-amber-200 p-4">
               <p className="text-sm">
                 预计费用 ¥{job.estimated_cost_cny.toFixed(2)}
@@ -1509,51 +1554,40 @@ export function ResearchPage() {
           </div>
         </Surface>
         <Surface className="p-5">
-          <SectionHeading
-            action={job ? <StatePill status={job.status} /> : null}
-            title="证据包摘要"
-          />
-          {job ? (
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              {[
-                [
-                  "事实/主张",
-                  packList(pack, "facts")[0] ??
-                    packList(pack, "claims")[0] ??
-                    "暂无",
-                ],
-                ["候选概念", packList(pack, "candidate_concepts")[0] ?? "暂无"],
-                ["冲突", packList(pack, "conflicts")[0] ?? "暂无"],
-                ["覆盖缺口", packList(pack, "coverage_gaps")[0] ?? "暂无"],
-              ].map(([title, text], index) => (
-                <div className="rounded-xl border p-4" key={title}>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={
-                        index === 3
-                          ? "size-2 rounded-full bg-amber-500"
-                          : "size-2 rounded-full bg-primary"
-                      }
-                    />
-                    <p className="text-sm font-semibold">{title}</p>
-                  </div>
-                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                    {text}
-                  </p>
+          <SectionHeading action={<StatePill status={job.status} />} title="证据包摘要" />
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {[
+              [
+                "事实/主张",
+                packList(pack, "facts")[0] ??
+                  packList(pack, "claims")[0] ??
+                  "暂无",
+              ],
+              ["候选概念", packList(pack, "candidate_concepts")[0] ?? "暂无"],
+              ["冲突", packList(pack, "conflicts")[0] ?? "暂无"],
+              ["覆盖缺口", packList(pack, "coverage_gaps")[0] ?? "暂无"],
+            ].map(([title, text], index) => (
+              <div className="rounded-xl border p-4" key={title}>
+                <div className="flex items-center gap-2">
+                  <span
+                    className={
+                      index === 3
+                        ? "size-2 rounded-full bg-amber-500"
+                        : "size-2 rounded-full bg-primary"
+                    }
+                  />
+                  <p className="text-sm font-semibold">{title}</p>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <p className="py-10 text-center text-sm text-muted-foreground">
-              尚无研究产物。
-            </p>
-          )}
-          {job ? (
-            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/55 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
-              <strong>审核边界：</strong>证据包
-              只进入候选审核，不会直接改写图谱或路线。
-            </div>
-          ) : null}
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  {text}
+                </p>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/55 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
+            <strong>审核边界：</strong>证据包
+            只进入候选审核，不会直接改写图谱或路线。
+          </div>
         </Surface>
       </div>
     </PageFrame>

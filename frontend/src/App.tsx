@@ -26,6 +26,7 @@ const ExerciseAnswerPage = lazy(() => import('@/features/learning/learning-pages
 const PracticePage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.PracticePage })))
 const RoadmapPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.RoadmapPage })))
 const ResearchPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.ResearchPage })))
+const ResearchNewTaskPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.ResearchNewTaskPage })))
 const SearchPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SearchPage })))
 const SourcesPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SourcesPage })))
 const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
@@ -125,6 +126,7 @@ function AppRoutes() {
         <Route element={<SourcesPage />} path="sources" />
         <Route element={<DocumentLearningPage />} path="documents/:fileId" />
         <Route element={<SearchPage />} path="research/search" />
+        <Route element={<ResearchNewTaskPage />} path="research/tasks/new" />
         <Route element={<ResearchPage />} path="research/tasks/:taskId" />
         <Route element={<EvidenceReviewPage />} path="evidence/review" />
         <Route element={<PracticePage />} path="practice" />
