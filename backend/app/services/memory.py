@@ -13,6 +13,7 @@ from sqlalchemy import select, update as sql_update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
+from app.domain.memory_event_models import MemorySearchDocument
 from app.domain.memory_types import (
     MEMORY_TYPE_REGISTRY,
     compute_memory_strength,
@@ -74,6 +75,7 @@ from app.repositories.domain import (
     SettingRepository,
 )
 from app.services.memory_vault import MemoryRecoveryVault
+from app.services.memory_zones import ReconcileZonesReport, reconcile_memory_zones
 from app.services.token_estimate import estimate_tokens
 
 
@@ -139,7 +141,12 @@ def _structured_datetime(value: object) -> datetime | None:
     return _as_utc(parsed)
 
 
-def _atomic_fields(structured: dict, source_ids: list[str]) -> dict:
+def _atomic_fields(
+    structured: dict,
+    source_ids: list[str],
+    *,
+    default_eligible: bool = False,
+) -> dict:
     """Normalize indexable atom lifecycle fields from validated LLM output."""
 
     version = int(structured.get("atom_schema_version") or 0)
@@ -147,7 +154,11 @@ def _atomic_fields(structured: dict, source_ids: list[str]) -> dict:
     temporal_status = str(structured.get("temporal_status") or "timeless")
     summary_eligibility = str(
         structured.get("summary_eligibility")
-        or ("durable" if version >= 1 and source_ids else "excluded")
+        or (
+            "durable"
+            if default_eligible or (version >= 1 and source_ids)
+            else "excluded"
+        )
     )
     return {
         "atom_schema_version": max(0, version),
@@ -986,6 +997,129 @@ class MemoryService:
             self.db.commit()
         return views
 
+    def list_views(
+        self,
+        *,
+        zone: str | None = None,
+        state: str = "active",
+        include_content: bool = False,
+    ) -> list[MemoryView]:
+        """Unified visible memory list: v1 records plus v2 event projections.
+
+        v2-only memories are read-only views surfaced so the user can see every
+        active memory block even before a legacy record exists.
+        """
+
+        self.purge_expired()
+        views = self.list(
+            zone=zone,
+            state=state,
+            include_content=include_content,
+        )
+        if state != "active":
+            return views
+        record_ids = {view.id for view in views}
+        statement = select(MemorySearchDocument).where(
+            MemorySearchDocument.target_type == "memory",
+            MemorySearchDocument.workspace_id == self.workspace_id,
+            MemorySearchDocument.status == "active",
+        )
+        if record_ids:
+            statement = statement.where(~MemorySearchDocument.target_id.in_(record_ids))
+        if zone:
+            statement = statement.where(MemorySearchDocument.zone == zone)
+        documents = self.db.scalars(
+            statement.order_by(MemorySearchDocument.updated_at.desc())
+        ).all()
+        views.extend(
+            self._search_document_view(document, include_content=include_content)
+            for document in documents
+        )
+        return views
+
+    def reconcile_zones(self) -> ReconcileZonesReport:
+        report = reconcile_memory_zones(self.db, self.workspace_id)
+        self.db.commit()
+        return report
+
+    def _search_document_view(
+        self,
+        document: MemorySearchDocument,
+        *,
+        include_content: bool = False,
+    ) -> MemoryView:
+        conversation_id = document.conversation_id
+        namespace = "session" if conversation_id else "workspace"
+        return MemoryView(
+            id=str(document.target_id),
+            lg_memory_id=str(document.target_id),
+            workspace_id=str(document.workspace_id or self.workspace_id),
+            namespace=namespace,
+            session_id=conversation_id,
+            scope_type="session" if conversation_id else "workspace",
+            scope_id=conversation_id if conversation_id else None,
+            goal_id=None,
+            node_id=document.knowledge_node_id,
+            record_kind=document.memory_type,
+            merge_strategy="UNION",
+            zone=document.zone or "recent",
+            state="active",
+            title=document.subject,
+            content_hash=document.content_hash,
+            relative_path="",
+            revision=document.target_version,
+            source="event",
+            source_ids=[document.source_event_id],
+            structured_payload={},
+            atom_schema_version=1,
+            canonical_key=document.slot_key,
+            atom_kind="fact",
+            ledger_status="active",
+            temporal_status="timeless",
+            summary_eligibility="current",
+            valid_from=document.valid_from,
+            valid_until=document.valid_until,
+            event_at=document.updated_at,
+            next_review_at=None,
+            last_verified_at=None,
+            timezone_name="Asia/Shanghai",
+            evidence_ids=[],
+            confidence=float(document.confidence or 0.7),
+            importance=float(document.importance or 0.5),
+            strength=0.5,
+            access_count=0,
+            confirmation_count=0,
+            successful_use_count=0,
+            last_accessed_at=None,
+            resolution_status="none",
+            decay_policy="SLOW",
+            supersedes_id=None,
+            provider_id="event-source",
+            provider_binding_id=None,
+            deleted_at=None,
+            recoverable_until=None,
+            content_destroyed_at=None,
+            tenant_id=document.tenant_id,
+            subject_user_id=document.subject_user_id,
+            audience_type="workspace",
+            task_id=document.task_id,
+            project_id=document.project_id,
+            conversation_id=conversation_id,
+            file_id=document.file_id,
+            memory_layer=document.memory_layer,
+            assertion_type="inferred",
+            sensitivity=document.sensitivity,
+            lifecycle_status="active",
+            superseded_by_id=None,
+            head_event_id=document.source_event_id,
+            view_source="event",
+            restore_available=False,
+            created_at=document.created_at,
+            updated_at=document.updated_at,
+            content=document.content if include_content else None,
+            retrieval_score=None,
+        )
+
     def get(self, memory_id: str) -> MemoryView:
         self.purge_expired()
         record = self.memories.require(memory_id, "memory")
@@ -1021,7 +1155,11 @@ class MemoryService:
         elif scope_type == "node":
             scope_id = node_id
         now = utc_now()
-        atomic = _atomic_fields(structured, list(payload.source_ids))
+        atomic = _atomic_fields(
+            structured,
+            list(payload.source_ids),
+            default_eligible=payload.source.startswith("user"),
+        )
         importance = float(payload.importance)
         strength = compute_memory_strength(
             base_importance=importance,
@@ -1201,7 +1339,11 @@ class MemoryService:
                     "profile_eligible": True,
                 },
             }
-        atomic = _atomic_fields(structured, source_ids)
+        atomic = _atomic_fields(
+            structured,
+            source_ids,
+            default_eligible=str(getattr(record, "source", "")).startswith("user"),
+        )
         if payload.scope_type is not None or payload.scope_id is not None or payload.goal_id is not None or payload.node_id is not None:
             scope_type, scope_id, goal_id, node_id = normalize_scope(
                 scope_type=payload.scope_type or record.scope_type,

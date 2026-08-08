@@ -115,6 +115,28 @@ def list_memory_types(
     return service(db, context, settings).list_memory_types()
 
 
+@router.get("/views", response_model=list[MemoryView])
+def list_memory_views(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    zone: Annotated[
+        Literal["hot", "recent", "topics", "archive"] | None,
+        Query(),
+    ] = None,
+    state: Annotated[
+        Literal["active", "deleted", "destroyed"],
+        Query(),
+    ] = "active",
+    include_content: Annotated[bool, Query()] = False,
+) -> list[MemoryView]:
+    return service(db, context, settings).list_views(
+        zone=zone,
+        state=state,
+        include_content=include_content,
+    )
+
+
 @router.get("/export")
 def export_memories(db: DB, context: CurrentWorkspace, settings: AppSettings) -> Response:
     payload = service(db, context, settings).export_markdown()
@@ -195,6 +217,25 @@ def reconcile_memory_time(
         context.workspace,
         settings,
     )
+
+
+@router.post("/maintenance/reconcile-zones")
+def reconcile_memory_zones(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict[str, int]:
+    """Recompute cold/hot layering for v1 records and v2 search projections."""
+
+    report = service(db, context, settings).reconcile_zones()
+    return {
+        "reviewed": report.reviewed,
+        "changed": report.changed,
+        "archived": report.archived,
+        "hot": report.hot,
+        "recent": report.recent,
+        "topics": report.topics,
+    }
 
 
 @router.post("/maintenance/migrate-atoms")

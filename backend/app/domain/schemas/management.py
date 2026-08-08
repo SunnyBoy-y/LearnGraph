@@ -17,7 +17,7 @@ class MemoryCreateRequest(BaseModel):
     scope_id: str | None = Field(default=None, min_length=1, max_length=64)
     goal_id: str | None = Field(default=None, min_length=1, max_length=36)
     node_id: str | None = Field(default=None, min_length=1, max_length=36)
-    zone: Literal["hot", "recent", "topics", "archive"] = "topics"
+    zone: Literal["hot", "recent", "topics", "archive"] = "recent"
     record_kind: str = Field(default="semantic_memory", min_length=1, max_length=64)
     structured_payload: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
@@ -138,6 +138,7 @@ class MemoryView(ORMModel):
     lifecycle_status: str = "active"
     superseded_by_id: str | None = None
     head_event_id: str | None = None
+    view_source: Literal["record", "event"] = "record"
     projection_version: int = 1
     auto_recall_suppressed: bool = False
     child_agent_denied: bool = False
@@ -345,7 +346,7 @@ class MemoryProfileView(BaseModel):
     workspace_id: str
     owner_subject_id: str
     version: int = 0
-    status: Literal["empty", "ready", "stale", "building", "failed"] = "empty"
+    status: Literal["empty", "atomic_snapshot", "ready", "stale", "building", "failed"] = "empty"
     markdown: str = ""
     structured_sections: list[dict[str, Any]] = Field(default_factory=list)
     source_atom_ids: list[str] = Field(default_factory=list)

@@ -242,6 +242,7 @@ class MemoryProjector:
             self.db.add(existing)
         existing.target_version = event.stream_version
         existing.memory_layer = str(payload.get("memory_layer") or existing.memory_layer or "L3")
+        existing.zone = str(payload.get("zone") or existing.zone or "recent")
         existing.memory_type = str(
             payload.get("record_kind") or existing.memory_type or "semantic_memory"
         )

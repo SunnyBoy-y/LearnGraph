@@ -180,6 +180,7 @@ class MemorySearchDocument(Base, TimestampMixin):
     knowledge_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     sensitivity: Mapped[str] = mapped_column(String(24), default="normal", index=True)
+    zone: Mapped[str] = mapped_column(String(16), default="recent", index=True)
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     importance: Mapped[float] = mapped_column(Float, default=0.5)

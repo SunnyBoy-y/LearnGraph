@@ -741,6 +741,11 @@ def _apply_sqlite_additive_migrations() -> None:
             "interaction_contract": "JSON",
             "component_manifest_id": "VARCHAR(36)",
         },
+        # Memory cold/hot zones on the v2 search projection so event-sourced
+        # memories participate in the same visible layering as v1 records.
+        "memory_search_documents": {
+            "zone": "VARCHAR(16) NOT NULL DEFAULT 'recent'",
+        },
     }
     with engine.begin() as connection:
         for table_name, columns in additions.items():

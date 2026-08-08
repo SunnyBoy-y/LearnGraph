@@ -118,6 +118,7 @@ export interface MemoryEntry {
   auto_recall_suppressed?: boolean
   child_agent_denied?: boolean
   restore_available: boolean
+  view_source?: 'record' | 'event'
   created_at: IsoDateTime
   updated_at: IsoDateTime
   content: string | null
@@ -213,7 +214,7 @@ export interface MemoryProfile {
   workspace_id: string
   owner_subject_id: string
   version: number
-  status: 'empty' | 'ready' | 'stale' | 'building' | 'failed'
+  status: 'empty' | 'atomic_snapshot' | 'ready' | 'stale' | 'building' | 'failed'
   markdown: string
   structured_sections: Array<{
     heading: string

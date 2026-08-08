@@ -41,6 +41,7 @@ import {
   listMemories,
   listMemoryRevisions,
   listMemoryTypes,
+  listMemoryViews,
   listSessions,
   migrateLegacyMemoryAtoms,
   purgeExpiredMemoryContent,
@@ -178,8 +179,8 @@ export function MemoryPage() {
   const { workspaceId = '' } = useParams()
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const memories = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, 'memory', 'active'),
-    queryFn: () => listMemories({ include_content: true }),
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'views'),
+    queryFn: () => listMemoryViews({ include_content: true }),
   })
   const profile = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile'),
@@ -451,8 +452,8 @@ export function MemoryPage() {
           {!activeMemories.length ? (
             <Surface className="p-2">
               <EmptyState
-                description="新增确认记忆后，会按所选层级写入真实 Provider。"
-                title="当前工作区还没有 Active 记忆"
+                description="新增记忆后会按热摘要/近期/主题/归档自动分层，事件投影记忆也会在这里出现。"
+                title="当前工作区还没有可见记忆"
               />
             </Surface>
           ) : (
@@ -687,6 +688,13 @@ function MemorySummaryCard({
             <Button disabled={busy} onClick={() => void onRefresh()} size="xs" variant="outline">
               立即刷新
             </Button>
+          </div>
+        ) : profile?.status === 'atomic_snapshot' ? (
+          <div className="mb-6 flex items-start gap-2 border-b border-primary/20 pb-3 text-xs text-muted-foreground">
+            <Sparkles className="mt-0.5 size-3.5 shrink-0 text-primary" />
+            <span>
+              当前为原子快照：未配置记忆摘要模型，先把每条记忆清晰列出。配置提取/摘要模型后，点击右上角刷新生成正式摘要。
+            </span>
           </div>
         ) : null}
 
@@ -1062,6 +1070,7 @@ function MemoryRow({
   onDelete: () => void
   onRestoreRevision: (revision: number) => void
 }) {
+  const readOnly = item.view_source === 'event'
   return (
     <div className="rounded-xl border bg-background/80 p-3 shadow-sm transition-colors hover:border-primary/30">
       <button className="w-full text-left" onClick={onOpen} type="button">
@@ -1074,7 +1083,13 @@ function MemoryRow({
         <Badge variant="outline">{item.namespace === 'session' ? 'Session' : 'Workspace'}</Badge>
         {item.scope_type ? <Badge variant="secondary">{item.scope_type}</Badge> : null}
         {item.record_kind ? <Badge variant="outline">{item.record_kind}</Badge> : null}
+        {readOnly ? <Badge variant="outline">事件派生只读</Badge> : null}
       </div>
+      {readOnly ? (
+        <div className="mt-2.5 border-t pt-2 text-xs text-muted-foreground">
+          该记忆来自事件投影，先在对话中确认或通过记忆治理流程创建记录后可编辑。
+        </div>
+      ) : (
       <div className="mt-2.5 flex flex-wrap items-center gap-0.5 border-t pt-2">
         <EditMemoryDialog busy={busy} item={item} onUpdate={onUpdate} workspaceId={workspaceId} />
         <RevisionDialog
@@ -1108,6 +1123,7 @@ function MemoryRow({
           </AlertDialogContent>
         </AlertDialog>
       </div>
+      )}
     </div>
   )
 }

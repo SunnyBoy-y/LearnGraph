@@ -38,6 +38,14 @@ export function listMemories(params: {
   return apiClient.get<MemoryEntry[]>('/memory', { query: params })
 }
 
+export function listMemoryViews(params: {
+  zone?: MemoryZone
+  state?: MemoryState
+  include_content?: boolean
+} = {}): Promise<MemoryEntry[]> {
+  return apiClient.get<MemoryEntry[]>('/memory/views', { query: params })
+}
+
 export function getMemory(memoryId: string): Promise<MemoryEntry> {
   return apiClient.get<MemoryEntry>(`/memory/${encodeURIComponent(memoryId)}`)
 }

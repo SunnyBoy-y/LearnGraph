@@ -117,7 +117,16 @@ def run_workspace_memory_retention(
             settings,
             now=now,
         )
-        return {**retention, **temporal}
+        from app.services.memory_zones import reconcile_memory_zones
+
+        zones = reconcile_memory_zones(db, workspace_id, now=now)
+        db.commit()
+        return {
+            **retention,
+            **temporal,
+            "zones_reviewed": zones.reviewed,
+            "zones_changed": zones.changed,
+        }
 
 
 def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int]:
@@ -128,6 +137,8 @@ def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int
         "journal_entries_removed": 0,
         "reviewed": 0,
         "lapsed": 0,
+        "zones_reviewed": 0,
+        "zones_changed": 0,
     }
     for workspace_id in workspace_ids:
         try:

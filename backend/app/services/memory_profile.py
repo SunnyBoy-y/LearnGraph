@@ -125,6 +125,32 @@ def _profile_atom_query(workspace_id: str):
     )
 
 
+def _visible_atom_query(workspace_id: str):
+    """Snapshot query: every active, non-excluded memory block.
+
+    Unlike ``_profile_atom_query`` this does not require atomization
+    (``atom_schema_version >= 1``), so manually confirmed memories stay visible
+    in the model-free atomic snapshot even before an LLM atomizes them.
+    """
+
+    return (
+        select(MemoryRecord)
+        .where(
+            MemoryRecord.workspace_id == workspace_id,
+            MemoryRecord.state == "active",
+            MemoryRecord.ledger_status == "active",
+            MemoryRecord.summary_eligibility.in_(tuple(_ELIGIBLE_SUMMARY)),
+            ~MemoryRecord.temporal_status.in_(tuple(_INELIGIBLE_TEMPORAL)),
+        )
+        .order_by(
+            MemoryRecord.importance.desc(),
+            MemoryRecord.updated_at.desc(),
+            MemoryRecord.id,
+        )
+        .limit(_PROFILE_MAX_ATOMS)
+    )
+
+
 def _eligible_profile_records(
     db: Session, workspace_id: str
 ) -> list[MemoryRecord]:
@@ -482,13 +508,87 @@ class MemoryProfileService:
             .order_by(MemoryProfileSnapshot.version.desc())
             .limit(1)
         )
-        if snapshot is not None and snapshot.status == "ready":
+        if snapshot is None:
+            return self._atomic_snapshot_view()
+        if snapshot.status == "ready":
             records = _eligible_profile_records(self.db, self.workspace_id)
             if snapshot.source_fingerprint != _atom_fingerprint(records):
                 snapshot.status = "stale"
                 snapshot.stale_reason = "source_fingerprint_changed"
                 self.db.commit()
         return self._profile_view(snapshot)
+
+    def _atomic_snapshot_view(self) -> MemoryProfileView:
+        """Local, model-free fallback so memory is visible before summarization.
+
+        The snapshot groups current atoms by their cold/hot layer. It is not a
+        generated prose summary; it guarantees the user can inspect every
+        eligible memory block without a configured summarization model.
+        """
+
+        records, atoms = self._atom_payloads(require_evidence=False)
+        if not atoms:
+            return MemoryProfileView(
+                workspace_id=self.workspace_id,
+                owner_subject_id=self.actor_id,
+                status="empty",
+            )
+        zone_by_id = {str(record.id): str(record.zone or "recent") for record in records}
+        headings = {
+            "hot": "热摘要",
+            "recent": "近期事件",
+            "topics": "主题记忆",
+            "archive": "冷区归档",
+        }
+        sections: list[dict[str, Any]] = []
+        markdown_parts: list[str] = []
+        for zone in ("hot", "recent", "topics", "archive"):
+            items = [
+                atom
+                for atom in atoms
+                if zone_by_id.get(str(atom["id"]), "recent") == zone
+            ]
+            if not items:
+                continue
+            paragraphs: list[dict[str, Any]] = []
+            for atom in items:
+                atom_id = str(atom["id"])
+                text = str(atom.get("title") or "").strip()
+                statement = str(atom.get("statement") or "").strip()
+                if text and statement:
+                    text = f"{text}：{statement[:220]}"
+                elif statement:
+                    text = statement[:220]
+                if not text:
+                    continue
+                paragraphs.append(
+                    {
+                        "id": f"atom-{atom_id}",
+                        "text": text,
+                        "atom_ids": [atom_id],
+                    }
+                )
+            if not paragraphs:
+                continue
+            sections.append(
+                {"heading": headings[zone], "paragraphs": paragraphs}
+            )
+            markdown_parts.append(f"## {headings[zone]}")
+            markdown_parts.extend(item["text"] for item in paragraphs)
+        source_ids = [str(item["id"]) for item in atoms]
+        return MemoryProfileView(
+            workspace_id=self.workspace_id,
+            owner_subject_id=self.actor_id,
+            status="atomic_snapshot",
+            markdown="\n\n".join(markdown_parts),
+            structured_sections=sections,
+            source_atom_ids=source_ids,
+            source_fingerprint=_atom_fingerprint(records),
+            updated_at=utc_now(),
+            stale_reason=(
+                "未配置记忆摘要模型；当前为原子快照，配置后可生成正式摘要"
+            ),
+        )
 
     def profile_sources(self) -> dict[str, Any]:
         snapshot = self.db.scalar(
@@ -556,8 +656,15 @@ class MemoryProfileService:
             "atoms": atoms,
         }
 
-    def _atom_payloads(self) -> tuple[list[MemoryRecord], list[dict[str, Any]]]:
-        records = _eligible_profile_records(self.db, self.workspace_id)
+    def _atom_payloads(
+        self, *, require_evidence: bool = True
+    ) -> tuple[list[MemoryRecord], list[dict[str, Any]]]:
+        if require_evidence:
+            records = _eligible_profile_records(self.db, self.workspace_id)
+        else:
+            records = list(
+                self.db.scalars(_visible_atom_query(self.workspace_id)).all()
+            )
         payloads: list[dict[str, Any]] = []
         for record in records:
             revision = self.db.scalar(
