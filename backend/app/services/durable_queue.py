@@ -273,6 +273,37 @@ def enqueue_research_poll(research_job_id: str, workspace_id: str, actor_id: str
         )
 
 
+def enqueue_memory_extraction(
+    workspace_id: str,
+    session_id: str,
+    actor_id: str,
+    last_message_id: str,
+) -> DurableJob:
+    """Event-driven memory extraction trigger (replaces polling sweeps).
+
+    Deduplicated per (session, last completed message) so a message is never
+    extracted twice even if the completion event fires more than once.
+    """
+
+    settings = get_settings()
+    with SessionLocal() as db:
+        return DurableQueue(
+            db,
+            lease_seconds=settings.durable_queue_lease_seconds,
+            max_attempts=settings.durable_queue_max_attempts,
+        ).enqueue(
+            workspace_id=workspace_id,
+            kind="memory.extract",
+            payload={
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "actor_id": actor_id,
+                "last_message_id": last_message_id,
+            },
+            dedupe_key=f"memory.extract:{session_id}:{last_message_id}",
+        )
+
+
 def run_research_poll_once(payload: dict[str, Any]) -> bool:
     """Poll one remote research task once with a fresh session.
 
@@ -326,6 +357,23 @@ def run_one_durable_job(worker_id: str) -> bool:
                 from app.services.chat_durable import run_chat_continue_once
 
                 run_chat_continue_once(job.payload)
+                queue.complete(job)
+            elif job.kind == "memory.extract":
+                from app.domain.models import Workspace
+                from app.services.memory_enhancement import extract_session_memories
+
+                workspace = db.get(Workspace, str(job.payload["workspace_id"]))
+                if workspace is not None:
+                    extract_session_memories(
+                        db,
+                        workspace,
+                        str(job.payload["session_id"]),
+                        get_settings(),
+                        actor_id=str(
+                            job.payload.get("actor_id")
+                            or "system:memory-extraction"
+                        ),
+                    )
                 queue.complete(job)
             else:
                 raise ValueError(f"Unsupported durable job kind: {job.kind}")

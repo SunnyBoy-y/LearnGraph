@@ -105,7 +105,10 @@ def _parse_extraction_time(value: object) -> datetime | None:
 def default_enhancement_config() -> dict[str, Any]:
     return {
         "extraction": {
-            "enabled": False,
+            # Default ON: whether extraction runs is gated only by the
+            # workspace "memory" master switch (workspace_enabled). The
+            # provider/model fall back to the workspace default model.
+            "enabled": True,
             "provider_id": "",
             "model_id": "",
             "follow_conversation": False,
@@ -858,14 +861,6 @@ def extract_session_memories(
     extraction_cfg = config["extraction"]
     if not extraction_cfg["enabled"] and not force:
         return {"status": "disabled", "drafts_created": 0}
-    if not extraction_cfg["provider_id"] or not extraction_cfg["model_id"]:
-        if force:
-            raise AppError(
-                409,
-                "memory_extraction_unconfigured",
-                "Configure an extraction provider and model first",
-            )
-        return {"status": "unconfigured", "drafts_created": 0}
     session = db.scalar(
         select(ChatSession).where(
             ChatSession.workspace_id == workspace.id,
@@ -877,7 +872,6 @@ def extract_session_memories(
     if (
         not _workspace_memory_enabled(db, workspace.id)
         or not session.memory_enabled
-        or not bool(getattr(session, "memory_learning_enabled", True))
     ):
         if force:
             policy = MemoryService(
@@ -938,8 +932,8 @@ def extract_session_memories(
         db,
         workspace.id,
         settings,
-        model_id=extraction_cfg["model_id"],
-        provider_id=extraction_cfg["provider_id"],
+        model_id=extraction_cfg["model_id"] or None,
+        provider_id=extraction_cfg["provider_id"] or None,
     )
     if not getattr(model, "available", False):
         state.last_status = "provider_unavailable"
@@ -1156,7 +1150,7 @@ def extract_session_memories(
                     confidence=confidence,
                     importance=importance,
                     # UPDATE rewrites an existing memory: always human-reviewed.
-                    auto_commit=bool(extraction_cfg["auto_commit"]) and operation == "CREATE",
+                    auto_commit=bool(extraction_cfg["auto_commit"]),
                     created_by="memory_extraction",
                     source_refs=[
                         {
@@ -1506,8 +1500,6 @@ def run_workspace_extraction_sweep(
     extraction_cfg = config["extraction"]
     if (
         not extraction_cfg["enabled"]
-        or not extraction_cfg["provider_id"]
-        or not extraction_cfg["model_id"]
         or not _workspace_memory_enabled(db, workspace.id)
     ):
         return totals

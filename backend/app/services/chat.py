@@ -2093,9 +2093,11 @@ class ChatService:
         ]
         if session.session_kind == "concept_branch" and session.context_capsule:
             context_sections.append(self._concept_capsule_prompt(session.context_capsule))
-        if self.memory_context_loader is not None:
+        if self.memory_context_loader is not None and get_settings().memory_read_mode != "events":
             # Current message + selected nodes let recall rank node-scoped
             # memories and (when configured) apply the embedding plugin.
+            # ``events`` read mode must not double-inject legacy memory: the
+            # v2 Context Builder block below fully replaces this section.
             context_sections.append(
                 self.memory_context_loader(
                     session_id,
@@ -2439,7 +2441,7 @@ class ChatService:
         ]
         if session.session_kind == "concept_branch" and session.context_capsule:
             context_sections.append(self._concept_capsule_prompt(session.context_capsule))
-        if self.memory_context_loader is not None:
+        if self.memory_context_loader is not None and get_settings().memory_read_mode != "events":
             context_sections.append(
                 self.memory_context_loader(
                     session_id,
@@ -12178,6 +12180,28 @@ class ChatService:
                 if submission is not None:
                     submission.status = "completed"
                 self._touch_session(session_id)
+                # Event-driven memory extraction: enqueue a deduplicated job per
+                # completed (session, message). The durable queue replaces the
+                # polling hot path; the extraction scheduler remains only as a
+                # crash-recovery sweep for messages missed while the worker was
+                # down or the queue was disabled.
+                try:
+                    from app.services.durable_queue import (
+                        enqueue_memory_extraction,
+                    )
+
+                    enqueue_memory_extraction(
+                        self.workspace_id,
+                        session_id,
+                        self.actor_id,
+                        assistant_message.id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to enqueue memory extraction for session %s",
+                        session_id,
+                        exc_info=True,
+                    )
                 completed_event = self._append_event(
                     session_id=session_id,
                     message_id=assistant_message.id,
