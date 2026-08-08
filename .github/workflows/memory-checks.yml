@@ -4,9 +4,7 @@ on:
   pull_request:
     paths:
       - "backend/app/**"
-      - "backend/tests/memory/**"
-      - "backend/tests/context/**"
-      - "backend/tests/integration/**"
+      - "backend/tests/**"
       - "backend/pyproject.toml"
       - "frontend/src/features/memory/**"
       - "frontend/src/api/**"
@@ -16,9 +14,7 @@ on:
     branches: [main]
     paths:
       - "backend/app/**"
-      - "backend/tests/memory/**"
-      - "backend/tests/context/**"
-      - "backend/tests/integration/**"
+      - "backend/tests/**"
       - "backend/pyproject.toml"
 
 permissions:
@@ -33,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --extra test pytest tests/memory tests/context tests/integration -q
+      - run: uv run --extra test pytest tests -q
       - run: uv run python -c "from app.main import app; print(app.title)"
 
   frontend:
