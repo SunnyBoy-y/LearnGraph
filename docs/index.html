@@ -305,9 +305,9 @@ npm.cmd run check</code></pre>
             <span class="section-index">04A</span>
             <div><p class="overline">Architecture evolution</p><h2>从转录修复到可治理 Runtime</h2></div>
           </div>
-          <p>以 <code>c173b36</code>「修复音频、视频等转录 bug」为基线，当前版本把媒体输入、工具执行和沙箱推进到可观察、可恢复、可审计的边界。</p>
+          <p>旧设计文档中的 <code>c173b36</code> 基线来自 rebase 前分支，不在当前 main 历史；当前 main 以 <code>ddf3a1c</code>（v0.1 首发）为起点，HEAD <code>08decda</code> 把媒体输入、工具执行和沙箱推进到可观察、可恢复、可审计的边界。</p>
           <div class="timeline-rail">
-            <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>基线 · c173b36</small><strong>先让媒体可靠进入系统</strong><p>修复 transcription model routing、音视频附件策略、解析器、文件服务和验证脚本；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
+            <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>起点 · ddf3a1c（v0.1）</small><strong>先让媒体可靠进入系统</strong><p>建立首版媒体输入、转录路由、音视频附件策略、解析器、文件服务与验证脚本基线；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
             <div class="timeline-item timeline-current"><span class="timeline-dot"></span><div><small>当前 · HEAD</small><strong>再让能力可治理地运行</strong><p>增加 sandbox readiness、网络/egress 授权、原子工具、能力按需装配、断线恢复和媒体描述缓存。</p></div></div>
           </div>
           <div class="principle-grid">
@@ -320,7 +320,7 @@ npm.cmd run check</code></pre>
             <div><span class="compare-label">baseline</span><h3>转录修复版</h3><ul><li>重点是音视频能否被正确解析和路由</li><li>附件策略与 Provider 失败边界开始显式化</li><li>验证以脚本和单次请求为主</li></ul></div>
             <div><span class="compare-label">current</span><h3>当前治理版</h3><ul><li>输入、工具和沙箱均有稳定事实与生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
           </div>
-          <div class="source-ref">对比基线：<code>git show c173b36</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
+          <div class="source-ref">对比起点：<code>git show ddf3a1c</code> · 当前 HEAD：<code>08decda</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
         </section>
 
         <section id="media-inputs" class="doc-section" data-title="媒体与文档输入">

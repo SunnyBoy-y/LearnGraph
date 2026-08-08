@@ -8,7 +8,7 @@
 
 ## 内容
 
-- 以 `c173b36 fix bugs 修复音频、视频等转录bug` 为基线的版本演进与设计原则
+- 基于当前 main 历史（起点 `ddf3a1c` v0.1 首发，HEAD `08decda`）的版本演进与设计原则；旧设计文档中的 `c173b36` 基线来自 rebase 前分支，不在 main 历史
 - 音频、视频、图片和全文文档的能力路由、解析、缓存与证据边界
 - 系统架构与 FastAPI 应用网关
 - Provider Port / Adapter 边界
@@ -38,5 +38,4 @@ python -m http.server 4173 --directory docs
 中将 Source 设为 **GitHub Actions**。之后可以通过推送触发部署，也可以在
 Actions 页面手动运行 `Deploy developer docs`。
 
-本地内部资料目录 `docs/` 与 `backend/docs/` 仍由根目录 `.gitignore` 排除，
-不会被包含在 Pages Artifact 中。
+`backend/docs/` 由根目录 `.gitignore` 排除；`docs/` 本身是已跟踪并发布到 GitHub Pages 的开发者文档目录。
