@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Box, Sparkles } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { apiClient } from "@/api/client";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import {
   createSubappChannel,
@@ -21,6 +22,7 @@ type MagicCardData = {
   reason?: string;
   origin_verified?: boolean;
   artifact_url?: string;
+  bundle_id?: string;
   preview_html?: string;
   preferred_height?: number;
   viewport?: {
@@ -98,6 +100,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   );
   const artifactUrl =
     typeof card.artifact_url === "string" ? card.artifact_url : "";
+  const bundleId = typeof card.bundle_id === "string" ? card.bundle_id : "";
   const previewHtml =
     typeof card.preview_html === "string" ? card.preview_html : "";
   const originVerified = card.origin_verified === true;
@@ -122,6 +125,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   const subappLoadedRef = useRef(false);
   const subappChannelRef = useRef<SubappChannel | null>(null);
   const [subappFailed, setSubappFailed] = useState<string | null>(null);
+  const [bundlePreviewUrl, setBundlePreviewUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (!subappTrigger) return;
@@ -153,6 +157,23 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     subappLoadedRef.current = true;
     subappChannelRef.current?.handleIframeLoad();
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    setBundlePreviewUrl(null);
+    if (!bundleId) return () => { cancelled = true; };
+    void apiClient
+      .get<{ url: string }>(`/subapps/bundles/${bundleId}/preview`)
+      .then((response) => {
+        if (!cancelled && typeof response?.url === "string") {
+          setBundlePreviewUrl(response.url);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setBundlePreviewUrl(null);
+      });
+    return () => { cancelled = true; };
+  }, [bundleId]);
 
   useEffect(() => {
     setFailed(false);
@@ -215,7 +236,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   }, [canRenderRemote, failed]);
 
   if (subappTrigger) {
-    const hasSubappContent = Boolean(previewHtml || canRenderRemote);
+    const hasSubappContent = Boolean(previewHtml || bundlePreviewUrl || canRenderRemote);
     return (
       <section aria-label={title} className="magic-card">
         <div className="magic-card__heading">
@@ -235,7 +256,11 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
-            src={!previewHtml && canRenderRemote ? artifactUrl : undefined}
+            src={
+              !previewHtml
+                ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined))
+                : undefined
+            }
             style={{ height }}
             title={`${title} 子应用`}
           />
