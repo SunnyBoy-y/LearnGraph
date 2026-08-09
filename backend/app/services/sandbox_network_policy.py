@@ -43,6 +43,16 @@ WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS = 600
 WEB_FETCH_POLICY_MAX_TTL_SECONDS = 86400
 WEB_FETCH_POLICY_FILE_SUFFIX = ".web_fetch.json"
 
+# Derived generic Agent egress (D2.1 T4.1): the workspace ``agent_egress``
+# allowlist plus active ``allow_once`` leases is the source of truth. It is
+# written to the same generic ``{workspace_id}.json`` slot the sandbox envelope
+# and proxy read, but carries its own issuer so audits can distinguish an
+# approval-derived policy from a deployment-reviewed baseline.
+AGENT_EGRESS_POLICY_ISSUER = "agent_egress_authorization"
+AGENT_EGRESS_POLICY_APPROVAL_ID = "agent_egress_authorization"
+AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS = 86400
+AGENT_EGRESS_POLICY_MAX_TTL_SECONDS = 7 * 86400
+
 # RFC 5737 documentation ranges and RFC 3849 IPv6 documentation range are not
 # reachable on the public internet; treating them as unreachable keeps the
 # classifier conservative.
@@ -453,6 +463,76 @@ def store_workspace_fetch_policy_file(policy_dir: str | Path, policy: EgressPoli
     finally:
         temporary.unlink(missing_ok=True)
     return policy_path
+
+
+def store_workspace_policy_file(policy_dir: str | Path, policy: EgressPolicy) -> Path:
+    """Atomically persist a derived generic Agent egress policy.
+
+    This writes the same ``{workspace_id}.json`` slot the sandbox envelope and
+    generic egress proxy read, so approval-derived hosts take effect for new
+    sandbox sessions without changing the proxy contract.
+    """
+    directory = Path(policy_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    policy_path = directory / f"{policy.workspace_id}.json"
+    temporary = policy_path.with_name(
+        f".{policy_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                json.dumps(policy.raw, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, policy_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return policy_path
+
+
+def derive_egress_policy_for_agent(
+    *,
+    workspace_id: str,
+    allowed_hosts: Iterable[str],
+    ttl_seconds: int = AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
+    now: datetime | None = None,
+) -> EgressPolicy:
+    """Derive a generic Agent egress policy from the durable approval allowlist.
+
+    The workspace ``agent_egress`` allowlist plus active ``allow_once`` leases
+    is the source of truth; this function turns it into an HTTPS-443-only
+    ``EgressPolicy`` with ``issuer=agent_egress_authorization``. An empty host
+    set fails closed (the caller should leave the policy file absent). The
+    resulting digest is stable for the same canonical document, so sandbox
+    envelopes and proxy registries can agree on the revision identity.
+    """
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise EgressPolicyInvalid("policy_missing_workspace")
+    if (
+        not isinstance(ttl_seconds, int)
+        or isinstance(ttl_seconds, bool)
+        or not 0 < ttl_seconds <= AGENT_EGRESS_POLICY_MAX_TTL_SECONDS
+    ):
+        raise EgressPolicyInvalid("policy_ttl_invalid")
+    hosts = list(
+        dict.fromkeys(normalize_hostname(str(value)) for value in allowed_hosts)
+    )
+    if not hosts:
+        raise EgressPolicyInvalid("policy_empty_hosts")
+    issued = now or _utc_now()
+    data = {
+        "workspace_id": workspace_id,
+        "approval_id": AGENT_EGRESS_POLICY_APPROVAL_ID,
+        "issuer": AGENT_EGRESS_POLICY_ISSUER,
+        "issued_at": issued.isoformat(),
+        "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
+        "hosts": [
+            {"host": host, "ports": [DEFAULT_PORT], "protocols": [PROTOCOL_HTTPS]}
+            for host in hosts
+        ],
+    }
+    return validate_egress_policy(data, now=now)
 
 
 def load_workspace_fetch_policy_file(

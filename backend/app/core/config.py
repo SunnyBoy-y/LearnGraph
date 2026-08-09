@@ -158,20 +158,25 @@ class Settings(BaseSettings):
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60
     # --- Reviewed outbound egress (P2-C) -------------------------------------
-    # Default sandbox posture stays fully offline. Enabling egress is a
-    # deployment decision that must point at a reviewed policy directory; every
-    # CONNECT is re-authorized by the egress proxy at connection time.
-    sandbox_egress_enabled: bool = False
+    # Sandbox egress is on by default for the local product experience, but it
+    # still requires a valid per-workspace reviewed policy file; without one the
+    # runtime envelope is ``None`` and the container stays fully offline. Every
+    # CONNECT is re-authorized by the egress proxy at connection time, so the
+    # switch alone never bypasses the private/loopback/metadata classifier.
+    sandbox_egress_enabled: bool = True
     sandbox_egress_policy_dir: str = "./data/egress-policies"
     sandbox_egress_network: str = "learngraph-egress"
     sandbox_egress_proxy_host: str = "127.0.0.1"
     sandbox_egress_proxy_port: int = 8888
     # Sandbox-visible proxy endpoint on the internal egress network.
     sandbox_egress_proxy_url: str = "http://egress-proxy:8888"
-    # Generic Agent egress approval channel (D2.1). Even with egress enabled,
-    # the approval queue/API stays off until explicitly opened: enabling the
-    # sandbox must not automatically expose an approval channel. Off by default.
-    sandbox_agent_egress_approvals_enabled: bool = False
+    # Generic Agent egress approval channel (D2.1). On by default so users can
+    # review and approve Agent egress host requests; the channel itself is
+    # inert while `sandbox_egress_enabled` stays off (sandbox stays fully
+    # offline). Every decision only adds an exact hostname; the egress proxy
+    # still re-classifies every CONNECT, so private/loopback/metadata targets
+    # remain denied.
+    sandbox_agent_egress_approvals_enabled: bool = True
     # Sandbox-isolated web fetch: when enabled together with sandbox_egress_enabled,
     # page retrieval and untrusted-HTML parsing happen inside a short-lived fixed
     # web_fetch container (never the host). Requires a non-empty workspace

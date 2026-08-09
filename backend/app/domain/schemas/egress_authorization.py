@@ -61,6 +61,10 @@ class EgressAuthorizationRequestView(ORMModel):
     ttl_seconds: int
     request_context: dict[str, Any] | None
     consumed_at: datetime | None
+    resume_payload: dict[str, Any] | None
+    assistant_message_id: str | None
+    user_message_id: str | None
+    tool_call_id: str | None
     created_at: datetime
     updated_at: datetime
 

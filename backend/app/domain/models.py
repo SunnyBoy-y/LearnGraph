@@ -2580,6 +2580,25 @@ class EgressAuthorizationRequest(Base, TimestampMixin, WorkspaceScopedMixin):
     consumed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Assistant message that carries the durable ``egress_authorization`` card
+    # part; the decision endpoint rewrites that part to its terminal state so
+    # the transcript stays consistent across reloads. Agent-mode challenges
+    # (the model re-invokes the sandbox tool itself) may leave these empty.
+    assistant_message_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    user_message_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    # Optional originating tool call id for audit / card correlation.
+    tool_call_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # Serialized Agent resume checkpoint (tool call, assistant message/version
+    # ids, allowed domains) so a decision can resume the exact suspended tool
+    # call server-side instead of asking the user to re-send. Agent-mode
+    # challenges that rely on the model re-invoking the tool leave this empty.
+    resume_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
 
 
 class HostAuthorizationGrant(Base, TimestampMixin, WorkspaceScopedMixin):

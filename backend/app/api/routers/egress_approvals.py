@@ -20,9 +20,11 @@ Contracts (design doc md-D2-1 §1.2):
 """
 
 from fastapi import APIRouter
+from sqlalchemy import select
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.core.errors import AppError
+from app.domain.models import Message, MessagePartRecord, MessageVersion
 from app.domain.schemas.egress_authorization import (
     EgressAuthorizationCreateRequest,
     EgressAuthorizationDecisionRequest,
@@ -91,7 +93,86 @@ def decide_egress_approval(
         actor_id=context.principal.user_id,
         is_manager="workspace.manage" in context.permissions,
     )
+    # Rewrite the durable ``egress_authorization`` card part on the assistant
+    # message that carried it, so a reload or a second browser shows the
+    # terminal decision instead of a live pending card (mirrors the
+    # fetch_authorization decision path).
+    if request.assistant_message_id:
+        message = db.scalar(
+            select(Message).where(
+                Message.id == request.assistant_message_id,
+                Message.workspace_id == context.workspace_id,
+            )
+        )
+        if message is not None:
+            latest_version_id = db.scalar(
+                select(MessageVersion.id)
+                .where(MessageVersion.message_id == message.id)
+                .order_by(MessageVersion.version.desc())
+                .limit(1)
+            )
+            part = (
+                db.scalar(
+                    select(MessagePartRecord)
+                    .where(
+                        MessagePartRecord.workspace_id == context.workspace_id,
+                        MessagePartRecord.message_version_id == latest_version_id,
+                        MessagePartRecord.part_type == "egress_authorization",
+                    )
+                    .order_by(MessagePartRecord.ordinal.desc())
+                )
+                if latest_version_id
+                else None
+            )
+            if part is not None:
+                part.status = "completed"
+                part.data = {
+                    **(part.data or {}),
+                    "decision": payload.decision,
+                    "authorization_status": request.status,
+                }
+                message.parts = [
+                    {
+                        **item,
+                        "status": "completed",
+                        "data": {
+                            **(item.get("data") or {}),
+                            "decision": payload.decision,
+                            "authorization_status": request.status,
+                        },
+                    }
+                    if item.get("type") == "egress_authorization"
+                    else item
+                    for item in (message.parts or [])
+                ]
     return EgressAuthorizationRequestView.model_validate(request)
+
+
+@router.post("/{request_id}/resume", response_model=dict)
+def resume_egress_approval(
+    request_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    """Resume the suspended Agent turn after the egress host was approved.
+
+    Only an ``approved`` request with a server-side ``resume_payload`` is
+    resumable; the resumed generation runs synchronously and replaces the
+    pending card part with the completed answer (D2.1 T4.1).
+    """
+    service = _service(db, context, settings)
+    request = service.get_request(request_id)
+    if request.status != "approved" or not request.resume_payload:
+        raise AppError(
+            409,
+            "egress_authorization_not_resumable",
+            "该授权不在服务端恢复流程内。",
+        )
+    from app.api.routers.chat import service as chat_service
+
+    chat = chat_service(db, context, settings)
+    return chat.resume_egress_generation(request_id)
 
 
 @router.get("", response_model=EgressAuthorizationListResponse)

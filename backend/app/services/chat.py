@@ -3074,6 +3074,24 @@ class ChatService:
                 )
             )
 
+        egress_auth = result_meta.get("egress_authorization_required")
+        if isinstance(egress_auth, dict):
+            candidates.append(
+                (
+                    "egress_authorization",
+                    "pending",
+                    {
+                        "authorization_request_id": egress_auth.get("authorization_request_id"),
+                        "tool_call_id": egress_auth.get("tool_call_id"),
+                        "tool_name": egress_auth.get("tool_name") or "sandbox_exec",
+                        "tool_label": egress_auth.get("tool_label") or "沙箱命令工具",
+                        "hostname": egress_auth.get("hostname") or "",
+                        "message_zh": egress_auth.get("message_zh")
+                        or "沙箱出站访问需要用户授权。",
+                    },
+                )
+            )
+
         auth = result_meta.get("sandbox_auth_required")
         if isinstance(auth, dict):
             candidates.append(
@@ -3126,6 +3144,8 @@ class ChatService:
                 content = str(data.get("message_zh") or data.get("phase") or "沙箱执行")
             elif part_type == "fetch_authorization":
                 content = str(data.get("message_zh") or "网页抓取需要授权")
+            elif part_type == "egress_authorization":
+                content = str(data.get("message_zh") or "沙箱出站访问需要授权")
             elif part_type == "component":
                 props = data.get("props") if isinstance(data.get("props"), dict) else {}
                 content = str(
@@ -4945,6 +4965,216 @@ class ChatService:
                 },
             )
             sequence += 1
+        self._append_event(
+            session_id=session_id,
+            message_id=assistant_message.id,
+            message_version_id=assistant_version.id,
+            part_id=text_record.id,
+            sequence=sequence,
+            event_type="message.completed",
+            payload={"status": "completed", "provider_trace": provider_trace},
+        )
+        self._touch_session(session_id)
+        return {"status": "completed", "assistant_message_id": assistant_message.id}
+
+    def resume_egress_generation(self, request_id: str) -> dict[str, str]:
+        """Resume an Agent turn after a generic egress approval (D2.1 T4.1).
+
+        The suspended tool call's checkpoint lives in
+        ``EgressAuthorizationRequest.resume_payload`` (tool call, assistant
+        message/version ids, allowed domains, tool loop bounds). After the
+        user approves, this method removes the pending card part, injects the
+        approval as a structured tool result, and re-runs the model so it can
+        continue with the sandbox tool now that the host is authorized.
+        Synchronous — the frontend refetches history once the decision
+        resolves.
+        """
+        from app.domain.models import EgressAuthorizationRequest
+
+        request = self.db.scalar(
+            select(EgressAuthorizationRequest).where(
+                EgressAuthorizationRequest.id == request_id,
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+            )
+        )
+        if request is None or request.status != "approved":
+            raise AppError(
+                409,
+                "egress_authorization_not_approved",
+                "沙箱出站授权尚未批准，无法恢复。",
+            )
+        payload = request.resume_payload
+        if not isinstance(payload, dict):
+            raise AppError(
+                409,
+                "egress_authorization_not_resumable",
+                "该授权不在服务端恢复流程内。",
+            )
+        assistant_message_id = request.assistant_message_id
+        if not assistant_message_id:
+            raise AppError(
+                409,
+                "egress_authorization_not_resumable",
+                "该授权缺少待恢复的消息上下文。",
+            )
+        assistant_message = self.db.get(Message, assistant_message_id)
+        if (
+            assistant_message is None
+            or assistant_message.workspace_id != self.workspace_id
+        ):
+            raise AppError(
+                404,
+                "pending_assistant_message_not_found",
+                "等待授权的消息已不存在。",
+            )
+        session_id = request.chat_session_id
+        if not session_id or assistant_message.session_id != session_id:
+            raise AppError(
+                409,
+                "egress_authorization_session_mismatch",
+                "授权与会话不匹配。",
+            )
+        assistant_version = self._latest_version(assistant_message.id)
+
+        decision = payload.get("decision") or request.decision or "allow_once"
+        tool_result = json.dumps(
+            {
+                "hostname": request.hostname,
+                "decision": decision,
+                "authorized": True,
+                "message": (
+                    f"沙箱出站访问主机 {request.hostname} 已获授权，"
+                    "可以继续执行需要该主机的命令。"
+                ),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        # Remove the pending egress card part (mirror fetch resume), then run
+        # one model turn with the approval injected as the tool result.
+        pending_auth_part = self.db.scalar(
+            select(MessagePartRecord).where(
+                MessagePartRecord.workspace_id == self.workspace_id,
+                MessagePartRecord.message_version_id == assistant_version.id,
+                MessagePartRecord.part_type == "egress_authorization",
+            )
+        )
+        if pending_auth_part is not None:
+            self.db.execute(
+                delete(MessageStreamEvent).where(
+                    MessageStreamEvent.workspace_id == self.workspace_id,
+                    MessageStreamEvent.message_version_id == assistant_version.id,
+                    MessageStreamEvent.part_id == pending_auth_part.id,
+                )
+            )
+            self.db.delete(pending_auth_part)
+            self.db.flush()
+
+        self._ensure_model_provider_available()
+        final_text = ""
+        try:
+            structured_chat = bool(
+                getattr(self.model_provider, "supports_structured_chat", False)
+            )
+            if structured_chat:
+                provider_messages, _ = self._build_structured_messages(
+                    session_id,
+                    "",
+                    history_before_message_id=assistant_message_id,
+                    agent_mode_enabled=True,
+                    additional_context=(
+                        "上一次工具调用因沙箱出站授权挂起。用户已批准。"
+                        f"工具结果：{tool_result}"
+                    ),
+                )
+                for provider_event in self.model_provider.stream_chat(
+                    provider_messages
+                ):
+                    if provider_event.type == "text_delta":
+                        final_text += provider_event.content or ""
+            else:
+                provider_prompt, _ = self._build_model_prompt(
+                    session_id,
+                    "",
+                    history_before_message_id=assistant_message_id,
+                    agent_mode=True,
+                    additional_context=(
+                        "上一次工具调用因沙箱出站授权挂起。用户已批准。"
+                        f"工具结果：{tool_result}"
+                    ),
+                )
+                for chunk in self.model_provider.stream_answer(provider_prompt):
+                    if chunk:
+                        final_text += chunk
+        except Exception:
+            assistant_message.status = "failed"
+            assistant_message.content = ""
+            assistant_version.status = "failed"
+            self.db.commit()
+            raise
+        final_text = final_text.strip() or "沙箱出站访问已获授权，可以继续。"
+
+        next_ordinal = 0
+        text_record = self.message_parts.add(
+            MessagePartRecord(
+                workspace_id=self.workspace_id,
+                message_version_id=assistant_version.id,
+                ordinal=next_ordinal,
+                part_type="text",
+                status="completed",
+                content=final_text,
+            )
+        )
+        parts = [
+            self._part_snapshot(text_record.id, "text", "completed", final_text),
+        ]
+        provider_trace = {
+            "provider_id": self.model_provider.provider_id,
+            "provider_type": getattr(self.model_provider, "provider_type", "unknown"),
+            "model_id": self.model_provider.model_id,
+            "remote_capability": self.model_provider.remote_capability,
+            "attempts": 1,
+            "usage_is_estimate": False,
+            "cost_usd": 0,
+            "thinking_mode": getattr(self.model_provider, "thinking_mode", "off"),
+            "search_route": getattr(self.model_provider, "search_route", "disabled"),
+            "agent_mode": True,
+            "resumed_from_egress_authorization": True,
+        }
+        assistant_message.content = final_text
+        assistant_message.parts = parts
+        assistant_message.status = "completed"
+        assistant_message.provider_trace = provider_trace
+        assistant_version.status = "completed"
+        assistant_version.provider_trace = provider_trace
+
+        sequence = (
+            self.db.scalar(
+                select(func.max(MessageStreamEvent.sequence)).where(
+                    MessageStreamEvent.workspace_id == self.workspace_id,
+                    MessageStreamEvent.message_version_id == assistant_version.id,
+                )
+            )
+            or 0
+        ) + 1
+        self._append_event(
+            session_id=session_id,
+            message_id=assistant_message.id,
+            message_version_id=assistant_version.id,
+            part_id=text_record.id,
+            sequence=sequence,
+            event_type="part.completed",
+            payload={
+                "part": self._part_snapshot(
+                    text_record.id,
+                    "text",
+                    "completed",
+                    final_text,
+                )
+            },
+        )
+        sequence += 1
         self._append_event(
             session_id=session_id,
             message_id=assistant_message.id,

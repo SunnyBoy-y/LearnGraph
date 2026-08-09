@@ -353,8 +353,18 @@ class SandboxTaskService:
         """
         if not self.settings.sandbox_egress_enabled:
             return None
+        from app.services.egress_approvals import EgressApprovalService
         from app.services.sandbox_network_policy import load_workspace_policy_file
 
+        try:
+            EgressApprovalService(
+                self.db, self.workspace_id, self.settings
+            ).ensure_agent_egress_policy()
+        except Exception:
+            logger.exception(
+                "agent egress policy refresh failed for sandbox task workspace %s",
+                self.workspace_id,
+            )
         policy = load_workspace_policy_file(
             self.settings.sandbox_egress_policy_dir, self.workspace_id
         )
@@ -1031,8 +1041,18 @@ class SandboxAgentWorkspaceService:
         """
         if not self.settings.sandbox_egress_enabled:
             return None
+        from app.services.egress_approvals import EgressApprovalService
         from app.services.sandbox_network_policy import load_workspace_policy_file
 
+        try:
+            EgressApprovalService(
+                self.db, self.workspace_id, self.settings
+            ).ensure_agent_egress_policy()
+        except Exception:
+            logger.exception(
+                "agent egress policy refresh failed for agent workspace %s",
+                self.workspace_id,
+            )
         policy = load_workspace_policy_file(
             self.settings.sandbox_egress_policy_dir, self.workspace_id
         )

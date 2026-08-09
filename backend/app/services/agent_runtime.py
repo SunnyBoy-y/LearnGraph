@@ -2396,6 +2396,61 @@ class AgentToolRuntime:
             },
         )
 
+    def _egress_authorization_challenge(
+        self,
+        hostname: str,
+        chat_session_id: str,
+        *,
+        purpose: str | None = None,
+        tool_call_id: str | None = None,
+        resume_payload: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Durable user approval before a generic Agent egress host may be used.
+
+        Mirrors ``_fetch_authorization_challenge`` but for the D2.1 generic
+        egress channel: the only authorization resource is the canonical
+        hostname (contract A). Pending is a suspension, never a failure — the
+        Agent run is marked ``waiting_egress_authorization`` so the transcript
+        shows a reviewable card instead of a hard error, and the model can
+        resume once the user decides.
+        """
+        from app.core.config import get_settings
+        from app.services.egress_approvals import EgressApprovalService
+
+        settings = get_settings()
+        service = EgressApprovalService(
+            self.extensions.db,
+            self.workspace_id,
+            settings,
+        )
+        request = service.create_request(
+            hostname=hostname,
+            requested_by=self.actor_id,
+            chat_session_id=chat_session_id or None,
+            purpose=purpose,
+            request_context={
+                "tool_name": "sandbox_exec",
+                "origin": "agent_runtime",
+            },
+            tool_call_id=tool_call_id,
+            resume_payload=resume_payload,
+        )
+        return self._failure(
+            "egress_authorization_required",
+            "沙箱出站访问需要用户授权",
+            data={
+                "authorization_request_id": request.id,
+                "tool_call_id": tool_call_id,
+                "tool_name": "sandbox_exec",
+                "tool_label": "沙箱命令工具",
+                "hostname": request.hostname,
+                "message_zh": (
+                    f"沙箱内的智能体需要访问主机 {request.hostname}，是否批准这次出站连接？"
+                ),
+                "resume_mode": "server" if resume_payload else None,
+            },
+        )
+
     def execute(
         self,
         tool_call: dict[str, Any],
@@ -6690,6 +6745,17 @@ class AgentToolRuntime:
                 "requested_url": details.get("requested_url"),
                 "hostname": details.get("hostname"),
                 "message_zh": details.get("message_zh") or "网页抓取需要用户授权。",
+            }
+        # Surface the D2.1 generic egress approval card (pending suspension).
+        if code == "egress_authorization_required":
+            meta["egress_authorization_required"] = {
+                "authorization_request_id": details.get("authorization_request_id"),
+                "tool_call_id": details.get("tool_call_id"),
+                "tool_name": details.get("tool_name") or "sandbox_exec",
+                "tool_label": details.get("tool_label") or "沙箱命令工具",
+                "hostname": details.get("hostname"),
+                "message_zh": details.get("message_zh")
+                or "沙箱出站访问需要用户授权。",
             }
         # Surface structured sandbox authorization challenges to the Chat SSE
         # assembler so the client can open an explicit grant dialog.

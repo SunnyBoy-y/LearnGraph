@@ -26,6 +26,7 @@ export type MessagePartType =
   | 'user_confirmation'
   | 'fetch_authorization'
   | 'fetch_setup_notice'
+  | 'egress_authorization'
   | 'error'
 
 export type MessagePartStatus = 'pending' | 'streaming' | 'completed' | 'failed'

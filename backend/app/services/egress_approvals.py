@@ -19,13 +19,17 @@ Two non-negotiable contracts:
   private/loopback/metadata address is still denied. This implementation does
   NOT bypass the classifier.
 
-This module does not touch ``web_fetch.policy``, ``UserWebFetchPolicy``, or the
-reviewed ``{workspace_id}.json`` policy files. The persistent allowlist is the
-``host_authorization_grants`` table in the ``agent_egress`` capability
-namespace; nothing here shares the web_fetch namespace.
+This module does not touch ``web_fetch.policy`` or ``UserWebFetchPolicy``. It
+derives the generic Agent egress policy from ``host_authorization_grants`` in
+the ``agent_egress`` capability namespace into ``{workspace_id}.json`` so the
+sandbox envelope and egress proxy see approval-derived hosts; it never shares
+the web_fetch namespace.
 """
 
+import json
+import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -44,6 +48,8 @@ from app.repositories.audit import AuditRepository
 from app.services.sandbox_network_policy import EgressPolicyInvalid, normalize_hostname
 
 ALLOWED_DECISIONS = frozenset({"allow_once", "allow_always", "deny"})
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -86,6 +92,105 @@ class EgressApprovalService:
                 "Egress authorization request was not found",
             )
         return request
+
+    def get_request(self, request_id: str) -> EgressAuthorizationRequest:
+        """Public read of one request (404 when missing / out of workspace)."""
+        return self._load(request_id)
+
+    def ensure_agent_egress_policy(self, *, now: datetime | None = None):
+        """Derive and persist the generic Agent egress policy for this workspace.
+
+        Source of truth: workspace-scoped ``agent_egress`` grants plus active
+        ``allow_once`` leases. A deployment-reviewed baseline file is preserved
+        and unioned so approvals only add hosts. When there are no active
+        approvals, the baseline (if any) is returned untouched; otherwise a
+        stale approval-derived file is removed so the sandbox fails closed.
+        Returns the effective policy or ``None`` (offline).
+        """
+        from app.services.sandbox_network_policy import (
+            AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
+            AGENT_EGRESS_POLICY_ISSUER,
+            AGENT_EGRESS_POLICY_MAX_TTL_SECONDS,
+            derive_egress_policy_for_agent,
+            load_workspace_policy_file,
+            store_workspace_policy_file,
+        )
+
+        current = now or _utc_now()
+        policy_dir = self.settings.sandbox_egress_policy_dir
+        baseline = load_workspace_policy_file(
+            policy_dir, self.workspace_id, now=current
+        )
+        # A file this service wrote itself is a derived snapshot, not a
+        # deployment baseline. Unioning it back in would resurrect consumed
+        # allow_once leases, so only a reviewed baseline with a different
+        # issuer is preserved.
+        baseline_is_reviewed = baseline is not None and baseline.issuer != AGENT_EGRESS_POLICY_ISSUER
+        hosts: set[str] = set()
+        expirations: list[datetime] = []
+        if baseline_is_reviewed:
+            hosts.update(item.host for item in baseline.hosts)
+            expirations.append(_as_utc(baseline.expires_at))
+        grants = self.db.scalars(
+            select(HostAuthorizationGrant).where(
+                HostAuthorizationGrant.workspace_id == self.workspace_id,
+                HostAuthorizationGrant.capability == EGRESS_APPROVAL_CAPABILITY,
+                HostAuthorizationGrant.subject_type == "workspace",
+                HostAuthorizationGrant.subject_id == self.workspace_id,
+                HostAuthorizationGrant.revoked_at.is_(None),
+            )
+        ).all()
+        hosts.update(grant.hostname for grant in grants)
+        leases = self.db.scalars(
+            select(EgressAuthorizationRequest).where(
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.capability == EGRESS_APPROVAL_CAPABILITY,
+                EgressAuthorizationRequest.status == "approved",
+                EgressAuthorizationRequest.decision == "allow_once",
+                EgressAuthorizationRequest.consumed_at.is_(None),
+            )
+        ).all()
+        for lease in leases:
+            lease_expires = _as_utc(lease.expires_at)
+            if lease_expires <= current:
+                continue
+            hosts.add(lease.hostname)
+            expirations.append(lease_expires)
+        if not hosts:
+            # No active approvals: preserve a reviewed baseline if present;
+            # otherwise remove any stale approval-derived file so the sandbox
+            # fails closed.
+            if baseline_is_reviewed:
+                return baseline
+            path = Path(policy_dir) / f"{self.workspace_id}.json"
+            if path.exists():
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    raw = None
+                if isinstance(raw, dict) and raw.get("issuer") == AGENT_EGRESS_POLICY_ISSUER:
+                    path.unlink(missing_ok=True)
+            return None
+        ttl = AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS
+        if expirations:
+            remaining = int((min(expirations) - current).total_seconds())
+            ttl = max(60, min(AGENT_EGRESS_POLICY_MAX_TTL_SECONDS, remaining))
+        try:
+            policy = derive_egress_policy_for_agent(
+                workspace_id=self.workspace_id,
+                allowed_hosts=hosts,
+                ttl_seconds=ttl,
+                now=current,
+            )
+            store_workspace_policy_file(policy_dir, policy)
+        except EgressPolicyInvalid as exc:
+            logger.warning(
+                "agent egress policy derivation failed for workspace %s: %s",
+                self.workspace_id,
+                exc.reason,
+            )
+            return baseline
+        return policy
 
     def _upsert_workspace_grant(
         self,
@@ -146,6 +251,10 @@ class EgressApprovalService:
         ttl_seconds: int = EGRESS_APPROVAL_DEFAULT_TTL_SECONDS,
         dedupe_key: str | None = None,
         now: datetime | None = None,
+        assistant_message_id: str | None = None,
+        user_message_id: str | None = None,
+        tool_call_id: str | None = None,
+        resume_payload: dict[str, Any] | None = None,
     ) -> EgressAuthorizationRequest:
         """Create (or return the existing) pending approval request.
 
@@ -181,6 +290,18 @@ class EgressApprovalService:
             )
         )
         if existing is not None:
+            # Back-fill correlation fields on a reused pending request so a
+            # repeated tool call still links the card to this assistant turn.
+            if assistant_message_id and not existing.assistant_message_id:
+                existing.assistant_message_id = assistant_message_id
+            if user_message_id and not existing.user_message_id:
+                existing.user_message_id = user_message_id
+            if tool_call_id and not existing.tool_call_id:
+                existing.tool_call_id = tool_call_id
+            if resume_payload and not existing.resume_payload:
+                existing.resume_payload = resume_payload
+            self.db.commit()
+            self.db.refresh(existing)
             return existing
 
         context = dict(request_context or {})
@@ -199,6 +320,10 @@ class EgressApprovalService:
             expires_at=current + timedelta(seconds=ttl_seconds),
             ttl_seconds=ttl_seconds,
             dedupe_key=source,
+            assistant_message_id=assistant_message_id,
+            user_message_id=user_message_id,
+            tool_call_id=tool_call_id,
+            resume_payload=resume_payload,
         )
         self.db.add(request)
         self.db.flush()
@@ -284,6 +409,13 @@ class EgressApprovalService:
         )
         self.db.commit()
         self.db.refresh(request)
+        try:
+            self.ensure_agent_egress_policy(now=current)
+        except Exception:
+            logger.exception(
+                "agent egress policy refresh failed after decision for workspace %s",
+                self.workspace_id,
+            )
         return request
 
     def list_requests(
@@ -381,6 +513,13 @@ class EgressApprovalService:
         )
         self.db.commit()
         self.db.refresh(request)
+        try:
+            self.ensure_agent_egress_policy()
+        except Exception:
+            logger.exception(
+                "agent egress policy refresh failed after consume for workspace %s",
+                self.workspace_id,
+            )
         return request
 
     # -- allowlist resolution (T4.1 / Phase 2 consumption point) --------------

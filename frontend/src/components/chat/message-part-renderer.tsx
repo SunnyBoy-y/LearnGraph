@@ -56,6 +56,7 @@ import { downloadFile } from "@/api/files";
 import { confirmSkillDeletion } from "@/api/extensions";
 import { approveResearch } from "@/api/research";
 import { decideFetchAuthorization, resumeFetchAuthorization } from "@/api/fetch-authorizations";
+import { decideEgressApproval, resumeEgressApproval } from "@/api/egress";
 import {
   TrustedComponentRenderer,
   type TrustedComponentAction,
@@ -85,6 +86,7 @@ import { decodeUrlForDisplay } from "@/lib/url-display";
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
 import type { FetchAuthorizationData, FetchAuthorizationDecision } from "@/types/fetch-authorization";
+import type { EgressAuthorizationCardData, EgressAuthorizationDecision } from "@/types/egress";
 
 type PartData = Record<string, unknown> | undefined;
 
@@ -1496,6 +1498,73 @@ function WebFetchAuthorizationCard({ data }: { data: FetchAuthorizationData }) {
   );
 }
 
+function EgressAuthorizationCard({ data }: { data: EgressAuthorizationCardData }) {
+  const requestId = data.authorization_request_id ?? "";
+  const [state, setState] = useState<"pending" | "submitting" | "approved" | "denied">(
+    data.authorization_status === "approved" || data.decision === "allow_once" || data.decision === "allow_always"
+      ? "approved"
+      : data.authorization_status === "denied" || data.decision === "deny"
+        ? "denied"
+        : "pending",
+  );
+  const [error, setError] = useState("");
+  const decide = async (decision: EgressAuthorizationDecision) => {
+    if (!requestId) return;
+    setState("submitting");
+    setError("");
+    try {
+      await decideEgressApproval(requestId, decision);
+      if (decision !== "deny" && data.resume_mode === "server") {
+        // Server-side resume: re-inject the approval into the suspended Agent
+        // turn and re-run the model (D2.1 T4.1).
+        await resumeEgressApproval(requestId);
+      } else if (decision !== "deny" && data.hostname) {
+        // Agent-mode fallback: prompt the model to retry the sandbox command
+        // that needed the host; the grant/lease is consumed on the next attempt.
+        window.dispatchEvent(new CustomEvent("learngraph:compose", {
+          detail: {
+            content: `已批准沙箱访问主机 ${data.hostname}。请继续执行刚才需要该主机的命令。`,
+            autoSend: true,
+          },
+        }));
+      }
+      // Refresh persisted history after every decision (including deny) so a
+      // remount or a second browser shows the terminal card, not a live one.
+      window.dispatchEvent(new CustomEvent("learngraph:refresh-messages"));
+      setState(decision === "deny" ? "denied" : "approved");
+      toast.success(
+        decision === "allow_always"
+          ? "已加入 Egress 允许列表"
+          : decision === "allow_once"
+            ? "已允许本次出站访问"
+            : "已拒绝出站访问",
+      );
+    } catch (cause) {
+      setState("pending");
+      setError(cause instanceof Error ? cause.message : "授权操作失败");
+    }
+  };
+  if (!requestId) return null;
+  if (state === "approved" || state === "denied") {
+    return <section className="mt-3 rounded-xl border border-muted p-4 text-sm text-muted-foreground">{state === "approved" ? "沙箱出站访问已获授权。" : "已拒绝沙箱出站访问。"}</section>;
+  }
+  return (
+    <section aria-label="沙箱出站授权" className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20">
+      <div>
+        <strong className="text-amber-700 dark:text-amber-400">需要沙箱出站授权</strong>
+        <p className="mt-1 break-words text-sm text-foreground">{data.message_zh || `沙箱内的智能体需要访问主机 ${data.hostname || "该"}主机，是否批准？`}</p>
+        {data.hostname ? <p className="mt-1 text-xs text-muted-foreground">主机：{data.hostname}</p> : null}
+      </div>
+      {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
+      <div className="flex flex-wrap gap-2">
+        <Button disabled={state === "submitting"} onClick={() => void decide("allow_once")} size="sm">{state === "submitting" ? "处理中…" : "允许一次"}</Button>
+        <Button disabled={state === "submitting"} onClick={() => void decide("allow_always")} size="sm" variant="outline">总是允许</Button>
+        <Button disabled={state === "submitting"} onClick={() => void decide("deny")} size="sm" variant="ghost">拒绝</Button>
+      </div>
+    </section>
+  );
+}
+
 function FetchSetupNoticePart({ data }: { data: PartData }) {
   const { workspaceId } = useAuth();
   const navigate = useNavigate();
@@ -1645,6 +1714,8 @@ export function MessagePartRenderer({
       return <WebFetchAuthorizationCard data={(part.data ?? {}) as FetchAuthorizationData} />;
     case "fetch_setup_notice":
       return <FetchSetupNoticePart data={part.data} />;
+    case "egress_authorization":
+      return <EgressAuthorizationCard data={(part.data ?? {}) as EgressAuthorizationCardData} />;
     case "graph_context":
       return <GraphContextPart data={part.data} />;
     case "quiz":
