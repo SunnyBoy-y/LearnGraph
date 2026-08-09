@@ -40,7 +40,9 @@ const MigrationPage = lazy(() => import('@/features/settings/governance-pages').
 const WorkspaceSettingsPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.WorkspaceSettingsPage })))
 const PersonalizationPage = lazy(() => import('@/features/settings/personalization-page').then((module) => ({ default: module.PersonalizationPage })))
 const AccessManagementPage = lazy(() => import('@/features/settings/control-pages').then((module) => ({ default: module.AccessManagementPage })))
+const EgressApprovalsPage = lazy(() => import('@/features/settings/egress-approvals-page').then((module) => ({ default: module.EgressApprovalsPage })))
 const AboutPage = lazy(() => import('@/features/settings/about-page').then((module) => ({ default: module.AboutPage })))
+const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -142,7 +144,9 @@ function AppRoutes() {
         <Route element={<WorkspaceSettingsPage />} path="settings/workspace" />
         <Route element={<PersonalizationPage />} path="settings/personalization" />
         <Route element={<AccessManagementPage />} path="settings/access" />
+        <Route element={<EgressApprovalsPage />} path="settings/egress" />
         <Route element={<AboutPage />} path="settings/about" />
+        <Route element={<ArtifactsPage />} path="settings/artifacts" />
       </Route>
       <Route element={<NotFound />} path="*" />
     </Routes></Suspense>

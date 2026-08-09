@@ -12,6 +12,7 @@ from app.domain.schemas.artifacts import (
     ArtifactShareTokenCreated,
     ArtifactShareTokenCreate,
     ArtifactShareTokenView,
+    ArtifactSummaryView,
     ArtifactVersionCreate,
     ArtifactVersionView,
     ArtifactView,
@@ -29,6 +30,53 @@ def service(db, context, settings):
         context.principal.user_id,
         context.principal.tenant_id,
     )
+
+
+@router.get("/artifacts", response_model=list[ArtifactSummaryView])
+def list_artifacts(
+    db: DB,
+    context: CurrentWorkspace,
+) -> list[ArtifactSummaryView]:
+    context.require_permission("workspace.read")
+    rows = service(db, context, None).list_artifact_summaries()
+    return [
+        ArtifactSummaryView.model_validate(
+            {**artifact.__dict__, "version_count": version_count}
+        )
+        for artifact, version_count in rows
+    ]
+
+
+@router.get(
+    "/artifacts/{artifact_id}/versions",
+    response_model=list[ArtifactVersionView],
+)
+def list_artifact_versions(
+    artifact_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> list[ArtifactVersionView]:
+    context.require_permission("workspace.read")
+    return [
+        ArtifactVersionView.model_validate(version)
+        for version in service(db, context, None).list_versions(artifact_id)
+    ]
+
+
+@router.get(
+    "/artifacts/versions/{version_id}/share-tokens",
+    response_model=list[ArtifactShareTokenView],
+)
+def list_artifact_share_tokens(
+    version_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> list[ArtifactShareTokenView]:
+    context.require_permission("workspace.read")
+    return [
+        ArtifactShareTokenView.model_validate(token)
+        for token in service(db, context, None).list_share_tokens(version_id)
+    ]
 
 
 @router.post("/artifacts", response_model=ArtifactView, status_code=status.HTTP_201_CREATED)

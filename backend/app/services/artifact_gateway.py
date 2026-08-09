@@ -33,6 +33,54 @@ class ArtifactGatewayService:
         self.db.refresh(artifact)
         return artifact
 
+    def list_artifact_summaries(self) -> list[tuple[Artifact, int]]:
+        rows = (
+            self.db.execute(
+                select(Artifact, func.count(ArtifactVersion.id))
+                .outerjoin(
+                    ArtifactVersion,
+                    ArtifactVersion.artifact_id == Artifact.id,
+                )
+                .where(
+                    Artifact.workspace_id == self.workspace_id,
+                    Artifact.tenant_id == self.tenant_id,
+                    Artifact.status == "active",
+                )
+                .group_by(Artifact.id)
+                .order_by(Artifact.created_at.desc())
+            )
+            .all()
+        )
+        return [(artifact, count) for artifact, count in rows]
+
+    def list_versions(self, artifact_id: str) -> list[ArtifactVersion]:
+        artifact = self.db.scalar(
+            select(Artifact).where(
+                Artifact.id == artifact_id,
+                Artifact.workspace_id == self.workspace_id,
+                Artifact.tenant_id == self.tenant_id,
+            )
+        )
+        if artifact is None:
+            raise AppError(404, "artifact_not_found", "Artifact was not found")
+        return list(
+            self.db.scalars(
+                select(ArtifactVersion)
+                .where(ArtifactVersion.artifact_id == artifact.id)
+                .order_by(ArtifactVersion.version.desc())
+            )
+        )
+
+    def list_share_tokens(self, version_id: str) -> list[ArtifactShareToken]:
+        version = self._version_for_workspace(version_id)
+        return list(
+            self.db.scalars(
+                select(ArtifactShareToken)
+                .where(ArtifactShareToken.artifact_version_id == version.id)
+                .order_by(ArtifactShareToken.created_at.desc())
+            )
+        )
+
     def publish_version(
         self,
         artifact_id: str,

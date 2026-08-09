@@ -4,7 +4,9 @@ import {
   Bot,
   CircleDollarSign,
   Database,
+  Globe,
   Info,
+  Package,
   Palette,
   Search,
   ShieldCheck,
@@ -28,8 +30,10 @@ export const settingsNav: SettingsNavItem[] = [
   { label: "扩展中心", icon: Sparkles, path: "settings/extensions" },
   { label: "搜索与研究", icon: Search, path: "settings/research" },
   { label: "账户与访问", icon: UsersRound, path: "settings/access" },
+  { label: "Egress 审批", icon: Globe, path: "settings/egress" },
   { label: "权限审计", icon: ShieldCheck, path: "settings/audit" },
   { label: "存储迁移", icon: Database, path: "settings/storage/migrations" },
+  { label: "产物与分享", icon: Package, path: "settings/artifacts" },
   { label: "关于", icon: Info, path: "settings/about" },
 ];
 

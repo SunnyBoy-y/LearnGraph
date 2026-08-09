@@ -32,6 +32,11 @@ class ArtifactView(ORMModel):
     name: str
     description: str
     status: str
+    created_at: datetime
+
+
+class ArtifactSummaryView(ArtifactView):
+    version_count: int = 0
 
 
 class ArtifactVersionView(ORMModel):
@@ -48,6 +53,7 @@ class ArtifactVersionView(ORMModel):
     published_by: str
     release_notes: str
     status: str
+    created_at: datetime
 
 
 class ArtifactShareTokenView(ORMModel):
@@ -59,6 +65,7 @@ class ArtifactShareTokenView(ORMModel):
     max_downloads: int | None = None
     download_count: int
     revoked_at: datetime | None = None
+    created_at: datetime
 
 
 class ArtifactShareTokenCreated(ArtifactShareTokenView):
