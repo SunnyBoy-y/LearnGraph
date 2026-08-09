@@ -178,6 +178,28 @@ npm run dev
 npm run dev -- --frontend-port 5174 --backend-port 8001
 ```
 
+### 通过 FRP / 内网穿透访问
+
+开发模式默认由 Vite 把 `/api` 以及 WebSocket 代理到本机后端，因此常规页面功能只暴露 `5173` 即可，不需要把 `8000` 也暴露到公网。
+
+| 本地端口 | 是否需要公网映射 | 用途 |
+| --- | --- | --- |
+| `5173` | 必需，已映射 | Vite 前端、同源 `/api`、SSE、实时听写 WebSocket |
+| `8001` | 使用交互式子应用/卡片时需要 | 独立 subapp preview 源，必须映射到另一个公网端口 |
+| `8000` | 可选 | 仅当需要公网直接访问 OpenAPI/API 时；普通页面由 `5173` 代理 |
+
+以当前 `https://frp-sea.com:23350` 为例，再把本地 `8001` 映射为公网 `23351`，启动：
+
+```bash
+npm run dev -- \
+  --public-origin https://frp-sea.com:23350 \
+  --preview-public-origin https://frp-sea.com:23351
+```
+
+如果 FRP 客户端不在运行服务的这台机器上，需要让服务监听局域网/外部地址，再额外加 `--lan`，或在 `frontend/.env` 设置 `LEARNGRAPH_LISTEN_HOST=0.0.0.0`。FRP 客户端在同一台机器上时默认的 `127.0.0.1` 绑定即可工作。
+
+也可以在环境文件中配置：`frontend/.env` 填 `LEARNGRAPH_PUBLIC_ORIGIN`，`backend/.env` 填 `LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN`。Vite 会自动允许公网 Host；`scripts/dev.mjs` 会自动把公网源加入 CORS，并把 subapp 预览 URL 切换成公网源。
+
 脚本使用 Node.js 编排，在 Windows、macOS 和 Linux 上使用相同命令。当前发布整理已在 Windows 上完成实际检查；macOS/Linux 建议在发布前通过 CI 或目标设备复核。
 
 ### 首次登录

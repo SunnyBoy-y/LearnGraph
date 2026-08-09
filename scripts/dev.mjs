@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -62,6 +62,8 @@ function parseArguments(argv) {
     previewPort: 8001,
     install: false,
     lan: false,
+    publicOrigin: process.env.LEARNGRAPH_PUBLIC_ORIGIN?.trim() || '',
+    previewPublicOrigin: process.env.LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN?.trim() || '',
     help: false,
   }
 
@@ -91,6 +93,13 @@ function parseArguments(argv) {
       else options.backendPort = port
       continue
     }
+    if (name === '--public-origin' || name === '--preview-public-origin') {
+      const value = inlineValue ?? argv[++index]
+      if (value === undefined) throw new Error(`${name} requires a value.`)
+      if (name === '--public-origin') options.publicOrigin = value.trim()
+      else options.previewPublicOrigin = value.trim()
+      continue
+    }
 
     throw new Error(`Unknown option: ${argument}`)
   }
@@ -112,6 +121,9 @@ Options:
   --frontend-port <port>    First Vite port to try; uses the next free port if needed (default: 5173)
   --backend-port <port>     Uvicorn main API port (default: 8000)
   --preview-port <port>     Uvicorn subapp preview origin port (default: 8001)
+  --public-origin <origin>  Public URL exposed by FRP/port forwarding for Vite (e.g. https://frp-sea.com:23350)
+  --preview-public-origin <origin>
+                            Public URL exposed for the subapp preview port (e.g. https://frp-sea.com:23351)
   -h, --help                Show this help`)
 }
 
@@ -154,6 +166,40 @@ function requireFile(filePath) {
   if (!existsSync(filePath)) {
     throw new Error(`Required file is missing: ${path.relative(repoRoot, filePath)}`)
   }
+}
+
+function loadSimpleEnv(filePath) {
+  const values = {}
+  if (!existsSync(filePath)) return values
+  for (const rawLine of readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line)
+    if (!match) continue
+    let value = match[2].trim()
+    if (value.length >= 2) {
+      const first = value[0]
+      const last = value[value.length - 1]
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+        value = value.slice(1, -1)
+      }
+    }
+    values[match[1]] = value
+  }
+  return values
+}
+
+function withOriginInCors(existing, origin) {
+  if (!origin) return existing
+  let origins
+  try {
+    origins = JSON.parse(existing)
+  } catch {
+    origins = existing.split(',').map((item) => item.trim()).filter(Boolean)
+  }
+  if (!Array.isArray(origins)) origins = []
+  if (!origins.includes(origin)) origins.push(origin)
+  return JSON.stringify(origins)
 }
 
 function npmCommand(args) {
@@ -362,6 +408,33 @@ async function main() {
   requireFile(path.join(backendDir, 'uv.lock'))
   initializeEnvFiles({ backendDir, frontendDir, repoRoot })
 
+  const frontendEnv = loadSimpleEnv(path.join(frontendDir, '.env'))
+  const backendEnv = loadSimpleEnv(path.join(backendDir, '.env'))
+  const publicOrigin = (options.publicOrigin || frontendEnv.LEARNGRAPH_PUBLIC_ORIGIN || '').trim()
+  const previewPublicOrigin = (
+    options.previewPublicOrigin ||
+    backendEnv.LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN ||
+    ''
+  ).trim()
+  const allowedHosts = new Set()
+  for (const raw of [
+    process.env.LEARNGRAPH_ALLOWED_HOSTS,
+    frontendEnv.LEARNGRAPH_ALLOWED_HOSTS,
+  ]) {
+    if (!raw) continue
+    for (const host of raw.split(',')) {
+      const trimmed = host.trim()
+      if (trimmed) allowedHosts.add(trimmed)
+    }
+  }
+  if (publicOrigin) {
+    try {
+      allowedHosts.add(new URL(publicOrigin).hostname)
+    } catch {
+      // The Vite config surfaces invalid origins; do not block local startup here.
+    }
+  }
+
   if (options.install) {
     await runChecked('Installing frontend dependencies from package-lock.json', npmCommand(['ci']), frontendDir)
     await runChecked(
@@ -381,9 +454,18 @@ async function main() {
   if (frontendPort !== options.frontendPort) {
     console.log(`Frontend port ${options.frontendPort} is in use; using ${frontendPort} instead.`)
   }
+  if (publicOrigin && frontendPort !== options.frontendPort) {
+    console.warn(
+      `WARNING: ${publicOrigin} is tunneled to local port ${options.frontendPort}, but Vite ` +
+        `started on ${frontendPort}. Free port ${options.frontendPort} or start with ` +
+        `--frontend-port ${frontendPort} so the tunnel points at the running server.`,
+    )
+  }
 
   const listenHost =
-    process.env.LEARNGRAPH_LISTEN_HOST?.trim() || (options.lan ? '0.0.0.0' : '127.0.0.1')
+    process.env.LEARNGRAPH_LISTEN_HOST?.trim() ||
+    frontendEnv.LEARNGRAPH_LISTEN_HOST?.trim() ||
+    (options.lan ? '0.0.0.0' : '127.0.0.1')
   if (listenHost !== '127.0.0.1' && listenHost !== 'localhost' && listenHost !== '::1') {
     console.warn(
       `\nWARNING: LearnGraph development services are exposed on ${listenHost}. ` +
@@ -395,13 +477,15 @@ async function main() {
   // Default to same-origin '/' so the browser calls the Vite dev proxy and
   // CORS never applies, whichever port the frontend lands on. An explicit
   // VITE_API_BASE_URL still opts into calling the backend directly.
-  const apiBaseUrl = process.env.VITE_API_BASE_URL?.trim() || '/'
-  const corsOrigins =
+  const apiBaseUrl = process.env.VITE_API_BASE_URL?.trim() || frontendEnv.VITE_API_BASE_URL?.trim() || '/'
+  const configuredCorsOrigins =
     process.env.LEARNGRAPH_CORS_ORIGINS?.trim() ||
+    backendEnv.LEARNGRAPH_CORS_ORIGINS?.trim() ||
     JSON.stringify([
       `http://localhost:${frontendPort}`,
       frontendOrigin,
     ])
+  const corsOrigins = withOriginInCors(configuredCorsOrigins, publicOrigin)
 
   // Subapp preview origin: a separate process on its own port so the preview
   // iframe origin is distinct from the main API origin. The main backend mints
@@ -446,6 +530,9 @@ async function main() {
           // explicitly configured a real domain (persisted frontend config or
           // LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN still wins inside the backend).
           LEARNGRAPH_SUBAPP_PREVIEW_PORT: String(previewPort),
+          ...(previewPublicOrigin
+            ? { LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: previewPublicOrigin }
+            : {}),
         },
       },
     )
@@ -501,6 +588,8 @@ async function main() {
         ...process.env,
         VITE_API_BASE_URL: apiBaseUrl,
         LEARNGRAPH_BACKEND_ORIGIN: backendOrigin,
+        LEARNGRAPH_PUBLIC_ORIGIN: publicOrigin,
+        LEARNGRAPH_ALLOWED_HOSTS: allowedHosts.size > 0 ? [...allowedHosts].join(',') : '',
       },
     },
   )
@@ -557,8 +646,9 @@ async function main() {
 
       if (!announcedReady) {
         console.log(`\nLearnGraph is ready: ${frontendOrigin}`)
+        if (publicOrigin) console.log(`Public entry: ${publicOrigin}`)
         console.log(`API health: ${backendHealthUrl}`)
-        console.log(`Subapp preview: ${previewHealthUrl}`)
+        console.log(`Subapp preview: ${previewPublicOrigin || previewHealthUrl}`)
         console.log(`OpenAPI: ${backendOrigin}/docs`)
         console.log('Press Ctrl+C to stop all services.')
         announcedReady = true
