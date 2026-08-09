@@ -441,6 +441,18 @@ def list_memory_drafts(
     session_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     goal_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
 ) -> list[MemoryDraftView]:
+    """List memory drafts (INTERNAL API).
+
+    Memory drafts are the human-confirmation gate of the memory extraction
+    pipeline: agents/extraction only *propose* drafts, and only committed
+    drafts become MemoryRecord entries (mirrored into the v2 event stream).
+
+    This endpoint family is primarily consumed by the extraction pipeline and
+    memory governance tooling. The frontend confirmation surface should read
+    committed/active memories via ``/memory`` (state=active) and resolve any
+    PENDING drafts through ``/drafts/{id}/decision``; do not expose raw draft
+    CRUD as a general-purpose UI contract.
+    """
     return service(db, context, settings).list_drafts(
         status=status_filter,
         session_id=session_id,
@@ -455,6 +467,7 @@ def create_memory_draft(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> MemoryDraftView:
+    """Create a memory draft (INTERNAL API — used by the extraction pipeline)."""
     return service(db, context, settings).create_draft(payload)
 
 
@@ -465,6 +478,7 @@ def get_memory_draft(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> MemoryDraftView:
+    """Get a single memory draft (INTERNAL API)."""
     return service(db, context, settings).get_draft(draft_id)
 
 
@@ -476,6 +490,12 @@ def decide_memory_draft(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> MemoryDraftView:
+    """Decide a pending memory draft (INTERNAL API).
+
+    ``commit`` materialises the draft into a MemoryRecord (and mirrors the
+    event into the v2 stream); ``reject`` marks it REJECTED. Used by the
+    extraction pipeline and the pending-confirmation governance surface.
+    """
     return service(db, context, settings).decide_draft(draft_id, payload)
 
 

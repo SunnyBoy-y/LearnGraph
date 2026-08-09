@@ -261,6 +261,66 @@ export interface MemoryProfileIntentResult {
   profile_status: string
 }
 
+/**
+ * Memory draft (mirrors backend MemoryDraftView).
+ *
+ * Drafts are the human-confirmation gate of the memory extraction pipeline:
+ * agents/extraction only *propose* drafts (PENDING), and only committed
+ * drafts become active MemoryRecords. The draft endpoint family is an
+ * internal contract — the UI consumes it only through the
+ * pending-confirmation governance surface.
+ */
+export interface MemoryDraft {
+  id: string
+  workspace_id: string
+  operation:
+    | 'CREATE'
+    | 'UPDATE'
+    | 'CORRECT'
+    | 'CONFIRM'
+    | 'COMPLETE'
+    | 'CANCEL'
+    | 'RESCHEDULE'
+    | 'MERGE'
+    | 'SUPERSEDE'
+    | 'RETRACT'
+    | 'PROMOTE'
+    | 'DEMOTE'
+    | 'ARCHIVE'
+  status: 'PENDING' | 'COMMITTED' | 'REJECTED' | 'CANCELLED'
+  memory_type: string
+  target_memory_id: string | null
+  proposed_scope_type: 'workspace' | 'goal' | 'node' | 'session'
+  proposed_scope_id: string | null
+  goal_id: string | null
+  node_id: string | null
+  session_id: string | null
+  branch_session_id: string | null
+  title: string
+  content: string
+  structured_payload: Record<string, unknown>
+  source_refs: Array<Record<string, unknown>>
+  confidence: number
+  importance: number
+  suggested_decay_policy: string
+  conflicts_with: string[]
+  created_by: string
+  reviewed_by: string | null
+  reviewed_at: IsoDateTime | null
+  rejection_reason: string
+  result_memory_id: string | null
+  result_revision: number | null
+  created_at: IsoDateTime
+  updated_at: IsoDateTime
+}
+
+export type MemoryDraftDecision = 'commit' | 'reject'
+
+export interface MemoryDraftDecisionRequest {
+  decision: MemoryDraftDecision
+  reason?: string
+}
+
 export interface MemoryProviderStatus {
   provider_id: string
   provider_type: string

@@ -4,6 +4,8 @@ import type {
   EffectiveMemoryPackage,
   MemoryCreateRequest,
   MemoryBinding,
+  MemoryDraft,
+  MemoryDraftDecisionRequest,
   MemoryEmbeddingPruneResult,
   MemoryEmbeddingReindexResult,
   MemoryEnhancement,
@@ -26,7 +28,7 @@ import type {
   MemoryZone,
 } from '@/types/memory'
 
-import { apiClient } from './client'
+import { apiClient, type QueryParams } from './client'
 
 export function listMemories(params: {
   zone?: MemoryZone
@@ -225,5 +227,44 @@ export function getGoalMemoryOverview(goalId: string): Promise<GoalMemoryOvervie
 export function archiveGoalMemories(goalId: string): Promise<{ archived: number }> {
   return apiClient.post<{ archived: number }>(
     `/memory/goal-archive/${encodeURIComponent(goalId)}`,
+  )
+}
+
+export interface MemoryDraftListParams {
+  status?: 'PENDING' | 'COMMITTED' | 'REJECTED' | 'CANCELLED'
+  session_id?: string
+  goal_id?: string
+}
+
+/**
+ * List memory drafts (internal contract).
+ *
+ * Drafts are the human-confirmation gate of the memory extraction pipeline.
+ * The pending-confirmation governance surface reads PENDING drafts here and
+ * resolves them via `decideMemoryDraft`; committed drafts materialise into
+ * active memories readable through `listMemories`.
+ */
+export function listMemoryDrafts(
+  params: MemoryDraftListParams = {},
+): Promise<MemoryDraft[]> {
+  const query: QueryParams = {
+    ...(params.status ? { status: params.status } : {}),
+    ...(params.session_id ? { session_id: params.session_id } : {}),
+    ...(params.goal_id ? { goal_id: params.goal_id } : {}),
+  }
+  return apiClient.get<MemoryDraft[]>('/memory/drafts', { query })
+}
+
+export function getMemoryDraft(draftId: string): Promise<MemoryDraft> {
+  return apiClient.get<MemoryDraft>(`/memory/drafts/${encodeURIComponent(draftId)}`)
+}
+
+export function decideMemoryDraft(
+  draftId: string,
+  payload: MemoryDraftDecisionRequest,
+): Promise<MemoryDraft> {
+  return apiClient.post<MemoryDraft, MemoryDraftDecisionRequest>(
+    `/memory/drafts/${encodeURIComponent(draftId)}/decision`,
+    payload,
   )
 }
