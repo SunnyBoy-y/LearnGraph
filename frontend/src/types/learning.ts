@@ -3,6 +3,11 @@ import type { IsoDateTime, UnknownRecord } from "./common";
 export type EvidenceSourceType =
   "conversation" | "exercise" | "file" | "user_correction" | "artifact";
 
+/**
+ * @deprecated 旧版证据写入模型（POST /api/v1/evidence）。
+ * 新证据链路统一使用 POST /api/v1/learning/evidence（事件溯源）；
+ * 本类型仅保留给旧端点兼容期使用，前端不得再新增创建入口。
+ */
 export interface EvidenceCreateRequest {
   node_id: string;
   source_type: EvidenceSourceType;

@@ -22,6 +22,16 @@ from app.services.mastery import MasteryService
 
 router = APIRouter(tags=["evidence-mastery"])
 
+# 旧版证据模型说明（2026-08-08 决策 D-20260808-01）
+# -----------------------------------------------------------
+# POST /evidence 是旧版证据写入模型，写入独立的 EvidenceRecord 存储；
+# 当前证据链路已统一收敛到事件溯源版 POST /api/v1/learning/evidence
+# （事件 -> 投影状态机 -> MasteryService）。前端与 Agent 运行时均未调用
+# 旧写入端点，保留它仅为兼容期兼容，不再新增 UI/工具入口。
+# GET /evidence 与 POST /evidence/{evidence_id}/decision 仍用于读取和
+# 审核既有旧版证据，暂不废弃。
+# -----------------------------------------------------------
+
 
 def service(db: DB, context: CurrentWorkspace) -> EvidenceService:
     return EvidenceService(db, context.workspace_id, context.principal.user_id)
@@ -36,8 +46,18 @@ def list_evidence(db: DB, context: CurrentWorkspace) -> list[EvidenceView]:
     return [EvidenceView.model_validate(item) for item in service(db, context).list()]
 
 
-@router.post("/evidence", response_model=EvidenceView, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/evidence",
+    response_model=EvidenceView,
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+)
 def create_evidence(payload: EvidenceCreateRequest, db: DB, context: CurrentWorkspace) -> EvidenceView:
+    """DEPRECATED: 旧版证据写入模型，已由 POST /api/v1/learning/evidence 取代。
+
+    兼容期保留本端点以读取/迁移既有数据链路；新功能一律写入
+    /api/v1/learning/evidence，后续版本将移除本端点。
+    """
     return EvidenceView.model_validate(service(db, context).create(payload))
 
 

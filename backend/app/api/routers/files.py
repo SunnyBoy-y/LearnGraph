@@ -295,6 +295,7 @@ def list_file_references(
     "/{file_id}/references",
     response_model=FileReferenceView,
     status_code=status.HTTP_201_CREATED,
+    deprecated=True,
 )
 def create_file_reference(
     file_id: str,
@@ -366,7 +367,7 @@ def delete_file_confirmed(
     )
 
 
-@router.delete("/{file_id}", response_model=ActionResponse)
+@router.delete("/{file_id}", response_model=ActionResponse, deprecated=True)
 def delete_file(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> ActionResponse:
     _require_file_access(db, context, file_id, "delete")
     service(db, context, settings).delete(file_id)
