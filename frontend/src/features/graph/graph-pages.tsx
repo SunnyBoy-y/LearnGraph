@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type PointerEvent,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRight,
@@ -387,6 +394,43 @@ function GraphBookshelf({
       event.currentTarget.releasePointerCapture(event.pointerId);
   }
 
+  function handleConstellationKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget) return;
+    const step = event.shiftKey ? 48 : 24;
+    switch (event.key) {
+      case "ArrowLeft":
+        event.preventDefault();
+        setConstellation((current) => ({ ...current, x: current.x - step }));
+        break;
+      case "ArrowRight":
+        event.preventDefault();
+        setConstellation((current) => ({ ...current, x: current.x + step }));
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        setConstellation((current) => ({ ...current, y: current.y - step }));
+        break;
+      case "ArrowDown":
+        event.preventDefault();
+        setConstellation((current) => ({ ...current, y: current.y + step }));
+        break;
+      case "+":
+      case "=":
+        event.preventDefault();
+        adjustScale(0.15);
+        break;
+      case "-":
+      case "_":
+        event.preventDefault();
+        adjustScale(-0.15);
+        break;
+      case "0":
+        event.preventDefault();
+        setConstellation({ scale: 1, x: 0, y: 0 });
+        break;
+    }
+  }
+
   return (
     <section className="graph-library" aria-label="图谱书架">
       <header className="graph-library__header">
@@ -517,7 +561,7 @@ function GraphBookshelf({
           >
             <span>
               <Move className="size-3.5" />
-              拖动画布
+              拖动画布 · 方向键平移
             </span>
             <Button
               aria-label="缩小核心分布图"
@@ -558,7 +602,9 @@ function GraphBookshelf({
           </div>
           <div
             className="graph-library__constellation"
+            aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown + - 0"
             aria-label="以正在学习图谱为核心的分布视图"
+            onKeyDown={handleConstellationKeyDown}
             onPointerCancel={endDrag}
             onPointerDown={startDrag}
             onPointerMove={moveDrag}
@@ -567,6 +613,7 @@ function GraphBookshelf({
               event.preventDefault();
               adjustScale(event.deltaY > 0 ? -0.08 : 0.08);
             }}
+            tabIndex={0}
           >
             <div
               className="graph-library__constellation-stage"

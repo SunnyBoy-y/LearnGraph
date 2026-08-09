@@ -599,7 +599,7 @@ function ConversationJumpNav({
             >
               <span>{index + 1}</span>
               <strong>{item.label}</strong>
-              {item.branch ? <GitBranch aria-label="分支问答" /> : null}
+              {item.branch ? <GitBranch aria-label="分支问答" role="img" /> : null}
             </button>
           ))}
         </div>
@@ -613,7 +613,7 @@ function ConversationJumpNav({
                 type="button"
               >
                 <strong>{branch.label}</strong>
-                <GitBranch aria-label="分支会话" />
+                <GitBranch aria-label="分支会话" role="img" />
               </button>
             ))}
           </div>
@@ -5093,7 +5093,17 @@ export function ChatCanvasPage() {
               }
               return;
             } catch {
-              // Preserve the streamed failure below until persistence catches up.
+              // The durable message exists but the detail endpoint failed (e.g.
+              // an unknown part type). Fall back to the timeline query and drop
+              // the optimistic rows so the UI never renders the same turn twice.
+              void queryClient.invalidateQueries({
+                queryKey: workspaceQueryKey(workspaceId, "messages", targetSessionId),
+              });
+              setLocalMessages((current) =>
+                current.filter(
+                  (message) => message.id !== user.id && message.id !== assistant.id,
+                ),
+              );
             }
           }
           markSessionGenerationFinished(targetSessionId, {

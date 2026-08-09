@@ -131,7 +131,7 @@ export function LoginPage() {
         {registerMode ? (
           <form onSubmit={submitRegister}>
             <div className="eyebrow">
-              <UserRound /> 创建你的学习空间
+              <UserRound aria-hidden="true" /> 创建你的学习空间
             </div>
             <h1 id="auth-title">注册 LearnGraph</h1>
             <p className="form-intro">
@@ -140,7 +140,7 @@ export function LoginPage() {
             <div className="field-stack">
               <Label htmlFor="display-name">显示名称</Label>
               <div className="field-with-icon">
-                <UserRound />
+                <UserRound aria-hidden="true" />
                 <Input
                   autoComplete="name"
                   id="display-name"
@@ -153,7 +153,7 @@ export function LoginPage() {
             <div className="field-stack">
               <Label htmlFor="register-username">用户名</Label>
               <div className="field-with-icon">
-                <UserRound />
+                <UserRound aria-hidden="true" />
                 <Input
                   autoComplete="username"
                   id="register-username"
@@ -177,7 +177,7 @@ export function LoginPage() {
             <div className="field-stack">
               <Label htmlFor="register-password">密码</Label>
               <div className="field-with-icon">
-                <KeyRound />
+                <KeyRound aria-hidden="true" />
                 <Input
                   aria-describedby="register-password-hint"
                   autoComplete="new-password"
@@ -208,7 +208,7 @@ export function LoginPage() {
             {error && <div className="form-error" role="alert">{error}</div>}
             <Button className="auth-submit" disabled={busy} type="submit">
               {busy ? "正在创建…" : "注册并开始学习"}
-              <ArrowRight />
+              <ArrowRight aria-hidden="true" />
             </Button>
             <Button
               className="auth-demo"
@@ -226,7 +226,7 @@ export function LoginPage() {
         ) : (
           <form onSubmit={submitLogin}>
             <div className="eyebrow">
-              <LockKeyhole /> 账号安全登录
+              <LockKeyhole aria-hidden="true" /> 账号安全登录
             </div>
             <h1 id="auth-title">继续学习</h1>
             <p className="form-intro">
@@ -235,7 +235,7 @@ export function LoginPage() {
             <div className="field-stack">
               <Label htmlFor="username">邮箱或用户名</Label>
               <div className="field-with-icon">
-                <UserRound />
+                <UserRound aria-hidden="true" />
                 <Input
                   autoComplete="username"
                   autoFocus
@@ -249,7 +249,7 @@ export function LoginPage() {
             <div className="field-stack">
               <Label htmlFor="password">密码</Label>
               <div className="field-with-icon">
-                <KeyRound />
+                <KeyRound aria-hidden="true" />
                 <Input
                   autoComplete="current-password"
                   id="password"
@@ -267,7 +267,7 @@ export function LoginPage() {
             )}
             <Button className="auth-submit" disabled={busy} type="submit">
               {busy ? "正在验证…" : "登录"}
-              <ArrowRight />
+              <ArrowRight aria-hidden="true" />
             </Button>
             {demoLoginEnabled && (
               <Button

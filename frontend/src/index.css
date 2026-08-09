@@ -191,10 +191,10 @@ h1, h2, h3, p { margin-top: 0; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.auth-page { position: relative; min-height: 100dvh; display: grid; place-items: center; overflow: hidden; padding: 24px; background: #eee; }
+.auth-page { position: relative; min-height: 100dvh; display: grid; place-items: center; overflow: auto; padding: 24px; background: #eee; }
 .auth-backdrop { position: absolute; inset: -24px; opacity: .42; filter: grayscale(1) blur(7px); transform: scale(1.04); pointer-events: none; }
 .auth-backdrop::after { content: ''; position: absolute; inset: 0; background: rgba(245,245,245,.62); }
-.auth-modal { position: relative; z-index: 1; width: min(440px, 100%); padding: 32px; border: 1px solid rgba(0,0,0,.12); border-radius: 18px; background: rgba(255,255,255,.96); box-shadow: 0 24px 70px rgba(0,0,0,.16); backdrop-filter: blur(24px); animation: auth-in .3s ease-out; }
+.auth-modal { position: relative; z-index: 1; width: min(440px, 100%); max-height: calc(100dvh - 32px); overflow-y: auto; overscroll-behavior: contain; padding: 32px; border: 1px solid rgba(0,0,0,.12); border-radius: 18px; background: rgba(255,255,255,.96); box-shadow: 0 24px 70px rgba(0,0,0,.16); backdrop-filter: blur(24px); animation: auth-in .3s ease-out; }
 .auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 34px; font-size: 17px; }
 .auth-modal h1 { margin: 12px 0 7px; font-size: 30px; font-weight: 720; letter-spacing: 0; }
 .auth-modal .eyebrow { color: #555; letter-spacing: 0; text-transform: none; }
@@ -245,8 +245,17 @@ h1, h2, h3, p { margin-top: 0; }
   .workspace-shell--collapsed { grid-template-columns: 50px minmax(520px,1fr) 280px; }
 }
 @media (max-width: 780px) {
-  .auth-modal { padding: 26px 22px; border-radius: 16px; }
+  .auth-page { padding: 16px; }
+  .auth-modal { padding: 26px 22px; border-radius: 16px; max-height: calc(100dvh - 32px); }
   .auth-brand { margin-bottom: 26px; }
+}
+
+@media (max-width: 420px) {
+  .auth-page { padding: 12px; }
+  .auth-modal { padding: 22px 16px; border-radius: 14px; }
+  .auth-modal h1 { font-size: 26px; }
+  .auth-modal input { height: 46px; }
+  .auth-submit { height: 46px; }
 }
 
 /* Entry */
@@ -2355,6 +2364,7 @@ body.is-resizing .workspace-resizer {
 .graph-library__constellation-tools > span { display: flex; align-items: center; gap: 5px; margin-right: auto; color: #777; font-size: 11px; }
 .graph-library__constellation-tools button { border-radius: 7px; }
 .graph-library__constellation { position: relative; min-height: 540px; overflow: hidden; background: #fcfcfc; cursor: grab; touch-action: none; }
+.graph-library__constellation:focus-visible { outline: 3px solid rgba(0,0,0,.48); outline-offset: 2px; }
 .graph-library__constellation:active { cursor: grabbing; }
 .graph-library__constellation-stage { position: absolute; inset: 0; transform-origin: 50% 50%; transition: transform .1s ease-out; }
 .graph-library__orbit { position: absolute; top: 50%; left: 50%; display: block; width: 290px; height: 290px; border: 1px solid #e3e3e3; border-radius: 50%; transform: translate(-50%, -50%); }
