@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 class ContextBuildRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=64)
+    message_id: str | None = Field(default=None, max_length=64)
     task_id: str | None = Field(default=None, max_length=64)
     query: str = Field(min_length=1, max_length=50_000)
     token_budget: int = Field(default=16_000, ge=256, le=500_000)
@@ -24,14 +25,18 @@ class ContextEvidenceView(BaseModel):
     target_id: str
     title: str
     content: str
+    content_hash: str = ""
     source_event_id: str
     scope: str
     confidence: float
-    status: str
+    status: str = "active"
     retrieval_reason: str
     trust: str
     score: float
     component_scores: dict[str, float] = Field(default_factory=dict)
+    reason_codes: list[str] = Field(default_factory=list)
+    token_cost: int = 0
+    manifest_status: str = "selected"
 
 
 class ContextBuildView(BaseModel):
@@ -40,6 +45,19 @@ class ContextBuildView(BaseModel):
     task_state: dict[str, Any] | None = None
     recent_context: list[dict[str, Any]] = Field(default_factory=list)
     memories: list[ContextEvidenceView] = Field(default_factory=list)
+    candidate_memories: list[ContextEvidenceView] = Field(default_factory=list)
+    retrieved_memories: list[ContextEvidenceView] = Field(default_factory=list)
+    selected_memories: list[ContextEvidenceView] = Field(default_factory=list)
+    injected_memories: list[ContextEvidenceView] = Field(default_factory=list)
+    excluded_memories: list[ContextEvidenceView] = Field(default_factory=list)
+    truncated_memories: list[ContextEvidenceView] = Field(default_factory=list)
+    candidate_count: int = 0
+    retrieved_count: int = 0
+    selected_count: int = 0
+    injected_count: int = 0
+    excluded_count: int = 0
+    truncated_count: int = 0
+    manifest_status: str = "ok"
     episodes: list[dict[str, Any]] = Field(default_factory=list)
     project_decisions: list[dict[str, Any]] = Field(default_factory=list)
     file_chunks: list[dict[str, Any]] = Field(default_factory=list)

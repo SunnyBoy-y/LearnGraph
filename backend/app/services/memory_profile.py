@@ -14,11 +14,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func as sql_func, select
+from sqlalchemy import func as sql_func, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.domain.memory_event_models import MemorySearchDocument
 from app.domain.models import (
     MemoryEvidence,
     MemoryProfileSnapshot,
@@ -40,15 +41,23 @@ from app.providers.factory import memory_provider_for_workspace, model_provider_
 from app.services.billing import BillingService
 from app.services.memory import MemoryService
 from app.services.memory_enhancement import load_enhancement_config
+from app.services.memory_plan import (
+    ensure_plan_canonical_key,
+    normalize_plan_status,
+    plan_change_text,
+    resolve_target_for_operation,
+)
+from app.services.temporal_normalizer import TemporalNormalizer
 from app.services.token_estimate import estimate_tokens
 
 
-PROFILE_PROMPT_VERSION = "memory-profile-v1"
+PROFILE_PROMPT_VERSION = "memory-profile-v2"
 _PROFILE_MAX_ATOMS = 160
 _PROFILE_MAX_MARKDOWN_CHARS = 12_000
 _EXCERPT_CHARS = 1_200
 _ELIGIBLE_SUMMARY = {"durable", "current"}
 _INELIGIBLE_TEMPORAL = {
+    "completed",
     "cancelled",
     "rescheduled",
     "lapsed_unverified",
@@ -247,6 +256,8 @@ def _atomization_schema() -> dict[str, Any]:
             "confidence": {"type": "number"},
             "importance": {"type": "number"},
             "temporal_status": {"type": "string"},
+            "time_expression": {"type": "string"},
+            "timezone_name": {"type": "string"},
             "summary_eligibility": {"type": "string"},
             "event_at": {"type": ["string", "null"]},
             "valid_from": {"type": ["string", "null"]},
@@ -276,15 +287,25 @@ def _atomization_schema() -> dict[str, Any]:
 
 
 def _profile_schema() -> dict[str, Any]:
+    """M2 contract: a mandatory overview plus structured dimensions.
+
+    ``key`` uses a stable vocabulary (long_term_direction / learning_style /
+    output_collaboration / stable_technical_preference / common_environment /
+    long_term_limit / current_state). A dimension without enough evidence is
+    simply omitted; the frontend never shows empty shells.
+    """
+
     return {
         "type": "object",
         "properties": {
-            "sections": {
+            "overview": {"type": "string"},
+            "dimensions": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "heading": {"type": "string"},
+                        "key": {"type": "string"},
+                        "title": {"type": "string"},
                         "paragraphs": {
                             "type": "array",
                             "items": {
@@ -300,11 +321,11 @@ def _profile_schema() -> dict[str, Any]:
                             },
                         },
                     },
-                    "required": ["heading", "paragraphs"],
+                    "required": ["key", "title", "paragraphs"],
                 },
-            }
+            },
         },
-        "required": ["sections"],
+        "required": ["overview", "dimensions"],
     }
 
 
@@ -480,14 +501,42 @@ class MemoryProfileService:
                 workspace_id=self.workspace_id,
                 owner_subject_id=self.actor_id,
             )
+        stored = list(snapshot.structured_sections or [])
+        overview = ""
+        dimensions: list[dict[str, Any]] = []
+        for section in stored:
+            if not isinstance(section, dict):
+                continue
+            kind = section.get("kind")
+            if kind == "overview":
+                overview = "\n".join(
+                    str(paragraph.get("text") or "")
+                    for paragraph in section.get("paragraphs") or []
+                    if isinstance(paragraph, dict)
+                ).strip()
+            elif kind == "dimension":
+                dimensions.append(
+                    {
+                        "key": str(section.get("key") or ""),
+                        "title": str(section.get("heading") or ""),
+                        "paragraphs": [
+                            paragraph
+                            for paragraph in section.get("paragraphs") or []
+                            if isinstance(paragraph, dict)
+                        ],
+                    }
+                )
         return MemoryProfileView(
             id=snapshot.id,
             workspace_id=snapshot.workspace_id,
             owner_subject_id=snapshot.owner_subject_id,
             version=snapshot.version,
             status=snapshot.status,  # type: ignore[arg-type]
+            overview=overview,
+            dimensions=dimensions,
+            source_count=len(list(snapshot.source_atom_ids or [])),
             markdown=snapshot.markdown,
-            structured_sections=list(snapshot.structured_sections or []),
+            structured_sections=stored,
             source_atom_ids=list(snapshot.source_atom_ids or []),
             source_fingerprint=snapshot.source_fingerprint,
             generated_at=snapshot.generated_at,
@@ -541,6 +590,7 @@ class MemoryProfileService:
             "archive": "冷区归档",
         }
         sections: list[dict[str, Any]] = []
+        dimensions: list[dict[str, Any]] = []
         markdown_parts: list[str] = []
         for zone in ("hot", "recent", "topics", "archive"):
             items = [
@@ -570,16 +620,25 @@ class MemoryProfileService:
                 )
             if not paragraphs:
                 continue
+            heading = headings[zone]
             sections.append(
-                {"heading": headings[zone], "paragraphs": paragraphs}
+                {"kind": "dimension", "key": zone, "heading": heading, "paragraphs": paragraphs}
             )
-            markdown_parts.append(f"## {headings[zone]}")
+            dimensions.append({"key": zone, "title": heading, "paragraphs": paragraphs})
+            markdown_parts.append(f"## {heading}")
             markdown_parts.extend(item["text"] for item in paragraphs)
         source_ids = [str(item["id"]) for item in atoms]
+        overview = (
+            f"当前为原子快照：共 {len(source_ids)} 条可显示记忆，"
+            "按冷热分层组织。配置记忆摘要模型后可生成正式摘要。"
+        )
         return MemoryProfileView(
             workspace_id=self.workspace_id,
             owner_subject_id=self.actor_id,
             status="atomic_snapshot",
+            overview=overview,
+            dimensions=dimensions,
+            source_count=len(source_ids),
             markdown="\n\n".join(markdown_parts),
             structured_sections=sections,
             source_atom_ids=source_ids,
@@ -732,8 +791,13 @@ class MemoryProfileService:
             "1. 每个段落只能陈述所引用 atom_ids 能直接支持的事实，绝不推断或发明。\n"
             "2. 合并重复事实；当前计划和稳定偏好分开；不要把一次事件写成习惯。\n"
             "3. 不输出已取消、过期、未验证失效的内容（输入已经过滤，仍须遵守）。\n"
-            "4. 输出 2-8 个动态标题，每段 1-4 句；总长度尽量在 1200-2200 中文字符内。\n"
-            "5. atom_ids 必须逐字来自输入。\n\n"
+            "4. overview 必填且是第一段概览，总体 1-4 句。\n"
+            "5. dimensions 使用稳定 key（long_term_direction/learning_style/"
+            "output_collaboration/stable_technical_preference/common_environment/"
+            "long_term_limit/current_state），title 为展示标题；"
+            "没有足够证据的维度不生成。\n"
+            "6. 全文目标 800-1600 中文字符，硬上限约 2000；按完整段落取舍。\n"
+            "7. atom_ids 必须逐字来自输入。\n\n"
             f"ATOMS JSON:\n{json.dumps(atoms, ensure_ascii=False)}"
         )
         payload, model_id = self._model_json(
@@ -747,14 +811,34 @@ class MemoryProfileService:
         sections: list[dict[str, Any]] = []
         claim_map: dict[str, list[str]] = {}
         markdown_parts: list[str] = []
-        raw_sections = payload.get("sections") if isinstance(payload, dict) else None
-        for section_index, raw_section in enumerate(raw_sections or []):
-            if not isinstance(raw_section, dict):
+        raw_overview = str(payload.get("overview") or "").strip() if isinstance(payload, dict) else ""
+        raw_dimensions = payload.get("dimensions") if isinstance(payload, dict) else None
+        if raw_overview:
+            sections.append(
+                {
+                    "kind": "overview",
+                    "heading": "概览",
+                    "paragraphs": [
+                        {
+                            "id": "overview",
+                            "text": raw_overview[:_PROFILE_MAX_MARKDOWN_CHARS],
+                            "atom_ids": sorted(allowed_ids)[:80],
+                        }
+                    ],
+                }
+            )
+            claim_map["overview"] = sorted(allowed_ids)[:80]
+            markdown_parts.append(raw_overview)
+        for dimension_index, raw_dimension in enumerate(raw_dimensions or []):
+            if not isinstance(raw_dimension, dict):
                 continue
-            heading = str(raw_section.get("heading") or "").strip()[:80]
+            key = str(raw_dimension.get("key") or "").strip()[:64]
+            title = str(raw_dimension.get("title") or "").strip()[:80]
+            if not key or not title:
+                continue
             paragraphs: list[dict[str, Any]] = []
             for paragraph_index, raw_paragraph in enumerate(
-                raw_section.get("paragraphs") or []
+                raw_dimension.get("paragraphs") or []
             ):
                 if not isinstance(raw_paragraph, dict):
                     continue
@@ -768,14 +852,21 @@ class MemoryProfileService:
                 )
                 if not text or not atom_ids:
                     continue
-                claim_id = f"s{section_index}p{paragraph_index}"
+                claim_id = f"d{dimension_index}p{paragraph_index}"
                 claim_map[claim_id] = atom_ids
                 paragraphs.append(
                     {"id": claim_id, "text": text, "atom_ids": atom_ids}
                 )
-            if heading and paragraphs:
-                sections.append({"heading": heading, "paragraphs": paragraphs})
-                markdown_parts.append(f"## {heading}")
+            if paragraphs:
+                sections.append(
+                    {
+                        "kind": "dimension",
+                        "key": key,
+                        "heading": title,
+                        "paragraphs": paragraphs,
+                    }
+                )
+                markdown_parts.append(f"## {title}")
                 markdown_parts.extend(item["text"] for item in paragraphs)
         markdown = "\n\n".join(markdown_parts).strip()[:_PROFILE_MAX_MARKDOWN_CHARS]
         if not markdown or not claim_map:
@@ -824,13 +915,19 @@ class MemoryProfileService:
             ]
             if not paragraphs:
                 continue
-            verified_sections.append(
-                {"heading": section["heading"], "paragraphs": paragraphs}
-            )
-            markdown_parts.append(f"## {section['heading']}")
-            for paragraph in paragraphs:
-                verified_claim_map[paragraph["id"]] = paragraph["atom_ids"]
-                markdown_parts.append(paragraph["text"])
+            kept = {"heading": section["heading"], "paragraphs": paragraphs}
+            if section.get("kind"):
+                kept["kind"] = section["kind"]
+            if section.get("key"):
+                kept["key"] = section["key"]
+            verified_sections.append(kept)
+            if section.get("kind") == "overview":
+                markdown_parts.extend(paragraph["text"] for paragraph in paragraphs)
+            else:
+                markdown_parts.append(f"## {section['heading']}")
+                for paragraph in paragraphs:
+                    verified_claim_map[paragraph["id"]] = paragraph["atom_ids"]
+                    markdown_parts.append(paragraph["text"])
         sections = verified_sections
         claim_map = verified_claim_map
         markdown = "\n\n".join(markdown_parts).strip()[:_PROFILE_MAX_MARKDOWN_CHARS]
@@ -941,7 +1038,9 @@ class MemoryProfileService:
             "你是 LearnGraph 的原子记忆整理器。把本次明确由用户输入的修改意图转换为"
             "最小、规范化、可验证的原子操作。不要保存输入原文，不要发明事实。\n"
             f"可信当前时间：{now.isoformat()}；用户时区：{request.timezone_name}。\n"
-            "时间规则：相对日期必须转成绝对 ISO 时间；计划过去不等于完成；"
+            "时间规则：把用户输入中的相对时间表达原样放入 time_expression，"
+            "不要自行换算成绝对时间；程序会用消息发生时间和用户时区确定性规范化。"
+            "计划过去不等于完成；"
             "取消用 CANCEL；改期用 RESCHEDULE；没有足够信息则 NOOP。\n"
             "一次事件不能推断成习惯。CREATE 每条只能有一个事实。"
             "所有非 NOOP 操作必须引用本次 evidence_id。"
@@ -960,12 +1059,12 @@ class MemoryProfileService:
             feature="memory_profile_intent",
             estimated_output_tokens=1_400,
         )
-        existing_ids = {
-            item["id"] for item in self._existing_atom_context()
-        }
+        existing_atoms = self._existing_atom_context()
+        existing_ids = {item["id"] for item in existing_atoms}
         affected: list[str] = []
         drafts_created = 0
         auto_committed = 0
+        normalizer = TemporalNormalizer()
         for raw in (payload.get("atoms") or [])[:8]:
             if not isinstance(raw, dict):
                 continue
@@ -973,8 +1072,23 @@ class MemoryProfileService:
             if operation not in _ALLOWED_OPERATIONS or operation == "NOOP":
                 continue
             target = str(raw.get("target_memory_id") or "").strip() or None
-            if operation != "CREATE" and target not in existing_ids:
-                continue
+            canonical_key = str(raw.get("canonical_key") or "").strip() or None
+            if operation != "CREATE":
+                resolved = resolve_target_for_operation(
+                    operation,
+                    target_memory_id=target,
+                    canonical_key=canonical_key,
+                    records=existing_atoms,
+                )
+                if resolved is None:
+                    continue
+                target = resolved
+                target_atom = next(
+                    (item for item in existing_atoms if item["id"] == resolved), None
+                )
+                canonical_key = canonical_key or str(
+                    (target_atom or {}).get("canonical_key") or ""
+                ).strip() or None
             statement = str(raw.get("statement") or "").strip()[:4_000]
             title = str(raw.get("title") or "").strip()[:240]
             if not statement or not title:
@@ -986,25 +1100,46 @@ class MemoryProfileService:
                 continue
             confidence = min(1.0, max(0.0, float(raw.get("confidence") or 0.0)))
             importance = min(1.0, max(0.0, float(raw.get("importance") or 0.5)))
-            temporal_status = str(raw.get("temporal_status") or "timeless")
+            raw_temporal_status = str(raw.get("temporal_status") or "timeless")
             eligibility = str(raw.get("summary_eligibility") or "durable")
             event_at = _parse_iso(raw.get("event_at"))
             valid_until = _parse_iso(raw.get("valid_until"))
             next_review = _parse_iso(raw.get("next_review_at"))
+            temporal_semantics: dict[str, Any] | None = None
+            time_expression = str(
+                raw.get("time_expression") or raw.get("original_expression") or ""
+            ).strip()
+            if time_expression and raw_temporal_status in {
+                "planned", "ongoing", "scheduled", "tentative", "rescheduled",
+                "in_progress", "completed", "cancelled", "lapsed_unverified", "expired",
+            }:
+                semantics = normalizer.normalize(
+                    time_expression,
+                    observed_at=now,
+                    timezone_name=request.timezone_name,
+                )
+                temporal_semantics = semantics.as_dict()
+                if semantics.start_at is not None and event_at is None:
+                    event_at = semantics.start_at
+                if semantics.end_at is not None and valid_until is None:
+                    valid_until = semantics.end_at
             temporal_anchor = valid_until or event_at
-            if temporal_status == "planned" and temporal_anchor is not None:
-                if temporal_anchor <= now:
-                    temporal_status = "lapsed_unverified"
-                    eligibility = "historical"
-                    next_review = None
-                elif next_review is None:
-                    next_review = temporal_anchor + timedelta(days=1)
-            elif temporal_status == "planned" and next_review is None:
-                next_review = now + timedelta(days=1)
+            temporal_status = normalize_plan_status(
+                raw_temporal_status,
+                start_at=temporal_anchor,
+                now=now,
+            )
+            if temporal_status == "lapsed_unverified":
+                eligibility = "historical"
+                next_review = None
+            elif temporal_status in {
+                "tentative", "scheduled", "rescheduled", "in_progress",
+            } and temporal_anchor is not None and next_review is None:
+                next_review = temporal_anchor + timedelta(days=1)
             structured = {
                 "atom_schema_version": 1,
                 "atom_kind": str(raw.get("atom_kind") or "fact")[:64],
-                "canonical_key": str(raw.get("canonical_key") or "")[:240],
+                "canonical_key": canonical_key or "",
                 "ledger_status": "active",
                 "temporal_status": temporal_status,
                 "summary_eligibility": eligibility,
@@ -1015,12 +1150,20 @@ class MemoryProfileService:
                 "last_verified_at": now.isoformat(),
                 "timezone_name": request.timezone_name,
                 "evidence_ids": [evidence.id],
+                "temporal_semantics": temporal_semantics,
                 "provenance": {
                     "authorship": "user",
                     "source_kinds": ["user_statement"],
                     "profile_eligible": True,
                 },
             }
+            structured = ensure_plan_canonical_key(structured, title=title)
+            if operation == "RESCHEDULE":
+                structured["plan_change_text"] = plan_change_text("rescheduled")
+            elif operation == "CANCEL":
+                structured["plan_change_text"] = plan_change_text("cancelled")
+            elif operation == "COMPLETE":
+                structured["plan_change_text"] = plan_change_text("completed")
             draft = self.memory.create_draft(
                 MemoryDraftCreateRequest(
                     operation=operation,  # type: ignore[arg-type]
@@ -1291,7 +1434,7 @@ def reconcile_workspace_temporal_atoms(
                 MemoryRecord.workspace_id == workspace.id,
                 MemoryRecord.state == "active",
                 MemoryRecord.ledger_status == "active",
-                MemoryRecord.temporal_status == "planned",
+                MemoryRecord.temporal_status.in_(("planned", "scheduled", "tentative")),
                 MemoryRecord.next_review_at.is_not(None),
                 MemoryRecord.next_review_at <= current,
             )
@@ -1317,6 +1460,7 @@ def reconcile_workspace_temporal_atoms(
         structured["temporal_status"] = "lapsed_unverified"
         structured["summary_eligibility"] = "historical"
         structured["next_review_at"] = None
+        structured["plan_change_text"] = "原计划 → 已逾期，待确认"
         service.update(
             record.id,
             # Existing content/title remain unchanged; this creates an audited
@@ -1326,5 +1470,20 @@ def reconcile_workspace_temporal_atoms(
                 reason="planned_time_passed_without_completion_evidence",
             ),
         )
+        # The event projection must stop recalling a lapsed plan even when its
+        # original end_at is still in the future.
+        for document in db.scalars(
+            select(MemorySearchDocument).where(
+                MemorySearchDocument.target_type == "memory",
+                MemorySearchDocument.target_id == record.id,
+            )
+        ).all():
+            document.status = "lapsed"
+            if db.bind is not None and db.bind.dialect.name == "sqlite":
+                db.execute(
+                    text("DELETE FROM memory_search_fts WHERE document_id = :id"),
+                    {"id": document.id},
+                )
         lapsed += 1
+    db.commit()
     return {"reviewed": len(records), "lapsed": lapsed}

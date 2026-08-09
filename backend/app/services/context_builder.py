@@ -48,12 +48,18 @@ class ContextBuilder:
         episodes = self._episodes(scope, request.conversation_id)
         learning = self._learning(scope)
         strategies = self._strategies(scope)
+        def _content_hash(item: Any) -> str:
+            return hashlib.sha256(
+                f"{item.title}\0{item.content}".encode("utf-8")
+            ).hexdigest()
+
         evidence = [
             ContextEvidenceView(
                 kind=item.target_type,
                 target_id=item.target_id,
                 title=item.title,
                 content=item.content,
+                content_hash=_content_hash(item),
                 source_event_id=item.source_event_id,
                 scope=f"workspace:{scope.workspace_id}",
                 confidence=item.confidence,
@@ -62,6 +68,9 @@ class ContextBuilder:
                 trust="user_explicit" if item.target_type == "memory" else "derived",
                 score=item.score,
                 component_scores=item.component_scores,
+                reason_codes=self._reason_codes_for(item),
+                token_cost=estimate_tokens(f"{item.title}\n{item.content}"),
+                manifest_status="candidate",
             )
             for item in routed.retrieval.candidates
         ]
@@ -75,12 +84,15 @@ class ContextBuilder:
                     "kind": "retrieved_memory",
                     "memory_id": item.target_id,
                     "content": item.content,
+                    "content_hash": item.content_hash,
                     "source": f"event:{item.source_event_id}",
                     "scope": item.scope,
                     "confidence": item.confidence,
                     "status": item.status,
                     "retrieval_reason": item.retrieval_reason,
                     "trust": item.trust,
+                    "reason_codes": item.reason_codes,
+                    "token_cost": item.token_cost,
                 }
                 for item in evidence
             ]
@@ -151,6 +163,13 @@ class ContextBuilder:
         }
         package_hash = hashlib.sha256(canonical_json_bytes(selected_payload)).hexdigest()
         context_build_id = "ctx_" + package_hash[:24]
+        memories_injected = any(name == "memories" for name, _, _ in selected_sections)
+        injected_memories = [item for item in evidence if memories_injected]
+        excluded_memories = [item for item in evidence if not memories_injected]
+        for item in evidence:
+            item.manifest_status = "injected" if memories_injected else "excluded"
+            if item.manifest_status == "excluded" and "BUDGET_EXCEEDED" not in item.reason_codes:
+                item.reason_codes.append("BUDGET_EXCEEDED")
         manifest = [
             {
                 "section": name,
@@ -160,11 +179,39 @@ class ContextBuilder:
             }
             for name, _, raw in selected_sections
         ]
+        manifest_status = (
+            "ok"
+            if memories_injected and excluded.get("budget", 0) == 0
+            else "truncated"
+            if memories_injected and excluded.get("budget", 0) > 0
+            else "excluded"
+        )
         view = ContextBuildView(
             context_build_id=context_build_id,
             trace_id=routed.trace_id,
             task_state=task_view,
-            memories=evidence if any(name == "memories" for name, _, _ in selected_sections) else [],
+            memories=injected_memories,
+            candidate_memories=evidence,
+            retrieved_memories=evidence,
+            selected_memories=evidence if memories_injected else [],
+            injected_memories=injected_memories,
+            excluded_memories=excluded_memories,
+            truncated_memories=(
+                [item for item in evidence if item.manifest_status == "injected"]
+                if excluded.get("budget", 0) > 0 and memories_injected
+                else []
+            ),
+            candidate_count=len(evidence),
+            retrieved_count=len(evidence),
+            selected_count=len(evidence) if memories_injected else 0,
+            injected_count=len(injected_memories),
+            excluded_count=len(excluded_memories) + int(excluded.get("budget", 0)),
+            truncated_count=(
+                len(injected_memories)
+                if memories_injected and excluded.get("budget", 0) > 0
+                else 0
+            ),
+            manifest_status=manifest_status,
             episodes=episodes if any(name == "episodes" for name, _, _ in selected_sections) else [],
             learning_states=learning if any(name == "learning_states" for name, _, _ in selected_sections) else [],
             strategies=strategies if any(name == "strategies" for name, _, _ in selected_sections) else [],
@@ -177,6 +224,21 @@ class ContextBuilder:
             degraded_modes=list(routed.retrieval.degraded_modes),
         )
         return BuiltContext(view, prompt_block)
+
+    @staticmethod
+    def _reason_codes_for(item: Any) -> list[str]:
+        status = str(getattr(item, "status", "") or "").casefold()
+        if status in {"expired", "lapsed", "lapsed_unverified"}:
+            return ["EXPIRED"]
+        if status in {"cancelled", "superseded", "rescheduled", "historical"}:
+            return ["SUPERSEDED"]
+        if status in {"out_of_scope", "cross_workspace"}:
+            return ["CROSS_WORKSPACE"]
+        if status in {"suppressed", "private", "restricted"}:
+            return ["NO_PERMISSION"]
+        if getattr(item, "score", 1.0) < 0.20:
+            return ["LOW_RELEVANCE"]
+        return []
 
     def _task(self, scope: MemoryScopeContext, task_id: str | None) -> dict[str, Any] | None:
         if not task_id:

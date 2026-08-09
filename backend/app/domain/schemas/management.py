@@ -120,6 +120,7 @@ class MemoryView(ORMModel):
     resolution_status: str = "none"
     decay_policy: str = "SLOW"
     supersedes_id: str | None = None
+    plan_change_text: str = ""
     provider_id: str
     provider_binding_id: str | None
     deleted_at: datetime | None
@@ -341,12 +342,27 @@ class MemoryEvidenceView(ORMModel):
     created_at: datetime
 
 
+class MemoryProfileDimension(BaseModel):
+    """Structured profile dimension with a stable key and atom-backed claims."""
+
+    key: str = ""
+    title: str = ""
+    paragraphs: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class MemoryProfileView(BaseModel):
     id: str | None = None
     workspace_id: str
     owner_subject_id: str
     version: int = 0
     status: Literal["empty", "atomic_snapshot", "ready", "stale", "building", "failed"] = "empty"
+    # M2 contract: a mandatory overview plus structured dimensions. The legacy
+    # free-form ``structured_sections`` is kept for backward compatibility but
+    # new snapshots are rendered from overview + dimensions.
+    overview: str = ""
+    dimensions: list[MemoryProfileDimension] = Field(default_factory=list)
+    scope: Literal["workspace", "global_user"] = "workspace"
+    source_count: int = 0
     markdown: str = ""
     structured_sections: list[dict[str, Any]] = Field(default_factory=list)
     source_atom_ids: list[str] = Field(default_factory=list)

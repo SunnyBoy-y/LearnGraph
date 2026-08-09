@@ -295,3 +295,66 @@ def test_list_views_includes_event_only_memory(db: Session) -> None:
     assert event_view.content == "This memory has no v1 record yet."
     assert event_view.zone == "recent"
     assert event_view.restore_available is False
+
+
+def test_profile_schema_v2_requires_overview_and_dimensions() -> None:
+    from app.services.memory_profile import _profile_schema
+
+    schema = _profile_schema()
+    assert schema["required"] == ["overview", "dimensions"]
+    props = schema["properties"]
+    assert "overview" in props
+    assert "dimensions" in props
+    dim_items = props["dimensions"]["items"]
+    assert dim_items["required"] == ["key", "title", "paragraphs"]
+
+
+def test_profile_view_renders_overview_and_dimensions(db: Session) -> None:
+    from app.domain.memory_event_models import utc_now
+    from app.domain.models import MemoryProfileSnapshot
+    from app.services.memory_profile import MemoryProfileService
+    from app.core.config import Settings
+
+    snapshot = MemoryProfileSnapshot(
+        workspace_id=WORKSPACE,
+        owner_subject_id=ACTOR,
+        version=1,
+        status="ready",
+        markdown="## 概览\n你好",
+        structured_sections=[
+            {
+                "kind": "overview",
+                "heading": "概览",
+                "paragraphs": [
+                    {"id": "overview", "text": "你好，我是示例用户。", "atom_ids": ["a1"]}
+                ],
+            },
+            {
+                "kind": "dimension",
+                "key": "learning_style",
+                "heading": "学习方式",
+                "paragraphs": [
+                    {"id": "d0p0", "text": "偏好结构化学习。", "atom_ids": ["a1"]}
+                ],
+            },
+        ],
+        source_atom_ids=["a1"],
+        source_fingerprint="fp",
+        prompt_version="memory-profile-v2",
+        generated_at=utc_now(),
+        activated_at=utc_now(),
+    )
+    db.add(snapshot)
+    db.commit()
+    service = MemoryProfileService(
+        db,
+        db.get(m.Workspace, WORKSPACE),
+        ACTOR,
+        Settings(),
+    )
+    view = service._profile_view(snapshot)
+    assert view.overview == "你好，我是示例用户。"
+    assert view.source_count == 1
+    assert len(view.dimensions) == 1
+    assert view.dimensions[0].key == "learning_style"
+    assert view.dimensions[0].title == "学习方式"

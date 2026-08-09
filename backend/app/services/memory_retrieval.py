@@ -9,7 +9,12 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.domain.memory_event_models import MemoryScopeContext, MemorySearchDocument
+from app.services.memory_enhancement import (
+    load_enhancement_config,
+    semantic_boosts_for_documents,
+)
 from app.services.memory_projector import (
     ensure_memory_search_fts,
     normalize_bm25_score,
@@ -98,6 +103,24 @@ class MemoryHybridRetriever:
             )
         ).all()
         fts_scores = self._fts_scores(scope, query, limit=max(top_k * 5, 20))
+        semantic_boosts: dict[str, float] = {}
+        embedding_enabled = False
+        try:
+            embedding_enabled = bool(
+                load_enhancement_config(self.db, scope.workspace_id)
+                .get("embedding", {})
+                .get("enabled", False)
+            )
+            if embedding_enabled and documents:
+                semantic_boosts = semantic_boosts_for_documents(
+                    self.db,
+                    scope.workspace_id,
+                    get_settings(),
+                    query,
+                    list(documents),
+                )
+        except Exception:
+            semantic_boosts = {}
         candidates: list[RetrievalCandidate] = []
         for document in documents:
             # ── Lifecycle: expired documents ────────────────────────────────
@@ -145,15 +168,18 @@ class MemoryHybridRetriever:
             recency = 0.5
             confidence = max(0.0, min(1.0, document.confidence))
             importance = max(0.0, min(1.0, document.importance))
-            semantic = 0.0
+            semantic = min(
+                1.0,
+                max(0.0, float(semantic_boosts.get(document.target_id, 0.0))),
+            )
             score = (
-                0.20 * lexical
+                0.25 * semantic
+                + 0.20 * lexical
                 + 0.15 * scope_score
                 + 0.15 * entity
                 + 0.10 * importance
                 + 0.10 * recency
                 + 0.05 * confidence
-                + 0.25 * semantic
             )
             if score < min_score:
                 excluded["quality"] += 1
@@ -194,7 +220,9 @@ class MemoryHybridRetriever:
             deduped.append(candidate)
             if len(deduped) >= top_k:
                 break
-        degraded = ("embedding_unavailable",)
+        degraded: tuple[str, ...] = ()
+        if embedding_enabled and not semantic_boosts:
+            degraded = ("embedding_unavailable",)
         return RetrievalResult(tuple(deduped), excluded, degraded)
 
     def _fts_scores(

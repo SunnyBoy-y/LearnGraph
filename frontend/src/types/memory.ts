@@ -96,6 +96,7 @@ export interface MemoryEntry {
   resolution_status?: MemoryResolutionStatus
   decay_policy?: string
   supersedes_id?: string | null
+  plan_change_text?: string
   provider_id: string
   provider_binding_id: string | null
   deleted_at: IsoDateTime | null
@@ -209,12 +210,26 @@ export interface MemoryPolicyUpdateRequest {
   all_sessions_shared?: boolean
 }
 
+export interface MemoryProfileDimension {
+  key: string
+  title: string
+  paragraphs: Array<{
+    id?: string
+    text: string
+    atom_ids: string[]
+  }>
+}
+
 export interface MemoryProfile {
   id: string | null
   workspace_id: string
   owner_subject_id: string
   version: number
   status: 'empty' | 'atomic_snapshot' | 'ready' | 'stale' | 'building' | 'failed'
+  overview: string
+  dimensions: MemoryProfileDimension[]
+  scope: 'workspace' | 'global_user'
+  source_count: number
   markdown: string
   structured_sections: Array<{
     heading: string

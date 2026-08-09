@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session
 
 from app.domain.memory_event_models import AgentRunProjection, MemoryScopeContext, StrategyMemory, new_id, utc_now
 from app.domain.memory_event_types import MemoryEventType
-from app.services.memory_event_store import AppendEvent, MemoryEventStore
+from app.domain.schemas.memory_v2 import MemoryEventAppendRequest
+from app.services.memory_event_ingestor import EventActor, MemoryEventIngestor
+from app.services.memory_event_store import MemoryEventStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,13 +32,16 @@ class AgentRunProjectionService:
 
     def start(self, scope: MemoryScopeContext, actor_id: str, request: RunStart) -> AgentRunProjection:
         run_id = f"run_{new_id()}"
-        event = self.store.append(
+        result = MemoryEventIngestor(self.store).ingest(
             scope,
-            aggregate_type="agent_run",
-            aggregate_id=run_id,
-            expected_version=0,
-            event=AppendEvent(
+            EventActor("agent", actor_id),
+            MemoryEventAppendRequest(
+                aggregate_type="agent_run",
+                aggregate_id=run_id,
+                expected_stream_version=0,
                 event_type=MemoryEventType.AGENT_RUN_STARTED,
+                producer="agent",
+                idempotency_key=request.idempotency_key,
                 payload={
                     "task_id": request.task_id,
                     "agent_id": request.agent_id,
@@ -44,11 +49,10 @@ class AgentRunProjectionService:
                     "input_scope_hash": request.input_scope_hash,
                     "context_build_id": request.context_build_id,
                 },
-                idempotency_key=request.idempotency_key,
-                actor_type="agent",
-                actor_id=actor_id,
             ),
-        ).event
+            trusted_producer=True,
+        )
+        event = result.event
         row = AgentRunProjection(
             id=run_id,
             stream_id=event.stream_id,
@@ -89,28 +93,31 @@ class AgentRunProjectionService:
         )
         if row is None:
             raise LookupError("agent run not found")
-        event = self.store.append(
+        result = MemoryEventIngestor(self.store).ingest(
             scope,
-            aggregate_type="agent_run",
-            aggregate_id=run_id,
-            expected_version=expected_version,
-            event=AppendEvent(
+            EventActor("agent", actor_id),
+            MemoryEventAppendRequest(
+                aggregate_type="agent_run",
+                aggregate_id=run_id,
+                expected_stream_version=expected_version,
                 event_type=(
                     MemoryEventType.AGENT_RUN_COMPLETED
                     if succeeded
                     else MemoryEventType.AGENT_RUN_FAILED
                 ),
+                producer="agent",
+                idempotency_key=idempotency_key,
                 payload={
                     "result_summary": result_summary,
                     "tool_call_refs": tool_call_refs,
                     "artifact_refs": artifact_refs,
                     "succeeded": succeeded,
+                    "summary_eligibility": "excluded",
                 },
-                idempotency_key=idempotency_key,
-                actor_type="agent",
-                actor_id=actor_id,
             ),
-        ).event
+            trusted_producer=True,
+        )
+        event = result.event
         row.status = "completed" if succeeded else "failed"
         row.result_summary = result_summary[:10_000]
         row.tool_call_refs_json = tool_call_refs

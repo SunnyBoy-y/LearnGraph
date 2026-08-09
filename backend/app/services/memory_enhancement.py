@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.database import commit_with_locked_retry
 from app.core.errors import AppError
+from app.domain.memory_event_models import MemorySearchDocument
 from app.domain.memory_types import MEMORY_TYPE_REGISTRY, get_memory_type
 from app.domain.models import (
     ChatSession,
@@ -58,6 +59,15 @@ from app.providers.factory import (
     model_provider_for_workspace,
 )
 from app.services.billing import BillingService
+from app.services.memory_plan import (
+    PLAN_STATES,
+    canonical_plan_key,
+    ensure_plan_canonical_key,
+    normalize_plan_status,
+    plan_change_text,
+    resolve_target_for_operation,
+)
+from app.services.temporal_normalizer import TemporalNormalizer
 from app.services.token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -100,6 +110,12 @@ def _parse_extraction_time(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def default_enhancement_config() -> dict[str, Any]:
@@ -428,6 +444,117 @@ def semantic_boosts_for_records(
         return {}
 
 
+def semantic_boosts_for_documents(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    query_text: str,
+    documents: list[MemorySearchDocument],
+    config: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Embedding boost for v2 MemorySearchDocument rows.
+
+    This mirrors ``semantic_boosts_for_records`` but reads the document
+    projection directly. Any provider failure or missing configuration degrades
+    to lexical retrieval; it never raises into the chat hot path.
+    """
+    query = (query_text or "").strip()
+    if not query or not documents:
+        return {}
+    try:
+        config = config or load_enhancement_config(db, workspace_id)
+        embedding_cfg = config["embedding"]
+        if not embedding_cfg["enabled"]:
+            return {}
+        provider = embedding_provider_for_workspace(
+            db,
+            workspace_id,
+            settings,
+            provider_id=embedding_cfg["provider_id"],
+            model_id=embedding_cfg["model_id"],
+        )
+        if provider is None:
+            return {}
+        model_key = _model_key(provider.provider_id, provider.model_id)
+        ids = [document.target_id for document in documents]
+        existing = _embedding_rows(db, workspace_id, model_key, ids)
+        fresh: dict[str, list[float]] = {}
+        stale: list[MemorySearchDocument] = []
+        for document in documents:
+            row = existing.get(document.target_id)
+            if row is not None and row.vector and row.content_hash == document.content_hash:
+                fresh[document.target_id] = list(row.vector)
+            else:
+                stale.append(document)
+        stale = stale[:_BACKFILL_PER_CALL]
+        if not fresh and not stale:
+            return {}
+        query_snippet = query[:_QUERY_CHAR_CAP]
+        billing = BillingService(db, workspace_id, "system:memory-embedding")
+        try:
+            quote = billing.preflight_model_call(
+                provider_id=provider.provider_id,
+                model_id=provider.model_id,
+                feature="memory_embedding",
+                estimated_input_tokens=estimate_tokens(query_snippet)
+                + sum(
+                    estimate_tokens(f"{doc.subject}\n{doc.content}")
+                    for doc in stale
+                ),
+                estimated_output_tokens=0,
+                remote_capability=True,
+            )
+        except AppError:
+            return {}
+        started_at = time.monotonic()
+        used_tokens = 0
+        if stale:
+            vectors = provider.embed(
+                [f"{doc.subject}\n{doc.content}"[:_MEMORY_TEXT_CHAR_CAP] for doc in stale]
+            )
+            used_tokens += int(dict(provider.last_usage or {}).get("input_tokens") or 0)
+            for document, vector in zip(stale, vectors):
+                row = existing.get(document.target_id)
+                if row is None:
+                    row = MemoryEmbedding(
+                        workspace_id=workspace_id,
+                        memory_id=document.target_id,
+                        model_key=model_key,
+                    )
+                    db.add(row)
+                    existing[document.target_id] = row
+                row.content_hash = document.content_hash
+                row.dim = len(vector)
+                row.vector = vector
+                fresh[document.target_id] = vector
+            db.commit()
+        query_vector = provider.embed([query_snippet])[0]
+        used_tokens += int(dict(provider.last_usage or {}).get("input_tokens") or 0)
+        billing.record_usage(
+            quote,
+            input_tokens=used_tokens,
+            output_tokens=0,
+            attempt=1,
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+            usage_reported=used_tokens > 0,
+        )
+        db.commit()
+        weight = float(embedding_cfg.get("semantic_weight") or 0.8)
+        boosts: dict[str, float] = {}
+        for document_id, vector in fresh.items():
+            similarity = _cosine(query_vector, vector)
+            if similarity > 0:
+                boosts[document_id] = weight * similarity
+        return boosts
+    except Exception:
+        logger.warning(
+            "Semantic v2 recall degraded to lexical scoring for workspace %s",
+            workspace_id,
+            exc_info=True,
+        )
+        return {}
+
+
 def reindex_memory_embeddings(
     db: Session,
     workspace_id: str,
@@ -658,6 +785,10 @@ def _extraction_schema() -> dict[str, Any]:
                         "atom_kind": {"type": "string"},
                         "canonical_key": {"type": "string"},
                         "temporal_status": {"type": "string"},
+                        "time_expression": {"type": "string"},
+                        "original_expression": {"type": "string"},
+                        "timezone_name": {"type": "string"},
+                        "granularity_hint": {"type": "string"},
                         "summary_eligibility": {"type": "string"},
                         "event_at": {"type": ["string", "null"]},
                         "valid_from": {"type": ["string", "null"]},
@@ -711,7 +842,10 @@ def _extraction_prompt(
         "人物事实、可以从图谱/掌握度中查到的权威状态（掌握分数、路线版本、文件路径等）、"
         "以及任何未经用户明确表达的臆测。一次事件绝不能推断成习惯。\n"
         f"可信当前时间：{utc_now().isoformat()}；默认时区：Asia/Shanghai。"
-        "相对时间必须转成绝对 ISO 时间。计划过去不代表已经完成；取消用 CANCEL，"
+        "识别相对时间时，把用户陈述中的时间表达原样放入 time_expression（"
+        "例如“下个月”“明天下午”“每周五”），不要自行换算成绝对时间；"
+        "程序会用消息发生时间和用户时区确定性规范化。"
+        "计划过去不代表已经完成；取消用 CANCEL，"
         "改期用 RESCHEDULE，没有足够证据用 NOOP。\n\n"
         f"可用的记忆类型：\n{_type_catalog_lines()}\n\n"
         f"{scope_hint}\n\n"
@@ -1054,6 +1188,12 @@ def extract_session_memories(
     drafts_created = 0
     auto_committed = 0
     skipped = 0
+    observed_at = messages[-1].created_at if messages else utc_now()
+    observed_by_evidence = {
+        evidence.id: evidence.observed_at
+        for evidence in evidence_by_message.values()
+    }
+    normalizer = TemporalNormalizer()
     for proposal in (proposals or [])[:_EXTRACTION_MAX_PROPOSALS]:
         if not isinstance(proposal, dict):
             continue
@@ -1075,9 +1215,27 @@ def extract_session_memories(
         if operation == "NOOP":
             continue
         target_memory_id = str(proposal.get("target_memory_id") or "").strip() or None
-        if operation != "CREATE" and target_memory_id not in known_ids:
-            operation = "CREATE"
-            target_memory_id = None
+        canonical_key = str(proposal.get("canonical_key") or "").strip() or None
+        if operation != "CREATE":
+            resolved_target = resolve_target_for_operation(
+                operation,
+                target_memory_id=target_memory_id,
+                canonical_key=canonical_key,
+                records=existing_records,
+            )
+            if resolved_target is None:
+                # Never downgrade CANCEL/RESCHEDULE/COMPLETE into an orphan
+                # CREATE. The proposal stays a NOOP until a target is clear.
+                skipped += 1
+                continue
+            target_memory_id = resolved_target
+            target_record = next(
+                (record for record in existing_records if record.id == resolved_target),
+                None,
+            )
+            canonical_key = canonical_key or str(
+                getattr(target_record, "canonical_key", "") or ""
+            ).strip() or None
         if operation == "CREATE":
             if _content_hash(title, content) in known_hashes or title in pending_titles:
                 skipped += 1
@@ -1092,7 +1250,7 @@ def extract_session_memories(
         if not evidence_ids:
             skipped += 1
             continue
-        temporal_status = str(
+        raw_temporal_status = str(
             proposal.get("temporal_status") or "timeless"
         ).strip()
         summary_eligibility = str(
@@ -1101,24 +1259,53 @@ def extract_session_memories(
         event_at = proposal.get("event_at")
         valid_until = proposal.get("valid_until")
         next_review_at = proposal.get("next_review_at")
+        observed_for_proposal = observed_at
+        for evidence_id in evidence_ids:
+            evidence_observed_at = observed_by_evidence.get(evidence_id)
+            if evidence_observed_at is not None:
+                observed_for_proposal = _as_utc(evidence_observed_at)
+                break
+        temporal_semantics: dict[str, Any] | None = None
+        original_expression = str(
+            proposal.get("time_expression") or proposal.get("original_expression") or ""
+        ).strip()
+        timezone_name = str(proposal.get("timezone_name") or "Asia/Shanghai").strip()
+        if original_expression and raw_temporal_status in {
+            "planned", "ongoing", "scheduled", "tentative", "rescheduled",
+            "in_progress", "completed", "cancelled", "lapsed_unverified", "expired",
+        }:
+            semantics = normalizer.normalize(
+                original_expression,
+                observed_at=observed_for_proposal,
+                timezone_name=timezone_name,
+            )
+            temporal_semantics = semantics.as_dict()
+            if semantics.start_at is not None and event_at is None:
+                event_at = semantics.start_at.isoformat()
+            if semantics.end_at is not None and valid_until is None:
+                valid_until = semantics.end_at.isoformat()
         temporal_anchor = (
             _parse_extraction_time(valid_until)
             or _parse_extraction_time(event_at)
         )
-        if temporal_status == "planned" and temporal_anchor is not None:
-            if temporal_anchor <= utc_now():
-                # A past plan is evidence that a plan existed, never evidence
-                # that the event happened. Keep it out of the current profile
-                # until the user confirms, cancels, or reschedules it.
-                temporal_status = "lapsed_unverified"
-                summary_eligibility = "historical"
-                next_review_at = None
-            elif _parse_extraction_time(next_review_at) is None:
+        temporal_status = normalize_plan_status(
+            raw_temporal_status,
+            start_at=temporal_anchor,
+            now=_as_utc(observed_for_proposal),
+        )
+        if temporal_status == "lapsed_unverified":
+            # A past plan is evidence that a plan existed, never evidence that
+            # the event happened. Keep it out of the current profile until the
+            # user confirms, cancels, or reschedules it.
+            summary_eligibility = "historical"
+            next_review_at = None
+        elif temporal_status in PLAN_STATES and temporal_anchor is not None:
+            if _parse_extraction_time(next_review_at) is None:
                 next_review_at = (temporal_anchor + timedelta(days=1)).isoformat()
         structured_payload = {
             "atom_schema_version": 1,
             "atom_kind": str(proposal.get("atom_kind") or "fact")[:64],
-            "canonical_key": str(proposal.get("canonical_key") or "")[:240],
+            "canonical_key": canonical_key or "",
             "ledger_status": "active",
             "temporal_status": temporal_status,
             "summary_eligibility": summary_eligibility,
@@ -1127,14 +1314,26 @@ def extract_session_memories(
             "valid_until": valid_until,
             "next_review_at": next_review_at,
             "last_verified_at": utc_now().isoformat(),
-            "timezone_name": "Asia/Shanghai",
+            "timezone_name": timezone_name,
             "evidence_ids": evidence_ids,
+            "temporal_semantics": temporal_semantics,
             "provenance": {
                 "authorship": "user",
                 "source_kinds": ["user_statement"],
                 "profile_eligible": True,
             },
         }
+        structured_payload = ensure_plan_canonical_key(
+            structured_payload, title=title
+        )
+        if operation == "RESCHEDULE":
+            structured_payload["plan_change_text"] = plan_change_text("rescheduled")
+        elif operation == "CANCEL":
+            structured_payload["plan_change_text"] = plan_change_text("cancelled")
+        elif operation == "COMPLETE":
+            structured_payload["plan_change_text"] = plan_change_text("completed")
+        if temporal_status == "rescheduled":
+            structured_payload["plan_change_text"] = plan_change_text("rescheduled")
         try:
             draft = memory_service.create_draft(
                 MemoryDraftCreateRequest(

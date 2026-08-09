@@ -8,6 +8,11 @@ from sqlalchemy import select
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.api.memory_deps import event_store, memory_scope
 from app.core.errors import AppError
+from app.domain.memory_event_models import (
+    MemoryAccessLog,
+    MemoryContextPackage,
+    MemoryScopeContext,
+)
 from app.domain.models import ChatSession, MemoryRecord
 from app.domain.schemas.context_builds import ContextBuildRequest, ContextBuildView
 from app.domain.schemas.memory_v2 import (
@@ -182,6 +187,68 @@ def build_context(
     built = ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db), db=db)).build(scope, payload)
     ContextTelemetryWriter(db).write(scope, payload, built.view)
     return built.view
+
+
+@router.get("/context/manifests")
+def list_context_manifests(
+    db: DB,
+    context: CurrentWorkspace,
+    session_id: str | None = None,
+    message_id: str | None = None,
+    context_build_id: str | None = None,
+) -> list[dict]:
+    """Return persisted, real Context Manifest receipts for this workspace.
+
+    The API never recomputes a historical manifest from the current query; it
+    reads the durable ``MemoryContextPackage`` + ``MemoryAccessLog`` rows that
+    were written when the context was built.
+    """
+    context.require_permission("workspace.manage")
+    statement = select(MemoryContextPackage).where(
+        MemoryContextPackage.workspace_id == context.workspace.id
+    )
+    if session_id:
+        statement = statement.where(MemoryContextPackage.conversation_id == session_id)
+    if message_id:
+        statement = statement.where(MemoryContextPackage.message_id == message_id)
+    if context_build_id:
+        statement = statement.where(MemoryContextPackage.id == context_build_id)
+    packages = db.scalars(
+        statement.order_by(MemoryContextPackage.created_at.desc()).limit(100)
+    ).all()
+    access_logs = {
+        log.context_build_id: log
+        for log in db.scalars(
+            select(MemoryAccessLog).where(
+                MemoryAccessLog.workspace_id == context.workspace.id,
+                MemoryAccessLog.context_build_id.in_(
+                    [package.id for package in packages]
+                ),
+            )
+        ).all()
+    }
+    return [
+        {
+            "context_build_id": package.id,
+            "session_id": package.conversation_id,
+            "message_id": package.message_id,
+            "status": package.outcome_status or "unknown",
+            "candidate_ids": package.candidate_ids_json,
+            "retrieved_ids": package.retrieved_ids_json,
+            "selected_ids": package.selected_ids_json,
+            "injected_ids": package.injected_ids_json,
+            "excluded_ids": package.excluded_ids_json,
+            "truncated_ids": package.truncated_ids_json,
+            "reason_codes": package.reason_codes_json,
+            "excluded_counts": package.excluded_counts_json,
+            "section_tokens": package.section_token_usage_json,
+            "total_tokens": package.total_tokens,
+            "injected_tokens": getattr(access_logs.get(package.id), "injected_tokens", 0),
+            "package_hash": package.package_hash,
+            "created_at": package.created_at,
+        }
+        for package in packages
+    ]
 
 
 @router.post("/{memory_id}/feedback")

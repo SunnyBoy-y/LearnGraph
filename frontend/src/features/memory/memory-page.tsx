@@ -24,12 +24,14 @@ import { toast } from 'sonner'
 
 import {
   applyMemoryProfileIntent,
+  archiveGoalMemories,
   createMemory,
   deleteMemory,
   exportMemoryMarkdown,
   extractSessionMemories,
   getCurrentUser,
   getEffectiveMemoryPackage,
+  getGoalMemoryOverview,
   getGraph,
   getMemory,
   getMemoryProfile,
@@ -395,22 +397,24 @@ export function MemoryPage() {
         ]}
       />
 
-      <Tabs className="gap-4" defaultValue="summary">
+      <GoalMemoryToolsCard goals={goals.data ?? []} workspaceId={workspaceId} />
+
+      <Tabs className="gap-4" defaultValue="now">
         <TabsList className="h-9 w-full justify-start sm:w-auto">
-          <TabsTrigger className="px-3" value="summary">
-            记忆摘要
+          <TabsTrigger className="px-3" value="now">
+            现在
           </TabsTrigger>
-          <TabsTrigger className="px-3" value="zones">
-            冷热分层
+          <TabsTrigger className="px-3" value="in-progress">
+            进行中
+          </TabsTrigger>
+          <TabsTrigger className="px-3" value="memory">
+            记忆
             <span className="ml-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
               {activeMemories.length}
             </span>
           </TabsTrigger>
-          <TabsTrigger className="px-3" value="preview">
-            AI 眼中的我
-          </TabsTrigger>
-          <TabsTrigger className="px-3" value="context-manifest">
-            AI 本轮看到了什么
+          <TabsTrigger className="px-3" value="usage">
+            使用记录
           </TabsTrigger>
           <TabsTrigger className="px-3" value="deleted">
             删除恢复
@@ -421,21 +425,13 @@ export function MemoryPage() {
             ) : null}
           </TabsTrigger>
           {memoryGovernanceV2Enabled ? (
-            <>
-              <TabsTrigger className="px-3" value="task-episode">
-                任务与 Episode
-              </TabsTrigger>
-              <TabsTrigger className="px-3" value="pending">
-                待确认
-              </TabsTrigger>
-              <TabsTrigger className="px-3" value="settings-export">
-                设置与导出
-              </TabsTrigger>
-            </>
+            <TabsTrigger className="px-3" value="settings-export">
+              设置与导出
+            </TabsTrigger>
           ) : null}
         </TabsList>
 
-        <TabsContent className="mt-0 outline-none" value="summary">
+        <TabsContent className="mt-0 outline-none" value="now">
           <MemorySummaryCard
             busy={editProfile.isPending || regenerateProfile.isPending || migrateAtoms.isPending}
             legacyCount={
@@ -446,78 +442,67 @@ export function MemoryPage() {
             onQuickAdd={quickAdd}
             profile={profile.data}
           />
+          {memoryGovernanceV2Enabled ? (
+            <div className="mt-4">
+              <MemoryPendingConfirmationPanel />
+            </div>
+          ) : null}
         </TabsContent>
 
-        <TabsContent className="mt-0 outline-none" value="zones">
+        <TabsContent className="mt-0 outline-none" value="in-progress">
+          {memoryGovernanceV2Enabled ? (
+            <MemoryTaskEpisodePanel />
+          ) : (
+            <Surface className="p-2">
+              <EmptyState
+                description="任务与 Episode 视角需要启用高级记忆治理。"
+                title="进行中视图暂未开启"
+              />
+            </Surface>
+          )}
+        </TabsContent>
+
+        <TabsContent className="mt-0 outline-none" value="memory">
           {!activeMemories.length ? (
             <Surface className="p-2">
               <EmptyState
-                description="新增记忆后会按热摘要/近期/主题/归档自动分层，事件投影记忆也会在这里出现。"
+                description="新增记忆后会出现在这里；事件投影记忆同样可见。"
                 title="当前工作区还没有可见记忆"
               />
             </Surface>
           ) : (
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              {zoneDefinitions.map(({ zone, title, description, icon: Icon }) => {
-                const items = grouped[zone]
-                return (
-                  <Surface className="flex min-h-0 flex-col overflow-hidden p-0" key={zone}>
-                    <div className="flex items-start gap-3 border-b bg-muted/25 px-4 py-3.5">
-                      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-                        <Icon className="size-4" />
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <h2 className="truncate text-sm font-semibold">{title}</h2>
-                          <Badge className="font-mono text-[10px]" variant="outline">
-                            {items.length}
-                          </Badge>
-                        </div>
-                        <p className="mt-0.5 truncate text-xs text-muted-foreground">{description}</p>
-                      </div>
-                    </div>
-                    <div className="flex flex-1 flex-col gap-2 p-3">
-                      {items.map((item) => (
-                        <MemoryRow
-                          busy={zoneBusy}
-                          item={item}
-                          key={item.id}
-                          onDelete={() => remove.mutate(item.id)}
-                          onOpen={() => setSelectedId(item.id)}
-                          onRestoreRevision={(revision) => restoreRevision.mutate({ item, revision })}
-                          onUpdate={(payload) =>
-                            update.mutateAsync({ id: item.id, payload }).then(() => undefined)
-                          }
-                          workspaceId={workspaceId}
-                        />
-                      ))}
-                      {!items.length ? (
-                        <div className="grid flex-1 place-items-center rounded-xl border border-dashed px-3 py-10 text-center text-xs text-muted-foreground">
-                          此层暂无真实记忆
-                        </div>
-                      ) : null}
-                    </div>
-                  </Surface>
-                )
-              })}
+            <div className="grid gap-2">
+              {activeMemories.map((item) => (
+                <MemoryRow
+                  busy={zoneBusy}
+                  item={item}
+                  key={item.id}
+                  onDelete={() => remove.mutate(item.id)}
+                  onOpen={() => setSelectedId(item.id)}
+                  onRestoreRevision={(revision) => restoreRevision.mutate({ item, revision })}
+                  onUpdate={(payload) =>
+                    update.mutateAsync({ id: item.id, payload }).then(() => undefined)
+                  }
+                  workspaceId={workspaceId}
+                />
+              ))}
             </div>
           )}
         </TabsContent>
 
-        <TabsContent className="mt-0 outline-none" value="preview">
-          <MemoryInjectionPreviewTab sessions={sessionList} workspaceId={workspaceId} />
-        </TabsContent>
-
-        <TabsContent className="mt-0 outline-none" value="context-manifest">
+        <TabsContent className="mt-0 outline-none" value="usage">
           <Surface className="p-5">
             <SectionHeading
-              description="只保存来源、版本、分数、排除原因和 Token，不保存完整 Prompt。"
-              title="Context Build Manifest"
+              description="本轮真实提供给模型的记忆回执（候选/检索/选择/注入/排除）。"
+              title="使用记录"
             />
             <div className="mt-4">
               <ContextManifestPanel />
             </div>
           </Surface>
+          <div className="mt-4">
+            <MemoryInjectionPreviewTab sessions={sessionList} workspaceId={workspaceId} />
+          </div>
         </TabsContent>
 
         <TabsContent className="mt-0 outline-none" value="deleted">
@@ -569,17 +554,9 @@ export function MemoryPage() {
         </TabsContent>
 
         {memoryGovernanceV2Enabled ? (
-          <>
-            <TabsContent className="mt-0 outline-none" value="task-episode">
-              <MemoryTaskEpisodePanel />
-            </TabsContent>
-            <TabsContent className="mt-0 outline-none" value="pending">
-              <MemoryPendingConfirmationPanel />
-            </TabsContent>
-            <TabsContent className="mt-0 outline-none" value="settings-export">
-              <MemorySettingsExportPanel />
-            </TabsContent>
-          </>
+          <TabsContent className="mt-0 outline-none" value="settings-export">
+            <MemorySettingsExportPanel />
+          </TabsContent>
         ) : null}
       </Tabs>
 
@@ -699,7 +676,45 @@ function MemorySummaryCard({
         ) : null}
 
         <AnimatePresence mode="wait">
-          {profile?.structured_sections.length ? (
+          {profile?.dimensions.length ? (
+            <motion.article
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-8"
+              exit={{ opacity: 0, y: -6 }}
+              initial={{ opacity: 0, y: 8 }}
+              key={profile.version}
+              transition={{ duration: 0.22, ease: 'easeOut' }}
+            >
+              {profile.overview ? (
+                <section>
+                  <h3 className="mb-2.5 text-[17px] font-semibold tracking-tight">概览</h3>
+                  <div className="space-y-3">
+                    <p className="selection:bg-primary/20 text-[15px] leading-7 text-foreground/88">
+                      {profile.overview}
+                    </p>
+                  </div>
+                </section>
+              ) : null}
+              {profile.dimensions.map((dimension, dimensionIndex) => (
+                <section key={dimension.key || `${dimension.title}-${dimensionIndex}`}>
+                  <h3 className="mb-2.5 text-[17px] font-semibold tracking-tight">
+                    {dimension.title}
+                  </h3>
+                  <div className="space-y-3">
+                    {dimension.paragraphs.map((paragraph, paragraphIndex) => (
+                      <p
+                        className="selection:bg-primary/20 text-[15px] leading-7 text-foreground/88"
+                        data-memory-atom-ids={paragraph.atom_ids.join(',')}
+                        key={paragraph.id ?? `${dimensionIndex}-${paragraphIndex}`}
+                      >
+                        {paragraph.text}
+                      </p>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </motion.article>
+          ) : profile?.structured_sections.length ? (
             <motion.article
               animate={{ opacity: 1, y: 0 }}
               className="space-y-8"
@@ -1567,5 +1582,117 @@ function MemoryDetailDialog({
         ) : null}
       </DialogContent>
     </Dialog>
+  )
+}
+
+function GoalMemoryToolsCard({ goals, workspaceId }: { goals: Goal[]; workspaceId: string }) {
+  const queryClient = useQueryClient()
+  const [selectedGoalId, setSelectedGoalId] = useState('')
+  const [overviewOpen, setOverviewOpen] = useState(false)
+
+  const overview = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'goal-overview', selectedGoalId),
+    queryFn: () => getGoalMemoryOverview(selectedGoalId),
+    enabled: Boolean(selectedGoalId) && overviewOpen,
+  })
+
+  const archive = useMutation({
+    mutationFn: () => archiveGoalMemories(selectedGoalId),
+    onSuccess: async (result) => {
+      toast.success(`已归档 ${result.archived} 条 Goal 记忆`)
+      await queryClient.invalidateQueries({
+        queryKey: workspaceResourcePrefix(workspaceId, 'memory'),
+      })
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, 'goals'),
+      })
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
+  return (
+    <Surface className="gap-3 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-52 flex-1 space-y-1">
+          <Label className="text-sm">Goal 记忆总览与归档</Label>
+          <p className="text-xs text-muted-foreground">
+            为指定目标生成热区记忆总览，或在目标结束后将生命周期记忆移入冷区归档。
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Select value={selectedGoalId} onValueChange={setSelectedGoalId}>
+            <SelectTrigger className="w-52"><SelectValue placeholder="选择目标" /></SelectTrigger>
+            <SelectContent>
+              {goals.map((goal) => (
+                <SelectItem key={goal.id} value={goal.id}>{goal.title || goal.id}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Dialog open={overviewOpen} onOpenChange={setOverviewOpen}>
+            <DialogTrigger asChild>
+              <Button
+                disabled={!selectedGoalId}
+                onClick={() => setOverviewOpen(true)}
+                type="button"
+                variant="outline"
+              >
+                <Eye className="mr-1.5 h-4 w-4" />
+                生成总览
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>Goal 记忆总览</DialogTitle>
+                <DialogDescription>
+                  {goals.find((goal) => goal.id === selectedGoalId)?.title ?? selectedGoalId}
+                </DialogDescription>
+              </DialogHeader>
+              {overview.isPending ? (
+                <LoadingState label="正在生成总览…" />
+              ) : overview.isError ? (
+                <ErrorState message={overview.error.message} onRetry={() => overview.refetch()} />
+              ) : (
+                <div className="rounded-xl border bg-background p-4">
+                  <MessageResponse className="prose prose-sm max-w-none">
+                    {overview.data?.overview_markdown ?? ''}
+                  </MessageResponse>
+                </div>
+              )}
+            </DialogContent>
+          </Dialog>
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                disabled={!selectedGoalId || archive.isPending}
+                type="button"
+                variant="destructive"
+              >
+                <Archive className="mr-1.5 h-4 w-4" />
+                {archive.isPending ? '归档中…' : '归档 Goal 记忆'}
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>归档该目标的记忆？</AlertDialogTitle>
+                <AlertDialogDescription>
+                  将目标关联的记忆移入冷区（archive），不再参与热区召回。此操作会更新记忆层级并可追溯审计，不会删除任何记忆。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={(event) => {
+                    event.preventDefault()
+                    void archive.mutateAsync().then(() => undefined)
+                  }}
+                >
+                  确认归档
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </div>
+    </Surface>
   )
 }

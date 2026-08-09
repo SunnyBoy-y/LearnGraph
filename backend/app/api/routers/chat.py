@@ -419,7 +419,11 @@ def service(
             if settings.memory_context_builder_v2
             else memory_service.context_for_session
         ),
-        memory_cache_context_loader=memory_service.context_for_session,
+        memory_cache_context_loader=(
+            None
+            if settings.memory_read_mode == "events"
+            else memory_service.context_for_session
+        ),
         suggested_prompt_context_access_checker=lambda session, session_permission: (
             authorization.can_access_resource(
                 context.workspace,

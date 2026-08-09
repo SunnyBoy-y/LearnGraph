@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.core.config import Settings, get_settings
+from app.domain.memory_event_models import MemoryScopeContext
+from app.domain.memory_event_types import MemoryEventType
 from app.domain.models import (
     AnswerRecord,
     Evidence,
@@ -21,6 +23,7 @@ from app.domain.models import (
     new_id,
     utc_now,
 )
+from app.domain.schemas.memory_v2 import MemoryEventAppendRequest
 from app.domain.schemas.files import DocumentQueryPreviewRequest, FileReferenceCreate
 from app.domain.schemas.learning import (
     AnswerRequest,
@@ -51,6 +54,8 @@ from app.services.billing import BillingService
 from app.services.document_learning import DocumentLearningService
 from app.services.file_references import FileReferenceService
 from app.services.mastery import MasteryService
+from app.services.memory_event_ingestor import EventActor, MemoryEventIngestor, event_cipher_from_settings
+from app.services.memory_event_store import MemoryEventStore
 
 TRUE_FALSE_OPTIONS = ["正确", "错误"]
 TRUE_FALSE_TRUE = frozenset({"true", "yes", "y", "1", "正确", "对", "是", "t"})
@@ -1191,6 +1196,73 @@ class ExerciseService:
         )
         return correct, answer_text, feedback
 
+    def _append_learning_evidence(
+        self,
+        exercise: Exercise,
+        answer: AnswerRecord,
+        signal: Evidence,
+        *,
+        correct: bool,
+        stored_answer: str,
+        feedback: str,
+    ) -> None:
+        """Publish the unique domain event for a submitted exercise answer.
+
+        Exercise evidence belongs to ``learning.evidence_recorded``; it must
+        never be sent through the chat memory extractor or create a
+        ``memory.atom_created`` projection.
+        """
+        try:
+            from app.domain.models import Workspace
+
+            workspace = self.db.get(Workspace, self.workspace_id)
+            tenant_id = workspace.tenant_id if workspace is not None else "local-tenant"
+            store = MemoryEventStore(
+                self.db, event_cipher_from_settings(self.settings)
+            )
+            MemoryEventIngestor(store).ingest(
+                MemoryScopeContext(
+                    tenant_id=tenant_id,
+                    principal_user_id=self.actor_id,
+                    workspace_id=self.workspace_id,
+                    conversation_id=None,
+                ),
+                EventActor("user", self.actor_id),
+                MemoryEventAppendRequest(
+                    aggregate_type="learning_node",
+                    aggregate_id=exercise.node_id,
+                    expected_stream_version=None,
+                    event_type=MemoryEventType.LEARNING_EVIDENCE_RECORDED,
+                    producer="tool",
+                    idempotency_key=f"exercise-answer:{exercise.id}:{answer.id}",
+                    knowledge_node_id=exercise.node_id,
+                    sensitivity="normal",
+                    payload={
+                        "evidence_id": signal.id,
+                        "node_id": exercise.node_id,
+                        "exercise_id": exercise.id,
+                        "answer_record_id": answer.id,
+                        "source_type": "exercise",
+                        "is_correct": correct,
+                        "answer": stored_answer[:4_000],
+                        "feedback": feedback[:2_000],
+                        "question_type": exercise.question_type,
+                        "confidence": 0.9 if correct else 0.35,
+                        "summary_eligibility": "excluded",
+                    },
+                ),
+            )
+        except Exception:
+            # Exercise grading/learning state must not fail because memory
+            # event telemetry is unavailable; the durable queue outbox is the
+            # retry path for projection workers.
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "learning.evidence_recorded append failed for answer %s",
+                answer.id,
+            )
+
     def answer(self, exercise_id: str, payload: AnswerRequest) -> AnswerResult:
         exercise = self.exercises.require(exercise_id, "exercise")
         correct, stored_answer, feedback = self._grade(exercise, payload)
@@ -1222,6 +1294,14 @@ class ExerciseService:
         )
         node = self.nodes.require(exercise.node_id, "graph node")
         awarded = self.mastery_scheduler.record_exercise_result(signal, node)
+        self._append_learning_evidence(
+            exercise,
+            answer,
+            signal,
+            correct=correct,
+            stored_answer=stored_answer,
+            feedback=feedback,
+        )
         self.audit.record(
             actor_id=self.actor_id,
             action="exercise.answer",

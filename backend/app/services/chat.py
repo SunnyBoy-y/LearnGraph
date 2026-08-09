@@ -1858,6 +1858,7 @@ class ChatService:
             }
 
             if settings.memory_read_mode == "events":
+                self._write_shadow_telemetry(scope, request, built.view, telemetry)
                 return built.prompt_block, telemetry
 
             # Shadow mode: log comparison but still use legacy.
@@ -3233,6 +3234,72 @@ class ChatService:
             return []
         return [part for part in extracted if isinstance(part, dict)]
 
+    def _record_agent_run_event(
+        self,
+        chat_session_id: str,
+        run_id: str,
+        *,
+        succeeded: bool,
+        output: str,
+        meta: dict,
+        sources: list[dict],
+    ) -> None:
+        """Best-effort ``agent.run_completed`` event; never blocks tool execution."""
+        try:
+            settings = get_settings()
+            if not settings.memory_agent_run_enabled:
+                return
+            from app.domain.memory_event_models import MemoryScopeContext
+            from app.domain.memory_event_types import MemoryEventType
+            from app.domain.schemas.memory_v2 import MemoryEventAppendRequest
+            from app.services.memory_event_ingestor import (
+                EventActor,
+                MemoryEventIngestor,
+                event_cipher_from_settings,
+            )
+            from app.services.memory_event_store import MemoryEventStore
+
+            scope = MemoryScopeContext(
+                tenant_id=self.tenant_id,
+                principal_user_id=self.actor_id,
+                workspace_id=self.workspace_id,
+                conversation_id=chat_session_id or None,
+            )
+            MemoryEventIngestor(
+                MemoryEventStore(self.db, event_cipher_from_settings(settings))
+            ).ingest(
+                scope,
+                EventActor("agent", self.actor_id),
+                MemoryEventAppendRequest(
+                    aggregate_type="agent_run",
+                    aggregate_id=run_id[:64],
+                    expected_stream_version=None,
+                    event_type=MemoryEventType.AGENT_RUN_COMPLETED
+                    if succeeded
+                    else MemoryEventType.AGENT_RUN_FAILED,
+                    producer="agent",
+                    idempotency_key=f"agent-run:{run_id[:64]}:{succeeded}",
+                    payload={
+                        "result_summary": str(output or "")[:10_000],
+                        "tool_call_refs": [],
+                        "artifact_refs": [],
+                        "succeeded": succeeded,
+                        "decision": str(meta.get("reason") or "")[:1_000],
+                        "source_count": len(sources or []),
+                        "summary_eligibility": "excluded",
+                    },
+                ),
+                trusted_producer=True,
+            )
+            self.db.flush()
+        except Exception:
+            logger.debug(
+                "agent.run_completed event skipped for run %s",
+                run_id,
+                exc_info=True,
+            )
+            self.db.rollback()
+
     @staticmethod
     def _injected_image_message(image_parts: list[dict]) -> ProviderChatMessage:
         return ProviderChatMessage(
@@ -3268,15 +3335,37 @@ class ChatService:
                     {"status": "failed", "reason": "agent_session_missing"},
                     [],
                 )
-            return self.agent_tool_runtime.execute(
-                tool_call,
-                allowed_domains=allowed_domains,
-                chat_session_id=chat_session_id,
-                assistant_message_id=assistant_message_id,
-                assistant_version_id=assistant_version_id,
-                source_message_id=source_message_id,
-                model_supports_image_input=self._agent_model_supports_image_input(),
+            run_id = f"run_{assistant_message_id or source_message_id or str(tool_call.get('id') or uuid4())}"
+            try:
+                result = self.agent_tool_runtime.execute(
+                    tool_call,
+                    allowed_domains=allowed_domains,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    assistant_version_id=assistant_version_id,
+                    source_message_id=source_message_id,
+                    model_supports_image_input=self._agent_model_supports_image_input(),
+                )
+            except Exception:
+                self._record_agent_run_event(
+                    chat_session_id,
+                    run_id,
+                    succeeded=False,
+                    output="",
+                    meta={},
+                    sources=[],
+                )
+                raise
+            output, meta, sources = result
+            self._record_agent_run_event(
+                chat_session_id,
+                run_id,
+                succeeded=str(meta.get("status")) != "failed",
+                output=output,
+                meta=meta,
+                sources=sources,
             )
+            return result
 
         call_id = tool_call.get("id")
         function = tool_call.get("function")
@@ -6178,7 +6267,7 @@ class ChatService:
             if cache_only
             else self.memory_context_loader
         )
-        if memory_loader is not None:
+        if memory_loader is not None and get_settings().memory_read_mode != "events":
             memory_context = memory_loader(session.id).strip()
 
         scope = {

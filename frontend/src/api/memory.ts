@@ -210,3 +210,20 @@ export function summarizeSessionContext(
     `/memory/enhancement/summarize/${encodeURIComponent(sessionId)}`,
   )
 }
+
+export interface GoalMemoryOverview {
+  goal_id: string
+  overview_markdown: string
+}
+
+export function getGoalMemoryOverview(goalId: string): Promise<GoalMemoryOverview> {
+  return apiClient.get<GoalMemoryOverview>(
+    `/memory/goal-overview/${encodeURIComponent(goalId)}`,
+  )
+}
+
+export function archiveGoalMemories(goalId: string): Promise<{ archived: number }> {
+  return apiClient.post<{ archived: number }>(
+    `/memory/goal-archive/${encodeURIComponent(goalId)}`,
+  )
+}

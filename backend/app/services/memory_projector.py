@@ -217,7 +217,25 @@ class MemoryProjector:
         title = str(payload.get("title") or "")
         content = str(payload.get("content") or "")
         status = str(payload.get("status") or "active")
-        if status != "active":
+        temporal_status = str(payload.get("temporal_status") or "timeless")
+        if status != "active" or temporal_status in {
+            "cancelled",
+            "rescheduled",
+            "lapsed_unverified",
+            "expired",
+        }:
+            if temporal_status in {"cancelled", "rescheduled", "lapsed_unverified", "expired"}:
+                existing = self.db.scalar(
+                    select(MemorySearchDocument).where(
+                        MemorySearchDocument.target_type == "memory",
+                        MemorySearchDocument.target_id == memory_id,
+                    )
+                )
+                if existing is not None:
+                    existing.status = "lapsed" if temporal_status == "lapsed_unverified" else temporal_status
+                    self._delete_fts_row(existing.id)
+                    self.db.flush()
+                    return
             self._remove_search_document(memory_id)
             return
 

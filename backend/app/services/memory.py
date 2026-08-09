@@ -74,6 +74,12 @@ from app.repositories.domain import (
     SessionRepository,
     SettingRepository,
 )
+from app.services.memory_plan import (
+    canonical_plan_key,
+    ensure_plan_canonical_key,
+    normalize_plan_status,
+    plan_change_text,
+)
 from app.services.memory_vault import MemoryRecoveryVault
 from app.services.memory_zones import ReconcileZonesReport, reconcile_memory_zones
 from app.services.token_estimate import estimate_tokens
@@ -90,7 +96,10 @@ _LEDGER_STATUSES = {"active", "superseded", "retracted", "deleted"}
 _TEMPORAL_STATUSES = {
     "timeless",
     "planned",
+    "scheduled",
+    "tentative",
     "ongoing",
+    "in_progress",
     "completed",
     "cancelled",
     "rescheduled",
@@ -614,6 +623,11 @@ class MemoryService:
             "resolution_status": getattr(record, "resolution_status", None) or "none",
             "decay_policy": getattr(record, "decay_policy", None) or "SLOW",
             "supersedes_id": getattr(record, "supersedes_id", None),
+            "plan_change_text": str(
+                (getattr(record, "structured_payload", None) or {}).get(
+                    "plan_change_text", ""
+                )
+            ),
             "restore_available": restore_available,
             "content": content,
             "retrieval_score": retrieval_score,
@@ -2599,14 +2613,22 @@ class MemoryService:
             assert draft.target_memory_id
             structured_payload = dict(draft.structured_payload or {})
             if draft.operation == "COMPLETE":
+                structured_payload = ensure_plan_canonical_key(
+                    structured_payload, title=draft.title
+                )
                 structured_payload["temporal_status"] = "completed"
                 structured_payload.setdefault(
                     "summary_eligibility", "historical"
                 )
+                structured_payload["plan_change_text"] = plan_change_text("completed")
                 structured_payload["last_verified_at"] = now.isoformat()
             elif draft.operation == "CANCEL":
+                structured_payload = ensure_plan_canonical_key(
+                    structured_payload, title=draft.title
+                )
                 structured_payload["temporal_status"] = "cancelled"
                 structured_payload["summary_eligibility"] = "excluded"
+                structured_payload["plan_change_text"] = plan_change_text("cancelled")
                 structured_payload["last_verified_at"] = now.isoformat()
             elif draft.operation == "CONFIRM":
                 structured_payload["last_verified_at"] = now.isoformat()
@@ -2634,6 +2656,25 @@ class MemoryService:
             # ``supersedes_id`` while the superseded record moves to the cold
             # archive zone (out of recall, still exportable/restorable).
             assert draft.target_memory_id
+            target = self.memories.require(draft.target_memory_id, "memory")
+            structured_payload = ensure_plan_canonical_key(
+                dict(draft.structured_payload or {}), title=draft.title
+            )
+            canonical_key = str(
+                target.canonical_key or structured_payload.get("canonical_key") or ""
+            ).strip() or canonical_plan_key(draft.title)
+            structured_payload["canonical_key"] = canonical_key
+            structured_payload["temporal_status"] = normalize_plan_status(
+                str(structured_payload.get("temporal_status") or "scheduled"),
+                start_at=(
+                    _structured_datetime(structured_payload.get("event_at"))
+                    or _structured_datetime(structured_payload.get("valid_until"))
+                ),
+                now=now,
+            )
+            if structured_payload["temporal_status"] == "rescheduled":
+                structured_payload["temporal_status"] = "scheduled"
+            structured_payload["plan_change_text"] = plan_change_text("rescheduled")
             created = self.create(
                 MemoryCreateRequest(
                     title=draft.title or draft.memory_type,
@@ -2646,7 +2687,7 @@ class MemoryService:
                     node_id=draft.node_id,
                     zone="topics",
                     record_kind=draft.memory_type,
-                    structured_payload=dict(draft.structured_payload or {}),
+                    structured_payload=structured_payload,
                     confidence=float(draft.confidence),
                     importance=float(draft.importance),
                     source=f"draft:{draft.created_by}",
@@ -2655,12 +2696,12 @@ class MemoryService:
             )
             successor = self.memories.require(created.id, "memory")
             successor.supersedes_id = draft.target_memory_id
-            target = self.memories.require(draft.target_memory_id, "memory")
             target_structured = dict(target.structured_payload or {})
             target_structured["ledger_status"] = "superseded"
             target_structured["summary_eligibility"] = "historical"
             if draft.operation == "RESCHEDULE":
                 target_structured["temporal_status"] = "rescheduled"
+                target_structured["plan_change_text"] = plan_change_text("rescheduled")
             self.update(
                 draft.target_memory_id,
                 MemoryUpdateRequest(

@@ -3,6 +3,7 @@ export interface ContextEvidence {
   target_id: string
   title: string
   content: string
+  content_hash: string
   source_event_id: string
   scope: string
   confidence: number
@@ -11,10 +12,14 @@ export interface ContextEvidence {
   trust: string
   score: number
   component_scores: Record<string, number>
+  reason_codes: string[]
+  token_cost: number
+  manifest_status: string
 }
 
 export interface ContextBuildRequest {
   conversation_id?: string
+  message_id?: string
   task_id?: string
   query: string
   token_budget?: number
@@ -30,6 +35,19 @@ export interface ContextBuildView {
   task_state: Record<string, unknown> | null
   recent_context: Array<Record<string, unknown>>
   memories: ContextEvidence[]
+  candidate_memories: ContextEvidence[]
+  retrieved_memories: ContextEvidence[]
+  selected_memories: ContextEvidence[]
+  injected_memories: ContextEvidence[]
+  excluded_memories: ContextEvidence[]
+  truncated_memories: ContextEvidence[]
+  candidate_count: number
+  retrieved_count: number
+  selected_count: number
+  injected_count: number
+  excluded_count: number
+  truncated_count: number
+  manifest_status: string
   episodes: Array<Record<string, unknown>>
   project_decisions: Array<Record<string, unknown>>
   file_chunks: Array<Record<string, unknown>>
@@ -43,4 +61,24 @@ export interface ContextBuildView {
   package_hash: string
   excluded: Record<string, number>
   degraded_modes: string[]
+}
+
+export interface ContextManifestReceipt {
+  context_build_id: string
+  session_id: string | null
+  message_id: string | null
+  status: string
+  candidate_ids: string[]
+  retrieved_ids: string[]
+  selected_ids: string[]
+  injected_ids: string[]
+  excluded_ids: string[]
+  truncated_ids: string[]
+  reason_codes: Record<string, string[]>
+  excluded_counts: Record<string, number>
+  section_tokens: Record<string, number>
+  total_tokens: number
+  injected_tokens: number
+  package_hash: string
+  created_at: string
 }

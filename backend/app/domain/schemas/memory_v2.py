@@ -21,7 +21,7 @@ class MemoryEventAppendRequest(BaseModel):
     expected_stream_version: int | None = Field(default=None, ge=0)
     event_type: str = Field(min_length=3, max_length=100)
     event_schema_version: int = Field(default=1, ge=1)
-    producer: Literal["api", "chat", "file", "tool", "scheduler", "migration", "device"] = "api"
+    producer: Literal["api", "chat", "file", "tool", "scheduler", "migration", "device", "agent"] = "api"
     idempotency_key: str = Field(min_length=8, max_length=160)
     correlation_id: str | None = Field(default=None, max_length=64)
     causation_id: str | None = Field(default=None, max_length=64)

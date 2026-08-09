@@ -78,9 +78,9 @@ class Settings(BaseSettings):
     # Event-sourced memory architecture rollout. Architecture flags are deployment
     # controls, never ordinary workspace settings editable by agents.
     memory_write_mode: str = "dual"
-    memory_read_mode: str = "legacy"
+    memory_read_mode: str = "events"
     memory_shadow_sample_rate: float = 0.05
-    memory_context_builder_v2: bool = False
+    memory_context_builder_v2: bool = True
     memory_task_episode_enabled: bool = True
     memory_file_revision_invalidation_enabled: bool = True
     memory_agent_run_enabled: bool = True

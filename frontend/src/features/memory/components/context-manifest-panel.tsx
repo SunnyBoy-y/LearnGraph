@@ -1,40 +1,70 @@
-import { useMutation } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
-import { buildMemoryContext } from '@/api'
+import { listContextManifests } from '@/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { ContextBuildView } from '@/types/context-builds'
+import type { ContextManifestReceipt } from '@/types/context-builds'
 
 export function ContextManifestPanel() {
-  const [query, setQuery] = useState('继续当前任务')
-  const build = useMutation({
-    mutationFn: () => buildMemoryContext({ query, debug_manifest: true }),
+  const [sessionId, setSessionId] = useState('')
+  const [appliedSessionId, setAppliedSessionId] = useState('')
+  const receipts = useQuery({
+    queryKey: ['memory-context-manifests', appliedSessionId],
+    queryFn: () =>
+      listContextManifests({
+        session_id: appliedSessionId || undefined,
+      }),
+    enabled: Boolean(appliedSessionId),
   })
-  const result: ContextBuildView | undefined = build.data
 
   return (
     <div className="space-y-4">
       <div className="flex gap-2">
-        <Input value={query} onChange={(event) => setQuery(event.target.value)} />
-        <Button disabled={!query.trim() || build.isPending} onClick={() => build.mutate()}>预览 AI 上下文</Button>
+        <Input
+          value={sessionId}
+          onChange={(event) => setSessionId(event.target.value)}
+          placeholder="Session ID（留空查全部）"
+        />
+        <Button
+          disabled={receipts.isFetching}
+          onClick={() => setAppliedSessionId(sessionId.trim())}
+        >
+          读取回执
+        </Button>
       </div>
-      {result && (
-        <div className="space-y-2 rounded-xl border p-4 text-sm">
-          <div className="flex flex-wrap gap-4 text-muted-foreground">
-            <span>Build {result.context_build_id}</span>
-            <span>{result.total_tokens} tokens</span>
-            <span>{result.memories.length} 条记忆</span>
-          </div>
-          {result.context_manifest.map((item, index) => (
-            <pre key={index} className="overflow-auto rounded-lg bg-muted p-3 text-xs">
-              {JSON.stringify(item, null, 2)}
-            </pre>
+      {receipts.isError ? (
+        <p className="text-sm text-red-600">无法读取记忆回执。</p>
+      ) : null}
+      {receipts.data?.length ? (
+        <div className="space-y-2">
+          {receipts.data.map((receipt: ContextManifestReceipt) => (
+            <div
+              className="rounded-lg border p-3 text-sm"
+              key={receipt.context_build_id}
+            >
+              <div className="flex flex-wrap gap-4 text-muted-foreground">
+                <span className="font-mono text-xs">{receipt.context_build_id}</span>
+                <span>状态 {receipt.status}</span>
+                <span>
+                  注入 {receipt.injected_ids.length} / 选择 {receipt.selected_ids.length} / 检索{' '}
+                  {receipt.retrieved_ids.length}
+                </span>
+                <span>{receipt.injected_tokens} tokens</span>
+              </div>
+              <div className="mt-2 grid gap-1 text-xs sm:grid-cols-2">
+                <span>候选 {receipt.candidate_ids.join(', ') || '无'}</span>
+                <span>排除 {receipt.excluded_ids.join(', ') || '无'}</span>
+                <span>截断 {receipt.truncated_ids.join(', ') || '无'}</span>
+                <span>原因 {JSON.stringify(receipt.reason_codes)}</span>
+              </div>
+            </div>
           ))}
-          {result.degraded_modes.length > 0 && (
-            <p className="text-xs text-amber-600">降级：{result.degraded_modes.join(', ')}</p>
-          )}
         </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          {receipts.isFetched ? '暂无历史回执。' : '输入 Session ID 后读取真实 Manifest 回执。'}
+        </p>
       )}
     </div>
   )
