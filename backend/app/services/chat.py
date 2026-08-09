@@ -47,6 +47,7 @@ from app.domain.models import (
     ProviderResponseState,
     Project,
     RetrievalHit,
+    SubAppInteractionEvent,
     SuggestedPromptBatch,
     WorkspaceSetting,
     utc_now,
@@ -9963,6 +9964,44 @@ class ChatService:
 
         return replay_and_follow()
 
+    def _validate_subapp_event_message(
+        self, session_id: str, payload: MessageCreateRequest
+    ) -> None:
+        """Reject forged/out-of-scope subapp_event chat turns.
+
+        Event-driven Agent turns are created by the durable worker; ordinary
+        HTTP clients must not be able to claim an arbitrary event id. The event
+        must exist in this workspace, belong to this session, and belong to the
+        same actor as the ChatService turn.
+        """
+        if payload.message_kind != "subapp_event":
+            return
+        event_id = payload.subapp_event_id
+        if not event_id:
+            raise AppError(
+                422,
+                "subapp_event_id_required",
+                "subapp_event message_kind requires subapp_event_id",
+            )
+        event = self.db.scalar(
+            select(SubAppInteractionEvent).where(
+                SubAppInteractionEvent.id == event_id,
+                SubAppInteractionEvent.workspace_id == self.workspace_id,
+            )
+        )
+        if event is None or event.session_id != session_id:
+            raise AppError(
+                404,
+                "subapp_event_not_found",
+                "Sub-application event not found in this session",
+            )
+        if event.actor_id != self.actor_id:
+            raise AppError(
+                403,
+                "subapp_event_actor_mismatch",
+                "Sub-application event does not belong to the current actor",
+            )
+
     def preflight_create_stream(
         self,
         session_id: str,
@@ -9984,6 +10023,8 @@ class ChatService:
         if session.status == "closed":
             raise AppError(409, "session_closed", "Closed sessions cannot accept new messages")
         self._validate_context(session_id, payload)
+        if payload.message_kind == "subapp_event":
+            self._validate_subapp_event_message(session_id, payload)
         normalized_key = idempotency_key.strip() if idempotency_key else None
         if idempotency_key is not None and not normalized_key:
             raise AppError(
@@ -10537,6 +10578,15 @@ class ChatService:
             ),
             *attachment_snapshots,
         ]
+        user_part_type = (
+            "subapp_event" if payload.message_kind == "subapp_event" else "text"
+        )
+        user_part_data: dict = {}
+        if payload.message_kind == "subapp_event":
+            user_part_data = {
+                "subapp_event_id": payload.subapp_event_id,
+                "event_type": payload.subapp_event_id or "",
+            }
         user_message = self.messages.add(
             Message(
                 workspace_id=self.workspace_id,
@@ -10548,9 +10598,10 @@ class ChatService:
                 parts=[
                     self._part_snapshot(
                         user_part_id,
-                        "text",
+                        user_part_type,
                         "completed",
                         payload.content,
+                        data=user_part_data,
                     ),
                     *user_context_snapshots,
                 ],
@@ -10570,9 +10621,10 @@ class ChatService:
                 workspace_id=self.workspace_id,
                 message_version_id=user_version.id,
                 ordinal=0,
-                part_type="text",
+                part_type=user_part_type,
                 status="completed",
                 content=payload.content,
+                data=user_part_data,
             )
         )
         for ordinal, snapshot in enumerate(user_context_snapshots, start=1):

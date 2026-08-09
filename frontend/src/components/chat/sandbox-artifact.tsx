@@ -8,6 +8,8 @@ import {
   CodeBlockHeader,
 } from "@/components/ai-elements/code-block";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { apiClient } from "@/api/client";
 import {
@@ -69,6 +71,13 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const subappLoadedRef = useRef(false);
   const subappChannelRef = useRef<SubappChannel | null>(null);
   const [subappFailed, setSubappFailed] = useState<string | null>(null);
+  const [consentRequest, setConsentRequest] = useState<{
+    eventId: string
+    pendingConsentId: string
+    triggers: string[]
+  } | null>(null);
+  const [agentStatus, setAgentStatus] = useState<'idle' | 'queued' | 'processing' | 'failed'>('idle');
+  const [agentError, setAgentError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!subappTrigger) return;
@@ -88,6 +97,12 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           : undefined,
       chatSessionId,
       onFailed: (reason) => setSubappFailed(reason),
+      onConsentRequired: (info) => setConsentRequest(info),
+      onEventQueued: () => setConsentRequest(null),
+      onAgentStatus: (status) => {
+        setAgentStatus(status.agentStatus)
+        setAgentError(status.error ?? null)
+      },
     });
     subappChannelRef.current = channel;
     return () => {
@@ -136,17 +151,19 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
 
       {subappTrigger ? (
         hasSubappContent ? (
-          <iframe
-            allow=""
-            className="sandbox-artifact__preview"
-            onLoad={handleSubappLoad}
-            ref={iframeRef}
-            referrerPolicy="no-referrer"
-            sandbox="allow-scripts"
-            srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
-            src={!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined)) : undefined}
-            title={`${title}子应用`}
-          />
+          <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+            <iframe
+              allow=""
+              className="sandbox-artifact__preview"
+              onLoad={handleSubappLoad}
+              ref={iframeRef}
+              referrerPolicy="no-referrer"
+              sandbox="allow-scripts"
+              srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
+              src={!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined)) : undefined}
+              title={`${title}子应用`}
+            />
+          </FullscreenPreview>
         ) : (
           <div className="sandbox-artifact__empty">
             <Box className="size-6" />
@@ -157,24 +174,28 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           </div>
         )
       ) : previewHtml ? (
-        <iframe
-          allow=""
-          className="sandbox-artifact__preview"
-          onLoad={(event) => postRendererUnlock(event.currentTarget, unlockMessage)}
-          referrerPolicy="no-referrer"
-          sandbox="allow-scripts"
-          srcDoc={sandboxedHtmlPreviewDocument(previewHtml)}
-          title={`${title}动态沙箱预览`}
-        />
+        <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+          <iframe
+            allow=""
+            className="sandbox-artifact__preview"
+            onLoad={(event) => postRendererUnlock(event.currentTarget, unlockMessage)}
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            srcDoc={sandboxedHtmlPreviewDocument(previewHtml)}
+            title={`${title}动态沙箱预览`}
+          />
+        </FullscreenPreview>
       ) : canRenderRemote ? (
-        <iframe
-          allow=""
-          className="sandbox-artifact__preview"
-          referrerPolicy="no-referrer"
-          sandbox="allow-scripts"
-          src={artifactUrl}
-          title={`${title}隔离运行预览`}
-        />
+        <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+          <iframe
+            allow=""
+            className="sandbox-artifact__preview"
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            src={artifactUrl}
+            title={`${title}隔离运行预览`}
+          />
+        </FullscreenPreview>
       ) : (
         <div className="sandbox-artifact__empty">
           <Box className="size-6" />
@@ -190,6 +211,68 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           <ShieldAlert className="size-3.5" />
           {subappFailureText(subappFailed)}
         </p>
+      ) : null}
+
+      {subappTrigger && consentRequest ? (
+        <div className="sandbox-artifact__consent" role="region" aria-label="Agent 协同模式授权">
+          <p>AI建议采用Agent协同模式，是否开启？</p>
+          <div className="sandbox-artifact__consent-actions">
+            <Button
+              size="sm"
+              type="button"
+              variant="default"
+              onClick={() => void subappChannelRef.current?.decideConsent('allow_session')}
+            >
+              允许本次
+            </Button>
+            <Button
+              size="sm"
+              type="button"
+              variant="secondary"
+              onClick={() => void subappChannelRef.current?.decideConsent('allow_app')}
+            >
+              加入白名单
+            </Button>
+            <Button
+              size="sm"
+              type="button"
+              variant="secondary"
+              onClick={() => void subappChannelRef.current?.decideConsent('allow_global')}
+            >
+              全局允许
+            </Button>
+            <Button
+              size="sm"
+              type="button"
+              variant="ghost"
+              onClick={() => void subappChannelRef.current?.decideConsent('deny')}
+            >
+              暂不开启
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {subappTrigger && (agentStatus === 'processing' || agentStatus === 'queued') ? (
+        <p className="sandbox-artifact__agent-status" role="status">
+          <ShieldCheck className="size-3.5" />
+          AI 正在处理子应用事件…
+        </p>
+      ) : null}
+
+      {subappTrigger && agentStatus === 'failed' ? (
+        <div className="sandbox-artifact__agent-error" role="alert">
+          <ShieldAlert className="size-3.5" />
+          <span>{agentError || '子应用 Agent 处理失败。'}</span>
+          <Button
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => void subappChannelRef.current?.retryAgentTask()}
+          >
+            重试
+          </Button>
+        </div>
       ) : null}
 
       {artifactUrl && !canRenderRemote ? (

@@ -9,6 +9,11 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.services.subapp_bundles import SubAppBundleService
 from app.core.errors import AppError
 from app.domain.schemas.subapps import (
+    SubAppAgentConsentDecisionRequest,
+    SubAppAgentConsentView,
+    SubAppAgentTaskRetryRequest,
+    SubAppAgentTaskRetryView,
+    SubAppAgentTaskStatusView,
     SubAppEventIngestedView,
     SubAppEventIngestRequest,
     SubAppEventListView,
@@ -19,6 +24,13 @@ from app.domain.schemas.subapps import (
     SubAppSessionView,
     SubAppStateListView,
     SubAppStateView,
+)
+from app.services.subapp_event_agent import (
+    cancel_subapp_agent_task,
+    decide_subapp_agent_consent,
+    get_subapp_agent_consent,
+    get_subapp_agent_task,
+    retry_subapp_agent_task,
 )
 from app.services.subapps import (
     MAX_SUBAPP_EVENT_LIST_LIMIT,
@@ -179,3 +191,81 @@ def terminate_subapp_session(
     context: CurrentWorkspace,
 ) -> SubAppSessionView:
     return service(db, context).terminate_session(session_id)
+
+
+@router.get("/sessions/{session_id}/agent-consent", response_model=SubAppAgentConsentView)
+def get_agent_consent(
+    session_id: SessionPath,
+    db: DB,
+    context: CurrentWorkspace,
+) -> SubAppAgentConsentView:
+    return SubAppAgentConsentView(**get_subapp_agent_consent(session_id))
+
+
+@router.post(
+    "/sessions/{session_id}/agent-consent",
+    response_model=SubAppAgentConsentView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def decide_agent_consent(
+    session_id: SessionPath,
+    payload: SubAppAgentConsentDecisionRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> SubAppAgentConsentView:
+    decide_subapp_agent_consent(
+        session_id=session_id,
+        token=payload.token,
+        decision=payload.decision,
+        actor_id=context.principal.user_id,
+    )
+    return SubAppAgentConsentView(**get_subapp_agent_consent(session_id))
+
+
+@router.get("/sessions/{session_id}/agent-task", response_model=SubAppAgentTaskStatusView)
+def get_agent_task(
+    session_id: SessionPath,
+    db: DB,
+    context: CurrentWorkspace,
+) -> SubAppAgentTaskStatusView:
+    return SubAppAgentTaskStatusView(**get_subapp_agent_task(session_id))
+
+
+@router.post(
+    "/sessions/{session_id}/agent-task/retry",
+    response_model=SubAppAgentTaskRetryView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_agent_task(
+    session_id: SessionPath,
+    payload: SubAppAgentTaskRetryRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> SubAppAgentTaskRetryView:
+    return SubAppAgentTaskRetryView(
+        **retry_subapp_agent_task(
+            session_id,
+            payload.token,
+            context.principal.user_id,
+        )
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/agent-task/cancel",
+    response_model=SubAppAgentTaskRetryView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def cancel_agent_task(
+    session_id: SessionPath,
+    payload: SubAppAgentTaskRetryRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> SubAppAgentTaskRetryView:
+    return SubAppAgentTaskRetryView(
+        **cancel_subapp_agent_task(
+            session_id,
+            payload.token,
+            context.principal.user_id,
+        )
+    )

@@ -130,6 +130,14 @@ export interface SubAppSessionRelay {
   getToken: () => string | null
   /** Fired after a 202 carries a freshly rotated token. */
   onAccepted?: (accepted: { sessionId: string; nextToken: string }) => void
+  /** Fired when the server asks for a one-time Agent consent decision. */
+  onConsentRequired?: (info: {
+    eventId: string
+    pendingConsentId: string
+    triggers: string[]
+  }) => void
+  /** Fired when the server accepted the event and queued an Agent turn. */
+  onEventQueued?: (info: { eventId?: string | null; runId?: string | null }) => void
   /** Fired on a deterministic (4xx) rejection such as an invalid/stale token. */
   onRejected?: (error: unknown) => void
 }
@@ -236,6 +244,16 @@ async function relaySessionEvent(
     })
     if (accepted?.next_token) {
       session.onAccepted?.({ sessionId: session.sessionId, nextToken: accepted.next_token })
+    }
+    const agent = accepted?.agent
+    if (agent?.consent_required) {
+      session.onConsentRequired?.({
+        eventId: agent.pending_consent_id ?? '',
+        pendingConsentId: agent.pending_consent_id ?? '',
+        triggers: Array.isArray(agent.triggers) ? agent.triggers : [],
+      })
+    } else if (agent?.triggered) {
+      session.onEventQueued?.({ eventId: agent.event_id, runId: agent.run_id })
     }
   } catch (error) {
     const status = apiErrorStatus(error)
@@ -354,6 +372,15 @@ export interface SubappEventAcceptedResponse {
   event: Record<string, unknown>
   next_token: string
   next_token_prefix: string
+  agent?: {
+    consent_required?: boolean
+    triggered?: boolean
+    pending_consent_id?: string | null
+    disabled?: boolean
+    event_id?: string | null
+    run_id?: string | null
+    triggers?: string[]
+  }
 }
 
 /**
@@ -461,6 +488,19 @@ export interface SubappChannelOptions {
   provisioned?: { sessionId: string; token: string; unlockMessage: Record<string, unknown> }
   /** Fired after a newer `renderer.state` version is pushed into the iframe. */
   onStatePushed?: (version: number) => void
+  /** Fired when the server asks for a one-time Agent consent decision. */
+  onConsentRequired?: (info: {
+    eventId: string
+    pendingConsentId: string
+    triggers: string[]
+  }) => void
+  /** Fired when an event-driven Agent turn was queued. */
+  onEventQueued?: (info: { eventId?: string | null; runId?: string | null }) => void
+  /** Fired when polling observes the session Agent status. */
+  onAgentStatus?: (status: {
+    agentStatus: 'idle' | 'queued' | 'processing' | 'failed'
+    error?: string | null
+  }) => void
   /**
    * P3 media injection: resolve a pushed state snapshot's `media` refs into
    * validated byte assets and post them as `renderer.media`. Defaults to
@@ -481,6 +521,14 @@ export interface SubappChannel {
   destroy(): void
   /** Current session id once established, else null. */
   sessionId(): string | null
+  /** Apply an Agent consent decision. */
+  decideConsent(
+    decision: 'allow_session' | 'allow_app' | 'allow_global' | 'deny',
+  ): Promise<boolean>
+  /** Manually retry the latest failed/skipped Agent task. */
+  retryAgentTask(): Promise<boolean>
+  /** Cancel a processing Agent task. */
+  cancelAgentTask(): Promise<boolean>
 }
 
 /**
@@ -634,6 +682,23 @@ export function createSubappChannel(options: SubappChannelOptions): SubappChanne
         options.onStatePushed?.(latest.version)
         void deliverMedia(latest)
       }
+      const sessionView = await apiClient.get<{
+        agent_status?: string
+        agent_error?: string | null
+      }>(`/subapps/sessions/${envelope.sessionId}`)
+      if (destroyed || !envelope) return
+      const agentStatus = sessionView?.agent_status
+      if (
+        agentStatus === 'idle' ||
+        agentStatus === 'queued' ||
+        agentStatus === 'processing' ||
+        agentStatus === 'failed'
+      ) {
+        options.onAgentStatus?.({
+          agentStatus,
+          error: sessionView?.agent_error ?? null,
+        })
+      }
     } catch (error) {
       // Transient poll failure: keep the timer running for the next attempt.
       console.warn('[subapp-channel] state poll failed', error)
@@ -671,6 +736,8 @@ export function createSubappChannel(options: SubappChannelOptions): SubappChanne
           pollAttempts = 0
           startPolling()
         },
+        onConsentRequired: options.onConsentRequired,
+        onEventQueued: options.onEventQueued,
         onRejected: (error) => {
           if (destroyed) return
           const status = apiErrorStatus(error)
@@ -693,6 +760,54 @@ export function createSubappChannel(options: SubappChannelOptions): SubappChanne
     if (envelope) activate()
   }
 
+  async function decideConsent(
+    decision: 'allow_session' | 'allow_app' | 'allow_global' | 'deny',
+  ): Promise<boolean> {
+    if (!envelope || !currentToken) return false
+    try {
+      await apiClient.post<unknown, { token: string; decision: string }>(
+        `/subapps/sessions/${envelope.sessionId}/agent-consent`,
+        { token: currentToken, decision },
+      )
+      pollAttempts = 0
+      startPolling()
+      return true
+    } catch (error) {
+      console.warn('[subapp-channel] agent consent decision failed', error)
+      return false
+    }
+  }
+
+  async function retryAgentTask(): Promise<boolean> {
+    if (!envelope || !currentToken) return false
+    try {
+      await apiClient.post<unknown, { token: string }>(
+        `/subapps/sessions/${envelope.sessionId}/agent-task/retry`,
+        { token: currentToken },
+      )
+      pollAttempts = 0
+      startPolling()
+      return true
+    } catch (error) {
+      console.warn('[subapp-channel] agent task retry failed', error)
+      return false
+    }
+  }
+
+  async function cancelAgentTask(): Promise<boolean> {
+    if (!envelope || !currentToken) return false
+    try {
+      await apiClient.post<unknown, { token: string }>(
+        `/subapps/sessions/${envelope.sessionId}/agent-task/cancel`,
+        { token: currentToken },
+      )
+      return true
+    } catch (error) {
+      console.warn('[subapp-channel] agent task cancel failed', error)
+      return false
+    }
+  }
+
   if (options.provisioned) {
     if (iframeLoaded) activate()
   } else {
@@ -702,6 +817,9 @@ export function createSubappChannel(options: SubappChannelOptions): SubappChanne
   return {
     handleIframeLoad,
     sessionId: () => envelope?.sessionId ?? null,
+    decideConsent,
+    retryAgentTask,
+    cancelAgentTask,
     destroy(): void {
       if (destroyed) return
       destroyed = true

@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     durable_queue_poll_seconds: float = 0.25
     durable_queue_lease_seconds: int = 300
     durable_queue_max_attempts: int = 3
+    # Event-driven Agent turns for bidirectional sub-applications. Default off:
+    # enabling it can trigger paid model calls without a frontend consent turn.
+    subapp_event_agent_enabled: bool = False
+    subapp_event_agent_max_attempts: int = 3
+    subapp_event_agent_idle_seconds: int = 120
+    subapp_event_agent_poll_reconcile: bool = True
     mastery_message_threshold: int = 8
     mastery_idle_seconds: int = 300
     mastery_embedded_scheduler_enabled: bool = True

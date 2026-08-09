@@ -25,12 +25,16 @@ MessagePartType = Literal[
     "chart",
     "sandbox",
     "sandbox_artifact",
+    "subapp_artifact",
+    "subapp_event",
     "sandbox_status",
+    "skill_trigger",
     "component",
     "magic_card",
     "user_confirmation",
     "fetch_authorization",
     "fetch_setup_notice",
+    "egress_authorization",
     "error",
 ]
 
@@ -433,6 +437,8 @@ class MessageCreateRequest(BaseModel):
     web_search: bool = False
     agent_mode: bool = False
     goal_mode: bool = False
+    message_kind: Literal["normal", "subapp_event"] = "normal"
+    subapp_event_id: str | None = Field(default=None, min_length=1, max_length=36)
     allowed_domains: list[str] = Field(default_factory=list, max_length=50)
     graph_action: Literal["none", "propose_create", "propose_update"] = "none"
     graph_id: str | None = Field(default=None, min_length=1, max_length=36)
@@ -445,6 +451,8 @@ class MessageCreateRequest(BaseModel):
             raise ValueError("image_size and source_file_ids require image generation mode")
         if self.goal_mode and not self.agent_mode:
             raise ValueError("goal_mode requires agent_mode")
+        if self.message_kind == "subapp_event" and not self.subapp_event_id:
+            raise ValueError("subapp_event requires subapp_event_id")
         if self.graph_action in {"none", "propose_create"} and self.graph_id is not None:
             raise ValueError("graph_id is only valid for propose_update")
         if self.web_search and self.search_route == "disabled":

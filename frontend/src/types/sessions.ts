@@ -19,6 +19,7 @@ export type MessagePartType =
   | 'sandbox'
   | 'sandbox_artifact'
   | 'subapp_artifact'
+  | 'subapp_event'
   | 'sandbox_status'
   | 'skill_trigger'
   | 'component'
@@ -201,6 +202,10 @@ export interface MessageCreateRequest {
   agent_mode?: boolean
   /** Activates the Goal-planning Agent Skill for this turn. Requires agent_mode. */
   goal_mode?: boolean
+  /** Reserved for server-driven sub-application events; normal chat sends "normal". */
+  message_kind?: 'normal' | 'subapp_event'
+  /** Required when message_kind is subapp_event; only the backend worker may use it. */
+  subapp_event_id?: string
   search_route?: 'disabled' | 'model_native' | 'external' | 'local' | 'auto'
   web_search?: boolean
   allowed_domains?: string[]

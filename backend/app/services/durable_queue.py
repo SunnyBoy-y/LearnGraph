@@ -375,6 +375,19 @@ def run_one_durable_job(worker_id: str) -> bool:
                         ),
                     )
                 queue.complete(job)
+            elif job.kind == "subapp.event.process":
+                from app.services.subapp_event_agent import (
+                    run_subapp_event_agent_once,
+                )
+
+                terminal = run_subapp_event_agent_once(job.payload)
+                if terminal:
+                    queue.complete(job)
+                else:
+                    queue.rearm(
+                        job,
+                        delay_seconds=settings.subapp_event_agent_idle_seconds,
+                    )
             else:
                 raise ValueError(f"Unsupported durable job kind: {job.kind}")
         except Exception as error:

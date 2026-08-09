@@ -327,3 +327,41 @@ export function cancelSessionMessage(sessionId: string, messageId: string): Prom
     `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/cancel`,
   )
 }
+
+// --------------------------------------------------------------------------- //
+// Sub-application event-driven Agent tasks
+// --------------------------------------------------------------------------- //
+
+export type SubappAgentConsentDecision =
+  | 'allow_session'
+  | 'allow_app'
+  | 'allow_global'
+  | 'deny'
+
+export async function decideSubappAgentConsent(
+  sessionId: string,
+  token: string,
+  decision: SubappAgentConsentDecision,
+): Promise<boolean> {
+  await apiClient.post<unknown, { token: string; decision: SubappAgentConsentDecision }>(
+    `/subapps/sessions/${encodeURIComponent(sessionId)}/agent-consent`,
+    { token, decision },
+  )
+  return true
+}
+
+export async function retrySubappAgentTask(sessionId: string, token: string): Promise<boolean> {
+  await apiClient.post<unknown, { token: string }>(
+    `/subapps/sessions/${encodeURIComponent(sessionId)}/agent-task/retry`,
+    { token },
+  )
+  return true
+}
+
+export async function cancelSubappAgentTask(sessionId: string, token: string): Promise<boolean> {
+  await apiClient.post<unknown, { token: string }>(
+    `/subapps/sessions/${encodeURIComponent(sessionId)}/agent-task/cancel`,
+    { token },
+  )
+  return true
+}

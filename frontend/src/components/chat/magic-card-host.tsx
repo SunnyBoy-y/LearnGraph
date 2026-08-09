@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Box, Sparkles } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { apiClient } from "@/api/client";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import {
@@ -125,6 +127,13 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   const subappLoadedRef = useRef(false);
   const subappChannelRef = useRef<SubappChannel | null>(null);
   const [subappFailed, setSubappFailed] = useState<string | null>(null);
+  const [consentRequest, setConsentRequest] = useState<{
+    eventId: string
+    pendingConsentId: string
+    triggers: string[]
+  } | null>(null);
+  const [agentStatus, setAgentStatus] = useState<'idle' | 'queued' | 'processing' | 'failed'>('idle');
+  const [agentError, setAgentError] = useState<string | null>(null);
   const [bundlePreviewUrl, setBundlePreviewUrl] = useState<string | null>(null);
 
   useEffect(() => {
@@ -145,6 +154,12 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           : undefined,
       chatSessionId,
       onFailed: (reason) => setSubappFailed(reason),
+      onConsentRequired: (info) => setConsentRequest(info),
+      onEventQueued: () => setConsentRequest(null),
+      onAgentStatus: (status) => {
+        setAgentStatus(status.agentStatus)
+        setAgentError(status.error ?? null)
+      },
     });
     subappChannelRef.current = channel;
     return () => {
@@ -248,28 +263,87 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           <Badge variant="secondary">subapp</Badge>
         </div>
         {hasSubappContent ? (
-          <iframe
-            allow=""
-            className="magic-card__frame"
-            onLoad={handleSubappLoad}
-            ref={subappIframeRef}
-            referrerPolicy="no-referrer"
-            sandbox="allow-scripts"
-            srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
-            src={
-              !previewHtml
-                ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined))
-                : undefined
-            }
-            style={{ height }}
-            title={`${title} 子应用`}
-          />
+          <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+            <iframe
+              allow=""
+              className="magic-card__frame"
+              onLoad={handleSubappLoad}
+              ref={subappIframeRef}
+              referrerPolicy="no-referrer"
+              sandbox="allow-scripts"
+              srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
+              src={
+                !previewHtml
+                  ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined))
+                  : undefined
+              }
+              style={{ height }}
+              title={`${title} 子应用`}
+            />
+          </FullscreenPreview>
         ) : (
           <MagicCardFallback
             reason="子应用尚未准备好，没有可加载的交互式页面内容。"
             title={title}
           />
         )}
+        {consentRequest ? (
+          <div className="magic-card__consent" role="region" aria-label="Agent 协同模式授权">
+            <p>AI建议采用Agent协同模式，是否开启？</p>
+            <div className="magic-card__consent-actions">
+              <Button
+                size="sm"
+                type="button"
+                variant="default"
+                onClick={() => void subappChannelRef.current?.decideConsent('allow_session')}
+              >
+                允许本次
+              </Button>
+              <Button
+                size="sm"
+                type="button"
+                variant="secondary"
+                onClick={() => void subappChannelRef.current?.decideConsent('allow_app')}
+              >
+                加入白名单
+              </Button>
+              <Button
+                size="sm"
+                type="button"
+                variant="secondary"
+                onClick={() => void subappChannelRef.current?.decideConsent('allow_global')}
+              >
+                全局允许
+              </Button>
+              <Button
+                size="sm"
+                type="button"
+                variant="ghost"
+                onClick={() => void subappChannelRef.current?.decideConsent('deny')}
+              >
+                暂不开启
+              </Button>
+            </div>
+          </div>
+        ) : null}
+        {agentStatus === 'processing' || agentStatus === 'queued' ? (
+          <p className="magic-card__agent-status" role="status">
+            AI 正在处理子应用事件…
+          </p>
+        ) : null}
+        {agentStatus === 'failed' ? (
+          <div className="magic-card__agent-error" role="alert">
+            <span>{agentError || '子应用 Agent 处理失败。'}</span>
+            <Button
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => void subappChannelRef.current?.retryAgentTask()}
+            >
+              重试
+            </Button>
+          </div>
+        ) : null}
         {subappFailed ? (
           <p className="magic-card__reason" role="status">
             {subappFailureText(subappFailed)}
@@ -305,20 +379,22 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
               : "react-sandbox-v1"}
           </Badge>
         </div>
-        <iframe
-          allow=""
-          className="magic-card__frame"
-          onError={() => {
-            setFailureReason("卡片 iframe 加载失败。");
-            setFailed(true);
-          }}
-          ref={iframeRef}
-          referrerPolicy="no-referrer"
-          sandbox="allow-scripts"
-          src={artifactUrl}
-          style={{ height }}
-          title={`${title} 隔离运行时`}
-        />
+        <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+          <iframe
+            allow=""
+            className="magic-card__frame"
+            onError={() => {
+              setFailureReason("卡片 iframe 加载失败。");
+              setFailed(true);
+            }}
+            ref={iframeRef}
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            src={artifactUrl}
+            style={{ height }}
+            title={`${title} 隔离运行时`}
+          />
+        </FullscreenPreview>
       </section>
     );
   }
@@ -339,15 +415,17 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           </div>
           <Badge variant="secondary">preview</Badge>
         </div>
-        <iframe
-          allow=""
-          className="magic-card__frame"
-          referrerPolicy="no-referrer"
-          sandbox="allow-scripts"
-          srcDoc={srcDoc}
-          style={{ height }}
-          title={`${title} 动态预览`}
-        />
+        <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+          <iframe
+            allow=""
+            className="magic-card__frame"
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            srcDoc={srcDoc}
+            style={{ height }}
+            title={`${title} 动态预览`}
+          />
+        </FullscreenPreview>
       </section>
     );
   }

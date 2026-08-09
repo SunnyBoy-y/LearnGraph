@@ -138,6 +138,13 @@ def _session_view(session: SubAppSession) -> SubAppSessionView:
         terminated_at=session.terminated_at,
         created_at=session.created_at,
         updated_at=session.updated_at,
+        agent_triggers=session.agent_triggers or [],
+        agent_status=session.agent_status,
+        agent_job_id=session.agent_job_id,
+        agent_error=session.agent_error,
+        agent_updated_at=session.agent_updated_at,
+        last_processed_event_id=session.last_processed_event_id,
+        agent_consent=session.agent_consent,
     )
 
 
@@ -323,6 +330,7 @@ class SubAppService:
             artifact_version_id=payload.artifact_version_id,
             event_schema=event_schema,
             state_schema=state_schema,
+            agent_triggers=contract.get("agent_triggers", []) or [],
             status="active",
             current_token_hash=token_hash,
             current_token_prefix=token_prefix,
@@ -458,11 +466,23 @@ class SubAppService:
         )
         self.db.commit()
         self.db.refresh(event)
+        from app.services.subapp_event_agent import (
+            maybe_enqueue_subapp_event_agent,
+        )
+
+        agent_info = maybe_enqueue_subapp_event_agent(
+            session_id=session.id,
+            event_id=event.id,
+            workspace_id=self.workspace_id,
+            actor_id=self.actor_id,
+            db=self.db,
+        )
         return SubAppSessionEventAcceptedView(
             session_id=session.id,
             event=_event_view(event),
             next_token=next_token,
             next_token_prefix=next_prefix,
+            agent=agent_info,
         )
 
     def list_states(

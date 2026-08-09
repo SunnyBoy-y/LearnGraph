@@ -21,6 +21,7 @@ from app.core.errors import AppError
 from app.domain.models import (
     ComponentManifestVersion,
     ContentBlob,
+    PluginRecord,
     SubAppBundle,
     SubAppBundleFile,
     SubAppBundlePreviewGrant,
@@ -384,10 +385,12 @@ class SubAppBundleService:
         The bundle is the durable source of truth; this manifest exists only so
         ``SubAppService.create_session`` can snapshot ``event_schema`` /
         ``state_schema`` and instantiate a T2.6 interactive session. It deliberately
-        bypasses the third-party component registration flow (no PluginRecord, no
-        health/render checks, no signature metadata) because the Agent is already
-        the authorized publisher of this chat session's sandbox output. Contract
-        validation reuses the same closed-schema guards as component registration.
+        bypasses the third-party component registration flow (no health/render
+        checks, no signature metadata) because the Agent is already the authorized
+        publisher of this chat session's sandbox output, but still owns a minimal
+        internal ``PluginRecord`` so the manifest foreign key is satisfied.
+        Contract validation reuses the same closed-schema guards as component
+        registration.
         """
         from app.services.components import _interaction_contract_guard
 
@@ -436,6 +439,24 @@ class SubAppBundleService:
                 "subapp_component_id_invalid",
                 "Derived sub-application component id is not a valid component id",
             )
+        # `component_manifest_versions.plugin_id` is a foreign key to
+        # `plugins.id`. Agent-published bundles do not go through the third-party
+        # component registration flow, so create a lightweight internal plugin
+        # record as the manifest owner instead of writing an empty plugin id.
+        plugin_key = f"agent-subapp-{bundle.id[:24]}"
+        plugin = PluginRecord(
+            workspace_id=self.workspace_id,
+            plugin_key=plugin_key,
+            name=bundle.title,
+            version="1.0.0",
+            plugin_type="agent_subapp",
+            status="configured",
+            enabled=False,
+            permissions=[],
+            capabilities=[],
+        )
+        self.db.add(plugin)
+        self.db.flush()
         data_schema = {
             "type": "object",
             "additionalProperties": False,
@@ -478,7 +499,7 @@ class SubAppBundleService:
         manifest_hash = _sha256(_canonical_json(material))
         manifest = ComponentManifestVersion(
             workspace_id=self.workspace_id,
-            plugin_id="",
+            plugin_id=plugin.id,
             component_id=component_id,
             version="1.0.0",
             display_name=bundle.title,

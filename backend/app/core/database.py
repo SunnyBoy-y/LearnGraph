@@ -217,6 +217,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
             "subapp_bundles",
             "subapp_bundle_files",
             "subapp_bundle_preview_grants",
+            "subapp_agent_runs",
+            "subapp_agent_consent_requests",
         ):
             Base.metadata.tables[table_name].create(connection, checkfirst=True)
 
@@ -447,6 +449,7 @@ def _apply_sqlite_additive_migrations() -> None:
         "workspaces": {
             "organization_id": "VARCHAR(64)",
             "workspace_kind": "VARCHAR(32) NOT NULL DEFAULT 'personal'",
+            "subapp_agent_consent": "VARCHAR(16) NOT NULL DEFAULT 'ask'",
         },
         "chat_sessions": {
             "status": "VARCHAR(32) NOT NULL DEFAULT 'active'",
@@ -740,6 +743,16 @@ def _apply_sqlite_additive_migrations() -> None:
         "subapp_bundles": {
             "interaction_contract": "JSON",
             "component_manifest_id": "VARCHAR(36)",
+            "agent_consent_allowlisted": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        "subapp_sessions": {
+            "agent_triggers": "JSON NOT NULL DEFAULT '[]'",
+            "agent_status": "VARCHAR(16) NOT NULL DEFAULT 'idle'",
+            "agent_job_id": "VARCHAR(36)",
+            "agent_error": "TEXT",
+            "agent_updated_at": "DATETIME",
+            "last_processed_event_id": "VARCHAR(36)",
+            "agent_consent": "VARCHAR(16) NOT NULL DEFAULT 'ask'",
         },
         # Memory cold/hot zones on the v2 search projection so event-sourced
         # memories participate in the same visible layering as v1 records.

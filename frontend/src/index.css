@@ -2205,6 +2205,14 @@ body.is-resizing .workspace-resizer {
 .sandbox-artifact__empty strong { color: #333; font-size: 12px; }
 .sandbox-artifact__empty span, .sandbox-artifact__warning { font-size: 11px; line-height: 1.55; }
 .sandbox-artifact__warning { display: flex; align-items: center; gap: 6px; margin: 0; color: #9a6518; }
+.sandbox-artifact__consent, .sandbox-artifact__agent-error { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; border: 1px solid #e3d7bd; border-radius: 8px; background: #fffaf0; padding: 8px 10px; }
+.sandbox-artifact__consent p, .sandbox-artifact__agent-error span { margin: 0; color: #6b4e1c; font-size: 12px; }
+.sandbox-artifact__consent-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.sandbox-artifact__agent-status { display: flex; align-items: center; gap: 6px; margin: 0; color: #166534; font-size: 12px; }
+.sandbox-artifact__agent-error { border-color: #e6b8b3; background: #fff7f5; }
+.sandbox-artifact__agent-error span { color: #8f2c22; }
+.chat-subapp-event { display: inline-flex; align-items: center; gap: 7px; border: 1px solid #e4e4e4; border-radius: 8px; background: #fafafa; padding: 5px 9px; color: #555; font-size: 11px; }
+.chat-subapp-event code { font-family: ui-monospace, monospace; font-size: 10px; color: #222; }
 .sandbox-artifact__code { max-height: 360px; }
 .graph-proposal { display: grid; gap: 11px; }
 .graph-proposal__heading { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 9px; }
@@ -2249,6 +2257,12 @@ body.is-resizing .workspace-resizer {
 .magic-card__frame { width: 100%; min-height: 180px; border: 1px solid #e4e4e4; border-radius: 10px; background: #fff; }
 .magic-card--failed { border-style: dashed; border-color: #d2a34d; background: #fffaf0; }
 .magic-card__reason { margin: 0; }
+.magic-card__consent, .magic-card__agent-error { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; border: 1px solid #e3d7bd; border-radius: 8px; background: #fffaf0; padding: 8px 10px; }
+.magic-card__consent p, .magic-card__agent-error span { margin: 0; color: #6b4e1c; font-size: 12px; }
+.magic-card__consent-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.magic-card__agent-status { margin: 0; color: #166534; font-size: 12px; }
+.magic-card__agent-error { border-color: #e6b8b3; background: #fff7f5; }
+.magic-card__agent-error span { color: #8f2c22; }
 
 @media (max-width: 640px) {
   .message-quiz__options { grid-template-columns: 1fr; }

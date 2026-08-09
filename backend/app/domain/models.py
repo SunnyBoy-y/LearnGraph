@@ -188,6 +188,10 @@ class Workspace(Base, TimestampMixin):
     workspace_kind: Mapped[str] = mapped_column(String(32), default="personal", index=True)
     name: Mapped[str] = mapped_column(String(160))
     description: Mapped[str] = mapped_column(Text, default="")
+    # ask / allow / deny — global consent for event-driven subapp Agent turns.
+    subapp_agent_consent: Mapped[str] = mapped_column(
+        String(16), default="ask", index=True
+    )
 
 
 class Project(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -397,6 +401,17 @@ class SubAppSession(Base, TimestampMixin, WorkspaceScopedMixin):
     state_version: Mapped[int] = mapped_column(Integer, default=0)
     state_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     terminated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Event-driven Agent task state. agent_consent is ask / allowed_session /
+    # denied; deny only affects one consent request, the session returns to ask.
+    agent_triggers: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    agent_status: Mapped[str] = mapped_column(String(16), default="idle", index=True)
+    agent_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    agent_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_processed_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    agent_consent: Mapped[str] = mapped_column(String(16), default="ask")
 
 
 class SubAppState(Base, WorkspaceScopedMixin):
@@ -415,6 +430,61 @@ class SubAppState(Base, WorkspaceScopedMixin):
     sha256: Mapped[str] = mapped_column(String(64), index=True)
     state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class SubAppAgentRun(Base, TimestampMixin, WorkspaceScopedMixin):
+    """One event-driven Agent processing attempt for a sub-application event."""
+
+    __tablename__ = "subapp_agent_runs"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "event_id", name="uq_subapp_agent_run_event"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_sessions.id", ondelete="CASCADE"), index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_interaction_events.id", ondelete="CASCADE"), index=True
+    )
+    chat_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    message_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="queued", index=True
+    )  # queued/processing/completed/failed/skipped
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    model_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SubAppAgentConsentRequest(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Pending/decided consent for one event-driven Agent turn."""
+
+    __tablename__ = "subapp_agent_consent_requests"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "event_id", name="uq_subapp_agent_consent_event"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_sessions.id", ondelete="CASCADE"), index=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("subapp_interaction_events.id", ondelete="CASCADE"), index=True
+    )
+    artifact_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", index=True
+    )  # pending/allowed/denied/expired/superseded
+    scope: Mapped[str] = mapped_column(String(16), default="session")
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Message(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -1833,6 +1903,8 @@ class SubAppBundle(Base, TimestampMixin, WorkspaceScopedMixin):
     # bundle remains a static preview.
     interaction_contract: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     component_manifest_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # App-level allowlist for event-driven Agent processing.
+    agent_consent_allowlisted: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(32), default="published", index=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     preferred_height: Mapped[int] = mapped_column(Integer, default=420)

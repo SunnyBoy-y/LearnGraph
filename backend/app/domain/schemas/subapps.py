@@ -94,6 +94,13 @@ class SubAppSessionView(ORMModel):
     terminated_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    agent_triggers: list[dict[str, Any]] = Field(default_factory=list)
+    agent_status: str = "idle"
+    agent_job_id: str | None = None
+    agent_error: str | None = None
+    agent_updated_at: datetime | None = None
+    last_processed_event_id: str | None = None
+    agent_consent: str = "ask"
 
 
 class SubAppSessionCreatedView(BaseModel):
@@ -147,6 +154,7 @@ class SubAppSessionEventAcceptedView(BaseModel):
     event: SubAppInteractionEventView
     next_token: str
     next_token_prefix: str
+    agent: dict[str, Any] = Field(default_factory=dict)
 
 
 class SubAppStateView(ORMModel):
@@ -165,3 +173,47 @@ class SubAppStateListView(BaseModel):
     offset: int
     limit: int
     total: int
+
+
+class SubAppAgentRunView(BaseModel):
+    run_id: str
+    session_id: str
+    event_id: str
+    status: str
+    error: str | None = None
+    message_id: str | None = None
+    message_version_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class SubAppAgentConsentView(BaseModel):
+    mode: str = "ask"
+    allowed: bool = False
+    pending_consent_id: str | None = None
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SubAppAgentTaskStatusView(BaseModel):
+    consent_mode: str = "ask"
+    allowed: bool = False
+    pending_consent_id: str | None = None
+    agent_status: str = "idle"
+    agent_error: str | None = None
+    latest_run: SubAppAgentRunView | None = None
+
+
+class SubAppAgentConsentDecisionRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
+    decision: Literal["allow_session", "allow_app", "allow_global", "deny"]
+
+
+class SubAppAgentTaskRetryRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
+
+
+class SubAppAgentTaskRetryView(BaseModel):
+    run_id: str | None = None
+    status: str = "queued"

@@ -1638,6 +1638,21 @@ function AcknowledgementPart({
   );
 }
 
+function SubappEventPart({
+  data,
+}: {
+  data: Record<string, unknown> | null | undefined
+}) {
+  const eventType = typeof data?.event_type === 'string' ? data.event_type : ''
+  const eventId = typeof data?.subapp_event_id === 'string' ? data.subapp_event_id : ''
+  return (
+    <div className="chat-subapp-event" role="note">
+      <span>子应用事件</span>
+      <code>{eventType || eventId || '已接收'}</code>
+    </div>
+  )
+}
+
 export function MessagePartRenderer({
   interactive = true,
   onAction,
@@ -1735,6 +1750,8 @@ export function MessagePartRenderer({
           onAction={onAction}
         />
       );
+    case "subapp_event":
+      return <SubappEventPart data={part.data} />;
     case "magic_card":
       return <MagicCardHost data={part.data ?? {}} />;
     case "sandbox": {
