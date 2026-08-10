@@ -62,6 +62,7 @@ from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRe
 from app.providers.factory import (
     fetch_provider_for_workspace,
     image_provider_for_workspace,
+    image_search_provider_for_workspace,
     memory_provider_for_workspace,
     model_provider_for_workspace,
     search_provider_for_workspace,
@@ -394,6 +395,9 @@ def service(
     search_provider = search_provider_for_workspace(
         db, context.workspace_id, settings, route=search_route
     )
+    image_search_provider = image_search_provider_for_workspace(
+        db, context.workspace_id, settings
+    )
     memory_service = MemoryService(
         db,
         context.workspace,
@@ -469,6 +473,7 @@ def service(
             settings=settings,
             can_manage_providers="workspace.manage" in context.permissions,
             fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
+            image_search_provider=image_search_provider,
         )
     return ChatService(
         db,
@@ -817,7 +822,18 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
         if websocket.client_state.name != "CONNECTED":
             await upstream.close()
 
-    await websocket.send_json({"type": "ready", "sample_rate": sample_rate})
+    if websocket.client_state.name != "CONNECTED":
+        # 客户端在等待 ASR 任务启动期间已断开,无需继续。
+        return
+
+    try:
+        await websocket.send_json({"type": "ready", "sample_rate": sample_rate})
+    except Exception:
+        # 竞态:状态检查通过后客户端才断开,send_json 会抛
+        # WebSocketDisconnect(1006)/InvalidState。连接已不可用,
+        # 关闭上游并静默退出,避免 ASGI 层记录无意义的异常栈。
+        await upstream.close()
+        return
 
     async def pump_client() -> str:
         nonlocal finish_sent
