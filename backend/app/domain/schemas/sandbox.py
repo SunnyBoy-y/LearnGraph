@@ -67,6 +67,7 @@ class SandboxBootstrapJobView(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     log_tail: list[str] = Field(default_factory=list)
+    log_seq: int = 0
     started_at: float
     finished_at: float | None = None
 

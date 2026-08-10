@@ -55,6 +55,10 @@ class BootstrapJob:
     error_code: str | None = None
     error_message: str | None = None
     log_lines: list[str] = field(default_factory=list)
+    # Monotonically increasing count of appended log lines. The frontend uses
+    # deltas to drive the progress bar from the real log stream even when the
+    # percent itself stalls inside a long Docker step.
+    log_seq: int = 0
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     actor_id: str | None = None
@@ -79,6 +83,7 @@ class BootstrapJob:
         if not text:
             return
         self.log_lines.append(text[:500])
+        self.log_seq += 1
         if len(self.log_lines) > 80:
             self.log_lines = self.log_lines[-80:]
 
@@ -95,6 +100,7 @@ class BootstrapJob:
             "error_code": self.error_code,
             "error_message": self.error_message,
             "log_tail": self.log_lines[-20:],
+            "log_seq": self.log_seq,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }

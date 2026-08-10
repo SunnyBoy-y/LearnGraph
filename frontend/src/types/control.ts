@@ -200,6 +200,8 @@ export interface SandboxBootstrapJob {
   error_code: string | null;
   error_message: string | null;
   log_tail: string[];
+  /** Monotonic count of appended log lines; deltas drive log-based progress motion. */
+  log_seq: number;
   started_at: number;
   finished_at: number | null;
 }
