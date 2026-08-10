@@ -215,6 +215,21 @@ export interface SandboxBootstrapPolicy {
   updated_by: string | null;
 }
 
+export interface SandboxBootstrapSource {
+  /** Persisted strategy: auto | prebuilt | build. */
+  mode: "auto" | "prebuilt" | "build";
+  /** Effective strategy after env/persisted resolution. */
+  effective_mode: "auto" | "prebuilt" | "build";
+  /** Effective prebuilt image reference (env wins over persisted). */
+  prebuilt_image: string | null;
+  /** LEARNGRAPH_SANDBOX_PREBUILT_IMAGE when the deployment set it. */
+  env_prebuilt_image: string | null;
+  /** True when an administrator persisted an explicit source choice. */
+  persisted: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
 export interface SandboxPreviewConfig {
   /** Effective subapp preview origin (persisted, env, or local derivation). */
   origin: string | null;
@@ -236,6 +251,11 @@ export interface SandboxBootstrapStatus {
   browser_image_ready: boolean;
   browser_image_digest: string | null;
   image_source: string | null;
+  /** Whether the deployment configured a prebuilt image (pull-only bootstrap). */
+  prebuilt_image_configured: boolean;
+  prebuilt_image_ref: string | null;
+  /** Effective image source strategy: auto | prebuilt | build. */
+  bootstrap_mode: "auto" | "prebuilt" | "build";
   phase: string;
   progress_percent: number;
   message: string;
