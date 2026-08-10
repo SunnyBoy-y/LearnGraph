@@ -43,6 +43,7 @@ import {
   listResearchJobs,
   listSourceRecords,
   parseFile,
+  pollParseJob,
   planResearch,
   searchWeb,
   uploadFile,
@@ -249,13 +250,17 @@ export function SourcesPage() {
     onError: (error) => toast.error(error.message),
   });
   const parse = useMutation({
-    mutationFn: parseFile,
-    onSuccess: (file) => {
+    // B1-8: parse runs on the durable queue; poll until terminal.
+    mutationFn: async (fileId: string) => {
+      const job = await parseFile(fileId);
+      return pollParseJob(job);
+    },
+    onSuccess: (job) => {
       toast.success("解析任务已完成");
       void Promise.all([
         queryClient.invalidateQueries({ queryKey: ["files"] }),
-        queryClient.invalidateQueries({ queryKey: ["file-chunks", file.id] }),
-        queryClient.invalidateQueries({ queryKey: ["file-references", file.id] }),
+        queryClient.invalidateQueries({ queryKey: ["file-chunks", job.file_id] }),
+        queryClient.invalidateQueries({ queryKey: ["file-references", job.file_id] }),
       ]);
     },
     onError: (error) => toast.error(error.message),

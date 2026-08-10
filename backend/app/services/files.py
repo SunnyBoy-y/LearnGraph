@@ -520,6 +520,25 @@ class FileService:
     async def upload(self, upload: UploadFile) -> FileRecord:
         original_name = upload.filename or "upload.bin"
 
+        # Workspace storage quota (aggregate, not per-file): reject before
+        # streaming when the workspace is already at/over budget. The quota
+        # check is best-effort (a concurrent writer can race past it); the
+        # per-file ceiling remains the hard cap enforced by storage.store.
+        quota_bytes = self.settings.workspace_storage_quota_bytes
+        if quota_bytes and quota_bytes > 0:
+            used = self.db.scalar(
+                select(func.coalesce(func.sum(FileRecord.size_bytes), 0)).where(
+                    FileRecord.workspace_id == self.workspace_id,
+                    FileRecord.lifecycle_status != "deleted",
+                )
+            ) or 0
+            if used >= quota_bytes:
+                raise AppError(
+                    413,
+                    "workspace_storage_quota_exceeded",
+                    "This workspace has reached its storage quota; delete files or raise the quota",
+                )
+
         async def chunks() -> AsyncIterator[bytes]:
             while chunk := await upload.read(1024 * 1024):
                 yield chunk

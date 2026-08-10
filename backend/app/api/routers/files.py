@@ -11,6 +11,8 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.core.errors import AppError
 from app.domain.schemas.common import ActionResponse
 from app.domain.schemas.files import (
+    DocumentJobCreate,
+    DocumentJobView,
     FileParserCapabilityView,
     AudioTranscriptionCreate,
     AudioTranscriptionView,
@@ -27,6 +29,8 @@ from app.domain.schemas.files import (
 from app.domain.schemas.workflow import DeleteConfirm, DeleteImpact
 from app.services.files import FileService
 from app.services.authorization import AuthorizationService
+from app.services.document_learning import DocumentLearningService
+from app.services.durable_queue import enqueue_document_job
 
 
 router = APIRouter(prefix="/files", tags=["files"])
@@ -84,6 +88,7 @@ def list_files(
     limit: Annotated[int | None, Query(ge=1, le=50)] = None,
 ) -> list[FileView]:
     authz = AuthorizationService(db, context.principal)
+    # B1-4: batch authorization instead of per-item can_access_resource.
     # When the client asks for a name filter (chat @ mention), use the bounded
     # search path. Unfiltered list remains full-workspace for the materials UI.
     if q is not None and q.strip():
@@ -92,10 +97,14 @@ def list_files(
         records = service(db, context, settings).search(q=None, limit=limit)
     else:
         records = service(db, context, settings).list()
+    # B1-4: batch authorization instead of per-item can_access_resource.
+    accessible = authz.filter_accessible_ids(
+        context.workspace, "file", [item.id for item in records], "read"
+    )
     return [
         FileView.model_validate(item)
         for item in records
-        if authz.can_access_resource(context.workspace, "file", item.id, "read")
+        if item.id in accessible
     ]
 
 
@@ -166,10 +175,42 @@ async def upload_file(
     return FileView.model_validate(await service(db, context, settings).upload(file))
 
 
-@router.post("/{file_id}/parse", response_model=FileView)
-def parse_file(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> FileView:
+@router.post(
+    "/{file_id}/parse",
+    response_model=DocumentJobView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def parse_file(
+    file_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", max_length=128)
+    ] = None,
+) -> DocumentJobView:
+    """B1-8: parse runs on the durable queue; returns a 202 job handle.
+
+    CPU-heavy document parsing (PDF/OCR) no longer blocks the request thread.
+    The client polls GET /document-jobs/{job_id} until the job is terminal.
+    """
     _require_file_access(db, context, file_id, "write")
-    return FileView.model_validate(service(db, context, settings).parse(file_id))
+    document_service = DocumentLearningService(
+        db,
+        context.workspace_id,
+        context.principal.user_id,
+        settings,
+    )
+    job, created = document_service.create_job(
+        file_id, DocumentJobCreate(), idempotency_key
+    )
+    if created or job.status == "queued":
+        enqueue_document_job(
+            context.workspace_id,
+            job.id,
+            DocumentLearningService.execution_token(job),
+        )
+    return DocumentJobView.model_validate(job)
 
 
 @router.get("/{file_id}/content")

@@ -2,6 +2,7 @@ import type { ActionResponse } from "@/types/common";
 import { createUuid } from "@/lib/uuid";
 import type {
   DocumentJob,
+  DocumentJobStatus,
   AudioTranscription,
   DocumentJobEvent,
   DocumentQueryPreview,
@@ -60,10 +61,52 @@ export function uploadFile(
   return apiClient.upload<FileRecord>("/files", formData, options);
 }
 
-export function parseFile(fileId: string): Promise<FileRecord> {
-  return apiClient.post<FileRecord>(
+export function parseFile(fileId: string): Promise<DocumentJob> {
+  // B1-8: parse is queued (202 + DocumentJob); poll pollParseJob for the result.
+  return apiClient.post<DocumentJob>(
     `/files/${encodeURIComponent(fileId)}/parse`,
+    undefined,
+    { headers: { 'Idempotency-Key': `parse-${createUuid()}` } },
   );
+}
+
+const TERMINAL_DOCUMENT_JOB_STATUSES = new Set<DocumentJobStatus>([
+  'completed',
+  'failed',
+  'cancelled',
+  'interrupted',
+]);
+
+function isDocumentJobTerminal(status?: DocumentJobStatus): boolean {
+  return status !== undefined && TERMINAL_DOCUMENT_JOB_STATUSES.has(status);
+}
+
+/**
+ * Poll a parse document job until it reaches a terminal state (800 ms interval).
+ * Resolves with the terminal job; throws on failure/cancellation/timeout.
+ */
+export async function pollParseJob(
+  job: DocumentJob,
+  options: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<DocumentJob> {
+  const intervalMs = options.intervalMs ?? 800;
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const deadline = Date.now() + timeoutMs;
+  let current = job;
+  while (!isDocumentJobTerminal(current.status)) {
+    if (Date.now() > deadline) {
+      throw new Error('解析任务超时，请稍后在解析页面查看进度');
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    current = await getDocumentJob(job.id);
+  }
+  if (current.status === 'failed') {
+    throw new Error(current.error_message || current.error_code || '解析任务失败');
+  }
+  if (current.status !== 'completed') {
+    throw new Error(`解析任务未完成（${current.status}）`);
+  }
+  return current;
 }
 
 export function createDocumentJob(

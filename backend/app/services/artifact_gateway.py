@@ -4,7 +4,7 @@ import hashlib
 import secrets
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
@@ -170,7 +170,31 @@ class ArtifactGatewayService:
         version = self.db.get(ArtifactVersion, token.artifact_version_id)
         if version is None or version.status != "published":
             raise AppError(404, "artifact_share_not_found", "Artifact share was not found")
-        token.download_count += 1
+        file = self.db.scalar(select(FileRecord).where(FileRecord.id == version.file_id))
+        if file is None or file.sha256 != version.sha256:
+            raise AppError(404, "artifact_share_not_found", "Artifact share was not found")
+        # P3-1: atomically claim one download slot. The WHERE re-checks
+        # revocation/expiry/limit so concurrent downloads cannot exceed
+        # max_downloads, and a missing file never increments the counter.
+        claimed = self.db.execute(
+            update(ArtifactShareToken)
+            .where(
+                ArtifactShareToken.id == token.id,
+                ArtifactShareToken.revoked_at.is_(None),
+                or_(
+                    ArtifactShareToken.expires_at.is_(None),
+                    ArtifactShareToken.expires_at > now,
+                ),
+                or_(
+                    ArtifactShareToken.max_downloads.is_(None),
+                    ArtifactShareToken.download_count < ArtifactShareToken.max_downloads,
+                ),
+            )
+            .values(download_count=ArtifactShareToken.download_count + 1)
+        )
+        if claimed.rowcount != 1:
+            self.db.rollback()
+            raise AppError(404, "artifact_share_not_found", "Artifact share was not found")
         self.db.commit()
         return version
 

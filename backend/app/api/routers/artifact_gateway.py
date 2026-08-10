@@ -151,7 +151,7 @@ def download_shared_artifact(raw_token: str, db: DB, settings: AppSettings):
     storage = object_storage_provider(db, version.source_workspace_id, settings)
     headers = {
         "Accept-Ranges": "bytes",
-        "Cache-Control": "public, immutable, max-age=31536000",
+        "Cache-Control": "private, no-store",
         "Content-Disposition": f'attachment; filename="{version.original_name.replace(chr(34), "")}"',
         "Content-Length": str(version.size_bytes),
         "ETag": f'"sha256-{version.sha256}"',
