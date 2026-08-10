@@ -61,6 +61,7 @@ class ResearchService:
         search_provider: SearchProviderPort,
         deep_research_provider: DeepResearchProviderPort | None = None,
         settings: Settings | None = None,
+        is_manager: bool = False,
     ) -> None:
         self.db = db
         self.workspace_id = workspace_id
@@ -68,10 +69,21 @@ class ResearchService:
         self.search_provider = search_provider
         self.deep_research_provider = deep_research_provider
         self.settings = settings or get_settings()
+        self.is_manager = is_manager
         self.research = ResearchRepository(db, workspace_id)
         self.events = ResearchEventRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
         self.billing = BillingService(db, workspace_id, actor_id)
+
+    def _require_job_owner(self, job: ResearchJob) -> ResearchJob:
+        """Only the requesting user (or a workspace manager) may read/approve/cancel a research job."""
+        if job.created_by not in (None, self.actor_id) and not self.is_manager:
+            raise AppError(
+                403,
+                "research_job_forbidden",
+                "Only the requesting user or a workspace manager may access this research job",
+            )
+        return job
 
     def _effective_allowed_domains(self, requested: list[str]) -> list[str]:
         workspace_domains = research_policy_domains(self.db, self.workspace_id)
@@ -196,6 +208,7 @@ class ResearchService:
         job = self.research.add(
             ResearchJob(
                 workspace_id=self.workspace_id,
+                created_by=self.actor_id,
                 question=payload.question,
                 status="awaiting_approval",
                 provider_id=plan.provider_id,
@@ -236,6 +249,7 @@ class ResearchService:
 
     def approve_research(self, job_id: str, payload: ResearchApprovalRequest) -> ResearchJob:
         job = self.research.require(job_id, "research job")
+        self._require_job_owner(job)
         if job.status != "awaiting_approval":
             raise AppError(409, "research_not_awaiting_approval", "Research job is not awaiting approval")
         if not payload.approved:
@@ -254,10 +268,12 @@ class ResearchService:
         return self._start_remote(job)
 
     def get_research(self, job_id: str) -> ResearchJob:
-        return self.research.require(job_id, "research job")
+        job = self.research.require(job_id, "research job")
+        return self._require_job_owner(job)
 
     def list_events(self, job_id: str) -> list[ResearchJobEvent]:
-        self.research.require(job_id, "research job")
+        job = self.research.require(job_id, "research job")
+        self._require_job_owner(job)
         return list(
             self.db.scalars(
                 self.events.query()
@@ -268,6 +284,7 @@ class ResearchService:
 
     def cancel_research(self, job_id: str) -> ResearchJob:
         job = self.research.require(job_id, "research job")
+        self._require_job_owner(job)
         if job.status in TERMINAL_RESEARCH_STATUSES:
             return job
         if job.status == "awaiting_approval":
@@ -334,11 +351,11 @@ class ResearchService:
         return job
 
     def list_research(self) -> list[ResearchJob]:
-        return list(
-            self.db.scalars(
-                self.research.query().order_by(ResearchJob.created_at.desc()).limit(100)
-            ).all()
-        )
+        query = self.research.query()
+        if not self.is_manager:
+            query = query.where(ResearchJob.created_by == self.actor_id)
+        query = query.order_by(ResearchJob.created_at.desc()).limit(100)
+        return list(self.db.scalars(query).all())
 
     def _start_remote(self, job: ResearchJob) -> ResearchJob:
         if job.budget_cny <= 0:
@@ -398,6 +415,7 @@ class ResearchService:
         job = self.research.add(
             ResearchJob(
                 workspace_id=self.workspace_id,
+                created_by=self.actor_id,
                 question=payload.question,
                 status="completed_source_collection" if remote_search else "completed_local_demo",
                 provider_id=self.search_provider.provider_id,

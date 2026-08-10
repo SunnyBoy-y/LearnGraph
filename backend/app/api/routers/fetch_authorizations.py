@@ -40,6 +40,17 @@ def decide_fetch_authorization(
         raise AppError(404, "fetch_authorization_not_found", "Fetch authorization request was not found")
     if pending.status != "pending":
         return FetchAuthorizationRequestView.model_validate(pending)
+    # Authority (design doc §6.3): only the requesting user, or a workspace
+    # manager deciding on their behalf, may decide a pending request.
+    if (
+        pending.actor_id != context.principal.user_id
+        and "workspace.manage" not in context.permissions
+    ):
+        raise AppError(
+            403,
+            "fetch_authorization_not_decider",
+            "Only the requesting user or a workspace manager may decide this request",
+        )
 
     pending.decision = payload.decision
     pending.status = "approved" if payload.decision != "deny" else "denied"
@@ -164,6 +175,17 @@ def resume_fetch_authorization(
             409,
             "fetch_authorization_not_resumable",
             "This authorization is not awaiting a server-side resume",
+        )
+    # Authority: only the requesting user (or a workspace manager) may resume
+    # the paused paid generation bound to this request.
+    if (
+        pending.actor_id != context.principal.user_id
+        and "workspace.manage" not in context.permissions
+    ):
+        raise AppError(
+            403,
+            "fetch_authorization_not_decider",
+            "Only the requesting user or a workspace manager may resume this request",
         )
     from app.api.routers.chat import service as chat_service
 

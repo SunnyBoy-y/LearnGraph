@@ -27,6 +27,7 @@ def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> Researc
         search_provider_for_workspace(db, context.workspace_id, settings),
         deep_research_provider_for_workspace(db, context.workspace_id, settings),
         settings,
+        is_manager="workspace.manage" in context.permissions,
     )
 
 

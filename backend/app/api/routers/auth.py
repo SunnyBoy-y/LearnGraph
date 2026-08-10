@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 from fastapi import APIRouter, Query, Request, status
 
 from app.api.deps import AppSettings, CurrentPrincipal, CurrentWorkspace, DB
+from app.core.config import get_settings
 from app.core.errors import AppError
+from app.core.rate_limit import SlidingWindowRateLimiter, enforce_auth_rate_limit
 from app.domain.models import User
 from app.domain.schemas.auth import (
     ACLGrantRequest,
@@ -41,6 +45,19 @@ from app.services.authorization import AuthorizationService, IdentityManagementS
 router = APIRouter(tags=["authentication-rbac"])
 
 
+@lru_cache(maxsize=1)
+def _auth_rate_limiter() -> SlidingWindowRateLimiter:
+    settings = get_settings()
+    return SlidingWindowRateLimiter(
+        max_requests=settings.auth_rate_limit_max,
+        window_seconds=settings.auth_rate_limit_window_seconds,
+    )
+
+
+def _enforce_auth_rate_limit(request: Request) -> None:
+    enforce_auth_rate_limit(request, _auth_rate_limiter())
+
+
 def _request_metadata(request: Request) -> tuple[str, str, str]:
     ip_address = request.client.host if request.client is not None else ""
     device_id = request.headers.get("x-device-id", "")
@@ -50,6 +67,7 @@ def _request_metadata(request: Request) -> tuple[str, str, str]:
 @router.post("/auth/login", response_model=LoginResponse)
 def login(payload: LoginRequest, request: Request, settings: AppSettings, db: DB) -> LoginResponse:
     """用户登录。输入用户名和密码，输出可撤销的 Bearer 会话、当前用户和可选工作区信息。"""
+    _enforce_auth_rate_limit(request)
     user_agent, ip_address, device_id = _request_metadata(request)
     return AuthService(db, settings).login(
         payload,
@@ -62,6 +80,7 @@ def login(payload: LoginRequest, request: Request, settings: AppSettings, db: DB
 @router.post("/auth/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, request: Request, settings: AppSettings, db: DB) -> LoginResponse:
     """注册用户。输入注册资料，创建用户并返回初始认证会话。"""
+    _enforce_auth_rate_limit(request)
     user_agent, ip_address, device_id = _request_metadata(request)
     return AuthService(db, settings).register(
         payload,
@@ -80,6 +99,7 @@ def demo_login(
 ) -> DemoLoginResponse:
     """开发环境 Demo 登录。输入固定的本地演示账号，输出正常的、可撤销的认证会话。"""
 
+    _enforce_auth_rate_limit(request)
     user_agent, ip_address, device_id = _request_metadata(request)
     return AuthService(db, settings).demo_login(
         payload,

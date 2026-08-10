@@ -30,6 +30,7 @@ dependencies = [
   # IANA zone database for zoneinfo on Windows (and minimal Linux images).
   # Required by Agent get_current_time (e.g. Asia/Shanghai).
   "tzdata>=2024.1",
+  "argon2-cffi>=23,<25",
 ]
 
 [project.optional-dependencies]

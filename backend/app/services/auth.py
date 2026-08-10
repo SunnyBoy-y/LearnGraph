@@ -26,6 +26,7 @@ from app.domain.models import (
     Tenant,
     User,
     Workspace,
+    new_id,
     utc_now,
 )
 from app.domain.schemas.auth import (
@@ -145,10 +146,16 @@ class AuthService:
         if demo_only and user.id != "demo-user":
             raise AppError(401, "invalid_credentials", "Invalid username or password")
 
-        user.failed_login_count = 0
-        user.locked_until = None
+        # B1-1: a clean account (no prior failed attempts) must not touch the
+        # users row, so the common login writes only AuthSession + SecurityEvent
+        # in one short transaction; the Workspace SELECT stays a pure read (WAL).
+        if user.failed_login_count != 0 or user.locked_until is not None:
+            user.failed_login_count = 0
+            user.locked_until = None
         token = new_session_token()
+        session_id = new_id()
         auth_session = AuthSession(
+            id=session_id,
             tenant_id=user.tenant_id,
             user_id=user.id,
             token_hash=hash_session_token(token),
@@ -158,8 +165,6 @@ class AuthService:
             ip_address=ip_address[:64],
             device_id=device_id[:128],
         )
-        self.db.add(auth_session)
-        self.db.flush()
         default_workspace = self.db.scalar(
             select(Workspace)
             .where(
@@ -168,14 +173,18 @@ class AuthService:
             )
             .order_by(Workspace.created_at)
         )
+        self.db.add(auth_session)
         self._record_security(
             event_type="auth.login",
             outcome="success",
             user=user,
             ip_address=ip_address,
             user_agent=user_agent,
-            details={"session_id": auth_session.id, "demo_endpoint": demo_only},
+            details={"session_id": session_id, "demo_endpoint": demo_only},
         )
+        # Single commit: AuthSession INSERT + SecurityEvent INSERT (plus the
+        # users UPDATE only after prior failed attempts) flush together, so the
+        # SQLite write lock is taken once and held for the shortest window.
         self.db.commit()
         response_type = DemoLoginResponse if demo_only else LoginResponse
         return response_type(
@@ -219,7 +228,10 @@ class AuthService:
             email=email,
             email_normalized=email_normalized,
             display_name=payload.display_name.strip(),
-            password_hash=hash_password(payload.password),
+            password_hash=hash_password(
+                payload.password,
+                iterations=self.settings.auth_hash_iterations,
+            ),
         )
         self.db.add(user)
         self.db.flush()
@@ -383,7 +395,10 @@ class AuthService:
         if verify_password(payload.new_password, user.password_hash):
             raise AppError(422, "password_unchanged", "New password must be different")
         validate_new_password(payload.new_password, username=user.username)
-        user.password_hash = hash_password(payload.new_password)
+        user.password_hash = hash_password(
+            payload.new_password,
+            iterations=self.settings.auth_hash_iterations,
+        )
         user.password_changed_at = utc_now()
         user.must_change_password = False
         other_sessions = self.db.scalars(
@@ -561,7 +576,10 @@ class AuthService:
         user.email = None
         user.email_normalized = None
         user.display_name = "Deleted account"
-        user.password_hash = hash_password(new_session_token())
+        user.password_hash = hash_password(
+            new_session_token(),
+            iterations=self.settings.auth_hash_iterations,
+        )
         user.status = "deleted"
         user.is_system_admin = False
         user.must_change_password = False

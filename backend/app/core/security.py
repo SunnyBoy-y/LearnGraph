@@ -20,31 +20,46 @@ class Principal:
     must_change_password: bool = False
 
 
-PASSWORD_SCHEME = "pbkdf2_sha256"
-PASSWORD_ITERATIONS = 600_000
+# B1-1: password hashing moved from PBKDF2-SHA256 (600k) to Argon2id so
+# verification runs in C without holding the GIL. Python 3.14's hashlib
+# pbkdf2_hmac serializes on the GIL, so concurrent logins (10+) stacked the
+# full 200ms+ hash per request; argon2-cffi releases the GIL and parallelizes.
+# Legacy "$pbkdf2_sha256$..." hashes remain verifiable (progressive migration).
+PASSWORD_SCHEME = "argon2id"
+PASSWORD_ITERATIONS = 600_000  # legacy PBKDF2 fallback; new hashes use Argon2id
 
 
 def normalize_identity(value: str) -> str:
     return value.strip().casefold()
 
 
+def _argon2():
+    from argon2 import PasswordHasher, exceptions
+
+    # time_cost=3, memory_cost=64 MiB, parallelism=1: OWASP-recommended
+    # Argon2id parameters; ~60-90ms single-shot on desktop hardware.
+    return PasswordHasher(time_cost=3, memory_cost=65536, parallelism=1), exceptions
+
+
 def hash_password(password: str, *, iterations: int = PASSWORD_ITERATIONS) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return "$".join(
-        (
-            PASSWORD_SCHEME,
-            str(iterations),
-            base64.urlsafe_b64encode(salt).decode("ascii"),
-            base64.urlsafe_b64encode(digest).decode("ascii"),
-        )
-    )
+    del iterations  # Argon2id parameters are fixed; iteration param kept for call-site compat
+    hasher, _ = _argon2()
+    return hasher.hash(password)
 
 
 def verify_password(password: str, encoded: str) -> bool:
+    if encoded.startswith("$argon2id$"):
+        hasher, exceptions = _argon2()
+        try:
+            return hasher.verify(encoded, password)
+        except exceptions.VerifyMismatchError:
+            return False
+        except exceptions.InvalidHashError:
+            return False
+    # Legacy PBKDF2-SHA256 path (existing users before the migration).
     try:
         scheme, iterations_text, salt_text, expected_text = encoded.split("$", 3)
-        if scheme != PASSWORD_SCHEME:
+        if scheme != "pbkdf2_sha256":
             return False
         iterations = int(iterations_text)
         if iterations < 100_000 or iterations > 2_000_000:

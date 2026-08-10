@@ -27,16 +27,36 @@ class Settings(BaseSettings):
 
     env: str = "development"
     database_url: str = "sqlite:///./data/learngraph.db"
+    # SQLite write-lock busy wait (milliseconds). Feeds both the pysqlite
+    # ``timeout`` and the per-connection PRAGMA busy_timeout. 10s bounds
+    # interactive-request stalls when a background sweep owns the single write
+    # lock, while staying well above the old 5s budget that lost races to
+    # multi-second chat/memory commits; the retry helpers and the B1-7 sweep
+    # mutex absorb the residual contention.
+    sqlite_busy_timeout_ms: int = 10_000
     storage_root: Path = Path("./data/storage")
     memory_root: Path = Path("./data/memory")
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     demo_username: str = "demo"
     demo_password: str = "learn-graph-local"
     enable_demo_seed: bool = False
-    enable_demo_login: bool = True
+    # Demo login is off by default: a fixed demo credential must never be
+    # reachable in a deployment that did not explicitly opt in. Development and
+    # local previews set LEARNGRAPH_ENABLE_DEMO_LOGIN=true in their env.
+    enable_demo_login: bool = False
     auth_session_hours: int = 12
     auth_max_failed_logins: int = 5
     auth_lockout_minutes: int = 15
+    # PBKDF2-SHA256 cost for NEW password hashes (register / change-password /
+    # account-deletion scramble). Login verification reads the iteration count
+    # embedded in each stored hash, so existing accounts keep their original
+    # cost until the password is rotated.
+    auth_hash_iterations: int = 600_000
+    # IP-level sliding-window rate limit for anonymous auth endpoints
+    # (login / register / demo-login). Protects accounts from brute-force
+    # lockout DoS and the registration surface from scripted abuse.
+    auth_rate_limit_max: int = 30
+    auth_rate_limit_window_seconds: int = 60
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str | None = None
     enable_local_demo_provider: bool = False
@@ -51,8 +71,13 @@ class Settings(BaseSettings):
     keyring_service_name: str = "LearnGraph"
     keyring_account_prefix: str = "master-key"
     # Large media is streamed directly into the local persistent file store. The
-    # limit is a policy ceiling, not preallocated disk space.
-    max_upload_bytes: int = 20 * 1024 * 1024 * 1024
+    # limit is a policy ceiling, not preallocated disk space. 512 MiB keeps a
+    # single upload from exhausting local disk on desktop/self-hosted installs
+    # while remaining ample for typical learning materials (PDF/DOCX/PPTX/media).
+    max_upload_bytes: int = 512 * 1024 * 1024
+    # Per-workspace aggregate storage budget enforced on upload. Set to 0 to
+    # disable quota enforcement (not recommended on shared deployments).
+    workspace_storage_quota_bytes: int = 10 * 1024 * 1024 * 1024
     max_backup_bytes: int = 1024 * 1024 * 1024
     max_document_parse_bytes: int = 50 * 1024 * 1024
     research_poll_seconds: float = 0.25
@@ -120,6 +145,10 @@ class Settings(BaseSettings):
     # and permissions used by source/desktop development.
     sandbox_workspace_uid: int | None = None
     sandbox_wall_time_seconds: int = 180
+    # Host-level timeout for a single Agent tool execution (search/fetch/sandbox
+    # command/MCP call). A hanging upstream must not stall the whole generation
+    # chain; the tool returns a timeout failure and the chain can continue.
+    agent_tool_timeout_seconds: int = 120
     sandbox_cpu_count: float = 2.0
     sandbox_memory_bytes: int = 2 * 1024 * 1024 * 1024
     sandbox_memory_swap_bytes: int = 2 * 1024 * 1024 * 1024
