@@ -13,6 +13,7 @@ from app.providers.remote.openai import (
     ProviderHTTPError,
     ProviderResponseError,
     ProviderTimeoutError,
+    _ReusableHTTPClient,
     _StreamingHTTPProvider,
     merge_provider_request_headers,
     validate_http_base_url,
@@ -93,16 +94,30 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
         self.base_url = normalize_anthropic_api_base_url(self.base_url)
 
     def _client(self) -> httpx.Client:
-        return httpx.Client(
-            headers=merge_provider_request_headers(
-                api_key=self.api_key,
-                extra_headers=self.extra_headers,
-                accept="application/json",
-                authorization_scheme="anthropic",
-            ),
-            timeout=self.timeout_seconds,
-            transport=self.transport,
-        )
+        if self._http_client is None:
+            self._http_client = _ReusableHTTPClient(
+                httpx.Client(
+                    headers=merge_provider_request_headers(
+                        api_key=self.api_key,
+                        extra_headers=self.extra_headers,
+                        accept="application/json",
+                        authorization_scheme="anthropic",
+                    ),
+                    timeout=self.timeout_seconds,
+                    transport=self.transport,
+                )
+            )
+        return self._http_client
+
+    @staticmethod
+    def _system_with_cache_control(system: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
 
     def _messages_url(self) -> str:
         root = self.base_url
@@ -379,7 +394,7 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
             "stream": True,
         }
         if system:
-            payload["system"] = system
+            payload["system"] = self._system_with_cache_control(system)
         tools_payload = self._tools_payload(tools)
         if tools_payload:
             payload["tools"] = tools_payload
@@ -493,7 +508,7 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
         payload: dict[str, Any] = {
             "model": self.model_id,
             "max_tokens": self.max_output_tokens,
-            "system": system,
+            "system": self._system_with_cache_control(system),
             "messages": [
                 {
                     "role": "user",

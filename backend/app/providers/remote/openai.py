@@ -287,6 +287,27 @@ def discover_remote_models(
     return sorted(set(model_ids))
 
 
+class _ReusableHTTPClient:
+    """Keep one httpx.Client alive while preserving ``with`` call sites.
+
+    The context-manager protocol is intentionally a no-op for exit so provider
+    adapters can continue using ``with self._client() as client`` without
+    tearing down the connection pool between Agent tool rounds.
+    """
+
+    def __init__(self, client: httpx.Client) -> None:
+        self._client = client
+
+    def __enter__(self) -> "_ReusableHTTPClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
 class _StreamingHTTPProvider:
     available = True
     remote_capability = True
@@ -339,8 +360,14 @@ class _StreamingHTTPProvider:
         )
         self.extra_headers = dict(extra_headers or {})
         self.authorization_scheme = authorization_scheme
+        self._http_client: _ReusableHTTPClient | None = None
 
     def _client(self) -> httpx.Client:
+        if self._http_client is None:
+            self._http_client = _ReusableHTTPClient(self._build_http_client())
+        return self._http_client
+
+    def _build_http_client(self) -> httpx.Client:
         return httpx.Client(
             headers=merge_provider_request_headers(
                 api_key=self.api_key,

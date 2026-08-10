@@ -25,7 +25,7 @@ from app.providers.remote.codex import (
     CodexCredentials,
     codex_request_headers,
 )
-from app.providers.remote.openai import OpenAIResponsesProvider
+from app.providers.remote.openai import OpenAIResponsesProvider, _ReusableHTTPClient
 
 # The backend rejects turns that arrive without operating instructions.  This
 # is a neutral LearnGraph system preamble, not a copy of Codex's agent prompt.
@@ -57,19 +57,23 @@ class CodexResponsesProvider(OpenAIResponsesProvider):
         self.last_rate_limits: dict[str, float | int | None] = {}
 
     def _client(self) -> httpx.Client:
-        headers = codex_request_headers(
-            self.credentials,
-            accept="text/event-stream",
-            session_id=self.session_id,
-        )
-        # Station-style custom headers may still be declared, but they can
-        # never override the Codex credential headers.
-        merged = {**self.extra_headers, **headers}
-        return httpx.Client(
-            headers=merged,
-            timeout=self.timeout_seconds,
-            transport=self.transport,
-        )
+        if self._http_client is None:
+            headers = codex_request_headers(
+                self.credentials,
+                accept="text/event-stream",
+                session_id=self.session_id,
+            )
+            # Station-style custom headers may still be declared, but they can
+            # never override the Codex credential headers.
+            merged = {**self.extra_headers, **headers}
+            self._http_client = _ReusableHTTPClient(
+                httpx.Client(
+                    headers=merged,
+                    timeout=self.timeout_seconds,
+                    transport=self.transport,
+                )
+            )
+        return self._http_client
 
     @staticmethod
     def _split_system_messages(
@@ -107,6 +111,7 @@ class CodexResponsesProvider(OpenAIResponsesProvider):
     ) -> dict[str, Any]:
         payload = super()._apply_call_options(payload, responses=responses)
         if responses:
+            payload.setdefault("prompt_cache_key", f"lg-{self.session_id}")
             payload.setdefault("instructions", self.instructions)
             # Nothing is stored server-side on this path, so reasoning has to
             # travel with the request; the parent already sets store/include

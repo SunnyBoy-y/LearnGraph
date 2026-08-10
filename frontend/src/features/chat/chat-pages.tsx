@@ -21,6 +21,7 @@ import {
   ArrowUp,
   Bot,
   CalendarDays,
+  Activity,
   Check,
   ChevronLeft,
   ChevronDown,
@@ -50,6 +51,13 @@ import {
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { SandboxAuthDialog, type SandboxAuthRequest } from "@/components/chat/sandbox-auth-dialog";
 import { SandboxBuildProgress } from "@/components/shared/sandbox-build-progress";
+import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
+import {
+  beginStreamStats,
+  deltaTextOf,
+  recordStreamDelta,
+  useShowStreamStats,
+} from "@/features/chat/stream-stats";
 
 import { toast } from "sonner";
 
@@ -84,6 +92,7 @@ import {
   listFiles,
   lookupFile,
   parseFile,
+  pollParseJob,
   rejectGraphChangeSet,
   retrySessionMessage,
   startSandboxBootstrap,
@@ -1786,6 +1795,11 @@ function AssistantMessageInner({
         ) : null}
         </div>
       </MessageContent>
+      <StreamStatsBadge
+        messageId={message.id}
+        status={shown.status}
+        providerTrace={shown.provider_trace}
+      />
       <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
         <MessageAction
           label="复制全文"
@@ -2312,6 +2326,7 @@ export function ChatCanvasPage() {
   }, []);
   const [localMessages, setLocalMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ChatStatus>("ready");
+  const [showStreamStats, toggleStreamStats] = useShowStreamStats();
   const [streamConnectionNotice, setStreamConnectionNotice] =
     useState<StreamConnectionNotice | null>(null);
   const [selectionMenu, setSelectionMenu] = useState<TextSelectionMenu | null>(null);
@@ -3475,6 +3490,7 @@ export function ChatCanvasPage() {
 
     void (async () => {
       latestOperationId.current += 1;
+      beginStreamStats(inFlight.id, Date.now());
       const streamSessionId = sessionId;
       let completed = false;
       let terminalFailure = "";
@@ -3506,6 +3522,7 @@ export function ChatCanvasPage() {
         },
       );
       const consume = (data: Record<string, unknown>) => {
+        recordStreamDelta(inFlight.id, deltaTextOf(data));
         const eventId =
           typeof data.event_id === "string" ? data.event_id : "";
         if (eventId && seenEventIds.has(eventId)) return;
@@ -4853,6 +4870,7 @@ export function ChatCanvasPage() {
                 setStreamConnectionNotice(null);
               }
               const data = streamData(event.data);
+              recordStreamDelta(assistant.id, deltaTextOf(data));
               const type = streamEventType(data);
               if (
                 typeof data.message_id === "string" &&
@@ -5232,7 +5250,10 @@ export function ChatCanvasPage() {
         return file;
       }
       try {
-        return await parseFile(file.id);
+        // B1-8: parse runs on the durable queue; wait for the job to finish.
+        const parseJob = await parseFile(file.id);
+        await pollParseJob(parseJob);
+        return file;
       } catch (error) {
         if (agentMode && error instanceof ApiError) {
           toast.message(
@@ -8358,6 +8379,18 @@ export function ChatCanvasPage() {
                  ? createPortal(modelMenu, topbarModelSlot)
                  : modelMenu;
              })()}
+            <PromptInputButton
+              aria-label={showStreamStats ? "隐藏流式指标" : "显示流式指标"}
+              aria-pressed={showStreamStats}
+              className={cn(
+                "chat-composer__stats",
+                showStreamStats && "chat-composer__stats--active",
+              )}
+              onClick={toggleStreamStats}
+              tooltip={showStreamStats ? "隐藏流式指标" : "显示流式指标"}
+            >
+              <Activity className="size-4" />
+            </PromptInputButton>
             <PromptInputButton
               aria-label={isListening ? "停止语音输入" : "开始语音输入"}
               aria-pressed={isListening}

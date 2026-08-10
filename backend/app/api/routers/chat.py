@@ -15,6 +15,7 @@ from fastapi import (
     File,
     Form,
     Header,
+    Request,
     Query,
     Response,
     UploadFile,
@@ -22,11 +23,18 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB, WorkspaceContext
 from app.core.errors import AppError
-from app.domain.models import Workspace
+from app.domain.models import (
+    Message,
+    MessageControl,
+    MessageVersion,
+    ProviderResponseState,
+    Workspace,
+)
 from app.domain.schemas.chat import (
     BranchRequest,
     ConceptBranchCreateRequest,
@@ -101,6 +109,7 @@ def _detached_sse_transport(
     *,
     session_id: str,
     thread_name: str,
+    on_disconnect: Callable[[], None] | None = None,
 ):
     output: queue.Queue[str | object | _DetachedStreamFailure] = queue.Queue(
         maxsize=256
@@ -182,6 +191,13 @@ def _detached_sse_transport(
             # Do not stop the worker. Clearing this flag only disables the
             # abandoned transport queue, preventing disconnect backpressure.
             subscriber_active.clear()
+            if on_disconnect is not None:
+                try:
+                    on_disconnect()
+                except Exception:
+                    # Disconnect-side cancellation is best-effort; the worker
+                    # continues its own persistence either way.
+                    pass
 
     return events()
 
@@ -240,6 +256,7 @@ def _detached_message_stream(
                     provider_id=payload.provider_id,
                     thinking_mode=payload.thinking_mode,
                     search_route=payload.search_route,
+                    agent_mode=payload.agent_mode,
                 )
             yield from worker_service.create_stream(
                 session_id,
@@ -248,10 +265,57 @@ def _detached_message_stream(
                 last_event_id=last_event_id,
             )
 
+    def _on_disconnect() -> None:
+        """A1-4: when the client leaves before completion, cancel the run if
+        it is NOT resumable (no provider continuation state), so an abandoned
+        generation does not keep billing indefinitely. Resumable (checkpointed)
+        messages keep running in the background for Last-Event-ID replay.
+        """
+        try:
+            with session_factory() as disconnect_db:
+                running = disconnect_db.scalar(
+                    select(MessageVersion)
+                    .join(Message, Message.id == MessageVersion.message_id)
+                    .where(
+                        Message.session_id == session_id,
+                        Message.workspace_id == context.workspace_id,
+                        MessageVersion.status.in_(("streaming", "submitted", "pending")),
+                    )
+                    .order_by(MessageVersion.created_at.desc())
+                    .limit(1)
+                )
+                if running is None:
+                    return
+                resumable = (
+                    disconnect_db.scalar(
+                        select(ProviderResponseState).where(
+                            ProviderResponseState.message_version_id == running.id
+                        )
+                    )
+                    is not None
+                )
+                if resumable:
+                    return
+                control = disconnect_db.get(MessageControl, running.id)
+                if control is None:
+                    disconnect_db.add(
+                        MessageControl(
+                            workspace_id=context.workspace_id,
+                            message_version_id=running.id,
+                            cancel_requested=True,
+                        )
+                    )
+                else:
+                    control.cancel_requested = True
+                disconnect_db.commit()
+        except Exception:
+            pass
+
     return _detached_sse_transport(
         produce,
         session_id=session_id,
         thread_name=f"learngraph-message-{session_id[:8]}",
+        on_disconnect=_on_disconnect,
     )
 
 
@@ -323,6 +387,8 @@ def service(
     provider_id: str | None = None,
     thinking_mode: str | None = None,
     search_route: str | None = None,
+    *,
+    agent_mode: bool = True,
 ) -> ChatService:
     authorization = AuthorizationService(db, context.principal)
     search_provider = search_provider_for_workspace(
@@ -349,19 +415,12 @@ def service(
         model_kwargs["thinking_mode"] = thinking_mode
     if search_route not in {None, "disabled"}:
         model_kwargs["search_route"] = search_route
-    sandbox_authorized = "workspace.manage" in authorization.workspace_permissions(
-        context.workspace
-    )
-    extension_service = MCPAndSkillService(
-        db,
-        context.workspace_id,
-        context.principal.user_id,
-        settings,
-        workspace=context.workspace,
-        principal=context.principal,
-    )
-    sandbox = (
-        SandboxAgentWorkspaceService(
+    agent_tool_runtime = None
+    if agent_mode:
+        sandbox_authorized = "workspace.manage" in authorization.workspace_permissions(
+            context.workspace
+        )
+        extension_service = MCPAndSkillService(
             db,
             context.workspace_id,
             context.principal.user_id,
@@ -369,39 +428,48 @@ def service(
             workspace=context.workspace,
             principal=context.principal,
         )
-        if sandbox_authorized and settings.sandbox_agent_enabled
-        else None
-    )
-    agent_tool_runtime = AgentToolRuntime(
-        workspace_id=context.workspace_id,
-        actor_id=context.principal.user_id,
-        search_provider=search_provider,
-        extensions=extension_service,
-        sandbox=sandbox,
-        sandbox_authorized=sandbox_authorized,
-        memory_tools=memory_service,
-        session_retrieval=SessionRetrievalService(
-            db,
-            context.workspace,
-            context.principal.user_id,
-            authorization,
-        ),
-        image_provider=image_provider_for_workspace(
-            db, context.workspace_id, settings
-        ),
-        image_provider_resolver=lambda image_provider_id, image_model_id: (
-            image_provider_for_workspace(
+        sandbox = (
+            SandboxAgentWorkspaceService(
                 db,
                 context.workspace_id,
+                context.principal.user_id,
                 settings,
-                provider_id=image_provider_id,
-                model_id=image_model_id,
+                workspace=context.workspace,
+                principal=context.principal,
             )
-        ),
-        settings=settings,
-        can_manage_providers="workspace.manage" in context.permissions,
-        fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
-    )
+            if sandbox_authorized and settings.sandbox_agent_enabled
+            else None
+        )
+        agent_tool_runtime = AgentToolRuntime(
+            workspace_id=context.workspace_id,
+            actor_id=context.principal.user_id,
+            search_provider=search_provider,
+            extensions=extension_service,
+            sandbox=sandbox,
+            sandbox_authorized=sandbox_authorized,
+            memory_tools=memory_service,
+            session_retrieval=SessionRetrievalService(
+                db,
+                context.workspace,
+                context.principal.user_id,
+                authorization,
+            ),
+            image_provider=image_provider_for_workspace(
+                db, context.workspace_id, settings
+            ),
+            image_provider_resolver=lambda image_provider_id, image_model_id: (
+                image_provider_for_workspace(
+                    db,
+                    context.workspace_id,
+                    settings,
+                    provider_id=image_provider_id,
+                    model_id=image_model_id,
+                )
+            ),
+            settings=settings,
+            can_manage_providers="workspace.manage" in context.permissions,
+            fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
+        )
     return ChatService(
         db,
         context.workspace_id,
@@ -480,16 +548,36 @@ def graph_change_service(db: DB, context: CurrentWorkspace) -> GraphChangeSetSer
 @router.get("", response_model=list[SessionView])
 def list_sessions(db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[SessionView]:
     authz = AuthorizationService(db, context.principal)
+    items = service(db, context, settings).list_sessions()
+    # B1-4: batch authorization instead of per-item can_access_resource.
+    accessible = authz.filter_accessible_ids(
+        context.workspace, "session", [item.id for item in items], "read"
+    )
     return [
         SessionView.model_validate(item)
-        for item in service(db, context, settings).list_sessions()
-        if authz.can_access_resource(context.workspace, "session", item.id, "read")
+        for item in items
+        if item.id in accessible
     ]
 
 
 @router.post("", response_model=SessionView, status_code=status.HTTP_201_CREATED)
-def create_session(payload: SessionCreateRequest, db: DB, context: CurrentWorkspace, settings: AppSettings) -> SessionView:
-    return SessionView.model_validate(service(db, context, settings).create_session(payload))
+def create_session(
+    payload: SessionCreateRequest,
+    request: Request,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ] = None,
+) -> SessionView:
+    return SessionView.model_validate(
+        service(db, context, settings).create_session(
+            payload,
+            idempotency_key=idempotency_key,
+        )
+    )
 
 
 # Static path registered before the /{session_id}/... routes below so a
@@ -1165,6 +1253,9 @@ def stream_message(
             provider_id=payload.provider_id,
             thinking_mode=payload.thinking_mode,
             search_route=payload.search_route,
+            # Preflight only needs validation dependencies. Deferring the Agent
+            # runtime avoids MCP/Sandbox setup before the stream can start.
+            agent_mode=False,
         )
     stream_service.preflight_create_stream(
         session_id,
@@ -1220,6 +1311,7 @@ def replay_message_events(
         str | None,
         Query(min_length=1, max_length=36),
     ] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 500,
 ) -> list[SSEEventEnvelope]:
     if after_event_id and last_event_id and after_event_id != last_event_id:
         raise AppError(
@@ -1232,6 +1324,7 @@ def replay_message_events(
         message_id,
         after_event_id=after_event_id or last_event_id,
         message_version_id=message_version_id,
+        limit=limit,
     )
 
 
