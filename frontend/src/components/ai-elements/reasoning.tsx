@@ -7,10 +7,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import { cjk } from "@streamdown/cjk";
-import { code } from "@streamdown/code";
-import { math } from "@streamdown/math";
-import { mermaid } from "@streamdown/mermaid";
+import { LazyStreamdown } from "@/components/ai-elements/lazy-streamdown";
 import { BrainIcon, ChevronDownIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import {
@@ -23,7 +20,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { Streamdown } from "streamdown";
 
 import { Shimmer } from "./shimmer";
 
@@ -214,8 +210,6 @@ export type ReasoningContentProps = ComponentProps<
   children: string;
 };
 
-const streamdownPlugins = { cjk, code, math, mermaid };
-
 /** Split streaming text so a live indicator can sit before the last line. */
 function splitStreamingLastLine(content: string) {
   if (!content) {
@@ -254,7 +248,7 @@ export const ReasoningContent = memo(
         {isStreaming ? (
           <>
             {head ? (
-              <Streamdown plugins={streamdownPlugins}>{head}</Streamdown>
+              <LazyStreamdown>{head}</LazyStreamdown>
             ) : null}
             <div className="reasoning-streaming-last-line">
               <span
@@ -263,7 +257,7 @@ export const ReasoningContent = memo(
               />
               {last ? (
                 <div className="reasoning-streaming-last-line__text">
-                  <Streamdown plugins={streamdownPlugins}>{last}</Streamdown>
+                  <LazyStreamdown>{last}</LazyStreamdown>
                 </div>
               ) : (
                 <span className="sr-only">处理中</span>
@@ -271,7 +265,7 @@ export const ReasoningContent = memo(
             </div>
           </>
         ) : (
-          <Streamdown plugins={streamdownPlugins}>{children}</Streamdown>
+          <LazyStreamdown>{children}</LazyStreamdown>
         )}
       </CollapsibleContent>
     );

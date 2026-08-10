@@ -1,5 +1,4 @@
 import type { ComponentProps, ReactNode } from 'react'
-import { motion } from 'motion/react'
 import { AlertCircle, CheckCircle2, CircleDashed, LoaderCircle } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -9,14 +8,14 @@ import { cn } from '@/lib/utils'
 
 export function PageFrame({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <motion.div
-      animate={{ opacity: 1, y: 0 }}
-      className={cn('mx-auto flex w-full max-w-[1180px] flex-col gap-5 px-5 pb-32 pt-5 sm:px-7', className)}
-      initial={{ opacity: 0, y: 8 }}
-      transition={{ duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }}
+    <div
+      className={cn(
+        'animate-in fade-in slide-in-from-bottom-1 duration-300 mx-auto flex w-full max-w-[1180px] flex-col gap-5 px-5 pb-32 pt-5 sm:px-7',
+        className,
+      )}
     >
       {children}
-    </motion.div>
+    </div>
   )
 }
 
@@ -165,10 +164,23 @@ export function LoadingState({ label = '正在读取工作区数据…' }: { lab
 }
 
 export function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
+  // U1-3: turn opaque transport/server errors into an actionable hint. Raw
+  // "Internal Server Error" / "Request failed" strings do not tell the user
+  // what happened or whether work was saved.
+  const normalized = (message || '').trim()
+  const opaque =
+    !normalized ||
+    normalized === 'Internal Server Error' ||
+    normalized === 'Request failed with status code 500' ||
+    normalized.startsWith('Request failed with status code 5') ||
+    /^Internal Server Error/.test(normalized)
+  const display = opaque
+    ? '服务暂时不可用，刚才的操作可能未保存。请稍后重试；如果持续出现，请检查模型/网络配置或联系管理员。'
+    : normalized
   return (
     <div className="surface flex min-h-44 flex-col items-center justify-center gap-3 p-8 text-center" role="alert">
       <AlertCircle className="size-6 text-destructive" />
-      <div><p className="font-medium">暂时无法加载</p><p className="mt-1 max-w-xl text-sm text-muted-foreground">{message}</p></div>
+      <div><p className="font-medium">暂时无法加载</p><p className="mt-1 max-w-xl text-sm text-muted-foreground">{display}</p></div>
       {onRetry ? <Button onClick={onRetry} size="sm" variant="outline">重试</Button> : null}
     </div>
   )

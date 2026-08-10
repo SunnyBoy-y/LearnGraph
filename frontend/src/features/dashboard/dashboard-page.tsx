@@ -93,10 +93,12 @@ export function DashboardPage() {
   const dashboard = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "dashboard"),
     queryFn: getDashboard,
+    staleTime: 30_000,
   });
   const sessions = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "sessions"),
     queryFn: listSessions,
+    staleTime: 30_000,
   });
   const recentSession = sessions.data?.[0];
   const recentMessages = useQuery({
@@ -107,6 +109,7 @@ export function DashboardPage() {
       "dashboard-preview",
     ),
     queryFn: () => listSessionMessages(recentSession!.id, { limit: 8 }),
+    staleTime: 30_000,
     enabled: Boolean(recentSession),
     gcTime: 30_000,
   });

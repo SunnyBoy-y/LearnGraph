@@ -13,14 +13,11 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { normalizeLatexDelimiters } from "@/lib/markdown";
+import { LazyStreamdown } from "@/components/ai-elements/lazy-streamdown";
 import { decodeUrlForDisplay } from "@/lib/url-display";
-import { cjk } from "@streamdown/cjk";
-import { code } from "@streamdown/code";
-import { createMathPlugin } from "@streamdown/math";
-import { mermaid } from "@streamdown/mermaid";
 import type { UIMessage } from "ai";
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
-import type { ComponentProps, HTMLAttributes, ReactElement } from "react";
+import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   createContext,
   memo,
@@ -30,7 +27,6 @@ import {
   useMemo,
   useState,
 } from "react";
-import { Streamdown } from "streamdown";
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
   from: UIMessage["role"];
@@ -327,13 +323,23 @@ export const MessageBranchPage = ({
   );
 };
 
-export type MessageResponseProps = ComponentProps<typeof Streamdown>;
+export type MessageResponseComponents = {
+  a?: (props: {
+    href?: string;
+    children?: ReactNode;
+    [key: string]: unknown;
+  }) => ReactNode;
+  [key: string]: unknown;
+};
 
-const streamdownPlugins = {
-  cjk,
-  code,
-  math: createMathPlugin({ singleDollarTextMath: true }),
-  mermaid,
+export type MessageResponseProps = {
+  className?: string;
+  components?: MessageResponseComponents;
+  linkSafety?: Record<string, unknown>;
+  translations?: Record<string, unknown>;
+  children?: ReactNode;
+  isAnimating?: boolean;
+  [key: string]: unknown;
 };
 
 export const MessageResponse = memo(
@@ -346,7 +352,17 @@ export const MessageResponse = memo(
     // (#2 - 知识图谱全景) are readable instead of %E7%9F%A5… garbled text.
     const resolvedLinkSafety = linkSafety ?? {
       enabled: true,
-      renderModal: ({ url, isOpen, onClose, onConfirm }) => {
+      renderModal: ({
+        url,
+        isOpen,
+        onClose,
+        onConfirm,
+      }: {
+        url: string;
+        isOpen: boolean;
+        onClose: () => void;
+        onConfirm: () => void;
+      }) => {
         if (!isOpen) return null;
         const displayUrl = decodeUrlForDisplay(url);
         return (
@@ -417,13 +433,12 @@ export const MessageResponse = memo(
       },
     };
     return (
-      <Streamdown
+      <LazyStreamdown
         className={cn(
           "size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
           className,
         )}
         linkSafety={resolvedLinkSafety}
-        plugins={streamdownPlugins}
         translations={{
           openExternalLink: "打开外部链接？",
           externalLinkWarning: "你即将访问外部网站。",
@@ -435,7 +450,7 @@ export const MessageResponse = memo(
         {...props}
       >
         {children}
-      </Streamdown>
+      </LazyStreamdown>
     );
   },
   (prevProps, nextProps) =>

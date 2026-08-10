@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -156,7 +157,11 @@ function knowledgeStateLabel(value: string | undefined, fallback: string) {
   return knowledgeStateLabels[state] ?? state;
 }
 
-function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
+const KnowledgeNodeView = memo(function KnowledgeNodeView({
+  data,
+  selected,
+  id,
+}: NodeProps<KnowledgeNode>) {
   if (data.initial)
     return (
       <div aria-label={`${data.label} 根节点`} className="knowledge-seed">
@@ -331,7 +336,7 @@ function KnowledgeNodeView({ data, selected, id }: NodeProps<KnowledgeNode>) {
       />
     </div>
   );
-}
+});
 
 function KnowledgeTreeEdge({
   id,
@@ -1002,7 +1007,17 @@ export function KnowledgeGraph({
         nodesDraggable={interactive && view !== "tree"}
         nodeTypes={nodeTypes}
         onInit={setFlowInstance}
-        onMove={(_, viewport) => setZoom(viewport.zoom)}
+        onMove={(_, viewport) =>
+          setZoom((current) => {
+            // F4.2/U1-1: commit zoom state only when the LOD tier changes so
+            // pan/zoom frames do not re-render the whole tree every frame.
+            const currentTier =
+              current < 0.4 ? "low" : current < 0.8 ? "mid" : "high";
+            const nextTier =
+              viewport.zoom < 0.4 ? "low" : viewport.zoom < 0.8 ? "mid" : "high";
+            return currentTier === nextTier ? current : viewport.zoom;
+          })
+        }
         onNodeClick={handleNodeClick}
         onNodeDragStop={(_, node) =>
           setPositionOverrides((current) => ({

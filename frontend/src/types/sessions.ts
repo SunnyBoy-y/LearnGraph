@@ -27,6 +27,7 @@ export type MessagePartType =
   | 'user_confirmation'
   | 'fetch_authorization'
   | 'fetch_setup_notice'
+  | 'graph_progress'
   | 'egress_authorization'
   | 'error'
 

@@ -125,7 +125,7 @@ import type { GraphNode, GraphSummary } from '@/types/graphs'
 import type { Session } from '@/types/sessions'
 
 const memoryGovernanceV2Enabled =
-  import.meta.env.VITE_MEMORY_GOVERNANCE_V2 === '1'
+  import.meta.env.VITE_MEMORY_GOVERNANCE_V2 !== '0'
 
 const zoneDefinitions: Array<{
   zone: MemoryZone

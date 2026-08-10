@@ -605,15 +605,18 @@ export function MigrationPage() {
   const migrations = useQuery({
     queryKey: ["migrations"],
     queryFn: listMigrations,
+    staleTime: 30_000,
   });
   const adapters = useQuery({
     queryKey: ["migration-adapters"],
     queryFn: listMigrationAdapters,
+    staleTime: 30_000,
   });
   const activeJobId = selectedJobId ?? migrations.data?.[0]?.id;
   const selectedJob = useQuery({
     queryKey: ["migration", activeJobId],
     queryFn: () => getMigration(activeJobId ?? ""),
+    staleTime: 30_000,
     enabled: Boolean(activeJobId),
   });
   const refreshMigrationData = async () => {
@@ -1404,6 +1407,7 @@ export function AuditPage() {
   const audit = useQuery({
     queryKey: ["audit", action],
     queryFn: () => listAuditEvents(action ? { action } : {}),
+    staleTime: 30_000,
   });
 
   const removeOne = useMutation({
@@ -2047,6 +2051,7 @@ function AccountDeletion({ username }: { username: string }) {
   const deletionImpact = useQuery({
     queryKey: ["account-deletion-impact"],
     queryFn: getAccountDeletionImpact,
+    staleTime: 30_000,
     enabled: deleteOpen,
   });
   const accountDeletion = useMutation({
@@ -2175,14 +2180,20 @@ export function WorkspaceSettingsPage() {
   const auth = useAuth();
   const queryClient = useQueryClient();
   const session = authStore.getSession();
-  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
+  const settings = useQuery({
+    queryKey: ["settings"],
+    queryFn: listSettings,
+    staleTime: 30_000,
+  });
   const workspaces = useQuery({
     queryKey: ["workspaces"],
     queryFn: listWorkspaces,
+    staleTime: 30_000,
   });
   const providers = useQuery({
     queryKey: ["providers"],
     queryFn: listProviders,
+    staleTime: 30_000,
   });
   const modelProviders = useMemo(
     () =>
@@ -2213,7 +2224,6 @@ export function WorkspaceSettingsPage() {
       return Object.fromEntries(entries) as Record<string, ProviderModel[]>;
     },
     enabled: modelProviders.length > 0,
-    staleTime: 60_000,
   });
   const featureModelChoices = useMemo(() => {
     const choices: Array<{
@@ -2301,6 +2311,7 @@ export function WorkspaceSettingsPage() {
   const memoryEnhancement = useQuery({
     queryKey: ["memory-enhancement"],
     queryFn: getMemoryEnhancement,
+    staleTime: 30_000,
   });
   const [pendingEmbeddingSwitch, setPendingEmbeddingSwitch] =
     useState<MemoryEnhancementUpdateRequest | null>(null);
@@ -2385,12 +2396,18 @@ export function WorkspaceSettingsPage() {
   const providerCatalog = useQuery({
     queryKey: ["provider-catalog"],
     queryFn: listProviderCatalog,
+    staleTime: 30_000,
   });
   const memoryPolicy = useQuery({
     queryKey: ["memory-policy"],
     queryFn: () => getMemoryPolicy(),
+    staleTime: 30_000,
   });
-  const sessions = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
+  const sessions = useQuery({
+    queryKey: ["sessions"],
+    queryFn: listSessions,
+    staleTime: 30_000,
+  });
   const [policySessionId, setPolicySessionId] = useState("");
   useEffect(() => {
     if (!policySessionId && sessions.data?.[0]) {
@@ -2400,6 +2417,7 @@ export function WorkspaceSettingsPage() {
   const sessionPolicy = useQuery({
     queryKey: ["memory-policy", policySessionId],
     queryFn: () => getMemoryPolicy(policySessionId),
+    staleTime: 30_000,
     enabled: Boolean(policySessionId),
   });
   const savePolicy = useMutation({
@@ -2437,6 +2455,7 @@ export function WorkspaceSettingsPage() {
   const embeddingDiscovery = useQuery({
     queryKey: ["settings-embedding-models", selectedEmbeddingProvider?.id],
     queryFn: () => discoverProviderModels(selectedEmbeddingProvider!.id),
+    staleTime: 30_000,
     enabled: Boolean(selectedEmbeddingProvider?.id),
   });
   const embeddingModels = (embeddingDiscovery.data?.models ?? []).filter(

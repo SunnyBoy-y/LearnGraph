@@ -132,7 +132,9 @@ function canListenOnPort(port) {
     const server = net.createServer()
     server.unref()
     server.once('error', () => resolve(false))
-    server.listen({ host: '0.0.0.0', port }, () => {
+    // Probe the same loopback interface Vite uses so an existing 127.0.0.1
+    // listener cannot be mistaken for an available port on Windows.
+    server.listen({ host: '127.0.0.1', port }, () => {
       server.close(() => resolve(true))
     })
   })

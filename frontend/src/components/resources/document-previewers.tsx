@@ -7,22 +7,36 @@ import {
   type ReactNode,
 } from "react";
 import { ChevronLeft, ChevronRight, LoaderCircle } from "lucide-react";
-import { renderAsync } from "docx-preview";
-import {
-  GlobalWorkerOptions,
+import type {
+  PDFDocumentLoadingTask,
+  PDFDocumentProxy,
+  PDFPageProxy,
   TextLayer,
-  getDocument,
-  type PDFDocumentProxy,
-  type PDFPageProxy,
 } from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { Workbook, type Cell, type Worksheet } from "exceljs";
+import type { Cell, Workbook, Worksheet } from "exceljs";
 
 import { Button } from "@/components/ui/button";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 
+type PdfJsModule = typeof import("pdfjs-dist");
 
-GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+// F1-2: pdfjs-dist + its worker are heavy; load them only when a PDF viewer
+// actually renders. The worker URL is a separate ?url import resolved by Vite.
+let pdfjsPromise: Promise<PdfJsModule> | undefined;
+
+function loadPdfjs() {
+  const promise =
+    pdfjsPromise ??
+    Promise.all([
+      import("pdfjs-dist"),
+      import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
+    ]).then(([pdfjs, workerUrl]) => {
+      pdfjs.GlobalWorkerOptions.workerSrc = String(workerUrl);
+      return pdfjs;
+    });
+  pdfjsPromise = promise;
+  return promise;
+}
 
 
 export type DocumentLocatorHint = Record<string, unknown>;
@@ -133,15 +147,14 @@ export function PdfDocumentViewer({
   useEffect(() => {
     let cancelled = false;
     let loadedDocument: PDFDocumentProxy | null = null;
-    let loadingTask: ReturnType<typeof getDocument> | null = null;
+    let loadingTask: PDFDocumentLoadingTask | null = null;
     setPdf(null);
     setLoadError("");
 
-    void blob
-      .arrayBuffer()
-      .then((data) => {
+    void Promise.all([loadPdfjs(), blob.arrayBuffer()])
+      .then(([pdfjs, data]) => {
         if (cancelled) return null;
-        loadingTask = getDocument({ data: new Uint8Array(data) });
+        loadingTask = pdfjs.getDocument({ data: new Uint8Array(data) });
         return loadingTask.promise;
       })
       .then((document) => {
@@ -185,9 +198,10 @@ export function PdfDocumentViewer({
     setRendering(true);
     textContainer.replaceChildren();
 
-    void pdf
-      .getPage(effectivePage)
-      .then(async (loadedPage) => {
+    void loadPdfjs()
+      .then(async (pdfjs) => {
+        if (cancelled) return;
+        const loadedPage = await pdf.getPage(effectivePage);
         if (cancelled) return;
         page = loadedPage;
         const viewport = loadedPage.getViewport({ scale });
@@ -203,7 +217,7 @@ export function PdfDocumentViewer({
         canvas.style.width = `${viewport.width}px`;
         canvas.style.height = `${viewport.height}px`;
 
-        renderTask = loadedPage.render({
+        const task = loadedPage.render({
           canvas,
           canvasContext: context,
           transform:
@@ -212,12 +226,13 @@ export function PdfDocumentViewer({
               : [outputScale, 0, 0, outputScale, 0, 0],
           viewport,
         });
-        textLayer = new TextLayer({
+        renderTask = task;
+        textLayer = new pdfjs.TextLayer({
           container: textContainer,
           textContentSource: loadedPage.streamTextContent({ includeMarkedContent: true }),
           viewport,
         });
-        await Promise.all([renderTask.promise, textLayer.render()]);
+        await Promise.all([task.promise, textLayer.render()]);
       })
       .then(() => {
         if (!cancelled) setRendering(false);
@@ -324,25 +339,28 @@ export function WordDocumentViewer({ blob, onEmbeddedImage, onTextSelection }: W
     bodyRef.current?.replaceChildren();
     stylesRef.current?.replaceChildren();
 
-    void renderAsync(blob, detachedBody, detachedStyles, {
-      breakPages: true,
-      debug: false,
-      experimental: false,
-      ignoreFonts: false,
-      ignoreHeight: false,
-      ignoreLastRenderedPageBreak: true,
-      ignoreWidth: false,
-      inWrapper: true,
-      renderAltChunks: false,
-      renderComments: true,
-      renderEndnotes: true,
-      renderFooters: true,
-      renderFootnotes: true,
-      renderHeaders: true,
-      renderChanges: true,
-      trimXmlDeclaration: true,
-      useBase64URL: true,
-    })
+    void import("docx-preview")
+      .then(async ({ renderAsync }) => {
+        await renderAsync(blob, detachedBody, detachedStyles, {
+          breakPages: true,
+          debug: false,
+          experimental: false,
+          ignoreFonts: false,
+          ignoreHeight: false,
+          ignoreLastRenderedPageBreak: true,
+          ignoreWidth: false,
+          inWrapper: true,
+          renderAltChunks: false,
+          renderComments: true,
+          renderEndnotes: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderHeaders: true,
+          renderChanges: true,
+          trimXmlDeclaration: true,
+          useBase64URL: true,
+        });
+      })
       .then(() => {
         if (renderGenerationRef.current !== generation) return;
         sanitizeWordOutput(detachedBody, detachedStyles);
@@ -628,6 +646,7 @@ export function ExcelWorkbookViewer({
         ) {
           throw new Error("仅支持读取原始 .xlsx 文件；旧版 .xls 需要在隔离转换服务中处理");
         }
+        const { Workbook } = await import("exceljs");
         const parsedWorkbook = new Workbook();
         await parsedWorkbook.xlsx.load(data);
         return parsedWorkbook;

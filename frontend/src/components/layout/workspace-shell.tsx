@@ -7,7 +7,8 @@ import {
   useSyncExternalStore,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
-} from "react";
+} from "react"
+import { lazy, Suspense } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Link,
@@ -90,7 +91,14 @@ import {
 import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { SettingsModal } from "@/components/layout/settings-modal";
-import { SelectionExplanationPanel } from "@/features/chat/selection-explanation-panel";
+// F1-2/P0-1: the selection-explanation panel pulls the whole chat renderer
+// (streamdown/hast/parse5/mermaid/d3 subtree) into the first-screen entry
+// chunk, which rolldown mis-orders at module eval (TDZ crash). Load it lazily.
+const SelectionExplanationPanel = lazy(() =>
+  import("@/features/chat/selection-explanation-panel").then((module) => ({
+    default: module.SelectionExplanationPanel,
+  })),
+);
 import {
   consumePendingSelectionExplanation,
   selectionExplanationOpenEventName,
@@ -98,10 +106,15 @@ import {
   type SelectionExplanationOpenDetail,
 } from "@/features/chat/selection-explanation";
 import { useAuth } from "@/features/auth/auth-context-value";
-import {
-  KnowledgeGraph,
-  type KnowledgeNode,
-} from "@/components/graph/knowledge-graph";
+import type { KnowledgeNode } from "@/components/graph/knowledge-graph";
+
+// F1-1: keep @xyflow/react out of the first-screen entry chunk. KnowledgeGraph
+// is a named export, so map it to the default shape React.lazy requires.
+const KnowledgeGraph = lazy(() =>
+  import("@/components/graph/knowledge-graph").then((module) => ({
+    default: module.KnowledgeGraph,
+  })),
+);
 import { NodeExploreChain } from "@/components/graph/node-explore";
 import {
   archiveProject,
@@ -506,14 +519,17 @@ function SidebarNav({
   const projectsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "projects"),
     queryFn: () => listProjects(true),
+    staleTime: 30_000,
   });
   const sessionsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "sessions"),
     queryFn: listSessions,
+    staleTime: 30_000,
   });
   const settingsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "settings"),
     queryFn: listSettings,
+    staleTime: 30_000,
   });
   const workspaceDefaultResponseMode = useMemo(
     () =>
@@ -540,11 +556,13 @@ function SidebarNav({
   const graphsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graphs"),
     queryFn: listGraphs,
+    staleTime: 30_000,
     enabled: !isSettings,
   });
   const goalsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "goals"),
     queryFn: listGoals,
+    staleTime: 30_000,
     enabled: !isSettings,
   });
   const firstProject = projectsQuery.data?.find(
@@ -862,6 +880,7 @@ function SidebarNav({
               (await queryClient.fetchQuery({
                 queryKey: workspaceQueryKey(workspaceId, "settings"),
                 queryFn: listSettings,
+                staleTime: 30_000,
               })) as WorkspaceSetting[] | undefined;
             resolvedMode = readChatDefaultResponseMode(settings);
           } catch {
@@ -906,6 +925,7 @@ function SidebarNav({
                 (await queryClient.fetchQuery({
                   queryKey: workspaceQueryKey(workspaceId, "settings"),
                   queryFn: listSettings,
+                  staleTime: 30_000,
                 })) as WorkspaceSetting[] | undefined;
               resolvedMode = readChatDefaultResponseMode(settings);
             } catch {
@@ -2787,6 +2807,7 @@ function TopBar({
   const dashboard = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "dashboard"),
     queryFn: getDashboard,
+    staleTime: 30_000,
     enabled: !isChat,
   });
   const [chatHeader, setChatHeader] = useState<{
@@ -3028,10 +3049,12 @@ function ContextRail({
   const railProjects = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "projects"),
     queryFn: () => listProjects(),
+    staleTime: 30_000,
   });
   const railSessions = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "sessions"),
     queryFn: listSessions,
+    staleTime: 30_000,
   });
   const isSettings = pathname.includes("/settings/");
   const isGoalClarify = pathname.includes("/goals/new/clarify");
@@ -3353,7 +3376,11 @@ function ProjectBookshelf({
   onBind: (graph: GraphSummary) => void;
   workspaceId: string;
 }) {
-  const graphs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "graphs"), queryFn: listGraphs });
+  const graphs = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "graphs"),
+    queryFn: listGraphs,
+    staleTime: 30_000,
+  });
   const books = graphs.data ?? [];
   return (
     <section
@@ -3470,6 +3497,7 @@ function BoundGraphRail({
   const graphQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     queryFn: () => getGraph(graphId),
+    staleTime: 30_000,
     enabled: Boolean(graphId),
   });
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
@@ -3514,8 +3542,8 @@ function BoundGraphRail({
   const questionsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "node-questions", graphId, effectiveNodeId),
     queryFn: () => listNodeQuestions(graphId, effectiveNodeId!),
+    staleTime: 30_000,
     enabled: Boolean(effectiveNodeId),
-    staleTime: 15_000,
     refetchOnWindowFocus: true,
   });
   // Accumulate explore counts as the user selects different cards so
@@ -3840,7 +3868,7 @@ function BoundGraphRail({
       aria-label={`${title} 右侧图谱`}
       className="bound-graph-rail chat-graph-rail__canvas"
     >
-      <KnowledgeGraph
+      <Suspense fallback={null}><KnowledgeGraph
         className="bound-graph-rail__canvas"
         compact
         edges={railGraph.edges}
@@ -3866,7 +3894,7 @@ function BoundGraphRail({
         selectedId={selectedNode?.id}
         showZoomControls
         title={graph.title || title}
-      />
+      /></Suspense>
       {selectedNode ? (
         <div className="bound-graph-rail__inspector">
           <div className="bound-graph-rail__node-title">
@@ -4155,7 +4183,11 @@ function BoundGraphRail({
 
 function CapabilityGraphRail({ workspaceId }: { workspaceId: string }) {
   const [maxDepth, setMaxDepth] = useState(1);
-  const mastery = useQuery({ queryKey: workspaceQueryKey(workspaceId, "mastery"), queryFn: getMastery });
+  const mastery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "mastery"),
+    queryFn: getMastery,
+    staleTime: 30_000,
+  });
   // Only user-declared mastered nodes enter the capability graph.
   const masteredNodes = useMemo(
     () =>
@@ -4234,7 +4266,7 @@ function CapabilityGraphRail({ workspaceId }: { workspaceId: string }) {
           </Button>
         </div>
       </div>
-      <KnowledgeGraph
+      <Suspense fallback={null}><KnowledgeGraph
         className="capability-graph-rail__canvas"
         compact
         edges={visible.edges}
@@ -4250,7 +4282,7 @@ function CapabilityGraphRail({ workspaceId }: { workspaceId: string }) {
               ? "能力成长图谱"
               : "暂无已掌握节点"
         }
-      />
+      /></Suspense>
     </section>
   );
 }
@@ -4357,7 +4389,7 @@ function GoalGraphPreviewRail() {
         </Badge>
       </div>
       {graph.nodes.length ? (
-        <KnowledgeGraph
+        <Suspense fallback={null}><KnowledgeGraph
           className="chat-graph-rail__canvas"
           compact
           edges={graph.edges}
@@ -4368,7 +4400,7 @@ function GoalGraphPreviewRail() {
           nodes={graph.nodes}
           showZoomControls
           title="当前目标图谱"
-        />
+        /></Suspense>
       ) : (
         <div className="goal-graph-rail__empty">
           <Network aria-hidden="true" className="size-5" />
@@ -4411,6 +4443,7 @@ function GraphWorkspaceRail() {
   const graph = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
     queryFn: () => getGraph(graphId),
+    staleTime: 30_000,
     enabled: Boolean(graphId),
   });
   const selectedNodeId = new URLSearchParams(search).get("node") ?? undefined;
@@ -4512,6 +4545,7 @@ export function WorkspaceShell() {
   const settings = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "settings"),
     queryFn: listSettings,
+    staleTime: 30_000,
   });
   const [collapsed, setCollapsed] = useState(
     () => window.localStorage.getItem("lg-sidebar-collapsed") !== "false",

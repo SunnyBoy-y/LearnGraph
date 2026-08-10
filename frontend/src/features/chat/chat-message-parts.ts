@@ -13,6 +13,7 @@ export const CHAIN_PART_TYPES = new Set<MessagePart["type"]>([
   "graph_context",
   "sandbox_status",
   "skill_trigger",
+  "graph_progress",
 ]);
 
 /** Reasoning-only subset (still chain parts; used for activity labels). */

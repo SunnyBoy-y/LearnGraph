@@ -48,7 +48,11 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
-      staleTime: 15_000,
+      // U1-2: remounted page queries (dashboard/sessions/settings/workspaces)
+      // stay fresh for 30s so page switches reuse the cache; gcTime stays 30s
+      // so the RAM tradeoff for session message history is unchanged. Queries
+      // with explicit refetchInterval / refetchOnMount:"always" are unaffected.
+      staleTime: 30_000,
       // Drop inactive query data quickly. Per-session message history and
       // derived message caches are the main multi-session RAM cost; chat also
       // actively evicts non-active/non-streaming session caches on switch.

@@ -87,7 +87,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // Hydrate the password-change requirement immediately after refresh so the
     // route guard never lets a pending-change session enter the workspace.
     checkSession();
-    const interval = window.setInterval(checkSession, 30_000);
+    const interval = window.setInterval(() => {
+      // U1-2: skip the heartbeat while the tab is hidden; the focus and
+      // visibilitychange listeners re-check immediately on return.
+      if (document.visibilityState === 'hidden') return;
+      checkSession();
+    }, 30_000);
     window.addEventListener('focus', checkSession);
     document.addEventListener('visibilitychange', checkSession);
 
