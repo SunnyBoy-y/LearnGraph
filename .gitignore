@@ -140,19 +140,25 @@ temp/
 /three-files.yaml
 /workspace-*.yaml
 
-# Product/security regressions under backend/tests are version-controlled.
+# Product/security regressions under backend/tests and frontend/src/test are version-controlled.
 /frontend/e2e/
 /frontend/playwright.config.*
 **/__tests__/
 **/tests/
+**/test/
 **/*_test.py
 **/test_*.py
 **/*.test.*
+**/*.spec.*
+**/*_spec.py
 **/test/**/*.{ts,tsx,js,jsx}
 !backend/tests/
+!backend/tests/**
 !backend/tests/security/
 !backend/tests/security/test_*.py
 !backend/tests/security/**/test_*.py
+!frontend/src/test/
+!frontend/src/test/**
 
 # Long-term memory architecture regression tests are an explicit tracked exception.
 !backend/tests/memory/
@@ -186,14 +192,24 @@ Desktop.ini
 /backend/README.md
 /image/
 /doc/
+**/doc/
 /ROADMAP.md
 
-# One-off verification/smoke scripts and scratch specs
-/backend/scripts/*_smoke*.py
-/backend/scripts/t2_4_smoke.py
+# Audit records and one-off verification/smoke/debug scripts are retained locally, not published
+/audit/
+/audits/
+**/audit/
+**/audits/
+/backend/scripts/*_smoke*.*
+/backend/scripts/*_debug*.*
+/backend/scripts/*_probe*.*
+/backend/scripts/run_*_probes*.*
+/backend/scripts/run_*_tests*.*
+/backend/scripts/verify-*.ps1
+/backend/scripts/verify_sandbox*.py
+/backend/scripts/verify_skill_packages.py
 /backend/scripts/verify_*_web_fetch_e2e.py
 /backend/scripts/run_sandbox_egress_proxy.py
 backend/sandbox/.spec-test.json
 .spec-test.json
-
 

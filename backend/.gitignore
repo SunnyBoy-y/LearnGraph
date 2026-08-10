@@ -8,5 +8,4 @@ data/
 tests/.pytest-tmp/
 .egress-smoke/
 sandbox/.spec-test.json
-/tests/
 
