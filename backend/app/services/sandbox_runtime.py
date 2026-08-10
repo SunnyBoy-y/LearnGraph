@@ -38,6 +38,117 @@ def bootstrap_policy_path(settings: Settings) -> Path:
     return runtime_config_path(settings).with_name("sandbox-bootstrap-policy.json")
 
 
+BOOTSTRAP_SOURCE_MODES = ("auto", "prebuilt", "build")
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxBootstrapSourceConfig:
+    """Deployment-level sandbox image source selection (page-configurable).
+
+    ``mode`` is the operator's intended strategy:
+
+    - ``auto``: pull the prebuilt image when one is configured, otherwise
+      fall back to a local Docker build (default when nothing is persisted).
+    - ``prebuilt``: always require the configured prebuilt image; never build
+      locally.
+    - ``build``: always build locally, ignoring any prebuilt image.
+
+    ``prebuilt_image`` holds the registry reference chosen on the settings
+    page; the deployment environment variable
+    ``LEARNGRAPH_SANDBOX_PREBUILT_IMAGE`` takes precedence over it when set.
+    """
+
+    mode: str
+    prebuilt_image: str | None
+    updated_at: str | None
+    updated_by: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "prebuilt_image": self.prebuilt_image,
+            "updated_at": self.updated_at,
+            "updated_by": self.updated_by,
+        }
+
+
+def bootstrap_source_path(settings: Settings) -> Path:
+    """Sibling of sandbox-bootstrap-policy.json; page-configured image source."""
+
+    return bootstrap_policy_path(settings).with_name("sandbox-bootstrap-source.json")
+
+
+def load_bootstrap_source(settings: Settings) -> SandboxBootstrapSourceConfig | None:
+    path = bootstrap_source_path(settings)
+    with _lock:
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    mode = str(raw.get("mode") or "").strip()
+    if mode not in BOOTSTRAP_SOURCE_MODES:
+        return None
+    prebuilt = str(raw.get("prebuilt_image") or "").strip() or None
+    return SandboxBootstrapSourceConfig(
+        mode=mode,
+        prebuilt_image=prebuilt,
+        updated_at=str(raw.get("updated_at")) if raw.get("updated_at") else None,
+        updated_by=str(raw.get("updated_by")) if raw.get("updated_by") else None,
+    )
+
+
+def save_bootstrap_source(
+    settings: Settings,
+    *,
+    mode: str,
+    prebuilt_image: str | None,
+    actor_id: str | None,
+) -> SandboxBootstrapSourceConfig:
+    if mode not in BOOTSTRAP_SOURCE_MODES:
+        raise ValueError(f"Unsupported sandbox bootstrap source mode: {mode}")
+    config = SandboxBootstrapSourceConfig(
+        mode=mode,
+        prebuilt_image=(prebuilt_image or "").strip() or None,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+        updated_by=(actor_id or "").strip() or None,
+    )
+    path = bootstrap_source_path(settings)
+    with _lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(json.dumps(config.to_dict(), ensure_ascii=False, indent=2) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return config
+
+
+def effective_bootstrap_source(settings: Settings) -> tuple[str, str | None]:
+    """Resolve (mode, prebuilt_image) with env taking precedence for the ref.
+
+    The persisted mode decides the strategy; the deployment environment
+    variable ``LEARNGRAPH_SANDBOX_PREBUILT_IMAGE`` overrides the persisted
+    image reference when present (backwards compatible with env-only
+    deployments). A ``build`` mode still ignores any prebuilt reference.
+    """
+
+    source = load_bootstrap_source(settings)
+    mode = source.mode if source is not None else "auto"
+    prebuilt = source.prebuilt_image if source is not None else None
+    env_ref = (settings.sandbox_prebuilt_image or "").strip()
+    if env_ref:
+        prebuilt = env_ref
+    return mode, prebuilt
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxBootstrapPolicy:
     """Deployment-level gate for sandbox runtime bootstrap.

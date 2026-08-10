@@ -24,6 +24,7 @@ from app.providers.remote.sandbox import (
     BROWSER_RUNTIME_KIND,
 )
 from app.services.sandbox_runtime import (
+    effective_bootstrap_source,
     effective_member_bootstrap_allowed,
     load_bootstrap_policy,
     load_runtime_config,
@@ -75,6 +76,7 @@ class BootstrapJob:
     message: str = "排队中"
     detail: str | None = None
     status: str = "running"  # running | succeeded | failed
+    mode: str = "auto"  # auto | prebuilt | build
     image_digest: str | None = None
     browser_image_digest: str | None = None
     error_code: str | None = None
@@ -162,6 +164,7 @@ class BootstrapJob:
             "message": self.message,
             "detail": self.detail,
             "status": self.status,
+            "mode": self.mode,
             "image_digest": self.image_digest,
             "browser_image_digest": self.browser_image_digest,
             "error_code": self.error_code,
@@ -213,11 +216,12 @@ _PREBUILT_IMAGE_REF_RE = re.compile(
 def _prebuilt_image_ref(value: str | None) -> str | None:
     """Return a safe pull reference; runtime refs are pinned separately."""
 
-    ref = (value or "").strip()
+    raw = value or ""
+    if any(character.isspace() or ord(character) < 32 for character in raw):
+        raise ValueError("Prebuilt sandbox image reference contains invalid characters")
+    ref = raw.strip()
     if not ref:
         return None
-    if any(character.isspace() or ord(character) < 32 for character in ref):
-        raise ValueError("Prebuilt sandbox image reference contains invalid characters")
     if not _PREBUILT_IMAGE_REF_RE.fullmatch(ref):
         raise ValueError("Prebuilt sandbox image reference is invalid")
     return ref
@@ -599,6 +603,12 @@ class SandboxBootstrapService:
                 else None
             )
 
+        try:
+            _, effective_prebuilt = effective_bootstrap_source(settings)
+            prebuilt_ref = _prebuilt_image_ref(effective_prebuilt) if effective_prebuilt else None
+        except ValueError:
+            prebuilt_ref = None
+
         remediation: list[str] = []
         can_initialize = settings.sandbox_enabled and docker_reachable
         if not settings.sandbox_enabled:
@@ -643,6 +653,11 @@ class SandboxBootstrapService:
             "bootstrap_policy": load_bootstrap_policy(settings).to_dict()
             if load_bootstrap_policy(settings)
             else None,
+            "prebuilt_image_configured": bool(prebuilt_ref),
+            "prebuilt_image_ref": (
+                _friendly_image_ref(prebuilt_ref) if prebuilt_ref else None
+            ),
+            "bootstrap_mode": effective_bootstrap_source(settings)[0],
             "image_source": (
                 "environment"
                 if (settings.sandbox_image or "").strip()
@@ -663,7 +678,17 @@ class SandboxBootstrapService:
             "remediation_steps": remediation,
         }
 
-    def start(self, settings: Settings, *, actor_id: str) -> dict[str, Any]:
+    def start(
+        self, settings: Settings, *, actor_id: str, mode: str = "auto"
+    ) -> dict[str, Any]:
+        if mode not in ("auto", "prebuilt", "build"):
+            return {
+                "accepted": False,
+                "error_code": "invalid_bootstrap_mode",
+                "error_message": f"Unsupported sandbox bootstrap mode: {mode}",
+                "job": None,
+                "status": self.status(settings),
+            }
         if not settings.sandbox_enabled:
             return {
                 "accepted": False,
@@ -681,6 +706,30 @@ class SandboxBootstrapService:
                 "job": None,
                 "status": self.status(settings),
             }
+        if mode == "prebuilt":
+            _, effective_prebuilt = effective_bootstrap_source(settings)
+            try:
+                prebuilt_ref = _prebuilt_image_ref(effective_prebuilt)
+            except ValueError as exc:
+                return {
+                    "accepted": False,
+                    "error_code": "prebuilt_image_invalid",
+                    "error_message": str(exc),
+                    "job": None,
+                    "status": self.status(settings),
+                }
+            if not prebuilt_ref:
+                return {
+                    "accepted": False,
+                    "error_code": "prebuilt_image_not_configured",
+                    "error_message": (
+                        "部署未配置预构建沙箱镜像"
+                        "（LEARNGRAPH_SANDBOX_PREBUILT_IMAGE 与设置页镜像来源均为空），"
+                        "请选择本地构建或由部署管理员在设置页配置预构建镜像。"
+                    ),
+                    "job": None,
+                    "status": self.status(settings),
+                }
 
         with self._lock:
             if self._job is not None and self._job.status == "running":
@@ -690,7 +739,7 @@ class SandboxBootstrapService:
                     "job": self._job.to_public(),
                     "status": self.status(settings),
                 }
-            job = BootstrapJob(id=str(uuid.uuid4()), actor_id=actor_id)
+            job = BootstrapJob(id=str(uuid.uuid4()), actor_id=actor_id, mode=mode)
             self._job = job
             thread = threading.Thread(
                 target=self._run_job,
@@ -872,10 +921,29 @@ class SandboxBootstrapService:
                 self._fail(job, "docker_unavailable", detail or "Docker Engine is unavailable")
                 return
 
+            # Resolve the prebuilt reference from the deployment source config:
+            # env LEARNGRAPH_SANDBOX_PREBUILT_IMAGE wins over the page-persisted
+            # reference; a forced build mode ignores it entirely.
+            effective_mode, effective_prebuilt = effective_bootstrap_source(settings)
+            prebuilt_candidate = (
+                effective_prebuilt
+                if job.mode != "build" and effective_mode != "build"
+                else None
+            )
             try:
-                prebuilt_ref = _prebuilt_image_ref(settings.sandbox_prebuilt_image)
+                prebuilt_ref = (
+                    _prebuilt_image_ref(prebuilt_candidate) if prebuilt_candidate else None
+                )
             except ValueError as exc:
                 self._fail(job, "prebuilt_image_invalid", str(exc))
+                return
+            if job.mode == "prebuilt" and not prebuilt_ref:
+                self._fail(
+                    job,
+                    "prebuilt_image_not_configured",
+                    "部署未配置预构建沙箱镜像"
+                    "（LEARNGRAPH_SANDBOX_PREBUILT_IMAGE 与设置页镜像来源均为空）",
+                )
                 return
             if prebuilt_ref:
                 digest = self._pull_prebuilt_image(job, settings, prebuilt_ref)

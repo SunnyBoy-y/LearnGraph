@@ -28,6 +28,13 @@ class SandboxBootstrapStatusView(BaseModel):
     browser_image_ready: bool = False
     browser_image_digest: str | None = None
     image_source: str | None = None
+    # Whether the deployment configured a prebuilt image
+    # (LEARNGRAPH_SANDBOX_PREBUILT_IMAGE or the settings page source config),
+    # enabling pull-only bootstrap.
+    prebuilt_image_configured: bool = False
+    prebuilt_image_ref: str | None = None
+    # Effective image source strategy: auto | prebuilt | build.
+    bootstrap_mode: str = "auto"
     phase: str
     progress_percent: float
     message: str
@@ -62,6 +69,8 @@ class SandboxBootstrapJobView(BaseModel):
     message: str
     detail: str | None = None
     status: str
+    # Bootstrap source requested by the actor: auto | prebuilt | build.
+    mode: str = "auto"
     image_digest: str | None = None
     browser_image_digest: str | None = None
     error_code: str | None = None
@@ -81,6 +90,17 @@ class SandboxBootstrapStartResponse(BaseModel):
     status: SandboxBootstrapStatusView
 
 
+class SandboxBootstrapStartRequest(BaseModel):
+    """Bootstrap source selection.
+
+    - auto: pull the prebuilt image when configured, otherwise build locally.
+    - prebuilt: require the deployment-configured prebuilt image.
+    - build: force a local Docker build even when a prebuilt image is set.
+    """
+
+    mode: Literal["auto", "prebuilt", "build"] = "auto"
+
+
 class SandboxBootstrapPolicyView(BaseModel):
     member_allowed: bool
     persisted: bool = False
@@ -90,6 +110,23 @@ class SandboxBootstrapPolicyView(BaseModel):
 
 class SandboxBootstrapPolicyUpdateRequest(BaseModel):
     member_allowed: bool
+
+
+class SandboxBootstrapSourceView(BaseModel):
+    """Page-configurable deployment image source (auto | prebuilt | build)."""
+
+    mode: Literal["auto", "prebuilt", "build"] = "auto"
+    effective_mode: Literal["auto", "prebuilt", "build"] = "auto"
+    prebuilt_image: str | None = None
+    env_prebuilt_image: str | None = None
+    persisted: bool = False
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+
+class SandboxBootstrapSourceUpdateRequest(BaseModel):
+    mode: Literal["auto", "prebuilt", "build"]
+    prebuilt_image: str | None = Field(default=None, max_length=300)
 
 
 class SandboxTaskCreateRequest(BaseModel):

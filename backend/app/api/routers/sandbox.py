@@ -21,6 +21,9 @@ from app.domain.schemas.sandbox import (
     SandboxBootstrapJobView,
     SandboxBootstrapPolicyUpdateRequest,
     SandboxBootstrapPolicyView,
+    SandboxBootstrapSourceUpdateRequest,
+    SandboxBootstrapSourceView,
+    SandboxBootstrapStartRequest,
     SandboxBootstrapStartResponse,
     SandboxBootstrapStatusView,
     SandboxWebAppPublishRequest,
@@ -52,9 +55,12 @@ from app.services.sandbox import (
 from app.services.sandbox_authz import SandboxAuthorizationService
 from app.services.sandbox_bootstrap import get_bootstrap_service
 from app.services.sandbox_runtime import (
+    effective_bootstrap_source,
     effective_member_bootstrap_allowed,
     load_bootstrap_policy,
+    load_bootstrap_source,
     save_bootstrap_policy,
+    save_bootstrap_source,
 )
 from app.services.session_workspace import SessionWorkspaceService
 
@@ -175,6 +181,86 @@ def update_bootstrap_policy(
     )
 
 
+@router.get("/bootstrap/source", response_model=SandboxBootstrapSourceView)
+def get_bootstrap_source(
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxBootstrapSourceView:
+    """Return the deployment image source selection and its effective mode.
+
+    Any workspace reader may view it so the sandbox page can show whether
+    initialization will pull a prebuilt image or build locally; only
+    deployment administrators may change it.
+    """
+
+    source = load_bootstrap_source(settings)
+    mode, prebuilt = effective_bootstrap_source(settings)
+    return SandboxBootstrapSourceView(
+        mode=source.mode if source is not None else "auto",
+        effective_mode=mode,
+        prebuilt_image=prebuilt,
+        env_prebuilt_image=(settings.sandbox_prebuilt_image or "").strip() or None,
+        persisted=source is not None,
+        updated_at=source.updated_at if source is not None else None,
+        updated_by=source.updated_by if source is not None else None,
+    )
+
+
+@router.put("/bootstrap/source", response_model=SandboxBootstrapSourceView)
+def update_bootstrap_source(
+    payload: SandboxBootstrapSourceUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxBootstrapSourceView:
+    """Persist the deployment image source strategy (admin only)."""
+
+    if not context.principal.is_system_admin:
+        raise AppError(
+            403,
+            "deployment_admin_required",
+            "Sandbox bootstrap source requires a deployment administrator",
+        )
+    prebuilt = (payload.prebuilt_image or "").strip() or None
+    if payload.mode == "prebuilt" and not prebuilt:
+        raise AppError(
+            400,
+            "prebuilt_image_required",
+            "预构建模式必须填写预构建镜像地址",
+        )
+    if prebuilt:
+        from app.services.sandbox_bootstrap import _prebuilt_image_ref
+
+        try:
+            _prebuilt_image_ref(prebuilt)
+        except ValueError as exc:
+            raise AppError(400, "prebuilt_image_invalid", str(exc))
+    source = save_bootstrap_source(
+        settings,
+        mode=payload.mode,
+        prebuilt_image=prebuilt,
+        actor_id=context.principal.user_id,
+    )
+    AuditRepository(db, context.workspace_id).record(
+        actor_id=context.principal.user_id,
+        action="sandbox.bootstrap.source_updated",
+        resource_type="deployment_setting",
+        resource_id="sandbox-bootstrap-source",
+        details={"mode": source.mode, "prebuilt_image": source.prebuilt_image},
+    )
+    db.commit()
+    mode, effective_prebuilt = effective_bootstrap_source(settings)
+    return SandboxBootstrapSourceView(
+        mode=source.mode,
+        effective_mode=mode,
+        prebuilt_image=effective_prebuilt,
+        env_prebuilt_image=(settings.sandbox_prebuilt_image or "").strip() or None,
+        persisted=True,
+        updated_at=source.updated_at,
+        updated_by=source.updated_by,
+    )
+
+
 @router.get("/preview-config", response_model=SandboxPreviewConfigView)
 def get_preview_config(
     context: CurrentWorkspace,
@@ -247,7 +333,9 @@ def update_preview_config(
 
 @router.post("/bootstrap", response_model=SandboxBootstrapStartResponse)
 def start_bootstrap(
-    context: CurrentWorkspace, settings: AppSettings
+    payload: SandboxBootstrapStartRequest,
+    context: CurrentWorkspace,
+    settings: AppSettings,
 ) -> SandboxBootstrapStartResponse:
     # Members may initialize the sandbox runtime by default; administrators
     # can restrict it via the bootstrap policy toggle (default: allowed).
@@ -262,7 +350,7 @@ def start_bootstrap(
                 "当前工作区已限制沙箱初始化权限，请联系管理员开启「允许普通成员初始化沙箱」后重试。",
             )
     result = get_bootstrap_service().start(
-        settings, actor_id=context.principal.user_id
+        settings, actor_id=context.principal.user_id, mode=payload.mode
     )
     return SandboxBootstrapStartResponse.model_validate(result)
 
