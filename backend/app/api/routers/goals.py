@@ -94,10 +94,15 @@ def require_publish_access(
 @router.get("", response_model=list[GoalView])
 def list_goals(db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[GoalView]:
     authz = AuthorizationService(db, context.principal)
+    items = service(db, context, settings).list()
+    # B1-4: batch authorization instead of per-item can_access_resource.
+    accessible = authz.filter_accessible_ids(
+        context.workspace, "goal", [item.id for item in items], "read"
+    )
     return [
         GoalView.model_validate(item)
-        for item in service(db, context, settings).list()
-        if authz.can_access_resource(context.workspace, "goal", item.id, "read")
+        for item in items
+        if item.id in accessible
     ]
 
 

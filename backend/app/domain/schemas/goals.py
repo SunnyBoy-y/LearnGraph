@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from app.domain.schemas.common import ORMModel
 
@@ -125,6 +125,37 @@ class GoalView(ORMModel):
     assumptions: list[dict[str, Any]]
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerate_corrupt_json_columns(cls, data: Any) -> Any:
+        """T1-3: tolerate one corrupted JSON column instead of failing the list.
+
+        A single row whose JSON columns were written as plain strings (legacy
+        migration, partial write, manual DB edit) previously made the whole
+        goals list / dashboard 500. Coerce such cells to their schema defaults
+        so the row renders with empty structured fields and the rest of the
+        list stays usable.
+        """
+        if not isinstance(data, dict):
+            # Pydantic ORMModel path passes the ORM instance; project its
+            # fields so corrupt JSON columns can be corrected before validation.
+            projected = {}
+            for field in ("id", "workspace_id", "title", "raw_prompt", "status", "intent", "time_limit", "target_weight", "deadline_at", "availability", "preferences", "desired_outcome", "constraints", "assumptions", "created_at", "updated_at"):
+                try:
+                    projected[field] = getattr(data, field)
+                except AttributeError:
+                    continue
+            data = projected
+        for key in ("availability", "preferences", "constraints", "assumptions"):
+            value = data.get(key)
+            if value is None or isinstance(value, str) or isinstance(value, (int, float, bool)):
+                data[key] = (
+                    {}
+                    if key in ("constraints",)
+                    else [] if key == "assumptions" else {}
+                )
+        return data
 
 
 class GoalClarifyResponse(BaseModel):

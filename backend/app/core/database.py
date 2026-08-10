@@ -22,9 +22,11 @@ class Base(DeclarativeBase):
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-# Wait long enough for concurrent request + scheduler writers. The previous
-# 5s budget was shorter than multi-second chat/memory commits under load.
-SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Busy timeout for the single SQLite write lock, sourced from settings
+# (LEARNGRAPH_SQLITE_BUSY_TIMEOUT_MS). Default 10s: bounds interactive-request
+# stalls while staying above the old 5s budget; the retry helpers and the
+# B1-7 sweep mutex absorb the residual contention.
+SQLITE_BUSY_TIMEOUT_MS = settings.sqlite_busy_timeout_ms
 SQLITE_BUSY_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1_000
 
 database_url = make_url(settings.database_url)
@@ -36,7 +38,8 @@ engine = create_engine(
     settings.database_url,
     connect_args={
         "check_same_thread": False,
-        # pysqlite lock wait (seconds). Mirrors PRAGMA busy_timeout below.
+        # pysqlite lock wait (seconds). Mirrors PRAGMA busy_timeout below;
+        # both come from settings.sqlite_busy_timeout_ms.
         "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
     }
     if is_sqlite
@@ -359,18 +362,21 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
         CREATE TRIGGER IF NOT EXISTS session_messages_fts_session_update
         AFTER UPDATE OF title, goal_id, graph_id ON chat_sessions
         BEGIN
-          DELETE FROM session_messages_fts WHERE session_id = old.id;
-          INSERT INTO session_messages_fts(
-            message_id, workspace_id, session_id, title, search_terms, raw_content
-          )
-          SELECT m.id, m.workspace_id, m.session_id, new.title,
-                 coalesce(new.title, '') || ' ' || coalesce(m.role, '') || ' ' ||
-                 coalesce(new.goal_id, '') || ' ' || coalesce(new.graph_id, '') || ' ' ||
-                 coalesce(m.content, ''),
-                 coalesce(m.content, '')
+          -- B1-9: update only the title-derived columns of the session's
+          -- existing FTS rows instead of deleting and re-inserting the whole
+          -- session (write amplification on every auto-title change).
+          UPDATE session_messages_fts
+             SET title = new.title,
+                 search_terms = coalesce(new.title, '') || ' ' ||
+                                coalesce(m.role, '') || ' ' ||
+                                coalesce(new.goal_id, '') || ' ' ||
+                                coalesce(new.graph_id, '') || ' ' ||
+                                coalesce(m.content, ''),
+                 raw_content = coalesce(m.content, '')
             FROM messages AS m
-           WHERE m.session_id = new.id
-             AND m.workspace_id = new.workspace_id
+           WHERE session_messages_fts.session_id = new.id
+             AND session_messages_fts.workspace_id = new.workspace_id
+             AND session_messages_fts.message_id = m.id
              AND m.status = 'completed';
         END
         """
@@ -452,6 +458,7 @@ def _apply_sqlite_additive_migrations() -> None:
             "subapp_agent_consent": "VARCHAR(16) NOT NULL DEFAULT 'ask'",
         },
         "chat_sessions": {
+            "idempotency_key_hash": "VARCHAR(64)",
             "status": "VARCHAR(32) NOT NULL DEFAULT 'active'",
             "closed_at": "DATETIME",
             "project_id": "VARCHAR(36)",
@@ -531,6 +538,7 @@ def _apply_sqlite_additive_migrations() -> None:
             "query_text": "TEXT NOT NULL DEFAULT ''",
         },
         "research_jobs": {
+            "created_by": "VARCHAR(64)",
             "estimated_cost_cny": "FLOAT NOT NULL DEFAULT 0.0",
             "actual_cost_cny": "FLOAT NOT NULL DEFAULT 0.0",
             "provider_task_id": "VARCHAR(160)",
@@ -738,6 +746,16 @@ def _apply_sqlite_additive_migrations() -> None:
             "assistant_message_id": "VARCHAR(36)",
             "user_message_id": "VARCHAR(36)",
         },
+        # D2.1 generic Agent egress approval: card correlation with the assistant
+        # message that carries the durable ``egress_authorization`` card part,
+        # the optional originating tool call id, and the serialized resume
+        # checkpoint so a decision can resume the exact suspended tool call.
+        "egress_authorization_requests": {
+            "assistant_message_id": "VARCHAR(36)",
+            "user_message_id": "VARCHAR(36)",
+            "tool_call_id": "VARCHAR(160)",
+            "resume_payload": "JSON",
+        },
         # Agent-published bidirectional sub-application: optional interaction
         # contract snapshot and the linked lightweight ComponentManifestVersion.
         "subapp_bundles": {
@@ -753,6 +771,18 @@ def _apply_sqlite_additive_migrations() -> None:
             "agent_updated_at": "DATETIME",
             "last_processed_event_id": "VARCHAR(36)",
             "agent_consent": "VARCHAR(16) NOT NULL DEFAULT 'ask'",
+        },
+        # Event-sourced memory context packages: correlation ids (conversation /
+        # message) and the full retrieval-exclusion ledger added to the v2
+        # package shape after the table shipped.
+        "memory_context_packages": {
+            "retrieved_ids_json": "JSON NOT NULL DEFAULT '[]'",
+            "injected_ids_json": "JSON NOT NULL DEFAULT '[]'",
+            "excluded_ids_json": "JSON NOT NULL DEFAULT '[]'",
+            "truncated_ids_json": "JSON NOT NULL DEFAULT '[]'",
+            "reason_codes_json": "JSON NOT NULL DEFAULT '{}'",
+            "conversation_id": "VARCHAR(64)",
+            "message_id": "VARCHAR(64)",
         },
         # Memory cold/hot zones on the v2 search projection so event-sourced
         # memories participate in the same visible layering as v1 records.
@@ -846,8 +876,49 @@ def _apply_sqlite_additive_migrations() -> None:
             "ON memory_drafts(workspace_id, status)"
         )
         connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_sessions_idempotency_key_hash "
+            "ON chat_sessions(idempotency_key_hash) "
+            "WHERE idempotency_key_hash IS NOT NULL"
+        )
+        connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_file_text_chunks_document_revision_id "
             "ON file_text_chunks(document_revision_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_egress_authorization_requests_assistant_message_id "
+            "ON egress_authorization_requests(assistant_message_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_egress_authorization_requests_user_message_id "
+            "ON egress_authorization_requests(user_message_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_context_packages_conversation_id "
+            "ON memory_context_packages(conversation_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_context_packages_message_id "
+            "ON memory_context_packages(message_id)"
+        )
+        # B1-2: session-history reads filter by workspace+session and sort by
+        # created_at; the composite index serves both the filter and the sort.
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_messages_workspace_session_created "
+            "ON messages(workspace_id, session_id, created_at)"
+        )
+        # B1-7: TTL lease table for cross-process sweep mutual exclusion.
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS advisory_locks ("
+            "name VARCHAR(120) NOT NULL PRIMARY KEY, "
+            "token VARCHAR(64) NOT NULL, "
+            "expires_at DATETIME, "
+            "created_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL"
+            ")"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_advisory_locks_expires_at "
+            "ON advisory_locks(expires_at)"
         )
         # This is an application-managed projection rather than a second fact
         # source. Trigram tokenization supports both CJK substring search and

@@ -236,6 +236,108 @@ class AuthorizationService:
             for grant in all_grants
         )
 
+    def filter_accessible_ids(
+        self,
+        workspace: Workspace,
+        resource_type: str,
+        resource_ids: Sequence[str],
+        permission: str,
+    ) -> set[str]:
+        """Return the subset of resource_ids the principal can access.
+
+        Equivalent to can_access_resource(...) per id but evaluates workspace
+        RBAC and membership once and loads every ACL grant in a single IN
+        query (B1-4: kill the list-endpoint N+1).
+        """
+        if resource_type in {"roadmap", "action"}:
+            # Derived facts resolve through parent-graph walks per id; fall
+            # back to exact per-item evaluation (no list endpoint uses them).
+            return {
+                resource_id
+                for resource_id in resource_ids
+                if resource_id
+                and self.can_access_resource(
+                    workspace, resource_type, resource_id, permission
+                )
+            }
+        model = RESOURCE_MODELS.get(resource_type)
+        if model is None:
+            return set()
+        ids = [resource_id for resource_id in resource_ids if resource_id]
+        if not ids:
+            return set()
+        existing = set(
+            self.db.scalars(
+                select(model.id).where(
+                    model.id.in_(ids),
+                    model.workspace_id == workspace.id,
+                )
+            ).all()
+        )
+        if not existing:
+            return set()
+        if workspace.owner_user_id == self.principal.user_id:
+            return existing
+        workspace_permissions = self.workspace_permissions(workspace)
+        if permission == "read" and "workspace.read" not in workspace_permissions:
+            return set()
+        if (
+            permission in {"write", "delete", "share"}
+            and "workspace.write" not in workspace_permissions
+        ):
+            return set()
+        membership = None
+        if workspace.organization_id:
+            membership = self.db.scalar(
+                select(Membership).where(
+                    Membership.organization_id == workspace.organization_id,
+                    Membership.user_id == self.principal.user_id,
+                    Membership.status == "active",
+                )
+            )
+        grants_by_resource: dict[str, list[ResourceACL]] = {}
+        for grant in self.db.scalars(
+            select(ResourceACL).where(
+                ResourceACL.workspace_id == workspace.id,
+                ResourceACL.tenant_id == workspace.tenant_id,
+                ResourceACL.resource_type == resource_type,
+                ResourceACL.resource_id.in_(existing),
+                ResourceACL.revoked_at.is_(None),
+            )
+        ).all():
+            grants_by_resource.setdefault(grant.resource_id, []).append(grant)
+        accessible: set[str] = set()
+        for resource_id in existing:
+            grants = grants_by_resource.get(resource_id)
+            if not grants:
+                # No active ACL yet: resource inherits the workspace RBAC
+                # boundary (see can_access_resource).
+                accessible.add(resource_id)
+                continue
+            if any(
+                permission in (grant.permissions or [])
+                and any(
+                    (
+                        (
+                            grant.grantee_type == "user"
+                            and grant.grantee_id == self.principal.user_id
+                        ),
+                        (
+                            grant.grantee_type == "organization"
+                            and grant.grantee_id == workspace.organization_id
+                        ),
+                        (
+                            membership is not None
+                            and grant.grantee_type == "role"
+                            and grant.grantee_id == membership.role_id
+                        ),
+                    )
+                )
+                for grant in grants
+            ):
+                accessible.add(resource_id)
+        return accessible
+
     def can_access_bindings(
         self,
         workspace: Workspace,

@@ -101,6 +101,10 @@ class MemoryHybridRetriever:
                 | (MemorySearchDocument.subject_user_id.is_(None)),
                 MemorySearchDocument.sensitivity.in_(scope.allowed_sensitivity),
             )
+            # B1-5: bound the structured leg at 200 rows so a large memory base
+            # cannot stall every retrieval with a full materialized .all(); the
+            # FTS leg supplies relevance ranking, this leg only widens recall.
+            .limit(200)
         ).all()
         fts_scores = self._fts_scores(scope, query, limit=max(top_k * 5, 20))
         semantic_boosts: dict[str, float] = {}

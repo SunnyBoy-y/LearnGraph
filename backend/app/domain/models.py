@@ -6,6 +6,34 @@ from uuid import uuid4
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator, Text as SAText
+
+
+class LenientJSON(TypeDecorator):
+    """JSON 列容错读取（T1-3）：脏数据（裸字符串/非容器 JSON）降级为空容器，
+    避免读行即 JSONDecodeError 导致 500；写侧仍正常序列化。"""
+
+    impl = SAText
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return __import__("json").dumps(value, ensure_ascii=False, default=str)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = __import__("json").loads(value)
+                return parsed if isinstance(parsed, (dict, list)) else {}
+            except (ValueError, TypeError):
+                return {}
+        return {}
+
 
 from app.core.database import Base
 
@@ -218,11 +246,11 @@ class Goal(Base, TimestampMixin, WorkspaceScopedMixin):
     # silently parsed into a deadline or availability assumption.
     target_weight: Mapped[int] = mapped_column(Integer, default=50)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    availability: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    preferences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    availability: Mapped[dict[str, Any]] = mapped_column(LenientJSON(), default=dict)
+    preferences: Mapped[dict[str, Any]] = mapped_column(LenientJSON(), default=dict)
     desired_outcome: Mapped[str] = mapped_column(Text, default="")
-    constraints: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    assumptions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    constraints: Mapped[dict[str, Any]] = mapped_column(LenientJSON(), default=dict)
+    assumptions: Mapped[list[dict[str, Any]]] = mapped_column(LenientJSON(), default=list)
 
 
 class Graph(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -363,6 +391,11 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
     # LLM-generated "learning event" description for the dashboard activity view.
     # Falls back to ``title`` when absent or when the provider is unavailable.
     activity_summary: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    # T1-1: session-create idempotency. Hash of the client Idempotency-Key
+    # (SHA-256 hex); a repeat POST with the same key returns the first session.
+    idempotency_key_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True, unique=True
+    )
 
 
 class SubAppSession(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -489,6 +522,16 @@ class SubAppAgentConsentRequest(Base, TimestampMixin, WorkspaceScopedMixin):
 
 class Message(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "messages"
+    __table_args__ = (
+        # B1-2: session-history reads filter by workspace+session and order by
+        # created_at; the composite index serves both filter and sort.
+        Index(
+            "ix_messages_workspace_session_created",
+            "workspace_id",
+            "session_id",
+            "created_at",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
     parent_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
@@ -1049,6 +1092,7 @@ class FileReference(Base, TimestampMixin, WorkspaceScopedMixin):
 class ResearchJob(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "research_jobs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    created_by: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     question: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="completed", index=True)
     provider_id: Mapped[str] = mapped_column(String(80), default="local_mock")
@@ -2718,3 +2762,15 @@ class HostAuthorizationGrant(Base, TimestampMixin, WorkspaceScopedMixin):
         DateTime(timezone=True), nullable=True
     )
     revoked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+class AdvisoryLock(Base, TimestampMixin):
+    """Cross-process scheduler lease (B1-7).
+
+    One row per named sweep; ``token`` identifies the owning process and
+    ``expires_at`` bounds the lease so a crashed worker cannot block the sweep.
+    """
+
+    __tablename__ = "advisory_locks"
+    name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    token: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)

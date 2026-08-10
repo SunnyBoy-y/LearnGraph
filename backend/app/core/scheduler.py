@@ -8,7 +8,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, update
 
 from app.core.config import get_settings
-from app.core.database import SessionLocal, commit_with_locked_retry
+from app.core.database import SessionLocal
+from app.core.database import commit_with_locked_retry
+from app.core.process_lock import acquire_advisory_lock, release_advisory_lock
 from app.domain.models import (
     MemoryProfileSnapshot,
     SandboxAgentCommand,
@@ -46,26 +48,35 @@ def run_mastery_ticks(
     now: datetime | None = None,
     execute: bool = True,
 ) -> list[MasterySchedulerTickView]:
-    with SessionLocal() as db:
-        workspace_ids = list(db.scalars(select(Workspace.id)))
-    results: list[MasterySchedulerTickView] = []
-    for workspace_id in workspace_ids:
-        try:
-            results.append(
-                run_workspace_mastery_tick(
-                    workspace_id,
-                    now=now,
-                    execute=execute,
+    # B1-7: cross-process mutex so multiple workers do not all run the sweep.
+    with SessionLocal() as lock_db:
+        lock_token = acquire_advisory_lock(lock_db, "sweep.mastery", ttl_seconds=600)
+    if lock_token is None:
+        return []
+    try:
+        with SessionLocal() as db:
+            workspace_ids = list(db.scalars(select(Workspace.id)))
+        results: list[MasterySchedulerTickView] = []
+        for workspace_id in workspace_ids:
+            try:
+                results.append(
+                    run_workspace_mastery_tick(
+                        workspace_id,
+                        now=now,
+                        execute=execute,
+                    )
                 )
-            )
-        except Exception:
-            # One workspace cannot suppress durable work in the others. Its
-            # queued/running rows remain in SQLite for the next tick.
-            logger.exception(
-                "Mastery scheduler tick failed for workspace %s",
-                workspace_id,
-            )
-    return results
+            except Exception:
+                # One workspace cannot suppress durable work in the others. Its
+                # queued/running rows remain in SQLite for the next tick.
+                logger.exception(
+                    "Mastery scheduler tick failed for workspace %s",
+                    workspace_id,
+                )
+        return results
+    finally:
+        with SessionLocal() as lock_db:
+            release_advisory_lock(lock_db, "sweep.mastery", lock_token)
 
 
 async def mastery_scheduler(
@@ -162,10 +173,23 @@ async def memory_retention_scheduler(
         else get_settings().memory_retention_interval_seconds,
     )
     while not stop.is_set():
+        # B1-7: only one process runs each sweep round.
+        with SessionLocal() as lock_db:
+            lock_token = acquire_advisory_lock(lock_db, "sweep.retention", ttl_seconds=600)
+        if lock_token is None:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+            continue
         try:
             await asyncio.to_thread(run_memory_retention_sweeps)
+            with SessionLocal() as lock_db:
+                release_advisory_lock(lock_db, "sweep.retention", lock_token)
         except Exception:
             logger.exception("Periodic memory retention wake-up failed")
+            with SessionLocal() as lock_db:
+                release_advisory_lock(lock_db, "sweep.retention", lock_token)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
@@ -299,10 +323,23 @@ async def memory_extraction_scheduler(
         else get_settings().memory_extraction_interval_seconds,
     )
     while not stop.is_set():
+        # B1-7: only one process runs each sweep round.
+        with SessionLocal() as lock_db:
+            lock_token = acquire_advisory_lock(lock_db, "sweep.extraction", ttl_seconds=600)
+        if lock_token is None:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+            continue
         try:
             await asyncio.to_thread(run_memory_extraction_sweeps)
+            with SessionLocal() as lock_db:
+                release_advisory_lock(lock_db, "sweep.extraction", lock_token)
         except Exception:
             logger.exception("Periodic memory extraction wake-up failed")
+            with SessionLocal() as lock_db:
+                release_advisory_lock(lock_db, "sweep.extraction", lock_token)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
@@ -485,10 +522,23 @@ async def sandbox_cleanup_scheduler(
         else get_settings().sandbox_cleanup_interval_seconds,
     )
     while not stop.is_set():
+        # B1-7: only one process runs each sweep round.
+        with SessionLocal() as lock_db:
+            lock_token = acquire_advisory_lock(lock_db, "sweep.sandbox_cleanup", ttl_seconds=600)
+        if lock_token is None:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+            continue
         try:
             await asyncio.to_thread(run_sandbox_cleanup_sweep)
+            with SessionLocal() as lock_db:
+                release_advisory_lock(lock_db, "sweep.sandbox_cleanup", lock_token)
         except Exception:
             logger.exception("Periodic sandbox cleanup wake-up failed")
+            with SessionLocal() as lock_db:
+                release_advisory_lock(lock_db, "sweep.sandbox_cleanup", lock_token)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

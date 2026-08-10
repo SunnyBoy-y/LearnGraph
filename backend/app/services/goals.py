@@ -760,10 +760,15 @@ class GoalService:
         values = payload.model_dump(exclude_unset=True)
         for nested_field in ("availability", "preferences"):
             if nested_field in values:
-                values[nested_field] = {
-                    **dict(getattr(goal, nested_field) or {}),
-                    **dict(values[nested_field]),
-                }
+                # T1-3: tolerate a legacy/corrupt non-dict JSON cell (written as
+                # a plain string) instead of failing the whole confirm with 500.
+                current = getattr(goal, nested_field)
+                if not isinstance(current, dict):
+                    current = {}
+                incoming = values[nested_field]
+                if not isinstance(incoming, dict):
+                    incoming = {}
+                values[nested_field] = {**current, **incoming}
         for field, value in values.items():
             if field == "deadline_at":
                 value = self._store_deadline_as_utc(value)
