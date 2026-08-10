@@ -78,6 +78,13 @@ def append_event(
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> MemoryEventView:
+    """INTERNAL（决策 D-20260808-04）：事件溯源底层写入管道，仅限 workspace.manage。
+
+    本端点直接写入 memory_events 事件流 + 投影，但**不镜像 MemoryRecord**，
+    因此写入的事件不会出现在 /memory 列表，也不参与 MemoryRecord 双写检索。
+    对外/用户侧记忆写入一律走 MemoryService（create/update/delete 双写链）；
+    本端点保留给内部迁移、运维重建、事件回放与测试使用，前端不应直接调用。
+    """
     context.require_permission("workspace.manage")
     scope = memory_scope(
         context,

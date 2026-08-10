@@ -605,13 +605,19 @@ def restore_memory_revision(
     return service(db, context, settings).restore_revision(memory_id, revision, payload)
 
 
-@router.get("/{memory_id}/journal", response_model=list[MemoryJournalView])
+@router.get("/{memory_id}/journal", response_model=list[MemoryJournalView], deprecated=True)
 def list_memory_journal(
     memory_id: str,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
 ) -> list[MemoryJournalView]:
+    """DEPRECATED: 旧版 MemoryJournalEntry 变更审计账本（决策 D-20260808-02）。
+
+    事件溯源（memory_events + export-event-manifest）已覆盖变更追溯能力；
+    本端点保留仅为兼容期审计/删除恢复，不再新增写入，后续版本将移除。
+    新功能请使用事件流（POST /memory/events、maintenance/replay-validate）。
+    """
     return service(db, context, settings).list_journal(memory_id)
 
 
