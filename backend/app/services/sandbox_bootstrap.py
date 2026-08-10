@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import threading
@@ -34,6 +35,30 @@ from app.services.sandbox_runtime import (
 
 DEFAULT_TAG = "learngraph-sandbox:local"
 SMOKE_CONTAINER_PREFIX = "learngraph-sandbox-smoke-"
+
+# Display ceilings per phase: the real docker signals already cover the phase
+# range (e.g. build_runner 40→68), so the lazy smoothing only bridges gaps and
+# never overshoots the phase's true end. Unknown phases cap at 90.
+_PHASE_PERCENT_CAP = {
+    "queued": 5,
+    "detect_docker": 15,
+    "pull_runner": 68,
+    "build_runner": 68,
+    "resolve_digest": 72,
+    "pin_digest": 72,
+    "smoke_test": 95,
+    "persist_runtime": 98,
+}
+# Slowest guaranteed motion (percent per second): the bar never freezes.
+_BOOTSTRAP_MIN_CREEP = 0.08
+# Extra motion at the very start of a phase (decays with phase age).
+_BOOTSTRAP_EARLY_CREEP = 0.55
+# Time constant (seconds) for the early-phase speed boost.
+_BOOTSTRAP_CREEP_DECAY_S = 70.0
+# Each freshly appended log line since the last read pushes the percent this much.
+_BOOTSTRAP_LOG_BOOST_PER_LINE = 0.35
+# Per-read cap so a log burst cannot blow past the phase ceiling.
+_BOOTSTRAP_MAX_LOG_BOOST = 6.0
 _URL_CREDENTIALS_RE = re.compile(r"(https?://)([^/@\s]+)@", re.IGNORECASE)
 _URL_QUERY_OR_FRAGMENT_RE = re.compile(r"(https?://[^\s?#]+)[?#][^\s]*", re.IGNORECASE)
 _TOKEN_ASSIGNMENT_RE = re.compile(
@@ -59,6 +84,12 @@ class BootstrapJob:
     # deltas to drive the progress bar from the real log stream even when the
     # percent itself stalls inside a long Docker step.
     log_seq: int = 0
+    # Lazy progress smoothing state: percent is bumped on every read while the
+    # job runs, so the value is real (persisted on the job), monotonic and
+    # survives page refreshes — unlike a frontend-only simulation.
+    phase_started_at: float | None = None
+    last_advance_at: float = field(default_factory=time.time)
+    last_advance_log_seq: int = 0
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     actor_id: str | None = None
@@ -87,7 +118,43 @@ class BootstrapJob:
         if len(self.log_lines) > 80:
             self.log_lines = self.log_lines[-80:]
 
+    def advance_lazy_progress(self) -> None:
+        """Persistently smooth the running percent between real docker signals.
+
+        Called on every read of the job while it is running. Applies a time
+        creep that is fast right after a phase starts and decays (but never
+        reaches zero), plus a boost proportional to freshly appended log
+        lines. The result is written back onto the job, so the value is real,
+        monotonic and identical after a page refresh.
+        """
+        if self.status != "running":
+            return
+        now = time.time()
+        elapsed = now - self.last_advance_at
+        if elapsed <= 0:
+            return
+        cap = _PHASE_PERCENT_CAP.get(self.phase, 90)
+        if self.progress_percent >= cap:
+            self.last_advance_at = now
+            self.last_advance_log_seq = self.log_seq
+            return
+        phase_started = self.phase_started_at or self.started_at
+        phase_age = max(0.0, now - phase_started)
+        creep = _BOOTSTRAP_MIN_CREEP + (
+            _BOOTSTRAP_EARLY_CREEP - _BOOTSTRAP_MIN_CREEP
+        ) * math.exp(-phase_age / _BOOTSTRAP_CREEP_DECAY_S)
+        log_delta = max(0, self.log_seq - self.last_advance_log_seq)
+        self.last_advance_log_seq = self.log_seq
+        log_boost = min(
+            _BOOTSTRAP_MAX_LOG_BOOST, log_delta * _BOOTSTRAP_LOG_BOOST_PER_LINE
+        )
+        boosted = self.progress_percent + creep * elapsed + log_boost
+        # max() guards against a concurrent real signal jump from the worker.
+        self.progress_percent = max(self.progress_percent, min(cap, boosted))
+        self.last_advance_at = now
+
     def to_public(self) -> dict[str, Any]:
+        self.advance_lazy_progress()
         return {
             "job_id": self.id,
             "phase": self.phase,
@@ -652,6 +719,10 @@ class SandboxBootstrapService:
             job.progress_percent = max(0, min(100, percent))
             job.message = message
             job.detail = None
+            # Reset the lazy progress smoothing so the next phase starts with a
+            # fresh, fast early creep.
+            job.phase_started_at = time.time()
+            job.last_advance_at = time.time()
             # Reset the docker build tracker for a fresh phase.
             job.context_current = job.context_total = 0
             job.download_current = job.download_total = 0
@@ -661,6 +732,7 @@ class SandboxBootstrapService:
             job.step_index = job.step_total = 0
             job.step_command = ""
             job.append_log(f"[{phase}] {message}")
+            job.last_advance_log_seq = job.log_seq
 
     def _fail(self, job: BootstrapJob, code: str, message: str) -> None:
         with self._lock:

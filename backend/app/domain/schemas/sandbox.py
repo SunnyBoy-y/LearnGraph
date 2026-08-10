@@ -29,7 +29,7 @@ class SandboxBootstrapStatusView(BaseModel):
     browser_image_digest: str | None = None
     image_source: str | None = None
     phase: str
-    progress_percent: int
+    progress_percent: float
     message: str
     detail: str | None = None
     can_initialize: bool
@@ -58,7 +58,7 @@ class SandboxAgentReadinessView(BaseModel):
 class SandboxBootstrapJobView(BaseModel):
     job_id: str
     phase: str
-    progress_percent: int
+    progress_percent: float
     message: str
     detail: str | None = None
     status: str

@@ -7,53 +7,25 @@ import { cn } from "@/lib/utils";
 /**
  * Live sandbox image build progress.
  *
- * The backend's `progress_percent` is authoritative, but inside a long Docker
- * step (e.g. `RUN pip install`) it can sit still for minutes while the daemon
- * emits nothing parseable. This component therefore animates between polls:
- *
- * - the backend percent is always the floor — the bar never regresses;
- * - new log lines (`log_seq` deltas) from the backend stream push the bar
- *   forward: the more logs arrive, the more it moves;
- * - a guaranteed time creep (fast right after a phase starts, decaying but
- *   never zero) keeps the bar moving even while Docker is silent;
- * - each phase has a display cap slightly above its real end, so the
- *   simulation bridges gaps without overshooting the next phase;
- * - an ETA is derived from a smoothed display rate and shown next to the
- *   percent.
+ * The bar always shows the backend's real `progress_percent`. The backend
+ * itself keeps that value moving during long Docker steps (a time creep that
+ * is fast right after a phase starts, plus a boost per new log line), so the
+ * value is real, monotonic and survives page refreshes — refreshing never
+ * makes the bar jump back. The remaining time is estimated from the smoothed
+ * rate of the real percent samples.
  */
 
-/** Per-phase display caps. Unknown phases cap at 90. */
-const PHASE_CAP: Record<string, number> = {
-  queued: 4,
-  detect_docker: 14,
-  pull_runner: 68,
-  build_runner: 68,
-  resolve_digest: 72,
-  pin_digest: 72,
-  smoke_test: 95,
-  persist_runtime: 98,
-};
-const UNKNOWN_PHASE_CAP = 90;
-
-const TICK_MS = 400;
-/** Slowest guaranteed motion (percent per second): the bar never freezes. */
-const MIN_CREEP = 0.08;
-/** Extra motion at the very start of a phase (decays with phase age). */
-const EARLY_CREEP = 0.55;
-/** Time constant (seconds) for the early-phase speed boost. */
-const CREEP_DECAY_S = 70;
-/** Each freshly appended backend log line pushes the bar this many percent. */
-const LOG_BOOST_PER_LINE = 0.5;
-/** Per-tick cap so a log burst cannot blow past the phase ceiling. */
-const MAX_LOG_BOOST = 8;
+const ETA_SAMPLE_MS = 1000;
+const ETA_MAX_SECONDS = 2400; // 40 min
+const ETA_MIN_SECONDS = 5;
 
 function formatEta(seconds: number): string {
   if (seconds < 60) return `剩余约 ${Math.max(1, Math.ceil(seconds))} 秒`;
   return `剩余约 ${Math.max(1, Math.ceil(seconds / 60))} 分钟`;
 }
 
-function useSmoothedBootstrapProgress(job: SandboxBootstrapJob | null) {
-  const [displayed, setDisplayed] = useState(() => job?.progress_percent ?? 0);
+/** Estimate the remaining time from real `progress_percent` samples. */
+function useBootstrapEta(job: SandboxBootstrapJob | null) {
   const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
 
   const jobRef = useRef(job);
@@ -61,35 +33,22 @@ function useSmoothedBootstrapProgress(job: SandboxBootstrapJob | null) {
 
   const stateRef = useRef({
     jobId: "",
-    phase: "",
-    phaseStartedAt: 0,
-    sim: 0,
-    prevValue: 0,
-    seenLogSeq: 0,
-    lastTickAt: 0,
+    prevPct: 0,
+    prevAt: 0,
     rateEma: 0,
-    rateSamples: 0,
+    samples: 0,
   });
 
-  // Reset the simulation whenever the job (or its phase) changes.
   useEffect(() => {
     const state = stateRef.current;
     const nextId = job?.job_id ?? "";
     if (nextId !== state.jobId) {
       state.jobId = nextId;
-      state.phase = job?.phase ?? "";
-      state.phaseStartedAt = performance.now();
-      state.sim = job?.progress_percent ?? 0;
-      state.prevValue = job?.progress_percent ?? 0;
-      state.seenLogSeq = job?.log_seq ?? 0;
-      state.lastTickAt = 0;
+      state.prevPct = job?.progress_percent ?? 0;
+      state.prevAt = performance.now();
       state.rateEma = 0;
-      state.rateSamples = 0;
-      setDisplayed(job?.progress_percent ?? 0);
+      state.samples = 0;
       setEtaSeconds(null);
-    } else if (job && job.phase !== state.phase) {
-      state.phase = job.phase;
-      state.phaseStartedAt = performance.now();
     }
   }, [job]);
 
@@ -97,58 +56,43 @@ function useSmoothedBootstrapProgress(job: SandboxBootstrapJob | null) {
 
   useEffect(() => {
     if (!running) {
-      const current = jobRef.current;
-      if (current) setDisplayed(current.progress_percent);
+      setEtaSeconds(null);
       return;
     }
     const timer = window.setInterval(() => {
-      const state = stateRef.current;
       const current = jobRef.current;
       if (!current || current.status !== "running") return;
-
+      const state = stateRef.current;
+      const pct = current.progress_percent;
       const now = performance.now();
-      const dt = state.lastTickAt
-        ? Math.max(0.05, Math.min(5, (now - state.lastTickAt) / 1000))
-        : TICK_MS / 1000;
-      state.lastTickAt = now;
-
-      const backend = Math.max(0, Math.min(100, current.progress_percent));
-
-      // Motion driven by the backend log stream: every new line pushes the bar.
-      const logSeq = current.log_seq ?? 0;
-      const logDelta = Math.max(0, logSeq - state.seenLogSeq);
-      state.seenLogSeq = logSeq;
-      const logBoost = Math.min(MAX_LOG_BOOST, logDelta * LOG_BOOST_PER_LINE);
-
-      // Front-loaded time creep: fast at phase start, decaying but never zero.
-      const phaseAge = Math.max(0, (now - state.phaseStartedAt) / 1000);
-      const creep =
-        MIN_CREEP +
-        Math.max(0, EARLY_CREEP - MIN_CREEP) * Math.exp(-phaseAge / CREEP_DECAY_S);
-
-      const cap = PHASE_CAP[current.phase] ?? UNKNOWN_PHASE_CAP;
-      const prevValue = state.prevValue;
-      state.sim = Math.min(cap, state.sim + (logBoost + creep) * dt);
-      const value = Math.min(cap, Math.max(backend, state.sim));
-      state.prevValue = value;
-      setDisplayed(value);
-
-      // Smoothed display rate → remaining time estimate.
-      const instantRate = Math.max(0, (value - prevValue) / dt);
-      state.rateEma =
-        state.rateSamples === 0
-          ? instantRate
-          : 0.7 * state.rateEma + 0.3 * instantRate;
-      state.rateSamples += 1;
-      if (state.rateSamples >= 2) {
-        const clampedRate = Math.max(0.05, Math.min(4, state.rateEma));
-        setEtaSeconds(Math.min(2400, Math.max(5, (100 - value) / clampedRate)));
+      if (pct === state.prevPct) return;
+      const dt = (now - state.prevAt) / 1000;
+      if (dt <= 0 || dt > 60) {
+        // Re-base after a long gap (e.g. tab was hidden) instead of a bogus rate.
+        state.prevPct = pct;
+        state.prevAt = now;
+        return;
       }
-    }, TICK_MS);
+      const rate = Math.max(0, (pct - state.prevPct) / dt);
+      state.rateEma =
+        state.samples === 0 ? rate : 0.7 * state.rateEma + 0.3 * rate;
+      state.samples += 1;
+      state.prevPct = pct;
+      state.prevAt = now;
+      if (state.samples >= 2) {
+        const clampedRate = Math.max(0.05, Math.min(4, state.rateEma));
+        setEtaSeconds(
+          Math.min(
+            ETA_MAX_SECONDS,
+            Math.max(ETA_MIN_SECONDS, (100 - pct) / clampedRate),
+          ),
+        );
+      }
+    }, ETA_SAMPLE_MS);
     return () => window.clearInterval(timer);
   }, [running]);
 
-  return { displayed, etaSeconds };
+  return etaSeconds;
 }
 
 /**
@@ -157,9 +101,8 @@ function useSmoothedBootstrapProgress(job: SandboxBootstrapJob | null) {
  * While a bootstrap job runs it shows a spinning loader, the real-time detail
  * the backend derives from the Docker build stream (e.g. "正在下载镜像
  * ubuntu:24.04 · 15.1 MB / 28.7 MB" or "正在构建 · 步骤 3/8：RUN pip install"),
- * the phase description, an animated striped progress bar that keeps moving
- * between polls (driven by the backend log stream plus a decaying time creep),
- * and an estimated remaining time.
+ * the phase description, an animated striped progress bar fed by the backend's
+ * real percent, and an estimated remaining time.
  */
 export function SandboxBuildProgress({
   job,
@@ -170,11 +113,11 @@ export function SandboxBuildProgress({
   tone?: "default" | "amber";
   className?: string;
 }) {
-  const { displayed, etaSeconds } = useSmoothedBootstrapProgress(job);
+  const etaSeconds = useBootstrapEta(job);
   if (!job) return null;
 
   const running = job.status === "running";
-  const percent = Math.round(displayed);
+  const percent = Math.round(Math.max(0, Math.min(100, job.progress_percent)));
   const detail = job.detail || job.message;
   const isAmber = tone === "amber";
 
@@ -224,7 +167,7 @@ export function SandboxBuildProgress({
       >
         <div
           className={cn(
-            "h-full rounded-full transition-[width] duration-300 ease-out",
+            "h-full rounded-full transition-[width] duration-700 ease-out",
             isAmber ? "bg-amber-600 dark:bg-amber-400" : "bg-primary",
             running && "sandbox-progress-stripes",
           )}
