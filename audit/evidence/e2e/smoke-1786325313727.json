@@ -1,0 +1,38 @@
+{
+  "base": "http://127.0.0.1:5174",
+  "ts": 1786325313727,
+  "steps": [
+    {
+      "name": "登录页渲染(#auth-title)",
+      "ok": true,
+      "detail": "",
+      "ms": 1681
+    },
+    {
+      "name": "注册→进入工作区",
+      "ok": true,
+      "detail": "http://127.0.0.1:5174/w/309e575e-672e-4cab-acff-a25a37ac06ce",
+      "ms": 1321
+    },
+    {
+      "name": "首页渲染(学习空间)",
+      "ok": false,
+      "detail": "page.waitForSelector: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('text=学习空间') to be visible\u001b[22m\n\u001b[2m    5 × locator resolved to hidden <span title=\"Smoke User 的学习空间\" class=\"block truncate text-[11px] font-normal text-muted-foreground\">Smoke User 的学习空间</span>\u001b[22m\n\u001b[2m    28 × l",
+      "ms": 15015
+    },
+    {
+      "name": "图谱页渲染",
+      "ok": false,
+      "detail": "page.waitForSelector: Timeout 15000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('text=图谱') to be visible\u001b[22m\n\u001b[2m    - locator resolved to 2 elements. Proceeding with the first one: <span class=\"sidebar-text\">图谱</span>\u001b[22m\n\u001b[2m    28 × locator resolved to 4 elements. Proceeding with the firs",
+      "ms": 15283
+    },
+    {
+      "name": "对话页 composer",
+      "ok": true,
+      "detail": "",
+      "ms": 2257
+    }
+  ],
+  "passed": false,
+  "pageErrors": []
+}

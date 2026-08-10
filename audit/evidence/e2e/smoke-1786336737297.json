@@ -1,0 +1,40 @@
+{
+  "base": "http://127.0.0.1:5175",
+  "ts": 1786336737297,
+  "steps": [
+    {
+      "name": "登录页渲染(#auth-title)",
+      "ok": true,
+      "detail": "",
+      "ms": 610
+    },
+    {
+      "name": "注册→进入工作区",
+      "ok": true,
+      "detail": "http://127.0.0.1:5175/w/4f964339-4d48-4726-af0e-3ccd523b3a7c",
+      "ms": 1986
+    },
+    {
+      "name": "首页渲染(学习空间)",
+      "ok": true,
+      "detail": "",
+      "ms": 7
+    },
+    {
+      "name": "图谱页渲染",
+      "ok": true,
+      "detail": "",
+      "ms": 1382
+    },
+    {
+      "name": "对话页 composer",
+      "ok": false,
+      "detail": "未找到输入框",
+      "ms": 2133
+    }
+  ],
+  "passed": false,
+  "pageErrors": [
+    "TypeError: Cannot read properties of undefined (reading 'axis')"
+  ]
+}

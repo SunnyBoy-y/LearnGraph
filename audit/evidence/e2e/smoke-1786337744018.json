@@ -1,0 +1,38 @@
+{
+  "base": "http://127.0.0.1:5175",
+  "ts": 1786337744018,
+  "steps": [
+    {
+      "name": "登录页渲染(#auth-title)",
+      "ok": true,
+      "detail": "",
+      "ms": 609
+    },
+    {
+      "name": "注册→进入工作区",
+      "ok": true,
+      "detail": "http://127.0.0.1:5175/w/5758b4a8-90ad-4946-ac5f-2d88d5c5bab9",
+      "ms": 1514
+    },
+    {
+      "name": "首页渲染(学习空间)",
+      "ok": true,
+      "detail": "",
+      "ms": 10
+    },
+    {
+      "name": "图谱页渲染",
+      "ok": true,
+      "detail": "",
+      "ms": 388
+    },
+    {
+      "name": "对话页 composer",
+      "ok": true,
+      "detail": "",
+      "ms": 2073
+    }
+  ],
+  "passed": true,
+  "pageErrors": []
+}

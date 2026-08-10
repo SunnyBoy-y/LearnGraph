@@ -1,0 +1,38 @@
+{
+  "base": "http://127.0.0.1:5174",
+  "ts": 1786325182684,
+  "steps": [
+    {
+      "name": "登录页渲染(#auth-title)",
+      "ok": true,
+      "detail": "",
+      "ms": 1052
+    },
+    {
+      "name": "注册→进入工作区",
+      "ok": false,
+      "detail": "page.waitForURL: Timeout 20000ms exceeded.\n=========================== logs ===========================\nwaiting for navigation until \"load\"\n============================================================",
+      "ms": 20273
+    },
+    {
+      "name": "首页渲染(学习空间)",
+      "ok": true,
+      "detail": "",
+      "ms": 7
+    },
+    {
+      "name": "图谱页渲染",
+      "ok": true,
+      "detail": "",
+      "ms": 426
+    },
+    {
+      "name": "对话页 composer",
+      "ok": false,
+      "detail": "未找到输入框",
+      "ms": 2195
+    }
+  ],
+  "passed": false,
+  "pageErrors": []
+}

@@ -1,0 +1,41 @@
+{
+  "base": "http://127.0.0.1:5175",
+  "ts": 1786335382313,
+  "steps": [
+    {
+      "name": "登录页渲染(#auth-title)",
+      "ok": true,
+      "detail": "",
+      "ms": 621
+    },
+    {
+      "name": "注册→进入工作区",
+      "ok": true,
+      "detail": "http://127.0.0.1:5175/w/f487673b-b0f4-4829-b945-fed38c25fdb0",
+      "ms": 1228
+    },
+    {
+      "name": "首页渲染(学习空间)",
+      "ok": true,
+      "detail": "",
+      "ms": 5
+    },
+    {
+      "name": "图谱页渲染",
+      "ok": false,
+      "detail": "page.waitForSelector: Timeout 40000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('text=图谱')\u001b[22m\n",
+      "ms": 40550
+    },
+    {
+      "name": "对话页 composer",
+      "ok": false,
+      "detail": "未找到输入框",
+      "ms": 2069
+    }
+  ],
+  "passed": false,
+  "pageErrors": [
+    "TypeError: Cannot read properties of undefined (reading 'div')",
+    "TypeError: Cannot read properties of undefined (reading 'axis')"
+  ]
+}

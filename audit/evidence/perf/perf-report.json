@@ -1,0 +1,51 @@
+{
+  "pages": {
+    "login": [
+      {
+        "loadMs": 864,
+        "errors": [],
+        "ttfb": 7.600000008940697,
+        "domContentLoaded": 307,
+        "jsCount": 63,
+        "jsBytes": 305809
+      },
+      {
+        "loadMs": 674,
+        "errors": [],
+        "ttfb": 2,
+        "domContentLoaded": 107,
+        "jsCount": 63,
+        "jsBytes": 305809
+      },
+      {
+        "loadMs": 660,
+        "errors": [],
+        "ttfb": 3,
+        "domContentLoaded": 110,
+        "jsCount": 63,
+        "jsBytes": 305809
+      }
+    ]
+  },
+  "graph": {
+    "graphId": "48eb4f1e-2f5f-488c-a101-ec5e21366cf1",
+    "pageLoadMs": 2021,
+    "jsHeapMB": 23,
+    "domNodes": 300,
+    "interactMs": 1826
+  },
+  "memory": {
+    "loopMB": [
+      17,
+      35,
+      49,
+      68,
+      59,
+      44,
+      54,
+      70,
+      81,
+      109
+    ]
+  }
+}

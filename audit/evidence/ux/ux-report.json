@@ -1,0 +1,177 @@
+{
+  "pages": {
+    "login": {
+      "http": 200,
+      "loadMs": 1281
+    },
+    "home": {
+      "loadMs": 1315
+    },
+    "graphs": {
+      "loadMs": 1173,
+      "url": "http://127.0.0.1:5174/w/ecb380ba-23ec-48b3-a857-78122f1ea5ba/graphs"
+    },
+    "sources": {
+      "loadMs": 1301,
+      "url": "http://127.0.0.1:5174/w/ecb380ba-23ec-48b3-a857-78122f1ea5ba/sources"
+    },
+    "settings": {
+      "loadMs": 1313,
+      "url": "http://127.0.0.1:5174/w/ecb380ba-23ec-48b3-a857-78122f1ea5ba/settings/workspace"
+    },
+    "memory": {
+      "loadMs": 1354,
+      "url": "http://127.0.0.1:5174/w/ecb380ba-23ec-48b3-a857-78122f1ea5ba/memory"
+    }
+  },
+  "network": {
+    "pollWindowSec": 30,
+    "freq": {
+      "/api/v1/auth/register": {
+        "count": 1,
+        "perMin": 2,
+        "method": "POST"
+      },
+      "/api/v1/workspaces": {
+        "count": 12,
+        "perMin": 24,
+        "method": "GET"
+      },
+      "/api/v1/auth/me": {
+        "count": 13,
+        "perMin": 26,
+        "method": "GET"
+      },
+      "/api/v1/projects": {
+        "count": 6,
+        "perMin": 12,
+        "method": "GET"
+      },
+      "/api/v1/sessions": {
+        "count": 7,
+        "perMin": 14,
+        "method": "GET"
+      },
+      "/api/v1/settings": {
+        "count": 7,
+        "perMin": 14,
+        "method": "GET"
+      },
+      "/api/v1/graphs": {
+        "count": 5,
+        "perMin": 10,
+        "method": "GET"
+      },
+      "/api/v1/goals": {
+        "count": 5,
+        "perMin": 10,
+        "method": "GET"
+      },
+      "/api/v1/dashboard": {
+        "count": 5,
+        "perMin": 10,
+        "method": "GET"
+      },
+      "/api/v1/actions": {
+        "count": 2,
+        "perMin": 4,
+        "method": "GET"
+      },
+      "/api/v1/files": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/files/storage-summary": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/files/parser-capabilities": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/sources": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/providers": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/memory/enhancement": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/providers/catalog": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/memory/policy": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/memory/views": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/memory/profile": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/memory/types": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      },
+      "/api/v1/memory": {
+        "count": 3,
+        "perMin": 6,
+        "method": "GET"
+      },
+      "/api/v1/memory/drafts": {
+        "count": 1,
+        "perMin": 2,
+        "method": "GET"
+      }
+    }
+  },
+  "findings": [
+    {
+      "sev": "P4",
+      "title": "登录页加载 1281ms (200)",
+      "detail": "预算内",
+      "evidence": [
+        "01-login.png"
+      ]
+    },
+    {
+      "sev": "P4",
+      "title": "登录后首页加载 1315ms",
+      "detail": "首页 TTFB 后完整可用耗时",
+      "evidence": [
+        "04-home.png"
+      ]
+    },
+    {
+      "sev": "P3",
+      "title": "高频轮询 8 个端点",
+      "detail": "[[\"/api/v1/auth/me\",{\"count\":13,\"perMin\":26,\"method\":\"GET\"}],[\"/api/v1/workspaces\",{\"count\":12,\"perMin\":24,\"method\":\"GET\"}],[\"/api/v1/sessions\",{\"count\":7,\"perMin\":14,\"method\":\"GET\"}],[\"/api/v1/settings\",{\"count\":7,\"perMin\":14,\"method\":\"GET\"}],[\"/api/v1/projects\",{\"count\":6,\"perMin\":12,\"method\":\"GET\"}]]",
+      "evidence": [
+        "network.snapshot"
+      ]
+    }
+  ],
+  "register": {
+    "url": "http://127.0.0.1:5174/w/ecb380ba-23ec-48b3-a857-78122f1ea5ba/home",
+    "inRegisterMode": true
+  }
+}
