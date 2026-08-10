@@ -7,6 +7,11 @@ from app.providers.model_catalog import (
     UNKNOWN_MODEL_CONTEXT_TOKENS,
     unified_model_defaults,
 )
+from app.providers.qwen_catalog import (
+    DASHSCOPE_ONLY_CAPABILITY_FIELDS,
+    PROTOCOL_FAMILY_DASHSCOPE,
+    strip_dashscope_private_capabilities,
+)
 
 
 ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
@@ -49,9 +54,14 @@ class ModelCallOptions:
 
 
 def _model_capabilities(capabilities: dict[str, Any], model_id: str) -> dict[str, Any]:
+    # The Provider's persisted protocol family decides whether DashScope-private
+    # catalogue claims may be granted.  Missing family (legacy rows) defaults to
+    # the safe side: no private claims, exactly like a plain relay.
+    dashscope_hosted = capabilities.get("protocol_family") == PROTOCOL_FAMILY_DASHSCOPE
     merged = unified_model_defaults(
         model_id,
         provider_type=str(capabilities.get("provider_family") or ""),
+        dashscope_hosted=dashscope_hosted,
     )
     merged.update(capabilities)
     configured_models = capabilities.get("models")
@@ -335,8 +345,7 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
 
 # Mirrors the frontend's blank capability form: the baseline a catalog record
 # is merged over so the persisted snapshot is always complete.
-_CATALOG_BASE_CAPABILITIES: dict[str, Any] = {
-    "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+_CATALOG_BASE_CAPABILITIES: dict[str, Any] = {    "reasoning_efforts": ["low", "medium", "high", "xhigh"],
     "thinking_mapping": {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"},
     "default_thinking_mode": "medium",
     "reasoning_parameter": "reasoning_effort",
@@ -362,13 +371,25 @@ _CATALOG_BASE_CAPABILITIES: dict[str, Any] = {
 
 
 def catalog_capability_snapshot(
-    model_id: str, *, provider_type: str | None = None
+    model_id: str,
+    *,
+    provider_type: str | None = None,
+    dashscope_hosted: bool | None = None,
 ) -> dict[str, Any]:
     """Official catalog defaults normalized into a savable capability snapshot.
 
     Catalog records are partial and occasionally self-inconsistent (for
     example a thinking-only model without a default mode); this repairs them
     so the result always passes ``validate_model_capability_update``.
+
+    ``dashscope_hosted`` answers whether the endpoint actually speaks the
+    DashScope wire dialect.  The reviewed Qwen catalogue describes the
+    DashScope hosting (``enable_search``, ``enable_thinking``,
+    ``preserve_thinking``); applying those claims to a third-party
+    OpenAI-compatible relay by model name alone fabricates capabilities the
+    relay rejects with ``UNKNOWN_FIELD``.  When the origin is not DashScope,
+    the DashScope-only claims are forced off and the search route repair below
+    falls back to ``auto``.
     """
 
     merged: dict[str, Any] = {
@@ -376,7 +397,15 @@ def catalog_capability_snapshot(
         "thinking_mapping": dict(_CATALOG_BASE_CAPABILITIES["thinking_mapping"]),
         "reasoning_efforts": list(_CATALOG_BASE_CAPABILITIES["reasoning_efforts"]),
     }
-    merged.update(unified_model_defaults(model_id, provider_type=provider_type))
+    merged.update(
+        unified_model_defaults(
+            model_id,
+            provider_type=provider_type,
+            dashscope_hosted=bool(dashscope_hosted),
+        )
+    )
+    if dashscope_hosted is False:
+        strip_dashscope_private_capabilities(merged)
     efforts = [
         item
         for item in (merged.get("reasoning_efforts") or [])

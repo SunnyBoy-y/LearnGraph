@@ -150,6 +150,7 @@ def unified_model_defaults(
     model_id: str,
     *,
     provider_type: str | None = None,
+    dashscope_hosted: bool = True,
 ) -> dict[str, Any]:
     """Project-wide defaults interface built on the models.dev-shaped schema.
 
@@ -158,6 +159,10 @@ def unified_model_defaults(
     snapshot overrides context window, output limit, thinking availability,
     and multimodal input support.  Workspace-saved per-Provider configuration
     is merged later in ``model_options`` and always wins over both.
+
+    ``dashscope_hosted`` gates the DashScope-private catalogue claims (hosted
+    search, preserve thinking, Responses tools, budget thinking): they are
+    only granted when the endpoint actually speaks the DashScope dialect.
     """
 
     from app.providers.models_dev import capability_overlay
@@ -179,7 +184,7 @@ def unified_model_defaults(
             "stepfun/",
         )
     ):
-        base = qwen_model_defaults(model_id)
+        base = qwen_model_defaults(model_id, dashscope_hosted=dashscope_hosted)
     else:
         base = model_context_defaults(model_id)
     overlay = capability_overlay(model_id, base)

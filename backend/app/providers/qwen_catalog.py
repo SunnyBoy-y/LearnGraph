@@ -66,6 +66,66 @@ def is_dashscope_api_base_url(base_url: str | None) -> bool:
     )
 
 
+def is_dashscope_origin(base_url: str | None) -> bool:
+    """Return whether ``base_url`` addresses any DashScope / Model Studio origin.
+
+    The strict :func:`is_dashscope_api_base_url` check only recognises the
+    classic ``dashscope.aliyuncs.com`` host label; workspace deployments under
+    ``*.maas.aliyuncs.com`` speak the same wire dialect (``enable_thinking``,
+    ``enable_search``, ``search_options``) and must match too.  Third-party
+    OpenAI-compatible relays must not match: they reject those DashScope-only
+    request fields with ``UNKNOWN_FIELD``, so capability claims and wire
+    emission for hosted search / preserve-thinking are gated on this origin.
+    """
+
+    if is_dashscope_api_base_url(base_url):
+        return True
+    if not base_url:
+        return False
+    try:
+        parsed = urlsplit(base_url.strip())
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold()
+    return bool(host) and host.endswith(".maas.aliyuncs.com")
+
+
+# Capability claims that describe the DashScope wire dialect (hosted search
+# switches, ``preserve_thinking``, Responses-style native tools, budget-shaped
+# thinking parameters).  They are only granted to DashScope / Model Studio
+# endpoints; a third-party OpenAI-compatible relay serving the same model id
+# must never inherit them — it rejects the matching request fields with
+# ``UNKNOWN_FIELD`` (HTTP 400).
+DASHSCOPE_ONLY_CAPABILITY_FIELDS: tuple[str, ...] = (
+    "hosted_web_search",
+    "hosted_web_fetch",
+    "hosted_image_search",
+    "preserve_thinking",
+    "chat_search_strategy",
+    "native_tool_pricing_cny_per_thousand_calls",
+)
+
+# Providers whose wire protocol matches the official OpenAI Chat Completions
+# contract.  Reserved for future protocol families (deepseek, anthropic, ...).
+PROTOCOL_FAMILY_OPENAI_COMPATIBLE = "openai_compatible"
+PROTOCOL_FAMILY_DASHSCOPE = "dashscope"
+
+
+def protocol_family_for(provider_type: str | None, base_url: str | None) -> str:
+    """Return the wire-protocol family a Provider row actually speaks.
+
+    The endpoint is the decisive signal (a model identifier is not a protocol
+    declaration): DashScope hosts many model families but always speaks its
+    own dialect, while a relay named ``qwen-*`` still speaks plain OpenAI
+    Chat Completions.  The result is persisted on the Provider's capability
+    snapshot and gates which catalogue defaults may be granted at runtime.
+    """
+
+    if is_dashscope_origin(base_url):
+        return PROTOCOL_FAMILY_DASHSCOPE
+    return PROTOCOL_FAMILY_OPENAI_COMPATIBLE
+
+
 def proportional_effort_mapping(values: Iterable[str]) -> dict[str, str]:
     """Map four LearnGraph levels onto a provider subset proportionally."""
 
@@ -423,8 +483,58 @@ def _is_image_generation_model(model: str) -> bool:
     return _starts(model, ("qwen-image", "wanx"))
 
 
-def qwen_model_defaults(model_id: str) -> dict[str, Any]:
-    """Return official overrides in the project-wide capability shape."""
+def qwen_model_defaults(
+    model_id: str, *, dashscope_hosted: bool = True
+) -> dict[str, Any]:
+    """Return official overrides in the project-wide capability shape.
+
+    ``dashscope_hosted`` answers whether the endpoint actually speaks the
+    DashScope wire dialect.  The catalogue describes DashScope hosting, so by
+    default it returns the full official snapshot; for any other endpoint the
+    DashScope-private claims are stripped (hosted search switches, preserve
+    thinking, Responses-style tools, budget-shaped thinking parameters) so a
+    third-party relay named ``qwen-*`` never receives capabilities it cannot
+    honour.
+    """
+
+    result = _qwen_model_defaults_raw(model_id)
+    if not dashscope_hosted:
+        strip_dashscope_private_capabilities(result)
+    return result
+
+
+def strip_dashscope_private_capabilities(capabilities: dict[str, Any]) -> dict[str, Any]:
+    """Remove DashScope-private claims from a capability snapshot in place.
+
+    Called on catalogue output for non-DashScope endpoints and on persisted
+    per-model snapshots during data repair.  Public so repair tooling and the
+    runtime merge share exactly one definition of what is DashScope-private.
+    """
+
+    for field in DASHSCOPE_ONLY_CAPABILITY_FIELDS:
+        capabilities.pop(field, None)
+    if capabilities.get("native_tool_protocol") == "responses":
+        # The Responses protocol (``POST /responses``) is DashScope-private;
+        # a relay only implements Chat Completions.
+        capabilities["native_tool_protocol"] = "chat_completions"
+    cache_modes = capabilities.get("cache_modes")
+    if isinstance(cache_modes, list) and "session" in cache_modes:
+        # ``session`` caching is a Responses-protocol feature.
+        capabilities["cache_modes"] = [mode for mode in cache_modes if mode != "session"]
+    if capabilities.get("reasoning_parameter") == "thinking_budget":
+        # Budget-shaped thinking (``thinking_budget``) is DashScope-private;
+        # fall back to the widely supported boolean ``enable_thinking`` shape.
+        capabilities["reasoning_parameter"] = "enable_thinking"
+        capabilities.pop("thinking_budget_max", None)
+        capabilities["thinking_mapping"] = {
+            "off": False,
+            **{effort: True for effort in LEARNGRAPH_EFFORTS},
+        }
+    return capabilities
+
+
+def _qwen_model_defaults_raw(model_id: str) -> dict[str, Any]:
+    """Official overrides before endpoint gating; see :func:`qwen_model_defaults`."""
 
     model = _model_key(model_id)
     if _is_image_generation_model(model):

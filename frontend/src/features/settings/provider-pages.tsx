@@ -155,6 +155,7 @@ import type {
   ProviderModelCapabilities,
   ProviderModelCapabilityView,
   ProviderModelsResponse,
+  ProviderModelStatesView,
   ProviderRole,
   ProviderTypeCatalogItem,
   ReasoningParameter,
@@ -1849,6 +1850,38 @@ export function ProvidersPage() {
             });
             void queryClient.invalidateQueries({ queryKey: ["providers"] });
           }}
+          onStatesSaved={(result) => {
+            // The discovery cache must never shadow the just-persisted toggle
+            // state: refresh the cached rows so the row's default-model picker
+            // grays out disabled models and the next dialog opens with the
+            // switches the user actually saved.
+            setModels((current) => {
+              const discovered = current[result.provider_id];
+              if (!discovered) return current;
+              return {
+                ...current,
+                [result.provider_id]: {
+                  ...discovered,
+                  models: discovered.models.map((model) => ({
+                    ...model,
+                    enabled: result.states[model.id] ?? model.enabled,
+                  })),
+                },
+              };
+            });
+            // A user-picked default that was just disabled must not keep
+            // shadowing the backend's re-derived default model.
+            setDefaultModels((current) => {
+              const override = current[result.provider_id];
+              if (override && result.states[override] === false) {
+                const next = { ...current };
+                delete next[result.provider_id];
+                return next;
+              }
+              return current;
+            });
+            void queryClient.invalidateQueries({ queryKey: ["providers"] });
+          }}
                     onSetDefault={(nextModelId) => {
             const provider = capabilityTarget.provider;
             const spec = catalogByType.get(provider.provider_type);
@@ -3438,6 +3471,7 @@ function ModelCapabilitiesDialog({
   onConfigureBalance,
   onSaved,
   onSetDefault,
+  onStatesSaved,
   provider,
 }: {
   modelId: string;
@@ -3446,6 +3480,8 @@ function ModelCapabilitiesDialog({
   onConfigureBalance: () => void;
   onSaved: (snapshot: ProviderModelCapabilityView) => void;
   onSetDefault: (modelId: string) => void;
+  /** Bulk model on/off switches committed; keeps the parent model cache fresh. */
+  onStatesSaved: (result: ProviderModelStatesView) => void;
   provider: Provider;
 }) {
   const queryClient = useQueryClient();
@@ -3488,19 +3524,33 @@ function ModelCapabilitiesDialog({
     queryFn: () => discoverProviderModels(provider.id),
     retry: false,
   });
+  // Switches the user flipped in this dialog session are never overwritten by
+  // a background refresh; everything else follows the persisted discovery.
+  const touchedModelIds = useRef<Set<string>>(new Set());
   useEffect(() => {
     const discovered = latestModels.data;
     if (!discovered) return;
     const merged = mergeProviderModelLists(discovered, provider) ?? discovered;
+    const mergedIds = new Set(merged.models.map((model) => model.id));
     setModelsList((current) => {
       const byId = new Map(current.models.map((model) => [model.id, model]));
       for (const model of merged.models) byId.set(model.id, model);
+      // Models the vendor no longer reports and the workspace never pinned
+      // manually are gone from the persisted snapshot — drop them instead of
+      // letting a stale row fail the bulk save with 404.
+      for (const id of [...byId.keys()]) {
+        if (!mergedIds.has(id)) byId.delete(id);
+      }
       return { ...merged, models: [...byId.values()] };
     });
     setModelStates((current) => {
       const next = { ...current };
       for (const model of merged.models) {
-        if (!(model.id in next)) next[model.id] = model.enabled !== false;
+        if (touchedModelIds.current.has(model.id)) continue;
+        next[model.id] = model.enabled !== false;
+      }
+      for (const id of Object.keys(next)) {
+        if (!mergedIds.has(id)) delete next[id];
       }
       return next;
     });
@@ -3664,8 +3714,9 @@ function ModelCapabilitiesDialog({
       // Nothing is being edited — the footer action only commits the model
       // on/off switches.
       updateProviderModelStates(provider.id, modelStates)
-        .then(() => {
+        .then((result) => {
           toast.success("模型开关已保存");
+          onStatesSaved(result);
           void queryClient.invalidateQueries({ queryKey: ["providers"] });
           onClose();
         })
@@ -3694,7 +3745,10 @@ function ModelCapabilitiesDialog({
     // Model switches are part of this supplier configuration and commit with
     // the footer action, rather than requiring a second "apply" step.
     updateProviderModelStates(provider.id, modelStates)
-      .then(() => save.mutate(capabilities))
+      .then((result) => {
+        onStatesSaved(result);
+        save.mutate(capabilities);
+      })
       .catch((error: Error) => toast.error(error.message));
   }
 
@@ -3833,7 +3887,7 @@ function ModelCapabilitiesDialog({
                 ) : null}
               </section>
               <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true])))} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false])))} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
                 <div className="flex items-center gap-2">
                   <Input
                     aria-label="手动添加模型"
@@ -3918,12 +3972,13 @@ function ModelCapabilitiesDialog({
                       </Button>
                       <Switch
                         checked={modelStates[model.id] === true}
-                        onCheckedChange={(checked) =>
+                        onCheckedChange={(checked) => {
+                          touchedModelIds.current.add(model.id);
                           setModelStates((current) => ({
                             ...current,
                             [model.id]: checked,
-                          }))
-                        }
+                          }));
+                        }}
                       />
                     </div>
                   ))}

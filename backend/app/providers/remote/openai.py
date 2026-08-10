@@ -11,6 +11,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
 from app.providers.model_options import ModelCallOptions
+from app.providers.qwen_catalog import is_dashscope_origin
 from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
 
 
@@ -1580,11 +1581,15 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
         # when ``enable_search`` accompanies ``tools``.  An Agent turn always
         # carries function tools and reaches the web through its own search
         # lane, so the hosted switch yields to them instead of failing the turn.
+        # The switch is DashScope wire dialect: third-party OpenAI-compatible
+        # relays reject ``enable_search`` with UNKNOWN_FIELD (HTTP 400), so it
+        # is only emitted against a DashScope / Model Studio origin.
         if (
             not responses
             and not payload.get("tools")
             and self.call_options is not None
             and self.call_options.native_web_search
+            and is_dashscope_origin(self.base_url)
         ):
             payload["enable_search"] = True
             strategy = self.capabilities.get("chat_search_strategy")
@@ -1598,11 +1603,14 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
         # across turns.  Sending it during a fast call is contradictory to the
         # explicit ``enable_thinking=false`` override and can make DashScope
         # continue a previous thinking turn.  Keep fast mode unambiguous.
+        # Like ``enable_search`` it is DashScope-only wire dialect; relays
+        # reject it as an unknown field, so only DashScope origins emit it.
         if (
             not responses
             and self.preserve_thinking
             and self.call_options is not None
             and self.call_options.thinking_mode != "off"
+            and is_dashscope_origin(self.base_url)
         ):
             payload["preserve_thinking"] = True
         return payload

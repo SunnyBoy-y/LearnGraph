@@ -158,6 +158,10 @@ from app.providers.model_options import (
     model_capabilities_for_model,
     validate_model_capability_update,
 )
+from app.providers.qwen_catalog import (
+    PROTOCOL_FAMILY_OPENAI_COMPATIBLE,
+    protocol_family_for,
+)
 from app.providers.model_catalog import unified_model_defaults
 from app.services.provider_secrets import (
     PROVIDER_SECRET_ALGORITHM,
@@ -776,6 +780,17 @@ class ProviderService:
             if provider.provider_type in EMBEDDING_PROVIDER_TYPES:
                 capabilities["default_embedding_model_id"] = payload.default_model
         if payload.default_image_generation_model_id is not None:
+            model_states = dict(capabilities.get("model_states") or {})
+            if (
+                provider.provider_type in IMAGE_GENERATION_PROVIDER_TYPES
+                and model_states.get(payload.default_image_generation_model_id)
+                is False
+            ):
+                raise AppError(
+                    409,
+                    "provider_model_disabled",
+                    "A disabled model cannot be selected as the default image generation model",
+                )
             capabilities["default_image_generation_model_id"] = (
                 payload.default_image_generation_model_id
             )
@@ -1190,6 +1205,11 @@ class ProviderService:
             for item in capabilities.get("hidden_model_ids") or []
             if str(item).strip()
         }
+        # Persist the wire-protocol family so runtime capability merging can
+        # gate DashScope-private claims even for models without a snapshot.
+        capabilities["protocol_family"] = protocol_family_for(
+            provider.provider_type, provider.base_url
+        )
         models = dict(capabilities.get("models") or {})
         synced: list[dict] = []
         warnings: list[dict[str, object]] = []
@@ -1198,7 +1218,11 @@ class ProviderService:
             if not model_id:
                 continue
             snapshot = catalog_capability_snapshot(
-                model_id, provider_type=provider.provider_type
+                model_id,
+                provider_type=provider.provider_type,
+                dashscope_hosted=(
+                    capabilities["protocol_family"] == "dashscope"
+                ),
             )
             try:
                 validated = validate_model_capability_update(snapshot)
@@ -2774,6 +2798,11 @@ class ProviderService:
         if provider.provider_type != "local_mock":
             provider.remote_capability = True
         capabilities = dict(provider.capabilities or {})
+        # Wire-protocol family gates DashScope-private catalogue claims at
+        # runtime; persist it on every probe so it stays authoritative.
+        capabilities["protocol_family"] = protocol_family_for(
+            provider.provider_type, provider.base_url
+        )
         if provider.provider_type in {
             *MODEL_PROVIDER_TYPES,
             *IMAGE_GENERATION_PROVIDER_TYPES,
