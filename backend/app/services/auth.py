@@ -228,10 +228,7 @@ class AuthService:
             email=email,
             email_normalized=email_normalized,
             display_name=payload.display_name.strip(),
-            password_hash=hash_password(
-                payload.password,
-                iterations=self.settings.auth_hash_iterations,
-            ),
+            password_hash=hash_password(payload.password),
         )
         self.db.add(user)
         self.db.flush()
@@ -395,10 +392,7 @@ class AuthService:
         if verify_password(payload.new_password, user.password_hash):
             raise AppError(422, "password_unchanged", "New password must be different")
         validate_new_password(payload.new_password, username=user.username)
-        user.password_hash = hash_password(
-            payload.new_password,
-            iterations=self.settings.auth_hash_iterations,
-        )
+        user.password_hash = hash_password(payload.new_password)
         user.password_changed_at = utc_now()
         user.must_change_password = False
         other_sessions = self.db.scalars(
@@ -576,10 +570,7 @@ class AuthService:
         user.email = None
         user.email_normalized = None
         user.display_name = "Deleted account"
-        user.password_hash = hash_password(
-            new_session_token(),
-            iterations=self.settings.auth_hash_iterations,
-        )
+        user.password_hash = hash_password(new_session_token())
         user.status = "deleted"
         user.is_system_admin = False
         user.must_change_password = False

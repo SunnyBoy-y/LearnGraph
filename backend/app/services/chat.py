@@ -143,6 +143,8 @@ SSE_SCHEMA_VERSION = "1.0"
 TERMINAL_SUBMISSION_STATUSES = {"completed", "failed", "cancelled"}
 REPLAY_POLL_SECONDS = 0.05
 REPLAY_HEARTBEAT_SECONDS = 5.0
+AGENT_TOOL_HEARTBEAT_SECONDS = 5.0
+AGENT_TOOL_POLL_SECONDS = 0.1
 REPLAY_IDLE_TIMEOUT_SECONDS = 30.0
 AUTO_TITLE_SOURCE_MAX_CHARS = 6_000
 AUTO_TITLE_USAGE_FEATURE = "chat_session_auto_title"
@@ -1912,6 +1914,22 @@ class ChatService:
         if self.context_builder is None or not settings.memory_context_builder_v2:
             return None, {}
 
+        # B1-5: in shadow mode the v2 build runs purely for comparison; sample
+        # it at memory_shadow_sample_rate so most requests run only the legacy
+        # loader instead of doubling the full-table retrieval on every message.
+        if settings.memory_read_mode != "events":
+            rate = settings.memory_shadow_sample_rate
+            if rate is None or rate <= 0:
+                return None, {"degraded": True, "read_mode": settings.memory_read_mode}
+            if rate < 1.0:
+                import random
+                if random.random() > rate:
+                    return None, {
+                        "degraded": True,
+                        "read_mode": settings.memory_read_mode,
+                        "shadow_sampled_out": True,
+                    }
+
         try:
             from app.domain.memory_event_models import MemoryScopeContext
             from app.domain.schemas.context_builds import ContextBuildRequest
@@ -3445,40 +3463,53 @@ class ChatService:
                 workspace_id=self.workspace_id,
                 conversation_id=chat_session_id or None,
             )
-            MemoryEventIngestor(
-                MemoryEventStore(self.db, event_cipher_from_settings(settings))
-            ).ingest(
-                scope,
-                EventActor("agent", self.actor_id),
-                MemoryEventAppendRequest(
-                    aggregate_type="agent_run",
-                    aggregate_id=run_id[:64],
-                    expected_stream_version=None,
-                    event_type=MemoryEventType.AGENT_RUN_COMPLETED
-                    if succeeded
-                    else MemoryEventType.AGENT_RUN_FAILED,
-                    producer="agent",
-                    idempotency_key=f"agent-run:{run_id[:64]}:{succeeded}",
-                    payload={
-                        "result_summary": str(output or "")[:10_000],
-                        "tool_call_refs": [],
-                        "artifact_refs": [],
-                        "succeeded": succeeded,
-                        "decision": str(meta.get("reason") or "")[:1_000],
-                        "source_count": len(sources or []),
-                        "summary_eligibility": "excluded",
-                    },
-                ),
-                trusted_producer=True,
-            )
-            self.db.flush()
+            # The ingest must never roll back the outer chat stream unit of
+            # work. A second tool call in the same assistant turn reuses the
+            # same run id and hits the ``agent-run:{run_id}:{succeeded}``
+            # idempotency key with a different payload, so the store raises a
+            # 409 conflict; any ingest failure used to end in
+            # ``self.db.rollback()`` here, which also discarded the freshly
+            # created MessagePart and its stream events that were still
+            # pending. The following ``_append_event`` then failed with a
+            # FOREIGN KEY constraint violation on message_stream_events.
+            # SAVEPOINT containment makes the memory write all-or-nothing on
+            # its own while leaving the outer transaction untouched.
+            with self.db.begin_nested():
+                MemoryEventIngestor(
+                    MemoryEventStore(self.db, event_cipher_from_settings(settings))
+                ).ingest(
+                    scope,
+                    EventActor("agent", self.actor_id),
+                    MemoryEventAppendRequest(
+                        aggregate_type="agent_run",
+                        aggregate_id=run_id[:64],
+                        expected_stream_version=None,
+                        event_type=MemoryEventType.AGENT_RUN_COMPLETED
+                        if succeeded
+                        else MemoryEventType.AGENT_RUN_FAILED,
+                        producer="agent",
+                        idempotency_key=f"agent-run:{run_id[:64]}:{succeeded}",
+                        payload={
+                            "result_summary": str(output or "")[:10_000],
+                            "tool_call_refs": [],
+                            "artifact_refs": [],
+                            "succeeded": succeeded,
+                            "decision": str(meta.get("reason") or "")[:1_000],
+                            "source_count": len(sources or []),
+                            "summary_eligibility": "excluded",
+                        },
+                    ),
+                    trusted_producer=True,
+                )
+                self.db.flush()
         except Exception:
+            # The SAVEPOINT already rolled back the memory writes; the outer
+            # chat stream transaction is untouched.
             logger.debug(
                 "agent.run_completed event skipped for run %s",
                 run_id,
                 exc_info=True,
             )
-            self.db.rollback()
 
     @staticmethod
     def _injected_image_message(image_parts: list[dict]) -> ProviderChatMessage:
@@ -3491,6 +3522,54 @@ class ChatService:
             content_parts=image_parts,
         )
 
+    def _begin_agent_tool_execution(
+        self,
+        tool_call: dict,
+        allowed_domains: list[str],
+        chat_session_id: str | None,
+        *,
+        assistant_message_id: str | None,
+        assistant_version_id: str | None,
+        source_message_id: str | None,
+    ) -> tuple[Any | None, float | None]:
+        """Submit the tool call on the shared executor and return (future, deadline)."""
+        if self.agent_tool_runtime is None or not chat_session_id:
+            return None, None
+        timeout_seconds = self.settings.agent_tool_timeout_seconds
+        if not timeout_seconds or timeout_seconds <= 0:
+            return None, None
+        executor = _agent_tool_executor()
+        future = executor.submit(
+            self.agent_tool_runtime.execute,
+            tool_call,
+            allowed_domains=allowed_domains,
+            chat_session_id=chat_session_id,
+            assistant_message_id=assistant_message_id,
+            assistant_version_id=assistant_version_id,
+            source_message_id=source_message_id,
+            model_supports_image_input=self._agent_model_supports_image_input(),
+        )
+        return future, time.monotonic() + timeout_seconds
+
+    def _wait_agent_tool_future(
+        self,
+        pending_future: Any | None,
+        pending_deadline: float | None,
+    ) -> Iterable[str]:
+        """A1-1: yield a keep-alive every ~5s while a tool call is in flight."""
+        yield ": agent-tool-running\n\n"
+        if pending_future is None:
+            return
+        next_heartbeat = time.monotonic() + AGENT_TOOL_HEARTBEAT_SECONDS
+        while not pending_future.done():
+            if pending_deadline is not None and time.monotonic() >= pending_deadline:
+                pending_future.cancel()
+                return
+            if time.monotonic() >= next_heartbeat:
+                yield ": agent-tool-running\n\n"
+                next_heartbeat = time.monotonic() + AGENT_TOOL_HEARTBEAT_SECONDS
+            time.sleep(AGENT_TOOL_POLL_SECONDS)
+
     def _execute_agent_tool(
         self,
         tool_call: dict,
@@ -3500,6 +3579,8 @@ class ChatService:
         assistant_message_id: str | None = None,
         assistant_version_id: str | None = None,
         source_message_id: str | None = None,
+        pending_future: Any | None = None,
+        pending_deadline: float | None = None,
     ) -> tuple[str, dict, list[dict]]:
         """Execute an allow-listed, side-effect-free model tool call.
 
@@ -3521,19 +3602,31 @@ class ChatService:
                 if timeout_seconds and timeout_seconds > 0:
                     from concurrent.futures import TimeoutError as FutureTimeout
 
-                    executor = _agent_tool_executor()
-                    future = executor.submit(
-                        self.agent_tool_runtime.execute,
-                        tool_call,
-                        allowed_domains=allowed_domains,
-                        chat_session_id=chat_session_id,
-                        assistant_message_id=assistant_message_id,
-                        assistant_version_id=assistant_version_id,
-                        source_message_id=source_message_id,
-                        model_supports_image_input=self._agent_model_supports_image_input(),
-                    )
+                    if pending_future is not None:
+                        # The generator call site already submitted the future
+                        # and polled it (yielding heartbeats); only wait for the
+                        # remaining budget (<= 0 means it already timed out).
+                        future = pending_future
+                        wait_seconds = (
+                            max(0.0, pending_deadline - time.monotonic())
+                            if pending_deadline is not None
+                            else timeout_seconds
+                        )
+                    else:
+                        executor = _agent_tool_executor()
+                        future = executor.submit(
+                            self.agent_tool_runtime.execute,
+                            tool_call,
+                            allowed_domains=allowed_domains,
+                            chat_session_id=chat_session_id,
+                            assistant_message_id=assistant_message_id,
+                            assistant_version_id=assistant_version_id,
+                            source_message_id=source_message_id,
+                            model_supports_image_input=self._agent_model_supports_image_input(),
+                        )
+                        wait_seconds = timeout_seconds
                     try:
-                        result = future.result(timeout=timeout_seconds)
+                        result = future.result(timeout=wait_seconds)
                     except FutureTimeout:
                         future.cancel()
                         self._record_agent_run_event(
@@ -7632,13 +7725,34 @@ class ChatService:
             raise AppError(409, "invalid_branch_lineage", "Session branch lineage contains a cycle")
 
         session = self.sessions.require(session_id, "session")
-        local_messages = list(
-            self.db.scalars(
-                self.messages.query()
-                .where(Message.session_id == session_id)
-                .order_by(Message.created_at)
-            ).all()
+        # B1-2: bound the common linear case at 500 most-recent messages; branch
+        # sessions keep the full history so the source-message merge stays
+        # correct (the source could sit outside a truncated parent window).
+        is_linear = (
+            session.parent_session_id is None
+            or session.session_kind in ("concept_branch", "side")
         )
+        timeline_query = self.messages.query().where(
+            Message.session_id == session_id
+        )
+        if is_linear:
+            # B1-2: linear sessions cap at the 500 most-recent messages; the
+            # composite (workspace_id, session_id, created_at) index serves the
+            # DESC scan. The branch source lives in the parent chain, never in
+            # this session's own rows, so truncating local rows is safe.
+            timeline_query = timeline_query.order_by(
+                Message.created_at.desc()
+            ).limit(500)
+        else:
+            # History-inheriting branches keep the source-merge semantics, but
+            # still bound pathological growth at 2000 local messages.
+            timeline_query = timeline_query.order_by(
+                Message.created_at.desc()
+            ).limit(2000)
+        local_messages = list(self.db.scalars(timeline_query).all())
+        # Both query paths order DESC (newest first) and cap the window, so
+        # always reverse back to chronological order for the caller.
+        local_messages.reverse()
         # concept_branch and side sessions are not history-inheriting branches:
         # concept_branch has its own capsule, side sessions are parallel threads
         # grouped under a parent but start from scratch.  Both return only their

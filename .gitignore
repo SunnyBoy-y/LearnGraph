@@ -212,4 +212,4 @@ Desktop.ini
 /backend/scripts/run_sandbox_egress_proxy.py
 backend/sandbox/.spec-test.json
 .spec-test.json
-
+/tests/

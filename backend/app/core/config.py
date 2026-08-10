@@ -39,19 +39,18 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     demo_username: str = "demo"
     demo_password: str = "learn-graph-local"
-    enable_demo_seed: bool = False
-    # Demo login is off by default: a fixed demo credential must never be
-    # reachable in a deployment that did not explicitly opt in. Development and
-    # local previews set LEARNGRAPH_ENABLE_DEMO_LOGIN=true in their env.
-    enable_demo_login: bool = False
+    # Demo seed data is on by default so the demo workspace opens with sample
+    # goals/graphs/sessions; demo_seed_enabled() gates it to non-production
+    # envs. Set LEARNGRAPH_ENABLE_DEMO_SEED=false to disable explicitly.
+    enable_demo_seed: bool = True
+    # Demo login is on by default for the local product experience; the fixed
+    # demo credential is never reachable in production-like envs because
+    # demo_login_enabled() additionally gates on LEARNGRAPH_ENV. Set
+    # LEARNGRAPH_ENABLE_DEMO_LOGIN=false to disable explicitly.
+    enable_demo_login: bool = True
     auth_session_hours: int = 12
     auth_max_failed_logins: int = 5
     auth_lockout_minutes: int = 15
-    # PBKDF2-SHA256 cost for NEW password hashes (register / change-password /
-    # account-deletion scramble). Login verification reads the iteration count
-    # embedded in each stored hash, so existing accounts keep their original
-    # cost until the password is rotated.
-    auth_hash_iterations: int = 600_000
     # IP-level sliding-window rate limit for anonymous auth endpoints
     # (login / register / demo-login). Protects accounts from brute-force
     # lockout DoS and the registration surface from scripted abuse.

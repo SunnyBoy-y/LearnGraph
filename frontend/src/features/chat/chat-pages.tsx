@@ -2534,6 +2534,12 @@ export function ChatCanvasPage() {
   const [historyTotalCount, setHistoryTotalCount] = useState(0);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const loadingOlderRef = useRef(false);
+  // F1-4: long sessions keep every message DOM shell mounted even though
+  // LazyMessageMount defers their content. Above the threshold, render only
+  // the most recent tail and reveal older history in steps on demand.
+  const [revealedHistoryCount, setRevealedHistoryCount] = useState(0);
+  const HISTORY_COLLAPSE_THRESHOLD = 120;
+  const HISTORY_REVEAL_STEP = 100;
 
   const history = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
@@ -7268,7 +7274,41 @@ export function ChatCanvasPage() {
                   </Button>
                 </div>
               ) : null}
-              {messages.map((message, messageIndex) => {
+              {(() => {
+                // F1-4: cap DOM shells for very long sessions; reveal in steps.
+                const collapseCut =
+                  messages.length > HISTORY_COLLAPSE_THRESHOLD
+                    ? Math.max(
+                        0,
+                        messages.length -
+                          HISTORY_COLLAPSE_THRESHOLD -
+                          revealedHistoryCount,
+                      )
+                    : 0;
+                const visibleMessages =
+                  collapseCut > 0 ? messages.slice(collapseCut) : messages;
+                return (
+                  <>
+                    {collapseCut > 0 ? (
+                      <div className="flex flex-col items-center gap-1 pb-2">
+                        <Button
+                          onClick={() =>
+                            setRevealedHistoryCount((current) =>
+                              Math.min(
+                                current + HISTORY_REVEAL_STEP,
+                                messages.length - HISTORY_COLLAPSE_THRESHOLD,
+                              ),
+                            )
+                          }
+                          size="sm"
+                          type="button"
+                          variant="ghost"
+                        >
+                          展开更早 {collapseCut} 条消息
+                        </Button>
+                      </div>
+                    ) : null}
+                    {visibleMessages.map((message, messageIndex) => {
                 const persisted =
                   !message.id.startsWith("temp") &&
                   message.id !== "welcome-local";
@@ -7281,7 +7321,7 @@ export function ChatCanvasPage() {
                 // addressable for the left question rail.
                 const eagerMount =
                   message.role === "user" ||
-                  messageIndex >= messages.length - 6 ||
+                  messageIndex >= visibleMessages.length - 6 ||
                   message.status === "streaming" ||
                   message.status === "pending" ||
                   editingMessageId === message.id;
@@ -7436,7 +7476,10 @@ export function ChatCanvasPage() {
                     />
                   </LazyMessageMount>
                 );
-              })}
+                  })}
+                  </>
+                  );
+                })()}
               {streamConnectionNotice ? (
                 <StreamConnectionFeedback notice={streamConnectionNotice} />
               ) : null}

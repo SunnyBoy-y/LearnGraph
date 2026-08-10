@@ -646,9 +646,51 @@ export function KnowledgeGraph({
     return map;
   }, [structuredTree.items]);
 
-  const laidOutNodes = useMemo(
-    () =>
-      visibleSourceNodes.map((node) => {
+  type LaidOutCacheEntry = {
+    source: KnowledgeNode;
+    openExplore: KnowledgeGraphProps["onOpenExplore"];
+    built: KnowledgeNode;
+  };
+
+  /** Compare derived fields; data.onOpenExplore is guarded by the source/openExplore refs. */
+  function sameLaidOutNode(prev: KnowledgeNode, next: KnowledgeNode): boolean {
+    if (prev.style !== next.style) {
+      if (
+        !prev.style ||
+        !next.style ||
+        prev.style.width !== next.style.width ||
+        prev.style.height !== next.style.height
+      ) {
+        return false;
+      }
+    }
+    return (
+      prev.selected === next.selected &&
+      prev.draggable === next.draggable &&
+      prev.selectable === next.selectable &&
+      prev.className === next.className &&
+      prev.position.x === next.position.x &&
+      prev.position.y === next.position.y &&
+      prev.data.depth === next.data.depth &&
+      prev.data.kind === next.data.kind &&
+      prev.data.step === next.data.step &&
+      prev.data.stepTotal === next.data.stepTotal &&
+      prev.data.initial === next.data.initial &&
+      prev.data.rootEmphasis === next.data.rootEmphasis &&
+      prev.data.tree === next.data.tree &&
+      prev.data.collapsed === next.data.collapsed &&
+      prev.data.hasChildren === next.data.hasChildren &&
+      prev.data.hiddenCount === next.data.hiddenCount &&
+      prev.data.onToggleCollapse === next.data.onToggleCollapse
+    );
+  }
+
+  const laidOutNodesRef = useRef<Map<string, LaidOutCacheEntry>>(new Map());
+
+  const laidOutNodes = useMemo(() => {
+    const previous = laidOutNodesRef.current;
+    const next = new Map<string, LaidOutCacheEntry>();
+    return visibleSourceNodes.map((node) => {
         const item = layoutItemById.get(node.id);
         const depth = structuredTree.depths[node.id] ?? item?.depth ?? 0;
         const kind = item?.kind;
@@ -674,7 +716,7 @@ export function KnowledgeGraph({
                 y: treePosition.y - height / 2,
               }
             : undefined;
-        return {
+        const candidate: KnowledgeNode = {
           ...node,
           data: {
             ...node.data,
@@ -713,7 +755,28 @@ export function KnowledgeGraph({
                 }
               : undefined,
         };
-      }),
+        // F1-3: keep the reference of unchanged nodes stable so React Flow's
+        // memoized node wrapper skips re-render for unaffected nodes on
+        // collapse/expand; only nodes whose derived fields actually changed
+        // (or whose source/openExplore identity changed) get a new object.
+        const prior = previous.get(node.id);
+        if (
+          prior &&
+          prior.source === node &&
+          prior.openExplore === onOpenExplore &&
+          sameLaidOutNode(prior.built, candidate)
+        ) {
+          next.set(node.id, prior);
+          return prior.built;
+        }
+        next.set(node.id, {
+          source: node,
+          openExplore: onOpenExplore,
+          built: candidate,
+        });
+        return candidate;
+      });
+    },
     [
       collapsedIds,
       freeLayoutPositions,

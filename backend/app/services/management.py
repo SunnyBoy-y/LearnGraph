@@ -13,6 +13,7 @@ from app.core.database import retry_sqlite_locked
 from app.core.errors import AppError
 from app.core.secret_store import SecretStoreUnavailable, secret_store_from_settings
 from app.core.security import SecretCipher, mask_secret
+from app.providers.provider_plan_cache import invalidate_provider_plan_cache
 from app.domain.models import (
     AuditEvent,
     MigrationJob,
@@ -631,6 +632,7 @@ class ProviderService:
             },
         )
         self.db.commit()
+        invalidate_provider_plan_cache(self.workspace_id, provider_id=provider_id)
         self.db.refresh(record)
         spec = provider_type_spec(provider.provider_type)
         if (
@@ -2518,6 +2520,7 @@ class ProviderService:
         )
         self.db.delete(provider)
         self.db.commit()
+        invalidate_provider_plan_cache(self.workspace_id, provider_id=provider_id)
         return {"status": "deleted", "resource_id": provider_id}
 
     def models(self, provider_id: str) -> dict:

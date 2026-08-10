@@ -107,7 +107,17 @@ from app.providers.remote.memory import (
     UnavailableMemoryProvider,
     mem0_entity_id,
 )
-from app.services.provider_secrets import decrypt_provider_secret
+from app.providers.provider_plan_cache import (
+    cached_first_provider_row,
+    cached_provider_rows,
+    cached_secret_for_provider,
+    cached_workspace_setting_value,
+    invalidate_provider_plan_cache,
+)
+from app.services.provider_secrets import (
+    ProviderSecretRevoked,
+    decrypt_secret_fields,
+)
 
 
 def _provider_priority_order():
@@ -122,18 +132,21 @@ def _provider_priority_order():
 def _secret_for_provider(
     db: Session,
     workspace_id: str,
-    provider: ProviderConfig,
+    provider: ProviderConfig | ProviderRowSnapshot,
     settings: Settings,
 ) -> str | None:
-    secret_record = db.scalar(
-        select(ProviderSecret).where(
-            ProviderSecret.workspace_id == workspace_id,
-            ProviderSecret.provider_id == provider.id,
-        )
-    )
-    if secret_record is None:
+    snapshot = cached_secret_for_provider(db, workspace_id, provider.id)
+    if snapshot is None:
         return None
-    return decrypt_provider_secret(settings, secret_record)
+    if snapshot.revoked_at is not None or not snapshot.ciphertext:
+        raise ProviderSecretRevoked("The Provider secret has been revoked")
+    return decrypt_secret_fields(
+        settings,
+        ciphertext=snapshot.ciphertext,
+        algorithm=snapshot.algorithm,
+        key_provider=snapshot.key_provider,
+        key_version=snapshot.key_version,
+    )
 
 
 def _web_fetch_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
@@ -155,13 +168,7 @@ def research_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
 def _workspace_policy_domains(
     db: Session, workspace_id: str, key: str
 ) -> frozenset[str]:
-    setting = db.scalar(
-        select(WorkspaceSetting).where(
-            WorkspaceSetting.workspace_id == workspace_id,
-            WorkspaceSetting.key == key,
-        )
-    )
-    value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    value = cached_workspace_setting_value(db, workspace_id, key) or {}
     raw = value.get("allowed_domains")
     if not isinstance(raw, list):
         return frozenset()
@@ -179,13 +186,12 @@ def _functional_model_target(
     workspace_id: str,
     capability: str,
 ) -> tuple[str | None, str | None]:
-    setting = db.scalar(
-        select(WorkspaceSetting).where(
-            WorkspaceSetting.workspace_id == workspace_id,
-            WorkspaceSetting.key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
+    raw = (
+        cached_workspace_setting_value(
+            db, workspace_id, FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY
         )
+        or {}
     )
-    raw = setting.value if setting is not None and isinstance(setting.value, dict) else {}
     target = raw.get(capability) if isinstance(raw, dict) else None
     if not isinstance(target, dict):
         return None, None
@@ -209,14 +215,9 @@ def model_provider_for_workspace(
         provider_id, model_id = _functional_model_target(
             db, workspace_id, "chat"
         )
-    statement = select(ProviderConfig).where(
-        ProviderConfig.workspace_id == workspace_id,
-        ProviderConfig.enabled.is_(True),
-        ProviderConfig.provider_type.in_(MODEL_PROVIDER_TYPES),
+    provider = cached_first_provider_row(
+        db, workspace_id, MODEL_PROVIDER_TYPES, provider_id=provider_id
     )
-    if provider_id:
-        statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     if provider_id and provider is None:
         return UnavailableModelProvider(
             "The selected model provider is not enabled in this workspace",
@@ -558,14 +559,9 @@ def image_provider_for_workspace(
         provider_id, model_id = _functional_model_target(
             db, workspace_id, "image_generation"
         )
-    statement = select(ProviderConfig).where(
-        ProviderConfig.workspace_id == workspace_id,
-        ProviderConfig.enabled.is_(True),
-        ProviderConfig.provider_type.in_(IMAGE_GENERATION_PROVIDER_TYPES),
+    provider = cached_first_provider_row(
+        db, workspace_id, IMAGE_GENERATION_PROVIDER_TYPES, provider_id=provider_id
     )
-    if provider_id:
-        statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     selected_model_id = model_id.strip() if model_id else ""
     if provider is None:
         return UnavailableImageGenerationProvider(
@@ -676,14 +672,9 @@ def vision_provider_for_workspace(
         provider_id, model_id = _functional_model_target(
             db, workspace_id, "vision"
         )
-    statement = select(ProviderConfig).where(
-        ProviderConfig.workspace_id == workspace_id,
-        ProviderConfig.enabled.is_(True),
-        ProviderConfig.provider_type.in_(VISION_PROVIDER_TYPES),
+    provider = cached_first_provider_row(
+        db, workspace_id, VISION_PROVIDER_TYPES, provider_id=provider_id
     )
-    if provider_id:
-        statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(*_provider_priority_order()))
     selected_model_id = model_id.strip() if model_id else ""
     if provider is None:
         if provider_id is None:
@@ -1403,14 +1394,8 @@ def memory_provider_for_workspace(
     user_id: str,
     settings: Settings,
 ) -> MemoryProviderPort:
-    provider = db.scalar(
-        select(ProviderConfig)
-        .where(
-            ProviderConfig.workspace_id == workspace.id,
-            ProviderConfig.enabled.is_(True),
-            ProviderConfig.provider_type.in_(MEMORY_PROVIDER_TYPES),
-        )
-        .order_by(*_provider_priority_order())
+    provider = cached_first_provider_row(
+        db, workspace.id, MEMORY_PROVIDER_TYPES
     )
     if provider is None:
         return LocalWorkspaceMemoryProvider(settings.memory_root, workspace.id)
