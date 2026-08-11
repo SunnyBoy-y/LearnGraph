@@ -30,7 +30,10 @@ from app.domain.models import (
     utc_now,
 )
 from app.domain.schemas.goals import (
+    AVAILABILITY_FIELDS,
+    PREFERENCES_FIELDS,
     CandidateGraphRequest,
+    CandidateGraphStreamRequest,
     ClarificationQuestion,
     GoalClarifyRequest,
     GoalClarifyResponse,
@@ -38,9 +41,14 @@ from app.domain.schemas.goals import (
     GoalPlanningUpdate,
     GoalView,
     ModelGoalPlan,
+    ModelGraphChunk,
+    ModelGraphChunkEdge,
     ModelGraphDraft,
+    ModelGraphNode,
+    ModelGraphRoot,
     PublishGoalRequest,
     PublishGoalResponse,
+    sanitize_goal_nested_dict,
 )
 from app.domain.schemas.files import FileReferenceCreate
 from app.domain.schemas.workflow import DeleteImpact, ImpactItem
@@ -768,7 +776,19 @@ class GoalService:
                 incoming = values[nested_field]
                 if not isinstance(incoming, dict):
                     incoming = {}
-                values[nested_field] = {**current, **incoming}
+                merged = {**current, **incoming}
+                # Drop legacy unknown keys (e.g. weekly_hours) and null values
+                # so strict GoalAvailability/GoalPreferences never reject a row
+                # that predates the current schema.
+                merged = sanitize_goal_nested_dict(
+                    merged,
+                    allowed_fields=(
+                        AVAILABILITY_FIELDS
+                        if nested_field == "availability"
+                        else PREFERENCES_FIELDS
+                    ),
+                )
+                values[nested_field] = merged
         for field, value in values.items():
             if field == "deadline_at":
                 value = self._store_deadline_as_utc(value)
@@ -800,10 +820,18 @@ class GoalService:
         for nested_field in ("availability", "preferences"):
             nested_patch = values.get(nested_field)
             if nested_patch is not None:
-                values[nested_field] = {
+                merged = {
                     **dict(getattr(goal, nested_field) or {}),
                     **nested_patch,
                 }
+                values[nested_field] = sanitize_goal_nested_dict(
+                    merged,
+                    allowed_fields=(
+                        AVAILABILITY_FIELDS
+                        if nested_field == "availability"
+                        else PREFERENCES_FIELDS
+                    ),
+                )
         for field, value in values.items():
             if field == "deadline_at":
                 value = self._store_deadline_as_utc(value)
@@ -961,6 +989,502 @@ class GoalService:
         )
         self.db.commit()
         self.db.refresh(graph)
+        return graph
+
+    # ------------------------------------------------------------------
+    # Streaming candidate generation (root preview first, then updates)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _node_snapshot(node: GraphNode) -> dict[str, Any]:
+        return {
+            "id": node.id,
+            "label": node.label,
+            "description": node.description,
+            "node_type": node.node_type,
+            "target_weight": node.target_weight,
+            "teaching_strategy": (node.teaching_strategy or "")[:400],
+        }
+
+    @staticmethod
+    def _edge_snapshot(edge: GraphEdge) -> dict[str, Any]:
+        return {
+            "id": edge.id,
+            "source_node_id": edge.source_node_id,
+            "target_node_id": edge.target_node_id,
+            "relation": edge.relation,
+        }
+
+    def _graph_full_snapshot(self, graph: Graph) -> dict[str, Any]:
+        nodes = list(
+            self.db.scalars(
+                self.nodes.query()
+                .where(GraphNode.graph_id == graph.id)
+                .order_by(GraphNode.created_at)
+            ).all()
+        )
+        edges = list(
+            self.db.scalars(
+                self.edges.query().where(GraphEdge.graph_id == graph.id)
+            ).all()
+        )
+        return {
+            "graph_id": graph.id,
+            "title": graph.title,
+            "revision": graph.revision,
+            "status": graph.status,
+            "nodes": [self._node_snapshot(node) for node in nodes],
+            "edges": [self._edge_snapshot(edge) for edge in edges],
+        }
+
+    def _goal_context_json(self, goal: Goal) -> str:
+        return json.dumps(
+            {
+                "title": goal.title,
+                "intent": goal.intent,
+                "time_limit": goal.time_limit,
+                "desired_outcome": goal.desired_outcome,
+                "constraints": {
+                    key: value
+                    for key, value in (goal.constraints or {}).items()
+                    if key not in {"file_ids", "graph_context_ids"}
+                },
+                "assumptions": goal.assumptions or [],
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
+    def _create_root_node(self, graph: Graph, spec: ModelGraphNode) -> GraphNode:
+        teaching_strategy = (spec.teaching_strategy or "").strip() or (
+            f"以百科词条方式讲解「{spec.label}」：先给出准确定义与边界，"
+            "再给出 1–2 个典型例子与常见误区，最后给出可自测的掌握标准。"
+        )
+        return self.nodes.add(
+            GraphNode(
+                workspace_id=self.workspace_id,
+                graph_id=graph.id,
+                label=spec.label[:200],
+                description=spec.description,
+                node_type="root",
+                target_weight=spec.target_weight,
+                teaching_strategy=teaching_strategy[:4_000],
+            )
+        )
+
+    @staticmethod
+    def _filter_chunk_keep(chunk: ModelGraphChunk, keep: set[int]) -> ModelGraphChunk:
+        """Keep only nodes whose original index is in ``keep``, remapping edges.
+
+        Label dedup drops model-repeated nodes; without index remapping the
+        remaining edges would point at the wrong (shifted) nodes or be dropped,
+        silently corrupting the generated structure.
+        """
+        old_to_new: dict[int, int] = {}
+        nodes: list[ModelGraphNode] = []
+        for old_index, node in enumerate(chunk.nodes):
+            if old_index in keep:
+                old_to_new[old_index] = len(nodes)
+                nodes.append(node)
+        edges: list[ModelGraphChunkEdge] = []
+        for edge in chunk.edges:
+            new_source = (
+                -1 if edge.source_index == -1 else old_to_new.get(edge.source_index)
+            )
+            new_target = (
+                -1 if edge.target_index == -1 else old_to_new.get(edge.target_index)
+            )
+            if new_source is None or new_target is None:
+                continue
+            edges.append(
+                edge.model_copy(
+                    update={"source_index": new_source, "target_index": new_target}
+                )
+            )
+        return chunk.model_copy(update={"nodes": nodes, "edges": edges})
+
+    def _append_parent_chunk(
+        self,
+        graph: Graph,
+        parent: GraphNode,
+        chunk: ModelGraphChunk,
+    ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        """Persist one chunk hung under ``parent`` (edge ``-1`` = this parent).
+
+        ``layer=1`` nodes are direct children of ``parent`` and get an automatic
+        ``contains`` edge; ``layer=2`` nodes are grandchildren attached to a
+        layer-1 node through the chunk's own edges, or auto-attached to the
+        first layer-1 node so nothing is ever persisted as an orphan. Any
+        model-issued ``contains`` edge from the parent is normalized away
+        (containment is derived from the layer field, not the model).
+        """
+        created: list[GraphNode] = []
+        layer_by_index: dict[int, int] = {}
+        for index, spec in enumerate(chunk.nodes):
+            node_type = spec.node_type
+            if node_type == "root":
+                node_type = "concept"
+            teaching_strategy = (spec.teaching_strategy or "").strip() or (
+                f"以百科词条方式讲解「{spec.label}」：先给出准确定义与边界，"
+                "再给出 1–2 个典型例子与常见误区，最后给出可自测的掌握标准。"
+            )
+            created.append(
+                self.nodes.add(
+                    GraphNode(
+                        workspace_id=self.workspace_id,
+                        graph_id=graph.id,
+                        label=spec.label[:200],
+                        description=spec.description,
+                        node_type=node_type,
+                        target_weight=spec.target_weight,
+                        teaching_strategy=teaching_strategy[:4_000],
+                    )
+                )
+            )
+            layer_by_index[index] = max(1, min(2, spec.layer))
+        node_by_index = {index: node for index, node in enumerate(created)}
+        layer1_ids = {
+            node.id for index, node in enumerate(created) if layer_by_index.get(index) == 1
+        }
+        first_layer1 = next(
+            (
+                node
+                for index, node in enumerate(created)
+                if layer_by_index.get(index) == 1
+            ),
+            created[0] if created else None,
+        )
+        added_edges: list[GraphEdge] = []
+        for edge_spec in chunk.edges:
+            source = (
+                parent
+                if edge_spec.source_index == -1
+                else node_by_index.get(edge_spec.source_index)
+            )
+            target = (
+                parent
+                if edge_spec.target_index == -1
+                else node_by_index.get(edge_spec.target_index)
+            )
+            if source is None or target is None or source.id == target.id:
+                continue
+            # Containment is derived from the layer field: skip any contains
+            # edge issued from the parent (the guaranteed edges below win).
+            if source.id == parent.id and edge_spec.relation == "contains":
+                continue
+            added_edges.append(
+                self.edges.add(
+                    GraphEdge(
+                        workspace_id=self.workspace_id,
+                        graph_id=graph.id,
+                        source_node_id=source.id,
+                        target_node_id=target.id,
+                        relation=edge_spec.relation,
+                    )
+                )
+            )
+        for index, node in enumerate(created):
+            if layer_by_index.get(index) == 1:
+                added_edges.append(
+                    self.edges.add(
+                        GraphEdge(
+                            workspace_id=self.workspace_id,
+                            graph_id=graph.id,
+                            source_node_id=parent.id,
+                            target_node_id=node.id,
+                            relation="contains",
+                        )
+                    )
+                )
+        # Layer-2 nodes with no chunk edge from a layer-1 node hang under the
+        # first layer-1 node so no grandchild is persisted as an orphan.
+        incoming_layer1 = {
+            edge_spec.target_index
+            for edge_spec in chunk.edges
+            if layer_by_index.get(edge_spec.target_index) == 2
+            and layer_by_index.get(edge_spec.source_index) == 1
+        }
+        if first_layer1 is not None:
+            for index, node in enumerate(created):
+                if layer_by_index.get(index) == 2 and index not in incoming_layer1:
+                    added_edges.append(
+                        self.edges.add(
+                            GraphEdge(
+                                workspace_id=self.workspace_id,
+                                graph_id=graph.id,
+                                source_node_id=first_layer1.id,
+                                target_node_id=node.id,
+                                relation="contains",
+                            )
+                        )
+                    )
+        return created, added_edges
+
+    def stream_candidate_graph(
+        self,
+        goal_id: str,
+        payload: CandidateGraphStreamRequest,
+        emit: Any,
+    ) -> Graph:
+        """Generate a candidate graph trunk-first, emitting SSE events per stage.
+
+        Stage ``root`` persists and emits the single root node immediately so
+        the UI can render the root preview while the rest still generates.
+        Stage ``nodes_added`` first carries the trunk (level-1 backbone under
+        the root), then per trunk node two incremental batches: its layer-1
+        children and its layer-2 grandchildren (two-layer expansion). Stage
+        ``complete`` carries the final full snapshot. ``mode`` selects the
+        budget: ``fast`` keeps thinking off with a compact trunk and narrow
+        branches; ``thinking`` allows a fuller trunk and wider branches.
+        """
+        from typing import Callable
+
+        _emit: Callable[[str, dict[str, Any]], None] = (
+            emit if isinstance(emit, Callable) else (lambda _event, _data: None)
+        )
+        self._ensure_model_provider_available()
+        goal = self.goals.require(goal_id, "goal")
+        if goal.status not in {"confirmed", "candidate_ready"}:
+            raise AppError(409, "goal_not_confirmed", "Confirm the GoalDraft before graph generation")
+        existing = self.db.scalar(
+            self.graphs.query().where(Graph.goal_id == goal.id, Graph.status == "candidate")
+        )
+        if existing is not None:
+            # A previous (possibly streaming) run already created a candidate:
+            # normalize and re-emit its full snapshot so the client converges.
+            self._normalize_candidate_roots(existing)
+            snapshot = self._graph_full_snapshot(existing)
+            _emit("graph.root", {"graph_id": existing.id, "title": existing.title, "root": snapshot["nodes"][0] if snapshot["nodes"] else None})
+            _emit("graph.nodes_added", {"nodes": snapshot["nodes"][1:], "edges": snapshot["edges"]})
+            _emit("graph.complete", snapshot)
+            return existing
+
+        concepts = [item.strip() for item in payload.seed_concepts if item.strip()]
+        remote = self.model_provider.remote_capability
+        goal_context = self._goal_context_json(goal)
+        mode = payload.mode or "thinking"
+
+        # Stage 1 — root preview.
+        root_spec: ModelGraphNode | None = None
+        model_title: str | None = None
+        if remote:
+            try:
+                root_draft = self._structured(
+                    "为已确认的学习目标生成图谱根节点（root）。"
+                    "title 必须是干净的学科/主题短语（如「数据库原理与应用」「离散数学」），"
+                    "不得包含天数、速通、计划、路径规划等过程修饰。"
+                    "root 是该学科的唯一顶层主题节点：label 简洁聚焦知识本体，"
+                    "description 概括学科边界与学习范围，node_type 必须为 root，"
+                    "并给出针对该学科的 teaching_strategy。\n"
+                    "已确认 Goal：" + goal_context[:12_000]
+                    + "\n种子概念：" + ", ".join(concepts),
+                    "learngraph_graph_root",
+                    ModelGraphRoot,
+                )
+                root_spec = root_draft.root
+                model_title = root_draft.title
+            except Exception:
+                root_spec = None
+                model_title = None
+        if root_spec is None:
+            root_label = " ".join((goal.title or "").split()) or "未命名主题"
+            root_spec = ModelGraphNode(
+                label=root_label[:200],
+                description=f"「{root_label}」的完整学习目标：涵盖基础概念、核心机制、实践练习与综合验收。",
+                node_type="root",
+                target_weight=50,
+                teaching_strategy="",
+            )
+        graph_title = self._graph_title_from_goal(goal.title, model_title)
+        graph = self.graphs.add(
+            Graph(workspace_id=self.workspace_id, goal_id=goal.id, title=graph_title, status="candidate")
+        )
+        root = self._create_root_node(graph, root_spec)
+        self.db.commit()
+        self.db.refresh(graph)
+        _emit(
+            "graph.root",
+            {
+                "graph_id": graph.id,
+                "title": graph.title,
+                "root": self._node_snapshot(root),
+            },
+        )
+
+        # Stage 2 — 主干（trunk）：根节点下第一层主干模块，先整体成形再逐分支展开。
+        # 每个批次边索引 -1 指向本批次的挂载父节点：主干批次挂 root，分支批次挂主干节点。
+        fallback_children = ["基础概念", "核心机制", "实践练习", "综合验收"]
+        trunk_min, trunk_max = (3, 4) if mode == "fast" else (5, 6)
+        seen_labels: set[str] = set()
+        trunk_chunk: ModelGraphChunk | None = None
+        if remote:
+            try:
+                trunk_chunk = self._structured(
+                    "为图谱生成「主干」（trunk）：根节点之下的第一层主干模块，"
+                    "构成整张图谱的主干骨架，覆盖该学科的主要模块并按学习顺序排列。"
+                    "node_type 使用 concept（知识点）、practice（练习）或 assessment（验收），layer 全部填 1。"
+                    "edges 里 source_index=-1 表示根节点；主干模块之间的先后关系用 prerequisite。"
+                    "本批次生成 "
+                    + f"{trunk_min}-{trunk_max} 个"
+                    + "左右主干节点，不要生成与根节点同名的节点。"
+                    + "每个节点必须并发生成 teaching_strategy（百科式定义切入、关键例子、常见误区、可验证掌握标准）。"
+                    + "\n图谱标题：" + graph_title
+                    + "\n根节点：" + root.label + " — " + (root.description or "")[:300]
+                    + "\n已确认 Goal：" + goal_context[:12_000]
+                    + "\n种子概念：" + ", ".join(concepts),
+                    "learngraph_graph_chunk",
+                    ModelGraphChunk,
+                )
+            except Exception:
+                trunk_chunk = None
+        if trunk_chunk is None or not trunk_chunk.nodes:
+            # 模型不可用或主干生成失败：退化为本地规则主干，保证图谱可审核。
+            remaining = [label for label in fallback_children if label not in seen_labels]
+            trunk_chunk = ModelGraphChunk(
+                nodes=[
+                    ModelGraphNode(
+                        label=label,
+                        description=f"「{label}」：围绕根节点组织的学习模块，发布前需审核。",
+                        node_type="concept",
+                        target_weight=50,
+                        teaching_strategy="",
+                    )
+                    for label in remaining[:4]
+                ],
+                edges=[],
+            )
+        fresh_indexes = {
+            index
+            for index, node in enumerate(trunk_chunk.nodes)
+            if node.label not in seen_labels and node.label != root.label
+        }
+        if not fresh_indexes:
+            fresh_indexes = {0}
+        for node in trunk_chunk.nodes:
+            if node.label not in seen_labels and node.label != root.label:
+                seen_labels.add(node.label)
+        trunk_chunk = self._filter_chunk_keep(trunk_chunk, fresh_indexes)
+        trunk_nodes, trunk_edges = self._append_parent_chunk(graph, root, trunk_chunk)
+        self.db.commit()
+        _emit(
+            "graph.nodes_added",
+            {
+                "nodes": [self._node_snapshot(node) for node in trunk_nodes],
+                "edges": [self._edge_snapshot(edge) for edge in trunk_edges],
+            },
+        )
+
+        # Stage 3 — 逐主干节点两层分层展开：每个主干节点生成 layer=1 直接子节点
+        # 与 layer=2 孙节点，按层分两个 nodes_added 事件流式发出。
+        expanded_branches = 0
+        for trunk_node in trunk_nodes:
+            if not remote:
+                break  # 无远程模型时仅保留主干，不做更深展开
+            layer1_count, layer2_count = (
+                (2, 1) if mode == "fast" else (3, 2)
+            )
+            branch_chunk: ModelGraphChunk | None = None
+            try:
+                branch_chunk = self._structured(
+                    "为图谱主干节点生成「两层分层展开」（layer=1 + layer=2）。"
+                    "layer=1：该主干节点下的直接子节点，"
+                    + f"生成 {layer1_count}-{layer1_count + 1} 个；"
+                    + "layer=2：挂在 layer=1 节点之下的孙节点，每个 layer=1 节点下"
+                    + f" {layer2_count}-{layer2_count + 1} 个。"
+                    + "每个节点的 layer 字段必须填写：直接子节点填 1，孙节点填 2。"
+                    + "node_type 使用 concept（知识点）、practice（练习）或 assessment（验收）。"
+                    + "edges：source_index=-1 表示挂载父节点（本主干节点）；"
+                    + "layer=1→layer=2 用本批 nodes 索引（先列 layer=1 节点，再列 layer=2 节点）；"
+                    + "本批次只属于这一个主干分支，不要重复已生成的标签；已生成的节点标签："
+                    + ("、".join(sorted(seen_labels)) or "无")
+                    + "\n主干节点：" + trunk_node.label + " — " + (trunk_node.description or "")[:300]
+                    + "\n图谱标题：" + graph_title
+                    + "\n根节点：" + root.label
+                    + "\n已确认 Goal：" + goal_context[:12_000]
+                    + "\n种子概念：" + ", ".join(concepts),
+                    "learngraph_graph_chunk",
+                    ModelGraphChunk,
+                )
+            except Exception:
+                branch_chunk = None
+            if branch_chunk is None or not branch_chunk.nodes:
+                continue
+            fresh_indexes = {
+                index
+                for index, node in enumerate(branch_chunk.nodes)
+                if node.label not in seen_labels and node.label != root.label
+            }
+            if not fresh_indexes:
+                continue
+            for node in branch_chunk.nodes:
+                if node.label not in seen_labels and node.label != root.label:
+                    seen_labels.add(node.label)
+            branch_chunk = self._filter_chunk_keep(branch_chunk, fresh_indexes)
+            branch_nodes, branch_edges = self._append_parent_chunk(graph, trunk_node, branch_chunk)
+            self.db.commit()
+            # 分层发出：先 layer=1 直接子节点批次，再 layer=2 孙节点批次。
+            # branch_nodes 与 branch_chunk.nodes 按同一顺序一一对应。
+            layer1_ids = {
+                branch_nodes[i].id
+                for i, spec in enumerate(branch_chunk.nodes)
+                if spec.layer == 1
+            }
+            if not layer1_ids:
+                layer1_ids = {branch_nodes[0].id} if branch_nodes else set()
+            layer2_ids = {node.id for node in branch_nodes if node.id not in layer1_ids}
+            layer1_edges = [
+                edge
+                for edge in branch_edges
+                if (
+                    edge.source_node_id in layer1_ids
+                    and edge.target_node_id in layer1_ids
+                )
+                or (
+                    edge.source_node_id == trunk_node.id
+                    and edge.target_node_id in layer1_ids
+                )
+            ]
+            layer1_edge_ids = {edge.id for edge in layer1_edges}
+            layer2_edges = [
+                edge for edge in branch_edges if edge.id not in layer1_edge_ids
+            ]
+            layer1_nodes = [node for node in branch_nodes if node.id in layer1_ids]
+            layer2_nodes = [node for node in branch_nodes if node.id in layer2_ids]
+            _emit(
+                "graph.nodes_added",
+                {
+                    "nodes": [self._node_snapshot(node) for node in layer1_nodes],
+                    "edges": [self._edge_snapshot(edge) for edge in layer1_edges],
+                },
+            )
+            if layer2_nodes or layer2_edges:
+                _emit(
+                    "graph.nodes_added",
+                    {
+                        "nodes": [self._node_snapshot(node) for node in layer2_nodes],
+                        "edges": [self._edge_snapshot(edge) for edge in layer2_edges],
+                    },
+                )
+            expanded_branches += 1
+
+        self._normalize_candidate_roots(graph)
+        goal.status = "candidate_ready"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="graph.generate_candidate_stream",
+            resource_type="graph",
+            resource_id=graph.id,
+            details={
+                "provider": self.model_provider.provider_id,
+                "remote_model_used": remote,
+                "mode": mode,
+                "trunk_nodes": len(trunk_nodes),
+                "branches_expanded": expanded_branches,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(graph)
+        _emit("graph.complete", self._graph_full_snapshot(graph))
         return graph
 
     def _normalize_candidate_roots(self, graph: Graph) -> bool:

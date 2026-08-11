@@ -1042,6 +1042,8 @@ class AgentToolRuntime:
                                     "fill_blank",
                                     "short_answer_table",
                                     "image_frame",
+                                    "goal_draft_editor",
+                                    "question_batch",
                                 ],
                             },
                             "props": {
@@ -2249,7 +2251,7 @@ class AgentToolRuntime:
         return [
             self._function_definition(
                 "create_chart",
-                "Create a readable, durable pie, line, or bar chart with per-series colors and structured source data.",
+                "Create a readable, durable pie, line, or bar chart with per-series colors and structured source data. Charts with real-world data MUST pass authoritative sources (title + URL from search_web/fetch_web_page results); never invent numbers.",
                 {
                     "type": {"type": "string", "enum": ["pie", "line", "bar"]},
                     "title": {"type": "string", "minLength": 1, "maxLength": 240},
@@ -2288,6 +2290,27 @@ class AgentToolRuntime:
                     },
                     "show_legend": {"type": "boolean"},
                     "show_values": {"type": "boolean"},
+                    "sources": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["title", "url"],
+                            "properties": {
+                                "title": {"type": "string", "minLength": 1, "maxLength": 240},
+                                "url": {"type": "string", "format": "uri", "minLength": 1, "maxLength": 1000},
+                                "note": {"type": "string", "maxLength": 500},
+                            },
+                        },
+                        "description": (
+                            "REQUIRED for any chart with real-world data: the "
+                            "authoritative sources (title + URL) behind the "
+                            "numbers, obtained from search_web / fetch_web_page. "
+                            "Never fabricate figures, ratios, or trends; without "
+                            "a citable source, do not draw a data chart."
+                        ),
+                    },
                 },
                 required=["type", "title", "labels", "series"],
             ),
@@ -3259,6 +3282,21 @@ class AgentToolRuntime:
                 arguments,
                 chat_session_id=chat_session_id,
             )
+        if name == "lg_goal_ask":
+            return self._execute_goal_ask(
+                arguments,
+                chat_session_id=chat_session_id,
+            )
+        if name == "lg_goal_ask_batch":
+            return self._execute_goal_ask_batch(
+                arguments,
+                chat_session_id=chat_session_id,
+            )
+        if name == "lg_goal_edit_draft":
+            return self._execute_goal_edit_draft(
+                arguments,
+                chat_session_id=chat_session_id,
+            )
         raise AppError(400, "unknown_goal_tool", f"Unknown goal tool: {name}")
 
     def _load_session_goal(
@@ -3484,6 +3522,21 @@ class AgentToolRuntime:
         for nested_field in ("availability", "preferences", "constraints"):
             value = arguments.get(nested_field)
             if isinstance(value, dict):
+                if nested_field in ("availability", "preferences"):
+                    from app.domain.schemas.goals import (
+                        AVAILABILITY_FIELDS,
+                        PREFERENCES_FIELDS,
+                        sanitize_goal_nested_dict,
+                    )
+
+                    value = sanitize_goal_nested_dict(
+                        value,
+                        allowed_fields=(
+                            AVAILABILITY_FIELDS
+                            if nested_field == "availability"
+                            else PREFERENCES_FIELDS
+                        ),
+                    )
                 setattr(goal, nested_field, value)
                 changed = True
         if isinstance(arguments.get("assumptions"), list):
@@ -3516,6 +3569,399 @@ class AgentToolRuntime:
                 "goal_id": goal.id,
                 "goal_status": goal.status,
                 "graph_propose_available": True,
+            },
+            [],
+        )
+
+    def _execute_goal_ask(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Ask the user with an interactive card (never plain text).
+
+        Emits a channel-A trusted component question card (single_choice /
+        multiple_choice / fill_blank / short_answer_table). The user's answer
+        arrives as the next user message and the Agent continues from it — the
+        answer is never fabricated here. The card is delivered through the same
+        artifact pipeline as canvas_emit_trusted_component so the UI renders it
+        inline and two-way interaction stays within the conversation.
+        """
+        from app.services.canvas_cards import build_trusted_component_part
+
+        db = self.extensions.db
+        question = str(arguments.get("question") or "").strip()
+        if not question:
+            raise AppError(422, "invalid_tool_arguments", "question is required")
+        if len(question) > 500:
+            raise AppError(422, "invalid_tool_arguments", "question is too long")
+        input_type = str(arguments.get("input_type") or "single_choice").strip()
+        if input_type not in {
+            "single_choice",
+            "multiple_choice",
+            "fill_blank",
+            "short_answer_table",
+            "date",
+        }:
+            raise AppError(422, "invalid_tool_arguments", "input_type is not supported")
+        options_raw = arguments.get("options")
+        options: list[dict[str, Any]] = []
+        if options_raw is not None:
+            if not isinstance(options_raw, list) or len(options_raw) > 8:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    "options must be an array of at most 8 items",
+                )
+            for item in options_raw:
+                if not isinstance(item, dict):
+                    raise AppError(
+                        422, "invalid_tool_arguments", "options items must be objects"
+                    )
+                option_id = str(item.get("id") or "").strip()
+                label = str(item.get("label") or "").strip()
+                if not option_id or not label:
+                    raise AppError(
+                        422, "invalid_tool_arguments", "options items need id and label"
+                    )
+                entry: dict[str, Any] = {"id": option_id[:80], "label": label[:500]}
+                description = item.get("description")
+                if isinstance(description, str) and description.strip():
+                    entry["description"] = description.strip()[:2_000]
+                options.append(entry)
+        if input_type in {"single_choice", "multiple_choice"} and not options:
+            raise AppError(
+                422, "invalid_tool_arguments", "choice questions need options"
+            )
+        allow_custom = arguments.get("allow_custom", True)
+        allow_skip = arguments.get("allow_skip", True)
+        component_id = (
+            str(arguments["component_id"]).strip()[:160]
+            if isinstance(arguments.get("component_id"), str)
+            and arguments["component_id"].strip()
+            else None
+        )
+        if input_type in {"single_choice", "multiple_choice"}:
+            props: dict[str, Any] = {
+                "title": question,
+                "options": options,
+                "allow_custom": bool(allow_custom),
+                "allow_skip": bool(allow_skip),
+            }
+        else:
+            props = {
+                "title": question,
+                "description": "直接在下方填写，回答会用于确认目标与图谱边界。",
+                "multiline": input_type == "short_answer_table",
+                "placeholder": "请输入你的回答…",
+            }
+        if input_type == "date":
+            # Date questions render a calendar card that also shows the user's
+            # learning schedule, so the chosen slot fits their plan.
+            part = build_trusted_component_part(
+                component_type="question_batch",
+                props={
+                    "title": question,
+                    "description": (
+                        "从日历中选择日期（日历中已标注你的学习日程），"
+                        "或直接在下方手动输入。"
+                    ),
+                    "questions": [
+                        {
+                            "key": "date",
+                            "prompt": question,
+                            "input_type": "date",
+                            "allow_custom": True,
+                            "allow_skip": bool(allow_skip),
+                            "required": False,
+                        }
+                    ],
+                    "submit_label": "确认日期",
+                },
+                component_id=component_id or f"question_batch_{uuid4().hex[:10]}",
+                allowed_events=["submit"],
+                schema_version="1.0",
+            )
+        else:
+            part = build_trusted_component_part(
+                component_type=input_type,
+                props=props,
+                component_id=component_id,
+                allowed_events=["submit"],
+                schema_version="1.0",
+            )
+        component_data = part.get("data") or {}
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="goal.ask_card",
+            resource_type="chat_session",
+            resource_id=chat_session_id,
+            details={
+                "component_id": component_data.get("component_id"),
+                "input_type": input_type,
+                "question": question[:200],
+            },
+        )
+        db.commit()
+        return self._success(
+            {
+                "asked": True,
+                "component_id": component_data.get("component_id"),
+                "component_type": input_type,
+                "question": question,
+                "waiting_for_answer": True,
+                "note": (
+                    "问题卡片已发出。等待用户回答后继续：下一轮用户消息就是答案，"
+                    "据此创建/确认 Goal 或生成图谱。不要编造用户答案。"
+                ),
+            },
+            {
+                "tool": "lg_goal_ask",
+                "component_id": component_data.get("component_id"),
+                "artifact": part,
+            },
+            [],
+        )
+
+    def _execute_goal_ask_batch(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Ask 2-8 related Goal questions in one aggregated card.
+
+        The card renders each sub-question as its own control and submits all
+        answers together; the answers arrive as the next user message. This is
+        the preferred way to batch clarification and cuts round trips.
+        """
+        from app.services.canvas_cards import build_trusted_component_part
+
+        db = self.extensions.db
+        title = str(arguments.get("title") or "").strip() or "目标澄清（聚合问答）"
+        if len(title) > 500:
+            raise AppError(422, "invalid_tool_arguments", "title is too long")
+        raw_questions = arguments.get("questions")
+        if not isinstance(raw_questions, list) or not 2 <= len(raw_questions) <= 8:
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "questions must be an array of 2 to 8 items",
+            )
+        questions: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for item in raw_questions:
+            if not isinstance(item, dict):
+                raise AppError(422, "invalid_tool_arguments", "questions items must be objects")
+            key = str(item.get("key") or "").strip()
+            prompt = str(item.get("prompt") or "").strip()
+            if not key or not prompt:
+                raise AppError(
+                    422, "invalid_tool_arguments", "every question needs key and prompt"
+                )
+            if key in seen_keys:
+                raise AppError(422, "invalid_tool_arguments", "question keys must be unique")
+            seen_keys.add(key)
+            input_type = str(item.get("input_type") or "single_choice").strip()
+            if input_type not in {
+                "single_choice",
+                "multiple_choice",
+                "fill_blank",
+                "short_answer_table",
+                "date",
+            }:
+                raise AppError(422, "invalid_tool_arguments", "input_type is not supported")
+            options: list[dict[str, Any]] = []
+            options_raw = item.get("options")
+            if options_raw is not None:
+                if not isinstance(options_raw, list) or len(options_raw) > 8:
+                    raise AppError(
+                        422,
+                        "invalid_tool_arguments",
+                        "options must be an array of at most 8 items",
+                    )
+                for option in options_raw:
+                    if not isinstance(option, dict):
+                        raise AppError(
+                            422,
+                            "invalid_tool_arguments",
+                            "options items must be objects",
+                        )
+                    option_id = str(option.get("id") or "").strip()
+                    label = str(option.get("label") or "").strip()
+                    if not option_id or not label:
+                        raise AppError(
+                            422,
+                            "invalid_tool_arguments",
+                            "options items need id and label",
+                        )
+                    entry: dict[str, Any] = {
+                        "id": option_id[:80],
+                        "label": label[:500],
+                    }
+                    description = option.get("description")
+                    if isinstance(description, str) and description.strip():
+                        entry["description"] = description.strip()[:2_000]
+                    options.append(entry)
+            if input_type in {"single_choice", "multiple_choice"} and not options:
+                raise AppError(
+                    422,
+                    "invalid_tool_arguments",
+                    f"question {key}: choice questions need options",
+                )
+            questions.append(
+                {
+                    "key": key[:80],
+                    "prompt": prompt[:500],
+                    "input_type": input_type,
+                    "options": options,
+                    "allow_custom": bool(item.get("allow_custom", True)),
+                    "allow_skip": bool(item.get("allow_skip", True)),
+                    "required": bool(item.get("required", False)),
+                }
+            )
+        component_id = (
+            str(arguments["component_id"]).strip()[:160]
+            if isinstance(arguments.get("component_id"), str)
+            and arguments["component_id"].strip()
+            else None
+        )
+        part = build_trusted_component_part(
+            component_type="question_batch",
+            props={
+                "title": title,
+                "description": (
+                    "一张卡片内包含多个问题，全部作答后一次提交；"
+                    "可跳过的问题会记下透明假设。"
+                ),
+                "questions": questions,
+                "submit_label": "一次提交全部答案",
+            },
+            component_id=component_id or f"question_batch_{uuid4().hex[:10]}",
+            allowed_events=["submit"],
+            schema_version="1.0",
+        )
+        component_data = part.get("data") or {}
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="goal.ask_batch_card",
+            resource_type="chat_session",
+            resource_id=chat_session_id,
+            details={
+                "component_id": component_data.get("component_id"),
+                "question_count": len(questions),
+                "keys": [q["key"] for q in questions],
+            },
+        )
+        db.commit()
+        return self._success(
+            {
+                "asked": True,
+                "component_id": component_data.get("component_id"),
+                "component_type": "question_batch",
+                "question_count": len(questions),
+                "questions": [
+                    {"key": q["key"], "prompt": q["prompt"], "input_type": q["input_type"]}
+                    for q in questions
+                ],
+                "waiting_for_answer": True,
+                "note": (
+                    "聚合问答卡片已发出。用户一次提交全部答案后，下一条用户消息就是答案，"
+                    "据此继续创建/确认 Goal 或生成图谱。不要编造用户答案。"
+                ),
+            },
+            {
+                "tool": "lg_goal_ask_batch",
+                "component_id": component_data.get("component_id"),
+                "artifact": part,
+            },
+            [],
+        )
+
+    def _execute_goal_edit_draft(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Open a two-way editable Goal-draft card (sub-page style).
+
+        The card is pre-filled with the current Goal fields; the user edits and
+        submits, and the edited values arrive as the next user message. The
+        Agent then applies them through lg_goal_confirm. Requires a session-
+        bound Goal (created with lg_goal_create).
+        """
+        from app.services.canvas_cards import build_trusted_component_part
+
+        db = self.extensions.db
+        goal_id = (
+            str(arguments["goal_id"]).strip()
+            if isinstance(arguments.get("goal_id"), str)
+            and arguments["goal_id"].strip()
+            else None
+        )
+        session, goal, graph = self._load_session_goal(
+            chat_session_id, goal_id=goal_id
+        )
+        if goal is None:
+            raise AppError(
+                409,
+                "goal_not_found",
+                "This session has no Goal bound yet; use lg_goal_create first",
+            )
+        focus = str(arguments.get("focus") or "all").strip()
+        if focus not in {"title", "time", "outcome", "all"}:
+            focus = "all"
+        props = {
+            "title": "编辑目标草稿（双向同步）",
+            "description": "修改后点击提交，智能体会按你改动的字段继续确认目标。",
+            "goal_id": goal.id,
+            "goal_status": goal.status,
+            "focus": focus,
+            "draft": {
+                "title": goal.title,
+                "intent": goal.intent or "",
+                "time_limit": goal.time_limit or "",
+                "desired_outcome": goal.desired_outcome or "",
+            },
+            "submit_label": "提交草稿修改",
+        }
+        part = build_trusted_component_part(
+            component_type="goal_draft_editor",
+            props=props,
+            component_id=f"goal_draft_editor_{goal.id[:8]}",
+            allowed_events=["submit"],
+            schema_version="1.0",
+        )
+        component_data = part.get("data") or {}
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="goal.edit_draft_card",
+            resource_type="goal",
+            resource_id=goal.id,
+            details={
+                "component_id": component_data.get("component_id"),
+                "focus": focus,
+                "chat_session_id": chat_session_id,
+            },
+        )
+        db.commit()
+        return self._success(
+            {
+                "opened": True,
+                "goal_id": goal.id,
+                "goal_status": goal.status,
+                "component_id": component_data.get("component_id"),
+                "note": (
+                    "目标草稿编辑卡片已发出。用户提交后，"
+                    "用 lg_goal_confirm 按提交的字段确认目标。"
+                ),
+            },
+            {
+                "tool": "lg_goal_edit_draft",
+                "goal_id": goal.id,
+                "artifact": part,
             },
             [],
         )
@@ -5574,6 +6020,31 @@ class AgentToolRuntime:
             f"{title}: {len(clean_labels)} categories, {len(clean_series)} series; "
             f"minimum {min(extrema):g}, maximum {max(extrema):g}."
         )
+        sources: list[dict[str, str]] = []
+        raw_sources = arguments.get("sources")
+        if raw_sources is not None:
+            if not isinstance(raw_sources, list) or len(raw_sources) > 8:
+                raise AppError(
+                    422,
+                    "invalid_chart_sources",
+                    "sources must be an array of at most 8 items",
+                )
+            for item in raw_sources:
+                if not isinstance(item, dict):
+                    raise AppError(422, "invalid_chart_sources", "sources items must be objects")
+                source_title = str(item.get("title") or "").strip()
+                source_url = str(item.get("url") or "").strip()
+                if not source_title or not source_url:
+                    raise AppError(
+                        422,
+                        "invalid_chart_sources",
+                        "every source needs title and url",
+                    )
+                entry: dict[str, str] = {"title": source_title[:240], "url": source_url[:1000]}
+                note = item.get("note")
+                if isinstance(note, str) and note.strip():
+                    entry["note"] = note.strip()[:500]
+                sources.append(entry)
         data = {
             "chart_id": str(uuid4()),
             "chart_type": chart_type,
@@ -5584,6 +6055,8 @@ class AgentToolRuntime:
             "show_values": bool(arguments.get("show_values", False)),
             "summary": summary,
             "source": "agent_structured_data",
+            "sources": sources,
+            "data_verified": bool(sources),
         }
         self.audit.record(
             actor_id=self.actor_id,

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from fastapi import APIRouter, status
+from fastapi.responses import StreamingResponse
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.core.errors import AppError
@@ -8,6 +12,7 @@ from app.domain.schemas.common import ActionResponse
 from app.providers.factory import model_provider_for_workspace
 from app.domain.schemas.goals import (
     CandidateGraphRequest,
+    CandidateGraphStreamRequest,
     GoalClarifyRequest,
     GoalClarifyResponse,
     GoalConfirmRequest,
@@ -184,6 +189,94 @@ def candidate_graph(
             model_id=payload.model_id,
             thinking_mode=payload.thinking_mode,
         ).generate_candidate_graph(goal_id, payload)
+    )
+
+
+def _sse_encode(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/{goal_id}/candidate-graph/stream")
+def candidate_graph_stream(
+    goal_id: str,
+    payload: CandidateGraphStreamRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> StreamingResponse:
+    """Stream a candidate graph trunk-first: root preview, then trunk, then
+    per-trunk two-layer expansion.
+
+    Event order: ``graph.root`` (single root), ``graph.nodes_added`` (trunk),
+    then per trunk node two ``graph.nodes_added`` events (layer-1 children,
+    layer-2 grandchildren), then ``graph.complete`` (full snapshot). Every
+    stage is persisted before it is emitted, so the review flow can start from
+    the already-visible root. ``mode=fast`` keeps thinking off with a compact
+    trunk and narrow branches; ``mode=thinking`` keeps the provider thinking
+    budget with a fuller trunk and wider branches.
+    """
+    require_goal_access(goal_id, "write", db, context)
+    thinking_mode = payload.thinking_mode
+    if thinking_mode is None and payload.mode == "fast":
+        thinking_mode = "off"
+
+    def generate() -> Any:
+        from queue import Empty, Queue
+        from threading import Thread
+
+        events: Queue[str | None] = Queue(maxsize=64)
+
+        def emit(event: str, data: dict[str, Any]) -> None:
+            events.put(_sse_encode(event, data))
+
+        def produce() -> None:
+            try:
+                svc = service_with_model(
+                    db,
+                    context,
+                    settings,
+                    provider_id=payload.provider_id,
+                    model_id=payload.model_id,
+                    thinking_mode=thinking_mode,
+                )
+                svc.stream_candidate_graph(goal_id, payload, emit)
+            except AppError as exc:
+                events.put(
+                    _sse_encode(
+                        "graph.error",
+                        {"code": exc.code, "message": str(exc.message)},
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 -- stream must terminate
+                events.put(
+                    _sse_encode(
+                        "graph.error",
+                        {"code": "graph_stream_failed", "message": str(exc)[:500]},
+                    )
+                )
+            finally:
+                events.put(None)
+
+        Thread(
+            target=produce,
+            name=f"learngraph-candidate-graph-{goal_id[:8]}",
+            daemon=True,
+        ).start()
+        yield ": graph-stream-ready\n\n"
+        while True:
+            item = events.get()
+            if item is None:
+                break
+            yield item
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 

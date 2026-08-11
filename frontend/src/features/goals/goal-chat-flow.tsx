@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRight,
@@ -13,14 +13,16 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import "./goal-chat-flow.css";
+
 import {
   clarifyGoal,
   confirmGoal,
   deleteGraphNode,
-  generateCandidateGraph,
   getGraph,
   publishGoal,
   retryGraphNode,
+  streamCandidateGraph,
   updateGraphNode,
 } from "@/api";
 import { ApiError } from "@/api/client";
@@ -41,6 +43,8 @@ import type {
   Goal,
   GoalClarifyResponse,
   GoalConfirmRequest,
+  GraphStreamEdge,
+  GraphStreamNode,
 } from "@/types/goals";
 
 /* oxlint-disable react/only-export-components -- this module exports the flow hook and its renderer as one contract. */
@@ -68,6 +72,13 @@ type GoalSetupOptions = {
   providerId?: string | null;
   modelId?: string | null;
   thinkingMode?: "off" | "low" | "medium" | "high" | "xhigh" | null;
+  /**
+   * Graph generation budget. `fast` keeps thinking off and streams the root
+   * preview first, then one batch of children; `thinking` allows the provider
+   * thinking mode and may split children into more batches. Both modes stream
+   * root-first so the user sees the root preview immediately.
+   */
+  graphMode?: "fast" | "thinking";
 };
 
 function initialGoalDraft(goal: Goal): GoalConfirmRequest {
@@ -145,6 +156,7 @@ export function useGoalSetupFlow({
   providerId,
   modelId,
   thinkingMode,
+  graphMode = "thinking",
 }: GoalSetupOptions) {
   const queryClient = useQueryClient();
   const wasEnabled = useRef(enabled);
@@ -160,6 +172,13 @@ export function useGoalSetupFlow({
   const [acceptedNodeIds, setAcceptedNodeIds] = useState<Set<string>>(
     () => new Set(),
   );
+  /** Root-first streaming preview while the candidate graph is being built. */
+  const [streamPreview, setStreamPreview] = useState<{
+    title: string;
+    nodes: GraphStreamNode[];
+    edges: GraphStreamEdge[];
+  }>({ title: "", nodes: [], edges: [] });
+  const graphStreamAbortRef = useRef<AbortController | null>(null);
 
   const clarify = useMutation({
     mutationFn: ({
@@ -205,18 +224,72 @@ export function useGoalSetupFlow({
     mutationFn: async () => {
       if (!result || !draft) throw new Error("Goal 草稿尚未准备完成。");
       const savedGoal = await confirmGoal(result.goal.id, draft);
-      const graphSummary = await generateCandidateGraph(result.goal.id, {
-        provider_id: providerId ?? undefined,
-        model_id: modelId ?? undefined,
-        thinking_mode: thinkingMode ?? undefined,
-      });
-      return { graphSummary, savedGoal };
+      // Root-first streaming generation: the root preview event arrives before
+      // level-1 children, so the UI can render it while the rest still streams.
+      setStreamPreview({ title: "", nodes: [], edges: [] });
+      const controller = new AbortController();
+      graphStreamAbortRef.current = controller;
+      try {
+        let streamedGraphId = "";
+        for await (const sse of streamCandidateGraph(
+          result.goal.id,
+          {
+            mode: graphMode,
+            provider_id: providerId ?? undefined,
+            model_id: modelId ?? undefined,
+            thinking_mode:
+              graphMode === "fast" ? "off" : (thinkingMode ?? undefined),
+          },
+          { signal: controller.signal },
+        )) {
+          const payload = sse.data as Record<string, unknown>;
+          if (sse.event === "graph.root") {
+            streamedGraphId = String(payload.graph_id ?? "");
+            setGraphId(streamedGraphId);
+            setStreamPreview({
+              title: String(payload.title ?? ""),
+              nodes: payload.root ? [payload.root as GraphStreamNode] : [],
+              edges: [],
+            });
+          } else if (sse.event === "graph.nodes_added") {
+            setStreamPreview((current) => ({
+              ...current,
+              title: current.title || streamedGraphId,
+              nodes: [
+                ...current.nodes,
+                ...((payload.nodes as GraphStreamNode[] | undefined) ?? []),
+              ],
+              edges: [
+                ...current.edges,
+                ...((payload.edges as GraphStreamEdge[] | undefined) ?? []),
+              ],
+            }));
+          } else if (sse.event === "graph.complete") {
+            streamedGraphId = String(payload.graph_id ?? streamedGraphId);
+            setGraphId(streamedGraphId);
+            setStreamPreview({
+              title: String(payload.title ?? ""),
+              nodes: (payload.nodes as GraphStreamNode[] | undefined) ?? [],
+              edges: (payload.edges as GraphStreamEdge[] | undefined) ?? [],
+            });
+          } else if (sse.event === "graph.error") {
+            throw new Error(
+              String(payload.message ?? "图谱流式生成失败，请稍后重试。"),
+            );
+          }
+        }
+        if (!streamedGraphId)
+          throw new Error("服务端没有返回候选图谱，请刷新后重试。");
+        return { graphId: streamedGraphId, savedGoal };
+      } finally {
+        graphStreamAbortRef.current = null;
+      }
     },
-    onSuccess: async ({ graphSummary, savedGoal }) => {
+    onSuccess: async ({ graphId: streamedGraphId, savedGoal }) => {
       setResult((current) =>
         current ? { ...current, goal: savedGoal } : current,
       );
-      setGraphId(graphSummary.id);
+      setGraphId(streamedGraphId);
       setAcceptedNodeIds(new Set());
       setStage("graph_review");
       await Promise.all([
@@ -227,7 +300,7 @@ export function useGoalSetupFlow({
           queryKey: workspaceQueryKey(workspaceId, "graphs"),
         }),
         queryClient.invalidateQueries({
-          queryKey: workspaceQueryKey(workspaceId, "graph", graphSummary.id),
+          queryKey: workspaceQueryKey(workspaceId, "graph", streamedGraphId),
         }),
       ]);
     },
@@ -333,6 +406,8 @@ export function useGoalSetupFlow({
   useEffect(() => {
     const scopeChanged = activeScopeKey.current !== scopeKey;
     if (enabled && (!wasEnabled.current || scopeChanged)) {
+      graphStreamAbortRef.current?.abort();
+      graphStreamAbortRef.current = null;
       setStage("capture");
       setSubmittedPrompt("");
       setResult(undefined);
@@ -341,6 +416,7 @@ export function useGoalSetupFlow({
       setDraft(undefined);
       setGraphId("");
       setAcceptedNodeIds(new Set());
+      setStreamPreview({ title: "", nodes: [], edges: [] });
       observedGraphRevision.current = undefined;
       resetClarify();
       resetPrepareGraph();
@@ -363,6 +439,13 @@ export function useGoalSetupFlow({
   ]);
 
   useEffect(() => {
+    return () => {
+      graphStreamAbortRef.current?.abort();
+      graphStreamAbortRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     const revision = graph.data?.revision;
     if (!revision) return;
     if (
@@ -377,6 +460,15 @@ export function useGoalSetupFlow({
   useEffect(() => {
     if (!enabled) return;
     const currentGraph = graph.data;
+    const building = stage === "graph_building";
+    // While the candidate is still streaming, prefer the incremental preview so
+    // a mid-stream graph fetch (root only) never makes the rail preview regress.
+    const previewNodes = building
+      ? streamPreview.nodes
+      : (currentGraph?.nodes ?? streamPreview.nodes);
+    const previewEdges = building
+      ? streamPreview.edges
+      : (currentGraph?.edges ?? streamPreview.edges);
     window.dispatchEvent(
       new CustomEvent("learngraph:goal-graph-preview", {
         detail: {
@@ -389,15 +481,15 @@ export function useGoalSetupFlow({
           phase:
             stage === "capture"
               ? "draft"
-              : clarify.isPending || stage === "graph_building"
+              : clarify.isPending || building
                 ? "building"
                 : stage === "graph_review"
                   ? "reviewing"
                   : stage === "complete"
                     ? "approved"
                     : "clarifying",
-          graphNodes: currentGraph?.nodes ?? [],
-          graphEdges: currentGraph?.edges ?? [],
+          graphNodes: previewNodes,
+          graphEdges: previewEdges,
         },
       }),
     );
@@ -408,6 +500,8 @@ export function useGoalSetupFlow({
     graph.data,
     result,
     stage,
+    streamPreview.edges,
+    streamPreview.nodes,
     submittedPrompt,
   ]);
 
@@ -489,6 +583,7 @@ export function useGoalSetupFlow({
     graphLoading: graph.isPending && Boolean(graphId),
     graphRefetch: graph.refetch,
     clarifyPending: clarify.isPending,
+    graphMode,
     prepareGraphPending: prepareGraph.isPending,
     publish: () => publish.mutate(),
     publishPending: publish.isPending,
@@ -504,6 +599,7 @@ export function useGoalSetupFlow({
     setDraft,
     setQuestionIndex,
     stage,
+    streamPreview,
     submit,
     submittedPrompt,
     updateNode: (nodeId: string, body: Partial<GraphNode>) =>
@@ -540,10 +636,15 @@ function GoalQuestionnaire({ flow }: { flow: GoalSetupController }) {
             回答会影响图谱边界与顺序；也可跳过，系统会记下透明假设。
           </span>
         </div>
-        <StatePill
-          label={flow.result?.remote_model_used ? "远程模型" : flow.result?.provider}
-          status={flow.result?.provider ?? "loading"}
-        />
+        <div className="goal-quiz-head__tools">
+          <Badge variant="outline">
+            {flow.graphMode === "fast" ? "极速" : "思考"}生成
+          </Badge>
+          <StatePill
+            label={flow.result?.remote_model_used ? "远程模型" : flow.result?.provider}
+            status={flow.result?.provider ?? "loading"}
+          />
+        </div>
       </div>
       {completedCount > 0 ? (
         <div className="goal-quiz-stash" aria-label="已答进度">
@@ -983,6 +1084,156 @@ function GoalGraphReview({ flow }: { flow: GoalSetupController }) {
   );
 }
 
+function GoalGraphStreamPreview({ flow }: { flow: GoalSetupController }) {
+  const preview = flow.streamPreview;
+  const root = preview.nodes.find((node) => node.node_type === "root");
+  const modeLabel = flow.graphMode === "fast" ? "极速" : "思考";
+
+  // 由边构建父子树：先主干（root 直连），再每个主干节点的两层分层展开。
+  const childrenByParent = new Map<string, GraphStreamNode[]>();
+  const childOfSomeNode = new Set<string>();
+  for (const edge of preview.edges) {
+    if (edge.source_node_id === edge.target_node_id) continue;
+    const source = preview.nodes.find((n) => n.id === edge.source_node_id);
+    const target = preview.nodes.find((n) => n.id === edge.target_node_id);
+    if (!source || !target) continue;
+    childOfSomeNode.add(target.id);
+    const siblings = childrenByParent.get(source.id) ?? [];
+    if (!siblings.some((n) => n.id === target.id)) siblings.push(target);
+    childrenByParent.set(source.id, siblings);
+  }
+  // 兜底：还没挂到树上的节点（如刚到达的批次）不消失，等下一批边补齐。
+  const orphans = preview.nodes.filter(
+    (node) => node.id !== root?.id && !childOfSomeNode.has(node.id),
+  );
+
+  const layerLabel = (depth: number) =>
+    depth === 1 ? "主干" : depth === 2 ? "L2 子层" : depth === 3 ? "L3 孙层" : `L${depth}`;
+
+  const renderLevel = (parentId: string, depth: number): ReactNode => {
+    if (depth > 3) return null; // 策略只展开两层分层
+    const kids = childrenByParent.get(parentId) ?? [];
+    if (!kids.length) return null;
+    return (
+      <div className="goal-flow-node-tree__children" key={`lvl-${parentId}`}>
+        {kids.map((node) => (
+          <div className="goal-flow-node-tree__branch" key={node.id}>
+            <article className="goal-flow-node topic-preview-card is-streamed">
+              <div className="goal-flow-node__head">
+                <Badge variant={depth === 1 ? "default" : "secondary"}>
+                  {layerLabel(depth)}
+                </Badge>
+                <span>权重 {node.target_weight}</span>
+              </div>
+              <div className="goal-flow-node__content topic-preview-card-body">
+                <h3>{node.label}</h3>
+                <p>{node.description}</p>
+              </div>
+            </article>
+            {renderLevel(node.id, depth + 1)}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <section
+      className="goal-flow-graph-stream topic-preview-panel"
+      aria-label="候选图谱流式生成"
+    >
+      <div className="topic-preview-head">
+        <div>
+          <strong>正在生成候选图谱</strong>
+          <span className="topic-preview-sub">
+            <Badge variant="secondary">{modeLabel}模式</Badge>
+            已生成 {preview.nodes.length} 个节点 · {preview.edges.length} 条关系。先出主干，再逐主干节点展开两层分层。
+          </span>
+        </div>
+        <StatePill status="building" label="生成中" />
+      </div>
+      {root ? (
+        <article className="goal-flow-node topic-preview-card is-root">
+          <div className="goal-flow-node__head">
+            <Badge>根节点</Badge>
+            <span>权重 {root.target_weight}</span>
+          </div>
+          <div className="goal-flow-node__content topic-preview-card-body">
+            <h3>{root.label}</h3>
+            <p>{root.description}</p>
+          </div>
+        </article>
+      ) : (
+        <div className="goal-flow-thinking" role="status">
+          <LoaderCircle className="size-4 animate-spin" />
+          正在生成根节点预览…
+        </div>
+      )}
+      <div className="goal-flow-node-tree" aria-label="流式节点">
+        {root ? renderLevel(root.id, 1) : null}
+        {orphans.length ? (
+          <div className="goal-flow-node-tree__children" key="orphans">
+            {orphans.map((node) => (
+              <article
+                className="goal-flow-node topic-preview-card is-streamed"
+                key={node.id}
+              >
+                <div className="goal-flow-node__head">
+                  <Badge variant="outline">待挂载</Badge>
+                  <span>权重 {node.target_weight}</span>
+                </div>
+                <div className="goal-flow-node__content topic-preview-card-body">
+                  <h3>{node.label}</h3>
+                  <p>{node.description}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : null}
+        {flow.prepareGraphPending ? (
+          <div
+            className="goal-flow-node topic-preview-card is-streaming-slot"
+            role="status"
+          >
+            <LoaderCircle className="size-4 animate-spin" />
+            正在展开下一分支…
+          </div>
+        ) : null}
+      </div>
+      {preview.edges.length ? (
+        <div className="goal-flow-edge-review" aria-label="已生成节点关系">
+          <div className="goal-flow-edge-review__head">
+            <strong>节点关系</strong>
+            <span>{preview.edges.length} 条</span>
+          </div>
+          <ul>
+            {preview.edges.slice(0, 8).map((edge) => {
+              const source = preview.nodes.find(
+                (node) => node.id === edge.source_node_id,
+              );
+              const target = preview.nodes.find(
+                (node) => node.id === edge.target_node_id,
+              );
+              return (
+                <li key={edge.id}>
+                  <span>{source?.label ?? "未知节点"}</span>
+                  <ArrowRight aria-hidden="true" className="size-3.5" />
+                  <span>{target?.label ?? "未知节点"}</span>
+                  <Badge variant="outline">{edge.relation}</Badge>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+      <div className="goal-flow-thinking" role="status">
+        <LoaderCircle className="size-4 animate-spin" />
+        生成完成后自动进入审核，无需等待整张图谱全部补齐。
+      </div>
+    </section>
+  );
+}
+
 export function GoalSetupConversation({
   flow,
   hasConversationMessages,
@@ -1024,14 +1275,12 @@ export function GoalSetupConversation({
           ) : null}
         </section>
       ) : null}
-      {flow.stage === "goal_review" || flow.stage === "graph_building" ? (
-        <GoalSummaryReview flow={flow} />
-      ) : null}
+      {flow.stage === "goal_review" ? <GoalSummaryReview flow={flow} /> : null}
       {flow.stage === "graph_building" ? (
-        <div className="goal-flow-thinking" role="status">
-          <LoaderCircle className="size-4 animate-spin" />
-          正在生成候选图谱…
-        </div>
+        <>
+          <GoalSummaryReview flow={flow} />
+          <GoalGraphStreamPreview flow={flow} />
+        </>
       ) : null}
       {flow.stage === "graph_review" ? <GoalGraphReview flow={flow} /> : null}
       {flow.error ? (

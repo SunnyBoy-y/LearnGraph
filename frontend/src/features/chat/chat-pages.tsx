@@ -4239,6 +4239,9 @@ export function ChatCanvasPage() {
     providerId: activeModelProvider?.id ?? null,
     modelId: selectedModel?.id ?? null,
     thinkingMode: effectiveThinkingMode,
+    // 极速/思考 both stream the graph root-first; 极速 keeps thinking off and
+    // produces fewer batches, 思考 allows the provider thinking budget.
+    graphMode: responseMode === "fast" ? "fast" : "thinking",
   });
   useEffect(() => {
     if (!goalMode) return;
@@ -5638,6 +5641,54 @@ export function ChatCanvasPage() {
         } else if (action.event === "undo") {
           reviewGraphChange.mutate({ decision: "undo", proposalId });
         }
+        return;
+      }
+
+      // Aggregated question card (lg_goal_ask_batch): all sub-answers are
+      // sent back to the Agent in one structured user message.
+      if (
+        action.componentType === "question_batch" &&
+        action.event === "submit"
+      ) {
+        const answers = Array.isArray(action.payload.answers)
+          ? action.payload.answers
+          : [];
+        const lines = answers
+          .map((item, index) => {
+            const record =
+              item && typeof item === "object"
+                ? (item as Record<string, unknown>)
+                : {};
+            const label =
+              typeof record.labels === "string" ? record.labels : "";
+            const value =
+              typeof record.value === "string" ? record.value : "";
+            const prompt =
+              typeof record.prompt === "string"
+                ? record.prompt
+                : `问题 ${index + 1}`;
+            return `${index + 1}. ${prompt} → ${label || value || "（跳过）"}`;
+          })
+          .filter(Boolean);
+        void send(`【聚合问答】${lines.join("；")}`, { graphAction: "none" });
+        return;
+      }
+
+      // Two-way Goal draft editor (lg_goal_edit_draft): send the edited fields
+      // back to the Agent as a structured user message so it can confirm the
+      // Goal with the exact values the user changed.
+      if (
+        action.componentType === "goal_draft_editor" &&
+        action.event === "submit"
+      ) {
+        const draftPayload =
+          (action.payload.draft as Record<string, unknown> | undefined) ??
+          action.payload;
+        const draftText = JSON.stringify(draftPayload, null, 0);
+        void send(
+          `【目标草稿更新】请按我修改后的字段确认目标草稿：${draftText}`,
+          { graphAction: "none" },
+        );
         return;
       }
 

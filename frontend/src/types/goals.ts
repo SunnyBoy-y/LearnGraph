@@ -86,6 +86,61 @@ export interface CandidateGraphRequest {
   thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | null
 }
 
+/** Streaming candidate-graph generation: mode selects the generation budget. */
+export interface CandidateGraphStreamRequest extends CandidateGraphRequest {
+  mode?: "fast" | "thinking"
+}
+
+export interface GraphStreamNode {
+  id: string
+  label: string
+  description: string
+  node_type: string
+  target_weight: number
+  teaching_strategy?: string
+}
+
+export interface GraphStreamEdge {
+  id: string
+  source_node_id: string
+  target_node_id: string
+  relation: string
+}
+
+/** Stage 1 — the single root preview is persisted and emitted immediately. */
+export interface GraphStreamRootEvent {
+  graph_id: string
+  title: string
+  root: GraphStreamNode | null
+}
+
+/** Stage 2 — one incremental batch of level-1 children + edges. */
+export interface GraphStreamNodesEvent {
+  nodes: GraphStreamNode[]
+  edges: GraphStreamEdge[]
+}
+
+/** Final stage — the full candidate snapshot (review is ready). */
+export interface GraphStreamCompleteEvent {
+  graph_id: string
+  title: string
+  revision: number
+  status: string
+  nodes: GraphStreamNode[]
+  edges: GraphStreamEdge[]
+}
+
+export interface GraphStreamErrorEvent {
+  code: string
+  message: string
+}
+
+export type GraphStreamEvent =
+  | { event: "graph.root"; data: GraphStreamRootEvent }
+  | { event: "graph.nodes_added"; data: GraphStreamNodesEvent }
+  | { event: "graph.complete"; data: GraphStreamCompleteEvent }
+  | { event: "graph.error"; data: GraphStreamErrorEvent }
+
 export interface PublishGoalRequest {
   graph_id: string
   expected_revision: number

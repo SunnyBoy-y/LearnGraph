@@ -116,6 +116,12 @@ export function ChartPart({ data }: { data: PartData }) {
         {data?.show_legend !== false ? <Legend /> : null}
       </>
     );
+    const sources = Array.isArray(data?.sources)
+      ? data.sources.filter(
+          (item): item is Record<string, unknown> =>
+            Boolean(item) && typeof item === "object" && !Array.isArray(item),
+        )
+      : [];
     return (
       <section
         aria-label={
@@ -206,6 +212,39 @@ export function ChartPart({ data }: { data: PartData }) {
             )}
           </ResponsiveContainer>
         </div>
+        {sources.length ? (
+          <div className="message-chart__sources" aria-label="数据来源">
+            <span>数据来源</span>
+            <ul>
+              {sources.map((source, index) => {
+                const title =
+                  typeof source.title === "string"
+                    ? source.title
+                    : `来源 ${index + 1}`;
+                const url =
+                  typeof source.url === "string" ? source.url : "";
+                const note =
+                  typeof source.note === "string" ? source.note : "";
+                return (
+                  <li key={`${title}-${index}`}>
+                    {url ? (
+                      <a
+                        href={url}
+                        rel="noopener noreferrer"
+                        target="_blank"
+                      >
+                        {title}
+                      </a>
+                    ) : (
+                      <span>{title}</span>
+                    )}
+                    {note ? <small>{note}</small> : null}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ) : null}
       </section>
     );
   }

@@ -1823,6 +1823,98 @@ body.is-resizing .workspace-resizer {
 .goal-flow-graph-review__summary { margin: 0; border-top: 1px solid #ececec; padding: 10px 0; color: #777; font-size: 12px; }
 .goal-flow-graph-review { container-type: inline-size; }
 .goal-flow-node-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 4px 0 14px; }
+/* Root-first streaming preview: root card is emphasized, streamed children
+   animate in, and the pending slot signals the next batch is being produced. */
+.goal-flow-graph-stream .goal-flow-node-grid { padding-top: 12px; }
+.goal-flow-graph-stream .goal-flow-node { min-height: 0; animation: goal-flow-rise 220ms ease-out both; }
+.goal-flow-graph-stream .goal-flow-node.is-root { border-color: #4f8f6e; background: linear-gradient(180deg, #f4faf6, #ffffff); box-shadow: inset 3px 0 0 #26845a; }
+.goal-flow-graph-stream .goal-flow-node.is-streamed { animation-name: goal-flow-rise; }
+.goal-flow-graph-stream .goal-flow-node.is-streaming-slot { min-height: 96px; align-content: center; justify-items: center; gap: 8px; border-style: dashed; color: #999; font-size: 12px; background: #fafbf9; }
+.goal-flow-graph-stream > .goal-flow-thinking { width: 100%; justify-content: flex-start; border-top: 1px solid #ececec; padding-top: 12px; }
+.goal-quiz-head__tools { display: flex; align-items: center; gap: 6px; }
+.goal-quiz-head__tools .state-pill { white-space: nowrap; }
+/* Two-way Goal draft editor card (sub-page style). */
+.goal-draft-editor { display: grid; gap: 12px; }
+.goal-draft-editor__form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.goal-draft-editor__form label { display: grid; min-width: 0; gap: 6px; }
+.goal-draft-editor__form label > span { color: #666; font-size: 11px; font-weight: 650; }
+.goal-draft-editor__form input, .goal-draft-editor__form textarea { border-radius: 8px; background: #fff; }
+.goal-draft-editor__form textarea { min-height: 92px; resize: vertical; }
+.goal-draft-editor__wide { grid-column: 1 / -1; }
+.goal-draft-editor__hint { margin: 0; color: #999; font-size: 11px; line-height: 1.6; }
+/* Aggregated question card (question_batch) — matches the OptionGroup visual
+   language used by the 极速/思考 goal wizard (gold selected state, card
+   choices in an auto-fit grid, action row at the bottom). */
+.question-batch { margin: 10px 0 14px; }
+.question-batch__list { display: grid; gap: 4px; border-top: 1px solid #ececec; padding-top: 6px; }
+.question-batch__item { display: grid; gap: 8px; border-bottom: 1px dashed #efefef; padding: 12px 0; }
+.question-batch__item:last-child { border-bottom: 0; }
+.question-batch__prompt { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.question-batch__index { display: inline-grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; background: rgba(196,146,42,.14); color: #9a741f; font-size: 11px; font-weight: 750; flex: none; }
+.question-batch__prompt > strong { font-size: 13px; font-weight: 680; line-height: 1.5; }
+.question-batch__type { flex: none; border: 1px solid #e4e4e4; border-radius: 999px; padding: 1px 7px; color: #8a8a8a; font-size: 10px; }
+.question-batch__required { flex: none; border: 1px solid #e8b4b4; border-radius: 999px; padding: 1px 7px; color: #c0392b; font-size: 10px; background: #fdf3f2; }
+.question-batch__choices { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.question-batch .option-group__choice { min-height: 46px; border-radius: 10px; background: #fff; }
+.question-batch .option-group__choice.is-selected { border-color: #c4922a; background: rgba(196,146,42,.08); box-shadow: 0 0 0 2px rgba(196,146,42,.12); }
+.question-batch .option-group__choice.is-selected strong { color: #7a5a12; }
+.question-batch .option-group__custom { height: 36px; border-radius: 9px; font-size: 12px; }
+.question-batch__open { display: grid; gap: 6px; }
+.question-batch__open input, .question-batch__open textarea { border-radius: 9px; background: #fff; }
+.question-batch__open textarea { min-height: 84px; resize: vertical; }
+.question-batch__progress { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; border-top: 1px solid #ececec; padding-top: 10px; color: #8a8a8a; font-size: 11px; }
+.question-batch__missing { color: #b45309; font-weight: 650; }
+/* Date picker calendar with embedded learning schedule (question_batch date). */
+.date-schedule-calendar { display: grid; gap: 8px; border: 1px solid #e5e5e5; border-radius: 12px; background: #fbfbfb; padding: 10px; }
+.date-schedule-calendar__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.date-schedule-calendar__head strong { font-size: 13px; font-weight: 700; }
+.date-schedule-calendar__nav { display: inline-grid; width: 26px; height: 26px; place-items: center; border: 1px solid #e5e5e5; border-radius: 8px; background: #fff; color: #666; cursor: pointer; transition: border-color .12s, background .12s; }
+.date-schedule-calendar__nav:hover { border-color: #c4922a; color: #9a741f; }
+.date-schedule-calendar__weekdays, .date-schedule-calendar__grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; }
+.date-schedule-calendar__weekdays span { text-align: center; color: #999; font-size: 10px; padding: 2px 0; }
+.date-schedule-calendar__day { position: relative; display: grid; min-height: 34px; place-items: center; gap: 1px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #3c4a40; font-size: 12px; cursor: pointer; transition: border-color .12s, background .12s; }
+.date-schedule-calendar__day:hover { border-color: #c4922a; background: rgba(196,146,42,.06); }
+.date-schedule-calendar__day.is-today { border-color: #b8c4bb; }
+.date-schedule-calendar__day.is-selected { border-color: #c4922a; background: rgba(196,146,42,.12); box-shadow: 0 0 0 2px rgba(196,146,42,.16); font-weight: 700; color: #7a5a12; }
+.date-schedule-calendar__mark { position: absolute; top: 2px; right: 3px; display: inline-grid; min-width: 14px; height: 14px; place-items: center; border-radius: 999px; background: #c4922a; color: #fff; font-size: 9px; font-weight: 700; line-height: 1; padding: 0 3px; }
+.date-schedule-calendar__schedule { display: grid; gap: 6px; border-top: 1px solid #ececec; padding-top: 8px; }
+.date-schedule-calendar__schedule-head { display: flex; align-items: center; gap: 6px; color: #666; font-size: 11px; }
+.date-schedule-calendar__schedule-head strong { color: #333; font-size: 12px; font-weight: 700; }
+.date-schedule-calendar__schedule-head span { margin-left: auto; color: #999; font-size: 10px; }
+.date-schedule-calendar__schedule ul { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.date-schedule-calendar__schedule li { display: flex; align-items: center; gap: 6px; min-width: 0; border-radius: 8px; background: #fff; border: 1px solid #efefef; padding: 5px 8px; font-size: 11px; }
+.date-schedule-calendar__dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #c4922a; }
+.date-schedule-calendar__dot.is-completed { background: #2f8f66; }
+.date-schedule-calendar__dot.is-blocked { background: #d64545; }
+.date-schedule-calendar__title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #3c4a40; }
+.date-schedule-calendar__schedule li small { margin-left: auto; flex: none; color: #999; font-size: 10px; }
+.date-schedule-calendar__more { color: #999; font-size: 10px; }
+.date-schedule-calendar__empty { margin: 0; color: #999; font-size: 11px; line-height: 1.5; }
+.dark .date-schedule-calendar { background: #1a211d; border-color: #39443c; }
+.dark .date-schedule-calendar__nav { background: #1f2722; border-color: #39443c; color: #cfd8d1; }
+.dark .date-schedule-calendar__day { color: #d7e2d9; }
+.dark .date-schedule-calendar__day.is-selected { background: rgba(196,146,42,.18); color: #e0bc64; }
+.dark .date-schedule-calendar__schedule li { background: #1f2722; border-color: #2a2f2b; }
+.dark .date-schedule-calendar__schedule-head strong { color: #cfd8d1; }
+.dark .date-schedule-calendar__title { color: #d7e2d9; }
+/* Chart authoritative sources. */
+.message-chart__sources { display: grid; gap: 6px; border-top: 1px solid #ececec; padding: 10px 0 0; }
+.message-chart__sources > span { color: #888; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.message-chart__sources ul { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0; padding: 0; list-style: none; }
+.message-chart__sources li { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.message-chart__sources a { color: #1f6f4c; font-size: 11px; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.message-chart__sources small { color: #999; font-size: 10px; }
+.dark .question-batch__item { border-color: #2a2f2b; }
+.dark .question-batch__index { background: rgba(196,146,42,.22); color: #e0bc64; }
+.dark .question-batch__type { border-color: #39443c; color: #9aa59c; }
+.dark .question-batch__required { border-color: #7a3b33; color: #f0a99f; background: #2a1714; }
+.dark .question-batch .option-group__choice { background: #1f2722; }
+.dark .question-batch .option-group__choice.is-selected { background: rgba(196,146,42,.16); }
+.dark .question-batch__open input, .dark .question-batch__open textarea { background: #1a211d; }
+.dark .message-chart__sources a { color: #7fd6a9; }
+@media (max-width: 640px) {
+  .goal-draft-editor__form { grid-template-columns: 1fr; }
+}
 .goal-flow-node { display: grid; min-width: 0; min-height: 190px; grid-template-rows: auto 1fr auto; gap: 10px; border: 1px solid #dedede; border-radius: 8px; background: #fff; padding: 12px; transition: border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease; }
 .goal-flow-node:hover { border-color: #b8b8b8; box-shadow: 0 7px 18px rgba(0,0,0,.05); transform: translateY(-1px); }
 .goal-flow-node.is-accepted { border-color: #9bc9b3; box-shadow: inset 3px 0 0 #26845a; }

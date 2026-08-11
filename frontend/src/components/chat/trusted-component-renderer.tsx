@@ -1,12 +1,16 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Check,
   CheckCircle2,
   CloudSun,
   GitBranch,
   ImageIcon,
   Network,
+  Save,
+  Send,
   ShieldCheck,
+  Target,
   Thermometer,
   Undo2,
   X,
@@ -19,9 +23,14 @@ import {
 } from "@/components/chat/option-group";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
+import { DateScheduleCalendar } from "@/components/chat/date-schedule-calendar";
 
 const optionSchema = z.object({
   id: z.string().min(1).max(160),
@@ -177,6 +186,61 @@ const graphProposalSchema = z.object({
   allowed_events: z.array(z.enum(["confirm", "reject", "undo"])).max(3),
 });
 
+const goalDraftFieldSchema = z.object({
+  title: z.string().min(1).max(240),
+  intent: z.string().max(240).optional(),
+  time_limit: z.string().max(120).optional(),
+  desired_outcome: z.string().max(4_000).optional(),
+});
+
+const goalDraftEditorSchema = z.object({
+  component_type: z.literal("goal_draft_editor"),
+  component_id: z.string().min(1).max(160).optional(),
+  schema_version: z.string().min(1).max(32),
+  props: z.object({
+    title: z.string().min(1).max(500),
+    description: z.string().max(2_000).nullish(),
+    goal_id: z.string().max(160).optional(),
+    goal_status: z.string().max(40).optional(),
+    focus: z.enum(["title", "time", "outcome", "all"]).optional(),
+    submit_label: z.string().max(80).nullish(),
+    draft: goalDraftFieldSchema,
+  }),
+  allowed_events: z.array(z.string()).max(10).default(["submit"]),
+});
+
+const questionBatchItemSchema = z.object({
+  key: z.string().min(1).max(80),
+  prompt: z.string().min(1).max(500),
+  input_type: z
+    .enum([
+      "single_choice",
+      "multiple_choice",
+      "fill_blank",
+      "short_answer_table",
+      "date",
+    ])
+    .default("single_choice"),
+  placeholder: z.string().max(500).optional(),
+  options: z.array(optionSchema).max(8).default([]),
+  allow_custom: z.boolean().default(true),
+  allow_skip: z.boolean().default(true),
+  required: z.boolean().default(false),
+});
+
+const questionBatchSchema = z.object({
+  component_type: z.literal("question_batch"),
+  component_id: z.string().min(1).max(160).optional(),
+  schema_version: z.string().min(1).max(32),
+  props: z.object({
+    title: z.string().min(1).max(500),
+    description: z.string().max(2_000).nullish(),
+    submit_label: z.string().max(80).nullish(),
+    questions: z.array(questionBatchItemSchema).min(2).max(8),
+  }),
+  allowed_events: z.array(z.string()).max(10).default(["submit"]),
+});
+
 const trustedComponentSchema = z.union([
   optionComponentSchema,
   textComponentSchema,
@@ -184,6 +248,8 @@ const trustedComponentSchema = z.union([
   weatherComponentSchema,
   metricComponentSchema,
   graphProposalSchema,
+  goalDraftEditorSchema,
+  questionBatchSchema,
 ]);
 
 export type TrustedComponentAction = {
@@ -228,6 +294,15 @@ export function TrustedComponentRenderer({
 }) {
   const parsed = useMemo(() => trustedComponentSchema.safeParse(data), [data]);
   const [textValue, setTextValue] = useState("");
+  const [goalDraftValue, setGoalDraftValue] = useState<{
+    title: string;
+    intent: string;
+    time_limit: string;
+    desired_outcome: string;
+  }>({ title: "", intent: "", time_limit: "", desired_outcome: "" });
+  const [batchAnswers, setBatchAnswers] = useState<
+    Record<string, { labels: string[]; values: string[]; text?: string }>
+  >({});
 
   // Third-party components are delivered with delivery_mode="sandbox_artifact".
   // They never match the built-in declarative schema below; delegate them to
@@ -490,6 +565,398 @@ export function TrustedComponentRenderer({
             })}
           </div>
         ) : null}
+      </section>
+    );
+  }
+
+  if (component.component_type === "question_batch") {
+    const batch = component.props;
+    // Time-keyword heuristic: open text questions that ask about a date/time
+    // render the calendar too, so the model never needs to know the exact
+    // input_type to give the user a calendar picker.
+    const TIME_KEYWORD_RE =
+      /什么时候|日期|哪天|周几|星期|几号|deadline|截止|开始时间|结束时间|安排|时段|几点|时间|每天|每周/;
+    const isAnswered = (question: z.infer<typeof questionBatchItemSchema>) => {
+      const answer = batchAnswers[question.key];
+      if (!answer) return false;
+      if (
+        question.input_type === "fill_blank" ||
+        question.input_type === "short_answer_table" ||
+        question.input_type === "date"
+      )
+        return Boolean(answer.text?.trim());
+      return answer.values.length > 0;
+    };
+    const answeredCount = batch.questions.filter(isAnswered).length;
+    const missingRequired = batch.questions.filter(
+      (question) => question.required && !isAnswered(question),
+    );
+    const canSubmit =
+      interactive && missingRequired.length === 0 && answeredCount > 0;
+    const typeLabel = (inputType: string) =>
+      inputType === "single_choice"
+        ? "单选"
+        : inputType === "multiple_choice"
+          ? "可多选"
+          : inputType === "fill_blank"
+            ? "填空"
+            : inputType === "date"
+              ? "日期"
+              : "简答";
+
+    const setChoice = (
+      question: z.infer<typeof questionBatchItemSchema>,
+      optionId: string,
+      optionLabel: string,
+      checked = true,
+    ) => {
+      setBatchAnswers((current) => {
+        const existing = current[question.key];
+        if (question.input_type === "multiple_choice") {
+          const values = checked
+            ? [...(existing?.values ?? []), optionId]
+            : (existing?.values ?? []).filter((item) => item !== optionId);
+          const labels = values.map((id) => {
+            const option = question.options.find((item) => item.id === id);
+            return option?.label ?? id;
+          });
+          return { ...current, [question.key]: { labels, values } };
+        }
+        return {
+          ...current,
+          [question.key]: { labels: [optionLabel], values: [optionId] },
+        };
+      });
+    };
+    const setText = (
+      questionKey: string,
+      text: string,
+      labels: string[] = [],
+    ) => {
+      setBatchAnswers((current) => ({
+        ...current,
+        [questionKey]: {
+          ...current[questionKey],
+          text,
+          values: [],
+          labels,
+        },
+      }));
+    };
+    return (
+      <section
+        aria-label={batch.title}
+        className="option-group question-batch"
+      >
+        <div className="option-group__heading">
+          <div>
+            <p>{batch.title}</p>
+            {batch.description ? <span>{batch.description}</span> : null}
+          </div>
+          <span>{batch.questions.length} 题 · 聚合问答</span>
+        </div>
+        <div className="question-batch__list">
+          {batch.questions.map((question, index) => {
+            const current = batchAnswers[question.key];
+            const isChoice =
+              question.input_type === "single_choice" ||
+              question.input_type === "multiple_choice";
+            const isDate =
+              question.input_type === "date" ||
+              (question.input_type !== "single_choice" &&
+                question.input_type !== "multiple_choice" &&
+                TIME_KEYWORD_RE.test(question.prompt));
+            return (
+              <div className="question-batch__item" key={question.key}>
+                <div className="question-batch__prompt">
+                  <span className="question-batch__index">{index + 1}</span>
+                  <strong>{question.prompt}</strong>
+                  <span className="question-batch__type">
+                    {typeLabel(isDate ? "date" : question.input_type)}
+                  </span>
+                  {question.required ? (
+                    <span className="question-batch__required">必答</span>
+                  ) : null}
+                </div>
+                {isChoice ? (
+                  <>
+                    {question.input_type === "single_choice" ? (
+                      <RadioGroup
+                        className="option-group__choices question-batch__choices"
+                        disabled={!interactive}
+                        onValueChange={(next) =>
+                          setChoice(
+                            question,
+                            next,
+                            question.options.find((item) => item.id === next)
+                              ?.label ?? next,
+                          )
+                        }
+                        value={current?.values[0] ?? ""}
+                      >
+                        {question.options.map((option) => (
+                          <Label
+                            className={cn(
+                              "option-group__choice",
+                              current?.values.includes(option.id) &&
+                                "is-selected",
+                            )}
+                            htmlFor={`${componentId}-qb-${question.key}-${option.id}`}
+                            key={option.id}
+                          >
+                            <RadioGroupItem
+                              id={`${componentId}-qb-${question.key}-${option.id}`}
+                              value={option.id}
+                            />
+                            <span>
+                              <strong>{option.label}</strong>
+                              {option.description ? (
+                                <small>{option.description}</small>
+                              ) : null}
+                            </span>
+                            {current?.values.includes(option.id) ? (
+                              <Check aria-hidden="true" className="size-3.5" />
+                            ) : null}
+                          </Label>
+                        ))}
+                      </RadioGroup>
+                    ) : (
+                      <div className="option-group__choices question-batch__choices">
+                        {question.options.map((option) => {
+                          const selected = (current?.values ?? []).includes(
+                            option.id,
+                          );
+                          return (
+                            <Label
+                              className={cn(
+                                "option-group__choice",
+                                selected && "is-selected",
+                              )}
+                              htmlFor={`${componentId}-qb-${question.key}-${option.id}`}
+                              key={option.id}
+                            >
+                              <Checkbox
+                                checked={selected}
+                                disabled={!interactive}
+                                id={`${componentId}-qb-${question.key}-${option.id}`}
+                                onCheckedChange={(checked) =>
+                                  setChoice(
+                                    question,
+                                    option.id,
+                                    option.label,
+                                    checked !== false,
+                                  )
+                                }
+                              />
+                              <span>
+                                <strong>{option.label}</strong>
+                                {option.description ? (
+                                  <small>{option.description}</small>
+                                ) : null}
+                              </span>
+                              {selected ? (
+                                <Check aria-hidden="true" className="size-3.5" />
+                              ) : null}
+                            </Label>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {question.allow_custom ? (
+                      <Input
+                        aria-label={`${question.prompt} 自定义答案`}
+                        className="option-group__custom"
+                        disabled={!interactive}
+                        onChange={(event) =>
+                          setText(question.key, event.target.value)
+                        }
+                        placeholder="输入其他答案"
+                        value={current?.text ?? ""}
+                      />
+                    ) : null}
+                  </>
+                ) : isDate ? (
+                  <div className="question-batch__date">
+                    <DateScheduleCalendar
+                      disabled={!interactive}
+                      onChange={(dateKey, label) =>
+                        setText(question.key, dateKey, [label])
+                      }
+                      value={current?.text}
+                    />
+                    <Input
+                      aria-label={`${question.prompt} 手动输入日期`}
+                      className="option-group__custom"
+                      disabled={!interactive}
+                      onChange={(event) =>
+                        setText(question.key, event.target.value)
+                      }
+                      placeholder="或手动输入，如 2026-09-01"
+                      value={current?.text ?? ""}
+                    />
+                  </div>
+                ) : (
+                  <div className="question-batch__open">
+                    {question.input_type === "short_answer_table" ? (
+                      <Textarea
+                        aria-label={question.prompt}
+                        disabled={!interactive}
+                        onChange={(event) =>
+                          setText(question.key, event.target.value)
+                        }
+                        placeholder={question.placeholder ?? "请输入…"}
+                        value={current?.text ?? ""}
+                      />
+                    ) : (
+                      <Input
+                        aria-label={question.prompt}
+                        className="option-group__custom"
+                        disabled={!interactive}
+                        onChange={(event) =>
+                          setText(question.key, event.target.value)
+                        }
+                        placeholder={question.placeholder ?? "请输入…"}
+                        value={current?.text ?? ""}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="question-batch__progress">
+          <span>
+            已答 {answeredCount}/{batch.questions.length}
+          </span>
+          {missingRequired.length ? (
+            <span className="question-batch__missing">
+              还有 {missingRequired.length} 道必答题未作答
+            </span>
+          ) : (
+            <span>一次提交，全部答案一起回传</span>
+          )}
+        </div>
+        <div className="option-group__actions">
+          <Button
+            disabled={!canSubmit || !component.allowed_events.includes("submit")}
+            onClick={() =>
+              emit("submit", {
+                answers: batch.questions.map((question) => {
+                  const answer = batchAnswers[question.key];
+                  const value = answer?.text?.trim() ?? answer?.values.join("、") ?? "";
+                  const label = answer?.labels.join("、") ?? "";
+                  return {
+                    key: question.key,
+                    prompt: question.prompt,
+                    value,
+                    labels: label,
+                    skipped: !value && !label,
+                  };
+                }),
+              })
+            }
+            size="sm"
+          >
+            <Send className="size-3.5" />
+            {batch.submit_label ?? "一次提交全部答案"}
+          </Button>
+        </div>
+      </section>
+    );
+  }
+
+  if (component.component_type === "goal_draft_editor") {
+    const editor = component.props;
+    const draftValue =
+      goalDraftValue.title || goalDraftValue.intent || goalDraftValue.time_limit || goalDraftValue.desired_outcome
+        ? goalDraftValue
+        : {
+            title: editor.draft.title,
+            intent: editor.draft.intent ?? "",
+            time_limit: editor.draft.time_limit ?? "",
+            desired_outcome: editor.draft.desired_outcome ?? "",
+          };
+    const updateField = (field: "title" | "intent" | "time_limit" | "desired_outcome", value: string) =>
+      setGoalDraftValue((current) => ({ ...current, [field]: value }));
+    const canSubmit = interactive && draftValue.title.trim().length > 0;
+    return (
+      <section
+        aria-label={editor.title}
+        className="message-component goal-draft-editor"
+      >
+        <div className="message-component__heading">
+          <Target className="size-4" />
+          <div>
+            <strong>{editor.title}</strong>
+            {editor.description ? <span>{editor.description}</span> : null}
+          </div>
+          {editor.goal_status ? (
+            <Badge variant="secondary">{editor.goal_status}</Badge>
+          ) : null}
+        </div>
+        <div className="goal-draft-editor__form">
+          <label>
+            <span>目标名称</span>
+            <Input
+              aria-label="目标名称"
+              disabled={!interactive}
+              onChange={(event) => updateField("title", event.target.value)}
+              value={draftValue.title}
+            />
+          </label>
+          <label>
+            <span>学习意图</span>
+            <Input
+              aria-label="学习意图"
+              disabled={!interactive}
+              onChange={(event) => updateField("intent", event.target.value)}
+              value={draftValue.intent}
+            />
+          </label>
+          <label>
+            <span>时间约束</span>
+            <Input
+              aria-label="时间约束"
+              disabled={!interactive}
+              onChange={(event) => updateField("time_limit", event.target.value)}
+              placeholder="例如：每天 2 小时，共 3 周"
+              value={draftValue.time_limit}
+            />
+          </label>
+          <label className="goal-draft-editor__wide">
+            <span>期望结果</span>
+            <Textarea
+              aria-label="期望结果"
+              disabled={!interactive}
+              onChange={(event) => updateField("desired_outcome", event.target.value)}
+              placeholder="希望通过什么方式验收学习成果？"
+              value={draftValue.desired_outcome}
+            />
+          </label>
+        </div>
+        <div className="message-component__actions">
+          <Button
+            disabled={!canSubmit || !component.allowed_events.includes("submit")}
+            onClick={() =>
+              emit("submit", {
+                draft: {
+                  title: draftValue.title.trim(),
+                  intent: draftValue.intent.trim(),
+                  time_limit: draftValue.time_limit.trim(),
+                  desired_outcome: draftValue.desired_outcome.trim(),
+                },
+              })
+            }
+            size="sm"
+          >
+            <Save className="size-3.5" />
+            {editor.submit_label ?? "提交"}
+          </Button>
+        </div>
+        <p className="goal-draft-editor__hint">
+          修改会以结构化消息发回给智能体，由智能体确认目标草稿后再生成图谱。
+        </p>
       </section>
     );
   }

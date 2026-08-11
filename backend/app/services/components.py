@@ -56,6 +56,8 @@ BUILTIN_COMPONENT_IDS = frozenset(
         "fill_blank",
         "short_answer_table",
         "image_frame",
+        "goal_draft_editor",
+        "question_batch",
     }
 )
 MAX_SCHEMA_BYTES = 64 * 1024
@@ -697,6 +699,147 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
                 "status": "placeholder",
                 "file_id": None,
                 "alt": "Pending image",
+            },
+        },
+        "goal_draft_editor": {
+            "display_name": "Goal Draft Editor",
+            "description": (
+                "Two-way editable Goal-draft card (sub-page style): the Agent "
+                "pre-fills current Goal fields, the user edits and submits, and "
+                "the edited values come back as the next user message."
+            ),
+            "data_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "draft"],
+                "properties": {
+                    "title": {"type": "string", "maxLength": 500},
+                    "description": {"type": "string", "maxLength": 2_000},
+                    "goal_id": {"type": "string", "maxLength": 160},
+                    "goal_status": {"type": "string", "maxLength": 40},
+                    "focus": {
+                        "type": "string",
+                        "enum": ["title", "time", "outcome", "all"],
+                    },
+                    "submit_label": {"type": "string", "maxLength": 80},
+                    "draft": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["title"],
+                        "properties": {
+                            "title": {"type": "string", "minLength": 1, "maxLength": 240},
+                            "intent": {"type": "string", "maxLength": 240},
+                            "time_limit": {"type": "string", "maxLength": 120},
+                            "desired_outcome": {"type": "string", "maxLength": 4_000},
+                        },
+                    },
+                },
+            },
+            "example_data": {
+                "title": "编辑目标草稿",
+                "goal_id": "goal_123",
+                "goal_status": "clarifying",
+                "focus": "all",
+                "draft": {
+                    "title": "数据库原理与应用",
+                    "intent": "考研",
+                    "time_limit": "每天 2 小时",
+                    "desired_outcome": "能独立完成 30 道综合应用题",
+                },
+                "submit_label": "提交草稿修改",
+            },
+        },
+        "question_batch": {
+            "display_name": "Aggregated Question Card",
+            "description": (
+                "One card containing multiple sub-questions (choice and/or "
+                "open answers) submitted together. Use for batches of related "
+                "clarification questions to cut round trips."
+            ),
+            "data_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "questions"],
+                "properties": {
+                    "title": {"type": "string", "maxLength": 500},
+                    "description": {"type": "string", "maxLength": 2_000},
+                    "submit_label": {"type": "string", "maxLength": 80},
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["key", "prompt"],
+                            "properties": {
+                                "key": {"type": "string", "minLength": 1, "maxLength": 80},
+                                "prompt": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "input_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "single_choice",
+                                        "multiple_choice",
+                                        "fill_blank",
+                                        "short_answer_table",
+                                        "date",
+                                    ],
+                                },
+                                "placeholder": {"type": "string", "maxLength": 500},
+                                "options": {
+                                    "type": "array",
+                                    "maxItems": 8,
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["id", "label"],
+                                        "properties": {
+                                            "id": {"type": "string", "maxLength": 80},
+                                            "label": {"type": "string", "maxLength": 500},
+                                            "description": {
+                                                "type": "string",
+                                                "maxLength": 2_000,
+                                            },
+                                        },
+                                    },
+                                },
+                                "allow_custom": {"type": "boolean"},
+                                "allow_skip": {"type": "boolean"},
+                                "required": {"type": "boolean"},
+                            },
+                        },
+                    },
+                },
+            },
+            "example_data": {
+                "title": "目标澄清（聚合）",
+                "description": "一次回答全部问题，答案会一起发回给智能体。",
+                "submit_label": "一次提交全部答案",
+                "questions": [
+                    {
+                        "key": "intent",
+                        "prompt": "主要学习场景是什么？",
+                        "input_type": "single_choice",
+                        "options": [
+                            {"id": "exam", "label": "考试"},
+                            {"id": "project", "label": "项目"},
+                            {"id": "interview", "label": "面试"},
+                        ],
+                        "allow_custom": True,
+                        "allow_skip": True,
+                    },
+                    {
+                        "key": "time_limit",
+                        "prompt": "每天可投入多长时间？",
+                        "input_type": "single_choice",
+                        "options": [
+                            {"id": "h1", "label": "1 小时"},
+                            {"id": "h2", "label": "2-3 小时"},
+                            {"id": "h5", "label": "5 小时以上"},
+                        ],
+                        "allow_skip": True,
+                    },
+                ],
             },
         },
     }

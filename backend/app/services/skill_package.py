@@ -166,7 +166,7 @@ SYSTEM_CANVAS_SKILL_NAME = "Canvas 可信组件发布"
 SYSTEM_CANVAS_SKILL_VERSION = "1.0.0"
 SYSTEM_GOAL_ROUTE_SKILL_KEY = "goal-learning-route"
 SYSTEM_GOAL_ROUTE_SKILL_NAME = "目标学习路线编排"
-SYSTEM_GOAL_ROUTE_SKILL_VERSION = "1.0.0"
+SYSTEM_GOAL_ROUTE_SKILL_VERSION = "2.0.1"
 
 _CANVAS_FALLBACK_MD = (
     "---\n"
@@ -257,6 +257,8 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "fill_blank",
             "short_answer_table",
             "image_frame",
+            "goal_draft_editor",
+            "question_batch",
         ),
         fallback_md=_CANVAS_FALLBACK_MD,
     ),

@@ -1,5 +1,6 @@
 import type {
   CandidateGraphRequest,
+  CandidateGraphStreamRequest,
   Goal,
   GoalClarifyRequest,
   GoalClarifyResponse,
@@ -10,6 +11,7 @@ import type {
 } from '@/types/goals'
 import type { GraphSummary } from '@/types/graphs'
 import type { DeleteImpact } from '@/types/workflow'
+import type { SseEvent } from './sse'
 
 import { apiClient } from './client'
 
@@ -33,6 +35,24 @@ export function generateCandidateGraph(
     `/goals/${encodeURIComponent(goalId)}/candidate-graph`,
     payload,
   )
+}
+
+/**
+ * Stream a candidate graph root-first (root preview, then incremental node
+ * batches). Each yielded event carries the event name and typed payload:
+ * `graph.root` → root preview; `graph.nodes_added` → children + edges batch;
+ * `graph.complete` → full snapshot (review ready); `graph.error` → failure.
+ */
+export async function* streamCandidateGraph(
+  goalId: string,
+  payload: CandidateGraphStreamRequest,
+  options: { signal?: AbortSignal } = {},
+): AsyncGenerator<SseEvent<Record<string, unknown>>> {
+  yield* apiClient.postSse<Record<string, unknown>>(
+    `/goals/${encodeURIComponent(goalId)}/candidate-graph/stream`,
+    payload,
+    { signal: options.signal },
+  );
 }
 
 export function publishGoal(

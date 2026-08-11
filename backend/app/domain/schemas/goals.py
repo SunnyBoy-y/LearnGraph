@@ -62,6 +62,33 @@ class GoalAvailability(BaseModel):
         }
 
 
+AVAILABILITY_FIELDS = frozenset({"minutes_per_day", "days_per_week"})
+PREFERENCES_FIELDS = frozenset({"preferred_action_types", "session_minutes"})
+
+
+def sanitize_goal_nested_dict(
+    value: Any,
+    *,
+    allowed_fields: frozenset[str],
+) -> dict[str, Any]:
+    """Drop unknown keys and null values from a legacy/corrupt nested dict.
+
+    Historical schema versions wrote extra availability keys (e.g.
+    ``weekly_hours``) and the DB may still hold them. Strict input schemas
+    (extra="forbid" + non-null validators) must stay strict for new writes, so
+    read/write paths sanitize the stored JSON before validation instead of
+    weakening the schemas. This mirrors the T1-3 corrupt-JSON tolerance for
+    GoalView columns.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: item
+        for key, item in value.items()
+        if key in allowed_fields and item is not None
+    }
+
+
 class GoalPreferences(BaseModel):
     """User choices that can break ties, never fabricate mastery."""
 
@@ -155,6 +182,17 @@ class GoalView(ORMModel):
                     if key in ("constraints",)
                     else [] if key == "assumptions" else {}
                 )
+        # Sanitize legacy nested dicts: unknown keys (e.g. weekly_hours from an
+        # older schema) and null values must not fail strict GoalAvailability /
+        # GoalPreferences validation and 500 the whole goals list.
+        data["availability"] = sanitize_goal_nested_dict(
+            data.get("availability"),
+            allowed_fields=AVAILABILITY_FIELDS,
+        )
+        data["preferences"] = sanitize_goal_nested_dict(
+            data.get("preferences"),
+            allowed_fields=PREFERENCES_FIELDS,
+        )
         return data
 
 
@@ -217,6 +255,21 @@ class CandidateGraphRequest(BaseModel):
     thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] | None = None
 
 
+class CandidateGraphStreamRequest(CandidateGraphRequest):
+    """Streaming candidate-graph generation (trunk first, then layer expansion).
+
+    ``mode`` selects the generation budget: ``fast`` keeps thinking off and
+    produces a compact trunk plus a two-layer expansion per trunk node;
+    ``thinking`` allows the provider thinking mode with a fuller trunk and
+    wider two-layer branches. SSE event order is ``graph.root`` (root preview),
+    then one ``graph.nodes_added`` for the trunk, then per trunk node two
+    ``graph.nodes_added`` events (layer-1 children, then layer-2 grandchildren),
+    finishing with ``graph.complete`` (full snapshot).
+    """
+
+    mode: Literal["fast", "thinking"] = "thinking"
+
+
 class PublishGoalRequest(BaseModel):
     graph_id: str = Field(min_length=1, max_length=36)
     expected_revision: int = Field(ge=1)
@@ -247,6 +300,16 @@ class ModelGraphNode(BaseModel):
         description=(
             "Subject-aware teaching strategy for this node: encyclopedia-style "
             "entry angle, examples, common pitfalls, and how to verify mastery."
+        ),
+    )
+    layer: int = Field(
+        default=1,
+        ge=1,
+        le=2,
+        description=(
+            "Expand layer used by streaming chunks: 1 = direct child of the "
+            "batch parent, 2 = grandchild hanging under a layer-1 node. The "
+            "root node and the full graph draft ignore this field."
         ),
     )
 
@@ -297,6 +360,55 @@ class ModelGraphDraft(BaseModel):
         if not normalized:
             raise ValueError("The generated graph title cannot be blank")
         return normalized[:80]
+
+
+class ModelGraphRoot(BaseModel):
+    """First streaming stage: the graph title and its single root node.
+
+    Emitted to the client as soon as it is ready so the user sees the root
+    preview instead of a blank spinner while level-1 children still generate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=80)
+    root: ModelGraphNode
+
+    @field_validator("root")
+    @classmethod
+    def root_must_be_root_type(cls, value: ModelGraphNode) -> ModelGraphNode:
+        if value.node_type != "root":
+            value = value.model_copy(update={"node_type": "root"})
+        return value
+
+
+class ModelGraphChunkEdge(BaseModel):
+    """Chunk-relative edge; ``-1`` refers to this batch's mount parent.
+
+    For the trunk batch the mount parent is the graph root; for a branch
+    expansion it is the trunk node being expanded. Positive indexes are
+    relative to this chunk's own node list.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    source_index: int = Field(ge=-1)
+    target_index: int = Field(ge=-1)
+    relation: str = Field(pattern="^(contains|prerequisite|related|contrast|application)$")
+
+
+class ModelGraphChunk(BaseModel):
+    """One streaming stage hung under a mount parent (root or a trunk node).
+
+    ``source_index == -1`` in an edge means the mount parent. Nodes may span
+    two layers of one branch: ``layer=1`` nodes are direct children of the
+    parent (an automatic ``contains`` edge is guaranteed), ``layer=2`` nodes
+    are grandchildren attached to a layer-1 node via the chunk's edges (or to
+    the first layer-1 node when the model omits the edge, so no orphan is ever
+    persisted).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    nodes: list[ModelGraphNode] = Field(min_length=1, max_length=10)
+    edges: list[ModelGraphChunkEdge] = Field(default_factory=list, max_length=20)
 
 
 class PublishGoalResponse(BaseModel):

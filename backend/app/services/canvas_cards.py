@@ -24,6 +24,8 @@ CHANNEL_A_TYPES = frozenset(
         "fill_blank",
         "short_answer_table",
         "image_frame",
+        "goal_draft_editor",
+        "question_batch",
     }
 )
 MAX_MAGIC_CARD_PREVIEW_CHARS = 100_000

@@ -1,0 +1,14 @@
+/* Goal 图谱流式预览：先主干，再逐主干节点两层分层展开的树状渲染。 */
+.goal-flow-node-tree { display: grid; gap: 8px; padding: 4px 0 14px; }
+.goal-flow-graph-stream .goal-flow-node-tree { padding-top: 12px; }
+.goal-flow-node-tree__children {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 2px 14px;
+  padding: 2px 0 2px 14px;
+  border-left: 1px dashed #d7d7d7;
+}
+.goal-flow-node-tree__branch { display: grid; gap: 8px; }
+html.dark .goal-flow-node-tree__children {
+  border-left-color: rgba(255, 255, 255, 0.14);
+}
