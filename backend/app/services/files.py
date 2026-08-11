@@ -32,6 +32,7 @@ from app.domain.models import (
     utc_now,
 )
 from app.domain.schemas.files import (
+    AudioTranscriptionAsyncCreate,
     AudioTranscriptionCreate,
     FileBatchDeleteImpact,
     FileBatchDeleteResponse,
@@ -40,6 +41,7 @@ from app.domain.schemas.files import (
 from app.domain.schemas.workflow import DeleteImpact, ImpactItem
 from app.providers.storage_factory import object_storage_provider
 from app.providers.factory import transcription_provider_for_workspace
+from app.providers.ports.transcription import TranscriptionResult
 from app.providers.remote.transcription import TranscriptionProviderError
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import (
@@ -355,12 +357,12 @@ class FileService:
             raise AppError(
                 409,
                 "stored_transcription_model_required",
-                "The configured ASR model is realtime-only. Stored audio transcription requires a non-realtime model that supports /audio/transcriptions.",
+                "The configured ASR model is realtime-only. Stored audio transcription requires a non-realtime model (DashScope qwen3-asr-flash 走 input_audio 通道；paraformer-v2 走录音文件识别)。",
                 {
                     "provider_id": provider.provider_id,
                     "model_id": provider.model_id,
                     "configured_transport": "realtime_websocket",
-                    "required_transport": "http_audio_transcriptions",
+                    "required_transport": "http_transcription",
                 },
             )
         billing = BillingService(self.db, self.workspace_id, self.actor_id)
@@ -497,6 +499,236 @@ class FileService:
                 "The audio transcription failed unexpectedly",
                 {"transcription_id": transcription_id},
             ) from exc
+
+    def transcribe_file_async(
+        self,
+        file_id: str,
+        payload: AudioTranscriptionAsyncCreate,
+        idempotency_key: str,
+        *,
+        max_wait_seconds: float = 60.0,
+    ) -> AudioTranscription:
+        """DashScope 录音文件识别：提交公网音频 URL，轮询至完成或超时。
+
+        音频字节必须可通过 ``source_url`` 被 DashScope 访问（OSS/分享链接）。
+        超时后记录保持 ``processing`` 并携带 provider task id，
+        由 ``poll_file_transcription`` 续查。
+        """
+        record = self.files.require(file_id, "file")
+        extension = Path(record.original_name).suffix.casefold()
+        if not record.mime_type.casefold().startswith("audio/") and extension not in AUDIO_EXTENSIONS:
+            raise AppError(415, "audio_required", "Only stored audio files can be transcribed")
+        source_url = (payload.source_url or "").strip()
+        if not source_url.startswith(("http://", "https://")):
+            raise AppError(422, "public_audio_url_required", "Async recording transcription requires a public http(s) audio URL")
+        key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        request_payload = {
+            "file_id": file_id,
+            "file_sha256": record.sha256,
+            "source_url": source_url,
+            **payload.model_dump(exclude={"source_url"}),
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(request_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        existing = self.db.scalar(
+            select(AudioTranscription).where(
+                AudioTranscription.workspace_id == self.workspace_id,
+                AudioTranscription.idempotency_key_hash == key_hash,
+            )
+        )
+        if existing is not None:
+            if existing.request_hash != request_hash:
+                raise AppError(409, "idempotency_key_reused", "Idempotency-Key was reused for a different transcription")
+            return existing
+        provider = transcription_provider_for_workspace(
+            self.db,
+            self.workspace_id,
+            self.settings,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+            purpose="stored_async",
+        )
+        if provider is None:
+            raise AppError(503, "transcription_provider_unavailable", "No enabled DashScope async ASR Provider matches this request")
+        if not getattr(provider, "supports_async", False):
+            raise AppError(422, "async_transcription_unsupported", "This Provider/model does not support async recording transcription (use paraformer-v2 or sensevoice-v1)")
+        billing = BillingService(self.db, self.workspace_id, self.actor_id)
+        quote = billing.preflight_model_call(
+            provider_id=provider.provider_id,
+            model_id=provider.model_id,
+            feature="audio_transcription",
+            estimated_input_tokens=0,
+            estimated_output_tokens=0,
+            remote_capability=True,
+        )
+        transcription = AudioTranscription(
+            workspace_id=self.workspace_id,
+            file_id=file_id,
+            provider_id=provider.provider_id,
+            model_id=provider.model_id,
+            language=payload.language,
+            status="processing",
+            idempotency_key_hash=key_hash,
+            request_hash=request_hash,
+            created_by=self.actor_id,
+        )
+        try:
+            self.db.add(transcription)
+            self.db.flush()
+            transcription_id = transcription.id
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="file.transcription.async_submitted",
+                resource_type="audio_transcription",
+                resource_id=transcription_id,
+                details={"file_id": file_id, "provider_id": provider.provider_id, "model_id": provider.model_id},
+            )
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            logger.exception("Failed to persist the start of an async audio transcription")
+            raise AppError(500, "transcription_start_failed", "The async audio transcription could not be started") from exc
+
+        started = time.monotonic()
+        try:
+            task_id = provider.submit(source_url=source_url, language=payload.language)
+            transcription.provider_request_id = task_id
+            transcription.provider_trace = {
+                "provider_id": provider.provider_id,
+                "model_id": provider.model_id,
+                "async_mode": True,
+                "task_id": task_id,
+                "source_url": source_url,
+            }
+            self.db.commit()
+        except TranscriptionProviderError as exc:
+            self._persist_transcription_failure(
+                transcription_id=transcription.id,
+                file_id=file_id,
+                provider_id=provider.provider_id,
+                error_code="transcription_submit_failed",
+                error_message=str(exc),
+            )
+            raise AppError(502, "transcription_submit_failed", str(exc), {"transcription_id": transcription.id}) from exc
+        try:
+            result = provider.wait_for_result(task_id, max_wait_seconds=max_wait_seconds)
+        except TranscriptionProviderError as exc:
+            if f"task_id={task_id}" in str(exc):
+                # 仍在运行：保留 processing 状态供轮询续查。
+                self.db.refresh(transcription)
+                return transcription
+            self._persist_transcription_failure(
+                transcription_id=transcription.id,
+                file_id=file_id,
+                provider_id=provider.provider_id,
+                error_code="transcription_provider_failed",
+                error_message=str(exc),
+            )
+            raise AppError(502, "transcription_provider_failed", str(exc), {"transcription_id": transcription.id}) from exc
+        self._finalize_async_transcription(transcription, provider, billing, quote, result, started, task_id)
+        self.db.refresh(transcription)
+        return transcription
+
+    def poll_file_transcription(
+        self,
+        transcription_id: str,
+        *,
+        max_wait_seconds: float = 120.0,
+    ) -> AudioTranscription:
+        """轮询续查一条进行中的异步录音识别任务，直至完成/失败或超时。"""
+        transcription = self.db.scalar(
+            select(AudioTranscription).where(
+                AudioTranscription.id == transcription_id,
+                AudioTranscription.workspace_id == self.workspace_id,
+            )
+        )
+        if transcription is None:
+            raise AppError(404, "transcription_not_found", "The transcription was not found")
+        if transcription.status != "processing" or not transcription.provider_request_id:
+            return transcription
+        provider = transcription_provider_for_workspace(
+            self.db,
+            self.workspace_id,
+            self.settings,
+            provider_id=transcription.provider_id,
+            model_id=transcription.model_id,
+            purpose="stored_async",
+        )
+        if provider is None or not getattr(provider, "supports_async", False):
+            raise AppError(503, "transcription_provider_unavailable", "The async ASR Provider is no longer available")
+        task_id = transcription.provider_request_id
+        try:
+            result = provider.wait_for_result(task_id, max_wait_seconds=max_wait_seconds)
+        except TranscriptionProviderError as exc:
+            if f"task_id={task_id}" in str(exc):
+                return transcription
+            self._persist_transcription_failure(
+                transcription_id=transcription.id,
+                file_id=transcription.file_id,
+                provider_id=provider.provider_id,
+                error_code="transcription_provider_failed",
+                error_message=str(exc),
+            )
+            raise AppError(502, "transcription_provider_failed", str(exc), {"transcription_id": transcription.id}) from exc
+        billing = BillingService(self.db, self.workspace_id, self.actor_id)
+        quote = billing.preflight_model_call(
+            provider_id=provider.provider_id,
+            model_id=provider.model_id,
+            feature="audio_transcription",
+            estimated_input_tokens=0,
+            estimated_output_tokens=0,
+            remote_capability=True,
+        )
+        started = time.monotonic()
+        self._finalize_async_transcription(transcription, provider, billing, quote, result, started, task_id)
+        self.db.refresh(transcription)
+        return transcription
+
+    def _finalize_async_transcription(
+        self,
+        transcription: AudioTranscription,
+        provider: object,
+        billing: BillingService,
+        quote: object,
+        result: TranscriptionResult,
+        started: float,
+        task_id: str,
+    ) -> None:
+        transcription.status = "completed"
+        transcription.transcript = result.text
+        transcription.duration_seconds = result.duration_seconds
+        transcription.provider_request_id = result.request_id or task_id
+        latency_ms = int((time.monotonic() - started) * 1000)
+        transcription.provider_trace = {
+            **transcription.provider_trace,
+            "async_mode": True,
+            "task_id": task_id,
+            "latency_ms": latency_ms,
+            "usage": result.usage,
+        }
+        usage = billing.record_usage(
+            quote,
+            input_tokens=int(result.usage.get("input_tokens") or 0),
+            output_tokens=int(result.usage.get("output_tokens") or 0),
+            attempt=1,
+            latency_ms=latency_ms,
+            usage_reported=bool(result.usage),
+        )
+        self.db.flush()
+        transcription.provider_trace = {
+            **transcription.provider_trace,
+            "usage_event_id": usage.id,
+        }
+        transcription.completed_at = utc_now()
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="file.transcription.async_completed",
+            resource_type="audio_transcription",
+            resource_id=transcription.id,
+            details={"file_id": transcription.file_id, "provider_id": provider.provider_id, "task_id": task_id},
+        )
+        self.db.commit()
 
     def add_reference(self, file_id: str, payload: FileReferenceCreate) -> FileReference:
         reference = self.reference_service.add(file_id, payload)

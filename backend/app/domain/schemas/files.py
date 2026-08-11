@@ -75,6 +75,15 @@ class AudioTranscriptionCreate(BaseModel):
     language: str | None = Field(default=None, min_length=2, max_length=32)
 
 
+class AudioTranscriptionAsyncCreate(BaseModel):
+    """DashScope 录音文件识别：音频必须已通过公网/OSS URL 可达。"""
+
+    source_url: str = Field(min_length=8, max_length=2048)
+    provider_id: str | None = Field(default=None, max_length=36)
+    model_id: str | None = Field(default=None, max_length=160)
+    language: str | None = Field(default=None, min_length=2, max_length=32)
+
+
 class AudioTranscriptionView(ORMModel):
     id: str
     workspace_id: str

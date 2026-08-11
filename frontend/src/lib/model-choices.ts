@@ -9,6 +9,7 @@ import type {
   ProviderModel,
   ThinkingMode,
 } from "@/types/providers";
+import { isDashscopeProvider } from "@/types/providers";
 
 export const thinkingLabels: Record<ThinkingMode, string> = {
   off: "关闭",
@@ -36,6 +37,25 @@ export function providerCapabilityString(
 
 export function isRealtimeTranscriptionModel(modelId: string | null | undefined) {
   return Boolean(modelId?.toLocaleLowerCase().includes("realtime"));
+}
+
+/**
+ * 解析 Provider 的转写模型 ID：优先读能力快照；DashScope 系 Provider
+ * （qwen 等，无 transcription 角色）未显式配置时，与后端兜底默认一致。
+ */
+export function providerAsrModelId(
+  provider: Provider | undefined,
+  lane: "stored" | "realtime",
+): string {
+  if (!provider) return "";
+  const capabilityKey =
+    lane === "realtime"
+      ? "default_realtime_transcription_model_id"
+      : "default_transcription_model_id";
+  const configured = providerCapabilityString(provider, capabilityKey);
+  if (configured) return configured;
+  if (!isDashscopeProvider(provider)) return "";
+  return lane === "realtime" ? "qwen3-asr-flash-realtime" : "qwen3-asr-flash";
 }
 
 export function providerModelOptions(

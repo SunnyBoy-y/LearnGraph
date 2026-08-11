@@ -135,6 +135,29 @@ export function isOfficialDeepSeekProvider(
 }
 
 /**
+ * DashScope 网关识别（转写/听写兜底用）。镜像后端
+ * `is_dashscope_api_base_url`：公共 `dashscope*.aliyuncs.com` 网关与私有
+ * `*.maas.aliyuncs.com` 租户都共用一把 DashScope key 提供 ASR。
+ */
+export function isDashscopeProvider(
+  provider: Pick<Provider, "base_url">,
+): boolean {
+  const baseUrl = provider.base_url;
+  if (!baseUrl) return false;
+  try {
+    const url = new URL(baseUrl);
+    if (url.protocol !== "https:" || url.username || url.password) return false;
+    const host = url.hostname.toLowerCase();
+    if (host.endsWith(".maas.aliyuncs.com")) return true;
+    if (!host.endsWith(".aliyuncs.com")) return false;
+    const label = host.split(".")[0];
+    return label === "dashscope" || label.startsWith("dashscope-");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * DeepSeek is OpenAI-compatible at the wire level. This is the behavioral
  * "DeepSeek family" check (thinking-mode fallbacks, balance routing); it also
  * matches relay stations that host DeepSeek models. It must not be used for

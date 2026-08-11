@@ -238,6 +238,7 @@ import {
 } from "@/components/ui/select";
 import type { FileRecord } from "@/types/files";
 import {
+  isDashscopeProvider,
   isDeepSeekProvider,
   isModelProviderType,
   type ProviderModel,
@@ -270,6 +271,7 @@ import {
   modelChoiceValue,
   modelProtocolLabel,
   parseModelChoiceValue,
+  providerAsrModelId,
   providerCapabilityString,
   providerModelOptions,
   thinkingLabels,
@@ -2889,30 +2891,31 @@ export function ChatCanvasPage() {
       (providers.data ?? []).filter((provider) => {
         if (!provider.enabled || !provider.remote_capability) return false;
         const role = providerCapabilityString(provider, "provider_role");
-        return (
+        if (
           role === "transcription" ||
           provider.provider_type === "openai_compatible_transcription"
+        ) {
+          return true;
+        }
+        // DashScope 系 Provider（qwen 等）共用同一把 key，后端已支持作为
+        // 转写通道兜底（stored / realtime / 异步录音识别）。
+        return (
+          (provider.provider_type === "qwen" ||
+            provider.provider_type === "qwen_image_search" ||
+            provider.provider_type === "openai_compatible_chat") &&
+          isDashscopeProvider(provider)
         );
       }),
     [providers.data],
   );
   const asrAvailable = transcriptionProviders.some((provider) => {
-    const storedModel = providerCapabilityString(
-      provider,
-      "default_transcription_model_id",
-    );
-    const realtimeModel = providerCapabilityString(
-      provider,
-      "default_realtime_transcription_model_id",
-    );
+    const storedModel = providerAsrModelId(provider, "stored");
+    const realtimeModel = providerAsrModelId(provider, "realtime");
     return Boolean(storedModel || realtimeModel);
   });
   const storedAudioTranscriptionProvider = transcriptionProviders.find(
     (provider) => {
-      const modelId = providerCapabilityString(
-        provider,
-        "default_transcription_model_id",
-      );
+      const modelId = providerAsrModelId(provider, "stored");
       return Boolean(modelId && !isRealtimeTranscriptionModel(modelId));
     },
   );
@@ -2921,26 +2924,15 @@ export function ChatCanvasPage() {
   // 非 realtime 模型走 HTTP 分段上传。
   const realtimeAudioTranscriptionProvider = transcriptionProviders.find(
     (provider) => {
-      const configuredRealtime = providerCapabilityString(
-        provider,
-        "default_realtime_transcription_model_id",
-      );
+      const configuredRealtime = providerAsrModelId(provider, "realtime");
       if (isRealtimeTranscriptionModel(configuredRealtime)) return true;
       // 兼容旧配置：旧 key 中的 realtime 型号仅用于实时听写。
-      return isRealtimeTranscriptionModel(
-        providerCapabilityString(provider, "default_transcription_model_id"),
-      );
+      return isRealtimeTranscriptionModel(providerAsrModelId(provider, "stored"));
     },
   );
   const realtimeAudioTranscriptionModel = realtimeAudioTranscriptionProvider
-    ? providerCapabilityString(
-        realtimeAudioTranscriptionProvider,
-        "default_realtime_transcription_model_id",
-      ) ||
-      providerCapabilityString(
-        realtimeAudioTranscriptionProvider,
-        "default_transcription_model_id",
-      )
+    ? providerAsrModelId(realtimeAudioTranscriptionProvider, "realtime") ||
+      providerAsrModelId(realtimeAudioTranscriptionProvider, "stored")
     : "";
   const asrRealtimeConfigured = Boolean(
     realtimeAudioTranscriptionProvider && realtimeAudioTranscriptionModel,
@@ -5227,10 +5219,7 @@ export function ChatCanvasPage() {
         toast.message(`正在为「${file.original_name}」自动转写…`);
         const transcription = await transcribeAudioFile(file.id, {
           provider_id: storedAudioTranscriptionProvider?.id,
-          model_id: providerCapabilityString(
-            storedAudioTranscriptionProvider,
-            "default_transcription_model_id",
-          ),
+          model_id: providerAsrModelId(storedAudioTranscriptionProvider, "stored"),
         });
         if (
           transcription.status !== "completed" ||
@@ -5274,7 +5263,7 @@ export function ChatCanvasPage() {
         await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
       }
     },
-    [queryClient, storedAudioTranscriptionProvider],
+    [queryClient, storedAudioTranscriptionProvider, workspaceId],
   );
 
   const uploadAndIndex = useCallback(
@@ -5296,7 +5285,7 @@ export function ChatCanvasPage() {
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
       return prepareStoredFile(stored, agentMode);
     },
-    [prepareStoredFile, queryClient, responseMode],
+    [prepareStoredFile, queryClient, responseMode, workspaceId],
   );
 
   const convertLongPaste = useMutation({
@@ -6072,9 +6061,9 @@ export function ChatCanvasPage() {
             (
               await transcribeDictationSegment(segment, {
                 provider_id: storedAudioTranscriptionProvider.id,
-                model_id: providerCapabilityString(
+                model_id: providerAsrModelId(
                   storedAudioTranscriptionProvider,
-                  "default_transcription_model_id",
+                  "stored",
                 ),
               })
             ).text,
@@ -6259,6 +6248,7 @@ export function ChatCanvasPage() {
     selectedModelId,
     settings.data,
     storedAudioTranscriptionProvider,
+    workspaceId,
   ]);
 
   const skipDictationFinalizing = useCallback(() => {

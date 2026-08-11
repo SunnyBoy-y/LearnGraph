@@ -14,6 +14,7 @@ from app.domain.schemas.files import (
     DocumentJobCreate,
     DocumentJobView,
     FileParserCapabilityView,
+    AudioTranscriptionAsyncCreate,
     AudioTranscriptionCreate,
     AudioTranscriptionView,
     FileBatchDeleteConfirm,
@@ -315,6 +316,47 @@ def transcribe_file(
     _require_file_access(db, context, file_id, "read")
     return AudioTranscriptionView.model_validate(
         service(db, context, settings).transcribe(file_id, payload, idempotency_key)
+    )
+
+
+@router.post(
+    "/{file_id}/transcriptions/async",
+    response_model=AudioTranscriptionView,
+    status_code=status.HTTP_201_CREATED,
+)
+def transcribe_file_async(
+    file_id: str,
+    payload: AudioTranscriptionAsyncCreate,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=128)],
+    max_wait: Annotated[float, Query(alias="maxWaitSeconds", ge=1, le=300)] = 60.0,
+) -> AudioTranscriptionView:
+    """DashScope 录音文件识别：提交公网音频 URL；超时返回 processing 供轮询。"""
+    _require_file_access(db, context, file_id, "read")
+    return AudioTranscriptionView.model_validate(
+        service(db, context, settings).transcribe_file_async(
+            file_id, payload, idempotency_key, max_wait_seconds=max_wait
+        )
+    )
+
+
+@router.get("/{file_id}/transcriptions/{transcription_id}", response_model=AudioTranscriptionView)
+def poll_file_transcription(
+    file_id: str,
+    transcription_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    max_wait: Annotated[float, Query(alias="maxWaitSeconds", ge=1, le=300)] = 120.0,
+) -> AudioTranscriptionView:
+    """续查一条 processing 中的异步录音识别任务，直至完成/失败或超时。"""
+    _require_file_access(db, context, file_id, "read")
+    return AudioTranscriptionView.model_validate(
+        service(db, context, settings).poll_file_transcription(
+            transcription_id, max_wait_seconds=max_wait
+        )
     )
 
 

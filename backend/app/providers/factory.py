@@ -32,7 +32,11 @@ from app.providers.ports.memory import MemoryProviderPort
 from app.providers.ports.research import DeepResearchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.ports.transcription import TranscriptionProviderPort
-from app.providers.remote.transcription import OpenAICompatibleTranscriptionProvider
+from app.providers.remote.transcription import (
+    DashScopeAsyncTranscriptionProvider,
+    OpenAICompatibleTranscriptionProvider,
+    is_async_transcription_model,
+)
 from app.providers.remote.anysearch import AnySearchSearchProvider
 from app.providers.model_options import (
     ModelCapabilityError,
@@ -1021,6 +1025,26 @@ def search_provider_for_workspace(
         return UnavailableSearchProvider(provider.id, f"Configured SearchProvider is unavailable: {exc}")
 
 
+# DashScope 系 Provider（qwen / qwen_image_search / openai_compatible_chat 指向
+# DashScope 网关）没有专门的 transcription 角色，但共用同一把 DashScope key，
+# 可作为转写通道兜底，避免用户为 ASR 重复配置一个 Provider 行。
+DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES: frozenset[str] = frozenset(
+    {"qwen", "qwen_image_search", "openai_compatible_chat"}
+)
+
+# 兜底默认模型：文件转写 / 实时 / 异步录音识别。均已在 DashScope 网关验证可用。
+DEFAULT_DASHSCOPE_STORED_ASR_MODEL = "qwen3-asr-flash"
+DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL = "qwen3-asr-flash-realtime"
+DEFAULT_DASHSCOPE_ASYNC_ASR_MODEL = "paraformer-v2"
+
+
+def _is_dashscope_provider_row(provider: ProviderConfig) -> bool:
+    base_url = (provider.base_url or "").strip()
+    return is_dashscope_api_base_url(base_url) or base_url.casefold().endswith(
+        ".maas.aliyuncs.com"
+    )
+
+
 def transcription_provider_for_workspace(
     db: Session,
     workspace_id: str,
@@ -1030,56 +1054,106 @@ def transcription_provider_for_workspace(
     model_id: str | None = None,
     purpose: str = "stored",
 ) -> TranscriptionProviderPort | None:
-    if purpose not in {"stored", "realtime"}:
+    if purpose not in {"stored", "realtime", "stored_async"}:
         raise ValueError(f"Unsupported transcription purpose: {purpose}")
     if purpose == "stored" and provider_id is None and model_id is None:
         provider_id, model_id = _functional_model_target(
             db, workspace_id, "transcription"
         )
-    statement = select(ProviderConfig).where(
+    explicit_model = (model_id or "").strip()
+    base_query = select(ProviderConfig).where(
         ProviderConfig.workspace_id == workspace_id,
         ProviderConfig.enabled.is_(True),
         ProviderConfig.remote_capability.is_(True),
-        ProviderConfig.provider_type.in_(TRANSCRIPTION_PROVIDER_TYPES),
     )
     if provider_id:
-        statement = statement.where(ProviderConfig.id == provider_id)
-    provider = db.scalar(statement.order_by(*_provider_priority_order()))
-    if provider is None or not provider.base_url:
-        return None
-    capabilities = dict(provider.capabilities or {})
-    explicit_model = (model_id or "").strip()
-    stored_model = str(
-        capabilities.get("default_transcription_model_id") or ""
-    ).strip()
-    realtime_model = str(
-        capabilities.get("default_realtime_transcription_model_id") or ""
-    ).strip()
-    if purpose == "realtime":
-        resolved_model = explicit_model or realtime_model
-        if not resolved_model and "realtime" in stored_model.casefold():
-            # Legacy rows overloaded the stored key with the realtime model.
-            resolved_model = stored_model
-    else:
-        resolved_model = explicit_model or stored_model
-    if not resolved_model:
-        return None
-    is_realtime = "realtime" in resolved_model.casefold()
-    if (purpose == "realtime") != is_realtime:
-        return None
-    try:
-        api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
-        return None
-    if not api_key:
-        return None
-    return OpenAICompatibleTranscriptionProvider(
-        provider_id=provider.id,
-        model_id=resolved_model,
-        base_url=provider.base_url,
-        api_key=api_key,
-        timeout_seconds=float(capabilities.get("transcription_timeout_seconds") or 180),
+        base_query = base_query.where(ProviderConfig.id == provider_id)
+
+    transcription_rows = list(
+        db.scalars(
+            base_query.where(
+                ProviderConfig.provider_type.in_(TRANSCRIPTION_PROVIDER_TYPES)
+            ).order_by(*_provider_priority_order())
+        ).all()
     )
+    # 没有专门转写角色时，复用已启用的 DashScope 系 Provider 及其密钥。
+    fallback_rows: list[ProviderConfig] = []
+    if not transcription_rows:
+        fallback_rows = list(
+            db.scalars(
+                base_query.where(
+                    ProviderConfig.provider_type.in_(
+                        DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES
+                    )
+                ).order_by(*_provider_priority_order())
+            ).all()
+        )
+
+    for provider in [*transcription_rows, *fallback_rows]:
+        if provider is None or not provider.base_url:
+            continue
+        capabilities = dict(provider.capabilities or {})
+        stored_model = str(
+            capabilities.get("default_transcription_model_id") or ""
+        ).strip()
+        realtime_model = str(
+            capabilities.get("default_realtime_transcription_model_id") or ""
+        ).strip()
+        async_model = str(
+            capabilities.get("default_async_transcription_model_id") or ""
+        ).strip()
+        dashscope_row = _is_dashscope_provider_row(provider)
+        # 兜底默认模型只作用于「非转写角色」的 DashScope 系行；显式配置了
+        # transcription 角色的行保持旧语义（能力里没有就跳过）。
+        fallback_default = (
+            provider.provider_type in DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES
+            and dashscope_row
+        )
+        if purpose == "realtime":
+            resolved_model = explicit_model or realtime_model
+            if not resolved_model and "realtime" in stored_model.casefold():
+                # Legacy rows overloaded the stored key with the realtime model.
+                resolved_model = stored_model
+            if not resolved_model and fallback_default:
+                resolved_model = DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL
+        elif purpose == "stored_async":
+            resolved_model = explicit_model or async_model
+            if not resolved_model and fallback_default:
+                resolved_model = DEFAULT_DASHSCOPE_ASYNC_ASR_MODEL
+            if not is_async_transcription_model(resolved_model):
+                continue
+        else:
+            resolved_model = explicit_model or stored_model
+            if not resolved_model and fallback_default:
+                resolved_model = DEFAULT_DASHSCOPE_STORED_ASR_MODEL
+        if not resolved_model:
+            continue
+        is_realtime = "realtime" in resolved_model.casefold()
+        if (purpose == "realtime") != is_realtime:
+            continue
+        try:
+            api_key = _secret_for_provider(db, workspace_id, provider, settings)
+        except Exception:
+            continue
+        if not api_key:
+            continue
+        if purpose == "stored_async":
+            if not dashscope_row:
+                continue
+            return DashScopeAsyncTranscriptionProvider(
+                provider_id=provider.id,
+                model_id=resolved_model,
+                base_url=provider.base_url,
+                api_key=api_key,
+            )
+        return OpenAICompatibleTranscriptionProvider(
+            provider_id=provider.id,
+            model_id=resolved_model,
+            base_url=provider.base_url,
+            api_key=api_key,
+            timeout_seconds=float(capabilities.get("transcription_timeout_seconds") or 180),
+        )
+    return None
 
 
 def embedding_provider_for_workspace(
