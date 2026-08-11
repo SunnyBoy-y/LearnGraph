@@ -835,9 +835,12 @@ class SandboxBootstrapService:
         self._set_phase(job, "pull_runner", 15, "正在下载预构建沙箱镜像…")
         client = self._docker_client()
         try:
-            repository = _repository_for_ref(configured_ref)
-            digest_ref = configured_ref if "@sha256:" in configured_ref else repository
-            for chunk in client.api.pull(digest_ref, stream=True, decode=True):
+            # docker-py's pull() parses ``repository:tag`` itself.  Passing the
+            # bare repository here would silently drop the configured tag and
+            # fetch ``:latest`` instead (e.g. ``...:1.0.0`` → ``...:latest``),
+            # which 404s for a tag-only registry image and would also make the
+            # ``client.images.get(configured_ref)`` below fail.
+            for chunk in client.api.pull(configured_ref, stream=True, decode=True):
                 failure = _append_build_entry(job, chunk)
                 if failure:
                     self._fail(job, "prebuilt_pull_failed", _build_failure_message(failure))
@@ -951,7 +954,25 @@ class SandboxBootstrapService:
                     self._verify_and_persist_image(
                         job, settings, digest, source="prebuilt_pull", tag=prebuilt_ref
                     )
-                return
+                    return
+                # Auto mode promises "pull the prebuilt image when one is
+                # configured, otherwise fall back to a local Docker build":
+                # an unreachable/missing registry image (not pushed yet,
+                # private without login, wrong tag) must not strand the
+                # deployment uninitialized.  An explicit prebuilt-only policy
+                # (request mode ``prebuilt`` or a persisted source mode of
+                # ``prebuilt``) still fails closed.
+                if job.mode == "auto" and effective_mode == "auto":
+                    with self._lock:
+                        job.status = "running"
+                        job.error_code = None
+                        job.error_message = None
+                        job.finished_at = None
+                    job.append_log(
+                        "[auto-fallback] 预构建镜像拉取失败，回退到本地构建"
+                    )
+                else:
+                    return
 
             sandbox_root = self._sandbox_root()
             dockerfile = sandbox_root / "Dockerfile"

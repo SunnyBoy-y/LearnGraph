@@ -7,17 +7,45 @@ function.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.domain.schemas.sandbox import SandboxBootstrapStartRequest
 from app.services.sandbox_bootstrap import (
+    BootstrapJob,
     SandboxBootstrapService,
     _prebuilt_image_ref,
 )
 
 ACR_REF = "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:1.0.0"
+
+
+class _FakeDockerClient:
+    """Minimal docker client double for the local-build fallback path."""
+
+    def __init__(self) -> None:
+        self.api = _FakeApi()
+        self.images = _FakeImages()
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeApi:
+    def build(self, **kwargs: Any):
+        return iter([])  # empty build stream
+
+
+class _FakeImages:
+    def get(self, ref: str) -> "_FakeImage":
+        return _FakeImage()
+
+
+class _FakeImage:
+    id = "sha256:" + "0" * 64
 
 
 class TestPrebuiltImageRefValidation:
@@ -63,8 +91,9 @@ class TestBootstrapStartModeSelection:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
         # tests/api/conftest.py disables the sandbox by default; the bootstrap
-        # gate tests opt back in explicitly.
-        settings = Settings(sandbox_enabled=True)  # sandbox_prebuilt_image defaults to None
+        # gate tests opt back in explicitly. Explicit None also beats a local
+        # .env LEARNGRAPH_SANDBOX_PREBUILT_IMAGE (init args > env > dotenv).
+        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=None)  # sandbox_prebuilt_image defaults to None
         result = service.start(settings, actor_id="u-test", mode="prebuilt")
         assert result["accepted"] is False
         assert result["error_code"] == "prebuilt_image_not_configured"
@@ -114,6 +143,54 @@ class TestBootstrapStartModeSelection:
 
     def test_status_reports_missing_prebuilt(self) -> None:
         service = SandboxBootstrapService()
-        status = service.status(Settings())
+        status = service.status(Settings(sandbox_prebuilt_image=None))
         assert status["prebuilt_image_configured"] is False
         assert status["prebuilt_image_ref"] is None
+
+
+class TestAutoModeLocalBuildFallback:
+    """Auto mode promises "pull when configured, otherwise build locally".
+
+    A failed prebuilt pull (image not pushed, private registry without login,
+    wrong tag) must fall back to the local Docker build instead of stranding
+    the deployment uninitialized.  Explicit ``prebuilt`` requests keep failing
+    closed.
+    """
+
+    @staticmethod
+    def _failing_pull(service: SandboxBootstrapService):
+        def _pull(job: BootstrapJob, settings: Settings, ref: str) -> None:
+            service._fail(job, "prebuilt_pull_failed", "simulated pull failure")
+            return None
+
+        return _pull
+
+    def test_auto_mode_falls_back_to_local_build(self, monkeypatch, tmp_path) -> None:
+        from app.services import sandbox_bootstrap as sb
+
+        service = SandboxBootstrapService()
+        monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        monkeypatch.setattr(service, "_pull_prebuilt_image", self._failing_pull(service))
+        monkeypatch.setattr(service, "_sandbox_root", lambda: tmp_path)
+        (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        monkeypatch.setattr(service, "_smoke_test", lambda *args, **kwargs: None)
+        monkeypatch.setattr(sb, "save_runtime_config", lambda *args, **kwargs: None)
+        monkeypatch.setattr(service, "_docker_client", lambda: _FakeDockerClient())
+        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=ACR_REF)
+        job = BootstrapJob(id="u-fallback", actor_id="u-test", mode="auto")
+        service._run_job(job, settings)  # noqa: SLF001 - unit-level verification
+        assert job.status == "succeeded"
+        assert any("[auto-fallback]" in line for line in job.log_lines)
+        assert job.image_digest == _FakeImage.id
+        assert job.error_code is None
+
+    def test_explicit_prebuilt_mode_does_not_fallback(self, monkeypatch) -> None:
+        service = SandboxBootstrapService()
+        monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        monkeypatch.setattr(service, "_pull_prebuilt_image", self._failing_pull(service))
+        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=ACR_REF)
+        job = BootstrapJob(id="u-nofallback", actor_id="u-test", mode="prebuilt")
+        service._run_job(job, settings)  # noqa: SLF001 - unit-level verification
+        assert job.status == "failed"
+        assert job.error_code == "prebuilt_pull_failed"
+        assert not any("[auto-fallback]" in line for line in job.log_lines)

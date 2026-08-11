@@ -97,8 +97,20 @@ def _sandbox_capacity_file_lock(settings: Settings) -> InterProcessFileLock:
 
 def _sandbox_workspace_path(settings: Settings, relative_path: str) -> Path:
     root = _sandbox_workspace_root(settings)
-    candidate = (root / relative_path).resolve()
-    if candidate == root or root not in candidate.parents:
+    # String-based containment. ``Path.resolve()`` consults the filesystem and,
+    # on Windows, can transiently return a different spelling (extended-length
+    # ``\\?\`` prefix or 8.3 short name) while parent directories are being
+    # created concurrently, which made the old ``parents()``-based check
+    # spuriously reject valid paths under parallel first-use. ``os.path.abspath``
+    # is a deterministic textual normalization, so this security check is
+    # race-free while keeping the fail-closed semantics (``..``/absolute/other
+    # drive inputs still normalize outside the root and are refused).
+    candidate = Path(os.path.abspath(os.path.join(str(root), relative_path)))
+    root_key = os.path.normcase(str(root))
+    candidate_key = os.path.normcase(str(candidate))
+    if candidate_key == root_key or not candidate_key.startswith(
+        root_key.rstrip("\\/") + os.sep
+    ):
         raise SandboxBackendError(
             f"Sandbox workspace path escaped the managed root (relative={relative_path!r})"
         )
