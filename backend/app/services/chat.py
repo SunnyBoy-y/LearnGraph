@@ -306,6 +306,11 @@ def _inject_web_citation_markers(text: str, sources: list[dict]) -> str:
     # Fallback: append numbered markers once when offsets are unavailable.
     if "网页引用：" in text:
         return text
+    # DashScope 原生联网（enable_search + enable_citation）会把角标直接写在
+    # 正文里（citation_format 默认 [N]，或自定义如 [ref_N]）。此时来源编号
+    # 已内联在正文，追加尾部列表只会产生重复徽章噪音，直接保留原样。
+    if re.search(r"\[ref_\d{1,3}\]|\[\d{1,3}\](?!\()", text):
+        return text
     markers = "".join(f"（网页引用：{source['index']}）" for source in sources if "index" in source)
     if not markers:
         return text
@@ -9298,6 +9303,20 @@ class ChatService:
                             ):
                                 if cancellation_requested():
                                     raise _GenerationCancellationRequested()
+                                # DashScope 原生联网（enable_search + enable_source）
+                                # 的 search_info 在流式早期即返回：立即把来源 URL
+                                # 推给前端（prepend_search_result 的效果），角标
+                                # [ref_N] 无需等整个流结束即可指代具体链接。
+                                sequence, next_ordinal, source_record, _native_pushed, native_events = self._push_native_sources_live(
+                                    session_id=session_id,
+                                    message_id=message.id,
+                                    message_version_id=version.id,
+                                    sequence=sequence,
+                                    next_ordinal=next_ordinal,
+                                    source_record=source_record,
+                                )
+                                for native_event in native_events:
+                                    yield self._encode_event(native_event)
                                 if provider_event.type == "text_delta":
                                     chunk = provider_event.content or ""
                                     if not chunk:
@@ -9434,6 +9453,17 @@ class ChatService:
                                     raise _GenerationCancellationRequested()
                                 if not chunk:
                                     continue
+                                # 极速/思考模式同样尽早推送原生搜索来源（URL）。
+                                sequence, next_ordinal, source_record, _native_pushed, native_events = self._push_native_sources_live(
+                                    session_id=session_id,
+                                    message_id=message.id,
+                                    message_version_id=version.id,
+                                    sequence=sequence,
+                                    next_ordinal=next_ordinal,
+                                    source_record=source_record,
+                                )
+                                for native_event in native_events:
+                                    yield self._encode_event(native_event)
                                 self._mark_first_token(
                                     active_attempt,
                                     provider_trace,
@@ -10719,6 +10749,109 @@ class ChatService:
                 payload.document_selection,
                 payload.content,
             )
+
+    def _push_native_sources_live(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        message_version_id: str,
+        sequence: int,
+        next_ordinal: int,
+        source_record: MessagePartRecord | None,
+    ) -> tuple[int, int, MessagePartRecord | None, bool, list[dict]]:
+        """流式中尽早把 DashScope 原生联网返回的搜索来源（URL 列表）推给前端。
+
+        ``enable_search + enable_source`` 的 ``search_info`` 会在流式早期到达
+        （官方 ``prepend_search_result`` 场景）；此方法立即创建/更新
+        ``source_list`` part 并返回待发送的 SSE 事件，让前端角标 ``[ref_N]``
+        能立刻指代到具体 URL，而不是等整个流结束。内容无变化时不重复推送。
+        """
+
+        raw = getattr(self.model_provider, "last_sources", None)
+        if not raw:
+            return sequence, next_ordinal, source_record, False, []
+        native = _normalize_web_sources(list(raw))
+        if not native:
+            return sequence, next_ordinal, source_record, False, []
+        existing = (
+            list((source_record.data or {}).get("results") or [])
+            if source_record is not None
+            else []
+        )
+        merged = _normalize_web_sources([*existing, *native])
+        current = (
+            list((source_record.data or {}).get("results") or [])
+            if source_record is not None
+            else None
+        )
+        if current is not None and current == merged:
+            return sequence, next_ordinal, source_record, False, []
+        events: list[dict] = []
+        if source_record is None:
+            source_record = self.message_parts.add(
+                MessagePartRecord(
+                    workspace_id=self.workspace_id,
+                    message_version_id=message_version_id,
+                    ordinal=next_ordinal,
+                    part_type="source_list",
+                    status="streaming",
+                    content="",
+                    data={"results": merged},
+                )
+            )
+            next_ordinal += 1
+            events.append(
+                self._append_event(
+                    session_id=session_id,
+                    message_id=message_id,
+                    message_version_id=message_version_id,
+                    part_id=source_record.id,
+                    sequence=sequence,
+                    event_type="part.started",
+                    payload={
+                        "part": self._part_snapshot(
+                            source_record.id,
+                            "source_list",
+                            "streaming",
+                            "",
+                            source_record.data,
+                        )
+                    },
+                )
+            )
+            sequence += 1
+        source_record.status = "completed"
+        source_record.content = f"已汇集 {len(merged)} 条可访问来源。"
+        source_record.data = {
+            **(source_record.data or {}),
+            "native_provider_id": self.model_provider.provider_id,
+            "native_remote_capability": bool(
+                getattr(self.model_provider, "remote_capability", False)
+            ),
+            "results": merged,
+        }
+        events.append(
+            self._append_event(
+                session_id=session_id,
+                message_id=message_id,
+                message_version_id=message_version_id,
+                part_id=source_record.id,
+                sequence=sequence,
+                event_type="part.completed",
+                payload={
+                    "part": self._part_snapshot(
+                        source_record.id,
+                        "source_list",
+                        "completed",
+                        source_record.content,
+                        source_record.data,
+                    )
+                },
+            )
+        )
+        sequence += 1
+        return sequence, next_ordinal, source_record, True, events
 
     @staticmethod
     def _part_snapshot(
@@ -12391,6 +12524,20 @@ class ChatService:
                             ):
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
+                                # DashScope 原生联网（enable_search + enable_source）
+                                # 的 search_info 在流式早期即返回：立即把来源 URL
+                                # 推给前端（prepend_search_result 的效果），角标
+                                # [ref_N] 无需等整个流结束即可指代具体链接。
+                                sequence, next_stream_part_ordinal, source_record, _native_pushed, native_events = self._push_native_sources_live(
+                                    session_id=session_id,
+                                    message_id=assistant_message.id,
+                                    message_version_id=assistant_version.id,
+                                    sequence=sequence,
+                                    next_ordinal=next_stream_part_ordinal,
+                                    source_record=source_record,
+                                )
+                                for native_event in native_events:
+                                    yield self._encode_event(native_event)
                                 if provider_event.type == "text_delta":
                                     chunk = provider_event.content or ""
                                     if not chunk:
@@ -12497,6 +12644,17 @@ class ChatService:
                                     continue
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
+                                # 极速/思考模式同样尽早推送原生搜索来源（URL）。
+                                sequence, next_stream_part_ordinal, source_record, _native_pushed, native_events = self._push_native_sources_live(
+                                    session_id=session_id,
+                                    message_id=assistant_message.id,
+                                    message_version_id=assistant_version.id,
+                                    sequence=sequence,
+                                    next_ordinal=next_stream_part_ordinal,
+                                    source_record=source_record,
+                                )
+                                for native_event in native_events:
+                                    yield self._encode_event(native_event)
                                 self._mark_first_token(
                                     attempt,
                                     provider_trace,

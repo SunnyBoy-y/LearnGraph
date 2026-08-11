@@ -1156,6 +1156,10 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                 self._raise_for_status(response)
                 self.last_request_id = response.headers.get("x-request-id")
                 for event in self._sse_payloads(response):
+                    # DashScope 原生联网（enable_search + enable_source）在兼容
+                    # 模式流式中返回 search_info，必须在此捕获，否则极速/思考
+                    # 模式的来源 URL 不会进入 last_sources 供前端渲染。
+                    self._capture_chat_sources(event)
                     usage = event.get("usage")
                     if isinstance(usage, dict):
                         input_details = usage.get("prompt_tokens_details") or {}
@@ -1177,6 +1181,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
     def stream_answer(self, prompt: str) -> Iterable[str]:
         self.last_usage = {}
         self.last_request_id = None
+        self.last_sources = []
         try:
             yield from self._stream_answer(prompt)
         except httpx.TimeoutException as exc:
@@ -1595,10 +1600,23 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
             strategy = self.capabilities.get("chat_search_strategy")
             if strategy not in {"turbo", "max", "agent", "agent_max"}:
                 strategy = "turbo"
-            payload.setdefault(
-                "search_options",
-                {"search_strategy": strategy, "enable_source": True},
-            )
+            search_options: dict[str, Any] = {
+                "search_strategy": strategy,
+                # 返回搜索来源：响应 search_info.search_results 携带结果列表
+                # （index / title / url / site_name / icon）。
+                "enable_source": True,
+            }
+            # 角标标注（enable_citation）按官方文档仅 DashScope 协议支持，
+            # OpenAI 兼容协议不支持（角标需要 DashScope）。另外 agent /
+            # agent_max 策略（多模态模型）只支持返回搜索来源，其他联网搜索
+            # 功能不可用，因此仅对 turbo / max 策略下发角标参数。
+            if strategy in {"turbo", "max"}:
+                search_options["enable_citation"] = True
+                search_options["citation_format"] = str(
+                    self.capabilities.get("chat_search_citation_format")
+                    or "[ref_<number>]"
+                )
+            payload.setdefault("search_options", search_options)
         # ``preserve_thinking`` only controls how reasoning state is carried
         # across turns.  Sending it during a fast call is contradictory to the
         # explicit ``enable_thinking=false`` override and can make DashScope
@@ -1614,6 +1632,208 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
         ):
             payload["preserve_thinking"] = True
         return payload
+
+    # --- DashScope 原生协议通道（搜索来源 + 角标） --------------------------
+    # 官方协议差异表：返回搜索来源（enable_source）与角标标注（enable_citation）
+    # 仅 DashScope 原生协议支持；OpenAI 兼容协议（compatible-mode 与
+    # Responses）不返回 search_info。QwenChatProvider 的默认 base_url 是
+    # compatible-mode，因此在启用原生联网搜索（native_web_search）时切换到
+    # 原生 /api/v1/services/aigc/text-generation/generation 流式通道，从而
+    # 真正获得 search_info（URL 来源列表）与模型文本里的 [ref_N] 角标。
+
+    def _dashscope_native_base_url(self) -> str | None:
+        """Return the DashScope native API origin (scheme://host) or None."""
+        if not is_dashscope_origin(self.base_url):
+            return None
+        try:
+            parsed = urlsplit(self.base_url.strip())
+        except ValueError:
+            return None
+        host = parsed.hostname
+        if not host:
+            return None
+        return f"{parsed.scheme or 'https'}://{host}"
+
+    def _use_native_dashscope(self, messages: list[ProviderChatMessage]) -> bool:
+        if self.call_options is None or not self.call_options.native_web_search:
+            return False
+        if not is_dashscope_origin(self.base_url):
+            return False
+        # 原生工具调用使用参数化 tools（与 OpenAI 兼容结构不同）；Agent 回合
+        # 总是携带函数工具，保持兼容模式。多模态 content_parts 同样保持兼容。
+        if any(getattr(message, "content_parts", None) for message in messages):
+            return False
+        return True
+
+    def _native_dashscope_body(
+        self, messages: list[ProviderChatMessage]
+    ) -> dict[str, Any]:
+        wire_messages: list[dict[str, Any]] = []
+        for message in messages:
+            content = message.content
+            wire_messages.append(
+                {
+                    "role": message.role,
+                    "content": content if isinstance(content, str) else str(content),
+                }
+            )
+        # 复用兼容适配器的参数组装：enable_search / search_options（含
+        # enable_source、enable_citation、citation_format）/ enable_thinking。
+        wire = self._apply_call_options(
+            {"model": self.model_id, "messages": wire_messages, "stream": True},
+            responses=False,
+        )
+        search_options = wire.get("search_options")
+        parameters: dict[str, Any] = {
+            "enable_search": True,
+            "search_options": (
+                search_options
+                if isinstance(search_options, dict)
+                else {"enable_source": True}
+            ),
+            "result_format": "message",
+            "incremental_output": True,
+            "stream": True,
+        }
+        for key in ("enable_thinking", "thinking_budget", "max_tokens"):
+            if key in wire:
+                parameters[key] = wire[key]
+        return {
+            "model": self.model_id,
+            "input": {"messages": wire_messages},
+            "parameters": parameters,
+        }
+
+    def _usage_from_native_dashscope(self, usage: dict[str, Any]) -> None:
+        def _int(value: object) -> int:
+            return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+        details = usage.get("input_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, dict) else None
+        self.last_usage = {
+            "input_tokens": _int(usage.get("input_tokens")),
+            "output_tokens": _int(usage.get("output_tokens")),
+            "cached_input_tokens": _int(cached),
+        }
+
+    def _stream_native_dashscope(
+        self, messages: list[ProviderChatMessage]
+    ) -> Iterable[ProviderStreamEvent]:
+        native_base = self._dashscope_native_base_url()
+        if native_base is None:
+            raise ProviderHTTPError("DashScope native base URL is unavailable")
+        body = self._native_dashscope_body(messages)
+        completed = False
+        finish_reason: str | None = None
+        with self._client() as client:
+            with client.stream(
+                "POST",
+                f"{native_base}/api/v1/services/aigc/text-generation/generation",
+                json=body,
+                headers={"X-DashScope-SSE": "enable"},
+            ) as response:
+                self._raise_for_status(response)
+                self.last_request_id = response.headers.get("x-request-id")
+                for line in response.iter_lines():
+                    if not line or line.startswith(":") or not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        completed = True
+                        break
+                    try:
+                        chunk = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderResponseError(
+                            "DashScope native stream returned invalid SSE JSON"
+                        ) from exc
+                    if not isinstance(chunk, dict):
+                        continue
+                    if chunk.get("code") or chunk.get("message"):
+                        # 原生协议业务错误以 HTTP 200 + code/message 返回。
+                        raise ProviderHTTPError(
+                            self._chat_stream_error_message(chunk)
+                        )
+                    output = chunk.get("output")
+                    if not isinstance(output, dict):
+                        continue
+                    search_info = output.get("search_info")
+                    if isinstance(search_info, dict):
+                        # 复用兼容适配器的来源提取（url/title/index 去重）。
+                        self._capture_chat_sources({"search_info": search_info})
+                    choices = output.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    choice = choices[0]
+                    if not isinstance(choice, dict):
+                        continue
+                    raw_finish = choice.get("finish_reason")
+                    if isinstance(raw_finish, str) and raw_finish and raw_finish != "null":
+                        finish_reason = raw_finish
+                        completed = True
+                    message = choice.get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str) and content:
+                        for text_delta in self._text_deltas(content):
+                            yield ProviderStreamEvent("text_delta", content=text_delta)
+                    reasoning = message.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        for reasoning_delta in self._text_deltas(reasoning):
+                            yield ProviderStreamEvent(
+                                "reasoning_delta",
+                                content=reasoning_delta,
+                                reasoning_kind="summary",
+                            )
+                    usage = chunk.get("usage")
+                    if isinstance(usage, dict):
+                        self._usage_from_native_dashscope(usage)
+        if not completed and not finish_reason:
+            raise ProviderHTTPError(
+                "DashScope native stream ended before completion"
+            )
+        yield ProviderStreamEvent("completed", finish_reason=finish_reason)
+
+    def stream_chat(
+        self,
+        messages: list[ProviderChatMessage],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Iterable[ProviderStreamEvent]:
+        if tools is None and self._use_native_dashscope(messages):
+            self.last_usage = {}
+            self.last_request_id = None
+            self.last_sources = []
+            try:
+                yield from self._stream_native_dashscope(messages)
+            except httpx.TimeoutException as exc:
+                raise ProviderTimeoutError("DashScope native stream timed out") from exc
+            except httpx.HTTPError as exc:
+                raise ProviderHTTPError(
+                    f"DashScope native stream transport failed ({type(exc).__name__})"
+                ) from exc
+            return
+        yield from super().stream_chat(messages, tools=tools)
+
+    def stream_answer(self, prompt: str) -> Iterable[str]:
+        messages = [ProviderChatMessage(role="user", content=prompt)]
+        if self._use_native_dashscope(messages):
+            self.last_usage = {}
+            self.last_request_id = None
+            self.last_sources = []
+            try:
+                for event in self._stream_native_dashscope(messages):
+                    if event.content:
+                        yield from self._text_deltas(event.content)
+            except httpx.TimeoutException as exc:
+                raise ProviderTimeoutError("DashScope native stream timed out") from exc
+            except httpx.HTTPError as exc:
+                raise ProviderHTTPError(
+                    f"DashScope native stream transport failed ({type(exc).__name__})"
+                ) from exc
+            return
+        yield from super().stream_answer(prompt)
 
     def generate_json(
         self,

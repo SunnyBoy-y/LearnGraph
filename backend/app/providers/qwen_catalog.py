@@ -102,6 +102,7 @@ DASHSCOPE_ONLY_CAPABILITY_FIELDS: tuple[str, ...] = (
     "hosted_image_search",
     "preserve_thinking",
     "chat_search_strategy",
+    "chat_search_citation_format",
     "native_tool_pricing_cny_per_thousand_calls",
 )
 
@@ -640,6 +641,9 @@ def _qwen_model_defaults_raw(model_id: str) -> dict[str, Any]:
             )
             else "turbo"
         ),
+        # 角标样式（enable_citation 的 citation_format），仅 DashScope 协议
+        # 支持；agent/agent_max 策略按文档不支持角标，运行时不下发。
+        "chat_search_citation_format": "[ref_<number>]",
         "native_tool_pricing_cny_per_thousand_calls": {
             "web_search_agent": 4.0,
             "web_search_image": 24.0,

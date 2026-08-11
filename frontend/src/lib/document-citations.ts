@@ -47,7 +47,7 @@ const WEB_CITE_PREFIX = "/__lgwebcite__/";
 
 /** Backend-injected or model-emitted web citation markers. */
 const WEB_CITATION_PATTERN =
-  /（\s*网页引用[:：]?\s*(\d{1,3})\s*）|\[(\d{1,3})\](?!\()/giu;
+  /（\s*网页引用[:：]?\s*(\d{1,3})\s*）|\[ref_(\d{1,3})\]|\[(\d{1,3})\](?!\()/giu;
 
 export function isDocumentCitationHref(href: string | null | undefined): boolean {
   return typeof href === "string" && href.startsWith(CITE_PREFIX);
@@ -128,7 +128,8 @@ export function rewriteDocumentCitations(text: string): {
 
 /**
  * Rewrite web citation markers to internal links when a source_list of URLs
- * is available. Numeric ``[n]`` only rewrites when ``n`` is a known source index.
+ * is available. Numeric ``[n]`` / ``[ref_n]`` only rewrites when ``n`` is a
+ * known source index.
  */
 export function rewriteWebCitations(
   text: string,
@@ -146,8 +147,8 @@ export function rewriteWebCitations(
         : null;
   const citations: WebCitation[] = [];
   const seen = new Set<number>();
-  const markdown = text.replace(WEB_CITATION_PATTERN, (match, g1, g2) => {
-    const index = Number(g1 || g2 || "0") || 0;
+  const markdown = text.replace(WEB_CITATION_PATTERN, (match, g1, g2, g3) => {
+    const index = Number(g1 || g2 || g3 || "0") || 0;
     if (index < 1) return match;
     const isBareNumeric = match.startsWith("[");
     const isKnown = !allowed || allowed.has(index);
