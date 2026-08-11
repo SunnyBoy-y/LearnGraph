@@ -1098,7 +1098,7 @@ export function DocumentChatPanel({
             ) : (
               <Button
                 aria-label="发送文档问题"
-                disabled={!draft.trim() || !activeProvider || sessionClosed || unavailableSession || Boolean(embeddedImages.length)}
+                disabled={!draft.trim() || !activeProvider || sessionClosed || unavailableSession}
                 size="icon-sm"
                 type="submit"
               >

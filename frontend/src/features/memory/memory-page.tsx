@@ -1537,7 +1537,7 @@ function MemoryDetailDialog({
   ] : []
   return (
     <Dialog onOpenChange={(open) => !open && onClose()} open={Boolean(memoryId)}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{memory.data?.title ?? '记忆详情'}</DialogTitle>
           <DialogDescription>Canonical 内容与 Provider Binding 元数据</DialogDescription>

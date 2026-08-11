@@ -1114,6 +1114,62 @@ function applyStreamUpdates(
   }, message);
 }
 
+/**
+ * Find the most recent persisted user message that is the durable twin of an
+ * optimistic user copy (same session + role + content). Reverse scan prefers
+ * the newest match so a repeated question overlays its own counterpart.
+ */
+function findPersistedUserTwin(
+  message: Message,
+  persisted: Message[],
+): Message | undefined {
+  for (let index = persisted.length - 1; index >= 0; index -= 1) {
+    const item = persisted[index];
+    if (
+      item.session_id === message.session_id &&
+      item.role === "user" &&
+      item.content === message.content
+    ) {
+      return item;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the durable twin of an optimistic temp message so the UI overlays
+ * (or eventually drops) the optimistic copy instead of rendering it twice.
+ *
+ * User turns match by session + role + content. Assistant turns resolve their
+ * parent temp user to the persisted user (via `tempUserToPersisted`), then
+ * match the child assistant by parent_message_id — the backend persists
+ * assistant.parent_message_id as its user message id, and the temp assistant
+ * points at the temp user id, so the chain lands on the real answer bubble
+ * even when the temp answer itself has no content yet.
+ */
+function findOptimisticCounterpart(
+  message: Message,
+  persisted: Message[],
+  tempUserToPersisted: Map<string, string>,
+): Message | undefined {
+  if (message.role === "user") {
+    return findPersistedUserTwin(message, persisted);
+  }
+  if (message.role === "assistant") {
+    const parentPersistedId = tempUserToPersisted.get(
+      message.parent_message_id ?? "",
+    );
+    if (!parentPersistedId) return undefined;
+    return persisted.find(
+      (item) =>
+        item.session_id === message.session_id &&
+        item.role === "assistant" &&
+        item.parent_message_id === parentPersistedId,
+    );
+  }
+  return undefined;
+}
+
 function createAnimationFrameQueue<T>(onBatch: (batch: T[]) => void) {
   let pending: T[] = [];
   let frameId: number | null = null;
@@ -3295,9 +3351,23 @@ export function ChatCanvasPage() {
     const retryOverlays = new Map<string, Message>();
     const normalOverlays = new Map<string, Message>();
     const appended: Message[] = [];
+    const appendedIds = new Set<string>();
     const persistedById = new Map(
       persisted.map((message) => [message.id, message]),
     );
+    // Map each optimistic user copy to its durable twin (by mapped id, then
+    // by session+role+content) so assistant copies can resolve their parent.
+    const tempUserToPersisted = new Map<string, string>();
+    for (const item of localMessages) {
+      if (item.role !== "user") continue;
+      const persistedId = item.provider_trace?.optimistic_persisted_message_id;
+      const byId =
+        typeof persistedId === "string"
+          ? persistedById.get(persistedId)
+          : undefined;
+      const resolved = byId ?? findPersistedUserTwin(item, persisted);
+      if (resolved) tempUserToPersisted.set(item.id, resolved.id);
+    }
     // Concurrent streams may still push into localMessages; only show the
     // active session so session B's tokens never paint on session C.
     localMessages.forEach((message) => {
@@ -3318,9 +3388,26 @@ export function ChatCanvasPage() {
           (typeof persistedId === "string"
             ? persistedById.get(persistedId)
             : undefined);
-        if (!confirmed)
-          appended.push(message);
-        else if (
+        if (!confirmed) {
+          // Race hardening: the durable message can already be inside
+          // history.data before the stream's `message.accepted` mapped the
+          // optimistic id (a concurrent refetch paints the just-persisted
+          // message). Match the optimistic copy to its durable twin — user
+          // turns by session+role+content, assistant turns through the parent
+          // chain — and overlay instead of appending, so the user's question
+          // and the (possibly empty) temp answer never render a second time.
+          const counterpart = findOptimisticCounterpart(
+            message,
+            persisted,
+            tempUserToPersisted,
+          );
+          if (counterpart && !retryOverlays.has(counterpart.id)) {
+            normalOverlays.set(counterpart.id, message);
+          } else if (!appendedIds.has(message.id)) {
+            appendedIds.add(message.id);
+            appended.push(message);
+          }
+        } else if (
           !TERMINAL_MESSAGE_STATUSES.includes(
             confirmed.status as (typeof TERMINAL_MESSAGE_STATUSES)[number],
           )
@@ -3692,7 +3779,7 @@ export function ChatCanvasPage() {
     // Intentionally no abort on unmount/session switch — concurrent sessions
     // keep replaying until the user stops this session or it finishes.
     return undefined;
-  }, [history.data, history.isSuccess, queryClient, sessionId, status]);
+  }, [history.data, history.isSuccess, queryClient, sessionId, status, workspaceId]);
 
 
   useEffect(() => {
@@ -3718,6 +3805,18 @@ export function ChatCanvasPage() {
       });
       const holdNewSessionOptimistic =
         optimisticSessionId.current === sessionId && !allNormalConfirmed;
+      const tempUserToPersisted = new Map<string, string>();
+      for (const item of current) {
+        if (item.role !== "user") continue;
+        const persistedId = item.provider_trace
+          ?.optimistic_persisted_message_id;
+        const byId =
+          typeof persistedId === "string"
+            ? persistedById.get(persistedId)
+            : undefined;
+        const resolved = byId ?? findPersistedUserTwin(item, history.data ?? []);
+        if (resolved) tempUserToPersisted.set(item.id, resolved.id);
+      }
       const next = current.filter((message) => {
         const retryTarget = message.provider_trace?.optimistic_target_message_id;
         if (typeof retryTarget === "string") {
@@ -3732,8 +3831,25 @@ export function ChatCanvasPage() {
         }
         const persistedId = message.provider_trace
           ?.optimistic_persisted_message_id;
-        if (typeof persistedId !== "string" || holdNewSessionOptimistic)
-          return true;
+        if (typeof persistedId !== "string") {
+          // The stream may have died before its first event, so this copy has
+          // no durable id mapping. Drop it once a terminal persisted
+          // counterpart exists (user by content, assistant by parent chain) —
+          // otherwise the temp pair lingers and duplicates the real turn.
+          if (holdNewSessionOptimistic) return true;
+          const counterpart = findOptimisticCounterpart(
+            message,
+            history.data ?? [],
+            tempUserToPersisted,
+          );
+          return !(
+            counterpart &&
+            TERMINAL_MESSAGE_STATUSES.includes(
+              counterpart.status as (typeof TERMINAL_MESSAGE_STATUSES)[number],
+            )
+          );
+        }
+        if (holdNewSessionOptimistic) return true;
         const persisted = persistedById.get(persistedId);
         return !(
           persisted &&
@@ -3762,7 +3878,7 @@ export function ChatCanvasPage() {
     return parent
       ? [{ id: parent.id, label: "原会话", active: false }]
       : [];
-  }, [currentSession, sessionId, sessions.data]);
+  }, [currentSession, sessions.data]);
   const sessionIsClosed = currentSession?.status === "closed";
   const isEmptySession = messages.length === 0;
   const latestAssistantMessage = useMemo(() => {
@@ -4064,7 +4180,7 @@ export function ChatCanvasPage() {
         new CustomEvent("learngraph:session-created", { detail: { session } }),
       );
     },
-    [queryClient, workspaceDefaultResponseMode],
+    [queryClient, workspaceDefaultResponseMode, workspaceId],
   );
   useEffect(() => {
     if (sessionId !== "new" || goalMode) return;
