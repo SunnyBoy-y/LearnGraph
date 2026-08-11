@@ -10252,7 +10252,6 @@ class ChatService:
                         sequence += 1
                         yield self._encode_event(retry_started)
 
-                yield from wait_for_graph_proposal()
                 generation_completed_at = utc_now()
                 provider_trace = {
                     **provider_trace,
@@ -10492,7 +10491,12 @@ class ChatService:
                 yield self._encode_event(text_failed)
                 yield self._encode_event(failed)
 
-        return stream()
+        # retry_message is a generator, so return stream() would discard
+        # the stream generator (StopIteration carries it as a value and
+        # yield from never iterates it), leaving the SSE transport with a
+        # ready comment and no events. Delegate into it exactly like
+        # create_stream does so provider deltas actually reach the client.
+        yield from stream()
 
     def _replay_submission(
         self,
