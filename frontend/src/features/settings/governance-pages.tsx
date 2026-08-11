@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Activity,
   AlertTriangle,
   ArchiveRestore,
   ArrowRight,
@@ -67,6 +68,7 @@ import {
 } from "@/api";
 import { authStore } from "@/api/auth-store";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { useShowStreamStats } from "@/features/chat/stream-stats";
 import {
   ErrorState,
   LoadingState,
@@ -2251,6 +2253,8 @@ export function WorkspaceSettingsPage() {
   const [dark, setDark] = useState(() =>
     document.documentElement.classList.contains("dark"),
   );
+  // 流式指标开关是设备本地偏好（localStorage），随本设备即时生效。
+  const [showStreamStats, setShowStreamStats] = useShowStreamStats();
   const save = useMutation({
     mutationFn: (value: unknown) => updateSetting("ui.preferences", value),
     onError: (error) => toast.error(error.message),
@@ -2779,6 +2783,22 @@ export function WorkspaceSettingsPage() {
               checked={contextUsageEnabled}
               disabled={saveContextUsage.isPending}
               onCheckedChange={(enabled) => saveContextUsage.mutate(enabled)}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Activity className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">显示流式指标</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  流式输出时在回答上显示首字延迟（TTFT）、Token/秒与输出 Token 数；默认关闭，保存在本设备
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="显示流式指标"
+              checked={showStreamStats}
+              onCheckedChange={setShowStreamStats}
             />
           </div>
           <div className="flex items-center justify-between gap-4 rounded-xl border p-4">

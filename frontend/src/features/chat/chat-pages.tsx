@@ -21,7 +21,6 @@ import {
   ArrowUp,
   Bot,
   CalendarDays,
-  Activity,
   Check,
   ChevronLeft,
   ChevronDown,
@@ -56,7 +55,6 @@ import {
   beginStreamStats,
   deltaTextOf,
   recordStreamDelta,
-  useShowStreamStats,
 } from "@/features/chat/stream-stats";
 
 import { toast } from "sonner";
@@ -2384,7 +2382,6 @@ export function ChatCanvasPage() {
   }, []);
   const [localMessages, setLocalMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ChatStatus>("ready");
-  const [showStreamStats, toggleStreamStats] = useShowStreamStats();
   const [streamConnectionNotice, setStreamConnectionNotice] =
     useState<StreamConnectionNotice | null>(null);
   const [selectionMenu, setSelectionMenu] = useState<TextSelectionMenu | null>(null);
@@ -8579,18 +8576,6 @@ export function ChatCanvasPage() {
                  ? createPortal(modelMenu, topbarModelSlot)
                  : modelMenu;
              })()}
-            <PromptInputButton
-              aria-label={showStreamStats ? "隐藏流式指标" : "显示流式指标"}
-              aria-pressed={showStreamStats}
-              className={cn(
-                "chat-composer__stats",
-                showStreamStats && "chat-composer__stats--active",
-              )}
-              onClick={toggleStreamStats}
-              tooltip={showStreamStats ? "隐藏流式指标" : "显示流式指标"}
-            >
-              <Activity className="size-4" />
-            </PromptInputButton>
             <PromptInputButton
               aria-label={isListening ? "停止语音输入" : "开始语音输入"}
               aria-pressed={isListening}

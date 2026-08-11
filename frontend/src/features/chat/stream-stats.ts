@@ -104,8 +104,13 @@ export function formatTokenCount(tokens: number): string {
   return `${Math.round(tokens).toLocaleString("en-US")} tok`;
 }
 
-/** Persisted UI toggle; default off. */
-export function useShowStreamStats(): [boolean, () => void] {
+/**
+ * Persisted UI toggle; default off.
+ *
+ * The setter accepts an optional explicit value: the settings switch passes the
+ * new checked state, while callers without an argument keep toggling.
+ */
+export function useShowStreamStats(): [boolean, (next?: boolean) => void] {
   const [enabled, setEnabled] = useState<boolean>(() => {
     try {
       return localStorage.getItem(STREAM_STATS_KEY) === "1";
@@ -113,16 +118,16 @@ export function useShowStreamStats(): [boolean, () => void] {
       return false;
     }
   });
-  const toggle = useCallback(() => {
+  const setOrToggle = useCallback((next?: boolean) => {
     setEnabled((current) => {
-      const next = !current;
+      const value = next === undefined ? !current : next;
       try {
-        localStorage.setItem(STREAM_STATS_KEY, next ? "1" : "0");
+        localStorage.setItem(STREAM_STATS_KEY, value ? "1" : "0");
       } catch {
         // localStorage unavailable (private mode): keep the in-memory state.
       }
-      return next;
+      return value;
     });
   }, []);
-  return [enabled, toggle];
+  return [enabled, setOrToggle];
 }
