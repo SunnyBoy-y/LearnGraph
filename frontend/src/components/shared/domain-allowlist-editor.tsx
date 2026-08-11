@@ -3,29 +3,43 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 
+import { getResearchPolicy, updateResearchPolicy } from "@/api/settings";
 import {
-  getResearchPolicy,
-  updateResearchPolicy,
-} from "@/api/settings";
+  fetchPolicyQueryKey,
+  getFetchPolicy,
+  researchPolicyQueryKey,
+  updateFetchPolicy,
+  type DomainPolicy,
+} from "@/components/shared/domain-policy";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-export const researchPolicyQueryKey = ["research-policy"] as const;
-
-export function DomainAllowlistEditor() {
+export function DomainAllowlistEditor({
+  queryKey,
+  getPolicy,
+  updatePolicy,
+  description,
+  emptyLabel,
+  placeholder,
+}: {
+  /** React Query cache key prefix, e.g. ["research-policy"]. */
+  queryKey: readonly unknown[];
+  getPolicy: () => Promise<DomainPolicy>;
+  updatePolicy: (policy: DomainPolicy) => Promise<DomainPolicy>;
+  description: string;
+  emptyLabel: string;
+  placeholder: string;
+}) {
   const queryClient = useQueryClient();
-  const policy = useQuery({
-    queryKey: researchPolicyQueryKey,
-    queryFn: getResearchPolicy,
-  });
+  const policy = useQuery({ queryKey, queryFn: getPolicy });
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const update = useMutation({
-    mutationFn: updateResearchPolicy,
+    mutationFn: updatePolicy,
     onSuccess: (next) => {
-      queryClient.setQueryData(researchPolicyQueryKey, next);
-      toast.success("工作区来源白名单已更新");
+      queryClient.setQueryData(queryKey, next);
+      toast.success("白名单已更新");
     },
     onError: (error) =>
       toast.error(error instanceof Error ? error.message : "白名单更新失败"),
@@ -68,15 +82,13 @@ export function DomainAllowlistEditor() {
 
   return (
     <div className="space-y-4">
-      <p className="text-xs leading-5 text-muted-foreground">
-        搜索与 Deep Research 只能使用这里列出的精确公共 DNS 域名。空列表表示不设置工作区默认来源限制，仍受 Provider 与网络安全策略约束。
-      </p>
+      <p className="text-xs leading-5 text-muted-foreground">{description}</p>
       <form className="flex flex-col gap-2 sm:flex-row" onSubmit={add}>
         <Input
-          aria-label="添加工作区来源域名"
+          aria-label="添加来源域名"
           disabled={update.isPending}
           onChange={(event) => setDraft(event.currentTarget.value)}
-          placeholder="例如：arxiv.org"
+          placeholder={placeholder}
           value={draft}
         />
         <Button disabled={update.isPending || !draft.trim()} type="submit" variant="outline">
@@ -133,9 +145,37 @@ export function DomainAllowlistEditor() {
         </div>
       ) : (
         <p className="rounded-lg border border-dashed px-3 py-5 text-center text-sm text-muted-foreground">
-          尚未设置搜索与 Deep Research 来源白名单。
+          {emptyLabel}
         </p>
       )}
     </div>
+  );
+}
+
+/** 搜索与 Deep Research 来源白名单（research.policy，应用层）。 */
+export function ResearchDomainAllowlistEditor() {
+  return (
+    <DomainAllowlistEditor
+      description="搜索与 Deep Research 只能使用这里列出的精确公共 DNS 域名。空列表表示不设置工作区默认来源限制，仍受 Provider 与网络安全策略约束。此白名单只约束查询来源（应用层），不授予沙箱出站权限；沙箱联网需在「Egress 审批」中获批。"
+      emptyLabel="尚未设置搜索与 Deep Research 来源白名单。"
+      getPolicy={getResearchPolicy}
+      placeholder="例如：arxiv.org"
+      queryKey={researchPolicyQueryKey}
+      updatePolicy={updateResearchPolicy}
+    />
+  );
+}
+
+/** 网页抓取白名单（web_fetch.policy，应用层抓取授权）。 */
+export function FetchDomainAllowlistEditor() {
+  return (
+    <DomainAllowlistEditor
+      description="网页抓取只能抓取这里列出的精确公共 DNS 域名（工作区级；聊天内「以后都允许」写入的是个人级列表，两者取并集）。空列表表示不限制工作区默认抓取域，仍按个人白名单与 Provider 能力约束。此授权只放行网页抓取操作（应用层），不授予沙箱出站权限。"
+      emptyLabel="尚未设置网页抓取白名单（个人白名单仍可生效）。"
+      getPolicy={getFetchPolicy}
+      placeholder="例如：example.com"
+      queryKey={fetchPolicyQueryKey}
+      updatePolicy={updateFetchPolicy}
+    />
   );
 }

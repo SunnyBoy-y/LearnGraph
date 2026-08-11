@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import {
   isSettingsNavActive,
   settingsNav,
+  type SettingsNavItem,
 } from "@/components/shared/settings-nav-data";
 
 /**
@@ -59,6 +60,19 @@ export function SettingsModal({
     ? `设置 · ${activeItem.label}`
     : "设置";
 
+  // Group consecutive items that share a `section` so the sidebar can render
+  // section headers; ungrouped items fall under a null title.
+  const sections: Array<{ title: string | null; items: SettingsNavItem[] }> =
+    [];
+  for (const item of settingsNav) {
+    const last = sections[sections.length - 1];
+    if (last && last.title === (item.section ?? null)) {
+      last.items.push(item);
+    } else {
+      sections.push({ title: item.section ?? null, items: [item] });
+    }
+  }
+
   return (
     <Dialog onOpenChange={handleOpenChange} open={open}>
       <DialogContent
@@ -91,29 +105,42 @@ export function SettingsModal({
           </div>
           <ScrollArea className="min-h-0 flex-1">
             <ul className="flex flex-col gap-0.5 px-2 pb-3">
-              {settingsNav.map((item) => {
-                const Icon = item.icon;
-                const active = isSettingsNavActive(pathname, item);
-                return (
-                  <li key={item.path}>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        navigate(`/w/${workspaceId}/${item.path}`)
-                      }
-                      className={cn(
-                        "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
-                        active
-                          ? "bg-background font-medium text-foreground shadow-sm ring-1 ring-black/5 dark:ring-white/10"
-                          : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
-                      )}
-                    >
-                      <Icon className="size-4 shrink-0" />
-                      <span className="truncate">{item.label}</span>
-                    </button>
-                  </li>
-                );
-              })}
+              {sections.map((section, sectionIndex) => (
+                <li key={section.title ?? sectionIndex}>
+                  {section.title ? (
+                    <p className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/60 first:pt-2">
+                      {section.title}
+                    </p>
+                  ) : (
+                    <div className="pt-2" />
+                  )}
+                  <ul className="flex flex-col gap-0.5">
+                    {section.items.map((item) => {
+                      const Icon = item.icon;
+                      const active = isSettingsNavActive(pathname, item);
+                      return (
+                        <li key={item.path}>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              navigate(`/w/${workspaceId}/${item.path}`)
+                            }
+                            className={cn(
+                              "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
+                              active
+                                ? "bg-background font-medium text-foreground shadow-sm ring-1 ring-black/5 dark:ring-white/10"
+                                : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
+                            )}
+                          >
+                            <Icon className="size-4 shrink-0" />
+                            <span className="truncate">{item.label}</span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </li>
+              ))}
             </ul>
           </ScrollArea>
         </nav>
@@ -138,10 +165,17 @@ export function SettingsModal({
                   navigate(`/w/${workspaceId}/${event.target.value}`)
                 }
               >
-                {settingsNav.map((item) => (
-                  <option key={item.path} value={item.path}>
-                    {item.label}
-                  </option>
+                {sections.map((section, sectionIndex) => (
+                  <optgroup
+                    key={section.title ?? sectionIndex}
+                    label={section.title ?? "设置"}
+                  >
+                    {section.items.map((item) => (
+                      <option key={item.path} value={item.path}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
             </div>

@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CircleAlert, Plus, RefreshCcw } from "lucide-react";
+import { Link } from "react-router-dom";
 import { toast } from "sonner";
 
 import {
@@ -148,9 +149,22 @@ export function EgressApprovalsPage() {
   return (
     <PageFrame>
       <PageIntro
-        description="Agent 沙箱需要访问外部主机时，在此创建并审批出站请求。审批只放行精确主机名，内网/环回/云元数据地址始终被代理拒绝。"
+        description="沙箱网络层出站审批：Agent 需要访问外部主机时，在此创建并审批请求，只放行精确主机名，内网/环回/云元数据地址始终被代理拒绝。搜索/Deep Research 允许查询哪些来源域名，请在「搜索与研究」页的来源白名单中配置（应用层）。"
         title="Egress 审批"
       />
+      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-muted bg-muted/25 px-4 py-3 text-xs text-muted-foreground">
+        <span className="min-w-0 flex-1">
+          本页只管沙箱容器的主机放行（网络层）。网页抓取与搜索的应用层白名单、
+          沙箱开关及完整边界请查看统一的
+          <Link
+            className="mx-1 font-medium text-primary underline-offset-4 hover:underline"
+            to={`/w/${workspaceId}/settings/access-approvals`}
+          >
+            访问与审批
+          </Link>
+          总览。
+        </span>
+      </div>
       <div className="flex items-center justify-end gap-2">
         <Button
           disabled={approvals.isFetching}

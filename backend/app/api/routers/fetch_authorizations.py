@@ -17,10 +17,41 @@ from app.domain.models import (
 from app.domain.schemas.fetch_authorization import (
     FetchAuthorizationDecisionRequest,
     FetchAuthorizationRequestView,
+    WebFetchRuntimeUpdateRequest,
+    WebFetchRuntimeView,
 )
 from app.repositories.audit import AuditRepository
+from app.services.web_fetch_runtime import (
+    save_web_fetch_runtime,
+    web_fetch_runtime_status,
+)
 
 router = APIRouter(prefix="/fetch-authorizations", tags=["fetch-authorizations"])
+
+
+@router.get("/settings", response_model=WebFetchRuntimeView)
+def get_web_fetch_settings(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> WebFetchRuntimeView:
+    """Workspace web fetch preferences plus effective channel status."""
+    return web_fetch_runtime_status(db, context.workspace_id, settings)
+
+
+@router.put("/settings", response_model=WebFetchRuntimeView)
+def update_web_fetch_settings(
+    payload: WebFetchRuntimeUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> WebFetchRuntimeView:
+    """Persist workspace web fetch preferences (sandbox switch + priority)."""
+    context.require_permission("workspace.manage")
+    save_web_fetch_runtime(
+        db, context.workspace_id, context.principal.user_id, payload
+    )
+    return web_fetch_runtime_status(db, context.workspace_id, settings)
 
 
 @router.post("/{request_id}/decision", response_model=FetchAuthorizationRequestView)

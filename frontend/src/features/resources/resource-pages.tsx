@@ -52,7 +52,7 @@ import { FileDiagnosticsDialog } from "@/components/resources/file-diagnostics-d
 import { SourceAssociationDialog } from "@/components/resources/source-association-dialog";
 import { SourceDetailDialog } from "@/components/resources/source-detail-dialog";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
-import { DomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
+import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import {
   ErrorState,
   LoadingState,
@@ -1213,7 +1213,7 @@ export function SearchPage() {
           description="工作区级来源限制会同时用于普通联网搜索与 Deep Research；请求级域名只能进一步缩小范围。"
           title="搜索与 Deep Research 来源白名单"
         />
-        <DomainAllowlistEditor />
+        <ResearchDomainAllowlistEditor />
       </Surface>
       {result ? (
         <div className="rounded-xl border border-blue-200 bg-blue-50/55 px-4 py-3 text-sm text-blue-800 dark:border-blue-900 dark:bg-blue-950/25 dark:text-blue-200">

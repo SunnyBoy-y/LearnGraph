@@ -51,7 +51,7 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
-import { DomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
+import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -1882,10 +1882,22 @@ export function ResearchSettingsPage() {
   return (
     <PageFrame>
       <PageIntro
-        description="SearchProvider、FetchProvider 与 DeepResearchProvider 独立记录；缺失的远程能力明确显示为未配置。"
-        eyebrow="Research providers"
+        description="SearchProvider、FetchProvider 与 DeepResearchProvider 独立记录；缺失的远程能力明确显示为未配置。本页白名单只约束搜索/Deep Research 的查询来源（应用层），不授予沙箱网络出站权限；沙箱联网访问请在 Egress 审批（网络层）中审批。"
+        eyebrow="Network & sources"
         title="搜索与 Deep Research 设置"
       />
+      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-muted bg-muted/25 px-4 py-3 text-xs text-muted-foreground">
+        <span className="min-w-0 flex-1">
+          需要查看网页抓取白名单、沙箱开关或出站审批的完整边界？请前往统一的
+          <Link
+            className="mx-1 font-medium text-primary underline-offset-4 hover:underline"
+            to={`/w/${workspaceId}/settings/access-approvals`}
+          >
+            访问与审批
+          </Link>
+          总览。
+        </span>
+      </div>
       <Surface className="p-5">
         <SectionHeading
           description="实例和状态均来自当前工作区 Provider API"
@@ -1943,7 +1955,7 @@ export function ResearchSettingsPage() {
           description="统一管理普通联网搜索与 Deep Research 可使用的工作区来源域名。"
           title="搜索与 Deep Research 来源白名单"
         />
-        <DomainAllowlistEditor />
+        <ResearchDomainAllowlistEditor />
       </Surface>
       <Surface className="p-5">
         <SectionHeading title="当前配置边界" />

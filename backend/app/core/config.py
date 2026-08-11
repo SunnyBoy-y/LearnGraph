@@ -215,12 +215,23 @@ class Settings(BaseSettings):
     # page retrieval and untrusted-HTML parsing happen inside a short-lived fixed
     # web_fetch container (never the host). Requires a non-empty workspace
     # web_fetch.policy allowlist; otherwise the explicit remote FetchProvider /
-    # Qwen companion path is used. Off by default (opt-in, like egress).
-    sandbox_web_fetch_enabled: bool = False
+    # Qwen companion path is used. This is the global hard gate: each workspace
+    # can additionally toggle its own sandbox fetch switch and channel priority
+    # in Provider 管理 -> 网页抓取 (``web_fetch.runtime`` setting). Defaults to
+    # on so sandbox-isolated fetch is the secure primary path out of the box.
+    sandbox_web_fetch_enabled: bool = True
     # Hard bounds for a single web_fetch container job (independent of the
     # generic sandbox resource limits).
     sandbox_web_fetch_timeout_seconds: float = 30.0
     sandbox_web_fetch_max_bytes: int = 2 * 1024 * 1024
+    # Warm web_fetch container pool: containers are created once per
+    # workspace/allowlist and reused across fetches, skipping the per-fetch
+    # create/delete cost (~1-3s each), and up to ``pool_size`` fetches run
+    # concurrently. 0 disables the pool and restores the legacy
+    # create-per-fetch behavior. Idle containers are pruned after
+    # ``pool_idle_seconds`` of inactivity (lazy + periodic sweep).
+    sandbox_web_fetch_pool_size: int = 4
+    sandbox_web_fetch_pool_idle_seconds: int = 600
     # --- Isolated component renderer (P2-A) --------------------------------
     # Third-party component data is rendered into a server-owned, inert HTML
     # template with a strict CSP and delivered through the existing opaque-origin

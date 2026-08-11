@@ -719,6 +719,7 @@ export function ProvidersPage() {
     "vision",
     "image_generation",
     "search",
+    "image_search",
     "fetch",
     "deep_research",
     "transcription",
@@ -824,6 +825,8 @@ export function ProvidersPage() {
                 const isDeepResearchProvider =
                   providerSpec?.role === "deep_research";
                 const isEmbeddingProvider = providerSpec?.role === "embedding";
+                const isImageSearchProvider =
+                  providerSpec?.role === "image_search";
                 const supportsManagedModels = providerSpec?.supports_model_discovery === true;
                 const hasConfigurableDefaultModel =
                   isModelProvider ||
@@ -831,7 +834,8 @@ export function ProvidersPage() {
                   isTranscriptionProvider ||
                   isVisionProvider ||
                   isDeepResearchProvider ||
-                  isEmbeddingProvider;
+                  isEmbeddingProvider ||
+                  isImageSearchProvider;
                 const supportsModelDiscovery =
                   providerSpec?.supports_model_discovery === true;
                 const supportsProbe = providerSpec?.supports_probe === true;
@@ -1917,6 +1921,8 @@ function providerRoleLabel(role: ProviderRole) {
       return "识图 / 视觉";
     case "search":
       return "搜索";
+    case "image_search":
+      return "文搜图 / 图搜图";
     case "fetch":
       return "网页抓取";
     case "deep_research":
@@ -2739,6 +2745,7 @@ function ProviderDialog({
     "vision",
     "image_generation",
     "search",
+    "image_search",
     "fetch",
     "deep_research",
     "transcription",

@@ -1,12 +1,18 @@
 """Sandbox-isolated web fetch provider.
 
 Retrieval of an approved public URL and the parsing of its (untrusted) HTML
-happen inside a short-lived, single-purpose fixed-runner container — never in
-the host process. The host only authorizes the URL against the unified
-``web_fetch.policy`` allowlist, writes an immutable hash-bound fetch spec, and
-reads back a validated Markdown artifact. The container has no general Agent
-argv access and no user profile, so malicious pages cannot reach the host or
-carry user cookies.
+happen inside fixed-runner containers — never in the host process. The host
+only authorizes the URL against the unified ``web_fetch.policy`` allowlist,
+writes an immutable hash-bound fetch spec, and reads back a validated Markdown
+artifact. The container has no general Agent argv access and no user profile,
+so malicious pages cannot reach the host or carry user cookies.
+
+By default the provider runs fetches on a process-wide pool of warm
+containers (see ``app.providers.sandbox_fetch_pool``): containers are created
+once per workspace/allowlist/settings tuple and reused, so repeated fetches
+skip the per-fetch create/delete cost and up to ``sandbox_web_fetch_pool_size``
+fetches run concurrently. Setting the pool size to 0 restores the legacy
+short-lived create-per-fetch behavior.
 
 The container's only network path is the internal egress proxy; its outbound
 policy is derived from the same unified allowlist (``web_fetch_egress_envelope``),
@@ -27,7 +33,6 @@ import hashlib
 import json
 import logging
 import shutil
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -80,6 +85,7 @@ class SandboxFetchProvider:
         workspace_id: str,
         allowed_domains: frozenset[str],
         backend: Any | None = None,
+        pool_namespace: str | None = None,
     ) -> None:
         if not allowed_domains:
             raise ValueError("SandboxFetchProvider requires a non-empty allowlist")
@@ -90,6 +96,9 @@ class SandboxFetchProvider:
         # Injectable for hermetic tests; production uses the settings-resolved
         # Docker backend.
         self._injected_backend = backend
+        # Isolates the process-wide container pool in tests that inject a fake
+        # backend; production callers leave it None (backend_id is used).
+        self._pool_namespace = pool_namespace
 
     # --- FetchProviderPort ----------------------------------------------------
 
@@ -99,8 +108,8 @@ class SandboxFetchProvider:
             raise UnsafeFetchURL(
                 "The requested URL is outside the sandbox web fetch allowlist"
             )
-        spec_digest = self._build_and_write_spec(target)
-        artifact = self._run_container(target, spec_digest)
+        spec, spec_digest = self._build_spec(target)
+        artifact = self._run_container(target, spec, spec_digest)
         final_url = str(artifact["final_url"]).strip()
         if not _exact_host_allowed(final_url, self.allowed_domains):
             raise UnsafeFetchURL(
@@ -134,7 +143,12 @@ class SandboxFetchProvider:
 
     # --- internals ------------------------------------------------------------
 
-    def _build_and_write_spec(self, url: str) -> str:
+    def _build_spec(self, url: str) -> tuple[dict[str, Any], str]:
+        """Build the immutable fetch spec; returns ``(spec, spec_sha256)``.
+
+        The spec is returned (never stored on the instance) so concurrent
+        ``fetch()`` calls cannot clobber each other's input files.
+        """
         body = {
             "schema_version": "1.0",
             "url": url,
@@ -144,21 +158,150 @@ class SandboxFetchProvider:
             "timeout_seconds": self.settings.sandbox_web_fetch_timeout_seconds,
         }
         spec_sha256 = hashlib.sha256(_canonical_json(body)).hexdigest()
-        self._spec = {**body, "spec_sha256": spec_sha256}
-        return spec_sha256
+        return {**body, "spec_sha256": spec_sha256}, spec_sha256
 
-    def _run_container(self, url: str, spec_digest: str) -> dict[str, Any]:
+    def _run_container(
+        self, url: str, spec: dict[str, Any], spec_digest: str
+    ) -> dict[str, Any]:
+        backend = (
+            self._injected_backend
+            if self._injected_backend is not None
+            else _backend_for_settings(self.settings)
+        )
+        if self.settings.sandbox_web_fetch_pool_size > 0:
+            artifact = self._run_pooled(backend, spec, spec_digest)
+        else:
+            artifact = self._run_ephemeral(backend, url, spec)
+        if (
+            not isinstance(artifact, dict)
+            or artifact.get("schema_version") != "1.0"
+            or artifact.get("task_type") != "web_fetch"
+            or artifact.get("status") != "ok"
+            or artifact.get("spec_sha256") != spec_digest
+            or not isinstance(artifact.get("markdown"), str)
+            or not artifact["markdown"].strip()
+            or not isinstance(artifact.get("final_url"), str)
+        ):
+            raise FetchProviderError(
+                "Sandbox web fetch returned an invalid artifact"
+            )
+        return artifact
+
+    def _exec_timeout_seconds(self) -> int:
+        return min(
+            self.settings.sandbox_wall_time_seconds,
+            int(self.settings.sandbox_web_fetch_timeout_seconds) + 15,
+        )
+
+    def _run_pooled(
+        self, backend: Any, spec: dict[str, Any], spec_digest: str
+    ) -> dict[str, Any]:
+        """Execute one fetch on a warm pooled container (reused, concurrent).
+
+        Containers are checked out exclusively (one runner per container at a
+        time — a timeout/truncation kills the container, so parallel execs in
+        the same container are never safe). Any round-trip failure evicts the
+        container so a poisoned container is never reused.
+        """
+        from app.services.sandbox import _sandbox_workspace_path  # lazy import
+        from app.providers.sandbox_fetch_pool import (
+            FetchPoolSaturated,
+            FetchPoolUnavailable,
+            get_fetch_pool,
+        )
+
+        namespace = self._pool_namespace or getattr(
+            backend, "backend_id", "docker"
+        )
+        pool = get_fetch_pool(
+            namespace=namespace,
+            backend=backend,
+            settings=self.settings,
+            workspace_id=self.workspace_id,
+            allowed_domains=self.allowed_domains,
+            max_size=self.settings.sandbox_web_fetch_pool_size,
+            idle_ttl=self.settings.sandbox_web_fetch_pool_idle_seconds,
+        )
+        exec_timeout = self._exec_timeout_seconds()
+        try:
+            entry = pool.acquire(timeout_seconds=exec_timeout + 10)
+        except (FetchPoolSaturated, FetchPoolUnavailable) as exc:
+            raise FetchProviderError(str(exc)) from exc
+        except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+            raise FetchProviderError(str(exc)) from exc
+        session_token = f"fetch-{new_id()}"
+        input_path = f"input/{session_token}.json"
+        output_path = f"output/{session_token}.json"
+        succeeded = False
+        try:
+            backend.write(
+                entry.handle,
+                input_path,
+                json.dumps(spec, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            )
+            result = backend.exec_fixed(
+                entry.handle,
+                (
+                    *_FETCH_TASK,
+                    "--input",
+                    input_path,
+                    "--output",
+                    output_path,
+                ),
+                timeout_seconds=exec_timeout,
+                output_limit=self.settings.sandbox_output_bytes,
+            )
+            if result.timed_out:
+                raise FetchProviderTimeout("Sandbox web fetch timed out")
+            if result.truncated:
+                raise SandboxOutputLimitExceeded(
+                    "Sandbox web fetch exceeded the configured output limit"
+                )
+            if result.exit_code != 0:
+                detail = result.stderr.decode("utf-8", errors="replace").strip()[:2_000]
+                raise FetchProviderError(
+                    f"Sandbox web fetch failed: {detail or result.exit_code}"
+                )
+            artifact_bytes = backend.read(
+                entry.handle, output_path, self.settings.sandbox_output_bytes
+            )
+            artifact = json.loads(artifact_bytes)
+            succeeded = True
+            return artifact
+        except json.JSONDecodeError as exc:
+            raise FetchProviderError(
+                "Sandbox web fetch returned a non-JSON artifact"
+            ) from exc
+        except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+            raise FetchProviderError(str(exc)) from exc
+        finally:
+            # Per-fetch input/output files are removed from the host workspace
+            # (the container's /workspace is a bind mount) so the pooled
+            # workspace never accumulates spec/artifact files across fetches.
+            workspace = _sandbox_workspace_path(
+                self.settings, entry.workspace_relative
+            )
+            for relative in (input_path, output_path):
+                try:
+                    (workspace / relative).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if succeeded:
+                pool.release(entry)
+            else:
+                # The container is in an unknown/killed state; never reuse it.
+                pool.evict(entry)
+
+    def _run_ephemeral(
+        self, backend: Any, url: str, spec: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Legacy path (pool disabled): one throwaway container per fetch."""
         from app.services.sandbox import (  # lazy: avoids factory<->sandbox cycle
             _initialize_workspace,
             _sandbox_workspace_path,
             web_fetch_egress_envelope,
         )
 
-        backend = (
-            self._injected_backend
-            if self._injected_backend is not None
-            else _backend_for_settings(self.settings)
-        )
         capability = backend.probe()
         if not capability.available:
             raise FetchProviderError(
@@ -196,7 +339,7 @@ class SandboxFetchProvider:
             backend.write(
                 handle,
                 input_path,
-                json.dumps(self._spec, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                json.dumps(spec, ensure_ascii=False, sort_keys=True).encode("utf-8"),
             )
             result = backend.exec_fixed(
                 handle,
@@ -207,10 +350,7 @@ class SandboxFetchProvider:
                     "--output",
                     output_path,
                 ),
-                timeout_seconds=min(
-                    self.settings.sandbox_wall_time_seconds,
-                    int(self.settings.sandbox_web_fetch_timeout_seconds) + 15,
-                ),
+                timeout_seconds=self._exec_timeout_seconds(),
                 output_limit=self.settings.sandbox_output_bytes,
             )
             if result.timed_out:
@@ -227,7 +367,7 @@ class SandboxFetchProvider:
             artifact_bytes = backend.read(
                 handle, output_path, self.settings.sandbox_output_bytes
             )
-            artifact = json.loads(artifact_bytes)
+            return json.loads(artifact_bytes)
         except json.JSONDecodeError as exc:
             raise FetchProviderError("Sandbox web fetch returned a non-JSON artifact") from exc
         except SandboxBackendUnavailable as exc:
@@ -247,20 +387,6 @@ class SandboxFetchProvider:
                 _sandbox_workspace_path(self.settings, relative),
                 ignore_errors=True,
             )
-        if (
-            not isinstance(artifact, dict)
-            or artifact.get("schema_version") != "1.0"
-            or artifact.get("task_type") != "web_fetch"
-            or artifact.get("status") != "ok"
-            or artifact.get("spec_sha256") != spec_digest
-            or not isinstance(artifact.get("markdown"), str)
-            or not artifact["markdown"].strip()
-            or not isinstance(artifact.get("final_url"), str)
-        ):
-            raise FetchProviderError(
-                "Sandbox web fetch returned an invalid artifact"
-            )
-        return artifact
 
 
 def _backend_for_settings(settings: Settings):

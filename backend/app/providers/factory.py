@@ -1306,29 +1306,46 @@ def deep_research_provider_for_workspace(
     )
 
 
-def fetch_provider_for_workspace(
-    db: Session,
-    workspace_id: str,
-    settings: Settings,
-) -> FetchProviderPort | None:
-    # Sandbox-isolated fetch is the secure primary path when the deployment has
-    # opted in (egress + web fetch enabled) and the unified allowlist is
-    # non-empty. It is a settings-gated built-in, so it needs no ProviderConfig
-    # row, base URL, or secret. When the gate is off / the allowlist is empty /
-    # the runtime image is missing, we fall through to the explicit remote
-    # FetchProvider or the Qwen companion exactly as before.
-    if settings.sandbox_web_fetch_enabled and settings.sandbox_egress_enabled:
-        domains = _web_fetch_policy_domains(db, workspace_id)
-        if domains:
-            from app.services.sandbox_runtime import resolve_sandbox_image
+def _sandbox_fetch_available(
+    db: Session, workspace_id: str, settings: Settings
+) -> bool:
+    """Whether the sandbox-isolated fetch lane can run for this workspace.
 
-            if resolve_sandbox_image(settings):
-                return SandboxFetchProvider(
-                    provider_id="sandbox_web_fetch",
-                    settings=settings,
-                    workspace_id=workspace_id,
-                    allowed_domains=domains,
-                )
+    Requires the global env gate, egress, a non-empty unified allowlist and a
+    resolved sandbox runtime image — exactly the conditions that previously
+    selected ``SandboxFetchProvider`` as the hard-coded primary path.
+    """
+    if not (settings.sandbox_web_fetch_enabled and settings.sandbox_egress_enabled):
+        return False
+    if not _web_fetch_policy_domains(db, workspace_id):
+        return False
+    from app.services.sandbox_runtime import resolve_sandbox_image
+
+    return bool(resolve_sandbox_image(settings))
+
+
+def _sandbox_fetch_provider(
+    db: Session, workspace_id: str, settings: Settings
+) -> FetchProviderPort | None:
+    if not _sandbox_fetch_available(db, workspace_id, settings):
+        return None
+    return SandboxFetchProvider(
+        provider_id="sandbox_web_fetch",
+        settings=settings,
+        workspace_id=workspace_id,
+        allowed_domains=_web_fetch_policy_domains(db, workspace_id),
+    )
+
+
+def _remote_fetch_provider(
+    db: Session, workspace_id: str, settings: Settings
+) -> FetchProviderPort | None:
+    """The explicit remote FetchProvider lane (Crawl4AI bridge / Firecrawl).
+
+    Returns ``None`` when no usable provider row exists (the hosted Qwen lane
+    may take over), or an ``UnavailableFetchProvider`` carrying the reason when
+    a configured row cannot be used.
+    """
     default_provider_id, _ = _functional_model_target(
         db, workspace_id, "fetch"
     )
@@ -1350,14 +1367,11 @@ def fetch_provider_for_workspace(
                 default_provider_id,
                 "The configured default FetchProvider is unavailable",
             )
-        return _qwen_companion_for_workspace(
-            db,
-            workspace_id,
-            settings,
-            capability="hosted_web_fetch",
-        )
+        return None
     if not provider.base_url:
-        return UnavailableFetchProvider(provider.id, f"Configured {provider.provider_type} has no base URL")
+        return UnavailableFetchProvider(
+            provider.id, f"Configured {provider.provider_type} has no base URL"
+        )
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
     except Exception:
@@ -1397,12 +1411,76 @@ def fetch_provider_for_workspace(
         )
 
 
+def _hosted_fetch_provider(
+    db: Session, workspace_id: str, settings: Settings
+) -> FetchProviderPort | None:
+    """The hosted Qwen web-extractor lane (Responses ``web_extractor`` tool)."""
+    return _qwen_companion_for_workspace(
+        db,
+        workspace_id,
+        settings,
+        capability="hosted_web_fetch",
+    )
+
+
+def resolve_fetch_channel(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    priority: list[str],
+) -> tuple[str | None, FetchProviderPort | None]:
+    """Resolve a fetch provider by channel priority.
+
+    ``priority`` is the workspace-level channel order (``sandbox`` /
+    ``remote`` / ``hosted``) from ``web_fetch.runtime``. The first channel that
+    yields a usable provider wins; an unavailable channel (missing allowlist,
+    unconfigured provider row, disabled global gate, …) falls through to the
+    next one. When nothing is usable, the last non-empty provider is returned
+    (it carries the reason) so callers keep failing with a precise error.
+    """
+    lane: dict[str, FetchProviderPort | None] = {}
+    for channel in priority:
+        if channel == "sandbox":
+            lane[channel] = _sandbox_fetch_provider(db, workspace_id, settings)
+        elif channel == "remote":
+            lane[channel] = _remote_fetch_provider(db, workspace_id, settings)
+        elif channel == "hosted":
+            lane[channel] = _hosted_fetch_provider(db, workspace_id, settings)
+        provider = lane[channel]
+        if provider is not None and not getattr(provider, "reason", None):
+            return channel, provider
+    last: FetchProviderPort | None = None
+    for channel in priority:
+        provider = lane.get(channel)
+        if provider is not None:
+            last = provider
+    return None, last
+
+
+def fetch_provider_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+) -> FetchProviderPort | None:
+    # Channel order comes from the workspace-level 网页抓取 preferences
+    # (``web_fetch.runtime``); the default is sandbox -> remote -> hosted.
+    # Lazy import keeps the factory free of a service import cycle.
+    from app.services.web_fetch_runtime import get_web_fetch_runtime
+
+    runtime = get_web_fetch_runtime(db, workspace_id)
+    _, provider = resolve_fetch_channel(
+        db, workspace_id, settings, runtime["priority"]
+    )
+    return provider
+
+
 def _qwen_companion_for_workspace(
     db: Session,
     workspace_id: str,
     settings: Settings,
     *,
     capability: str,
+    provider_types: tuple[str, ...] = ("qwen",),
 ) -> QwenResponsesToolProvider | None:
     """Resolve an explicitly enabled Qwen model as a mixed-model tool lane.
 

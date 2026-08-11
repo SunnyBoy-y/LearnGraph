@@ -1281,6 +1281,10 @@ function WebFetchAuthorizationCard({ data }: { data: FetchAuthorizationData }) {
         <Button disabled={state === "submitting"} onClick={() => void decide("allow_always")} size="sm" variant="outline">以后都允许</Button>
         <Button disabled={state === "submitting"} onClick={() => void decide("deny")} size="sm" variant="ghost">拒绝</Button>
       </div>
+      <p className="text-[11px] leading-4 text-muted-foreground">
+        此授权只放行网页抓取操作（应用层）。若抓取由沙箱容器执行，其网络出站仍受
+        「Egress 审批」（网络层）约束，两者相互独立。
+      </p>
     </section>
   );
 }
@@ -1348,6 +1352,10 @@ function EgressAuthorizationCard({ data }: { data: EgressAuthorizationCardData }
         <Button disabled={state === "submitting"} onClick={() => void decide("allow_always")} size="sm" variant="outline">总是允许</Button>
         <Button disabled={state === "submitting"} onClick={() => void decide("deny")} size="sm" variant="ghost">拒绝</Button>
       </div>
+      <p className="text-[11px] leading-4 text-muted-foreground">
+        此授权只放行沙箱容器访问该主机的网络流量（网络层）。搜索与网页抓取的
+        应用层白名单相互独立，不会因本次放行而自动生效。
+      </p>
     </section>
   );
 }

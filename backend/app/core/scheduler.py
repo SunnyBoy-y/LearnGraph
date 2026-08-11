@@ -352,6 +352,14 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
     totals = {"cooled": 0, "cleaned": 0, "recovered": 0, "cleanup_blocked": 0}
     workspace_root = settings.resolved_sandbox_workspace_root
     workspace_root.mkdir(parents=True, exist_ok=True)
+    # Warm web_fetch pool containers are not DB-tracked; prune idle ones here
+    # so a long-idle process can never leak warm containers. Best-effort.
+    try:
+        from app.providers.sandbox_fetch_pool import prune_fetch_pools
+
+        prune_fetch_pools()
+    except Exception:
+        logger.exception("Web fetch container pool prune failed")
 
     def aware(value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
