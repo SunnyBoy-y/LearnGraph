@@ -435,6 +435,44 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         requires_runtime="sandbox+egress",
         required_tools=("fetch_web_page",),
     ),
+    OfficialSkillSpec(
+        key="sandbox-files",
+        display_name="沙箱文件处理",
+        version="1.0.0",
+        dir_name="sandbox_files",
+        description=(
+            "沙箱工作区文件的定位、检索、分页读取、精确编辑与授权删除 "
+            "（sandbox_read_file / sandbox_grep / sandbox_list_files / "
+            "sandbox_write_file / sandbox_edit_file / sandbox_delete_file）。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        category="files",
+        capability_ids=("files.list", "files.search", "files.read", "files.edit", "files.delete"),
+        keywords=(
+            "文件",
+            "工作区",
+            "workspace",
+            "grep",
+            "搜索",
+            "查找",
+            "读取",
+            "编辑",
+            "替换",
+            "删除",
+            "read_file",
+            "list_files",
+        ),
+        requires_runtime="sandbox",
+        required_tools=(
+            "sandbox_read_file",
+            "sandbox_write_file",
+            "sandbox_append_file",
+            "sandbox_edit_file",
+            "sandbox_list_files",
+            "sandbox_grep",
+            "sandbox_delete_file",
+        ),
+    ),
 )
 
 OFFICIAL_SKILL_KEYS: frozenset[str] = frozenset(spec.key for spec in OFFICIAL_SKILLS)

@@ -5,6 +5,6 @@
   "network": "offline_by_default",
   "browser": {"name": "chromium", "executable_path": "/usr/bin/chromium"},
   "binaries": ["python", "node", "npm", "chromium", "ffmpeg", "ffprobe", "antiword", "catppt", "7z", "git", "jq", "zip", "unzip"],
-  "python_packages": ["Pillow", "pypdf", "openpyxl", "pandas", "mammoth", "playwright-core"],
+  "python_packages": ["Pillow", "pypdf", "openpyxl", "pandas", "mammoth", "playwright-core", "learngraph_tasks"],
   "node_packages": ["playwright-core", "vite", "react", "react-dom", "vue", "typescript", "tsx"]
 }

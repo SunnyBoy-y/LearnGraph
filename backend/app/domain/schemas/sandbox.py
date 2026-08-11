@@ -233,6 +233,9 @@ class SandboxAgentFileEditRequest(BaseModel):
     old_string: str = Field(min_length=1, max_length=1_048_576)
     new_string: str = Field(max_length=1_048_576)
     expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # When true, replace every occurrence instead of requiring a single match
+    # (safety cap of 100 replacements; bulk rewrites belong in sandbox_exec).
+    replace_all: bool = False
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
@@ -252,11 +255,42 @@ class SandboxAgentImagePublishRequest(BaseModel):
 class SandboxAgentFileReadRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
     path: str = Field(min_length=1, max_length=255)
+    # Optional line-range view: read only lines [start_line, end_line] (1-based,
+    # inclusive). Combined with max_chars this keeps large files out of the
+    # model context. When omitted the whole file is returned.
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    max_chars: int | None = Field(default=None, ge=1, le=1_048_576)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentFileGrepRequest(BaseModel):
+    """Host-side content search over the durable session workspace."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    pattern: str = Field(min_length=1, max_length=500)
+    # Optional glob filter over workspace paths, e.g. "work/**/*.py" or
+    # "work/main.py". Omit to search every durable workspace file.
+    path: str | None = Field(default=None, max_length=255)
+    case_sensitive: bool = False
+    context_lines: int = Field(default=0, ge=0, le=5)
+    max_matches: int = Field(default=50, ge=1, le=500)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentFileDeleteRequest(BaseModel):
+    """Delete ONE file under the session work/ tree (single-use authorization)."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    path: str = Field(min_length=1, max_length=255)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
 class SandboxAgentFileListRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
+    # Optional glob filter over workspace paths (e.g. "work/**/*.py").
+    pattern: str | None = Field(default=None, max_length=255)
+    max_results: int | None = Field(default=None, ge=1, le=1000)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
@@ -283,6 +317,9 @@ class SandboxAgentTranscribeRequest(BaseModel):
 class SandboxAgentWorkspaceFileView(BaseModel):
     path: str
     size_bytes: int
+    role: str | None = None
+    source: str | None = None
+    mtime: str | None = None
 
 
 class SandboxAgentFileView(BaseModel):
@@ -292,6 +329,42 @@ class SandboxAgentFileView(BaseModel):
     sha256: str | None = None
     content: str | None = None
     files: list[SandboxAgentWorkspaceFileView] = Field(default_factory=list)
+    # read_file line-range view metadata.
+    total_lines: int | None = None
+    total_bytes: int | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    # max_chars truncation flag for read_file; match cap for grep.
+    truncated: bool | None = None
+    # edit_file replace_all outcome.
+    replaced_count: int | None = None
+    # delete_file outcome.
+    deleted: bool | None = None
+
+
+class SandboxAgentFileGrepMatch(BaseModel):
+    path: str
+    line_number: int
+    text: str
+    context: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SandboxAgentFileGrepCount(BaseModel):
+    path: str
+    matches: int
+
+
+class SandboxAgentFileGrepView(BaseModel):
+    sandbox_session_id: str
+    pattern: str
+    case_sensitive: bool
+    searched_files: int
+    skipped_binary: int
+    skipped_large: int
+    skipped_container_only: int
+    matches: list[SandboxAgentFileGrepMatch] = Field(default_factory=list)
+    file_counts: list[SandboxAgentFileGrepCount] = Field(default_factory=list)
+    truncated: bool = False
 
 
 class SandboxAgentCommandView(ORMModel):

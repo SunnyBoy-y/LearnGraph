@@ -52,6 +52,14 @@ class SandboxDestructiveAuthorizationRequired(SandboxBackendError):
         self.paths = paths
 
 
+# Constrained in-container unlink for the Agent file-delete tool: regular files
+# only, never directories/symlinks, idempotent when the path is already gone.
+_AGENT_UNLINK_HELPER = (
+    "from pathlib import Path; import sys; "
+    "p = Path(sys.argv[1]); (p.unlink() if p.is_file() else None)"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _WorkspaceUsageStats:
     bytes: int
@@ -716,6 +724,52 @@ class DockerSandboxBackend(SandboxBackendPort):
         """Materialize an Agent-authored file owned by the sandbox user only."""
 
         self._put_workspace_file(session, path, data, mode=0o600)
+
+    def delete_agent_file(self, session: SandboxSessionHandle, path: str) -> None:
+        """Best-effort single-file delete inside the container workspace.
+
+        Only regular files are removed (never directories, symlinks or host
+        paths). The host-side logical workspace store is authoritative; the
+        container copy is cleaned so later listings do not resurrect the file.
+        """
+
+        safe = _safe_workspace_path(path)
+        client, container = self._container(session.backend_ref)
+        try:
+            result = self._stream_exec(
+                client,
+                container,
+                argv=(
+                    "python",
+                    "-I",
+                    "-B",
+                    "-c",
+                    _AGENT_UNLINK_HELPER,
+                    str(safe),
+                ),
+                workdir="/workspace",
+                user="65532:65532",
+                environment={
+                    "HOME": "/workspace",
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                timeout_seconds=30,
+                output_limit=65_536,
+                started=time.monotonic(),
+            )
+        except Exception as exc:
+            raise SandboxBackendError("Sandbox Agent file delete failed") from exc
+        finally:
+            client.close()
+        if result.timed_out or result.truncated:
+            raise SandboxBackendError("Sandbox Agent file delete did not complete")
+        if result.exit_code != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()[:500]
+            raise SandboxBackendError(
+                f"Sandbox Agent file delete failed (exit {result.exit_code}): {detail}"
+            )
 
     def _put_workspace_file(
         self,

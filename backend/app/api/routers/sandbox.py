@@ -11,6 +11,9 @@ from app.domain.schemas.sandbox import (
     SandboxAgentReadinessView,
     SandboxAgentFileListRequest,
     SandboxAgentFileReadRequest,
+    SandboxAgentFileDeleteRequest,
+    SandboxAgentFileGrepRequest,
+    SandboxAgentFileGrepView,
     SandboxAgentFileView,
     SandboxAgentFileWriteRequest,
     SandboxAgentFileAppendRequest,
@@ -515,6 +518,32 @@ def list_agent_files(
     require_agent_sandbox_permission(context)
     return SandboxAgentFileView.model_validate(
         agent_service(db, context, settings).list_files(payload)
+    )
+
+
+@router.post("/agent/files/grep", response_model=SandboxAgentFileGrepView)
+def grep_agent_files(
+    payload: SandboxAgentFileGrepRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxAgentFileGrepView:
+    require_agent_sandbox_permission(context)
+    return SandboxAgentFileGrepView.model_validate(
+        agent_service(db, context, settings).grep_files(payload)
+    )
+
+
+@router.post("/agent/files/delete", response_model=SandboxAgentFileView)
+def delete_agent_file(
+    payload: SandboxAgentFileDeleteRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxAgentFileView:
+    require_agent_sandbox_permission(context)
+    return SandboxAgentFileView.model_validate(
+        agent_service(db, context, settings).delete_file(payload)
     )
 
 

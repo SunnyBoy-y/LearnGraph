@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
@@ -45,6 +46,8 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileAppendRequest,
     SandboxAgentEnvironmentRequest,
     SandboxAgentImagePublishRequest,
+    SandboxAgentFileDeleteRequest,
+    SandboxAgentFileGrepRequest,
     SandboxAgentFileListRequest,
     SandboxAgentFileReadRequest,
     SandboxAgentFileWriteRequest,
@@ -1937,20 +1940,38 @@ class SandboxAgentWorkspaceService:
         if payload.expected_sha256 != digest:
             raise AppError(409, "sandbox_file_changed", "Sandbox file changed; read it again before editing")
         count = current.count(payload.old_string)
-        if count != 1:
-            raise AppError(
-                422,
-                "sandbox_edit_match_invalid",
-                "old_string must occur exactly once in the sandbox file",
-            )
-        return self.write_file(
+        if payload.replace_all:
+            if count == 0:
+                raise AppError(
+                    422,
+                    "sandbox_edit_match_invalid",
+                    "old_string was not found in the sandbox file",
+                )
+            if count > 100:
+                raise AppError(
+                    422,
+                    "sandbox_edit_too_many_matches",
+                    "replace_all matched more than 100 occurrences; use sandbox_exec for bulk rewrites",
+                )
+            content = current.replace(payload.old_string, payload.new_string)
+        else:
+            if count != 1:
+                raise AppError(
+                    422,
+                    "sandbox_edit_match_invalid",
+                    "old_string must occur exactly once in the sandbox file",
+                )
+            content = current.replace(payload.old_string, payload.new_string, 1)
+        result = self.write_file(
             SandboxAgentFileWriteRequest(
                 chat_session_id=payload.chat_session_id,
                 path=path,
-                content=current.replace(payload.old_string, payload.new_string, 1),
+                content=content,
                 sandbox_session_id=payload.sandbox_session_id,
             )
         )
+        result["replaced_count"] = count
+        return result
 
     def read_file(self, payload: SandboxAgentFileReadRequest) -> dict[str, Any]:
         try:
@@ -1988,6 +2009,32 @@ class SandboxAgentWorkspaceService:
             raise AppError(422, "sandbox_file_not_text", "Sandbox Agent file is not UTF-8 text") from exc
         if len(data) > self.settings.sandbox_agent_file_bytes:
             raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
+        # Line-range view: slice by [start_line, end_line] (1-based, inclusive),
+        # then optionally cap by max_chars. Whole-file reads stay untouched.
+        lines = content.splitlines(keepends=True)
+        total_lines = len(lines)
+        lo = (payload.start_line - 1) if payload.start_line is not None else 0
+        hi = payload.end_line if payload.end_line is not None else len(lines)
+        if payload.start_line is not None and lo > len(lines):
+            raise AppError(
+                422,
+                "sandbox_file_range_out_of_bounds",
+                f"start_line {payload.start_line} is beyond the file's {total_lines} lines",
+            )
+        if hi > len(lines):
+            hi = len(lines)
+        if lo > hi:
+            raise AppError(
+                422,
+                "sandbox_file_range_invalid",
+                "end_line must be greater than or equal to start_line",
+            )
+        selected = lines[lo:hi]
+        content = "".join(selected)
+        truncated = False
+        if payload.max_chars is not None and len(content) > payload.max_chars:
+            content = content[: payload.max_chars]
+            truncated = True
         self._touch_session(session)
         session.lifecycle_state = "WARM_IDLE"
         self.audit.record(
@@ -1995,7 +2042,13 @@ class SandboxAgentWorkspaceService:
             action="sandbox.agent.file_read",
             resource_type="sandbox_session",
             resource_id=session.id,
-            details={"path": path, "size_bytes": len(data)},
+            details={
+                "path": path,
+                "size_bytes": len(data),
+                "total_lines": total_lines,
+                "start_line": lo + 1 if payload.start_line is not None else None,
+                "end_line": hi if payload.end_line is not None else None,
+            },
         )
         self.db.commit()
         return {
@@ -2004,6 +2057,11 @@ class SandboxAgentWorkspaceService:
             "size_bytes": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
             "content": content,
+            "total_lines": total_lines,
+            "total_bytes": len(data),
+            "start_line": lo + 1 if payload.start_line is not None else None,
+            "end_line": hi if payload.end_line is not None else None,
+            "truncated": truncated,
         }
 
     def list_files(self, payload: SandboxAgentFileListRequest) -> dict[str, Any]:
@@ -2018,6 +2076,7 @@ class SandboxAgentWorkspaceService:
                 "role": entry.role,
                 "file_id": entry.file_id,
                 "source": entry.source,
+                "mtime": entry.updated_at.isoformat() if entry.updated_at else None,
             }
             for entry in logical
         }
@@ -2034,6 +2093,7 @@ class SandboxAgentWorkspaceService:
                         "role": "work",
                         "file_id": None,
                         "source": "container",
+                        "mtime": None,
                     }
                 else:
                     existing["size_bytes"] = item.size_bytes or existing["size_bytes"]
@@ -2041,7 +2101,14 @@ class SandboxAgentWorkspaceService:
             # Logical workspace alone is enough for list; agent can still read
             # materializable inputs without a live Docker handle.
             pass
-        files = sorted(by_path.values(), key=lambda item: item["path"])[:200]
+        pattern = payload.pattern
+        if pattern:
+            filtered = {
+                path: item for path, item in by_path.items() if fnmatch.fnmatch(path, pattern)
+            }
+            by_path = filtered
+        limit = payload.max_results or 200
+        files = sorted(by_path.values(), key=lambda item: item["path"])[:limit]
         self._touch_session(session)
         session.lifecycle_state = "WARM_IDLE"
         self.audit.record(
@@ -2049,7 +2116,11 @@ class SandboxAgentWorkspaceService:
             action="sandbox.agent.files_listed",
             resource_type="sandbox_session",
             resource_id=session.id,
-            details={"file_count": len(files)},
+            details={
+                "file_count": len(files),
+                "pattern": pattern,
+                "limit": limit,
+            },
         )
         self.db.commit()
         return {
@@ -2057,6 +2128,186 @@ class SandboxAgentWorkspaceService:
             "path": ".",
             "size_bytes": 0,
             "files": files,
+        }
+
+    # Host-side content search over the durable session workspace. Container
+    # snapshots are deliberately not streamed here: per-file host materialization
+    # keeps the search fast, memory-bounded and Docker-independent.
+    GREP_MAX_FILE_BYTES = 4 * 1024 * 1024
+    GREP_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+    GREP_MAX_LINE_CHARS = 500
+
+    def grep_files(self, payload: SandboxAgentFileGrepRequest) -> dict[str, Any]:
+        self._require_chat_session(payload.chat_session_id)
+        try:
+            flags = 0 if payload.case_sensitive else re.IGNORECASE
+            matcher = re.compile(payload.pattern, flags)
+        except re.error as exc:
+            raise AppError(
+                422,
+                "sandbox_grep_invalid_pattern",
+                f"grep pattern is not a valid regular expression: {exc}",
+            ) from exc
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        path_filter = payload.path
+        ctx = payload.context_lines
+        max_matches = payload.max_matches
+
+        matches: list[dict[str, Any]] = []
+        file_counts: list[dict[str, Any]] = []
+        searched = 0
+        skipped_binary = 0
+        skipped_large = 0
+        skipped_container_only = 0
+        truncated = False
+        total_scanned = 0
+
+        for entry in self.workspace_files.list_entries(payload.chat_session_id):
+            if path_filter and not fnmatch.fnmatch(entry.path, path_filter):
+                continue
+            if int(entry.size_bytes or 0) > self.GREP_MAX_FILE_BYTES:
+                skipped_large += 1
+                continue
+            try:
+                data = self.workspace_files.materialize_bytes(
+                    payload.chat_session_id, entry.path
+                )
+            except AppError:
+                # exec-generated files live only inside the container; the
+                # durable logical store cannot materialize them host-side.
+                skipped_container_only += 1
+                continue
+            total_scanned += len(data)
+            try:
+                text = data.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                skipped_binary += 1
+                continue
+            searched += 1
+            lines = text.splitlines(keepends=True)
+            line_count = len(lines)
+            file_match_count = 0
+            index = 0
+            while index < line_count:
+                if not matcher.search(lines[index]):
+                    index += 1
+                    continue
+                file_match_count += 1
+                window_lo = max(0, index - ctx)
+                window_hi = min(line_count - 1, index + ctx)
+                context_rows: list[dict[str, Any]] = []
+                for row in range(window_lo, window_hi + 1):
+                    row_text = lines[row].rstrip("\n").rstrip("\r")
+                    if len(row_text) > self.GREP_MAX_LINE_CHARS:
+                        row_text = row_text[: self.GREP_MAX_LINE_CHARS] + "…"
+                    if row != index:
+                        context_rows.append({"line_number": row + 1, "text": row_text})
+                matched_text = lines[index].rstrip("\n").rstrip("\r")
+                if len(matched_text) > self.GREP_MAX_LINE_CHARS:
+                    matched_text = matched_text[: self.GREP_MAX_LINE_CHARS] + "…"
+                matches.append(
+                    {
+                        "path": entry.path,
+                        "line_number": index + 1,
+                        "text": matched_text,
+                        "context": context_rows,
+                    }
+                )
+                if len(matches) >= max_matches:
+                    truncated = True
+                    break
+                index = window_hi + 1
+            if file_match_count:
+                file_counts.append({"path": entry.path, "matches": file_match_count})
+            if truncated or total_scanned >= self.GREP_MAX_TOTAL_BYTES:
+                if not truncated:
+                    truncated = True
+                break
+
+        self._touch_session(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.files_grep",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={
+                "pattern": payload.pattern,
+                "searched_files": searched,
+                "match_files": len(file_counts),
+                "matches": len(matches),
+                "truncated": truncated,
+            },
+        )
+        self.db.commit()
+        return {
+            "sandbox_session_id": session.id,
+            "pattern": payload.pattern,
+            "case_sensitive": payload.case_sensitive,
+            "searched_files": searched,
+            "skipped_binary": skipped_binary,
+            "skipped_large": skipped_large,
+            "skipped_container_only": skipped_container_only,
+            "matches": matches,
+            "file_counts": file_counts,
+            "truncated": truncated,
+        }
+
+    def delete_file(self, payload: SandboxAgentFileDeleteRequest) -> dict[str, Any]:
+        path = validate_agent_workspace_path(payload.path)
+        # Grant API parity: destructive authorizations are limited to the
+        # session work/ tree (see SandboxAuthorizationService.grant).
+        if not (path == "work" or path.startswith("work/")):
+            self._record_policy_block(
+                action="sandbox.agent.file_delete.blocked",
+                reason="sandbox_delete_file is limited to the session work/ tree",
+                path=path,
+            )
+            raise AppError(
+                422,
+                "sandbox_path_blocked",
+                "sandbox_delete_file is limited to the session work/ tree; use sandbox_exec for other paths",
+            )
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        # Reuse the exact single-use grant flow used by destructive argv: the
+        # chat authorization dialog grants the intent digest, then the retry
+        # consumes it atomically here.
+        argv = ("sandbox_delete_file", path)
+        intent_digest = destructive_intent_digest(
+            chat_session_id=payload.chat_session_id,
+            sandbox_session_id=session.id,
+            argv=argv,
+            paths=(path,),
+        )
+        self.authz.consume_delete_prefixes(
+            chat_session_id=payload.chat_session_id,
+            sandbox_session_id=session.id,
+            paths=(path,),
+            command_intent_digest=intent_digest,
+        )
+        self.workspace_files.delete_entry(payload.chat_session_id, path)
+        # Best-effort container cleanup: the logical store is authoritative;
+        # Docker unavailability must not fail the durable delete.
+        try:
+            handle = self._ensure_backend_session(session)
+            self._runtime_backend(session).delete_agent_file(handle, path)
+        except (SandboxBackendUnavailable, SandboxBackendError):
+            pass
+        session.status = "ready"
+        self._touch_session(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.file_deleted",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={"path": path},
+        )
+        self.db.commit()
+        return {
+            "sandbox_session_id": session.id,
+            "path": path,
+            "deleted": True,
         }
 
     def video_info(self, payload: SandboxAgentVideoInfoRequest) -> dict[str, Any]:
@@ -2458,7 +2709,7 @@ class SandboxAgentWorkspaceService:
                 "type": "function",
                 "function": {
                     "name": "sandbox_edit_file",
-                    "description": "Atomically replace one unique UTF-8 string in a workspace file. First read the file and pass its SHA-256 as expected_sha256.",
+                    "description": "Atomically replace one unique UTF-8 string in a workspace file. First read the file and pass its SHA-256 as expected_sha256. Set replace_all=true only when the same change must be applied to every occurrence (capped at 100 replacements).",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -2466,6 +2717,7 @@ class SandboxAgentWorkspaceService:
                             "old_string": {"type": "string"},
                             "new_string": {"type": "string"},
                             "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one match (safety cap 100)."},
                             "sandbox_session_id": session_property,
                         },
                         "required": ["path", "old_string", "new_string", "expected_sha256"],
@@ -2477,10 +2729,16 @@ class SandboxAgentWorkspaceService:
                 "type": "function",
                 "function": {
                     "name": "sandbox_read_file",
-                    "description": "Read a UTF-8 file from the isolated Agent workspace.",
+                    "description": "Read a UTF-8 file from the isolated Agent workspace. Pass start_line/end_line to read only a line range (1-based, inclusive) and max_chars to bound the returned text; the response reports total_lines/total_bytes so you can page through large files without re-reading everything.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"path": {"type": "string"}, "sandbox_session_id": session_property},
+                        "properties": {
+                            "path": {"type": "string"},
+                            "start_line": {"type": "integer", "minimum": 1, "description": "First line to return (1-based)."},
+                            "end_line": {"type": "integer", "minimum": 1, "description": "Last line to return (inclusive); values beyond the file are clamped."},
+                            "max_chars": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "Optional character cap on the returned content (truncated=true when applied)."},
+                            "sandbox_session_id": session_property,
+                        },
                         "required": ["path"],
                         "additionalProperties": False,
                     },
@@ -2490,10 +2748,50 @@ class SandboxAgentWorkspaceService:
                 "type": "function",
                 "function": {
                     "name": "sandbox_list_files",
-                    "description": "List regular files in the isolated Agent workspace.",
+                    "description": "List regular files in the isolated Agent workspace. Pass pattern (glob, e.g. work/**/*.py) to filter and max_results to bound the response.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"sandbox_session_id": session_property},
+                        "properties": {
+                            "pattern": {"type": "string", "description": "Optional glob filter over workspace paths."},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Optional result cap (default 200)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_grep",
+                    "description": "Search workspace file contents with a regular expression and return matching lines with optional context. Use this instead of sandbox_exec for locating symbols, error strings, or patterns before editing — it runs host-side without starting a container command. Searches the durable session workspace (chat attachments and files written by sandbox tools); files created by sandbox_exec inside the container are not indexed — read those files first or search them inside the script.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string", "description": "Regular expression to search for."},
+                            "path": {"type": "string", "description": "Optional glob filter over workspace paths (e.g. work/**/*.py)."},
+                            "case_sensitive": {"type": "boolean", "description": "Match case-sensitively (default false)."},
+                            "context_lines": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Lines of context before/after each match (default 0)."},
+                            "max_matches": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum matching lines to return (default 50; truncated=true when the cap is hit)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["pattern"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_delete_file",
+                    "description": "Permanently delete ONE regular file under the session work/ tree (e.g. work/tmp.txt). Raises sandbox_auth_required first and the chat UI asks the user to authorize this single-use delete before it proceeds. Cannot delete inputs/, outputs/, or host files; for directories or batch deletion use sandbox_exec (same authorization flow).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative workspace path under work/."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path"],
                         "additionalProperties": False,
                     },
                 },
@@ -2503,21 +2801,16 @@ class SandboxAgentWorkspaceService:
                 "function": {
                     "name": "sandbox_exec",
                     "description": (
-                        "Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file in the isolated sandbox. "
-                        "argv is never evaluated by a shell. The sandbox has NO network access (page.goto to "
-                        "the internet, pip install and npm install all fail by design). Pre-installed and "
-                        "offline-ready: Chromium + playwright-core (headless render/screenshot/PDF with CJK "
-                        "fonts), ffmpeg/ffprobe, Python libs mammoth/pypdf/openpyxl/Pillow/pydub, and "
-                        "learngraph_tasks (docx_to_pdf, html_to_pdf, html_to_png, audio_transcode, media_info, "
-                        "make_zip, extract_zip, pdf_merge). The frontend toolchain (vite, vue, react, "
-                        "react-dom, @vitejs plugins, vite-plugin-singlefile) resolves from the image's "
-                        "/node_modules — write app sources plus a driver script that imports {build} from "
-                        "'vite' (base:'./', singlefile for previewable output), then validate and publish "
-                        "the resulting dist/index.html with sandbox_validate_web_app followed by "
-                        "sandbox_publish_web_app for a multi-file teaching app. Use "
-                        "sandbox_publish_file only for downloadable single-file outputs. "
-                        "Host-path deletes are blocked; session work/ deletes require "
-                        "prior user authorization."
+                        "Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file in the isolated, "
+                        "offline sandbox (argv is never evaluated by a shell; pip/npm install and "
+                        "internet access fail by design). Prefer the dedicated sandbox_write_file / "
+                        "sandbox_edit_file / sandbox_read_file / sandbox_grep / sandbox_list_files "
+                        "tools for single-file operations — sandbox_exec is for scripts that need "
+                        "Chromium, ffmpeg, the Python/Node toolchain, or batch/multi-file work. "
+                        "Installed capabilities are summarized by sandbox_env_info; the "
+                        "learngraph_tasks library and file-workflow guidance live in the sandbox_files "
+                        "skill. Host-path deletes are blocked; session work/ deletes require prior "
+                        "user authorization."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2775,6 +3068,10 @@ class SandboxAgentWorkspaceService:
                 return self.read_file(SandboxAgentFileReadRequest.model_validate(payload))
             if name == "sandbox_list_files":
                 return self.list_files(SandboxAgentFileListRequest.model_validate(payload))
+            if name == "sandbox_grep":
+                return self.grep_files(SandboxAgentFileGrepRequest.model_validate(payload))
+            if name == "sandbox_delete_file":
+                return self.delete_file(SandboxAgentFileDeleteRequest.model_validate(payload))
             if name == "sandbox_exec":
                 command = self.execute_command(
                     SandboxAgentCommandRequest.model_validate(payload),

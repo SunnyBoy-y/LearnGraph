@@ -71,6 +71,8 @@ class SandboxBackendPort(Protocol):
         self, session: SandboxSessionHandle, path: str, data: bytes
     ) -> None: ...
 
+    def delete_agent_file(self, session: SandboxSessionHandle, path: str) -> None: ...
+
     def exec_fixed(
         self,
         session: SandboxSessionHandle,
