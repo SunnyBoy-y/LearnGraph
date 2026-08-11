@@ -161,14 +161,14 @@ def _atomic_fields(
     version = int(structured.get("atom_schema_version") or 0)
     ledger_status = str(structured.get("ledger_status") or "active")
     temporal_status = str(structured.get("temporal_status") or "timeless")
-    summary_eligibility = str(
-        structured.get("summary_eligibility")
-        or (
-            "durable"
-            if default_eligible or (version >= 1 and source_ids)
-            else "excluded"
+    summary_eligibility = str(structured.get("summary_eligibility") or "")
+    if summary_eligibility not in _SUMMARY_ELIGIBILITY:
+        # Unknown values (e.g. a model emitting the legacy "eligible") must
+        # never silently degrade a valid atom to "excluded" - that would hide
+        # it from the profile summary. Fall back to the default rule instead.
+        summary_eligibility = (
+            "durable" if default_eligible or (version >= 1 and source_ids) else "excluded"
         )
-    )
     return {
         "atom_schema_version": max(0, version),
         "canonical_key": str(structured.get("canonical_key") or "")[:240],

@@ -789,7 +789,11 @@ def _extraction_schema() -> dict[str, Any]:
                         "original_expression": {"type": "string"},
                         "timezone_name": {"type": "string"},
                         "granularity_hint": {"type": "string"},
-                        "summary_eligibility": {"type": "string"},
+                        "summary_eligibility": {
+                            "type": "string",
+                            "enum": ["durable", "current", "historical", "excluded"],
+                            "description": "durable=稳定长期事实；current=当前有效状态；historical=已闭环仅留档；excluded=不应进入长期摘要",
+                        },
                         "event_at": {"type": ["string", "null"]},
                         "valid_from": {"type": ["string", "null"]},
                         "valid_until": {"type": ["string", "null"]},
@@ -846,7 +850,9 @@ def _extraction_prompt(
         "例如“下个月”“明天下午”“每周五”），不要自行换算成绝对时间；"
         "程序会用消息发生时间和用户时区确定性规范化。"
         "计划过去不代表已经完成；取消用 CANCEL，"
-        "改期用 RESCHEDULE，没有足够证据用 NOOP。\n\n"
+        "改期用 RESCHEDULE，没有足够证据用 NOOP。\n"
+        "summary_eligibility 取值：durable（稳定长期事实）、current（当前有效状态）、"
+        "historical（已闭环仅留档）、excluded（不应进入长期摘要）；拿不准时用 durable。\n\n"
         f"可用的记忆类型：\n{_type_catalog_lines()}\n\n"
         f"{scope_hint}\n\n"
         f"已有记忆（避免重复；如需修正请用 operation=UPDATE 并给出 target_memory_id）：\n"
@@ -1256,6 +1262,12 @@ def extract_session_memories(
         summary_eligibility = str(
             proposal.get("summary_eligibility") or "durable"
         ).strip()
+        if summary_eligibility not in {
+            "durable", "current", "historical", "excluded",
+        }:
+            # Never let an out-of-vocabulary model value (e.g. legacy
+            # "eligible") silently exclude a valid atom from the summary.
+            summary_eligibility = "durable"
         event_at = proposal.get("event_at")
         valid_until = proposal.get("valid_until")
         next_review_at = proposal.get("next_review_at")

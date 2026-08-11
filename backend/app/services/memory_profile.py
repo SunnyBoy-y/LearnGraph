@@ -258,7 +258,11 @@ def _atomization_schema() -> dict[str, Any]:
             "temporal_status": {"type": "string"},
             "time_expression": {"type": "string"},
             "timezone_name": {"type": "string"},
-            "summary_eligibility": {"type": "string"},
+            "summary_eligibility": {
+                "type": "string",
+                "enum": ["durable", "current", "historical", "excluded"],
+                "description": "durable=稳定长期事实；current=当前有效状态；historical=已闭环仅留档；excluded=不应进入长期摘要",
+            },
             "event_at": {"type": ["string", "null"]},
             "valid_from": {"type": ["string", "null"]},
             "valid_until": {"type": ["string", "null"]},
@@ -345,7 +349,10 @@ def _legacy_migration_schema() -> dict[str, Any]:
                         "title": {"type": "string"},
                         "statement": {"type": "string"},
                         "temporal_status": {"type": "string"},
-                        "summary_eligibility": {"type": "string"},
+                        "summary_eligibility": {
+                            "type": "string",
+                            "enum": ["durable", "current", "historical", "excluded"],
+                        },
                         "event_at": {"type": ["string", "null"]},
                         "valid_until": {"type": ["string", "null"]},
                         "next_review_at": {"type": ["string", "null"]},
@@ -1102,6 +1109,12 @@ class MemoryProfileService:
             importance = min(1.0, max(0.0, float(raw.get("importance") or 0.5)))
             raw_temporal_status = str(raw.get("temporal_status") or "timeless")
             eligibility = str(raw.get("summary_eligibility") or "durable")
+            if eligibility not in {
+                "durable", "current", "historical", "excluded",
+            }:
+                # Never let an out-of-vocabulary model value (e.g. legacy
+                # "eligible") silently exclude a valid atom from the summary.
+                eligibility = "durable"
             event_at = _parse_iso(raw.get("event_at"))
             valid_until = _parse_iso(raw.get("valid_until"))
             next_review = _parse_iso(raw.get("next_review_at"))
@@ -1324,6 +1337,12 @@ class MemoryProfileService:
                 requested_eligibility = str(
                     raw.get("summary_eligibility") or "durable"
                 )
+                if requested_eligibility not in {
+                    "durable", "current", "historical", "excluded",
+                }:
+                    # Never let an out-of-vocabulary model value (e.g. legacy
+                    # "eligible") silently exclude a valid atom from the summary.
+                    requested_eligibility = "durable"
                 eligibility = (
                     requested_eligibility if user_confirmed else "excluded"
                 )
