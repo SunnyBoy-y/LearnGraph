@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="LearnGraph 开发者文档：架构、API 网关、Agent、渐进式工具、Skills、MCP、Docker 沙箱与系统提示词策略。"
+      content="LearnGraph 开发者文档：架构、API 网关、Agent、渐进式工具、Skills、MCP、记忆系统、Docker 沙箱、Egress 审批、可信组件与系统提示词策略。"
     />
     <title>LearnGraph Developer Docs</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23171a18'/%3E%3Cpath d='M8 10.5 16 6l8 4.5v9L16 24l-8-4.5zm0 0 8 4.5 8-4.5M16 15v9' fill='none' stroke='white' stroke-width='1.6'/%3E%3C/svg%3E" />
@@ -78,9 +78,13 @@
             <div class="nav-group">
               <p>运行与数据</p>
               <a href="#sandbox">沙箱</a>
+              <a href="#sandbox-egress">沙箱联网与审批</a>
+              <a href="#memory">记忆系统</a>
+              <a href="#artifacts">产物与分享</a>
               <a href="#atomic-tools">原子工具</a>
               <a href="#streaming">消息与 SSE</a>
               <a href="#trusted-components">可信组件</a>
+              <a href="#subapps">交互式子应用</a>
               <a href="#security">安全与授权</a>
             </div>
             <div class="nav-group">
@@ -259,7 +263,7 @@ npm.cmd run check</code></pre>
                 <div class="arch-label">Domain</div>
                 <div class="arch-main">
                   <strong>Services + Repositories</strong>
-                  <span>Goal · Graph · Chat · Evidence · Mastery</span>
+                  <span>Goal · Graph · Chat · Memory · Evidence · Mastery</span>
                 </div>
               </div>
               <div class="arch-layer">
@@ -303,24 +307,28 @@ npm.cmd run check</code></pre>
         <section id="evolution" class="doc-section doc-section-accent" data-title="版本演进与设计原则">
           <div class="section-heading">
             <span class="section-index">04A</span>
-            <div><p class="overline">Architecture evolution</p><h2>从转录修复到可治理 Runtime</h2></div>
+            <div><p class="overline">Architecture evolution</p><h2>从 v0.1 起步到可治理 Runtime</h2></div>
           </div>
-          <p>旧设计文档中的 <code>c173b36</code> 基线来自 rebase 前分支，不在当前 main 历史；当前 main 以 <code>ddf3a1c</code>（v0.1 首发）为起点，HEAD <code>08decda</code> 把媒体输入、工具执行和沙箱推进到可观察、可恢复、可审计的边界。</p>
+          <p>旧设计文档中的 <code>c173b36</code> 基线来自 rebase 前分支，不在当前 main 历史；当前 main 以 <code>ddf3a1c</code>（v0.1 首发）为起点，HEAD <code>57fd37f</code> 把记忆系统、沙箱审批制出网、交互式子应用与产物版本化推进到可观察、可恢复、可审计的边界，并已完成一轮上线前全盘审计（NO_GO → 修复 → 有条件放行）。</p>
           <div class="timeline-rail">
-            <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>起点 · ddf3a1c（v0.1）</small><strong>先让媒体可靠进入系统</strong><p>建立首版媒体输入、转录路由、音视频附件策略、解析器、文件服务与验证脚本基线；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
-            <div class="timeline-item timeline-current"><span class="timeline-dot"></span><div><small>当前 · HEAD</small><strong>再让能力可治理地运行</strong><p>增加 sandbox readiness、网络/egress 授权、原子工具、能力按需装配、断线恢复和媒体描述缓存。</p></div></div>
+            <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>起点 · ddf3a1c（v0.1）</small><strong>先让能力可靠进入系统</strong><p>建立首版媒体输入、转录路由、音视频附件策略、解析器、文件服务与验证脚本基线；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div><small>07-31 ~ 08-08 · 记忆 WP 系列</small><strong>记忆系统升级</strong><p>长期记忆从“摘要 + 检索”升级为原子记忆能力（自动提取、按需回填、用户纠错优先），并切换为默认读取链路；事件溯源等底层架构仍在演进中。</p></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div><small>08-09 ~ 08-10 · 安全与审计</small><strong>Egress 审批默认开启 + 上线前审计</strong><p>沙箱 Egress 审批链全量落地并默认开启；上线前审计发现生产构建 P0 白屏、登录并发、越权等问题，逐项修复后按边界放行。</p></div></div>
+            <div class="timeline-item timeline-current"><span class="timeline-dot"></span><div><small>当前 · HEAD</small><strong>让能力可治理地运行</strong><p>记忆系统、沙箱 readiness 与 egress 授权、原子工具、渐进披露、断线恢复、产物版本化与分享令牌、交互式子应用全部就位。</p></div></div>
           </div>
           <div class="principle-grid">
             <article><span class="principle-icon">01</span><strong>能力先于格式</strong><p>按 MIME、解析能力和 Provider capability 路由；音频、视频、图片和文本文档不共享一条假设链。</p></article>
             <article><span class="principle-icon">02</span><strong>边界先于便利</strong><p>沙箱、工具、Grant、工作区和 Provider 都是独立边界；没有能力就明确 unavailable，不静默落回宿主。</p></article>
-            <article><span class="principle-icon">03</span><strong>事实先于视图</strong><p>数据库记录、revision 和 audit 是事实；SSE、UI 面板和缓存都是可恢复或可重建的视图。</p></article>
+            <article><span class="principle-icon">03</span><strong>事实先于视图</strong><p>数据库记录、事件、revision 和 audit 是事实；SSE、UI 面板和缓存都是可恢复或可重建的视图。</p></article>
             <article><span class="principle-icon">04</span><strong>按需披露</strong><p>模型先看到能力摘要和授权范围，再在需要时发现工具、读取大结果或展开上下文，减少噪声与权限面。</p></article>
+            <article><span class="principle-icon">05</span><strong>静默降级即缺陷</strong><p>枚举校验、能力门控、失败边界都要显式：要么显式报错，要么显式兜底，绝不静默改变语义（记忆摘要空值的教训）。</p></article>
+            <article><span class="principle-icon">06</span><strong>门禁先于发布</strong><p>上线前审计（构建、并发、越权、限流、计费）与 CONDTIONAL_GO 边界是发布纪律，不是可选项。</p></article>
           </div>
           <div class="compare evolution-compare">
-            <div><span class="compare-label">baseline</span><h3>转录修复版</h3><ul><li>重点是音视频能否被正确解析和路由</li><li>附件策略与 Provider 失败边界开始显式化</li><li>验证以脚本和单次请求为主</li></ul></div>
-            <div><span class="compare-label">current</span><h3>当前治理版</h3><ul><li>输入、工具和沙箱均有稳定事实与生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
+            <div><span class="compare-label">baseline</span><h3>v0.1 起步版</h3><ul><li>重点是媒体能否被正确解析和路由</li><li>附件策略与 Provider 失败边界开始显式化</li><li>验证以脚本和单次请求为主</li></ul></div>
+            <div><span class="compare-label">current</span><h3>记忆 + 治理版</h3><ul><li>输入、工具、沙箱和记忆均有稳定事实与生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
           </div>
-          <div class="source-ref">对比起点：<code>git show ddf3a1c</code> · 当前 HEAD：<code>08decda</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
+          <div class="source-ref">对比起点：<code>git show ddf3a1c</code> · 当前 HEAD：<code>57fd37f</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/memory_event_store.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
         </section>
 
         <section id="media-inputs" class="doc-section" data-title="媒体与文档输入">
@@ -382,8 +390,11 @@ npm.cmd run check</code></pre>
           <div class="route-cloud" aria-label="FastAPI 路由域">
             <code>auth</code><code>dashboard</code><code>goals</code><code>graphs</code><code>sessions</code>
             <code>files</code><code>research</code><code>sources</code><code>evidence</code><code>exercises</code>
-            <code>mcp-skills</code><code>providers</code><code>usage</code><code>plugins</code>
-            <code>components</code><code>migrations</code><code>audit</code><code>workflow</code><code>sandbox</code>
+            <code>memory</code><code>memory_v2</code><code>episodes</code><code>learning_state</code>
+            <code>mcp-skills</code><code>providers</code><code>usage</code><code>image_generations</code>
+            <code>plugins</code><code>components</code><code>subapps</code><code>artifact_gateway</code>
+            <code>egress_approvals</code><code>fetch_authorizations</code><code>migrations</code>
+            <code>audit</code><code>workflow</code><code>sandbox</code><code>document_learning</code>
           </div>
         </section>
 
@@ -404,6 +415,7 @@ npm.cmd run check</code></pre>
             <tbody>
               <tr><td>SQLAlchemy / SQLite</td><td>账号、RBAC、Goal、Graph、Session、Evidence、Provider、授权、审计</td><td>当前规范事实源</td></tr>
               <tr><td>Message timeline</td><td>Message、MessageVersion、MessagePart、SSE 事件、Provider Trace</td><td>SSE 只负责传输</td></tr>
+              <tr><td>Memory</td><td>原子记忆（提取 + 存储 + 按需回填）</td><td>记忆是长期事实，可随用户纠错更新</td></tr>
               <tr><td>Object Storage</td><td>上传文件、生成产物、内容寻址 Blob</td><td>默认本地，可经迁移边界切换</td></tr>
             </tbody>
           </table>
@@ -429,19 +441,40 @@ npm.cmd run check</code></pre>
             适配器负责协议差异、探测、超时、限额和 Provider Trace。
           </p>
           <div class="capability-rows">
-            <div><span>Model</span><strong>OpenAI Responses · OpenAI-compatible Chat · Anthropic Messages · DeepSeek</strong><small>统一为 ProviderChatMessage / ProviderStreamEvent</small></div>
-            <div><span>Search</span><strong>SearXNG · Cloud / AnySearch</strong><small>搜索不可用时显式失败，不生成来源</small></div>
-            <div><span>Fetch</span><strong>Crawl4AI HTTP · Firecrawl</strong><small>URL 安全校验、超时和响应结构限制</small></div>
+            <div><span>Model</span><strong>OpenAI Responses · OpenAI-compatible Chat · Anthropic Messages · DeepSeek · Qwen DashScope（原生搜索通道）· Ollama · GitHub Copilot · Codex · Ollama Cloud</strong><small>统一为 ProviderChatMessage / ProviderStreamEvent；多角色模型（fast / thinking / agentic）</small></div>
+            <div><span>Search</span><strong>通用搜索 Provider + Qwen 原生联网（enable_source / enable_citation）</strong><small>搜索来源与 [ref_N] 角标仅 DashScope 原生协议支持，按能力快照门控；搜索不可用时显式失败，不生成来源</small></div>
+            <div><span>Fetch</span><strong>沙箱热池抓取 · Crawl4AI HTTP · Firecrawl · Qwen hosted</strong><small>URL 安全校验、超时和响应结构限制；沙箱抓取复用热容器池</small></div>
             <div><span>Research</span><strong>Deep Research HTTP</strong><small>独立 Provider，不与普通搜索混淆</small></div>
+            <div><span>Image</span><strong>文生图 / 图生图 / 参考图编辑（gpt-image-2 · qwen-image-edit · qwen_image_search）</strong><small>图片模型独立 lane，拦截误作文本模型</small></div>
+            <div><span>ASR</span><strong>DashScope 转录（实时 + 录音转写）</strong><small>qwen 行兜底路由 · input_audio 直连 · 异步录音识别；沙箱内音频走宿主侧 ASR 桥</small></div>
             <div><span>Storage</span><strong>Local filesystem · MinIO</strong><small>通过迁移流程切换</small></div>
             <div><span>Sandbox</span><strong>Docker backend</strong><small>无 Docker 时明确 unavailable，不落回宿主执行</small></div>
           </div>
+          <h3>能力快照与按供应商门控</h3>
+          <p>
+            供应商协议差异（搜索参数、思考模式开关、图片输入、计费字段）被建模为<strong>能力快照</strong>，
+            而不是散落在调用点的 if。发不发 <code>enable_search</code> 由"该供应商是否支持"决定——
+            曾因向 OpenAI 兼容中继发送未知字段 <code>enable_search</code> 触发 400，修复后：
+            非 DashScope 中继一律不发；存量误标由 <code>repair_non_dashscope_capabilities.py</code> 修正。
+            极速模式的思考关闭同样按模型维护关闭矩阵（required / disabled / none / off），并拦截图片模型误作文本模型。
+          </p>
+          <h3>原生协议特化通道</h3>
+          <p>
+            DashScope 联网搜索的"返回搜索来源"（<code>enable_source</code> → <code>search_info.search_results</code>）与
+            "角标标注"（<code>enable_citation + citation_format</code> → 文本 <code>[ref_N]</code>）仅原生协议支持，
+            OpenAI 兼容方式（Chat Completions 与 Responses）均不支持。QwenChatProvider 在
+            <code>is_dashscope_origin</code> 且开启 <code>native_web_search</code>、无 tools、纯文本时自动切原生通道
+            （<code>POST /api/v1/services/aigc/text-generation/generation</code>，X-DashScope-SSE: enable），
+            带 tools 的 Agent 回合与多模态保持兼容模式；<code>prepend_search_result</code> 可提前返回搜索来源降低首包延迟。
+          </p>
           <h3>模型消息抽象</h3>
           <p>
             <code>ProviderChatMessage</code> 保留 <code>system/user/assistant/tool</code> 角色、tool calls、reasoning summary
             与协议原生 response items。原生 continuation state 作为不透明数据保存，不能被业务层臆造或跨协议消费。
+            Provider 连接按计划缓存跨请求复用（避免每条消息重建 HTTP 客户端与 TLS 握手）；usage 归一化拆分
+            input / cached / cache-creation，缓存 token 参与计费与预算（CNY/USD 多币种）。
           </p>
-          <div class="source-ref">来源：<code>backend/app/providers/ports/model.py</code> · <code>backend/app/providers/remote/</code></div>
+          <div class="source-ref">来源：<code>backend/app/providers/ports/model.py</code> · <code>backend/app/providers/remote/</code> · <code>backend/app/providers/catalog.py</code> · <code>backend/app/providers/qwen_catalog.py</code> · <code>backend/repair_non_dashscope_capabilities.py</code></div>
         </section>
 
         <section id="agent" class="doc-section" data-title="Agent 执行循环">
@@ -850,6 +883,101 @@ npm.cmd run check</code></pre>
           <div class="source-ref">来源：<code>backend/app/services/sandbox.py</code> · <code>backend/app/services/sandbox_authz.py</code> · <code>backend/app/services/session_workspace.py</code> · <code>backend/app/providers/remote/sandbox.py</code> · <code>backend/sandbox/</code></div>
         </section>
 
+        <section id="sandbox-egress" class="doc-section" data-title="沙箱联网与审批">
+          <div class="section-heading">
+            <span class="section-index">13A</span>
+            <div><p class="overline">Egress approval chain</p><h2>沙箱联网与审批：默认断网，出网必须过审</h2></div>
+          </div>
+          <p>
+            沙箱没有直接出网。需要联网的能力（网页抓取、依赖下载）必须经过<strong>工作区级审批链</strong>；
+            没有合法策略时容器保持 <code>network_mode="none"</code>（fail-closed，默认拒绝网络是安全基线）。
+          </p>
+          <div class="plain-grid">
+            <div><strong>EgressPolicy 白名单</strong><p>按工作区评审的出网策略：host 域名 + HTTPS 端口 + 有效期 + 审批记录 + 不可变 digest；<strong>拒绝通配符、拒绝 IP 字面量</strong>。抓取白名单（web_fetch.policy）与通用 Agent egress 策略各自独立，抓取授权不会扩大通用出网面。</p></div>
+            <div><strong>CONNECT 代理唯一出口</strong><p><code>SandboxEgressProxy</code> 是纯 asyncio CONNECT 代理。每次 CONNECT 都按策略 digest 鉴权（<code>X-LearnGraph-Policy-Digest</code> 头自证身份），并在<strong>连接时重新解析 DNS + 逐地址分类</strong>——私网 / 环回 / 链路本地 / 元数据 / 保留段全拒，防 DNS-rebinding（审批时是公网、连接时变内网）。</p></div>
+            <div><strong>容器接线</strong><p>有合法策略 → 容器加入 <code>learngraph-egress</code> 网络，注入 <code>HTTP_PROXY/HTTPS_PROXY</code> 与 <code>LEARNGRAPH_EGRESS_POLICY_DIGEST</code>；无策略 → 完全离线。拒绝时返回可审计原因。</p></div>
+            <div><strong>落地状态</strong><p>Egress 审批链默认开启（D2.1 全量落地），审批记录可查询、可吊销；服务端重启可恢复未完成审批流。</p></div>
+          </div>
+          <h3>web_fetch 热容器池</h3>
+          <p>
+            沙箱隔离的网页抓取每次请求原本要付完整容器生命周期（create → materialize → run → delete ≈ 1.5-3s 宿主开销/次）。
+            进程级<strong>热容器池</strong>按 <code>工作区 + 白名单 + settings 指纹</code> 复用空闲容器：
+          </p>
+          <table>
+            <thead><tr><th>机制</th><th>行为</th></tr></thead>
+            <tbody>
+              <tr><td>池 key</td><td>工作区 + 域名白名单 + settings 指纹（镜像/内存/CPU/workspace 路径…）；配置变化即换池，旧池按 idle TTL 自然淘汰</td></tr>
+              <tr><td>并发与饱和</td><td>默认池大小 4（0 关闭池回退旧行为）；饱和时等待预算内排队，超时抛 FetchPoolSaturated</td></tr>
+              <tr><td>驱逐</td><td>任何超时 / 截断 / 后端错误的容器立即销毁，绝不回流复用</td></tr>
+              <tr><td>回收</td><td>空闲 600s 由惰性 prune + 调度器 sweep 回收；进程退出 atexit 全量关闭</td></tr>
+            </tbody>
+          </table>
+          <h3>预构建镜像与真实进度</h3>
+          <p>
+            本地构建分钟级，支持发布预构建镜像到阿里云 ACR：只持久化 <strong>RepoDigest</strong>（本地 image ID 不可移植），
+            docker-py pull 显式传完整 tag（丢 tag 会静默拉 <code>:latest</code> 404），auto 模式拉取失败回退本地构建、显式 prebuilt 仍 fail-closed。
+            构建进度百分比来自<strong>后端真实 docker 事件</strong>（下载/解压/构建阶段 40-68%），BuildKit 的 \r/ANSI 日志清洗为可读行，
+            进度持久化、只前进不倒退、刷新不回跳；前端只渲染、不模拟。
+          </p>
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>联网能力与沙箱能力分开授权</strong>
+              <p>网页抓取的白名单、审批记录与沙箱执行权限是独立维度；抓取授权只影响抓取路径，不会放大 Agent 通用出网面。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/sandbox_egress_proxy.py</code> · <code>backend/app/services/sandbox_network_policy.py</code> · <code>backend/app/services/egress_approvals.py</code> · <code>backend/app/providers/sandbox_fetch_pool.py</code> · <code>backend/app/services/sandbox_bootstrap.py</code></div>
+        </section>
+
+        <section id="memory" class="doc-section doc-section-accent" data-title="记忆系统">
+          <div class="section-heading">
+            <span class="section-index">13B</span>
+            <div><p class="overline">Atomic memory</p><h2>记忆系统：原子记忆</h2></div>
+          </div>
+          <p>
+            记忆不是"把完整历史塞 prompt"。LearnGraph 的记忆系统以<strong>原子记忆</strong>为单位：
+            自动沉淀对话与任务中值得长期记住的事实，并在后续会话中按相关性回填给 Agent。
+            本节只描述当前提供的能力；底层架构仍在演进中。
+          </p>
+          <div class="plain-grid">
+            <div><strong>自动提取</strong><p>对话与任务结束后自动识别值得长期记住的事实（用户偏好、项目决策、纠错反馈等），无需手工录入；由工作区"记忆"总开关控制。</p></div>
+            <div><strong>原子化存储</strong><p>每条记忆独立成条，记录来源与置信度；同一事实的多次修正更新原条目，而不是堆积重复内容。</p></div>
+            <div><strong>按需回填</strong><p>后续会话只装配与当前任务相关的记忆，不注入完整历史；受预算约束，避免上下文失控。</p></div>
+            <div><strong>用户纠错优先</strong><p>用户可查看、修正或删除记忆；用户明确给出的纠正优先于自动提取的结果。</p></div>
+            <div><strong>作用域隔离</strong><p>记忆按任务 / 工作区 / 用户分级，跨工作区访问受授权约束。</p></div>
+            <div><strong>时效管理</strong><p>记忆带时效信息，过期或失去依据的内容自动降级或失效，避免误导后续会话。</p></div>
+          </div>
+          <p class="muted">记忆提取由工作区"记忆"总开关决定，任务结束后自动触发。</p>
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
+            <div>
+              <strong>静默降级是 bug 温床</strong>
+              <p>旧枚举 <code>summary_eligibility="eligible"</code> 曾因 schema 无枚举约束被静默降级为 excluded，导致记忆摘要永远为空。修复：非法值显式兜底（有证据→durable）、schema 加 enum + prompt 加取值说明 + 入口白名单校验、存量误标记录修复并备份。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/memory_*.py</code></div>
+        </section>
+
+        <section id="artifacts" class="doc-section" data-title="产物与分享">
+          <div class="section-heading">
+            <span class="section-index">13C</span>
+            <div><p class="overline">Artifact gateway</p><h2>产物与分享：不可变版本、分享令牌与卡片索引</h2></div>
+          </div>
+          <p>
+            沙箱、Agent 和可信组件产生的产物（sandbox_artifact、组件 Artifact、子应用 bundle）统一经过
+            <strong>Artifact Gateway</strong> 管理，遵循"发布即冻结"的版本模型，而不是工作区临时文件。
+          </p>
+          <div class="plain-grid">
+            <div><strong>不可变版本快照</strong><p>发布时生成不可变版本（版本 + 内容 hash 绑定），同一版本不可替换；预览与分享都引用版本而非工作区路径，工作区过期不影响已发布产物。</p></div>
+            <div><strong>只读分享令牌</strong><p>分享生成令牌（token），只读公开访问；令牌可撤销，撤销后原链接立即失效。</p></div>
+            <div><strong>软删除 + 级联撤销</strong><p>删除为软删除（保留审计痕迹）；删除产物时级联撤销其分享令牌，避免"删了还公开着"。</p></div>
+            <div><strong>会话卡片索引</strong><p>产物自动聚合为会话卡片（卡片网格），按会话/会话类型索引，可在产物页统一管理（编辑、分享、删除）。</p></div>
+            <div><strong>渲染降级</strong><p>组件 Artifact 由服务器持有模板渲染（CSP 锁死，见可信组件节）；离线沙箱渲染可用时附加有界截图，不可用时 <code>runtime_status=unavailable</code> 安全降级。</p></div>
+            <div><strong>bundle 预览</strong><p>交互式子应用支持 bundle 预览地址（独立 preview 源），发布/预览到期校验做时区归一化。</p></div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/artifact_gateway.py</code> · <code>artifact_cards.py</code> · <code>canvas_cards.py</code> · <code>component_renderer.py</code> · <code>backend/app/api/routers/artifact_gateway.py</code></div>
+        </section>
+
         <section id="streaming" class="doc-section" data-title="消息与 SSE">
           <div class="section-heading">
             <span class="section-index">14</span>
@@ -879,6 +1007,24 @@ npm.cmd run check</code></pre>
             前端以 Message Part 渲染文本、来源、推理摘要、工具状态、可信组件和沙箱 Artifact。
             未知组件安全降级为数据预览，不注入任意 HTML、脚本或 React 代码。
           </p>
+          <h3>单写者下的落库工程</h3>
+          <p>
+            SQLite 只有一个写者，如果每个流 delta 都 commit，token 投递会被串行化在 fsync/锁获取后面。策略：
+          </p>
+          <div class="plain-grid">
+            <div><strong>分级 flush</strong><p>started / completed / failed / checkpoint 等锚点事件立即落库；普通 delta 按条数或时间节奏批量落库——可靠性与吞吐兼得。</p></div>
+            <div><strong>per-Session 串行化付费调用</strong><p>自动标题、建议、活动摘要等每次调用都花钱的 LLM 调用按 Session 加锁串行，并发请求先释放快照再 CAS 读，防重复付费。</p></div>
+            <div><strong>重试分类与退避</strong><p>502/503/504 为中继失败、500 flaky、408/429 明确可重试、529 overloaded；退避用 uniform ±ratio 抖动 + 上限，避免惊群。</p></div>
+            <div><strong>共享 executor 工具超时</strong><p>Agent 工具调用用模块级共享单 worker executor + 宿主超时；超时后链路继续，挂起线程不阻塞回合。</p></div>
+          </div>
+          <h3>心跳、断线与恢复</h3>
+          <div class="plain-grid">
+            <div><strong>SSE 心跳</strong><p>工具执行 / 退避 / 搜索期间定期发心跳，防止中间代理断流，也防止用户误以为卡死。</p></div>
+            <div><strong>状态机终端化</strong><p>后端重启把未完成流标为 <code>interrupted</code>（可恢复）或 <code>failed</code>（可重试）；interrupted 保留重放窗口。</p></div>
+            <div><strong>重试端点</strong><p>retry 走独立端点重新生成消息版本；生成器必须 <code>yield from</code> 流（曾因 <code>return stream()</code> 把生成器当 StopIteration 值丢弃导致只发 ready 就 EOF）。</p></div>
+            <div><strong>断连 ≠ 取消</strong><p>页面关闭后任务继续并持久化；同账号多浏览器可恢复获取；关页不再等于白烧钱。</p></div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/chat.py</code> · <code>backend/app/core/process_lock.py</code> · <code>frontend/src/lib/session-streams.ts</code></div>
         </section>
 
         <section id="trusted-components" class="doc-section" data-title="可信组件">
@@ -1147,6 +1293,40 @@ npm.cmd run check</code></pre>
           <div class="source-ref">来源：<code>backend/app/domain/schemas/components.py</code> · <code>backend/app/services/components.py</code> · <code>backend/app/services/canvas_cards.py</code> · <code>frontend/src/components/chat/trusted-component-renderer.tsx</code> · <code>backend/app/skills/canvas_emit_trusted_component/SKILL.md</code></div>
         </section>
 
+        <section id="subapps" class="doc-section" data-title="交互式子应用">
+          <div class="section-heading">
+            <span class="section-index">15B</span>
+            <div><p class="overline">Interactive sub-apps</p><h2>交互式子应用：有状态的双向数据通道</h2></div>
+          </div>
+          <p>
+            交互式子应用（subapp）是可信组件的进阶形态：不只展示，还能<strong>收集用户交互数据并接收 AI 写回的状态</strong>，
+            形成"用户操作 → 事件 → Agent 处理 → 页面更新"的多轮对话式交互。UI 与数据契约分离——
+            <code>interaction_contract</code> 定义数据格式，"千万种交互形式，结果一致"。
+          </p>
+          <h3>协议与生命周期</h3>
+          <ol class="steps compact-steps">
+            <li><span>01</span><div><strong>注册 bundle</strong><p><code>subapp_bundles</code> 带 <code>interaction_contract</code> 与 <code>component_manifest_id</code>；契约校验顺序与组件 ID 匹配在服务端强制。</p></div></li>
+            <li><span>02</span><div><strong>发布 / 预览</strong><p>发布产生不可变版本与 bundle 预览地址（独立 preview 源）；发布/预览到期校验做时区归一化。</p></div></li>
+            <li><span>03</span><div><strong>双向通道</strong><p>iframe → <code>postMessage</code> 数据出口（宿主桥）→ 事件入库（T1.4 只读观察）→ 事件驱动 Agent 处理 → <code>patch_state</code> 写回（T2.5）→ 页面更新。</p></div></li>
+            <li><span>04</span><div><strong>媒体注入</strong><p>视频 / 音频经 blob 注入（零联网）；地图等外部资源走经审批的会话级媒体域名。</p></div></li>
+          </ol>
+          <h3>安全不变量</h3>
+          <div class="plain-grid">
+            <div><strong>服务器持有模板</strong><p>预览 HTML 是固定模板，组件数据是 schema 校验后的惰性 JSON，渲染进 HTML-escaped <code>&lt;pre&gt;</code>；组件提供的 HTML/JS/CSS/URL 永不嵌入（"没有可执行面"）。</p></div>
+            <div><strong>CSP 锁死 + opaque iframe</strong><p><code>default-src 'none'; script-src 'none'; connect-src 'none'</code>；iframe 读不到 cookie/localStorage，发不出 HTTP。</p></div>
+            <div><strong>postMessage 唯一出口</strong><p>CSP 拦不住 postMessage，因此数据出口只有宿主桥一条受控通道，按 interaction contract 校验、可审计。</p></div>
+            <div><strong>渲染兜底</strong><p>组件渲染可选在离线 Docker 沙箱做校验 + 有界截图；不可用则 <code>runtime_status=unavailable</code> 降级，不阻断主流程。</p></div>
+          </div>
+          <div class="callout callout-note">
+            <span class="callout-icon">i</span>
+            <div>
+              <strong>演进不破坏安全</strong>
+              <p>路径是 静态 HTML 预览 → 魔术卡片（可交互控件）→ 双向交互子应用。能力每前进一步，安全边界（模板、CSP、出口）同步验证一层。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/services/subapp_bundles.py</code> · <code>subapp_event_agent.py</code> · <code>component_renderer.py</code> · <code>backend/app/api/routers/subapps.py</code> · <code>frontend/src/lib/subapp-bridge.ts</code> · <code>frontend/src/lib/trusted-renderer.ts</code></div>
+        </section>
+
         <section id="security" class="doc-section" data-title="安全与授权">
           <div class="section-heading">
             <span class="section-index">16</span>
@@ -1164,6 +1344,17 @@ npm.cmd run check</code></pre>
             <div><span>05</span><strong>No silent fallback</strong><p>远程 Provider、Docker 或 Transport 失败时保持失败事实，不落回 mock、宿主执行或硬编码结果。</p></div>
             <div><span>06</span><strong>Audit trail</strong><p>授权、拒绝、撤销、失败、超时、大小阻断和成功调用均记录工作区审计。</p></div>
           </div>
+          <h3>认证、供应链与发布治理</h3>
+          <div class="definition-list compact">
+            <div><span class="status status-current">认证加固</span><p>首次登录强制改密（独立页面 + 刷新恢复）、Demo 登录默认关闭、认证限流防灌水；按端点明确权限边界、避免尾斜杠绕过。</p></div>
+            <div><span class="status status-current">供应链</span><p>沙箱镜像 lockfile + 供应链清单校验、镜像只持久化 RepoDigest、MCP 凭据接入版本化密钥存储加密、工具输出脱敏（URL 凭据/密钥赋值）。</p></div>
+            <div><span class="status status-current">资源配额</span><p>沙箱 inode / 文件数 / 目录数 / 快照保留限额；浏览器预览 Range 截断；宿主内存/CPU/磁盘保留水位。</p></div>
+            <div><span class="status status-current">发布门禁</span><p>上线前全盘审计（生产构建、登录并发、SSE 心跳、越权、限流、关页计费、首屏体积）→ 分级修复 → 回归验证 → 按"个人/小团队、单实例单进程"边界放行（CONDITIONAL_GO）。</p></div>
+          </div>
+          <p class="muted">
+            安全是默认值而不是功能：沙箱无策略即离线（fail-closed）、工具未授权即拒绝、Provider 能力不匹配即显式 unavailable——
+            任何"静默降级"都被视为缺陷。
+          </p>
         </section>
 
         <section id="repo-map" class="doc-section" data-title="代码地图">
@@ -1184,7 +1375,14 @@ npm.cmd run check</code></pre>
             <div><code>backend/app/services/chat.py</code><span>Chat、上下文、Agent 循环与持久化</span></div>
             <div><code>backend/app/services/agent_runtime.py</code><span>工具定义、注册与执行分派</span></div>
             <div><code>backend/app/services/mcp_skills.py</code><span>MCP/Skill 生命周期、Grant 与 Invocation</span></div>
+            <div><code>backend/app/services/memory_*.py</code><span>原子记忆：提取 / 存储 / 检索 / 回填 / 纠错 / 时效管理</span></div>
             <div><code>backend/app/services/sandbox.py</code><span>沙箱任务与 Agent Workspace</span></div>
+            <div><code>backend/app/services/sandbox_egress_proxy.py</code><span>出网 CONNECT 代理（策略 digest + 地址重分类）</span></div>
+            <div><code>backend/app/services/egress_approvals.py</code><span>Egress 审批链与策略落盘</span></div>
+            <div><code>backend/app/providers/sandbox_fetch_pool.py</code><span>web_fetch 热容器池（复用 + 并发）</span></div>
+            <div><code>backend/app/services/artifact_gateway.py</code><span>产物不可变版本与分享令牌</span></div>
+            <div><code>backend/app/services/component_renderer.py</code><span>服务器持有模板 + 离线沙箱渲染降级</span></div>
+            <div><code>backend/app/services/subapp_event_agent.py</code><span>交互子应用事件驱动 Agent（observe / patch_state）</span></div>
             <div><code>backend/app/prompts/</code><span>系统提示词片段与风格编译器</span></div>
             <div><code>backend/app/repositories/</code><span>工作区作用域数据访问</span></div>
             <div><code>backend/app/providers/ports/</code><span>外部能力契约</span></div>

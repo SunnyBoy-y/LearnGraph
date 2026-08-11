@@ -8,13 +8,16 @@
 
 ## 内容
 
-- 基于当前 main 历史（起点 `ddf3a1c` v0.1 首发，HEAD `08decda`）的版本演进与设计原则；旧设计文档中的 `c173b36` 基线来自 rebase 前分支，不在 main 历史
-- 音频、视频、图片和全文文档的能力路由、解析、缓存与证据边界
+- 基于当前 main 历史（起点 `ddf3a1c` v0.1 首发，HEAD `57fd37f`）的版本演进与设计原则；旧设计文档中的 `c173b36` 基线来自 rebase 前分支，不在 main 历史
 - 系统架构与 FastAPI 应用网关
-- Provider Port / Adapter 边界
+- Provider Port / Adapter 边界、能力快照与按供应商门控（Qwen 原生搜索通道、DashScope ASR）
 - Agent Runtime、渐进式披露与原子工具模型
-- Docker 沙箱、Agent Workspace、网络与 egress 审批
-- Message / SSE 持久化和断线恢复理念
+- Docker 沙箱、Agent Workspace、Egress 审批制出网、热容器池与预构建镜像
+- 事件溯源记忆系统：事件存储、投影、混合检索、Context Builder 动态装配与防注入
+- 产物与分享：Artifact 不可变版本、分享令牌、软删除与卡片索引
+- 可信组件与交互式子应用：服务器持有模板、CSP 锁死、postMessage 数据通道、interaction contract
+- Message / SSE 持久化、批量落库、心跳与断线恢复理念
+- 媒体输入管线：音频、视频、图片和全文文档的能力路由、解析、缓存与证据边界
 - 安全、代码地图、扩展与验收规范
 
 页面包含无需后端的交互预览：媒体输入管线与能力渐进式披露。所有动画均支持 `prefers-reduced-motion`，不加载外部脚本、字体或图片。

@@ -213,3 +213,6 @@ Desktop.ini
 backend/sandbox/.spec-test.json
 .spec-test.json
 /tests/
+
+# Blog deliverables (engineering retrospective series) — generated output, kept local
+/blog-output/
