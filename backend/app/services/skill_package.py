@@ -464,6 +464,33 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         required_tools=("fetch_web_page",),
     ),
     OfficialSkillSpec(
+        key="image-generation",
+        display_name="文生图 / 图生图",
+        version="1.0.0",
+        dir_name="image_generation",
+        description=(
+            "用宿主 generate_image 工具完成文生图与图生图编辑：先解析会话图片 "
+            "file_id（list_session_files / read_session_file），再生成或基于原图编辑；"
+            "区分搜图（search_images）与生图（generate_image）。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        category="image",
+        capability_ids=("image.generate", "image.edit", "image.file.read"),
+        keywords=(
+            "文生图",
+            "图生图",
+            "生成图片",
+            "generate_image",
+            "配图",
+            "插画",
+            "改图",
+            "编辑图片",
+            "source_file_ids",
+        ),
+        requires_runtime="agent",
+        required_tools=("generate_image", "list_session_files", "read_session_file"),
+    ),
+    OfficialSkillSpec(
         key="sandbox-files",
         display_name="沙箱文件处理",
         version="1.0.0",
