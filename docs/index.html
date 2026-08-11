@@ -947,15 +947,6 @@ npm.cmd run check</code></pre>
             <div><strong>作用域隔离</strong><p>记忆按任务 / 工作区 / 用户分级，跨工作区访问受授权约束。</p></div>
             <div><strong>时效管理</strong><p>记忆带时效信息，过期或失去依据的内容自动降级或失效，避免误导后续会话。</p></div>
           </div>
-          <p class="muted">记忆提取由工作区"记忆"总开关决定，任务结束后自动触发。</p>
-          <div class="callout callout-warning">
-            <span class="callout-icon">!</span>
-            <div>
-              <strong>静默降级是 bug 温床</strong>
-              <p>旧枚举 <code>summary_eligibility="eligible"</code> 曾因 schema 无枚举约束被静默降级为 excluded，导致记忆摘要永远为空。修复：非法值显式兜底（有证据→durable）、schema 加 enum + prompt 加取值说明 + 入口白名单校验、存量误标记录修复并备份。</p>
-            </div>
-          </div>
-          <div class="source-ref">来源：<code>backend/app/services/memory_*.py</code></div>
         </section>
 
         <section id="artifacts" class="doc-section" data-title="产物与分享">
