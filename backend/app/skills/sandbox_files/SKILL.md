@@ -59,6 +59,7 @@ sandbox_exec 验证/批量/多文件处理（learngraph_tasks、fs 库）
 - 删除必须先过单次用户授权（`sandbox_auth_required` → 聊天内授权对话框），授权即用即失效。
 - exec 生成但未写回宿主存储的文件，`sandbox_grep` 索引不到——先在脚本内处理或 read_file 拉回。
 - 大输出受 `sandbox_output_bytes` 截断；脚本 stdout 用结构化 JSON + 摘要。
+- `learngraph_tasks.fs` 库随镜像分发：先 import 探测再使用，`ModuleNotFoundError` 时降级到宿主工具（宿主工具永远可用）。
 
 ## 详细说明
 

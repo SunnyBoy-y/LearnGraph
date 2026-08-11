@@ -10,6 +10,21 @@ print(json.dumps(file_stats("inputs/notes.txt"), ensure_ascii=False))
 print(json.dumps(grep_lines("TODO", glob="work/**/*.py", context=1), ensure_ascii=False))
 ```
 
+## 可用性边界（先确认再使用）
+
+- 本库随**沙箱镜像**分发，不是后端代码：当前会话的镜像若未包含 `fs.py`（旧镜像），`import` 会直接 `ModuleNotFoundError`。
+- 使用前先在脚本里探测，失败时**降级到宿主工具**（`sandbox_grep` / `sandbox_read_file` 等永远可用，不依赖镜像）：
+
+```python
+try:
+    from learngraph_tasks.fs import file_stats, grep_lines
+    HAVE_FS = True
+except ModuleNotFoundError:
+    HAVE_FS = False
+```
+
+- 宿主工具与 `fs` 库能力重叠时，优先宿主工具（毫秒级、不启动容器、不计入 exec 快照成本）。
+
 ## 与宿主工具的分工
 
 | 场景 | 优先选择 |
