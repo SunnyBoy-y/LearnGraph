@@ -1,5 +1,7 @@
 import type {
   Artifact,
+  ArtifactCard,
+  ArtifactCardPreview,
   ArtifactShareToken,
   ArtifactShareTokenCreated,
   ArtifactSummary,
@@ -46,6 +48,30 @@ export function updateArtifactVersion(
 export function deleteArtifactVersion(versionId: string): Promise<ArtifactVersion> {
   return apiClient.delete<ArtifactVersion>(
     `/artifacts/versions/${encodeURIComponent(versionId)}`,
+  );
+}
+
+export function listArtifactCards(params?: {
+  status?: string;
+  card_type?: string;
+  interactive?: boolean;
+  sort?: string;
+  order?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<ArtifactCard[]> {
+  return apiClient.get<ArtifactCard[]>("/artifacts/cards", { query: params });
+}
+
+export function getArtifactCardPreview(cardId: string): Promise<ArtifactCardPreview> {
+  return apiClient.get<ArtifactCardPreview>(
+    `/artifacts/cards/${encodeURIComponent(cardId)}/preview`,
+  );
+}
+
+export function deleteArtifactCard(cardId: string): Promise<ArtifactCard> {
+  return apiClient.delete<ArtifactCard>(
+    `/artifacts/cards/${encodeURIComponent(cardId)}`,
   );
 }
 

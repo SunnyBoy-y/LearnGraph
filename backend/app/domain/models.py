@@ -2089,6 +2089,42 @@ class Artifact(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
 
 
+class ArtifactCard(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Index of interactive HTML cards emitted by the agent in chat sessions.
+
+    One row per stable card identity (``card_id``); re-emitting the same card id
+    refreshes the row so the artifacts page always shows the latest draft. The
+    ``preview_snapshot`` keeps a copy of the render data at emit time so cards
+    stay previewable even after the source message is pruned.
+    """
+
+    __tablename__ = "artifact_cards"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "card_id",
+            name="uq_artifact_card_workspace_card",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    # Stable identity chosen by the agent; ``card_instance_id`` changes on every emit.
+    card_id: Mapped[str] = mapped_column(String(64), index=True)
+    card_instance_id: Mapped[str] = mapped_column(String(64), index=True)
+    card_type: Mapped[str] = mapped_column(String(32), default="magic_card")
+    # True when the card carries an agent round-trip runtime (react-sandbox-v1)
+    # or declarative events; False for static inline HTML pages.
+    interactive: Mapped[bool] = mapped_column(Boolean, default=False)
+    title: Mapped[str] = mapped_column(String(240), default="交互卡片")
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    chat_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    message_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    part_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    preview_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ArtifactVersion(Base, TimestampMixin):
     """Immutable snapshot of one FileRecord published as an artifact output."""
 

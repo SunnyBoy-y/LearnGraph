@@ -47,3 +47,23 @@ export interface ArtifactShareToken {
 export interface ArtifactShareTokenCreated extends ArtifactShareToken {
   token: string;
 }
+
+/** Indexed chat card (magic_card / declarative component) in the artifacts page. */
+export interface ArtifactCard {
+  id: string;
+  card_id: string;
+  card_instance_id: string;
+  card_type: "magic_card" | "component";
+  interactive: boolean;
+  title: string;
+  status: "draft" | "published" | "deleted";
+  chat_session_id: string | null;
+  message_id: string | null;
+  created_at: IsoDateTime;
+  updated_at: IsoDateTime;
+}
+
+/** Full render data for previewing a card in a popup window. */
+export interface ArtifactCardPreview extends ArtifactCard {
+  preview_snapshot: Record<string, unknown>;
+}

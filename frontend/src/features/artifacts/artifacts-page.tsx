@@ -67,8 +67,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { CardArtifactsPanel } from "@/features/artifacts/card-artifacts-panel";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { FileRecord } from "@/types/files";
 import type {
@@ -197,41 +199,52 @@ export function ArtifactsPage() {
   return (
     <PageFrame>
       <PageIntro
-        actions={
-          <Button onClick={() => setCreateOpen(true)} type="button">
-            <Plus className="size-4" />
-            新建产物
-          </Button>
-        }
-        description="把学习产物发布为不可变版本，并生成可撤销的只读分享链接。"
+        description="会话中生成的交互 HTML 卡片自动聚合为草稿，可预览、跳转会话与删除；文件产物支持发布不可变版本与分享链接。"
         eyebrow="Artifacts"
         title="产物与分享"
       />
 
-      <CreateArtifactDialog
-        busy={createMutation.isPending}
-        onOpenChange={setCreateOpen}
-        open={createOpen}
-        onSubmit={(payload) => createMutation.mutate(payload)}
-      />
+      <Tabs defaultValue="cards">
+        <TabsList>
+          <TabsTrigger value="cards">会话卡片</TabsTrigger>
+          <TabsTrigger value="files">文件产物</TabsTrigger>
+        </TabsList>
 
-      <Surface className="p-5">
-        <SectionHeading
-          action={
-            <Button
-              disabled={artifacts.isFetching}
-              onClick={() => void artifacts.refetch()}
-              size="sm"
-              type="button"
-              variant="ghost"
-            >
-              <RefreshCw className={`size-4 ${artifacts.isFetching ? "animate-spin" : ""}`} />
-              刷新
-            </Button>
-          }
-          description="每个产物可以发布多个不可变版本，分享令牌只作用于单个版本。"
-          title="工作区产物"
-        />
+        <TabsContent className="mt-3" value="cards">
+          <CardArtifactsPanel workspaceId={workspaceId} />
+        </TabsContent>
+
+        <TabsContent className="mt-3 grid gap-4" value="files">
+          <CreateArtifactDialog
+            busy={createMutation.isPending}
+            onOpenChange={setCreateOpen}
+            open={createOpen}
+            onSubmit={(payload) => createMutation.mutate(payload)}
+          />
+
+          <Surface className="p-5">
+            <SectionHeading
+              action={
+                <div className="flex items-center gap-2">
+                  <Button onClick={() => setCreateOpen(true)} size="sm" type="button" variant="outline">
+                    <Plus className="size-4" />
+                    新建产物
+                  </Button>
+                  <Button
+                    disabled={artifacts.isFetching}
+                    onClick={() => void artifacts.refetch()}
+                    size="sm"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <RefreshCw className={`size-4 ${artifacts.isFetching ? "animate-spin" : ""}`} />
+                    刷新
+                  </Button>
+                </div>
+              }
+              description="每个产物可以发布多个不可变版本，分享令牌只作用于单个版本。"
+              title="工作区产物"
+            />
 
         {artifacts.isPending ? (
           <div className="mt-4 grid gap-3">
@@ -342,6 +355,8 @@ export function ArtifactsPage() {
           workspaceId={workspaceId}
         />
       ) : null}
+        </TabsContent>
+      </Tabs>
     </PageFrame>
   );
 }

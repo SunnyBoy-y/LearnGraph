@@ -48,6 +48,28 @@ class ArtifactView(ORMModel):
     created_at: datetime
 
 
+class ArtifactCardView(ORMModel):
+    """List/summary view of an indexed chat card (no preview payload)."""
+
+    id: str
+    card_id: str
+    card_instance_id: str
+    card_type: str
+    interactive: bool
+    title: str
+    status: str
+    chat_session_id: str | None = None
+    message_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArtifactCardPreviewView(ArtifactCardView):
+    """Full render data for previewing a card in the artifacts page."""
+
+    preview_snapshot: dict
+
+
 class ArtifactSummaryView(ArtifactView):
     version_count: int = 0
 

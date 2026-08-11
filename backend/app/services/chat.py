@@ -3352,6 +3352,27 @@ class ChatService:
                     data=data,
                 )
             )
+            # Index interactive HTML cards (magic_card / declarative component)
+            # so the artifacts page can aggregate, filter, and preview them. Only
+            # completed cards enter the index; a re-emit of the same card_id
+            # refreshes the draft row.
+            if (
+                part_type in {"magic_card", "component"}
+                and record.status == "completed"
+            ):
+                from app.services.artifact_cards import ArtifactCardIndexer
+
+                ArtifactCardIndexer.upsert_from_part(
+                    self.db,
+                    workspace_id=self.workspace_id,
+                    tenant_id=self.tenant_id,
+                    chat_session_id=session_id,
+                    message_id=assistant_message_id,
+                    message_version_id=assistant_version_id,
+                    part_id=record.id,
+                    part_type=part_type,
+                    data=data,
+                )
             # Agent-emitted graph proposals must bind the durable card part so
             # confirm/reject/undo can rewrite the snapshot after review.
             if (

@@ -8,6 +8,8 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.core.errors import AppError
 from app.domain.models import ArtifactVersion, FileRecord
 from app.domain.schemas.artifacts import (
+    ArtifactCardPreviewView,
+    ArtifactCardView,
     ArtifactCreate,
     ArtifactShareTokenCreated,
     ArtifactShareTokenCreate,
@@ -47,6 +49,68 @@ def list_artifacts(
         )
         for artifact, version_count in rows
     ]
+
+
+@router.get("/artifacts/cards", response_model=list[ArtifactCardView])
+def list_artifact_cards(
+    db: DB,
+    context: CurrentWorkspace,
+    status: str | None = None,
+    card_type: str | None = None,
+    interactive: bool | None = None,
+    sort: str = "updated_at",
+    order: str = "desc",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[ArtifactCardView]:
+    """List indexed interactive HTML cards emitted in chat sessions."""
+    context.require_permission("workspace.read")
+    from app.services.artifact_cards import ArtifactCardService
+
+    cards = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).list_cards(
+        status=status,
+        card_type=card_type,
+        interactive=interactive,
+        sort=sort,
+        order=order,
+        limit=limit,
+        offset=offset,
+    )
+    return [ArtifactCardView.model_validate(card) for card in cards]
+
+
+@router.get("/artifacts/cards/{card_id}/preview", response_model=ArtifactCardPreviewView)
+def get_artifact_card_preview(
+    card_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactCardPreviewView:
+    """Full render data (preview_html / runtime / viewport) for one card."""
+    context.require_permission("workspace.read")
+    from app.services.artifact_cards import ArtifactCardService
+
+    card = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).get_preview(card_id)
+    return ArtifactCardPreviewView.model_validate(card)
+
+
+@router.delete("/artifacts/cards/{card_id}", response_model=ArtifactCardView)
+def delete_artifact_card(
+    card_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactCardView:
+    """Soft-delete a card so it disappears from the artifacts page."""
+    context.require_permission("workspace.write")
+    from app.services.artifact_cards import ArtifactCardService
+
+    card = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).delete_card(card_id)
+    return ArtifactCardView.model_validate(card)
 
 
 @router.get(
