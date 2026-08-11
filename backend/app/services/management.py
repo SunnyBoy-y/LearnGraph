@@ -71,6 +71,7 @@ from app.providers.catalog import (
     EMBEDDING_PROVIDER_TYPES,
     FETCH_PROVIDER_TYPES,
     IMAGE_GENERATION_PROVIDER_TYPES,
+    IMAGE_SEARCH_PROVIDER_TYPES,
     MEMORY_PROVIDER_TYPES,
     MODEL_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
@@ -179,6 +180,7 @@ _MODEL_MANAGEMENT_PROVIDER_TYPES = frozenset(
     {
         *MODEL_PROVIDER_TYPES,
         *IMAGE_GENERATION_PROVIDER_TYPES,
+        *IMAGE_SEARCH_PROVIDER_TYPES,
         *VISION_PROVIDER_TYPES,
         *TRANSCRIPTION_PROVIDER_TYPES,
         *EMBEDDING_PROVIDER_TYPES,
@@ -957,6 +959,28 @@ class ProviderService:
                 "search" if provider.provider_type in SEARCH_PROVIDER_TYPES else "fetch",
             )
             provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in IMAGE_SEARCH_PROVIDER_TYPES:
+            # 文搜图/图搜图专用通道（qwen_image_search）：仅通过 DashScope
+            # Responses API 提供服务，启用前必须配置 base URL、加密密钥和
+            # 默认模型（模型需声明 hosted_image_search 且走 Responses 协议，
+            # 由 image_search_provider_for_workspace 在解析时校验）。
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "文搜图/图搜图 Provider requires a base URL and encrypted secret before enabling",
+                )
+            if not str(capabilities.get("default_model") or "").strip():
+                raise AppError(
+                    409,
+                    "provider_image_search_model_required",
+                    "A default 文搜图/图搜图 model is required before enabling",
+                )
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "image_search"
+            provider.status = "enabled_unverified"
         elif enabled and provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
             secret = self._active_secret_record(provider.id)
             if secret is None or not provider.base_url:
@@ -1703,6 +1727,7 @@ class ProviderService:
         elif provider.provider_type in {
             *MODEL_PROVIDER_TYPES,
             *IMAGE_GENERATION_PROVIDER_TYPES,
+            *IMAGE_SEARCH_PROVIDER_TYPES,
             *VISION_PROVIDER_TYPES,
         }:
             model_ids = self._discover(provider)
@@ -2575,6 +2600,7 @@ class ProviderService:
         if provider.provider_type not in {
             *MODEL_PROVIDER_TYPES,
             *IMAGE_GENERATION_PROVIDER_TYPES,
+            *IMAGE_SEARCH_PROVIDER_TYPES,
             *VISION_PROVIDER_TYPES,
             *TRANSCRIPTION_PROVIDER_TYPES,
             *EMBEDDING_PROVIDER_TYPES,
@@ -2682,6 +2708,8 @@ class ProviderService:
                         if provider.provider_type in TRANSCRIPTION_PROVIDER_TYPES
                         else ["embedding"]
                         if provider.provider_type in EMBEDDING_PROVIDER_TYPES
+                        else ["image_search"]
+                        if provider.provider_type in IMAGE_SEARCH_PROVIDER_TYPES
                         else ["deep_research"]
                         if provider.provider_type == "qwen_deep_research"
                         else ["llm"]
@@ -2765,6 +2793,7 @@ class ProviderService:
         elif provider.provider_type in {
             *MODEL_PROVIDER_TYPES,
             *IMAGE_GENERATION_PROVIDER_TYPES,
+            *IMAGE_SEARCH_PROVIDER_TYPES,
             *VISION_PROVIDER_TYPES,
         }:
             model_ids = self._discover(provider)

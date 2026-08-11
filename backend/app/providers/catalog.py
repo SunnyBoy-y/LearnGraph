@@ -9,6 +9,7 @@ ProviderRole = Literal[
     "image_generation",
     "vision",
     "search",
+    "image_search",
     "fetch",
     "deep_research",
     "memory",
@@ -120,6 +121,30 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         brand_id="qwen",
         brand_icon_url="https://models.dev/logos/alibaba.svg",
         documentation_url="https://help.aliyun.com/zh/model-studio/",
+        key_management_url="https://bailian.console.aliyun.com/?tab=model#/api-key",
+    ),
+    ProviderTypeSpec(
+        provider_type="qwen_image_search",
+        role="image_search",
+        label="阿里云文搜图 / 图搜图",
+        description=(
+            "将阿里云百炼的文搜图（web_search_image）与图搜图（image_search）"
+            "封装为一个 search_images 工具，供任意 Agent 模型调用：只给文本描述"
+            "即按文搜图，附带公开图片 URL 即按图搜图。仅支持 Responses API "
+            "（POST /responses），需要模型具备 hosted_image_search 能力且原生"
+            "走 Responses 协议。"
+        ),
+        requires_base_url=True,
+        requires_secret=True,
+        supports_model_discovery=True,
+        default_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        probe_notice=(
+            "探测仅调用 GET /models 校验密钥，不会触发图片搜索计费。"
+            "文搜图/图搜图工具仅通过 Responses API 调用。"
+        ),
+        brand_id="qwen",
+        brand_icon_url="https://models.dev/logos/alibaba.svg",
+        documentation_url="https://help.aliyun.com/zh/model-studio/web-search-image",
         key_management_url="https://bailian.console.aliyun.com/?tab=model#/api-key",
     ),
     ProviderTypeSpec(
@@ -681,6 +706,9 @@ MEMORY_PROVIDER_TYPES = frozenset(
 )
 SEARCH_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "search"
+)
+IMAGE_SEARCH_PROVIDER_TYPES = frozenset(
+    item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "image_search"
 )
 FETCH_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "fetch"

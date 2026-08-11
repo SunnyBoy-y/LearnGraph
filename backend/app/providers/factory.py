@@ -18,6 +18,7 @@ from app.providers.catalog import (
     DEEP_RESEARCH_PROVIDER_TYPES,
     FETCH_PROVIDER_TYPES,
     IMAGE_GENERATION_PROVIDER_TYPES,
+    IMAGE_SEARCH_PROVIDER_TYPES,
     MEMORY_PROVIDER_TYPES,
     MODEL_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
@@ -962,6 +963,9 @@ def search_provider_for_workspace(
             workspace_id,
             settings,
             capability="hosted_web_search",
+            # 专用文搜图/图搜图 provider 同样通过 Responses API 提供联网搜索，
+            # 在只配置了该 provider 的工作区中可作为搜索通道兜底。
+            provider_types=("qwen_image_search", "qwen"),
         )
         if qwen_tool is not None:
             return qwen_tool
@@ -1407,6 +1411,10 @@ def _qwen_companion_for_workspace(
     DashScope exposes hosted search on plain Chat Completions too (via
     ``enable_search``) for families such as ``qwen-plus``, ``qwq-plus`` and the
     hosted DeepSeek models, and those would fail against the Responses route.
+
+    ``provider_types`` lets dedicated companion roles (for example the
+    ``qwen_image_search`` 文搜图/图搜图 lane) reuse the same resolution while
+    keeping the general ``qwen`` model rows as the default.
     """
 
     candidates = list(
@@ -1416,7 +1424,7 @@ def _qwen_companion_for_workspace(
                 ProviderConfig.workspace_id == workspace_id,
                 ProviderConfig.enabled.is_(True),
                 ProviderConfig.remote_capability.is_(True),
-                ProviderConfig.provider_type == "qwen",
+                ProviderConfig.provider_type.in_(provider_types),
             )
             .order_by(*_provider_priority_order())
         ).all()
@@ -1460,6 +1468,37 @@ def _qwen_companion_for_workspace(
             extra_headers=_extra_headers_from_capabilities(capabilities),
         )
     return None
+
+
+def image_search_provider_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+) -> SearchProviderPort | None:
+    """Resolve the dedicated 文搜图/图搜图 companion lane for Agent tools.
+
+    Prefers an explicitly enabled ``qwen_image_search`` provider; falls back to
+    a general Qwen model companion whose snapshot declares
+    ``hosted_image_search`` and the Responses protocol.  Both paths speak the
+    Responses API only (``POST /responses`` with the ``web_search_image`` /
+    ``image_search`` tools), which is the documented transport for these tools.
+    """
+
+    dedicated = _qwen_companion_for_workspace(
+        db,
+        workspace_id,
+        settings,
+        capability="hosted_image_search",
+        provider_types=tuple(IMAGE_SEARCH_PROVIDER_TYPES),
+    )
+    if dedicated is not None:
+        return dedicated
+    return _qwen_companion_for_workspace(
+        db,
+        workspace_id,
+        settings,
+        capability="hosted_image_search",
+    )
 
 
 def memory_provider_for_workspace(

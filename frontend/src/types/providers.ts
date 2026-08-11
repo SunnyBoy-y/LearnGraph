@@ -5,6 +5,7 @@ export type ProviderRole =
   | "image_generation"
   | "vision"
   | "search"
+  | "image_search"
   | "fetch"
   | "deep_research"
   | "memory"

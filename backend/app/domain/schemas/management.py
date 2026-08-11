@@ -536,7 +536,7 @@ class ProviderCreateRequest(BaseModel):
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[
-        "model", "image_generation", "vision", "search", "fetch", "deep_research", "memory", "transcription", "embedding"
+        "model", "image_generation", "vision", "search", "image_search", "fetch", "deep_research", "memory", "transcription", "embedding"
     ]
     label: str
     description: str

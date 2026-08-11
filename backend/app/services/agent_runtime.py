@@ -113,10 +113,12 @@ class AgentToolRuntime:
         settings: Settings | None = None,
         can_manage_providers: bool = False,
         fetch_provider: FetchProviderPort | None = None,
+        image_search_provider: SearchProviderPort | None = None,
     ) -> None:
         self.workspace_id = workspace_id
         self.actor_id = actor_id
         self.search_provider = search_provider
+        self.image_search_provider = image_search_provider
         self.extensions = extensions
         self.sandbox = sandbox
         self.sandbox_authorized = sandbox_authorized
@@ -185,14 +187,18 @@ class AgentToolRuntime:
                 activated_capabilities=effective_activated,
             )
         )
-        # search_web / parallel_web_research / search_images follow the explicit
-        # "联网" search toggle — they need an authorized SearchProvider and the
-        # user's web_search flag. fetch_web_page is decoupled: a Firecrawl-style
-        # FetchProvider (or a Qwen companion with .fetch) makes it available even
-        # when "联网" is off, since fetching a single authorized URL is not a
-        # blanket web-search action and the URL is always SSRF/allow-list gated.
+        # search_web / parallel_web_research follow the explicit "联网" search
+        # toggle — they need an authorized SearchProvider and the user's
+        # web_search flag. search_images (文搜图/图搜图) uses its own dedicated
+        # provider lane (qwen_image_search) but keeps the same toggle.
+        # fetch_web_page is decoupled: a Firecrawl-style FetchProvider (or a
+        # Qwen companion with .fetch) makes it available even when "联网" is
+        # off, since fetching a single authorized URL is not a blanket
+        # web-search action and the URL is always SSRF/allow-list gated.
         if web_search_enabled and self._search_available:
             definitions.extend(self._web_tool_definitions())
+        if web_search_enabled and self._image_search_available:
+            definitions.append(self._image_search_tool_definition())
         if self._fetch_available or callable(
             getattr(self.search_provider, "fetch", None)
         ):
@@ -473,6 +479,228 @@ class AgentToolRuntime:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_goal_ask",
+                    "description": (
+                        "Ask the user a question with an interactive card, never "
+                        "plain text. This is the ONLY way to ask the user while "
+                        "working on a Goal: emit a single_choice / multiple_choice "
+                        "card for selection questions, or fill_blank / "
+                        "short_answer_table for open answers. Keep it to one "
+                        "question per card and prefer 3-5 options; questions must "
+                        "change the Goal boundary, depth, or acceptance criteria. "
+                        "After emitting, briefly tell the user to answer the card "
+                        "and stop; the answer arrives as the next user message, "
+                        "then continue (create/confirm the Goal or propose the "
+                        "graph). Never fabricate the user's answer."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500,
+                                "description": "The question shown as the card title.",
+                            },
+                            "input_type": {
+                                "type": "string",
+                                "enum": [
+                                    "single_choice",
+                                    "multiple_choice",
+                                    "fill_blank",
+                                    "short_answer_table",
+                                    "date",
+                                ],
+                                "description": "Defaults to single_choice. Use date for time/date questions — the card renders a calendar with the user's learning schedule.",
+                            },
+                            "options": {
+                                "type": "array",
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 80,
+                                        },
+                                        "label": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 500,
+                                        },
+                                        "description": {
+                                            "type": "string",
+                                            "maxLength": 2_000,
+                                        },
+                                    },
+                                    "required": ["id", "label"],
+                                    "additionalProperties": False,
+                                },
+                                "description": "Required for single/multiple choice.",
+                            },
+                            "allow_custom": {
+                                "type": "boolean",
+                                "description": "Let the user type their own answer (default true).",
+                            },
+                            "allow_skip": {
+                                "type": "boolean",
+                                "description": "Let the user skip; a transparent assumption is recorded (default true).",
+                            },
+                            "component_id": {
+                                "type": "string",
+                                "description": "Optional stable card id so a follow-up can reference it.",
+                            },
+                        },
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_goal_ask_batch",
+                    "description": (
+                        "Ask 2-5 related Goal-clarification questions in ONE "
+                        "aggregated card (preferred over lg_goal_ask for any "
+                        "batch of questions). Each sub-question is a small "
+                        "control: single_choice / multiple_choice for selection, "
+                        "fill_blank / short_answer_table for open answers. The "
+                        "user submits all answers together; they arrive as the "
+                        "next user message. Only ask questions that change the "
+                        "Goal boundary, depth, order, or acceptance criteria — "
+                        "never a fixed questionnaire, and never plain-text "
+                        "questions in your reply. One card per batch; keep 3-5 "
+                        "options per choice question. After emitting, tell the "
+                        "user to answer the card and stop."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500,
+                                "description": "Card title, e.g. 目标澄清（3 个问题，一次提交）.",
+                            },
+                            "questions": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "key": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 80,
+                                        },
+                                        "prompt": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 500,
+                                        },
+                                        "input_type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "single_choice",
+                                                "multiple_choice",
+                                                "fill_blank",
+                                                "short_answer_table",
+                                                "date",
+                                            ],
+                                        },
+                                        "options": {
+                                            "type": "array",
+                                            "maxItems": 8,
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "id": {
+                                                        "type": "string",
+                                                        "minLength": 1,
+                                                        "maxLength": 80,
+                                                    },
+                                                    "label": {
+                                                        "type": "string",
+                                                        "minLength": 1,
+                                                        "maxLength": 500,
+                                                    },
+                                                    "description": {
+                                                        "type": "string",
+                                                        "maxLength": 2_000,
+                                                    },
+                                                },
+                                                "required": ["id", "label"],
+                                                "additionalProperties": False,
+                                            },
+                                            "description": "Required for choice questions.",
+                                        },
+                                        "allow_custom": {
+                                            "type": "boolean",
+                                            "description": "Let the user type their own answer (default true).",
+                                        },
+                                        "allow_skip": {
+                                            "type": "boolean",
+                                            "description": "Let the user skip this sub-question (default true).",
+                                        },
+                                        "required": {
+                                            "type": "boolean",
+                                            "description": "Block submit until answered (default false).",
+                                        },
+                                    },
+                                    "required": ["key", "prompt"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "component_id": {
+                                "type": "string",
+                                "description": "Optional stable card id for follow-ups.",
+                            },
+                        },
+                        "required": ["title", "questions"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_goal_edit_draft",
+                    "description": (
+                        "Open the Goal draft in a two-way editable card (sub-page "
+                        "style) so the user can directly adjust title / intent / "
+                        "time limit / desired outcome before confirmation. Use it "
+                        "when the user wants to tweak the Goal instead of answering "
+                        "question by question, or after a first draft exists. The "
+                        "user edits the fields and submits; the edited values "
+                        "arrive as the next user message, then confirm the Goal "
+                        "with lg_goal_confirm using those values. Requires a "
+                        "session-bound Goal (create it first with lg_goal_create)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "goal_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 36,
+                                "description": "Optional explicit Goal id; defaults to the session-bound Goal.",
+                            },
+                            "focus": {
+                                "type": "string",
+                                "enum": ["title", "time", "outcome", "all"],
+                                "description": "Which fields to highlight; defaults to all.",
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
 
     @property
@@ -490,6 +718,51 @@ class AgentToolRuntime:
         return self.search_provider is not None and bool(
             getattr(self.search_provider, "available", True)
         )
+
+    @property
+    def _image_search_available(self) -> bool:
+        provider = self.image_search_provider
+        return (
+            provider is not None
+            and bool(getattr(provider, "available", True))
+            and callable(getattr(provider, "image_search", None))
+        )
+
+    @staticmethod
+    def _image_search_tool_definition() -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": "search_images",
+                "description": (
+                    "Search the public web for images through the configured "
+                    "文搜图/图搜图 provider lane (阿里云百炼 web_search_image / "
+                    "image_search via the Responses API). Pass only a text query "
+                    "for text-to-image search, or add a public image URL for "
+                    "reverse image search."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                        },
+                        "image_url": {
+                            "type": "string",
+                            "format": "uri",
+                            "description": (
+                                "Optional public image URL for reverse image search "
+                                "(图搜图); omit for text-to-image search (文搜图)."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+        }
 
     @property
     def _fetch_available(self) -> bool:
@@ -1183,7 +1456,8 @@ class AgentToolRuntime:
                                 "type": "string",
                                 "description": (
                                     "Optional filter: model | image_generation | vision | "
-                                    "search | fetch | deep_research | memory | transcription"
+                                    "search | image_search | fetch | deep_research | memory | "
+                                    "transcription"
                                 ),
                             }
                         },
@@ -2309,38 +2583,6 @@ class AgentToolRuntime:
                 },
             },
         ]
-        if callable(getattr(self.search_provider, "image_search", None)):
-            definitions.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search_images",
-                        "description": (
-                            "Search the public web for images through the configured "
-                            "Qwen Responses image-search companion."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "maxLength": 500,
-                                },
-                                "image_url": {
-                                    "type": "string",
-                                    "format": "uri",
-                                    "description": (
-                                        "Optional public image URL for reverse image search."
-                                    ),
-                                },
-                            },
-                            "required": ["query"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
         return definitions
 
     def _web_fetch_policy(self) -> dict[str, Any]:
@@ -2572,7 +2814,14 @@ class AgentToolRuntime:
                     assistant_message_id=assistant_message_id,
                     source_message_id=source_message_id,
                 )
-            if name in {"lg_goal_read", "lg_goal_create", "lg_goal_confirm"}:
+            if name in {
+                "lg_goal_read",
+                "lg_goal_create",
+                "lg_goal_confirm",
+                "lg_goal_ask",
+                "lg_goal_ask_batch",
+                "lg_goal_edit_draft",
+            }:
                 return self._execute_goal_tool(
                     name,
                     arguments,
@@ -5954,17 +6203,24 @@ class AgentToolRuntime:
         unknown = set(arguments) - {"query", "image_url"}
         query = arguments.get("query")
         image_url = arguments.get("image_url")
+        provider = self.image_search_provider
+        if provider is None or not callable(getattr(provider, "image_search", None)):
+            # Legacy fallback: the search lane itself may be the Qwen Responses
+            # companion exposing image_search.
+            provider = self.search_provider
         if (
             unknown
             or not isinstance(query, str)
             or not 1 <= len(query.strip()) <= 500
             or (image_url is not None and not isinstance(image_url, str))
-            or not callable(getattr(self.search_provider, "image_search", None))
+            or provider is None
+            or not callable(getattr(provider, "image_search", None))
         ):
             raise AppError(
                 422,
                 "invalid_tool_arguments",
-                "search_images requires a query and an optional public image URL",
+                "search_images requires a query, an optional public image URL, "
+                "and a configured 文搜图/图搜图 provider",
             )
         try:
             if isinstance(image_url, str):
@@ -5974,7 +6230,7 @@ class AgentToolRuntime:
                     if isinstance(item, str) and item.strip()
                 }
                 require_public_http_url(image_url.strip(), domains)
-            images = self.search_provider.image_search(
+            images = provider.image_search(
                 query.strip(),
                 image_url=image_url.strip() if isinstance(image_url, str) else None,
             )
@@ -5993,7 +6249,7 @@ class AgentToolRuntime:
             result,
             {
                 "result_count": len(images),
-                "provider_id": self.search_provider.provider_id,
+                "provider_id": provider.provider_id,
             },
             [],
         )

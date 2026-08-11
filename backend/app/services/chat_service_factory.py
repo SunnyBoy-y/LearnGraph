@@ -7,6 +7,7 @@ from app.core.config import Settings
 from app.providers.factory import (
     fetch_provider_for_workspace,
     image_provider_for_workspace,
+    image_search_provider_for_workspace,
     memory_provider_for_workspace,
     model_provider_for_workspace,
     search_provider_for_workspace,
@@ -44,6 +45,9 @@ def build_chat_service(
     authorization = AuthorizationService(db, context.principal)
     search_provider = search_provider_for_workspace(
         db, context.workspace_id, settings, route=search_route
+    )
+    image_search_provider = image_search_provider_for_workspace(
+        db, context.workspace_id, settings
     )
     memory_service = MemoryService(
         db,
@@ -118,6 +122,7 @@ def build_chat_service(
         settings=settings,
         can_manage_providers="workspace.manage" in context.permissions,
         fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
+        image_search_provider=image_search_provider,
     )
     return ChatService(
         db,
