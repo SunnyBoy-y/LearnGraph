@@ -1,6 +1,6 @@
 ---
 name: pptx-generation
-description: 从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览。
+description: 从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览；处理演示文稿/幻灯片/slides/deck 相关需求。
 ---
 
 # PPT 生成与检查

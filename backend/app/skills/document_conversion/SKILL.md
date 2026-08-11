@@ -1,6 +1,6 @@
 ---
 name: document-conversion
-description: DOC/DOCX/RTF/HTML 文档转 HTML、纯文本、PDF、PNG，并抽取正文供下游分析。
+description: DOC/DOCX/RTF/HTML（Word/Office）文档转 HTML、纯文本、PDF、PNG 预览，并抽取正文供下游分析；PDF/表格/JSON 不属本 Skill（→ pdf-processing / spreadsheet-analysis / data-processing）。
 ---
 
 # 文档转换与文本抽取
@@ -10,6 +10,8 @@ description: DOC/DOCX/RTF/HTML 文档转 HTML、纯文本、PDF、PNG，并抽�
 - 用户上传或引用了 `.doc` / `.docx` / `.rtf` / `.html` 文件，需要**读取正文、转 PDF、转图片、转可打印页面**。
 - 需要把某份 Word/网页内容喂给下游 Skill（PDF 合并、表格分析、前端预览、知识图谱）之前先抽取文本。
 - 需要把一段本地 HTML 渲染成 PDF 或 PNG 截图做验收。
+
+> **不是本 Skill 的职责**：`.pdf` 的解析/合并/拆分/渲染（→ `pdf-processing`）；表格 `.csv/.xls/.xlsx/.ods` 的探查与清洗（→ `spreadsheet-analysis`）；JSON/文本批量流水线与报告（→ `data-processing`）。本 Skill 只管 DOC/DOCX/RTF/HTML 类文档的转换与正文抽取。输入是 `.pdf` 时不要在这里用 HTML 链路硬转，交给 pdf-processing。
 
 ## 决策顺序
 

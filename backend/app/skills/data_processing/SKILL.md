@@ -1,6 +1,6 @@
 ---
 name: data-processing
-description: JSON/CSV/文本批处理、转换、统计与 Markdown 报告生成。
+description: JSON/CSV/文本批处理、转换、统计与 Markdown 报告生成；CSV 作为批处理管道一环/产出报告或 JSON → 本 Skill；围绕「表」的探查清洗写出 → spreadsheet-analysis。
 ---
 
 # 数据批处理与转换
@@ -10,6 +10,8 @@ description: JSON/CSV/文本批处理、转换、统计与 Markdown 报告生成
 - 需要对 JSON/CSV/纯文本做**批量转换、清洗、统计、抽样**。
 - 需要把分析结果/学习内容整理成 **Markdown 报告**。
 - 需要在工作区内批量重命名/整理文件。
+
+> **不是本 Skill 的职责**：结构化表格 `.xls/.xlsx/.xlsb/.ods` 的探查/清洗/汇总/写出（→ `spreadsheet-analysis`）；文档类正文抽取与转换（`.doc/.docx/.rtf/.html` → `document-conversion`；`.pdf` → `pdf-processing`）。**CSV 归属裁决**：围绕"表"的读/洗/汇总/写出（inspect/clean/summarize/write）→ `spreadsheet-analysis`；作为批处理管道一环（`json_transform → csv_profile → make_report` 流水线）或最终产物是报告/JSON/重命名 → 本 Skill。
 
 ## 决策顺序
 

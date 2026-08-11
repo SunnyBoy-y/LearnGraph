@@ -1,6 +1,6 @@
 ---
 name: spreadsheet-analysis
-description: CSV/XLS/XLSX/XLSB/ODS 表格的读取、探查、清洗、汇总与写出。
+description: CSV/XLS/XLSX/XLSB/ODS 表格的读取、探查、清洗、汇总与写出；CSV 围绕「表」的读/洗/汇总/写出也走本 Skill；批量管道/报告/重命名走 data-processing；DOC/PDF 不属本 Skill。
 ---
 
 # 表格分析与处理
@@ -9,6 +9,8 @@ description: CSV/XLS/XLSX/XLSB/ODS 表格的读取、探查、清洗、汇总与
 
 - 用户上传或引用了 `.csv` / `.tsv` / `.xls` / `.xlsx` / `.xlsb` / `.ods`，需要**探查结构、清洗、汇总统计、写出新表格**。
 - 需要对表格做 pandas 分析、生成报表或给下游（图谱、报告、前端图表）喂干净数据。
+
+> **不是本 Skill 的职责**：纯文本/JSON 的批处理与报告生成（→ `data-processing`）；`.doc/.docx/.rtf/.html` 正文抽取（→ `document-conversion`）；`.pdf` 解析（→ `pdf-processing`）。**CSV 归属裁决**：围绕"表"的探查/清洗/汇总/写出（inspect/clean/summarize/write_xlsx）→ 本 Skill；批量管道/报告/重命名（csv_profile 只是流水线一环）→ `data-processing`。
 
 ## 决策顺序
 

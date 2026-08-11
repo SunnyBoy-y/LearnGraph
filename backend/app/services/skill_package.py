@@ -318,54 +318,76 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
     OfficialSkillSpec(
         key="document-conversion",
         display_name="文档转换与文本抽取",
-        version="1.0.0",
+        version="1.0.1",
         dir_name="document_conversion",
         description=(
-            "DOC/DOCX/RTF/HTML 文档转 HTML、纯文本、PDF、PNG，并抽取正文供下游分析。"
+            "DOC/DOCX/RTF/HTML（Word/Office）文档转 HTML、纯文本、PDF、PNG 预览，"
+            "并抽取正文供下游分析；PDF/表格/JSON 不属本 Skill"
+            "（→ pdf-processing / spreadsheet-analysis / data-processing）。"
         ),
         grant_reason="official_skill_auto_enable",
         category="document",
         capability_ids=("docx.read", "doc.read", "rtf.read", "html.read", "document.convert"),
-        keywords=("docx", "doc", "rtf", "html", "word", "转换", "文本抽取", "pdf预览"),
+        keywords=(
+            "docx", "doc", "rtf", "html", "word", "office", "转换", "文本抽取",
+            "pdf预览", "转word", "正文提取",
+        ),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
     OfficialSkillSpec(
         key="pdf-processing",
         display_name="PDF 解析与处理",
-        version="1.0.0",
+        version="1.0.1",
         dir_name="pdf_processing",
-        description="PDF 元信息、正文/页抽取、合并拆分、页面渲染为 PNG。",
+        description=(
+            "PDF 元信息、正文/页抽取（大文件 --pages 分段）、合并拆分、页面渲染 PNG；"
+            "扫描件/图片型 PDF（无文本层）需先渲染为图片走视觉模型识别（本包不做 OCR）；"
+            "Word/HTML/表格类不属本 Skill（→ document-conversion / spreadsheet-analysis）。"
+        ),
         grant_reason="official_skill_auto_enable",
         category="pdf",
         capability_ids=("pdf.read", "pdf.merge", "pdf.split", "pdf.render"),
-        keywords=("pdf", "合并", "拆分", "提取文本", "页数", "渲染", "pdf转图片"),
+        keywords=(
+            "pdf", "合并", "拆分", "提取文本", "页数", "渲染", "pdf转图片",
+            "ocr", "扫描件", "扫描", "图片型pdf", "文字识别",
+        ),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
     OfficialSkillSpec(
         key="pptx-generation",
         display_name="PPT 生成与检查",
-        version="1.0.0",
+        version="1.0.1",
         dir_name="pptx_generation",
-        description="从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览。",
+        description=(
+            "从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览；"
+            "处理演示文稿/幻灯片/slides/deck 相关需求。"
+        ),
         grant_reason="official_skill_auto_enable",
         category="pptx",
         capability_ids=("pptx.build", "pptx.read", "pptx.preview"),
-        keywords=("pptx", "ppt", "演示", "幻灯片", "生成", "大纲", "deck"),
+        keywords=("pptx", "ppt", "演示", "幻灯片", "生成", "大纲", "deck", "slides", "演示文稿"),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
     OfficialSkillSpec(
         key="spreadsheet-analysis",
         display_name="表格分析与处理",
-        version="1.0.0",
+        version="1.0.1",
         dir_name="spreadsheet_analysis",
-        description="CSV/XLS/XLSX/XLSB/ODS 表格的读取、探查、清洗、汇总与写出。",
+        description=(
+            "CSV/XLS/XLSX/XLSB/ODS 表格的读取、探查、清洗、汇总与写出；"
+            "CSV 围绕「表」的读/洗/汇总/写出也走本 Skill；"
+            "批量管道/报告/重命名走 data-processing；DOC/PDF 不属本 Skill。"
+        ),
         grant_reason="official_skill_auto_enable",
         category="spreadsheet",
         capability_ids=("xlsx.read", "csv.read", "xls.read", "sheet.analyze", "xlsx.write"),
-        keywords=("xlsx", "xls", "csv", "tsv", "ods", "表格", "数据分析", "pandas", "openpyxl"),
+        keywords=(
+            "xlsx", "xls", "csv", "tsv", "ods", "表格", "数据分析", "pandas",
+            "openpyxl", "清洗", "探查", "导出",
+        ),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -398,13 +420,17 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
     OfficialSkillSpec(
         key="data-processing",
         display_name="数据批处理与转换",
-        version="1.0.0",
+        version="1.0.1",
         dir_name="data_processing",
-        description="JSON/CSV/文本批处理、转换、统计与 Markdown 报告生成。",
+        description=(
+            "JSON/CSV/文本批处理、转换、统计与 Markdown 报告生成；"
+            "CSV 作为批处理管道一环/产出报告或 JSON → 本 Skill；"
+            "围绕「表」的探查清洗写出 → spreadsheet-analysis。"
+        ),
         grant_reason="official_skill_auto_enable",
         category="data",
         capability_ids=("json.transform", "csv.profile", "files.rename", "report.generate"),
-        keywords=("json", "csv", "批处理", "转换", "统计", "报告", "rename"),
+        keywords=("json", "csv", "批处理", "转换", "统计", "报告", "rename", "清洗", "格式化"),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),

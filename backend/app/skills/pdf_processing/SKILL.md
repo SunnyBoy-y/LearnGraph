@@ -1,6 +1,6 @@
 ---
 name: pdf-processing
-description: PDF 元信息、正文/页抽取、合并拆分、页面渲染为 PNG。
+description: PDF 元信息、正文/页抽取（大文件 --pages 分段）、合并拆分、页面渲染 PNG；扫描件/图片型 PDF（无文本层）需先渲染为图片走视觉模型识别（本包不做 OCR）；Word/HTML/表格类不属本 Skill（→ document-conversion / spreadsheet-analysis）。
 ---
 
 # PDF 解析与处理
@@ -10,6 +10,8 @@ description: PDF 元信息、正文/页抽取、合并拆分、页面渲染为 P
 - 用户上传或引用了 `.pdf`，需要**读元信息、抽正文、按页提取、合并多份、拆分、渲染页面为图片**。
 - 需要把 PDF 内容交给下游（图谱、记忆、报告、表格）之前先抽取文本。
 - 需要视觉核对 PDF 页面（缩略图/截图）。
+
+> **不是本 Skill 的职责**：`.doc/.docx/.rtf/.html` 的正文抽取与格式转换（→ `document-conversion`）；表格 `.csv/.xls/.xlsx` 的读取与清洗（→ `spreadsheet-analysis`）。本 Skill 只管 PDF。若用户目标是"把 Word 转成 PDF"，先走 document-conversion（docx → HTML → 打印），不要在本 Skill 里硬造。
 
 ## 决策顺序
 
@@ -35,7 +37,7 @@ description: PDF 元信息、正文/页抽取、合并拆分、页面渲染为 P
 PDF ──pdf_info──> 元信息
 PDF ──pdf_extract_text──> 正文.txt ──> 图谱/记忆/报告
 PDF A + B ──pdf_merge──> 合并.pdf ──pdf_to_png──> 缩略图
-PDF ──pdf_split──> 子集.pdf ──(document-conversion/html_to_pdf?)──> 重建/交付
+PDF ──pdf_split──> 子集.pdf ──> 交付/下游
 ```
 
 ## 安全与限制
