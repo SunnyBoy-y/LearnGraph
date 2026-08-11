@@ -959,12 +959,16 @@ class SandboxBootstrapService:
                 # configured, otherwise fall back to a local Docker build":
                 # an unreachable/missing registry image (not pushed yet,
                 # private without login, wrong tag) must not strand the
-                # deployment uninitialized.  An explicit prebuilt-only policy
-                # (request mode ``prebuilt`` or a persisted source mode of
-                # ``prebuilt``) still fails closed.
-                if job.mode == "auto" and effective_mode == "auto":
+                # deployment uninitialized.  The one-click init always sends
+                # auto, so a failed prebuilt pull degrades to the local build
+                # even when the settings page persisted ``prebuilt`` as the
+                # source mode; only an explicit request mode ``prebuilt``
+                # still fails closed.
+                if job.mode == "auto":
                     with self._lock:
                         job.status = "running"
+                        job.phase = "pull_runner"
+                        job.message = "预构建镜像不可用，正在回退本地构建…"
                         job.error_code = None
                         job.error_message = None
                         job.finished_at = None

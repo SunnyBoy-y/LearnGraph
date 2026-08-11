@@ -153,8 +153,9 @@ class TestAutoModeLocalBuildFallback:
 
     A failed prebuilt pull (image not pushed, private registry without login,
     wrong tag) must fall back to the local Docker build instead of stranding
-    the deployment uninitialized.  Explicit ``prebuilt`` requests keep failing
-    closed.
+    the deployment uninitialized — even when the settings page persisted
+    source mode ``prebuilt``.  Only explicit ``prebuilt`` requests keep
+    failing closed.
     """
 
     @staticmethod
@@ -184,6 +185,37 @@ class TestAutoModeLocalBuildFallback:
         assert job.image_digest == _FakeImage.id
         assert job.error_code is None
 
+    def test_auto_mode_falls_back_even_when_source_mode_is_prebuilt(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """One-click init (auto) degrades even with a persisted prebuilt source.
+
+        The settings page may persist source mode ``prebuilt`` (the operator
+        prefers the registry image), but a failed pull must still degrade to
+        the local build instead of stranding the deployment uninitialized.
+        Only an explicit request mode ``prebuilt`` fails closed.
+        """
+        from app.services import sandbox_bootstrap as sb
+        from app.services.sandbox_runtime import save_bootstrap_source
+
+        service = SandboxBootstrapService()
+        monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        monkeypatch.setattr(service, "_pull_prebuilt_image", self._failing_pull(service))
+        monkeypatch.setattr(service, "_sandbox_root", lambda: tmp_path)
+        (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        monkeypatch.setattr(service, "_smoke_test", lambda *args, **kwargs: None)
+        monkeypatch.setattr(sb, "save_runtime_config", lambda *args, **kwargs: None)
+        monkeypatch.setattr(service, "_docker_client", lambda: _FakeDockerClient())
+        settings = Settings(sandbox_enabled=True)
+        save_bootstrap_source(
+            settings, mode="prebuilt", prebuilt_image=ACR_REF, actor_id="u-test"
+        )
+        job = BootstrapJob(id="u-fallback-persisted", actor_id="u-test", mode="auto")
+        service._run_job(job, settings)  # noqa: SLF001 - unit-level verification
+        assert job.status == "succeeded"
+        assert any("[auto-fallback]" in line for line in job.log_lines)
+        assert job.error_code is None
+
     def test_explicit_prebuilt_mode_does_not_fallback(self, monkeypatch) -> None:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
@@ -194,3 +226,34 @@ class TestAutoModeLocalBuildFallback:
         assert job.status == "failed"
         assert job.error_code == "prebuilt_pull_failed"
         assert not any("[auto-fallback]" in line for line in job.log_lines)
+
+
+class TestBootstrapStartHttpContract:
+    """The one-click init button posts without a body.
+
+    POST /sandbox/bootstrap with no JSON body must default to mode="auto"
+    instead of FastAPI rejecting the request with 422 "Field required".
+    """
+
+    def test_post_without_body_is_accepted(self, client, register_user, auth_headers) -> None:
+        token, ws, _, _ = register_user()
+        resp = client.post(
+            "/api/v1/sandbox/bootstrap", headers=auth_headers(token, ws)
+        )
+        # The test environment disables the sandbox, so the request is parsed
+        # and rejected by policy (sandbox_disabled) — never by the schema
+        # layer (422). A body-less request must not be required.
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["accepted"] is False
+        assert body["error_code"] == "sandbox_disabled"
+
+    def test_post_with_empty_json_body_defaults_to_auto(self, client, register_user, auth_headers) -> None:
+        token, ws, _, _ = register_user()
+        resp = client.post(
+            "/api/v1/sandbox/bootstrap",
+            headers=auth_headers(token, ws),
+            json={},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["error_code"] == "sandbox_disabled"

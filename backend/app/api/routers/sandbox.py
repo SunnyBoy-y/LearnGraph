@@ -336,9 +336,11 @@ def update_preview_config(
 
 @router.post("/bootstrap", response_model=SandboxBootstrapStartResponse)
 def start_bootstrap(
-    payload: SandboxBootstrapStartRequest,
     context: CurrentWorkspace,
     settings: AppSettings,
+    # The one-click init button posts without a body; a missing body must
+    # default to mode="auto" instead of FastAPI's 422 "Field required".
+    payload: SandboxBootstrapStartRequest = SandboxBootstrapStartRequest(),
 ) -> SandboxBootstrapStartResponse:
     # Members may initialize the sandbox runtime by default; administrators
     # can restrict it via the bootstrap policy toggle (default: allowed).
