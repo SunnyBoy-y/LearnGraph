@@ -220,6 +220,12 @@ class SkillRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     status: Mapped[str] = mapped_column(String(40), default="authorization_required", index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     authorization_generation: Mapped[int] = mapped_column(Integer, default=0)
+    # Last time the Agent announced using this skill (lg_skill_used). Only an
+    # LRU ordering signal for prompt-level progressive disclosure; never a
+    # durable authorization input.
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
 
 class SkillDeleteConfirmation(Base, TimestampMixin, WorkspaceScopedMixin):

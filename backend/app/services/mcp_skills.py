@@ -1617,10 +1617,24 @@ class MCPAndSkillService:
         sections: list[str] = []
         catalog_lines: list[str] = []
         used_budget = 0
+        # LRU ordering: activated first, then most-recently-used (lg_skill_used),
+        # then install order. Cold-start rows (no usage yet) fall back to
+        # created_at, keeping the historical behavior for new workspaces.
         skills = sorted(
             self._authorized_packages(),
-            key=lambda skill: (skill.skill_key not in activated, skill.created_at, skill.id),
+            key=lambda skill: (
+                skill.skill_key not in activated,
+                skill.last_used_at is None,
+                -(
+                    skill.last_used_at.timestamp()
+                    if skill.last_used_at is not None
+                    else 0.0
+                ),
+                skill.created_at,
+                skill.id,
+            ),
         )
+        total_eligible = 0
         for skill in skills:
             # Contextual official skills are installed durably but injected only
             # when the user explicitly activates the matching composer mode.
@@ -1630,6 +1644,7 @@ class MCPAndSkillService:
                 and skill.skill_key not in activated
             ):
                 continue
+            total_eligible += 1
             instructions = (skill.instructions_markdown or "").strip()
             description = ""
             category = ""
@@ -1680,6 +1695,7 @@ class MCPAndSkillService:
                 )
         if not sections and not catalog_lines:
             return ""
+        truncated_count = max(0, total_eligible - len(sections) - len(catalog_lines))
         parts: list[str] = [
             "Authorized LearnGraph Agent Skill packages for this turn. "
             "Treat each block as optional skill instructions when the user's "
@@ -1703,6 +1719,14 @@ class MCPAndSkillService:
                 "files) before applying it. Do not guess a skill's content "
                 "from its one-line summary.\n"
                 + "\n".join(catalog_lines)
+            )
+        if truncated_count:
+            parts.append(
+                "> Note: "
+                f"{truncated_count} more authorized skills exceed the catalog "
+                "limit and are not listed here. If the task may match one, use "
+                "`lg_capability_search` to find it, then `lg_skill_read` to "
+                "load its SKILL.md before applying it."
             )
         return "\n\n".join(parts)
 
@@ -4031,6 +4055,10 @@ class MCPAndSkillService:
             skill = self._resolve_skill_by_key(str(arguments["skill_key"]))
             if not skill.enabled or skill.status != "enabled":
                 raise AppError(403, "skill_not_enabled", "该 Skill 未启用或未授权")
+            # LRU ordering signal for prompt-level progressive disclosure; purely
+            # informational, never an authorization input.
+            skill.last_used_at = utc_now()
+            self.db.flush()
             return {
                 "skill_key": skill.skill_key,
                 "skill_name": skill.name,

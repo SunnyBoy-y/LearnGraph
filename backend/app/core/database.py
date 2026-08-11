@@ -425,6 +425,7 @@ def _ensure_sqlite_skill_package_columns() -> None:
         "has_scripts": "BOOLEAN DEFAULT 0",
         "locale_source": "VARCHAR(32) DEFAULT ''",
         "is_official": "BOOLEAN DEFAULT 0",
+        "last_used_at": "DATETIME",
     }
     with engine.begin() as connection:
         existing = {
