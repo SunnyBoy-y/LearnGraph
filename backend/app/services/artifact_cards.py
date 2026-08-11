@@ -4,19 +4,27 @@ One row per stable ``card_id`` per workspace. The indexer runs at the single
 MessagePart persistence point (``ChatService._emit_sandbox_side_effect_parts``)
 so every card-producing path (main stream, retry, agent canvas tools) is
 captured. Cards start as ``draft``; publishing freezes a versioned snapshot
-(second phase).
+into :class:`ArtifactCardVersion` and flips the card to ``published``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import secrets
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.models import ArtifactCard, utc_now
+from app.domain.models import (
+    ArtifactCard,
+    ArtifactCardShareToken,
+    ArtifactCardVersion,
+    utc_now,
+)
 
 # Runtimes that round-trip user events back to the agent (bidirectional card).
 BIDIRECTIONAL_RUNTIMES = frozenset({"react-sandbox-v1", "opaque-origin-subapp-v1"})
@@ -141,12 +149,16 @@ class ArtifactCardIndexer:
 
 
 class ArtifactCardService:
-    """Query and lifecycle operations over the card index."""
+    """Query, versioning, and sharing operations over the card index."""
 
     def __init__(self, db: Session, workspace_id: str, tenant_id: str) -> None:
         self.db = db
         self.workspace_id = workspace_id
         self.tenant_id = tenant_id
+
+    # ------------------------------------------------------------------ #
+    # Cards
+    # ------------------------------------------------------------------ #
 
     def list_cards(
         self,
@@ -158,7 +170,8 @@ class ArtifactCardService:
         order: str = "desc",
         limit: int = 100,
         offset: int = 0,
-    ) -> list[ArtifactCard]:
+    ) -> list[dict[str, Any]]:
+        """Return card views with version stats, newest version first."""
         query = select(ArtifactCard).where(
             ArtifactCard.workspace_id == self.workspace_id,
             ArtifactCard.status != CARD_STATUS_DELETED,
@@ -178,13 +191,62 @@ class ArtifactCardService:
         query = query.order_by(column, ArtifactCard.id.desc())
         if limit > 0:
             query = query.limit(min(limit, 200)).offset(max(offset, 0))
-        return list(self.db.scalars(query))
+        cards = list(self.db.scalars(query))
+        if not cards:
+            return []
+        card_ids = [card.id for card in cards]
+        version_rows = self.db.execute(
+            select(
+                ArtifactCardVersion.card_id,
+                func.count(ArtifactCardVersion.id),
+                func.max(ArtifactCardVersion.version),
+                func.max(ArtifactCardVersion.created_at),
+            )
+            .where(
+                ArtifactCardVersion.card_id.in_(card_ids),
+                ArtifactCardVersion.status == "active",
+            )
+            .group_by(ArtifactCardVersion.card_id)
+        ).all()
+        stats: dict[str, dict[str, Any]] = {}
+        for card_id, count, max_version, latest_created in version_rows:
+            stats[card_id] = {
+                "version_count": int(count or 0),
+                "latest_version": int(max_version or 0),
+                "latest_version_at": latest_created,
+            }
+        views: list[dict[str, Any]] = []
+        for card in cards:
+            card_stats = stats.get(card.id) or {
+                "version_count": 0,
+                "latest_version": 0,
+                "latest_version_at": None,
+            }
+            views.append(
+                {
+                    **card.__dict__,
+                    "version_count": card_stats["version_count"],
+                    "latest_version": card_stats["latest_version"],
+                    "draft_dirty": bool(
+                        card.status == CARD_STATUS_PUBLISHED
+                        and card_stats["latest_version_at"] is not None
+                        and card.updated_at > card_stats["latest_version_at"]
+                    ),
+                }
+            )
+        return views
 
-    def get_preview(self, card_id: str) -> ArtifactCard:
+    def get_preview(
+        self, card_id: str, version: int | None = None
+    ) -> tuple[ArtifactCard, dict[str, Any]]:
+        """Return (card, snapshot). ``version`` selects a frozen snapshot."""
         row = self._card_for_workspace(card_id)
         if row.status == CARD_STATUS_DELETED:
             raise AppError(404, "artifact_card_not_found", "Artifact card was not found")
-        return row
+        if version is not None:
+            frozen = self._card_version_for_workspace(card_id, version)
+            return row, dict(frozen.preview_snapshot or {})
+        return row, dict(row.preview_snapshot or {})
 
     def delete_card(self, card_id: str) -> ArtifactCard:
         """Soft-delete a card; a later agent re-emit revives it as a draft."""
@@ -197,6 +259,183 @@ class ArtifactCardService:
         self.db.refresh(row)
         return row
 
+    # ------------------------------------------------------------------ #
+    # Versioned immutable snapshots
+    # ------------------------------------------------------------------ #
+
+    def publish_version(
+        self,
+        card_id: str,
+        *,
+        release_notes: str = "",
+        actor_id: str = "user",
+        publish_source: str = "user",
+    ) -> ArtifactCardVersion:
+        """Freeze the card's current draft snapshot as the next immutable version."""
+        if publish_source not in {"user", "agent"}:
+            publish_source = "user"
+        row = self._card_for_workspace(card_id)
+        if row.status == CARD_STATUS_DELETED:
+            raise AppError(404, "artifact_card_not_found", "Artifact card was not found")
+        current = self.db.scalar(
+            select(func.max(ArtifactCardVersion.version)).where(
+                ArtifactCardVersion.card_id == row.id,
+                ArtifactCardVersion.status == "active",
+            )
+        )
+        version = ArtifactCardVersion(
+            tenant_id=self.tenant_id,
+            workspace_id=self.workspace_id,
+            card_id=row.id,
+            version=(current or 0) + 1,
+            preview_snapshot=deepcopy(row.preview_snapshot or {}),
+            release_notes=(release_notes or "")[:4000],
+            published_by=actor_id,
+            publish_source=publish_source,
+        )
+        self.db.add(version)
+        if row.status == CARD_STATUS_DRAFT:
+            row.status = CARD_STATUS_PUBLISHED
+        self.db.commit()
+        self.db.refresh(version)
+        return version
+
+    def list_versions(self, card_id: str) -> list[ArtifactCardVersion]:
+        row = self._card_for_workspace(card_id)
+        if row.status == CARD_STATUS_DELETED:
+            raise AppError(404, "artifact_card_not_found", "Artifact card was not found")
+        return list(
+            self.db.scalars(
+                select(ArtifactCardVersion)
+                .where(
+                    ArtifactCardVersion.card_id == row.id,
+                    ArtifactCardVersion.status == "active",
+                )
+                .order_by(ArtifactCardVersion.version.desc())
+            )
+        )
+
+    def delete_version(self, version_id: str) -> ArtifactCardVersion:
+        version = self._version_for_workspace(version_id)
+        if version.status != "active":
+            raise AppError(404, "artifact_card_version_not_found", "Artifact card version was not found")
+        version.status = "deleted"
+        version.deleted_at = utc_now()
+        self.db.commit()
+        self.db.refresh(version)
+        return version
+
+    # ------------------------------------------------------------------ #
+    # Share tokens (public read-only HTML viewer)
+    # ------------------------------------------------------------------ #
+
+    def create_share_token(
+        self,
+        version_id: str,
+        *,
+        label: str = "",
+        expires_at: datetime | None = None,
+        max_views: int | None = None,
+    ) -> tuple[str, ArtifactCardShareToken]:
+        version = self._version_for_workspace(version_id)
+        if version.status != "active":
+            raise AppError(404, "artifact_card_version_not_found", "Artifact card version was not found")
+        raw_token = secrets.token_urlsafe(32)
+        record = ArtifactCardShareToken(
+            tenant_id=self.tenant_id,
+            workspace_id=self.workspace_id,
+            artifact_card_version_id=version.id,
+            created_by="user",
+            token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+            token_prefix=raw_token[:12],
+            label=label[:120],
+            expires_at=expires_at,
+            max_views=max_views if max_views and max_views > 0 else None,
+        )
+        self.db.add(record)
+        self.db.commit()
+        self.db.refresh(record)
+        return raw_token, record
+
+    def list_share_tokens(self, version_id: str) -> list[ArtifactCardShareToken]:
+        version = self._version_for_workspace(version_id)
+        return list(
+            self.db.scalars(
+                select(ArtifactCardShareToken)
+                .where(ArtifactCardShareToken.artifact_card_version_id == version.id)
+                .order_by(ArtifactCardShareToken.created_at.desc())
+            )
+        )
+
+    def revoke_share_token(self, token_id: str) -> ArtifactCardShareToken:
+        token = self.db.scalar(
+            select(ArtifactCardShareToken)
+            .join(
+                ArtifactCardVersion,
+                ArtifactCardVersion.id == ArtifactCardShareToken.artifact_card_version_id,
+            )
+            .join(ArtifactCard, ArtifactCard.id == ArtifactCardVersion.card_id)
+            .where(
+                ArtifactCardShareToken.id == token_id,
+                ArtifactCard.workspace_id == self.workspace_id,
+                ArtifactCard.tenant_id == self.tenant_id,
+            )
+        )
+        if token is None:
+            raise AppError(404, "artifact_card_share_not_found", "Artifact card share was not found")
+        token.revoked_at = utc_now()
+        self.db.commit()
+        self.db.refresh(token)
+        return token
+
+    def resolve_card_share(
+        self, raw_token: str
+    ) -> tuple[ArtifactCardVersion, ArtifactCard]:
+        """Resolve + atomically claim one view for a public card share link."""
+        digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        token = self.db.scalar(
+            select(ArtifactCardShareToken).where(ArtifactCardShareToken.token_hash == digest)
+        )
+        now = utc_now()
+        if (
+            token is None
+            or token.revoked_at is not None
+            or (token.expires_at is not None and token.expires_at <= now)
+            or (token.max_views is not None and token.view_count >= token.max_views)
+        ):
+            raise AppError(404, "artifact_card_share_not_found", "Artifact card share was not found")
+        version = self.db.get(ArtifactCardVersion, token.artifact_card_version_id)
+        if version is None or version.status != "active":
+            raise AppError(404, "artifact_card_share_not_found", "Artifact card share was not found")
+        card = self.db.get(ArtifactCard, version.card_id)
+        if card is None or card.status == CARD_STATUS_DELETED:
+            raise AppError(404, "artifact_card_share_not_found", "Artifact card share was not found")
+        claimed = self.db.execute(
+            update(ArtifactCardShareToken)
+            .where(
+                ArtifactCardShareToken.id == token.id,
+                ArtifactCardShareToken.revoked_at.is_(None),
+                or_(
+                    ArtifactCardShareToken.expires_at.is_(None),
+                    ArtifactCardShareToken.expires_at > now,
+                ),
+                or_(
+                    ArtifactCardShareToken.max_views.is_(None),
+                    ArtifactCardShareToken.view_count < ArtifactCardShareToken.max_views,
+                ),
+            )
+            .values(view_count=ArtifactCardShareToken.view_count + 1)
+        )
+        if claimed.rowcount != 1:
+            self.db.rollback()
+            raise AppError(404, "artifact_card_share_not_found", "Artifact card share was not found")
+        self.db.commit()
+        return version, card
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
     def _card_for_workspace(self, card_id: str) -> ArtifactCard:
         row = self.db.scalar(
             select(ArtifactCard).where(
@@ -208,3 +447,30 @@ class ArtifactCardService:
         if row is None:
             raise AppError(404, "artifact_card_not_found", "Artifact card was not found")
         return row
+
+    def _card_version_for_workspace(self, card_id: str, version: int) -> ArtifactCardVersion:
+        row = self._card_for_workspace(card_id)
+        frozen = self.db.scalar(
+            select(ArtifactCardVersion).where(
+                ArtifactCardVersion.card_id == row.id,
+                ArtifactCardVersion.version == version,
+                ArtifactCardVersion.status == "active",
+            )
+        )
+        if frozen is None:
+            raise AppError(404, "artifact_card_version_not_found", "Artifact card version was not found")
+        return frozen
+
+    def _version_for_workspace(self, version_id: str) -> ArtifactCardVersion:
+        version = self.db.scalar(
+            select(ArtifactCardVersion)
+            .join(ArtifactCard, ArtifactCard.id == ArtifactCardVersion.card_id)
+            .where(
+                ArtifactCardVersion.id == version_id,
+                ArtifactCard.workspace_id == self.workspace_id,
+                ArtifactCard.tenant_id == self.tenant_id,
+            )
+        )
+        if version is None:
+            raise AppError(404, "artifact_card_version_not_found", "Artifact card version was not found")
+        return version

@@ -2125,6 +2125,64 @@ class ArtifactCard(Base, TimestampMixin, WorkspaceScopedMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ArtifactCardVersion(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Immutable snapshot of one published card draft.
+
+    Publishing freezes the card's current preview_snapshot; later draft edits
+    never mutate an existing version. Versions are soft-deletable but their
+    snapshot content is never rewritten.
+    """
+
+    __tablename__ = "artifact_card_versions"
+    __table_args__ = (
+        UniqueConstraint("card_id", "version", name="uq_artifact_card_version"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    card_id: Mapped[str] = mapped_column(
+        ForeignKey("artifact_cards.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    preview_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    release_notes: Mapped[str] = mapped_column(Text, default="")
+    published_by: Mapped[str] = mapped_column(String(64))
+    # agent | user — who triggered the publish.
+    publish_source: Mapped[str] = mapped_column(String(16), default="user", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ArtifactCardShareToken(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Revocable, read-only token scoped to one published card version.
+
+    Opens a public HTML viewer page (sandboxed preview) instead of a file
+    download. The raw token is returned once; only a SHA-256 digest and a
+    display prefix are persisted.
+    """
+
+    __tablename__ = "artifact_card_share_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_artifact_card_share_token_hash"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    artifact_card_version_id: Mapped[str] = mapped_column(
+        ForeignKey("artifact_card_versions.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(64))
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    token_prefix: Mapped[str] = mapped_column(String(16))
+    label: Mapped[str] = mapped_column(String(120), default="")
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    max_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+
 class ArtifactVersion(Base, TimestampMixin):
     """Immutable snapshot of one FileRecord published as an artifact output."""
 

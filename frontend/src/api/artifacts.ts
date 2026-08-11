@@ -2,6 +2,9 @@ import type {
   Artifact,
   ArtifactCard,
   ArtifactCardPreview,
+  ArtifactCardShareToken,
+  ArtifactCardShareTokenCreated,
+  ArtifactCardVersion,
   ArtifactShareToken,
   ArtifactShareTokenCreated,
   ArtifactSummary,
@@ -63,9 +66,13 @@ export function listArtifactCards(params?: {
   return apiClient.get<ArtifactCard[]>("/artifacts/cards", { query: params });
 }
 
-export function getArtifactCardPreview(cardId: string): Promise<ArtifactCardPreview> {
+export function getArtifactCardPreview(
+  cardId: string,
+  params?: { version?: number },
+): Promise<ArtifactCardPreview> {
   return apiClient.get<ArtifactCardPreview>(
     `/artifacts/cards/${encodeURIComponent(cardId)}/preview`,
+    { query: params },
   );
 }
 
@@ -73,6 +80,62 @@ export function deleteArtifactCard(cardId: string): Promise<ArtifactCard> {
   return apiClient.delete<ArtifactCard>(
     `/artifacts/cards/${encodeURIComponent(cardId)}`,
   );
+}
+
+export function publishArtifactCardVersion(
+  cardId: string,
+  payload: { release_notes?: string },
+): Promise<ArtifactCardVersion> {
+  return apiClient.post<ArtifactCardVersion, typeof payload>(
+    `/artifacts/cards/${encodeURIComponent(cardId)}/versions`,
+    payload,
+  );
+}
+
+export function listArtifactCardVersions(
+  cardId: string,
+): Promise<ArtifactCardVersion[]> {
+  return apiClient.get<ArtifactCardVersion[]>(
+    `/artifacts/cards/${encodeURIComponent(cardId)}/versions`,
+  );
+}
+
+export function deleteArtifactCardVersion(versionId: string): Promise<ArtifactCardVersion> {
+  return apiClient.delete<ArtifactCardVersion>(
+    `/artifacts/cards/versions/${encodeURIComponent(versionId)}`,
+  );
+}
+
+export function listArtifactCardShareTokens(
+  versionId: string,
+): Promise<ArtifactCardShareToken[]> {
+  return apiClient.get<ArtifactCardShareToken[]>(
+    `/artifacts/cards/versions/${encodeURIComponent(versionId)}/share-tokens`,
+  );
+}
+
+export function createArtifactCardShareToken(
+  versionId: string,
+  payload: {
+    label?: string;
+    expires_at?: string | null;
+    max_views?: number | null;
+  },
+): Promise<ArtifactCardShareTokenCreated> {
+  return apiClient.post<ArtifactCardShareTokenCreated, typeof payload>(
+    `/artifacts/cards/versions/${encodeURIComponent(versionId)}/share-tokens`,
+    payload,
+  );
+}
+
+export function revokeArtifactCardShareToken(tokenId: string): Promise<ArtifactCardShareToken> {
+  return apiClient.delete<ArtifactCardShareToken>(
+    `/artifacts/cards/share-tokens/${encodeURIComponent(tokenId)}`,
+  );
+}
+
+export function cardShareUrl(rawToken: string): string {
+  return `/api/v1/card-share/${encodeURIComponent(rawToken)}`;
 }
 
 export function listArtifactVersions(

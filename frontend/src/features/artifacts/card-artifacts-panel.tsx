@@ -1,13 +1,32 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { History, LayoutGrid, Link2, LoaderCircle, MessageSquare, RefreshCw, Trash2 } from "lucide-react";
+import {
+  Check,
+  Copy,
+  ExternalLink,
+  History,
+  LayoutGrid,
+  Link2,
+  LoaderCircle,
+  MessageSquare,
+  RefreshCw,
+  Rocket,
+  Trash2,
+} from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import {
+  cardShareUrl,
+  createArtifactCardShareToken,
   deleteArtifactCard,
+  deleteArtifactCardVersion,
   getArtifactCardPreview,
+  listArtifactCardShareTokens,
+  listArtifactCardVersions,
   listArtifactCards,
+  publishArtifactCardVersion,
+  revokeArtifactCardShareToken,
 } from "@/api/artifacts";
 import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
@@ -29,9 +48,12 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -40,8 +62,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
 import { workspaceQueryKey } from "@/lib/query-keys";
-import type { ArtifactCard } from "@/types/artifacts";
+import type {
+  ArtifactCard,
+  ArtifactCardShareTokenCreated,
+} from "@/types/artifacts";
 
 function formatDate(value: string): string {
   const date = new Date(value);
@@ -61,9 +87,15 @@ function CardTypeBadge({ card }: { card: ArtifactCard }) {
   );
 }
 
-function StatusBadge({ status }: { status: ArtifactCard["status"] }) {
-  if (status === "published") return <Badge>已发布</Badge>;
-  return <Badge variant="outline">草稿</Badge>;
+function StatusBadge({ card }: { card: ArtifactCard }) {
+  if (card.status === "published") {
+    return (
+      <Badge variant="outline">
+        已发布{card.latest_version > 0 ? ` v${card.latest_version}` : ""}
+      </Badge>
+    );
+  }
+  return <Badge variant="secondary">草稿</Badge>;
 }
 
 export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
@@ -79,7 +111,8 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
     () => ({
       status: statusFilter === "all" ? undefined : statusFilter,
       card_type: typeFilter === "all" ? undefined : typeFilter,
-      interactive: typeFilter === "interactive" ? true : typeFilter === "static" ? false : undefined,
+      interactive:
+        typeFilter === "interactive" ? true : typeFilter === "static" ? false : undefined,
       sort: sortOrder,
       order: "desc",
       limit: 200,
@@ -173,7 +206,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
 
       <Surface className="p-5">
         <SectionHeading
-          description="会话中生成的交互 HTML 页面自动聚合为草稿；点击卡片可小窗预览并全屏。"
+          description="会话中生成的交互 HTML 页面自动聚合为草稿；发布后生成不可变版本，可切换查看与分享。"
           title="会话卡片"
         />
         {cards.isPending ? (
@@ -206,9 +239,12 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                   onClick={() => setPreviewCard(card)}
                   type="button"
                 >
-                  <div className="flex min-w-0 items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <CardTypeBadge card={card} />
-                    <StatusBadge status={card.status} />
+                    <StatusBadge card={card} />
+                    {card.draft_dirty ? (
+                      <Badge variant="destructive">有未发布更新</Badge>
+                    ) : null}
                   </div>
                   <span className="line-clamp-2 text-sm font-semibold">{card.title}</span>
                   <span className="text-xs text-muted-foreground">
@@ -229,10 +265,9 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                   </Button>
                   <Button
                     className="ml-auto"
-                    disabled={!card.chat_session_id}
                     onClick={() => setPreviewCard(card)}
                     size="sm"
-                    title="预览"
+                    title="预览 / 版本 / 分享"
                     type="button"
                     variant="ghost"
                   >
@@ -260,6 +295,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
         card={previewCard}
         onClose={() => setPreviewCard(null)}
         workspaceId={workspaceId}
+        onChanged={invalidateCards}
       />
 
       <AlertDialog
@@ -296,43 +332,120 @@ function CardPreviewDialog({
   card,
   onClose,
   workspaceId,
+  onChanged,
 }: {
   card: ArtifactCard | null;
   onClose: () => void;
   workspaceId: string;
+  onChanged: () => Promise<void> | void;
 }) {
   const navigate = useNavigate();
+  // "draft" shows the live draft; a number shows a frozen published snapshot.
+  const [selectedVersion, setSelectedVersion] = useState<number | "draft">("draft");
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+
+  const versions = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "cards", card?.card_id ?? "__none__", "versions"),
+    queryFn: () => listArtifactCardVersions(card!.card_id),
+    enabled: Boolean(card),
+  });
+
   const preview = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "cards", card?.card_id ?? "__none__", "preview"),
-    queryFn: () => getArtifactCardPreview(card!.card_id),
+    queryKey: workspaceQueryKey(
+      workspaceId,
+      "cards",
+      card?.card_id ?? "__none__",
+      "preview",
+      selectedVersion,
+    ),
+    queryFn: () =>
+      getArtifactCardPreview(card!.card_id, {
+        ...(selectedVersion !== "draft" ? { version: selectedVersion } : {}),
+      }),
     enabled: Boolean(card),
   });
 
   const snapshot = preview.data?.preview_snapshot ?? {};
   const isComponent = card?.card_type === "component";
   const title = card?.title ?? "卡片预览";
+  const selectedVersionId =
+    selectedVersion !== "draft"
+      ? versions.data?.find((version) => version.version === selectedVersion)?.id
+      : undefined;
+
+  const publishMutation = useMutation({
+    mutationFn: (releaseNotes: string) =>
+      publishArtifactCardVersion(card!.card_id, { release_notes: releaseNotes }),
+    onSuccess: async () => {
+      toast.success("版本已发布");
+      setPublishOpen(false);
+      await versions.refetch();
+      await onChanged();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const deleteVersionMutation = useMutation({
+    mutationFn: deleteArtifactCardVersion,
+    onSuccess: async () => {
+      toast.success("版本已删除");
+      if (selectedVersion !== "draft") setSelectedVersion("draft");
+      await versions.refetch();
+      await onChanged();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const resetState = () => {
+    setSelectedVersion("draft");
+    setPublishOpen(false);
+    setShareOpen(false);
+  };
 
   return (
     <Dialog
       onOpenChange={(next) => {
-        if (!next) onClose();
+        if (!next) {
+          resetState();
+          onClose();
+        }
       }}
       open={Boolean(card)}
     >
-      <DialogContent
-        className="flex max-h-[90vh] max-w-3xl flex-col gap-3 overflow-y-auto"
-        onOpenAutoFocus={(event) => event.preventDefault()}
-      >
+      <DialogContent className="flex max-h-[90vh] max-w-3xl flex-col gap-3 overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex flex-wrap items-center gap-2">
             <History className="size-4" />
             {title}
           </DialogTitle>
-          <DialogDescription>
-            {isComponent ? "声明式组件 · 只读预览" : "交互页面 · 沙箱预览"}
-            {card?.chat_session_id ? " · 双击右上角可全屏" : ""}
+          <DialogDescription className="flex flex-wrap items-center gap-3">
+            <Select
+              onValueChange={(value) =>
+                setSelectedVersion(value === "draft" ? "draft" : Number(value))
+              }
+              value={selectedVersion === "draft" ? "draft" : String(selectedVersion)}
+            >
+              <SelectTrigger className="w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="draft">
+                  当前草稿{card?.draft_dirty ? "（有更新）" : ""}
+                </SelectItem>
+                {versions.data?.map((version) => (
+                  <SelectItem key={version.id} value={String(version.version)}>
+                    v{version.version} · {formatDate(version.created_at)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <span className="text-xs">
+              {isComponent ? "声明式组件 · 只读预览" : "交互页面 · 沙箱预览"}
+            </span>
           </DialogDescription>
         </DialogHeader>
+
         {preview.isPending ? (
           <Skeleton className="h-64 w-full" />
         ) : preview.isError ? (
@@ -352,21 +465,327 @@ function CardPreviewDialog({
             <MagicCardHost data={snapshot} />
           </FullscreenPreview>
         )}
-        {card?.chat_session_id ? (
-          <div className="flex justify-end gap-2 border-t pt-3">
+
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3">
+          <div className="flex items-center gap-2">
+            {selectedVersion !== "draft" && selectedVersionId ? (
+              <Button
+                disabled={deleteVersionMutation.isPending}
+                onClick={() => deleteVersionMutation.mutate(selectedVersionId)}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                <Trash2 className="size-4" />
+                删除此版本
+              </Button>
+            ) : null}
+            <Button onClick={() => setPublishOpen(true)} size="sm" type="button">
+              <Rocket className="size-4" />
+              发布当前草稿
+            </Button>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button onClick={() => setShareOpen(true)} size="sm" type="button" variant="outline">
+              <Link2 className="size-4" />
+              分享
+            </Button>
+            {card?.chat_session_id ? (
+              <Button
+                onClick={() => navigate(`/w/${workspaceId}/chat/${card.chat_session_id}`)}
+                size="sm"
+                type="button"
+              >
+                <MessageSquare className="size-4" />
+                跳转到会话
+              </Button>
+            ) : null}
             <Button onClick={onClose} size="sm" type="button" variant="ghost">
               关闭
             </Button>
-            <Button
-              onClick={() => navigate(`/w/${workspaceId}/chat/${card.chat_session_id}`)}
-              size="sm"
-              type="button"
-            >
-              <MessageSquare className="size-4" />
-              跳转到会话
-            </Button>
           </div>
-        ) : null}
+        </div>
+      </DialogContent>
+
+      <PublishVersionDialog
+        card={card}
+        busy={publishMutation.isPending}
+        onClose={() => setPublishOpen(false)}
+        onSubmit={(releaseNotes) => publishMutation.mutate(releaseNotes)}
+        open={publishOpen}
+      />
+
+      <CardShareDialog
+        card={card}
+        onClose={() => setShareOpen(false)}
+        open={shareOpen}
+        versionId={selectedVersionId}
+        workspaceId={workspaceId}
+      />
+    </Dialog>
+  );
+}
+
+function PublishVersionDialog({
+  card,
+  open,
+  onClose,
+  onSubmit,
+  busy,
+}: {
+  card: ArtifactCard | null;
+  open: boolean;
+  onClose: () => void;
+  onSubmit: (releaseNotes: string) => void;
+  busy: boolean;
+}) {
+  const [releaseNotes, setReleaseNotes] = useState("");
+  return (
+    <Dialog
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      open={open}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>发布版本 · {card?.title ?? ""}</DialogTitle>
+          <DialogDescription>
+            将当前草稿冻结为不可变版本（{card ? `v${card.latest_version + 1}` : ""}）。
+            之后的草稿修改不会影响已发布版本。
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="grid gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSubmit(releaseNotes.trim());
+          }}
+        >
+          <div className="grid gap-2">
+            <Label htmlFor="card-release-notes">版本说明（可选）</Label>
+            <Textarea
+              autoFocus
+              id="card-release-notes"
+              maxLength={4000}
+              onChange={(event) => setReleaseNotes(event.target.value)}
+              placeholder="这个版本包含什么变化"
+              rows={3}
+              value={releaseNotes}
+            />
+          </div>
+          <DialogFooter>
+            <Button disabled={busy} onClick={onClose} type="button" variant="ghost">
+              取消
+            </Button>
+            <Button disabled={busy} type="submit">
+              {busy ? <LoaderCircle className="size-4 animate-spin" /> : <Rocket className="size-4" />}
+              发布
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CardShareDialog({
+  card,
+  open,
+  onClose,
+  versionId,
+  workspaceId,
+}: {
+  card: ArtifactCard | null;
+  open: boolean;
+  onClose: () => void;
+  versionId: string | undefined;
+  workspaceId: string;
+}) {
+  const queryClient = useQueryClient();
+  const [label, setLabel] = useState("");
+  const [maxViews, setMaxViews] = useState("");
+  const [createdToken, setCreatedToken] = useState<ArtifactCardShareTokenCreated | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const tokens = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", versionId ?? "__none__"),
+    queryFn: () => listArtifactCardShareTokens(versionId as string),
+    enabled: Boolean(versionId) && open,
+  });
+
+  const invalidateTokens = () =>
+    queryClient.invalidateQueries({
+      queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", versionId ?? "__none__"),
+    });
+
+  const createMutation = useMutation({
+    mutationFn: (payload: { label?: string; max_views?: number | null }) =>
+      createArtifactCardShareToken(versionId as string, payload),
+    onSuccess: (token) => {
+      setCreatedToken(token);
+      void invalidateTokens();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const revokeMutation = useMutation({
+    mutationFn: revokeArtifactCardShareToken,
+    onSuccess: () => {
+      toast.success("分享链接已撤销");
+      void invalidateTokens();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const shareUrl = useMemo(
+    () => (createdToken ? window.location.origin + cardShareUrl(createdToken.token) : ""),
+    [createdToken],
+  );
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopied(true);
+      toast.success("分享链接已复制");
+      window.setTimeout(() => setCopied(false), 1_600);
+    } catch {
+      toast.error("无法复制，请手动复制链接");
+    }
+  };
+
+  return (
+    <Dialog onOpenChange={(next) => { if (!next) onClose(); }} open={open}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>分享版本 · {card?.title ?? ""}</DialogTitle>
+          <DialogDescription>
+            {versionId
+              ? "生成只读预览链接；打开链接的人无需登录即可查看该版本。"
+              : "请先在版本列表中选择一个已发布版本再分享。"}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-4">
+          {!versionId ? (
+            <p className="text-sm text-muted-foreground">
+              当前选中内容尚未发布。请先发布版本，或在版本列表中选择一个已发布版本。
+            </p>
+          ) : createdToken ? (
+            <div className="grid gap-3 rounded-xl border bg-muted/30 p-4">
+              <p className="text-sm font-medium">分享链接已生成</p>
+              <div className="flex min-w-0 items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded-lg border bg-background px-3 py-2 text-xs">
+                  {shareUrl}
+                </code>
+                <Button onClick={() => void copy()} size="icon" type="button" variant="outline">
+                  {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                完整令牌只在本次生成时显示。链接可被随时撤销。
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button asChild size="sm" variant="outline">
+                  <a href={shareUrl} rel="noreferrer noopener" target="_blank">
+                    <ExternalLink className="size-4" />
+                    打开链接
+                  </a>
+                </Button>
+                <Button onClick={() => setCreatedToken(null)} size="sm" type="button">
+                  完成
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="card-share-label">标签（可选）</Label>
+                <Input
+                  id="card-share-label"
+                  maxLength={120}
+                  onChange={(event) => setLabel(event.target.value)}
+                  placeholder="例如：给朋友的路线图"
+                  value={label}
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="card-share-max-views">查看次数上限（可选）</Label>
+                <Input
+                  id="card-share-max-views"
+                  min={1}
+                  onChange={(event) => setMaxViews(event.target.value)}
+                  placeholder="留空表示不限次数"
+                  type="number"
+                  value={maxViews}
+                />
+              </div>
+              <Button
+                disabled={createMutation.isPending}
+                onClick={() =>
+                  createMutation.mutate({
+                    label: label.trim(),
+                    max_views: maxViews.trim() ? Number(maxViews) : null,
+                  })
+                }
+                type="button"
+              >
+                {createMutation.isPending ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : (
+                  <Link2 className="size-4" />
+                )}
+                生成分享链接
+              </Button>
+            </>
+          )}
+
+          <div>
+            <SectionHeading description="所有令牌只显示前缀，完整链接仅在生成时可见。" title="已有分享链接" />
+            {tokens.isPending ? (
+              <Skeleton className="mt-3 h-10 w-full" />
+            ) : tokens.data?.length === 0 ? (
+              <p className="mt-3 text-xs text-muted-foreground">暂无分享链接。</p>
+            ) : (
+              <div className="mt-3 flex flex-col divide-y rounded-xl border">
+                {tokens.data?.map((token) => (
+                  <div
+                    className="flex flex-col gap-2 p-3 sm:flex-row sm:items-center sm:justify-between"
+                    key={token.id}
+                  >
+                    <div className="min-w-0">
+                      <p className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                        {token.label || token.token_prefix}
+                        {token.revoked_at ? (
+                          <Badge variant="destructive">已撤销</Badge>
+                        ) : token.expires_at && new Date(token.expires_at) < new Date() ? (
+                          <Badge variant="secondary">已过期</Badge>
+                        ) : (
+                          <Badge>有效</Badge>
+                        )}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {token.token_prefix}… · 查看 {token.view_count}
+                        {token.max_views ? ` / ${token.max_views}` : ""}
+                        {token.expires_at ? ` · 过期 ${formatDate(token.expires_at)}` : ""}
+                      </p>
+                    </div>
+                    <Button
+                      disabled={Boolean(token.revoked_at) || revokeMutation.isPending}
+                      onClick={() => revokeMutation.mutate(token.id)}
+                      size="sm"
+                      type="button"
+                      variant="outline"
+                    >
+                      <Trash2 className="size-4" />
+                      撤销
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </DialogContent>
     </Dialog>
   );

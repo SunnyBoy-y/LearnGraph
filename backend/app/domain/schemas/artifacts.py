@@ -37,6 +37,18 @@ class ArtifactShareTokenCreate(BaseModel):
     max_downloads: int | None = Field(default=None, ge=1)
 
 
+class ArtifactCardPublish(BaseModel):
+    """Publish a card draft as the next immutable version."""
+
+    release_notes: str = Field(default="", max_length=4000)
+
+
+class ArtifactCardShareTokenCreate(BaseModel):
+    label: str = Field(default="", max_length=120)
+    expires_at: datetime | None = None
+    max_views: int | None = Field(default=None, ge=1)
+
+
 class ArtifactView(ORMModel):
     id: str
     tenant_id: str
@@ -60,6 +72,11 @@ class ArtifactCardView(ORMModel):
     status: str
     chat_session_id: str | None = None
     message_id: str | None = None
+    version_count: int = 0
+    latest_version: int = 0
+    # True when the card has published versions but the draft changed after the
+    # latest publish (an unpublished draft update exists).
+    draft_dirty: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -68,6 +85,35 @@ class ArtifactCardPreviewView(ArtifactCardView):
     """Full render data for previewing a card in the artifacts page."""
 
     preview_snapshot: dict
+
+
+class ArtifactCardVersionView(ORMModel):
+    """One immutable published snapshot of a card."""
+
+    id: str
+    card_id: str
+    version: int
+    release_notes: str
+    published_by: str
+    publish_source: str
+    status: str
+    created_at: datetime
+
+
+class ArtifactCardShareTokenView(ORMModel):
+    id: str
+    artifact_card_version_id: str
+    token_prefix: str
+    label: str
+    expires_at: datetime | None = None
+    max_views: int | None = None
+    view_count: int
+    revoked_at: datetime | None = None
+    created_at: datetime
+
+
+class ArtifactCardShareTokenCreated(ArtifactCardShareTokenView):
+    token: str
 
 
 class ArtifactSummaryView(ArtifactView):

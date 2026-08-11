@@ -838,6 +838,41 @@ class AgentToolRuntime:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "artifact_publish_card",
+                    "description": (
+                        "Publish a card you emitted earlier (canvas_emit_magic_card "
+                        "or canvas_emit_trusted_component) as an immutable version "
+                        "in the workspace artifacts page. Publishing freezes the "
+                        "card's current preview as a version and marks the card "
+                        "published; later draft edits never change a published "
+                        "version, and repeated publishes create v2, v3, ... "
+                        "versions. Call this ONLY when the card is the final "
+                        "deliverable for the user's request — not during draft "
+                        "iteration. Use the card_id from the emit tool's result."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "card_id": {
+                                "type": "string",
+                                "description": (
+                                    "The card_id returned by canvas_emit_magic_card "
+                                    "or canvas_emit_trusted_component for the card to publish."
+                                ),
+                            },
+                            "release_notes": {
+                                "type": "string",
+                                "description": "Optional short release notes for this version.",
+                            },
+                        },
+                        "required": ["card_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
 
     def _component_admin_tool_definitions(self) -> list[dict[str, Any]]:
@@ -2521,6 +2556,7 @@ class AgentToolRuntime:
                 "canvas_get_render_contract",
                 "canvas_emit_trusted_component",
                 "canvas_emit_magic_card",
+                "artifact_publish_card",
             }:
                 return self._execute_canvas_tool(name, arguments, chat_session_id=chat_session_id)
             if name in {
@@ -5567,6 +5603,58 @@ class AgentToolRuntime:
                     "canvas": True,
                     "tool": name,
                     "artifact": part,
+                },
+                [],
+            )
+        if name == "artifact_publish_card":
+            card_id = arguments.get("card_id")
+            if not isinstance(card_id, str) or not card_id.strip():
+                raise AppError(422, "invalid_tool_arguments", "card_id is required")
+            release_notes = arguments.get("release_notes")
+            if not isinstance(release_notes, str):
+                release_notes = ""
+            from app.domain.models import Workspace
+            from app.services.artifact_cards import ArtifactCardService
+
+            db = self.extensions.db
+            workspace = db.get(Workspace, self.workspace_id)
+            tenant_id = workspace.tenant_id if workspace is not None else "local-tenant"
+            version = ArtifactCardService(
+                db, self.workspace_id, tenant_id
+            ).publish_version(
+                card_id.strip(),
+                release_notes=release_notes.strip(),
+                actor_id=self.actor_id,
+                publish_source="agent",
+            )
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="canvas.publish_card",
+                resource_type="artifact_card_version",
+                resource_id=version.id,
+                details={
+                    "card_id": card_id.strip(),
+                    "version": version.version,
+                    "chat_session_id": chat_session_id,
+                },
+            )
+            db.commit()
+            return self._success(
+                {
+                    "published": True,
+                    "card_id": card_id.strip(),
+                    "version": version.version,
+                    "status": "published",
+                    "note": (
+                        "The card draft is now frozen as this version in the "
+                        "artifacts page. Further draft edits will not change it; "
+                        "publish again to create a newer version."
+                    ),
+                },
+                {
+                    "canvas": True,
+                    "tool": name,
+                    "card_version": version.version,
                 },
                 [],
             )
