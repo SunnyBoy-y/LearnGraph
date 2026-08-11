@@ -93,13 +93,6 @@ function parseArguments(argv) {
       else options.backendPort = port
       continue
     }
-    if (name === '--public-origin' || name === '--preview-public-origin') {
-      const value = inlineValue ?? argv[++index]
-      if (value === undefined) throw new Error(`${name} requires a value.`)
-      if (name === '--public-origin') options.publicOrigin = value.trim()
-      else options.previewPublicOrigin = value.trim()
-      continue
-    }
 
     throw new Error(`Unknown option: ${argument}`)
   }
@@ -121,10 +114,12 @@ Options:
   --frontend-port <port>    First Vite port to try; uses the next free port if needed (default: 5173)
   --backend-port <port>     Uvicorn main API port (default: 8000)
   --preview-port <port>     Uvicorn subapp preview origin port (default: 8001)
-  --public-origin <origin>  Public URL exposed by FRP/port forwarding for Vite (e.g. https://frp-sea.com:23350)
-  --preview-public-origin <origin>
-                            Public URL exposed for the subapp preview port (e.g. https://frp-sea.com:23351)
-  -h, --help                Show this help`)
+  -h, --help                Show this help
+
+Public access (tunneling / port forwarding) is configured manually via env:
+  frontend/.env  LEARNGRAPH_PUBLIC_ORIGIN          public entry for Vite (allowedHosts + origin)
+  frontend/.env  LEARNGRAPH_ALLOWED_HOSTS          extra Vite allowed hosts (comma separated)
+  backend/.env   LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN  public entry for the subapp preview port`)
 }
 
 function canListenOnPort(port) {
@@ -429,13 +424,6 @@ async function main() {
       if (trimmed) allowedHosts.add(trimmed)
     }
   }
-  if (publicOrigin) {
-    try {
-      allowedHosts.add(new URL(publicOrigin).hostname)
-    } catch {
-      // The Vite config surfaces invalid origins; do not block local startup here.
-    }
-  }
 
   if (options.install) {
     await runChecked('Installing frontend dependencies from package-lock.json', npmCommand(['ci']), frontendDir)
@@ -455,13 +443,6 @@ async function main() {
   const frontendPort = await findAvailableFrontendPort(options.frontendPort, options.backendPort)
   if (frontendPort !== options.frontendPort) {
     console.log(`Frontend port ${options.frontendPort} is in use; using ${frontendPort} instead.`)
-  }
-  if (publicOrigin && frontendPort !== options.frontendPort) {
-    console.warn(
-      `WARNING: ${publicOrigin} is tunneled to local port ${options.frontendPort}, but Vite ` +
-        `started on ${frontendPort}. Free port ${options.frontendPort} or start with ` +
-        `--frontend-port ${frontendPort} so the tunnel points at the running server.`,
-    )
   }
 
   const listenHost =
