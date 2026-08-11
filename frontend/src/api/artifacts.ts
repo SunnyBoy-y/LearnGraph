@@ -19,6 +19,36 @@ export function createArtifact(payload: {
   return apiClient.post<Artifact, typeof payload>("/artifacts", payload);
 }
 
+export function updateArtifact(
+  artifactId: string,
+  payload: { name?: string; description?: string },
+): Promise<Artifact> {
+  return apiClient.patch<Artifact, typeof payload>(
+    `/artifacts/${encodeURIComponent(artifactId)}`,
+    payload,
+  );
+}
+
+export function deleteArtifact(artifactId: string): Promise<Artifact> {
+  return apiClient.delete<Artifact>(`/artifacts/${encodeURIComponent(artifactId)}`);
+}
+
+export function updateArtifactVersion(
+  versionId: string,
+  payload: { release_notes?: string },
+): Promise<ArtifactVersion> {
+  return apiClient.patch<ArtifactVersion, typeof payload>(
+    `/artifacts/versions/${encodeURIComponent(versionId)}`,
+    payload,
+  );
+}
+
+export function deleteArtifactVersion(versionId: string): Promise<ArtifactVersion> {
+  return apiClient.delete<ArtifactVersion>(
+    `/artifacts/versions/${encodeURIComponent(versionId)}`,
+  );
+}
+
 export function listArtifactVersions(
   artifactId: string,
 ): Promise<ArtifactVersion[]> {

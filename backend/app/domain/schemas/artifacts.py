@@ -12,10 +12,23 @@ class ArtifactCreate(BaseModel):
     description: str = Field(default="", max_length=2000)
 
 
+class ArtifactUpdate(BaseModel):
+    """Partial update of an artifact's mutable metadata (name/description)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=240)
+    description: str | None = Field(default=None, max_length=2000)
+
+
 class ArtifactVersionCreate(BaseModel):
     file_id: str
     source_chat_session_id: str | None = None
     release_notes: str = Field(default="", max_length=4000)
+
+
+class ArtifactVersionUpdate(BaseModel):
+    """Partial update of a version's release notes (content itself is immutable)."""
+
+    release_notes: str | None = Field(default=None, max_length=4000)
 
 
 class ArtifactShareTokenCreate(BaseModel):

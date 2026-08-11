@@ -33,6 +33,46 @@ class ArtifactGatewayService:
         self.db.refresh(artifact)
         return artifact
 
+    def update_artifact(
+        self,
+        artifact_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Artifact:
+        artifact = self._artifact_for_workspace(artifact_id)
+        if artifact.status != "active":
+            raise AppError(404, "artifact_not_found", "Artifact was not found")
+        if name is not None:
+            artifact.name = name[:240]
+        if description is not None:
+            artifact.description = description[:2000]
+        self.db.commit()
+        self.db.refresh(artifact)
+        return artifact
+
+    def delete_artifact(self, artifact_id: str) -> Artifact:
+        """Soft-delete an artifact and revoke every share token of its versions."""
+        artifact = self._artifact_for_workspace(artifact_id)
+        if artifact.status != "active":
+            raise AppError(404, "artifact_not_found", "Artifact was not found")
+        artifact.status = "deleted"
+        self.db.execute(
+            update(ArtifactShareToken)
+            .where(
+                ArtifactShareToken.artifact_version_id.in_(
+                    select(ArtifactVersion.id).where(
+                        ArtifactVersion.artifact_id == artifact.id
+                    )
+                ),
+                ArtifactShareToken.revoked_at.is_(None),
+            )
+            .values(revoked_at=utc_now())
+        )
+        self.db.commit()
+        self.db.refresh(artifact)
+        return artifact
+
     def list_artifact_summaries(self) -> list[tuple[Artifact, int]]:
         rows = (
             self.db.execute(
@@ -66,7 +106,10 @@ class ArtifactGatewayService:
         return list(
             self.db.scalars(
                 select(ArtifactVersion)
-                .where(ArtifactVersion.artifact_id == artifact.id)
+                .where(
+                    ArtifactVersion.artifact_id == artifact.id,
+                    ArtifactVersion.status == "published",
+                )
                 .order_by(ArtifactVersion.version.desc())
             )
         )
@@ -126,6 +169,37 @@ class ArtifactGatewayService:
             release_notes=release_notes[:4000],
         )
         self.db.add(version)
+        self.db.commit()
+        self.db.refresh(version)
+        return version
+
+    def update_version(
+        self, version_id: str, *, release_notes: str | None = None
+    ) -> ArtifactVersion:
+        """Update a version's release notes. The published file content stays immutable."""
+        version = self._version_for_workspace(version_id)
+        if version.status != "published":
+            raise AppError(404, "artifact_version_not_found", "Artifact version was not found")
+        if release_notes is not None:
+            version.release_notes = release_notes[:4000]
+        self.db.commit()
+        self.db.refresh(version)
+        return version
+
+    def delete_version(self, version_id: str) -> ArtifactVersion:
+        """Soft-delete a version and revoke all of its share tokens."""
+        version = self._version_for_workspace(version_id)
+        if version.status != "published":
+            raise AppError(404, "artifact_version_not_found", "Artifact version was not found")
+        version.status = "deleted"
+        self.db.execute(
+            update(ArtifactShareToken)
+            .where(
+                ArtifactShareToken.artifact_version_id == version.id,
+                ArtifactShareToken.revoked_at.is_(None),
+            )
+            .values(revoked_at=utc_now())
+        )
         self.db.commit()
         self.db.refresh(version)
         return version
@@ -215,6 +289,18 @@ class ArtifactGatewayService:
         self.db.commit()
         self.db.refresh(token)
         return token
+
+    def _artifact_for_workspace(self, artifact_id: str) -> Artifact:
+        artifact = self.db.scalar(
+            select(Artifact).where(
+                Artifact.id == artifact_id,
+                Artifact.workspace_id == self.workspace_id,
+                Artifact.tenant_id == self.tenant_id,
+            )
+        )
+        if artifact is None:
+            raise AppError(404, "artifact_not_found", "Artifact was not found")
+        return artifact
 
     def _version_for_workspace(self, version_id: str) -> ArtifactVersion:
         version = self.db.scalar(

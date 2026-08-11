@@ -8,6 +8,7 @@ import {
   Link2,
   LoaderCircle,
   Package,
+  Pencil,
   Plus,
   RefreshCw,
   Trash2,
@@ -19,11 +20,15 @@ import {
   artifactShareUrl,
   createArtifact,
   createArtifactShareToken,
+  deleteArtifact,
+  deleteArtifactVersion,
   listArtifactShareTokens,
   listArtifactVersions,
   listArtifacts,
   publishArtifactVersion,
   revokeArtifactShareToken,
+  updateArtifact,
+  updateArtifactVersion,
 } from "@/api/artifacts";
 import { listFiles, uploadFile } from "@/api/files";
 import {
@@ -32,6 +37,16 @@ import {
   SectionHeading,
   Surface,
 } from "@/components/shared/page-elements";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -94,6 +109,10 @@ export function ArtifactsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [publishTarget, setPublishTarget] = useState<ArtifactSummary | null>(null);
   const [shareVersion, setShareVersion] = useState<ArtifactVersion | null>(null);
+  const [editArtifactTarget, setEditArtifactTarget] = useState<ArtifactSummary | null>(null);
+  const [deleteArtifactTarget, setDeleteArtifactTarget] = useState<ArtifactSummary | null>(null);
+  const [editVersionTarget, setEditVersionTarget] = useState<ArtifactVersion | null>(null);
+  const [deleteVersionTarget, setDeleteVersionTarget] = useState<ArtifactVersion | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const artifacts = useQuery({
@@ -116,6 +135,61 @@ export function ArtifactsPage() {
       await invalidateArtifacts();
       toast.success("产物已创建");
       setCreateOpen(false);
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const updateArtifactMutation = useMutation({
+    mutationFn: (payload: { artifactId: string; name: string; description: string }) =>
+      updateArtifact(payload.artifactId, {
+        name: payload.name,
+        description: payload.description,
+      }),
+    onSuccess: async () => {
+      await invalidateArtifacts();
+      toast.success("产物已更新");
+      setEditArtifactTarget(null);
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const deleteArtifactMutation = useMutation({
+    mutationFn: deleteArtifact,
+    onSuccess: async (deleted) => {
+      await invalidateArtifacts();
+      setExpandedId((current) => (current === deleted.id ? null : current));
+      toast.success("产物已删除");
+      setDeleteArtifactTarget(null);
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const updateVersionMutation = useMutation({
+    mutationFn: (payload: { versionId: string; releaseNotes: string }) =>
+      updateArtifactVersion(payload.versionId, { release_notes: payload.releaseNotes }),
+    onSuccess: async () => {
+      if (expandedId) {
+        await queryClient.invalidateQueries({
+          queryKey: artifactVersionsQueryKey(workspaceId, expandedId),
+        });
+      }
+      toast.success("版本说明已更新");
+      setEditVersionTarget(null);
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const deleteVersionMutation = useMutation({
+    mutationFn: deleteArtifactVersion,
+    onSuccess: async () => {
+      await invalidateArtifacts();
+      if (expandedId) {
+        await queryClient.invalidateQueries({
+          queryKey: artifactVersionsQueryKey(workspaceId, expandedId),
+        });
+      }
+      toast.success("版本已删除");
+      setDeleteVersionTarget(null);
     },
     onError: (error: Error) => toast.error(error.message),
   });
@@ -190,11 +264,61 @@ export function ArtifactsPage() {
                 versions={versions.data}
                 versionsPending={versions.isPending && expandedId === artifact.id}
                 onShare={setShareVersion}
+                onEdit={() => setEditArtifactTarget(artifact)}
+                onDelete={() => setDeleteArtifactTarget(artifact)}
+                onEditVersion={setEditVersionTarget}
+                onDeleteVersion={setDeleteVersionTarget}
               />
             ))}
           </div>
         )}
       </Surface>
+
+      <EditArtifactDialog
+        artifact={editArtifactTarget}
+        busy={updateArtifactMutation.isPending}
+        key={editArtifactTarget?.id ?? "none"}
+        onOpenChange={(next) => {
+          if (!next) setEditArtifactTarget(null);
+        }}
+        onSubmit={(payload) =>
+          updateArtifactMutation.mutate({
+            artifactId: editArtifactTarget!.id,
+            ...payload,
+          })
+        }
+        open={Boolean(editArtifactTarget)}
+      />
+
+      <DeleteArtifactDialog
+        artifact={deleteArtifactTarget}
+        busy={deleteArtifactMutation.isPending}
+        onClose={() => setDeleteArtifactTarget(null)}
+        onConfirm={() => deleteArtifactMutation.mutate(deleteArtifactTarget!.id)}
+      />
+
+      <EditVersionDialog
+        version={editVersionTarget}
+        busy={updateVersionMutation.isPending}
+        key={editVersionTarget?.id ?? "none"}
+        onOpenChange={(next) => {
+          if (!next) setEditVersionTarget(null);
+        }}
+        onSubmit={(releaseNotes) =>
+          updateVersionMutation.mutate({
+            versionId: editVersionTarget!.id,
+            releaseNotes,
+          })
+        }
+        open={Boolean(editVersionTarget)}
+      />
+
+      <DeleteVersionDialog
+        version={deleteVersionTarget}
+        busy={deleteVersionMutation.isPending}
+        onClose={() => setDeleteVersionTarget(null)}
+        onConfirm={() => deleteVersionMutation.mutate(deleteVersionTarget!.id)}
+      />
 
       <PublishVersionDialog
         artifact={publishTarget}
@@ -230,6 +354,10 @@ function ArtifactRow({
   versions,
   versionsPending,
   onShare,
+  onEdit,
+  onDelete,
+  onEditVersion,
+  onDeleteVersion,
 }: {
   artifact: ArtifactSummary;
   expanded: boolean;
@@ -238,6 +366,10 @@ function ArtifactRow({
   versions?: ArtifactVersion[];
   versionsPending: boolean;
   onShare: (version: ArtifactVersion) => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onEditVersion: (version: ArtifactVersion) => void;
+  onDeleteVersion: (version: ArtifactVersion) => void;
 }) {
   return (
     <div>
@@ -263,10 +395,32 @@ function ArtifactRow({
             </span>
           </span>
         </button>
-        <Button onClick={onPublish} size="sm" type="button" variant="outline">
-          <Plus className="size-4" />
-          发布版本
-        </Button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Button onClick={onPublish} size="sm" type="button" variant="outline">
+            <Plus className="size-4" />
+            发布版本
+          </Button>
+          <Button
+            aria-label={`编辑 ${artifact.name}`}
+            onClick={onEdit}
+            size="icon"
+            title="编辑产物"
+            type="button"
+            variant="ghost"
+          >
+            <Pencil className="size-4" />
+          </Button>
+          <Button
+            aria-label={`删除 ${artifact.name}`}
+            onClick={onDelete}
+            size="icon"
+            title="删除产物"
+            type="button"
+            variant="ghost"
+          >
+            <Trash2 className="size-4 text-destructive" />
+          </Button>
+        </div>
       </div>
 
       {expanded ? (
@@ -300,10 +454,32 @@ function ArtifactRow({
                       ) : null}
                     </div>
                   </div>
-                  <Button onClick={() => onShare(version)} size="sm" type="button" variant="outline">
-                    <Link2 className="size-4" />
-                    分享
-                  </Button>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <Button onClick={() => onShare(version)} size="sm" type="button" variant="outline">
+                      <Link2 className="size-4" />
+                      分享
+                    </Button>
+                    <Button
+                      aria-label={`编辑 v${version.version} 说明`}
+                      onClick={() => onEditVersion(version)}
+                      size="icon"
+                      title="编辑版本说明"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <Pencil className="size-4" />
+                    </Button>
+                    <Button
+                      aria-label={`删除 v${version.version}`}
+                      onClick={() => onDeleteVersion(version)}
+                      size="icon"
+                      title="删除版本"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <Trash2 className="size-4 text-destructive" />
+                    </Button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -382,6 +558,214 @@ function CreateArtifactDialog({
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function EditArtifactDialog({
+  artifact,
+  open,
+  onOpenChange,
+  onSubmit,
+  busy,
+}: {
+  artifact: ArtifactSummary | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSubmit: (payload: { name: string; description: string }) => void;
+  busy: boolean;
+}) {
+  const [name, setName] = useState(artifact?.name ?? "");
+  const [description, setDescription] = useState(artifact?.description ?? "");
+
+  return (
+    <Dialog onOpenChange={(next) => (next ? undefined : onOpenChange(false))} open={open}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>编辑产物</DialogTitle>
+          <DialogDescription>修改名称与描述，不影响已发布版本与分享链接。</DialogDescription>
+        </DialogHeader>
+        <form
+          className="grid gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (name.trim()) onSubmit({ name: name.trim(), description: description.trim() });
+          }}
+        >
+          <div className="grid gap-2">
+            <Label htmlFor="artifact-edit-name">名称</Label>
+            <Input
+              autoFocus
+              id="artifact-edit-name"
+              maxLength={240}
+              onChange={(event) => setName(event.target.value)}
+              required
+              value={name}
+            />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="artifact-edit-description">描述</Label>
+            <Textarea
+              id="artifact-edit-description"
+              maxLength={2000}
+              onChange={(event) => setDescription(event.target.value)}
+              rows={3}
+              value={description}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={busy}
+              onClick={() => onOpenChange(false)}
+              type="button"
+              variant="ghost"
+            >
+              取消
+            </Button>
+            <Button disabled={busy || !name.trim()} type="submit">
+              {busy ? <LoaderCircle className="size-4 animate-spin" /> : <Check className="size-4" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DeleteArtifactDialog({
+  artifact,
+  onClose,
+  onConfirm,
+  busy,
+}: {
+  artifact: ArtifactSummary | null;
+  onClose: () => void;
+  onConfirm: () => void;
+  busy: boolean;
+}) {
+  return (
+    <AlertDialog
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      open={Boolean(artifact)}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除“{artifact?.name ?? ""}”？</AlertDialogTitle>
+          <AlertDialogDescription>
+            产物将从列表移除，其所有版本的分享链接都会被立即撤销。该操作不可恢复。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+          <AlertDialogAction disabled={busy} onClick={onConfirm} variant="destructive">
+            {busy ? <LoaderCircle className="size-4 animate-spin" /> : null}
+            确认删除
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+function EditVersionDialog({
+  version,
+  open,
+  onOpenChange,
+  onSubmit,
+  busy,
+}: {
+  version: ArtifactVersion | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSubmit: (releaseNotes: string) => void;
+  busy: boolean;
+}) {
+  const [releaseNotes, setReleaseNotes] = useState(version?.release_notes ?? "");
+
+  return (
+    <Dialog onOpenChange={(next) => (next ? undefined : onOpenChange(false))} open={open}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>编辑版本说明 · v{version?.version ?? ""}</DialogTitle>
+          <DialogDescription>
+            {version?.original_name ?? ""} · 文件内容不可变，只能修改说明文字。
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="grid gap-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSubmit(releaseNotes.trim());
+          }}
+        >
+          <div className="grid gap-2">
+            <Label htmlFor="version-edit-notes">版本说明</Label>
+            <Textarea
+              autoFocus
+              id="version-edit-notes"
+              maxLength={4000}
+              onChange={(event) => setReleaseNotes(event.target.value)}
+              placeholder="这个版本包含什么变化"
+              rows={4}
+              value={releaseNotes}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={busy}
+              onClick={() => onOpenChange(false)}
+              type="button"
+              variant="ghost"
+            >
+              取消
+            </Button>
+            <Button disabled={busy} type="submit">
+              {busy ? <LoaderCircle className="size-4 animate-spin" /> : <Check className="size-4" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DeleteVersionDialog({
+  version,
+  onClose,
+  onConfirm,
+  busy,
+}: {
+  version: ArtifactVersion | null;
+  onClose: () => void;
+  onConfirm: () => void;
+  busy: boolean;
+}) {
+  return (
+    <AlertDialog
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      open={Boolean(version)}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除版本 v{version?.version ?? ""}？</AlertDialogTitle>
+          <AlertDialogDescription>
+            该版本的分享链接会被立即撤销，版本将从列表移除且不可恢复。产物的其他版本不受影响。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+          <AlertDialogAction disabled={busy} onClick={onConfirm} variant="destructive">
+            {busy ? <LoaderCircle className="size-4 animate-spin" /> : null}
+            确认删除
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }
 

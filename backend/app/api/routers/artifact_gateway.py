@@ -13,7 +13,9 @@ from app.domain.schemas.artifacts import (
     ArtifactShareTokenCreate,
     ArtifactShareTokenView,
     ArtifactSummaryView,
+    ArtifactUpdate,
     ArtifactVersionCreate,
+    ArtifactVersionUpdate,
     ArtifactVersionView,
     ArtifactView,
 )
@@ -89,6 +91,31 @@ def create_artifact(
     return service(db, context, None).create_artifact(payload.name, payload.description)
 
 
+@router.patch("/artifacts/{artifact_id}", response_model=ArtifactView)
+def update_artifact(
+    artifact_id: str,
+    payload: ArtifactUpdate,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactView:
+    context.require_permission("workspace.write")
+    return service(db, context, None).update_artifact(
+        artifact_id,
+        name=payload.name,
+        description=payload.description,
+    )
+
+
+@router.delete("/artifacts/{artifact_id}", response_model=ArtifactView)
+def delete_artifact(
+    artifact_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactView:
+    context.require_permission("workspace.write")
+    return service(db, context, None).delete_artifact(artifact_id)
+
+
 @router.post(
     "/artifacts/{artifact_id}/versions",
     response_model=ArtifactVersionView,
@@ -107,6 +134,30 @@ def publish_artifact_version(
         source_chat_session_id=payload.source_chat_session_id,
         release_notes=payload.release_notes,
     )
+
+
+@router.patch("/artifacts/versions/{version_id}", response_model=ArtifactVersionView)
+def update_artifact_version(
+    version_id: str,
+    payload: ArtifactVersionUpdate,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactVersionView:
+    context.require_permission("workspace.write")
+    return service(db, context, None).update_version(
+        version_id,
+        release_notes=payload.release_notes,
+    )
+
+
+@router.delete("/artifacts/versions/{version_id}", response_model=ArtifactVersionView)
+def delete_artifact_version(
+    version_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactVersionView:
+    context.require_permission("workspace.write")
+    return service(db, context, None).delete_version(version_id)
 
 
 @router.post(
