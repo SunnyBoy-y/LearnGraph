@@ -153,9 +153,13 @@ async function main() {
       failures.push('Frontend behavior tests')
     }
     if (
-      !(await runCommand('Frontend production build', npmCommand(['run', 'build']), frontendDir))
+      !(await runCommand(
+        'Frontend typecheck + production build',
+        npmCommand(['run', 'build:check']),
+        frontendDir,
+      ))
     ) {
-      failures.push('Frontend production build')
+      failures.push('Frontend typecheck + production build')
     }
   }
 
