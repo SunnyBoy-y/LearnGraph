@@ -898,6 +898,20 @@ npm.cmd run check</code></pre>
             <div><strong>容器接线</strong><p>有合法策略 → 容器加入 <code>learngraph-egress</code> 网络，注入 <code>HTTP_PROXY/HTTPS_PROXY</code> 与 <code>LEARNGRAPH_EGRESS_POLICY_DIGEST</code>；无策略 → 完全离线。拒绝时返回可审计原因。</p></div>
             <div><strong>落地状态</strong><p>Egress 审批链默认开启（D2.1 全量落地），审批记录可查询、可吊销；服务端重启可恢复未完成审批流。</p></div>
           </div>
+          <h3>外部来源可信获取：联网下载，离线执行</h3>
+          <p>
+            <code>download_external_image</code> 与 <code>download_github_source</code> 不会给沙箱临时联网，也不向模型暴露
+            <code>curl / wget / git clone</code>。宿主侧 <code>ExternalAcquisitionService</code> 复用 Egress 审批卡 UI，但使用独立的
+            <code>external_acquisition</code> capability：下载批准只放行宿主下载器，绝不派生沙箱出网策略，通用沙箱 Grant 也不会自动放行下载。
+            <code>allow_once</code> 额外绑定规范化资源请求的 SHA-256，并在联网前通过条件更新原子认领（并发只允许一次执行）。
+            每次连接都重新解析全部 DNS 答案并拒绝任何私网/环回/元数据地址，HTTPS 连接固定到已分类的公网 IP；跨主机重定向必须再次审批。
+          </p>
+          <div class="plain-grid">
+            <div><strong>图片 URL</strong><p>限制 wire bytes、像素与帧数，只接受 PNG/JPEG/WebP；完整解码后重新编码，去除 EXIF/ICC 等非必要元数据，再写入内容寻址存储与会话 <code>inputs/</code>。`search_images` 之后可传 `urls` 数组（2–8 张）并行下载，单张失败不中断整批。</p></div>
+            <div><strong>GitHub 源码</strong><p>通过 API 将 ref 固定为 40 位 commit，检查 tree 截断、文件数/大小、Git mode，拒绝 symlink、submodule 与 Git LFS pointer；全部文件下载验证完成后再写入工作区，并生成逐文件哈希 manifest。</p></div>
+            <div><strong>不可变来源凭据</strong><p><code>ExternalAcquisitionReceipt</code> 记录请求摘要、requested/final URL、重定向链、解析地址、声明/检测 MIME、wire/stored bytes、文件或 manifest SHA-256、GitHub commit 与审批请求 ID；<code>ExternalAcquisitionFile</code> 逐文件关联 receipt 与 FileRecord。</p></div>
+            <div><strong>持久化注入</strong><p>内容先进入 <code>ContentBlob / FileRecord / SessionWorkspaceEntry</code>，再由现有 Agent Workspace 按需 materialize；Docker 不可用或容器销毁也不丢失下载结果和来源。单次下载的 blob、条目、FileRecord、receipt 与关联行在同一事务提交，失败不留半份仓库。</p></div>
+          </div>
           <h3>web_fetch 热容器池</h3>
           <p>
             沙箱隔离的网页抓取每次请求原本要付完整容器生命周期（create → materialize → run → delete ≈ 1.5-3s 宿主开销/次）。
@@ -926,7 +940,7 @@ npm.cmd run check</code></pre>
               <p>网页抓取的白名单、审批记录与沙箱执行权限是独立维度；抓取授权只影响抓取路径，不会放大 Agent 通用出网面。</p>
             </div>
           </div>
-          <div class="source-ref">来源：<code>backend/app/services/sandbox_egress_proxy.py</code> · <code>backend/app/services/sandbox_network_policy.py</code> · <code>backend/app/services/egress_approvals.py</code> · <code>backend/app/providers/sandbox_fetch_pool.py</code> · <code>backend/app/services/sandbox_bootstrap.py</code></div>
+          <div class="source-ref">来源：<code>backend/app/services/sandbox_egress_proxy.py</code> · <code>backend/app/services/sandbox_network_policy.py</code> · <code>backend/app/services/egress_approvals.py</code> · <code>backend/app/services/external_acquisition.py</code> · <code>backend/app/services/session_workspace.py</code> · <code>backend/app/providers/sandbox_fetch_pool.py</code> · <code>backend/app/services/sandbox_bootstrap.py</code></div>
         </section>
 
         <section id="memory" class="doc-section doc-section-accent" data-title="记忆系统">

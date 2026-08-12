@@ -13,6 +13,7 @@
 - Provider Port / Adapter 边界、能力快照与按供应商门控（Qwen 原生搜索通道、DashScope ASR）
 - Agent Runtime、渐进式披露与原子工具模型
 - Docker 沙箱、Agent Workspace、Egress 审批制出网、热容器池与预构建镜像
+- 外部来源可信获取：图片 URL 安全下载/净化、GitHub commit 固定快照、不可变来源凭据与无网沙箱注入
 - 事件溯源记忆系统：事件存储、投影、混合检索、Context Builder 动态装配与防注入
 - 产物与分享：Artifact 不可变版本、分享令牌、软删除与卡片索引
 - 可信组件与交互式子应用：服务器持有模板、CSP 锁死、postMessage 数据通道、interaction contract
