@@ -15,6 +15,8 @@ export interface WebFetchRuntimeSettings {
   global_sandbox_gate: boolean;
   egress_enabled: boolean;
   allowlist_count: number;
+  /** 统一白名单「不拦截全放行」模式。 */
+  allow_all: boolean;
   image_available: boolean;
   sandbox_effective: boolean;
   remote_configured: boolean;

@@ -100,13 +100,16 @@ class EgressApprovalService:
     def ensure_agent_egress_policy(self, *, now: datetime | None = None):
         """Derive and persist the generic Agent egress policy for this workspace.
 
-        Source of truth: workspace-scoped ``agent_egress`` grants plus active
-        ``allow_once`` leases. A deployment-reviewed baseline file is preserved
-        and unioned so approvals only add hosts. When there are no active
-        approvals, the baseline (if any) is returned untouched; otherwise a
-        stale approval-derived file is removed so the sandbox fails closed.
+        Source of truth: workspace-scoped ``agent_egress`` grants, active
+        ``allow_once`` leases, plus the unified ``access.allowlist`` domains
+        (whitelisted hosts bypass the approval queue). When the workspace opted
+        into no-interception mode (``access.allowlist.allow_all``), an
+        allow-all public policy is derived instead — the proxy still rejects
+        private/loopback/metadata targets at CONNECT time. A deployment-reviewed
+        baseline file is preserved and unioned so approvals only add hosts.
         Returns the effective policy or ``None`` (offline).
         """
+        from app.providers.factory import access_allow_all, access_allowlist_domains
         from app.services.sandbox_network_policy import (
             AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
             AGENT_EGRESS_POLICY_ISSUER,
@@ -156,7 +159,10 @@ class EgressApprovalService:
                 continue
             hosts.add(lease.hostname)
             expirations.append(lease_expires)
-        if not hosts:
+        allow_all = access_allow_all(self.db, self.workspace_id)
+        if not allow_all:
+            hosts.update(access_allowlist_domains(self.db, self.workspace_id))
+        if not hosts and not allow_all:
             # No active approvals: preserve a reviewed baseline if present;
             # otherwise remove any stale approval-derived file so the sandbox
             # fails closed.
@@ -180,6 +186,7 @@ class EgressApprovalService:
                 workspace_id=self.workspace_id,
                 allowed_hosts=hosts,
                 ttl_seconds=ttl,
+                allow_all_public=allow_all,
                 now=current,
             )
             store_workspace_policy_file(policy_dir, policy)
@@ -304,6 +311,24 @@ class EgressApprovalService:
             self.db.refresh(existing)
             return existing
 
+        if self._auto_allowable(canonical):
+            # Unified whitelist (or allow-all mode): the host is pre-approved
+            # and never enters the pending queue — no interception.
+            return self._auto_approve(
+                hostname=canonical,
+                requested_by=requested_by,
+                chat_session_id=chat_session_id,
+                purpose=purpose,
+                request_context=request_context,
+                ttl_seconds=ttl_seconds,
+                dedupe_key=source,
+                now=current,
+                assistant_message_id=assistant_message_id,
+                user_message_id=user_message_id,
+                tool_call_id=tool_call_id,
+                resume_payload=resume_payload,
+            )
+
         context = dict(request_context or {})
         if purpose:
             context.setdefault("purpose", purpose)
@@ -337,6 +362,91 @@ class EgressApprovalService:
         )
         self.db.commit()
         self.db.refresh(request)
+        return request
+
+    def _auto_allowable(self, hostname: str) -> bool:
+        """Whether ``hostname`` bypasses the approval queue under the unified allowlist."""
+        from app.providers.factory import access_allow_all, access_allowlist_domains
+
+        return access_allow_all(
+            self.db, self.workspace_id
+        ) or hostname in access_allowlist_domains(self.db, self.workspace_id)
+
+    def _auto_approve(
+        self,
+        *,
+        hostname: str,
+        requested_by: str,
+        chat_session_id: str | None,
+        purpose: str | None,
+        request_context: dict[str, Any] | None,
+        ttl_seconds: int,
+        dedupe_key: str,
+        now: datetime,
+        assistant_message_id: str | None,
+        user_message_id: str | None,
+        tool_call_id: str | None,
+        resume_payload: dict[str, Any] | None,
+    ) -> EgressAuthorizationRequest:
+        """Record an auto-approved request for a unified-allowlist host.
+
+        The host is already whitelisted (or the workspace opted into
+        no-interception mode), so the request is created approved with an
+        ``allow_always`` workspace grant instead of entering the pending queue.
+        The grant is authored as ``system:allowlist`` — a policy decision, not a
+        user decision — and never bypasses the egress proxy classifier.
+        """
+        context = dict(request_context or {})
+        if purpose:
+            context.setdefault("purpose", purpose)
+        request = EgressAuthorizationRequest(
+            workspace_id=self.workspace_id,
+            hostname=hostname,
+            capability=EGRESS_APPROVAL_CAPABILITY,
+            requested_by=requested_by,
+            chat_session_id=chat_session_id,
+            request_context=context or None,
+            status="approved",
+            decision="allow_always",
+            allow_always=True,
+            decided_by="system:allowlist",
+            decided_at=now,
+            expires_at=now + timedelta(seconds=ttl_seconds),
+            ttl_seconds=ttl_seconds,
+            dedupe_key=dedupe_key,
+            assistant_message_id=assistant_message_id,
+            user_message_id=user_message_id,
+            tool_call_id=tool_call_id,
+            resume_payload=resume_payload,
+        )
+        self.db.add(request)
+        self.db.flush()
+        self._upsert_workspace_grant(
+            request=request, granted_by="system:allowlist", now=now
+        )
+        from app.providers.factory import access_allow_all
+
+        self.audit.record(
+            actor_id=requested_by,
+            action="agent_egress.authorization_auto_approved",
+            resource_type="egress_authorization_request",
+            resource_id=request.id,
+            outcome="approved",
+            details={
+                "hostname": hostname,
+                "capability": EGRESS_APPROVAL_CAPABILITY,
+                "reason": "unified_allowlist" if not access_allow_all(self.db, self.workspace_id) else "allow_all",
+            },
+        )
+        self.db.commit()
+        self.db.refresh(request)
+        try:
+            self.ensure_agent_egress_policy(now=now)
+        except Exception:
+            logger.exception(
+                "agent egress policy refresh failed after auto-approval for workspace %s",
+                self.workspace_id,
+            )
         return request
 
     def decide(

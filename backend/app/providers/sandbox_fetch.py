@@ -72,6 +72,23 @@ def _exact_host_allowed(url: str, allowed_domains: frozenset[str]) -> bool:
     return parsed.hostname is not None and _normalize_hostname(parsed.hostname) in allowed_domains
 
 
+def _host_allowed(url: str, allowed_domains: frozenset[str], *, allow_all: bool) -> bool:
+    """Authorize one fetch URL under the unified allowlist (or allow-all mode)."""
+    parsed = urlparse(url)
+    if parsed.hostname is None:
+        return False
+    if allow_all:
+        # No interception: any DNS host is fine. The egress proxy still
+        # re-classifies the resolved address at CONNECT time (private,
+        # loopback and metadata targets stay denied).
+        try:
+            ipaddress.ip_address(_normalize_hostname(parsed.hostname))
+        except ValueError:
+            return True
+        return False
+    return _normalize_hostname(parsed.hostname) in allowed_domains
+
+
 class SandboxFetchProvider:
     """``FetchProviderPort`` backed by the isolated fixed ``web_fetch`` runner."""
 
@@ -84,15 +101,17 @@ class SandboxFetchProvider:
         settings: Settings,
         workspace_id: str,
         allowed_domains: frozenset[str],
+        allow_all: bool = False,
         backend: Any | None = None,
         pool_namespace: str | None = None,
     ) -> None:
-        if not allowed_domains:
+        if not allowed_domains and not allow_all:
             raise ValueError("SandboxFetchProvider requires a non-empty allowlist")
         self.provider_id = provider_id
         self.settings = settings
         self.workspace_id = workspace_id
         self.allowed_domains = allowed_domains
+        self.allow_all = allow_all
         # Injectable for hermetic tests; production uses the settings-resolved
         # Docker backend.
         self._injected_backend = backend
@@ -104,14 +123,14 @@ class SandboxFetchProvider:
 
     def fetch(self, url: str) -> FetchedDocument:
         target = url.strip()
-        if not _exact_host_allowed(target, self.allowed_domains):
+        if not _host_allowed(target, self.allowed_domains, allow_all=self.allow_all):
             raise UnsafeFetchURL(
                 "The requested URL is outside the sandbox web fetch allowlist"
             )
         spec, spec_digest = self._build_spec(target)
         artifact = self._run_container(target, spec, spec_digest)
         final_url = str(artifact["final_url"]).strip()
-        if not _exact_host_allowed(final_url, self.allowed_domains):
+        if not _host_allowed(final_url, self.allowed_domains, allow_all=self.allow_all):
             raise UnsafeFetchURL(
                 "The fetched page is outside the sandbox web fetch allowlist"
             )
@@ -153,6 +172,7 @@ class SandboxFetchProvider:
             "schema_version": "1.0",
             "url": url,
             "allowed_domains": sorted(self.allowed_domains),
+            "allow_all": self.allow_all,
             "max_redirects": 5,
             "max_bytes": self.settings.sandbox_web_fetch_max_bytes,
             "timeout_seconds": self.settings.sandbox_web_fetch_timeout_seconds,
@@ -219,6 +239,7 @@ class SandboxFetchProvider:
             settings=self.settings,
             workspace_id=self.workspace_id,
             allowed_domains=self.allowed_domains,
+            allow_all=self.allow_all,
             max_size=self.settings.sandbox_web_fetch_pool_size,
             idle_ttl=self.settings.sandbox_web_fetch_pool_idle_seconds,
         )
@@ -308,7 +329,10 @@ class SandboxFetchProvider:
                 capability.reason or "The sandbox runtime is unavailable"
             )
         egress = web_fetch_egress_envelope(
-            self.settings, self.workspace_id, self.allowed_domains
+            self.settings,
+            self.workspace_id,
+            self.allowed_domains,
+            allow_all=self.allow_all,
         )
         if egress is None:
             raise FetchProviderError(

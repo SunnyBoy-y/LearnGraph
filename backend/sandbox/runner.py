@@ -48,6 +48,7 @@ _TITLE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.IGNORECASE | re.DOTALL)
 class WebFetchSpec:
     url: str
     allowed_domains: frozenset[str]
+    allow_all: bool
     max_redirects: int
     max_bytes: int
     timeout_seconds: float
@@ -84,7 +85,12 @@ def _normalize_domain(value: object) -> str:
     return candidate
 
 
-def _validated_fetch_url(url: object, allowed_domains: frozenset[str]) -> str:
+def _validated_fetch_url(
+    url: object,
+    allowed_domains: frozenset[str],
+    *,
+    allow_all: bool = False,
+) -> str:
     if not isinstance(url, str) or not url.strip():
         raise WebFetchError("web fetch URL is required")
     parsed = urlparse(url.strip())
@@ -105,6 +111,11 @@ def _validated_fetch_url(url: object, allowed_domains: frozenset[str]) -> str:
         pass
     else:
         raise WebFetchError("web fetch URL host must be a DNS name")
+    if allow_all:
+        # No-interception mode: any public DNS host is accepted. The network
+        # boundary stays enforced by the egress proxy, which re-classifies the
+        # resolved address at CONNECT time (private/loopback/metadata denied).
+        return parsed.geturl()
     # Exact-host matching: the derived egress policy is exact-host by security
     # design (no wildcard/suffix expansion), so the runner must agree with the
     # proxy on the same set. Host-side authorization layers stay subdomain-
@@ -127,12 +138,19 @@ def load_web_fetch_spec(path: Path) -> WebFetchSpec:
     if hashlib.sha256(_canonical_json(raw)).hexdigest() != expected_digest:
         raise WebFetchError("web fetch spec digest does not match its content")
     if raw.get("schema_version") != "1.0" or set(raw) != {
-        "schema_version", "url", "allowed_domains", "max_redirects", "max_bytes", "timeout_seconds"
+        "schema_version", "url", "allowed_domains", "allow_all", "max_redirects", "max_bytes", "timeout_seconds"
     }:
         raise WebFetchError("web fetch spec has an unsupported schema")
+    allow_all = raw["allow_all"]
+    if not isinstance(allow_all, bool):
+        raise WebFetchError("web fetch spec allow_all must be a boolean")
     domains_raw = raw["allowed_domains"]
-    if not isinstance(domains_raw, list) or not 1 <= len(domains_raw) <= 50:
+    if not isinstance(domains_raw, list):
+        raise WebFetchError("web fetch spec allowed_domains must be a list")
+    if not allow_all and not 1 <= len(domains_raw) <= 50:
         raise WebFetchError("web fetch spec requires 1 to 50 allowed domains")
+    if allow_all and len(domains_raw) > 50:
+        raise WebFetchError("web fetch spec allowed_domains exceeds 50 entries")
     domains = frozenset(_normalize_domain(item) for item in domains_raw)
     if len(domains) != len(domains_raw):
         raise WebFetchError("web fetch spec allowed domains must be unique")
@@ -145,10 +163,11 @@ def load_web_fetch_spec(path: Path) -> WebFetchSpec:
         raise WebFetchError("web fetch spec max_bytes is outside the permitted range")
     if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or not 0 < float(timeout_seconds) <= MAX_WEB_FETCH_TIMEOUT_SECONDS:
         raise WebFetchError("web fetch spec timeout_seconds is outside the permitted range")
-    url = _validated_fetch_url(raw["url"], domains)
+    url = _validated_fetch_url(raw["url"], domains, allow_all=allow_all)
     return WebFetchSpec(
         url=url,
         allowed_domains=domains,
+        allow_all=allow_all,
         max_redirects=max_redirects,
         max_bytes=max_bytes,
         timeout_seconds=float(timeout_seconds),

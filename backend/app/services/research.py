@@ -86,10 +86,16 @@ class ResearchService:
         return job
 
     def _effective_allowed_domains(self, requested: list[str]) -> list[str]:
+        from app.providers.factory import access_allow_all
+
         workspace_domains = research_policy_domains(self.db, self.workspace_id)
         requested_domains = {
             item.strip().casefold().rstrip(".") for item in requested if item.strip()
         }
+        if access_allow_all(self.db, self.workspace_id):
+            # No-interception mode: search / Deep Research are not restricted to
+            # a workspace source list (provider and network safety still apply).
+            return sorted(requested_domains)
         if workspace_domains:
             if requested_domains:
                 outside = sorted(requested_domains - workspace_domains)

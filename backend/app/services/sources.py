@@ -136,18 +136,24 @@ class SourceService:
             if policy_setting is not None and isinstance(policy_setting.value, dict)
             else {}
         )
+        from app.providers.factory import access_allow_all, access_allowlist_domains
+
         policy_domains = {
             domain
             for value in policy.get("allowed_domains", [])
             if isinstance(value, str) and (domain := normalize_domain(value))
         }
+        policy_domains.update(access_allowlist_domains(self.db, self.workspace_id))
+        allow_all = access_allow_all(self.db, self.workspace_id)
         requested_domains = {
             domain
             for value in payload.authorized_domains
             if (domain := normalize_domain(value))
         }
         allowed_domains = policy_domains or requested_domains
-        if policy.get("allow_without_confirmation") is True and not allowed_domains:
+        if (
+            policy.get("allow_without_confirmation") is True or allow_all
+        ) and not allowed_domains:
             try:
                 allowed_domains = {require_public_http_url(payload.url, None)}
             except UnsafeFetchURL as exc:

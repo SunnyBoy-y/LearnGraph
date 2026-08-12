@@ -1208,6 +1208,27 @@ class ResearchPolicySettingValue(BaseModel):
         return normalize_allowed_domains(domains)
 
 
+class AccessAllowlistSettingValue(BaseModel):
+    """Unified workspace allowlist covering search, web fetch, and outbound egress.
+
+    One list is the single layer of interception control: any exact host in
+    ``allowed_domains`` bypasses search/fetch source filtering and the egress
+    approval queue. ``allow_all`` (opt-in) disables interception entirely for
+    public hosts — private/loopback/metadata targets remain denied by the
+    sandbox egress classifier.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_all: bool = Field(default=False, strict=True)
+    allowed_domains: list[str] = Field(default_factory=list, max_length=200)
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def validate_domains(cls, domains: list[str]) -> list[str]:
+        return normalize_allowed_domains(domains)
+
+
 def normalize_allowed_domains(domains: list[str]) -> list[str]:
     from app.domain.schemas.components import DOMAIN_PATTERN
 

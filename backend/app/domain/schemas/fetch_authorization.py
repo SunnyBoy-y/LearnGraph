@@ -51,6 +51,7 @@ class WebFetchRuntimeView(BaseModel):
     global_sandbox_gate: bool
     egress_enabled: bool
     allowlist_count: int
+    allow_all: bool
     image_available: bool
     sandbox_effective: bool
     remote_configured: bool

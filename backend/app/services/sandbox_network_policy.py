@@ -224,7 +224,9 @@ class EgressPolicy:
 
     ``digest`` is the SHA-256 of the canonical policy JSON and is the identity a
     sandbox carries in its environment so the proxy and audit trail agree on
-    exactly which policy revision was in force.
+    exactly which policy revision was in force. ``allow_all_public`` (opt-in
+    no-interception mode) skips the exact-host allowlist at CONNECT time while
+    still requiring every resolved address to classify as public.
     """
 
     workspace_id: str
@@ -235,6 +237,7 @@ class EgressPolicy:
     issuer: str
     digest: str
     raw: dict[str, Any]
+    allow_all_public: bool = False
 
     def is_expired(self, *, now: datetime | None = None) -> bool:
         current = now or _utc_now()
@@ -257,15 +260,17 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
     """Strictly validate a reviewed policy document.
 
     Rejects wildcard/suffix hosts, direct IP literals, non-HTTPS protocols,
-    empty host lists, missing approval/expiry fields, expired policies, and any
-    ambiguity. The digest is computed over the canonical form so the same
-    document always yields the same revision identity.
+    empty host lists (unless ``allow_all_public``), missing approval/expiry
+    fields, expired policies, and any ambiguity. The digest is computed over
+    the canonical form so the same document always yields the same revision
+    identity.
     """
     if not isinstance(data, dict):
         raise EgressPolicyInvalid("policy_must_be_object")
     workspace_id = data.get("workspace_id")
     approval_id = data.get("approval_id")
     issuer = data.get("issuer")
+    allow_all_public = data.get("allow_all_public") is True
     issued_at = parse_policy_datetime(data.get("issued_at"))
     expires_at = parse_policy_datetime(data.get("expires_at"))
     if not isinstance(workspace_id, str) or not workspace_id:
@@ -280,7 +285,9 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
         raise EgressPolicyInvalid("policy_expired")
 
     raw_hosts = data.get("hosts")
-    if not isinstance(raw_hosts, list) or not raw_hosts:
+    if not isinstance(raw_hosts, list):
+        raise EgressPolicyInvalid("policy_hosts_must_be_list")
+    if not raw_hosts and not allow_all_public:
         raise EgressPolicyInvalid("policy_empty_hosts")
 
     hosts: list[PolicyHost] = []
@@ -322,6 +329,7 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
         issuer=issuer,
         digest=digest,
         raw=dict(data),
+        allow_all_public=allow_all_public,
     )
 
 
@@ -353,11 +361,24 @@ def authorize_connect(
         raise EgressPolicyDenied("host_not_normalizable", details={**audit, "host": host, "reason": exc.reason}) from exc
 
     audit["host"] = normalized
-    rule = next((candidate for candidate in policy.hosts if candidate.host == normalized), None)
-    if rule is None:
-        raise EgressPolicyDenied("host_not_in_allowlist", details={**audit, "requested_port": port})
+    rule: PolicyHost | None = None
+    if not policy.allow_all_public:
+        rule = next(
+            (candidate for candidate in policy.hosts if candidate.host == normalized),
+            None,
+        )
+        if rule is None:
+            raise EgressPolicyDenied(
+                "host_not_in_allowlist",
+                details={**audit, "requested_port": port},
+            )
+    else:
+        # No-interception mode: any public DNS host is accepted, but every
+        # resolved address is still re-classified below so private, loopback,
+        # link-local, multicast and cloud-metadata targets stay denied.
+        rule = None
 
-    if port not in rule.ports:
+    if rule is not None and port not in rule.ports:
         raise EgressPolicyDenied("port_not_allowed", details={**audit, "requested_port": port, "allowed_ports": list(rule.ports)})
 
     addresses = resolver(normalized)
@@ -405,16 +426,18 @@ def derive_egress_policy_for_fetch(
     workspace_id: str,
     allowed_domains: Iterable[str],
     ttl_seconds: int = WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS,
+    allow_all_public: bool = False,
     now: datetime | None = None,
 ) -> EgressPolicy:
     """Derive a narrow, short-lived egress policy from the unified fetch allowlist.
 
-    The shared ``web_fetch.policy.allowed_domains`` list is the single source of
+    The shared ``access.allowlist.allowed_domains`` list is the single source of
     truth; this function turns it into an ``EgressPolicy`` that is HTTPS-443-only,
     expires quickly (so a stale derivation cannot outlive an allowlist change),
     and records ``issuer=web_fetch_policy`` so the egress proxy and audit trail
     can distinguish it from a separately-reviewed generic policy. An empty or
-    invalid allowlist fails closed.
+    invalid allowlist fails closed unless ``allow_all_public`` opts into
+    no-interception mode.
     """
     if not isinstance(workspace_id, str) or not workspace_id:
         raise EgressPolicyInvalid("policy_missing_workspace")
@@ -427,10 +450,10 @@ def derive_egress_policy_for_fetch(
     domains = list(
         dict.fromkeys(normalize_hostname(str(value)) for value in allowed_domains)
     )
-    if not domains:
+    if not domains and not allow_all_public:
         raise EgressPolicyInvalid("policy_empty_hosts")
     issued = now or _utc_now()
-    data = {
+    data: dict[str, Any] = {
         "workspace_id": workspace_id,
         "approval_id": WEB_FETCH_POLICY_APPROVAL_ID,
         "issuer": WEB_FETCH_POLICY_ISSUER,
@@ -441,6 +464,8 @@ def derive_egress_policy_for_fetch(
             for domain in domains
         ],
     }
+    if allow_all_public:
+        data["allow_all_public"] = True
     return validate_egress_policy(data, now=now)
 
 
@@ -496,6 +521,7 @@ def derive_egress_policy_for_agent(
     workspace_id: str,
     allowed_hosts: Iterable[str],
     ttl_seconds: int = AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
+    allow_all_public: bool = False,
     now: datetime | None = None,
 ) -> EgressPolicy:
     """Derive a generic Agent egress policy from the durable approval allowlist.
@@ -503,9 +529,10 @@ def derive_egress_policy_for_agent(
     The workspace ``agent_egress`` allowlist plus active ``allow_once`` leases
     is the source of truth; this function turns it into an HTTPS-443-only
     ``EgressPolicy`` with ``issuer=agent_egress_authorization``. An empty host
-    set fails closed (the caller should leave the policy file absent). The
-    resulting digest is stable for the same canonical document, so sandbox
-    envelopes and proxy registries can agree on the revision identity.
+    set fails closed (the caller should leave the policy file absent) unless
+    ``allow_all_public`` opts into no-interception mode. The resulting digest is
+    stable for the same canonical document, so sandbox envelopes and proxy
+    registries can agree on the revision identity.
     """
     if not isinstance(workspace_id, str) or not workspace_id:
         raise EgressPolicyInvalid("policy_missing_workspace")
@@ -518,10 +545,10 @@ def derive_egress_policy_for_agent(
     hosts = list(
         dict.fromkeys(normalize_hostname(str(value)) for value in allowed_hosts)
     )
-    if not hosts:
+    if not hosts and not allow_all_public:
         raise EgressPolicyInvalid("policy_empty_hosts")
     issued = now or _utc_now()
-    data = {
+    data: dict[str, Any] = {
         "workspace_id": workspace_id,
         "approval_id": AGENT_EGRESS_POLICY_APPROVAL_ID,
         "issuer": AGENT_EGRESS_POLICY_ISSUER,
@@ -532,6 +559,8 @@ def derive_egress_policy_for_agent(
             for host in hosts
         ],
     }
+    if allow_all_public:
+        data["allow_all_public"] = True
     return validate_egress_policy(data, now=now)
 
 

@@ -7,6 +7,8 @@ export const researchPolicyQueryKey = ["research-policy"] as const;
 
 export const fetchPolicyQueryKey = ["web-fetch-policy"] as const;
 
+export const accessAllowlistQueryKey = ["access-allowlist"] as const;
+
 export async function getFetchPolicy(): Promise<DomainPolicy> {
   const settings = await listSettings();
   const raw = settings.find((item) => item.key === "web_fetch.policy")?.value;

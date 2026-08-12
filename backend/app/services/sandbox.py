@@ -243,16 +243,18 @@ def web_fetch_egress_envelope(
     settings: Settings,
     workspace_id: str,
     allowed_domains: Iterable[str],
+    *,
+    allow_all: bool = False,
 ) -> dict[str, Any] | None:
     """Build the egress envelope for a fixed ``web_fetch`` runner container.
 
-    Fetch egress is gated by the unified ``web_fetch.policy`` allowlist alone.
-    The generic per-workspace reviewed policy (``_egress_envelope``) is NOT
-    consulted here, so fetch approvals never widen generic Agent egress. A
-    non-empty derived policy is persisted to its own file and the container
-    joins the egress network with that policy's digest. Returns ``None``
-    (the container stays offline) when egress is disabled or the allowlist
-    cannot produce a valid policy.
+    Fetch egress is gated by the unified ``access.allowlist`` alone (allow-all
+    mode included). The generic per-workspace reviewed policy
+    (``_egress_envelope``) is NOT consulted here, so fetch approvals never
+    widen generic Agent egress. A non-empty derived policy is persisted to its
+    own file and the container joins the egress network with that policy's
+    digest. Returns ``None`` (the container stays offline) when egress is
+    disabled or the allowlist cannot produce a valid policy.
     """
     if not settings.sandbox_egress_enabled:
         return None
@@ -266,6 +268,7 @@ def web_fetch_egress_envelope(
         policy = derive_egress_policy_for_fetch(
             workspace_id=workspace_id,
             allowed_domains=allowed_domains,
+            allow_all_public=allow_all,
         )
     except EgressPolicyInvalid:
         logger.exception("Web fetch egress policy could not be derived; fetch stays offline")

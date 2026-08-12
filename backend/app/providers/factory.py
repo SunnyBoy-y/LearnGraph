@@ -155,19 +155,72 @@ def _secret_for_provider(
 
 
 def _web_fetch_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
-    """Load the unified fetch allowlist from ``web_fetch.policy`` (single source of truth).
+    """Load the fetch allowlist (unified ``access.allowlist`` when persisted).
 
-    Returns a normalized exact-host set. An empty result means the workspace has
-    no persistent web-fetch allowlist, so the sandbox fetch path stays disabled
-    and the caller falls back to the explicit remote / Qwen provider.
+    An empty result means the workspace has no persistent web-fetch allowlist,
+    so the sandbox fetch path stays disabled and the caller falls back to the
+    explicit remote / Qwen provider (unless ``access_allow_all`` is on).
     """
+    if access_allowlist_persisted(db, workspace_id):
+        return access_allowlist_domains(db, workspace_id)
     return _workspace_policy_domains(db, workspace_id, "web_fetch.policy")
 
 
 def research_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
-    """Load the workspace source allowlist shared by search and Deep Research."""
+    """Load the workspace source allowlist shared by search and Deep Research.
 
+    Uses the unified ``access.allowlist`` once persisted; before that, falls
+    back to the legacy ``research.policy`` list so existing workspaces keep
+    their behavior until the unified list is saved.
+    """
+
+    if access_allowlist_persisted(db, workspace_id):
+        return access_allowlist_domains(db, workspace_id)
     return _workspace_policy_domains(db, workspace_id, "research.policy")
+
+
+ACCESS_ALLOWLIST_SETTING_KEY = "access.allowlist"
+
+
+def access_allowlist_persisted(db: Session, workspace_id: str) -> bool:
+    """Whether the workspace has an explicit unified allowlist setting."""
+    from app.providers.provider_plan_cache import cached_workspace_setting_value
+
+    return (
+        cached_workspace_setting_value(db, workspace_id, ACCESS_ALLOWLIST_SETTING_KEY)
+        is not None
+    )
+
+
+def access_allowlist_domains(db: Session, workspace_id: str) -> frozenset[str]:
+    """Normalized exact hosts from the unified ``access.allowlist``."""
+    from app.providers.provider_plan_cache import cached_workspace_setting_value
+
+    raw = cached_workspace_setting_value(
+        db, workspace_id, ACCESS_ALLOWLIST_SETTING_KEY
+    )
+    if not isinstance(raw, dict):
+        return frozenset()
+    domains = raw.get("allowed_domains")
+    if not isinstance(domains, list):
+        return frozenset()
+    return frozenset(
+        {
+            domain
+            for item in domains
+            if isinstance(item, str) and (domain := normalize_domain(item))
+        }
+    )
+
+
+def access_allow_all(db: Session, workspace_id: str) -> bool:
+    """Whether the workspace opted into no-interception mode (allow_all)."""
+    from app.providers.provider_plan_cache import cached_workspace_setting_value
+
+    raw = cached_workspace_setting_value(
+        db, workspace_id, ACCESS_ALLOWLIST_SETTING_KEY
+    )
+    return isinstance(raw, dict) and raw.get("allow_all") is True
 
 
 def _workspace_policy_domains(
@@ -1311,13 +1364,16 @@ def _sandbox_fetch_available(
 ) -> bool:
     """Whether the sandbox-isolated fetch lane can run for this workspace.
 
-    Requires the global env gate, egress, a non-empty unified allowlist and a
-    resolved sandbox runtime image — exactly the conditions that previously
-    selected ``SandboxFetchProvider`` as the hard-coded primary path.
+    Requires the global env gate, egress, a non-empty unified allowlist (or
+    allow-all mode) and a resolved sandbox runtime image — exactly the
+    conditions that previously selected ``SandboxFetchProvider`` as the
+    hard-coded primary path.
     """
     if not (settings.sandbox_web_fetch_enabled and settings.sandbox_egress_enabled):
         return False
-    if not _web_fetch_policy_domains(db, workspace_id):
+    if not _web_fetch_policy_domains(db, workspace_id) and not access_allow_all(
+        db, workspace_id
+    ):
         return False
     from app.services.sandbox_runtime import resolve_sandbox_image
 
@@ -1334,6 +1390,7 @@ def _sandbox_fetch_provider(
         settings=settings,
         workspace_id=workspace_id,
         allowed_domains=_web_fetch_policy_domains(db, workspace_id),
+        allow_all=access_allow_all(db, workspace_id),
     )
 
 

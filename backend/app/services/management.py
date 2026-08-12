@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 import json
 from urllib.parse import urlsplit
@@ -7,6 +8,8 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.core.config import Settings
 from app.core.database import retry_sqlite_locked
@@ -37,6 +40,7 @@ from app.domain.settings import (
     FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
 )
 from app.domain.schemas.management import (
+    AccessAllowlistSettingValue,
     ChatContextUsageSettingValue,
     ChatDefaultResponseModeSettingValue,
     ChatDictationCleanupSettingValue,
@@ -3635,6 +3639,11 @@ class SettingsService:
             "default": {"allowed_domains": []},
             "risk": "high",
         },
+        "access.allowlist": {
+            "description": "Unified workspace allowlist (search / web fetch / outbound egress); allow_all disables interception",
+            "default": {"allow_all": False, "allowed_domains": []},
+            "risk": "high",
+        },
         "usage.display_currency": {
             "description": "Display currency for usage views",
             "default": "CNY",
@@ -3841,6 +3850,17 @@ class SettingsService:
                     "research.policy must contain a list of exact DNS allowed_domains",
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc
+        elif key == "access.allowlist":
+            try:
+                value = AccessAllowlistSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "access.allowlist must contain an allow_all boolean and a list "
+                    "of exact DNS allowed_domains",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
         elif key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY:
             try:
                 value = FunctionalModelDefaultsSettingValue.model_validate(
@@ -3892,4 +3912,40 @@ class SettingsService:
         self.audit.record(actor_id=self.actor_id, action="settings.update", resource_type="setting", resource_id=key)
         self.db.commit()
         self.db.refresh(setting)
+        if key == "access.allowlist":
+            self._refresh_egress_policies()
         return setting
+
+    def _refresh_egress_policies(self) -> None:
+        """Re-derive sandbox egress policies after an allowlist change.
+
+        The generic Agent egress policy and the web-fetch egress policy file are
+        both derived from the unified ``access.allowlist``; regenerating them
+        here makes a whitelist / allow_all change take effect for new sandbox
+        sessions without waiting for the proxy reload window.
+        """
+        try:
+            from app.core.config import get_settings
+            from app.providers.factory import (
+                _web_fetch_policy_domains,
+                access_allow_all,
+            )
+            from app.services.egress_approvals import EgressApprovalService
+            from app.services.sandbox import web_fetch_egress_envelope
+
+            settings = get_settings()
+            EgressApprovalService(
+                self.db, self.workspace_id, settings
+            ).ensure_agent_egress_policy()
+            web_fetch_egress_envelope(
+                settings,
+                self.workspace_id,
+                _web_fetch_policy_domains(self.db, self.workspace_id),
+                allow_all=access_allow_all(self.db, self.workspace_id),
+            )
+        except Exception:
+            logger.exception(
+                "egress policy refresh failed after access.allowlist update "
+                "for workspace %s",
+                self.workspace_id,
+            )

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  FileSearch,
   Network,
   PackageCheck,
   Pencil,
@@ -29,7 +28,6 @@ import {
   listBuiltinMcpTools,
   listMcpServers,
   listPlugins,
-  listProviderCatalog,
   listProviders,
   listSkills,
   refreshMcpServer,
@@ -51,7 +49,6 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
-import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -86,7 +83,6 @@ import type {
   SkillCreate,
   SkillDeleteRequest,
 } from "@/types/extensions";
-import type { ProviderRole } from "@/types/providers";
 
 /** Hub tabs for D-076 unified Extensions Center. */
 export type ExtensionsHubTab =
@@ -1834,152 +1830,3 @@ export function ToolsPage({
   return <PageFrame>{body}</PageFrame>;
 }
 
-export function ResearchSettingsPage() {
-  const { workspaceId = "" } = useParams();
-  const providers = useQuery({
-    queryKey: ["providers"],
-    queryFn: listProviders,
-  });
-  const providerCatalog = useQuery({
-    queryKey: ["provider-catalog"],
-    queryFn: listProviderCatalog,
-  });
-  if (providers.isPending || providerCatalog.isPending)
-    return (
-      <PageFrame>
-        <LoadingState />
-      </PageFrame>
-    );
-  if (providers.isError || providerCatalog.isError)
-    return (
-      <PageFrame>
-        <ErrorState
-          message={
-            (providers.error ?? providerCatalog.error)?.message ??
-            "Provider 目录读取失败"
-          }
-        />
-      </PageFrame>
-    );
-  const rolesByType = new Map(
-    providerCatalog.data.map((item) => [item.provider_type, item.role]),
-  );
-  const groups = [
-    { icon: Search, title: "普通搜索 Provider", role: "search" },
-    { icon: Network, title: "正文抓取 FetchProvider", role: "fetch" },
-    { icon: FileSearch, title: "DeepResearch Provider", role: "deep_research" },
-  ] satisfies {
-    icon: typeof Search;
-    title: string;
-    role: Extract<ProviderRole, "search" | "fetch" | "deep_research">;
-  }[];
-  const groupedProviders = groups.map((group) => ({
-    ...group,
-    providers: providers.data.filter((provider) =>
-      rolesByType.get(provider.provider_type) === group.role,
-    ),
-  }));
-  return (
-    <PageFrame>
-      <PageIntro
-        description="SearchProvider、FetchProvider 与 DeepResearchProvider 独立记录；缺失的远程能力明确显示为未配置。本页白名单只约束搜索/Deep Research 的查询来源（应用层），不授予沙箱网络出站权限；沙箱联网访问请在 Egress 审批（网络层）中审批。"
-        eyebrow="Network & sources"
-        title="搜索与 Deep Research 设置"
-      />
-      <div className="flex flex-wrap items-center gap-3 rounded-xl border border-muted bg-muted/25 px-4 py-3 text-xs text-muted-foreground">
-        <span className="min-w-0 flex-1">
-          需要查看网页抓取白名单、沙箱开关或出站审批的完整边界？请前往统一的
-          <Link
-            className="mx-1 font-medium text-primary underline-offset-4 hover:underline"
-            to={`/w/${workspaceId}/settings/access-approvals`}
-          >
-            访问与审批
-          </Link>
-          总览。
-        </span>
-      </div>
-      <Surface className="p-5">
-        <SectionHeading
-          description="实例和状态均来自当前工作区 Provider API"
-          title="Provider 分层"
-        />
-        <div className="mt-5 grid gap-4 lg:grid-cols-3">
-          {groupedProviders.map((group) => {
-            const Icon = group.icon;
-            return (
-              <div className="rounded-xl border p-4" key={group.title}>
-                <div className="flex items-center gap-2">
-                  <Icon className="size-4 text-primary" />
-                  <p className="text-sm font-semibold">{group.title}</p>
-                </div>
-                <div className="mt-4 space-y-2">
-                  {group.providers.length ? (
-                    group.providers.map((provider) => (
-                      <div
-                        className="rounded-lg border bg-muted/20 px-3 py-2 text-xs"
-                        key={provider.id}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="truncate font-medium">
-                            {provider.display_name}
-                          </span>
-                          <StatePill
-                            status={
-                              provider.enabled ? provider.status : "disabled"
-                            }
-                          />
-                        </div>
-                        <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">
-                          {provider.base_url ?? "未设置 Base URL"}
-                        </p>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="rounded-lg border border-dashed px-3 py-5 text-center text-xs text-muted-foreground">
-                      未配置
-                    </p>
-                  )}
-                </div>
-                <Button asChild className="mt-4" size="xs" variant="outline">
-                  <Link to={`/w/${workspaceId}/settings/providers`}>
-                    管理 Provider
-                  </Link>
-                </Button>
-              </div>
-            );
-          })}
-        </div>
-      </Surface>
-      <Surface className="space-y-4 p-5">
-        <SectionHeading
-          description="统一管理普通联网搜索与 Deep Research 可使用的工作区来源域名。"
-          title="搜索与 Deep Research 来源白名单"
-        />
-        <ResearchDomainAllowlistEditor />
-      </Surface>
-      <Surface className="p-5">
-        <SectionHeading title="当前配置边界" />
-        <div className="mt-4 grid gap-3 sm:grid-cols-3">
-          {groupedProviders.map((group) => (
-            <div className="rounded-xl border p-4" key={group.title}>
-              <p className="text-xs text-muted-foreground">{group.title}</p>
-              <p className="mt-2 text-2xl font-semibold">
-                {group.providers.length}
-              </p>
-              <p className="mt-1 text-[10px] text-muted-foreground">
-                其中
-                {
-                  group.providers.filter(
-                    (provider) =>
-                      provider.enabled && provider.remote_capability,
-                  ).length
-                }{" "}
-                个已声明远程能力
-              </p>
-            </div>
-          ))}
-        </div>
-      </Surface>
-    </PageFrame>
-  );
-}

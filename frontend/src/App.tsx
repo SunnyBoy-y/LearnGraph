@@ -31,17 +31,15 @@ const SearchPage = lazy(() => import('@/features/resources/resource-pages').then
 const SourcesPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SourcesPage })))
 const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
 const MemoryPage = lazy(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
-const ProvidersPage = lazy(() => import('@/features/settings/providers-page-shell').then((module) => ({ default: module.ProvidersPageWithWebFetch })))
+const ProvidersPage = lazy(() => import('@/features/settings/provider-pages').then((module) => ({ default: module.ProvidersPage })))
 const UsagePage = lazy(() => import('@/features/settings/usage-pages').then((module) => ({ default: module.UsagePage })))
 const ExtensionsPage = lazy(() => import('@/features/settings/extension-pages').then((module) => ({ default: module.ExtensionsPage })))
-const ResearchSettingsPage = lazy(() => import('@/features/settings/extension-pages').then((module) => ({ default: module.ResearchSettingsPage })))
+const SearchFetchPage = lazy(() => import('@/features/settings/search-fetch-page').then((module) => ({ default: module.SearchFetchPage })))
 const AuditPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.AuditPage })))
 const MigrationPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.MigrationPage })))
 const WorkspaceSettingsPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.WorkspaceSettingsPage })))
 const PersonalizationPage = lazy(() => import('@/features/settings/personalization-page').then((module) => ({ default: module.PersonalizationPage })))
 const AccessManagementPage = lazy(() => import('@/features/settings/control-pages').then((module) => ({ default: module.AccessManagementPage })))
-const EgressApprovalsPage = lazy(() => import('@/features/settings/egress-approvals-page').then((module) => ({ default: module.EgressApprovalsPage })))
-const AccessApprovalsPage = lazy(() => import('@/features/settings/access-approvals-page').then((module) => ({ default: module.AccessApprovalsPage })))
 const AboutPage = lazy(() => import('@/features/settings/about-page').then((module) => ({ default: module.AboutPage })))
 const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
 
@@ -143,14 +141,15 @@ function AppRoutes() {
         <Route element={<ProvidersPage />} path="settings/providers" />
         <Route element={<UsagePage />} path="settings/usage" />
         <Route element={<ExtensionsPage />} path="settings/extensions" />
-        <Route element={<ResearchSettingsPage />} path="settings/research" />
+        <Route element={<SearchFetchPage />} path="settings/search-fetch" />
+        <Route element={<Navigate replace to="../search-fetch" />} path="settings/research" />
+        <Route element={<Navigate replace to="../search-fetch" />} path="settings/egress" />
+        <Route element={<Navigate replace to="../search-fetch" />} path="settings/access-approvals" />
         <Route element={<MigrationPage />} path="settings/storage/migrations" />
         <Route element={<AuditPage />} path="settings/audit" />
         <Route element={<WorkspaceSettingsPage />} path="settings/workspace" />
         <Route element={<PersonalizationPage />} path="settings/personalization" />
         <Route element={<AccessManagementPage />} path="settings/access" />
-        <Route element={<EgressApprovalsPage />} path="settings/egress" />
-        <Route element={<AccessApprovalsPage />} path="settings/access-approvals" />
         <Route element={<AboutPage />} path="settings/about" />
         <Route element={<ArtifactsPage />} path="settings/artifacts" />
       </Route>

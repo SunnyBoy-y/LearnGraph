@@ -1,4 +1,5 @@
 import type {
+  AccessAllowlist,
   ResearchPolicy,
   SettingUpdateRequest,
   WorkspaceSetting,
@@ -44,6 +45,53 @@ export async function updateResearchPolicy(
     allowed_domains: Array.isArray(domains)
       ? domains.filter((item): item is string => typeof item === "string")
       : [],
+  };
+}
+
+export async function getAccessAllowlist(): Promise<AccessAllowlist> {
+  const settings = await listSettings();
+  const raw = settings.find((item) => item.key === "access.allowlist")?.value;
+  if (!raw || typeof raw !== "object") {
+    // 未保存统一白名单：并集旧的 research.policy / web_fetch.policy，
+    // 首次保存时会把它们迁移进统一列表。
+    const legacy = new Set<string>();
+    for (const key of ["research.policy", "web_fetch.policy"]) {
+      const value = settings.find((item) => item.key === key)?.value;
+      if (!value || typeof value !== "object") continue;
+      const domains = (value as Partial<AccessAllowlist>).allowed_domains;
+      if (Array.isArray(domains)) {
+        for (const item of domains) {
+          if (typeof item === "string" && item.trim()) legacy.add(item.trim());
+        }
+      }
+    }
+    return { allowed_domains: [...legacy], allow_all: false };
+  }
+  const value = raw as Partial<AccessAllowlist>;
+  const domains = value.allowed_domains;
+  return {
+    allowed_domains: Array.isArray(domains)
+      ? domains.filter((item): item is string => typeof item === "string")
+      : [],
+    allow_all: value.allow_all === true,
+  };
+}
+
+export async function updateAccessAllowlist(
+  policy: AccessAllowlist,
+): Promise<AccessAllowlist> {
+  const setting = await updateSetting("access.allowlist", policy);
+  const raw = setting.value;
+  if (!raw || typeof raw !== "object") {
+    return { allowed_domains: [], allow_all: false };
+  }
+  const value = raw as Partial<AccessAllowlist>;
+  const domains = value.allowed_domains;
+  return {
+    allowed_domains: Array.isArray(domains)
+      ? domains.filter((item): item is string => typeof item === "string")
+      : [],
+    allow_all: value.allow_all === true,
   };
 }
 

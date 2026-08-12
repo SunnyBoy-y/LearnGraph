@@ -108,6 +108,7 @@ class FetchPoolKey:
     namespace: str
     workspace_id: str
     domains: tuple[str, ...]
+    allow_all: bool
     fingerprint: str
 
 
@@ -131,6 +132,7 @@ class WebFetchContainerPool:
         settings: Settings,
         workspace_id: str,
         allowed_domains: frozenset[str],
+        allow_all: bool = False,
         image_ref: str,
         max_size: int,
         idle_ttl: int,
@@ -139,6 +141,7 @@ class WebFetchContainerPool:
         self.settings = settings
         self.workspace_id = workspace_id
         self.allowed_domains = allowed_domains
+        self.allow_all = allow_all
         self.image_ref = image_ref
         self.max_size = max(1, min(int(max_size), _MAX_POOL_SIZE))
         self.idle_ttl = max(1, int(idle_ttl))
@@ -269,7 +272,10 @@ class WebFetchContainerPool:
                 capability.reason or "The sandbox runtime is unavailable"
             )
         egress = web_fetch_egress_envelope(
-            self.settings, self.workspace_id, self.allowed_domains
+            self.settings,
+            self.workspace_id,
+            self.allowed_domains,
+            allow_all=self.allow_all,
         )
         if egress is None:
             raise FetchPoolUnavailable(
@@ -338,12 +344,14 @@ def pool_key(
     namespace: str,
     workspace_id: str,
     allowed_domains: frozenset[str],
+    allow_all: bool = False,
     fingerprint: str,
 ) -> FetchPoolKey:
     return FetchPoolKey(
         namespace=namespace,
         workspace_id=workspace_id,
         domains=tuple(sorted(allowed_domains)),
+        allow_all=allow_all,
         fingerprint=fingerprint,
     )
 
@@ -355,6 +363,7 @@ def get_fetch_pool(
     settings: Settings,
     workspace_id: str,
     allowed_domains: frozenset[str],
+    allow_all: bool = False,
     max_size: int,
     idle_ttl: int,
 ) -> WebFetchContainerPool:
@@ -369,6 +378,7 @@ def get_fetch_pool(
         namespace=namespace,
         workspace_id=workspace_id,
         allowed_domains=allowed_domains,
+        allow_all=allow_all,
         fingerprint=fingerprint,
     )
     with _registry_lock:
@@ -379,6 +389,7 @@ def get_fetch_pool(
                 settings=settings,
                 workspace_id=workspace_id,
                 allowed_domains=allowed_domains,
+                allow_all=allow_all,
                 image_ref=image_ref,
                 max_size=max_size,
                 idle_ttl=idle_ttl,

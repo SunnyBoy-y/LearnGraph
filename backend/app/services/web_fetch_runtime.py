@@ -138,6 +138,9 @@ def web_fetch_runtime_status(
     sandbox_enabled = bool(runtime["sandbox_enabled"])
     global_gate = bool(settings.sandbox_web_fetch_enabled)
     egress_enabled = bool(settings.sandbox_egress_enabled)
+    from app.providers.factory import access_allow_all
+
+    allow_all = access_allow_all(db, workspace_id)
     allowlist_count = 0
     if sandbox_enabled and global_gate and egress_enabled:
         from app.providers.factory import _web_fetch_policy_domains
@@ -148,7 +151,7 @@ def web_fetch_runtime_status(
         sandbox_enabled
         and global_gate
         and egress_enabled
-        and allowlist_count > 0
+        and (allowlist_count > 0 or allow_all)
         and image_available
     )
     remote_configured = _remote_fetch_configured(db, workspace_id)
@@ -177,6 +180,7 @@ def web_fetch_runtime_status(
         global_sandbox_gate=global_gate,
         egress_enabled=egress_enabled,
         allowlist_count=allowlist_count,
+        allow_all=allow_all,
         image_available=image_available,
         sandbox_effective=sandbox_effective,
         remote_configured=remote_configured,
