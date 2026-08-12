@@ -1,8 +1,10 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
-  Check,
+  ArrowRight,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CloudSun,
   GitBranch,
   ImageIcon,
@@ -10,7 +12,6 @@ import {
   Save,
   Send,
   ShieldCheck,
-  Target,
   Thermometer,
   Undo2,
   X,
@@ -21,14 +22,11 @@ import {
   OptionGroup,
   type OptionGroupSubmission,
 } from "@/components/chat/option-group";
+import { StatePill } from "@/components/shared/page-elements";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { DateScheduleCalendar } from "@/components/chat/date-schedule-calendar";
 
@@ -303,6 +301,8 @@ export function TrustedComponentRenderer({
   const [batchAnswers, setBatchAnswers] = useState<
     Record<string, { labels: string[]; values: string[]; text?: string }>
   >({});
+  /** Tabbed-paging index for the aggregated question card (question_batch). */
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
 
   // Third-party components are delivered with delivery_mode="sandbox_artifact".
   // They never match the built-in declarative schema below; delegate them to
@@ -587,12 +587,18 @@ export function TrustedComponentRenderer({
         return Boolean(answer.text?.trim());
       return answer.values.length > 0;
     };
-    const answeredCount = batch.questions.filter(isAnswered).length;
+    // 已处理 = 已作答或已跳过（与极速问卷一致：跳过也算处理完一页）。
+    const processedCount = batch.questions.filter(
+      (question) => Boolean(batchAnswers[question.key]),
+    ).length;
     const missingRequired = batch.questions.filter(
       (question) => question.required && !isAnswered(question),
     );
     const canSubmit =
-      interactive && missingRequired.length === 0 && answeredCount > 0;
+      interactive &&
+      missingRequired.length === 0 &&
+      processedCount === batch.questions.length &&
+      component.allowed_events.includes("submit");
     const typeLabel = (inputType: string) =>
       inputType === "single_choice"
         ? "单选"
@@ -603,31 +609,6 @@ export function TrustedComponentRenderer({
             : inputType === "date"
               ? "日期"
               : "简答";
-
-    const setChoice = (
-      question: z.infer<typeof questionBatchItemSchema>,
-      optionId: string,
-      optionLabel: string,
-      checked = true,
-    ) => {
-      setBatchAnswers((current) => {
-        const existing = current[question.key];
-        if (question.input_type === "multiple_choice") {
-          const values = checked
-            ? [...(existing?.values ?? []), optionId]
-            : (existing?.values ?? []).filter((item) => item !== optionId);
-          const labels = values.map((id) => {
-            const option = question.options.find((item) => item.id === id);
-            return option?.label ?? id;
-          });
-          return { ...current, [question.key]: { labels, values } };
-        }
-        return {
-          ...current,
-          [question.key]: { labels: [optionLabel], values: [optionId] },
-        };
-      });
-    };
     const setText = (
       questionKey: string,
       text: string,
@@ -643,212 +624,221 @@ export function TrustedComponentRenderer({
         },
       }));
     };
+    const activeIndex = Math.min(
+      activeQuestionIndex,
+      Math.max(batch.questions.length - 1, 0),
+    );
+    const question = batch.questions[activeIndex];
+    if (!question) return null;
+    const currentAnswer = batchAnswers[question.key];
+    const remaining = batch.questions.length - processedCount;
+    const isChoice =
+      question.input_type === "single_choice" ||
+      question.input_type === "multiple_choice";
+    const isDate =
+      question.input_type === "date" ||
+      (question.input_type !== "single_choice" &&
+        question.input_type !== "multiple_choice" &&
+        TIME_KEYWORD_RE.test(question.prompt));
+    const isLast = activeIndex === batch.questions.length - 1;
+    const openAnswered = isAnswered(question);
+
+    function recordAndAdvance(
+      key: string,
+      answer: { labels: string[]; values: string[]; text?: string },
+    ) {
+      setBatchAnswers((current) => ({ ...current, [key]: answer }));
+      if (!isLast) setActiveQuestionIndex(activeIndex + 1);
+    }
+
     return (
       <section
         aria-label={batch.title}
-        className="option-group question-batch"
+        className="goal-flow-questionnaire goal-quiz question-batch"
       >
-        <div className="option-group__heading">
+        <div className="goal-quiz-head">
           <div>
-            <p>{batch.title}</p>
-            {batch.description ? <span>{batch.description}</span> : null}
+            <strong>
+              {activeIndex + 1} / {batch.questions.length}
+            </strong>
+            <span className="goal-quiz-sub">
+              {batch.description ??
+                "回答会影响图谱边界与顺序；也可跳过，系统会记下透明假设。"}
+            </span>
           </div>
-          <span>{batch.questions.length} 题 · 聚合问答</span>
+          <div className="goal-quiz-head__tools">
+            <Badge variant="outline">智能体生成</Badge>
+            <StatePill label="聚合问答" status="reviewing" />
+          </div>
         </div>
-        <div className="question-batch__list">
-          {batch.questions.map((question, index) => {
-            const current = batchAnswers[question.key];
-            const isChoice =
-              question.input_type === "single_choice" ||
-              question.input_type === "multiple_choice";
-            const isDate =
-              question.input_type === "date" ||
-              (question.input_type !== "single_choice" &&
-                question.input_type !== "multiple_choice" &&
-                TIME_KEYWORD_RE.test(question.prompt));
-            return (
-              <div className="question-batch__item" key={question.key}>
-                <div className="question-batch__prompt">
-                  <span className="question-batch__index">{index + 1}</span>
-                  <strong>{question.prompt}</strong>
-                  <span className="question-batch__type">
-                    {typeLabel(isDate ? "date" : question.input_type)}
-                  </span>
-                  {question.required ? (
-                    <span className="question-batch__required">必答</span>
-                  ) : null}
+        {processedCount > 0 ? (
+          <div className="goal-quiz-stash" aria-label="已答进度">
+            <span className="goal-quiz-stash-tag">已处理 {processedCount} 题</span>
+            <span className="goal-quiz-stash-text">
+              {batch.questions
+                .filter((item) => batchAnswers[item.key])
+                .map((item) => {
+                  const answer = batchAnswers[item.key];
+                  const value =
+                    answer?.text?.trim() ?? answer?.labels.join("、") ?? "";
+                  return (value || "已跳过").slice(0, 28);
+                })
+                .join(" · ")}
+            </span>
+          </div>
+        ) : null}
+        <div className="goal-quiz-card background-question">
+          {isChoice ? (
+            <OptionGroup
+              allowCustom={question.allow_custom ?? true}
+              allowSkip={question.allow_skip ?? true}
+              description={undefined}
+              key={question.key}
+              mode={
+                question.input_type === "multiple_choice" ? "multiple" : "single"
+              }
+              onSubmit={(submission) =>
+                recordAndAdvance(question.key, {
+                  labels: submission.labels,
+                  values: submission.values,
+                })
+              }
+              options={question.options.map((option) => ({
+                id: option.id,
+                label: option.label,
+                description: option.description ?? undefined,
+              }))}
+              submitLabel={
+                !isLast
+                  ? remaining > 1
+                    ? `确认 · 还差 ${remaining - (currentAnswer ? 0 : 1)} 题`
+                    : "确认并继续"
+                  : "确认本题"
+              }
+              title={question.prompt}
+              value={currentAnswer?.values ?? undefined}
+            />
+          ) : (
+            <div className="goal-quiz-card__open">
+              <div className="goal-quiz-card__prompt">
+                <strong>{question.prompt}</strong>
+                <span className="question-batch__type">
+                  {typeLabel(isDate ? "date" : question.input_type)}
+                </span>
+                {question.required ? (
+                  <span className="question-batch__required">必答</span>
+                ) : null}
+              </div>
+              {isDate ? (
+                <div className="question-batch__date">
+                  <DateScheduleCalendar
+                    disabled={!interactive}
+                    onChange={(dateKey, label) =>
+                      setText(question.key, dateKey, [label])
+                    }
+                    value={currentAnswer?.text}
+                  />
+                  <Input
+                    aria-label={`${question.prompt} 手动输入日期`}
+                    className="option-group__custom"
+                    disabled={!interactive}
+                    onChange={(event) =>
+                      setText(question.key, event.target.value)
+                    }
+                    placeholder="或手动输入，如 2026-09-01"
+                    value={currentAnswer?.text ?? ""}
+                  />
                 </div>
-                {isChoice ? (
-                  <>
-                    {question.input_type === "single_choice" ? (
-                      <RadioGroup
-                        className="option-group__choices question-batch__choices"
-                        disabled={!interactive}
-                        onValueChange={(next) =>
-                          setChoice(
-                            question,
-                            next,
-                            question.options.find((item) => item.id === next)
-                              ?.label ?? next,
-                          )
-                        }
-                        value={current?.values[0] ?? ""}
-                      >
-                        {question.options.map((option) => (
-                          <Label
-                            className={cn(
-                              "option-group__choice",
-                              current?.values.includes(option.id) &&
-                                "is-selected",
-                            )}
-                            htmlFor={`${componentId}-qb-${question.key}-${option.id}`}
-                            key={option.id}
-                          >
-                            <RadioGroupItem
-                              id={`${componentId}-qb-${question.key}-${option.id}`}
-                              value={option.id}
-                            />
-                            <span>
-                              <strong>{option.label}</strong>
-                              {option.description ? (
-                                <small>{option.description}</small>
-                              ) : null}
-                            </span>
-                            {current?.values.includes(option.id) ? (
-                              <Check aria-hidden="true" className="size-3.5" />
-                            ) : null}
-                          </Label>
-                        ))}
-                      </RadioGroup>
-                    ) : (
-                      <div className="option-group__choices question-batch__choices">
-                        {question.options.map((option) => {
-                          const selected = (current?.values ?? []).includes(
-                            option.id,
-                          );
-                          return (
-                            <Label
-                              className={cn(
-                                "option-group__choice",
-                                selected && "is-selected",
-                              )}
-                              htmlFor={`${componentId}-qb-${question.key}-${option.id}`}
-                              key={option.id}
-                            >
-                              <Checkbox
-                                checked={selected}
-                                disabled={!interactive}
-                                id={`${componentId}-qb-${question.key}-${option.id}`}
-                                onCheckedChange={(checked) =>
-                                  setChoice(
-                                    question,
-                                    option.id,
-                                    option.label,
-                                    checked !== false,
-                                  )
-                                }
-                              />
-                              <span>
-                                <strong>{option.label}</strong>
-                                {option.description ? (
-                                  <small>{option.description}</small>
-                                ) : null}
-                              </span>
-                              {selected ? (
-                                <Check aria-hidden="true" className="size-3.5" />
-                              ) : null}
-                            </Label>
-                          );
-                        })}
-                      </div>
-                    )}
-                    {question.allow_custom ? (
-                      <Input
-                        aria-label={`${question.prompt} 自定义答案`}
-                        className="option-group__custom"
-                        disabled={!interactive}
-                        onChange={(event) =>
-                          setText(question.key, event.target.value)
-                        }
-                        placeholder="输入其他答案"
-                        value={current?.text ?? ""}
-                      />
-                    ) : null}
-                  </>
-                ) : isDate ? (
-                  <div className="question-batch__date">
-                    <DateScheduleCalendar
+              ) : (
+                <div className="question-batch__open">
+                  {question.input_type === "short_answer_table" ? (
+                    <Textarea
+                      aria-label={question.prompt}
                       disabled={!interactive}
-                      onChange={(dateKey, label) =>
-                        setText(question.key, dateKey, [label])
+                      onChange={(event) =>
+                        setText(question.key, event.target.value)
                       }
-                      value={current?.text}
+                      placeholder={question.placeholder ?? "请输入…"}
+                      value={currentAnswer?.text ?? ""}
                     />
+                  ) : (
                     <Input
-                      aria-label={`${question.prompt} 手动输入日期`}
+                      aria-label={question.prompt}
                       className="option-group__custom"
                       disabled={!interactive}
                       onChange={(event) =>
                         setText(question.key, event.target.value)
                       }
-                      placeholder="或手动输入，如 2026-09-01"
-                      value={current?.text ?? ""}
+                      placeholder={question.placeholder ?? "请输入…"}
+                      value={currentAnswer?.text ?? ""}
                     />
-                  </div>
-                ) : (
-                  <div className="question-batch__open">
-                    {question.input_type === "short_answer_table" ? (
-                      <Textarea
-                        aria-label={question.prompt}
-                        disabled={!interactive}
-                        onChange={(event) =>
-                          setText(question.key, event.target.value)
-                        }
-                        placeholder={question.placeholder ?? "请输入…"}
-                        value={current?.text ?? ""}
-                      />
-                    ) : (
-                      <Input
-                        aria-label={question.prompt}
-                        className="option-group__custom"
-                        disabled={!interactive}
-                        onChange={(event) =>
-                          setText(question.key, event.target.value)
-                        }
-                        placeholder={question.placeholder ?? "请输入…"}
-                        value={current?.text ?? ""}
-                      />
-                    )}
-                  </div>
-                )}
+                  )}
+                </div>
+              )}
+              <div className="goal-quiz-card__actions">
+                {question.allow_skip !== false ? (
+                  <Button
+                    disabled={!interactive}
+                    onClick={() =>
+                      recordAndAdvance(question.key, { labels: [], values: [] })
+                    }
+                    size="sm"
+                    variant="ghost"
+                  >
+                    跳过
+                  </Button>
+                ) : null}
+                <Button
+                  disabled={!interactive || !openAnswered}
+                  onClick={() =>
+                    recordAndAdvance(
+                      question.key,
+                      currentAnswer ?? { labels: [], values: [] },
+                    )
+                  }
+                  size="sm"
+                >
+                  {isLast ? "确认本题" : "确认并继续"}
+                  <ArrowRight className="size-4" />
+                </Button>
               </div>
-            );
-          })}
-        </div>
-        <div className="question-batch__progress">
-          <span>
-            已答 {answeredCount}/{batch.questions.length}
-          </span>
-          {missingRequired.length ? (
-            <span className="question-batch__missing">
-              还有 {missingRequired.length} 道必答题未作答
-            </span>
-          ) : (
-            <span>一次提交，全部答案一起回传</span>
+            </div>
           )}
         </div>
-        <div className="option-group__actions">
+        <div className="goal-flow-questionnaire__footer goal-quiz-actions">
           <Button
-            disabled={!canSubmit || !component.allowed_events.includes("submit")}
+            aria-label="上一个澄清问题"
+            disabled={activeIndex === 0 || !interactive}
+            onClick={() => setActiveQuestionIndex(activeIndex - 1)}
+            size="icon-sm"
+            variant="ghost"
+          >
+            <ChevronLeft className="size-4" />
+          </Button>
+          <span>
+            {processedCount}/{batch.questions.length} 已处理
+          </span>
+          <Button
+            aria-label="下一个澄清问题"
+            disabled={isLast || !interactive}
+            onClick={() => setActiveQuestionIndex(activeIndex + 1)}
+            size="icon-sm"
+            variant="ghost"
+          >
+            <ChevronRight className="size-4" />
+          </Button>
+          <Button
+            disabled={!canSubmit}
             onClick={() =>
               emit("submit", {
-                answers: batch.questions.map((question) => {
-                  const answer = batchAnswers[question.key];
-                  const value = answer?.text?.trim() ?? answer?.values.join("、") ?? "";
+                answers: batch.questions.map((item) => {
+                  const answer = batchAnswers[item.key];
+                  const value =
+                    answer?.text?.trim() ?? answer?.values.join("、") ?? "";
                   const label = answer?.labels.join("、") ?? "";
                   return {
-                    key: question.key,
-                    prompt: question.prompt,
+                    key: item.key,
+                    prompt: item.prompt,
                     value,
                     labels: label,
                     skipped: !value && !label,
@@ -880,22 +870,28 @@ export function TrustedComponentRenderer({
     const updateField = (field: "title" | "intent" | "time_limit" | "desired_outcome", value: string) =>
       setGoalDraftValue((current) => ({ ...current, [field]: value }));
     const canSubmit = interactive && draftValue.title.trim().length > 0;
+    // 与极速模式的「确认学习目标」面板保持同款渲染与确认风格。
     return (
       <section
         aria-label={editor.title}
-        className="message-component goal-draft-editor"
+        className="goal-flow-review topic-preview-panel goal-draft-editor"
       >
-        <div className="message-component__heading">
-          <Target className="size-4" />
+        <div className="topic-preview-head">
           <div>
-            <strong>{editor.title}</strong>
-            {editor.description ? <span>{editor.description}</span> : null}
+            <strong>确认学习目标</strong>
+            <span className="topic-preview-sub">
+              {editor.description ??
+                "看一下、改一下措辞，提交后智能体会据此确认目标草稿。"}
+            </span>
           </div>
-          {editor.goal_status ? (
-            <Badge variant="secondary">{editor.goal_status}</Badge>
-          ) : null}
+          <div className="goal-graph-review-tools">
+            <StatePill
+              label={editor.goal_status ? undefined : "草稿"}
+              status={editor.goal_status ?? "reviewing"}
+            />
+          </div>
         </div>
-        <div className="goal-draft-editor__form">
+        <div className="goal-flow-review__form">
           <label>
             <span>目标名称</span>
             <Input
@@ -914,6 +910,18 @@ export function TrustedComponentRenderer({
               value={draftValue.intent}
             />
           </label>
+          <label className="goal-flow-review__wide">
+            <span>期望结果</span>
+            <Textarea
+              aria-label="期望结果"
+              disabled={!interactive}
+              onChange={(event) =>
+                updateField("desired_outcome", event.target.value)
+              }
+              placeholder="希望通过什么方式验收学习成果？"
+              value={draftValue.desired_outcome}
+            />
+          </label>
           <label>
             <span>时间约束</span>
             <Input
@@ -924,18 +932,8 @@ export function TrustedComponentRenderer({
               value={draftValue.time_limit}
             />
           </label>
-          <label className="goal-draft-editor__wide">
-            <span>期望结果</span>
-            <Textarea
-              aria-label="期望结果"
-              disabled={!interactive}
-              onChange={(event) => updateField("desired_outcome", event.target.value)}
-              placeholder="希望通过什么方式验收学习成果？"
-              value={draftValue.desired_outcome}
-            />
-          </label>
         </div>
-        <div className="message-component__actions">
+        <div className="topic-preview-actions goal-flow-review__actions">
           <Button
             disabled={!canSubmit || !component.allowed_events.includes("submit")}
             onClick={() =>
@@ -951,7 +949,7 @@ export function TrustedComponentRenderer({
             size="sm"
           >
             <Save className="size-3.5" />
-            {editor.submit_label ?? "提交"}
+            {editor.submit_label ?? "确认提交"}
           </Button>
         </div>
         <p className="goal-draft-editor__hint">
@@ -971,6 +969,7 @@ export function TrustedComponentRenderer({
   }
   const graphComponent = graphProposalSchema.parse(data);
   const proposal = graphComponent.props;
+  const isCreate = proposal.mode === "create";
   const canDecide =
     interactive &&
     proposal.status === "proposed" &&
@@ -982,7 +981,9 @@ export function TrustedComponentRenderer({
     graphComponent.allowed_events.includes("undo");
   const statusLabel =
     proposal.status === "confirmed"
-      ? "已采纳"
+      ? isCreate
+        ? "已通过审核"
+        : "已采纳"
       : proposal.status === "rejected"
         ? "已拒绝"
         : proposal.status === "undone"
@@ -994,55 +995,203 @@ export function TrustedComponentRenderer({
       : proposal.status === "rejected" || proposal.status === "undone"
         ? "secondary"
         : "outline";
+  const statusKey =
+    proposal.status === "confirmed"
+      ? "approved"
+      : proposal.status === "rejected"
+        ? "failed"
+        : proposal.status === "undone"
+          ? "cancelled"
+          : "reviewing";
+  const confirmLabel = isCreate
+    ? `确认生成 (${proposal.nodes.length})`
+    : "确认写入图谱";
+
+  // 增量更新（update）提案：保持原有紧凑布局。
+  if (!isCreate) {
+    return (
+      <section
+        className={
+          interactive
+            ? "graph-proposal"
+            : "graph-proposal graph-proposal--locked"
+        }
+        aria-label={`图谱变更提案：${proposal.title}`}
+        aria-disabled={!interactive || undefined}
+      >
+        <div className="graph-proposal__heading">
+          <span>
+            <Network className="size-4" />
+          </span>
+          <div>
+            <p>图谱变更提案</p>
+            <strong>{proposal.title}</strong>
+          </div>
+          <Badge variant={statusVariant}>{statusLabel}</Badge>
+        </div>
+        <p className="graph-proposal__summary">{proposal.summary}</p>
+        <div className="graph-proposal__stats">
+          <span><strong>{proposal.nodes.length}</strong> 个节点</span>
+          <span><strong>{proposal.edges.length}</strong> 条关系</span>
+          <span><strong>{proposal.mode}</strong> 模式</span>
+        </div>
+        {proposal.nodes.length ? (
+          <ul className="graph-proposal__nodes">
+            {proposal.nodes.slice(0, 8).map((node) => (
+              <li key={node.id}>
+                <span data-change={node.change}>{node.change}</span>
+                <div>
+                  <strong>{node.label}</strong>
+                  {node.description ? <small>{node.description}</small> : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {proposal.nodes.length > 8 ? (
+          <p className="graph-proposal__more">另有 {proposal.nodes.length - 8} 个节点，确认前可在图谱工作台完整查看。</p>
+        ) : null}
+        {!interactive && proposal.status === "proposed" ? (
+          <div className="graph-proposal__resolved graph-proposal__resolved--pending">
+            <GitBranch className="size-3.5" />
+            回答生成中，完成后可审核此提案
+          </div>
+        ) : canDecide ? (
+          <div className="graph-proposal__actions">
+            <Button
+              disabled={!graphComponent.allowed_events.includes("reject")}
+              onClick={() => emit("reject", { proposal_id: proposal.proposal_id })}
+              size="sm"
+              variant="ghost"
+            >
+              <X className="size-3.5" />拒绝
+            </Button>
+            <Button
+              disabled={!graphComponent.allowed_events.includes("confirm")}
+              onClick={() => emit("confirm", { proposal_id: proposal.proposal_id })}
+              size="sm"
+            >
+              <CheckCircle2 className="size-3.5" />{confirmLabel}
+            </Button>
+          </div>
+        ) : proposal.status === "confirmed" ? (
+          <div className="graph-proposal__resolved graph-proposal__resolved--confirmed">
+            <div className="graph-proposal__resolved-copy">
+              <CheckCircle2 className="size-3.5" />
+              <span>
+                已写入图谱
+                {proposal.confirmed_revision != null
+                  ? ` 修订 v${proposal.confirmed_revision}`
+                  : ""}
+              </span>
+            </div>
+            {canUndo ? (
+              <Button
+                onClick={() => emit("undo", { proposal_id: proposal.proposal_id })}
+                size="sm"
+                variant="ghost"
+              >
+                <Undo2 className="size-3.5" />撤销
+              </Button>
+            ) : null}
+          </div>
+        ) : (
+          <div className="graph-proposal__resolved">
+            <GitBranch className="size-3.5" />
+            {proposal.status === "rejected"
+              ? proposal.rejection_reason
+                ? `已拒绝：${proposal.rejection_reason}`
+                : "该提案已拒绝，正式图谱未被修改"
+              : proposal.status === "undone"
+                ? "该提案写入已撤销，图谱已恢复"
+                : "该提案已结束"}
+          </div>
+        )}
+      </section>
+    );
+  }
+
+  // create 模式：与极速模式「审核初始图谱」1:1 复刻，确认即通过审核并发布。
+  const nodeById = new Map(proposal.nodes.map((node) => [node.id, node]));
   return (
     <section
-      className={
-        interactive
-          ? "graph-proposal"
-          : "graph-proposal graph-proposal--locked"
-      }
-      aria-label={`图谱变更提案：${proposal.title}`}
+      className="goal-flow-graph-review topic-preview-panel graph-proposal is-create-panel"
+      aria-label={`审核初始图谱：${proposal.title}`}
       aria-disabled={!interactive || undefined}
     >
-      <div className="graph-proposal__heading">
-        <span>
-          <Network className="size-4" />
-        </span>
+      <div className="topic-preview-head">
         <div>
-          <p>图谱变更提案</p>
-          <strong>{proposal.title}</strong>
+          <strong>审核初始图谱</strong>
+          <span className="topic-preview-sub">
+            {proposal.summary ||
+              "未修改的节点视为已接受。确认即通过审核，图谱将发布并绑定到学习会话。"}
+          </span>
         </div>
-        <Badge variant={statusVariant}>{statusLabel}</Badge>
+        <div className="goal-graph-review-tools">
+          <Badge variant={statusVariant}>{statusLabel}</Badge>
+          <StatePill label="新建" status={statusKey} />
+        </div>
       </div>
-      <p className="graph-proposal__summary">{proposal.summary}</p>
-      <div className="graph-proposal__stats">
-        <span><strong>{proposal.nodes.length}</strong> 个节点</span>
-        <span><strong>{proposal.edges.length}</strong> 条关系</span>
-        <span><strong>{proposal.mode}</strong> 模式</span>
+      <p className="goal-flow-graph-review__summary">
+        {proposal.nodes.length} 个节点 · {proposal.edges.length} 条关系 · 确认即通过审核并发布
+      </p>
+      <div className="goal-flow-node-grid topic-preview-list">
+        {proposal.nodes.map((node) => (
+          <article
+            className="goal-flow-node topic-preview-card is-accepted"
+            key={node.id}
+          >
+            <div className="goal-flow-node__head">
+              <Badge
+                variant={node.node_type === "root" ? "default" : "secondary"}
+              >
+                {node.node_type === "root" ? "根节点" : node.node_type}
+              </Badge>
+              <span
+                className="graph-proposal__change"
+                data-change={node.change}
+              >
+                {node.change === "add" ? "新增" : "更新"}
+              </span>
+            </div>
+            <div className="goal-flow-node__content topic-preview-card-body">
+              <h3>{node.label}</h3>
+              <p>{node.description}</p>
+            </div>
+          </article>
+        ))}
       </div>
-      {proposal.nodes.length ? (
-        <ul className="graph-proposal__nodes">
-          {proposal.nodes.slice(0, 8).map((node) => (
-            <li key={node.id}>
-              <span data-change={node.change}>{node.change}</span>
-              <div>
-                <strong>{node.label}</strong>
-                {node.description ? <small>{node.description}</small> : null}
-              </div>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      {proposal.nodes.length > 8 ? (
-        <p className="graph-proposal__more">另有 {proposal.nodes.length - 8} 个节点，确认前可在图谱工作台完整查看。</p>
+      {proposal.edges.length ? (
+        <div className="goal-flow-edge-review" aria-label="候选图谱关系">
+          <div className="goal-flow-edge-review__head">
+            <strong>节点关系</strong>
+            <span>{proposal.edges.length} 条</span>
+          </div>
+          <ul>
+            {proposal.edges.map((edge, index) => (
+              <li
+                key={`${edge.source_ref}-${edge.target_ref}-${index}`}
+              >
+                <span>
+                  {nodeById.get(edge.source_ref)?.label ?? edge.source_ref}
+                </span>
+                <ArrowRight aria-hidden="true" className="size-3.5" />
+                <span>
+                  {nodeById.get(edge.target_ref)?.label ?? edge.target_ref}
+                </span>
+                <Badge variant="outline">{edge.relation}</Badge>
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : null}
       {!interactive && proposal.status === "proposed" ? (
         <div className="graph-proposal__resolved graph-proposal__resolved--pending">
           <GitBranch className="size-3.5" />
-          回答生成中，完成后可审核此提案
+          回答生成中，完成后可审核此图谱
         </div>
       ) : canDecide ? (
-        <div className="graph-proposal__actions">
+        <div className="topic-preview-actions goal-flow-review__actions">
           <Button
             disabled={!graphComponent.allowed_events.includes("reject")}
             onClick={() => emit("reject", { proposal_id: proposal.proposal_id })}
@@ -1056,7 +1205,8 @@ export function TrustedComponentRenderer({
             onClick={() => emit("confirm", { proposal_id: proposal.proposal_id })}
             size="sm"
           >
-            <CheckCircle2 className="size-3.5" />确认写入图谱
+            <CheckCircle2 className="size-3.5" />
+            {confirmLabel}
           </Button>
         </div>
       ) : proposal.status === "confirmed" ? (
@@ -1064,7 +1214,7 @@ export function TrustedComponentRenderer({
           <div className="graph-proposal__resolved-copy">
             <CheckCircle2 className="size-3.5" />
             <span>
-              已写入正式图谱
+              已通过审核并发布
               {proposal.confirmed_revision != null
                 ? ` 修订 v${proposal.confirmed_revision}`
                 : ""}
@@ -1086,9 +1236,9 @@ export function TrustedComponentRenderer({
           {proposal.status === "rejected"
             ? proposal.rejection_reason
               ? `已拒绝：${proposal.rejection_reason}`
-              : "该提案已拒绝，正式图谱未被修改"
+              : "该提案已拒绝，图谱未被发布"
             : proposal.status === "undone"
-              ? "该提案写入已撤销，图谱已恢复"
+              ? "该提案发布已撤销，图谱已移除"
               : "该提案已结束"}
         </div>
       )}

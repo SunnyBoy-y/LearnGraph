@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
@@ -17,6 +17,7 @@ from app.domain.models import (
     GraphRevision,
     Message,
     MessagePartRecord,
+    utc_now,
 )
 from app.domain.schemas.graphs import ModelConversationGraphProposal
 from app.repositories.audit import AuditRepository
@@ -275,7 +276,10 @@ class GraphChangeSetService:
             )
 
         if mode == "create":
-            # Initial draft must include layer 0 (root) and layer 1 only.
+            # Initial draft spans root (layer 0), trunk (layer 1) and up to two
+            # expansion layers per trunk node (layer-2 children and layer-3
+            # grandchildren) so the whole first graph is produced by the create
+            # tool in one proposal. Deeper layers come from later node splits.
             layer_one = [node_id for node_id, depth in depths.items() if depth == 1]
             if not layer_one:
                 raise AppError(
@@ -285,27 +289,31 @@ class GraphChangeSetService:
                     {"root_id": root_id},
                 )
             too_deep = sorted(
-                node_id for node_id, depth in depths.items() if depth > 1
+                node_id for node_id, depth in depths.items() if depth > 3
             )
             if too_deep:
                 raise AppError(
                     502,
                     "graph_proposal_hierarchy_invalid",
-                    "Initial graph generation may only create layer 0 and layer 1; deeper layers are produced by later node splits",
-                    {"deep_refs": too_deep, "max_allowed_depth": 1},
+                    "Initial graph generation may only span layers 0..3 (root, trunk, and two expansion layers); deeper layers are produced by later node splits",
+                    {"deep_refs": too_deep, "max_allowed_depth": 3},
                 )
-            # Every L1 node must be a direct contains child of the root.
-            not_under_root = sorted(
+            # Progressive layers: every node must hang directly under exactly
+            # one contains parent exactly one layer above — no skipped layers,
+            # no cross-layer attachments, no direct-child-of-root-only shortcut.
+            non_progressive = sorted(
                 node_id
                 for node_id in projected_node_ids
-                if node_id != root_id and parents.get(node_id) != [root_id]
+                if node_id != root_id
+                and depths.get(node_id)
+                != depths.get(parents[node_id][0]) + 1
             )
-            if not_under_root:
+            if non_progressive:
                 raise AppError(
                     502,
                     "graph_proposal_hierarchy_invalid",
-                    "On first generation every non-root node must be a direct contains child of the layer-0 root",
-                    {"invalid_refs": not_under_root, "root_id": root_id},
+                    "Initial graph layers must be progressive: every node attaches directly under a contains parent exactly one layer above",
+                    {"invalid_refs": non_progressive, "root_id": root_id},
                 )
             return
 
@@ -495,6 +503,13 @@ class GraphChangeSetService:
                     502,
                     "graph_proposal_out_of_scope",
                     "A proposed edge references a node outside the proposal and target graph",
+                    {"source_ref": edge.source_ref, "target_ref": edge.target_ref},
+                )
+            if edge.source_ref == edge.target_ref:
+                raise AppError(
+                    502,
+                    "graph_proposal_self_loop",
+                    "A graph proposal cannot contain a self-loop edge",
                     {"source_ref": edge.source_ref, "target_ref": edge.target_ref},
                 )
             key = (edge.source_ref, edge.target_ref, edge.relation)
@@ -964,7 +979,19 @@ class GraphChangeSetService:
             "node_ids": ref_to_node_id,
             "edge_ids": [edge.id for edge in created_edges],
         }
-        session.graph_id = graph.id
+        if item.mode == "create":
+            # 确认 create 提案视作通过审核：直接发布为正式图谱。提案校验已经
+            # 保证结构合规（单根、每个非根节点恰好一个 contains 父、无环、
+            # 无重复标签/边、无孤立节点），物化后的候选图谱天然满足可发布性
+            # 门槛。智能体模式没有单独的发布步骤，发布后学习会话才能绑定图谱。
+            self._publish_created_graph(graph, goal, item)
+        else:
+            # A learning Session can only bind a published Graph. The candidate graph
+            # is addressable through the Goal; the session is bound when the graph is
+            # published (GoalService.publish), so an un-reviewed candidate is never
+            # bound to a session that the model can treat as its learning graph.
+            if graph.status == "published":
+                session.graph_id = graph.id
         if session.goal_id is None:
             session.goal_id = goal.id
         self._sync_component_snapshot(item)
@@ -988,6 +1015,47 @@ class GraphChangeSetService:
         self.db.commit()
         self.db.refresh(item)
         return item
+
+    def _publish_created_graph(
+        self,
+        graph: Graph,
+        goal: Goal,
+        item: GraphChangeSet,
+    ) -> None:
+        """Publish a just-materialized create-mode graph immediately.
+
+        智能体模式的 create 提案没有独立发布步骤：用户点击「确认」即视为审核
+        通过，图谱直接进入 published，Goal 进入 approved。学习会话随后绑定该
+        图谱（学习会话只能绑定已发布的图谱）。
+        """
+        if graph.status != "candidate":
+            return
+        graph.status = "published"
+        graph.published_at = utc_now()
+        goal.status = "approved"
+        session_ids = set(
+            self.db.scalars(
+                select(GraphChangeSet.session_id).where(
+                    GraphChangeSet.workspace_id == self.workspace_id,
+                    GraphChangeSet.graph_id == graph.id,
+                    GraphChangeSet.status == "confirmed",
+                )
+            ).all()
+        )
+        if not session_ids:
+            return
+        self.db.execute(
+            update(ChatSession)
+            .where(
+                ChatSession.workspace_id == self.workspace_id,
+                ChatSession.id.in_(session_ids),
+                ChatSession.goal_id == goal.id,
+                ChatSession.graph_id.is_(None),
+                ChatSession.status == "active",
+            )
+            .values(graph_id=graph.id)
+            .execution_options(synchronize_session=False)
+        )
 
     def reject(self, session_id: str, change_set_id: str, reason: str = "") -> GraphChangeSet:
         item = self._change_set(session_id, change_set_id)

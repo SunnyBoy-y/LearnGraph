@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRight,
@@ -38,6 +38,10 @@ import {
 } from "@/components/shared/page-elements";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  KnowledgeGraph,
+  type KnowledgeNode,
+} from "@/components/graph/knowledge-graph";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -478,6 +482,53 @@ export function GoalConfirmPage() {
   );
 }
 
+const REVIEW_RELATION_LABELS: Record<string, string> = {
+  contains: "包含",
+  prerequisite: "前置",
+  related: "关联",
+  contrast: "对比",
+  application: "应用",
+};
+
+/** Graph → KnowledgeGraph 视图：contains 为教学层级，其余关系为视觉叠加。 */
+function toReviewGraphView(graph: Graph) {
+  const containedNodeIds = new Set(
+    graph.edges
+      .filter((edge) => edge.relation === "contains")
+      .map((edge) => edge.target_node_id),
+  );
+  const hasDeclaredRoot = graph.nodes.some(
+    (node) => node.node_type === "root",
+  );
+  const nodes: KnowledgeNode[] = graph.nodes.map((node, index) => ({
+    id: node.id,
+    type: "knowledge",
+    position: {
+      x: 160 + (index % 3) * 190,
+      y: 90 + Math.floor(index / 3) * 130,
+    },
+    data: {
+      label: node.label,
+      description: node.description,
+      nodeType: node.node_type,
+      targetWeight: node.target_weight,
+      mastered: node.attention_state === "mastered",
+      root:
+        node.node_type === "root" ||
+        (!hasDeclaredRoot && !containedNodeIds.has(node.id)),
+    },
+  }));
+  const edges = graph.edges.map((edge) => ({
+    id: edge.id,
+    source: edge.source_node_id,
+    target: edge.target_node_id,
+    label: REVIEW_RELATION_LABELS[edge.relation] ?? edge.relation,
+    data: { relation: edge.relation },
+    type: "smoothstep" as const,
+  }));
+  return { nodes, edges };
+}
+
 export function GraphReviewPage() {
   const { goalId = "", workspaceId = "" } = useParams();
   const [searchParams] = useSearchParams();
@@ -645,6 +696,10 @@ export function GraphReviewPage() {
     graph.data.nodes[0];
   const allAccepted = graph.data.nodes.length > 0;
   const actionsDisabled = graph.data.status === "published";
+  const reviewGraph = useMemo(
+    () => (graph.data ? toReviewGraphView(graph.data) : undefined),
+    [graph.data],
+  );
 
   return (
     <PageFrame>
@@ -659,30 +714,56 @@ export function GraphReviewPage() {
           这是已发布版本。当前页面仍以审核视图展示；修改会生成新的候选修订。
         </SuccessNotice>
       ) : null}
-      <Surface className="candidate-knowledge-surface p-5">
-        <SectionHeading
-          description="点击编辑后直接在卡片内解锁输入框；候选节点以平铺方式审核。"
-          title="拟新增知识卡片"
-        />
-        <div className="candidate-knowledge-grid mt-5">
-          {graph.data.nodes.map((node) => (
-            <CandidateKnowledgeCard
-              busy={updateNode.isPending}
-              disabled={actionsDisabled}
-              key={node.id}
-              node={node}
-              onDelete={() => removeNode.mutate(node.id)}
-              onRetry={(instruction) =>
-                retryNode.mutate({ nodeId: node.id, instruction })
-              }
-              onSave={(body) => updateNode.mutate({ nodeId: node.id, body })}
-              onSelect={() => setSelected(node.id)}
-              retrying={retryNode.isPending}
-              selected={selectedNode?.id === node.id}
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_400px]">
+        <Surface className="candidate-knowledge-surface p-5">
+          <SectionHeading
+            description="点击编辑后直接在卡片内解锁输入框；候选节点以平铺方式审核，右侧图谱点击节点可定位卡片。"
+            title="拟新增知识卡片"
+          />
+          <div className="candidate-knowledge-grid mt-5">
+            {graph.data.nodes.map((node) => (
+              <CandidateKnowledgeCard
+                busy={updateNode.isPending}
+                disabled={actionsDisabled}
+                key={node.id}
+                node={node}
+                onDelete={() => removeNode.mutate(node.id)}
+                onRetry={(instruction) =>
+                  retryNode.mutate({ nodeId: node.id, instruction })
+                }
+                onSave={(body) => updateNode.mutate({ nodeId: node.id, body })}
+                onSelect={() => setSelected(node.id)}
+                retrying={retryNode.isPending}
+                selected={selectedNode?.id === node.id}
+              />
+            ))}
+          </div>
+        </Surface>
+
+        <div className="min-w-0 xl:sticky xl:top-6 xl:self-start">
+          <Surface className="p-4">
+            <SectionHeading
+              description="树状展示 contains 教学层级；点击节点定位到左侧候选卡片。"
+              title="图谱结构预览"
             />
-          ))}
+            <div className="mt-4 h-[540px] overflow-hidden rounded-xl">
+              {reviewGraph ? (
+                <KnowledgeGraph
+                  compact
+                  edges={reviewGraph.edges}
+                  layout="tree"
+                  nodes={reviewGraph.nodes}
+                  onSelect={(node) => setSelected(node.id)}
+                  rootEmphasis
+                  selectedId={selectedNode?.id}
+                  showZoomControls
+                  title={graph.data.title}
+                />
+              ) : null}
+            </div>
+          </Surface>
         </div>
-      </Surface>
+      </div>
 
       <Surface className="p-5">
         <SectionHeading

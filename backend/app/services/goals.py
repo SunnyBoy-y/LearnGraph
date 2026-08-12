@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import and_, delete, distinct, func, or_, select, update
 from sqlalchemy.orm import Session
@@ -54,6 +54,11 @@ from app.domain.schemas.files import FileReferenceCreate
 from app.domain.schemas.workflow import DeleteImpact, ImpactItem
 from app.providers.ports.model import ModelProviderPort
 from app.repositories.audit import AuditRepository
+
+# 分支展开的并发度：主干各分支的模型调用彼此独立，用线程池并行以显著缩短
+# 总等待时间（思考模式 5-6 个主干时约节省一半以上）。并发上限保持克制，
+# 兼顾上游 API 限流与返回质量；需要时可整体调大。
+_GRAPH_BRANCH_PARALLEL_WORKERS = 3
 from app.repositories.domain import (
     FileRepository,
     GoalRepository,
@@ -66,7 +71,14 @@ from app.services.billing import BillingService
 
 
 class GoalService:
-    def __init__(self, db: Session, workspace_id: str, actor_id: str, model_provider: ModelProviderPort) -> None:
+    def __init__(
+        self,
+        db: Session,
+        workspace_id: str,
+        actor_id: str,
+        model_provider: ModelProviderPort,
+        provider_factory: Callable[[], ModelProviderPort] | None = None,
+    ) -> None:
         self.db = db
         self.workspace_id = workspace_id
         self.actor_id = actor_id
@@ -79,6 +91,10 @@ class GoalService:
         self.audit = AuditRepository(db, workspace_id)
         self.model_provider = model_provider
         self.billing = BillingService(db, workspace_id, actor_id)
+        # Optional builder for per-worker provider clones used by the parallel
+        # branch expansion. When omitted, _fork_model_provider reconstructs the
+        # workspace provider from the request payload instead.
+        self.provider_factory = provider_factory
 
     def _ensure_model_provider_available(self) -> None:
         if getattr(self.model_provider, "available", True):
@@ -121,6 +137,10 @@ class GoalService:
                 ),
                 remote_capability=self.model_provider.remote_capability,
             )
+            # Release preflight writes (catalog price seed / audit) BEFORE the
+            # long generate_json call; a dirty session would hold the single
+            # SQLite write lock across the whole remote call.
+            self.db.commit()
             provider_returned = False
             result = None
             try:
@@ -1220,6 +1240,117 @@ class GoalService:
                     )
         return created, added_edges
 
+    def _fork_model_provider(self, payload: CandidateGraphStreamRequest, mode: str):
+        """Build an independent provider instance for one branch worker.
+
+        Remote providers keep per-call metadata (``last_usage``,
+        ``last_request_id``) on the instance, so concurrent branch calls must
+        never share a single instance.  Prefer the injected ``provider_factory``
+        (set by the router with the exact payload/mode the request used);
+        otherwise rebuild from the same payload/mode, replicating the
+        fast→thinking-off default.
+        """
+        if self.provider_factory is not None:
+            return self.provider_factory()
+        from app.core.config import get_settings
+        from app.providers.factory import model_provider_for_workspace
+
+        thinking_mode = payload.thinking_mode
+        if thinking_mode is None and mode == "fast":
+            thinking_mode = "off"
+        return model_provider_for_workspace(
+            self.db,
+            self.workspace_id,
+            get_settings(),
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+            thinking_mode=thinking_mode,
+        )
+
+    @staticmethod
+    def _branch_generate_job(
+        provider: ModelProviderPort,
+        prompt: str,
+        schema: dict[str, Any],
+        attempts: int = 3,
+    ) -> tuple[ModelGraphChunk | None, dict[str, Any] | None, bool]:
+        """Generate one branch expansion inside a worker thread.
+
+        The provider instance is owned by this worker (``last_usage`` is
+        per-instance), so parallel branches never race on usage metadata.
+        Mirrors ``_structured``'s retry budget: returns ``(chunk, usage,
+        provider_returned)`` where ``provider_returned`` is True whenever the
+        provider answered, even when the payload failed validation.
+        """
+        errors: list[str] = []
+        for _ in range(attempts):
+            try:
+                raw = provider.generate_json(
+                    prompt, "learngraph_graph_chunk", schema
+                )
+                usage = dict(getattr(provider, "last_usage", {}) or {})
+                return ModelGraphChunk.model_validate(raw), usage, True
+            except Exception as exc:  # noqa: BLE001 -- same retry budget as _structured
+                errors.append(type(exc).__name__)
+        return None, None, False
+
+    def _emit_branch_layers(
+        self,
+        emit: Any,
+        trunk_node: GraphNode,
+        branch_chunk: ModelGraphChunk,
+        branch_nodes: list[GraphNode],
+        branch_edges: list[GraphEdge],
+    ) -> None:
+        """Emit one branch as two SSE batches: layer-1 children, then layer-2.
+
+        ``branch_nodes`` and ``branch_chunk.nodes`` share index order, so the
+        layer split derives from the spec ``layer`` field (1 = direct child,
+        2 = grandchild).  The tree therefore grows one level at a time even
+        though both layers came from a single model call.
+        """
+        layer1_ids = {
+            branch_nodes[i].id
+            for i, spec in enumerate(branch_chunk.nodes)
+            if spec.layer == 1
+        }
+        if not layer1_ids:
+            layer1_ids = {branch_nodes[0].id} if branch_nodes else set()
+        layer2_ids = {node.id for node in branch_nodes if node.id not in layer1_ids}
+        layer1_edges = [
+            edge
+            for edge in branch_edges
+            if (
+                edge.source_node_id in layer1_ids
+                and edge.target_node_id in layer1_ids
+            )
+            or (
+                edge.source_node_id == trunk_node.id
+                and edge.target_node_id in layer1_ids
+            )
+        ]
+        layer1_edge_ids = {edge.id for edge in layer1_edges}
+        layer2_edges = [
+            edge for edge in branch_edges if edge.id not in layer1_edge_ids
+        ]
+        layer1_nodes = [node for node in branch_nodes if node.id in layer1_ids]
+        layer2_nodes = [node for node in branch_nodes if node.id in layer2_ids]
+        emit(
+            "graph.nodes_added",
+            {
+                "nodes": [self._node_snapshot(node) for node in layer1_nodes],
+                "edges": [self._edge_snapshot(edge) for edge in layer1_edges],
+            },
+        )
+        if layer2_nodes or layer2_edges:
+            emit(
+                "graph.nodes_added",
+                {
+                    "nodes": [self._node_snapshot(node) for node in layer2_nodes],
+                    "edges": [self._edge_snapshot(edge) for edge in layer2_edges],
+                },
+            )
+
     def stream_candidate_graph(
         self,
         goal_id: str,
@@ -1231,11 +1362,13 @@ class GoalService:
         Stage ``root`` persists and emits the single root node immediately so
         the UI can render the root preview while the rest still generates.
         Stage ``nodes_added`` first carries the trunk (level-1 backbone under
-        the root), then per trunk node two incremental batches: its layer-1
-        children and its layer-2 grandchildren (two-layer expansion). Stage
-        ``complete`` carries the final full snapshot. ``mode`` selects the
-        budget: ``fast`` keeps thinking off with a compact trunk and narrow
-        branches; ``thinking`` allows a fuller trunk and wider branches.
+        the root), then every trunk node expands concurrently (each branch in
+        its own worker thread with a dedicated provider instance) and emits
+        two incremental batches when it completes: its layer-1 children and
+        its layer-2 grandchildren (two-layer expansion). Stage ``complete``
+        carries the final full snapshot. ``mode`` selects the budget: ``fast``
+        keeps thinking off with a compact trunk and narrow branches;
+        ``thinking`` allows a fuller trunk and wider branches.
         """
         from typing import Callable
 
@@ -1374,18 +1507,24 @@ class GoalService:
             },
         )
 
-        # Stage 3 — 逐主干节点两层分层展开：每个主干节点生成 layer=1 直接子节点
-        # 与 layer=2 孙节点，按层分两个 nodes_added 事件流式发出。
+        # Stage 3 — 各主干节点的两层分层展开：模型调用彼此独立且耗时最长，
+        # 用线程池并发执行（每个 worker 持有独立的 provider 实例，避免
+        # last_usage 竞态）；记账、标签去重、持久化与 SSE 事件全部回到主线程
+        # 串行处理，SQLite 写锁只在主线程短暂持有。分支按完成顺序逐个发出，
+        # 前端即可看到图谱逐分支、逐层「长出来」。
         expanded_branches = 0
-        for trunk_node in trunk_nodes:
-            if not remote:
-                break  # 无远程模型时仅保留主干，不做更深展开
+        if remote and trunk_nodes:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             layer1_count, layer2_count = (
                 (2, 1) if mode == "fast" else (3, 2)
             )
-            branch_chunk: ModelGraphChunk | None = None
-            try:
-                branch_chunk = self._structured(
+            chunk_schema = ModelGraphChunk.model_json_schema()
+            # 先在主线程完成全部记账预检（可能产生少量写入），一次提交释放
+            # SQLite 写锁，再并发发起模型调用。
+            pending: list[tuple[GraphNode, Any, str]] = []
+            for trunk_node in trunk_nodes:
+                prompt = (
                     "为图谱主干节点生成「两层分层展开」（layer=1 + layer=2）。"
                     "layer=1：该主干节点下的直接子节点，"
                     + f"生成 {layer1_count}-{layer1_count + 1} 个；"
@@ -1401,71 +1540,80 @@ class GoalService:
                     + "\n图谱标题：" + graph_title
                     + "\n根节点：" + root.label
                     + "\n已确认 Goal：" + goal_context[:12_000]
-                    + "\n种子概念：" + ", ".join(concepts),
-                    "learngraph_graph_chunk",
-                    ModelGraphChunk,
+                    + "\n种子概念：" + ", ".join(concepts)
                 )
-            except Exception:
-                branch_chunk = None
-            if branch_chunk is None or not branch_chunk.nodes:
-                continue
-            fresh_indexes = {
-                index
-                for index, node in enumerate(branch_chunk.nodes)
-                if node.label not in seen_labels and node.label != root.label
-            }
-            if not fresh_indexes:
-                continue
-            for node in branch_chunk.nodes:
-                if node.label not in seen_labels and node.label != root.label:
-                    seen_labels.add(node.label)
-            branch_chunk = self._filter_chunk_keep(branch_chunk, fresh_indexes)
-            branch_nodes, branch_edges = self._append_parent_chunk(graph, trunk_node, branch_chunk)
+                quote = self.billing.preflight_model_call(
+                    provider_id=self.model_provider.provider_id,
+                    model_id=getattr(self.model_provider, "model_id", "unknown"),
+                    feature="learngraph_graph_chunk",
+                    estimated_input_tokens=max(1, (len(prompt) + 3) // 4),
+                    estimated_output_tokens=max(
+                        0,
+                        int(getattr(self.model_provider, "max_output_tokens", 0)),
+                    ),
+                    remote_capability=True,
+                )
+                pending.append((trunk_node, quote, prompt))
             self.db.commit()
-            # 分层发出：先 layer=1 直接子节点批次，再 layer=2 孙节点批次。
-            # branch_nodes 与 branch_chunk.nodes 按同一顺序一一对应。
-            layer1_ids = {
-                branch_nodes[i].id
-                for i, spec in enumerate(branch_chunk.nodes)
-                if spec.layer == 1
-            }
-            if not layer1_ids:
-                layer1_ids = {branch_nodes[0].id} if branch_nodes else set()
-            layer2_ids = {node.id for node in branch_nodes if node.id not in layer1_ids}
-            layer1_edges = [
-                edge
-                for edge in branch_edges
-                if (
-                    edge.source_node_id in layer1_ids
-                    and edge.target_node_id in layer1_ids
-                )
-                or (
-                    edge.source_node_id == trunk_node.id
-                    and edge.target_node_id in layer1_ids
-                )
+            providers = [
+                self._fork_model_provider(payload, mode)
+                for _ in range(min(_GRAPH_BRANCH_PARALLEL_WORKERS, len(pending)))
             ]
-            layer1_edge_ids = {edge.id for edge in layer1_edges}
-            layer2_edges = [
-                edge for edge in branch_edges if edge.id not in layer1_edge_ids
-            ]
-            layer1_nodes = [node for node in branch_nodes if node.id in layer1_ids]
-            layer2_nodes = [node for node in branch_nodes if node.id in layer2_ids]
-            _emit(
-                "graph.nodes_added",
-                {
-                    "nodes": [self._node_snapshot(node) for node in layer1_nodes],
-                    "edges": [self._edge_snapshot(edge) for edge in layer1_edges],
-                },
-            )
-            if layer2_nodes or layer2_edges:
-                _emit(
-                    "graph.nodes_added",
-                    {
-                        "nodes": [self._node_snapshot(node) for node in layer2_nodes],
-                        "edges": [self._edge_snapshot(edge) for edge in layer2_edges],
-                    },
-                )
-            expanded_branches += 1
+            future_to_branch: dict[Any, tuple[GraphNode, Any]] = {}
+            with ThreadPoolExecutor(
+                max_workers=len(providers),
+                thread_name_prefix="lg-graph-branch",
+            ) as pool:
+                for index, (trunk_node, quote, prompt) in enumerate(pending):
+                    future = pool.submit(
+                        self._branch_generate_job,
+                        providers[index % len(providers)],
+                        prompt,
+                        chunk_schema,
+                    )
+                    future_to_branch[future] = (trunk_node, quote)
+                for future in as_completed(future_to_branch):
+                    trunk_node, quote = future_to_branch[future]
+                    chunk: ModelGraphChunk | None = None
+                    usage: dict[str, Any] = {}
+                    provider_returned = False
+                    try:
+                        chunk, usage, provider_returned = future.result()
+                    except BaseException:  # noqa: BLE001 -- one branch must not kill the stream
+                        chunk, usage, provider_returned = None, {}, False
+                    if provider_returned:
+                        self.billing.record_usage(
+                            quote,
+                            input_tokens=int(usage.get("input_tokens") or 0),
+                            output_tokens=int(usage.get("output_tokens") or 0),
+                            cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                            cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+                            reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+                            attempt=1,
+                            usage_reported=bool(usage),
+                        )
+                        self.db.commit()
+                    if chunk is None or not chunk.nodes:
+                        continue
+                    fresh_indexes = {
+                        index
+                        for index, node in enumerate(chunk.nodes)
+                        if node.label not in seen_labels and node.label != root.label
+                    }
+                    if not fresh_indexes:
+                        continue
+                    for node in chunk.nodes:
+                        if node.label not in seen_labels and node.label != root.label:
+                            seen_labels.add(node.label)
+                    branch_chunk = self._filter_chunk_keep(chunk, fresh_indexes)
+                    branch_nodes, branch_edges = self._append_parent_chunk(
+                        graph, trunk_node, branch_chunk
+                    )
+                    self.db.commit()
+                    self._emit_branch_layers(
+                        _emit, trunk_node, branch_chunk, branch_nodes, branch_edges
+                    )
+                    expanded_branches += 1
 
         self._normalize_candidate_roots(graph)
         goal.status = "candidate_ready"
@@ -1766,6 +1914,40 @@ class GoalService:
             )
         return violations, len(nodes), len(edges)
 
+    def _bind_sessions_to_published_graph(self, graph: Graph) -> None:
+        """Bind active creator sessions once their graph is published.
+
+        A learning Session can only bind a published Graph, so the agent-mode
+        (and chat) proposal flow never binds a candidate graph to its session.
+        When the graph is published, sessions that confirmed a change set
+        against it get the binding so Goal/Graph tooling can act on it. The
+        WHERE clause is a no-op when the session is already bound elsewhere.
+        """
+
+        session_ids = set(
+            self.db.scalars(
+                select(GraphChangeSet.session_id).where(
+                    GraphChangeSet.workspace_id == self.workspace_id,
+                    GraphChangeSet.graph_id == graph.id,
+                    GraphChangeSet.status == "confirmed",
+                )
+            ).all()
+        )
+        if not session_ids:
+            return
+        self.db.execute(
+            update(ChatSession)
+            .where(
+                ChatSession.workspace_id == self.workspace_id,
+                ChatSession.id.in_(session_ids),
+                ChatSession.goal_id == graph.goal_id,
+                ChatSession.graph_id.is_(None),
+                ChatSession.status == "active",
+            )
+            .values(graph_id=graph.id)
+            .execution_options(synchronize_session=False)
+        )
+
     def publish(self, goal_id: str, payload: PublishGoalRequest) -> PublishGoalResponse:
         goal = self.goals.require(goal_id, "goal")
         graph = self.graphs.require(payload.graph_id, "graph")
@@ -1797,6 +1979,7 @@ class GoalService:
                     "published_graph_goal_state_conflict",
                     "Published Graph and Goal approval state are inconsistent",
                 )
+            self._bind_sessions_to_published_graph(graph)
             return PublishGoalResponse(
                 goal=GoalView.model_validate(goal),
                 graph_id=graph.id,
@@ -1872,6 +2055,9 @@ class GoalService:
         # the ORM flush cannot emit a second, unconditional Graph write.
         self.db.refresh(graph)
         goal.status = "approved"
+        # The graph is now published: bind the sessions that confirmed a change
+        # set against it (a learning Session can only bind a published Graph).
+        self._bind_sessions_to_published_graph(graph)
         self.audit.record(
             actor_id=self.actor_id,
             action="graph.publish",

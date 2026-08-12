@@ -31,7 +31,13 @@ router = APIRouter(prefix="/goals", tags=["goals"])
 
 
 def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> GoalService:
-    return GoalService(db, context.workspace_id, context.principal.user_id, model_provider_for_workspace(db, context.workspace_id, settings))
+    return GoalService(
+        db,
+        context.workspace_id,
+        context.principal.user_id,
+        model_provider_for_workspace(db, context.workspace_id, settings),
+        provider_factory=lambda: model_provider_for_workspace(db, context.workspace_id, settings),
+    )
 
 
 def service_with_model(
@@ -49,6 +55,10 @@ def service_with_model(
     provider/model; without this the wizard silently falls back to the
     workspace's implicit provider-priority default, which is how a model that
     works in normal chat could still fail the goal/graph endpoints.
+
+    The ``provider_factory`` closure lets the parallel branch expansion build
+    one dedicated provider instance per worker thread (usage metadata such as
+    ``last_usage`` is per-instance, so workers must never share one).
     """
 
     return GoalService(
@@ -56,6 +66,14 @@ def service_with_model(
         context.workspace_id,
         context.principal.user_id,
         model_provider_for_workspace(
+            db,
+            context.workspace_id,
+            settings,
+            provider_id=provider_id,
+            model_id=model_id,
+            thinking_mode=thinking_mode,
+        ),
+        provider_factory=lambda: model_provider_for_workspace(
             db,
             context.workspace_id,
             settings,
@@ -205,15 +223,18 @@ def candidate_graph_stream(
     settings: AppSettings,
 ) -> StreamingResponse:
     """Stream a candidate graph trunk-first: root preview, then trunk, then
-    per-trunk two-layer expansion.
+    per-trunk two-layer expansion generated concurrently across branches.
 
     Event order: ``graph.root`` (single root), ``graph.nodes_added`` (trunk),
     then per trunk node two ``graph.nodes_added`` events (layer-1 children,
-    layer-2 grandchildren), then ``graph.complete`` (full snapshot). Every
-    stage is persisted before it is emitted, so the review flow can start from
-    the already-visible root. ``mode=fast`` keeps thinking off with a compact
-    trunk and narrow branches; ``mode=thinking`` keeps the provider thinking
-    budget with a fuller trunk and wider branches.
+    layer-2 grandchildren) in branch completion order, then
+    ``graph.complete`` (full snapshot). Every stage is persisted before it is
+    emitted, so the review flow can start from the already-visible root.
+    Branch expansions run in parallel worker threads; persistence and SSE
+    emission stay on a single thread so SQLite writes remain short and
+    serialized. ``mode=fast`` keeps thinking off with a compact trunk and
+    narrow branches; ``mode=thinking`` keeps the provider thinking budget
+    with a fuller trunk and wider branches.
     """
     require_goal_access(goal_id, "write", db, context)
     thinking_mode = payload.thinking_mode

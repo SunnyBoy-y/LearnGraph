@@ -50,7 +50,7 @@ description: 目标模式（Goal 按钮）下的强制编排 Skill。指导智�
 
 1. 先复述当前理解的目标（一句话）。
 2. 需要澄清 → 用 `lg_goal_ask_batch` / `lg_goal_ask` 发卡片；需要用户改字段 → `lg_goal_edit_draft`；需要决策数据 → 先检索再出图表。
-3. 会话已绑定已确认 Goal/Graph：`lg_goal_read` 核对 → `lg_graph_read` 读取当前图谱 → **先按 `graph-generation` Skill 的分层生成规则与"提交前自我校验清单"完成结构自检**（层级、深度、环/孤立节点校验以 graph-generation 为唯一权威）→ 通过后 `lg_graph_propose_change` 生成待审核提案；校验失败先修正再重试，绝不把半成品审核卡丢给用户。**调用 `lg_graph_propose_change` 前必须先用 `lg_skill_read` 读取 `graph-generation` 的完整 SKILL.md**，不得凭本 Skill 的记忆推断层级规则。
+3. 会话已绑定已确认 Goal/Graph：`lg_goal_read` 核对 → `lg_graph_read` 读取当前图谱 → **先按 `graph-generation` Skill 的分层生成规则与"提交前自我校验清单"完成结构自检**（层级、深度、环/孤立节点校验以 graph-generation 为唯一权威）→ 通过后按语义选择工具：Goal 尚无图谱用 `lg_graph_create`（首次新建），已有图谱用 `lg_graph_propose_change`（增量更新）生成待审核提案；校验失败先修正再重试，绝不把半成品审核卡丢给用户。**调用图谱工具前必须先用 `lg_skill_read` 读取 `graph-generation` 的完整 SKILL.md**，不得凭本 Skill 的记忆推断层级规则。
 4. 会话尚未绑定已确认 Goal：`lg_goal_read` 确认 → 信息足以命名学科主题时 `lg_goal_create` 生成待确认草稿并绑定 → **仅当用户本轮明确同意后** `lg_goal_confirm` 置为已确认。
 5. 确认 Goal 后按序使用图谱、路线、日程工具；未经确认的草稿不能作为正式图谱/路线/日程依据。路线/日程的编排细节（基于图谱前置、掌握度、可用时间排序）按 `roadmap-planning` Skill 执行，必要时用 `lg_skill_read` 展开其完整规则。
 6. 路线/日程只在目标、期限、验收方式足以排序时调用；信息不足先用聚合卡片澄清；与 roadmap-planning / review-coach 的领域规则冲突时，以对应叶子 Skill 为准。

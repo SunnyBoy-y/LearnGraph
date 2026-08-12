@@ -1864,6 +1864,29 @@ body.is-resizing .workspace-resizer {
 .question-batch__open textarea { min-height: 84px; resize: vertical; }
 .question-batch__progress { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; border-top: 1px solid #ececec; padding-top: 10px; color: #8a8a8a; font-size: 11px; }
 .question-batch__missing { color: #b45309; font-weight: 650; }
+
+/* 智能体模式控件 1:1 复刻极速模式：聚合问答卡片改为 goal-quiz 选项卡翻页。 */
+.goal-flow-questionnaire.goal-quiz.question-batch { width: min(100%, 780px); margin: 12px 0; }
+.goal-flow-questionnaire.goal-quiz.question-batch .goal-quiz-head { padding-top: 14px; }
+.goal-quiz-card__open { display: grid; gap: 10px; padding: 6px 0 2px; }
+.goal-quiz-card__prompt { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.goal-quiz-card__prompt > strong { font-size: 13px; font-weight: 680; line-height: 1.5; }
+.goal-quiz-card__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.goal-quiz-card .question-batch__date, .goal-quiz-card .question-batch__open { margin: 2px 0 6px; }
+.goal-quiz-card .question-batch__open input, .goal-quiz-card .question-batch__open textarea { border-radius: 9px; background: #fff; }
+.goal-quiz-card .question-batch__open textarea { min-height: 84px; resize: vertical; }
+/* create 提案审核卡：与极速模式「审核初始图谱」面板同款外观。 */
+.graph-proposal.is-create-panel { margin: 12px 0; border-color: #e2e4e0; border-radius: 16px; background:
+  radial-gradient(circle at 88% 0%, rgba(50,127,109,.06), transparent 32%),
+  #fbfcfb; padding: 4px 16px 8px; }
+.graph-proposal.is-create-panel .goal-flow-node { min-height: 0; }
+.graph-proposal.is-create-panel .goal-flow-node__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.graph-proposal__change { color: #9a741f; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 650; }
+.graph-proposal__change[data-change='update'] { color: #166534; }
+.dark .goal-quiz-card .question-batch__open input, .dark .goal-quiz-card .question-batch__open textarea { background: #1a211d; }
+.dark .graph-proposal__change { color: #e0bc64; }
+.dark .graph-proposal__change[data-change='update'] { color: #7fd6a9; }
+
 /* Date picker calendar with embedded learning schedule (question_batch date). */
 .date-schedule-calendar { display: grid; gap: 8px; border: 1px solid #e5e5e5; border-radius: 12px; background: #fbfbfb; padding: 10px; }
 .date-schedule-calendar__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

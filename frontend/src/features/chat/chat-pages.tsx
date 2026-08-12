@@ -74,6 +74,7 @@ import {
   generateSessionSuggestedPrompts,
   getAgentSandboxReadiness,
   getCurrentUser,
+  getGraph,
   getSandboxBootstrapStatus,
   getMessageSnapshot,
   getSessionContextUsage,
@@ -4161,13 +4162,25 @@ export function ChatCanvasPage() {
   );
   const rememberCreatedSession = useCallback(
     (session: Session) => {
-      // Seed workspace default response mode before the chat route hydrates so a
-      // brand-new draft never inherits a previous session's "极速" via localStorage.
+      // Seed the new session with the LIVE composer selection. This matters
+      // when a session is created mid-send (goal mode): the user already picked
+      // 智能体 + a real provider/model, and seeding workspace defaults here
+      // would wipe that selection once the chat route hydrates — forcing the
+      // mode back to 思考 and leaving selectedModel empty for the next send
+      // (e.g. submitting the goal-clarification answer card). For page-load
+      // draft creation the live selection IS the workspace default, so that
+      // flow keeps its "no previous-session leak" guarantee unchanged.
       if (!hasSessionComposerPrefs(session.id)) {
-        setSessionComposerPrefs(
-          session.id,
-          defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
-        );
+        setSessionComposerPrefs(session.id, {
+          responseMode,
+          thinkingMode,
+          searchRoute,
+          generationMode,
+          providerId: selectedProviderId || undefined,
+          modelId: selectedModelId || undefined,
+          imageProviderId: selectedImageProviderId || undefined,
+          imageModelId: selectedImageModelId || undefined,
+        });
       }
       queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
         session,
@@ -4177,7 +4190,18 @@ export function ChatCanvasPage() {
         new CustomEvent("learngraph:session-created", { detail: { session } }),
       );
     },
-    [queryClient, workspaceDefaultResponseMode, workspaceId],
+    [
+      generationMode,
+      queryClient,
+      responseMode,
+      searchRoute,
+      selectedImageModelId,
+      selectedImageProviderId,
+      selectedModelId,
+      selectedProviderId,
+      thinkingMode,
+      workspaceId,
+    ],
   );
   useEffect(() => {
     if (sessionId !== "new" || goalMode) return;
@@ -4355,6 +4379,8 @@ export function ChatCanvasPage() {
     // 极速/思考 both stream the graph root-first; 极速 keeps thinking off and
     // produces fewer batches, 思考 allows the provider thinking budget.
     graphMode: responseMode === "fast" ? "fast" : "thinking",
+    // 智能体模式下右侧图谱预览由会话消息驱动，关闭向导自身的广播以免覆盖。
+    previewEnabled: responseMode !== "agentic",
   });
   useEffect(() => {
     if (!goalMode) return;
@@ -4364,6 +4390,79 @@ export function ChatCanvasPage() {
       }),
     );
   }, [composerText, goalMode]);
+
+  // 智能体模式：把会话消息里的 create 图谱提案实时同步到右侧「目标图谱预览」，
+  // 提案待审核 → reviewing；确认后（状态为 confirmed）→ approved（通过审核）。
+  useEffect(() => {
+    if (!goalMode || responseMode !== "agentic") return;
+    const proposalParts = messages.flatMap((message) =>
+      (message.parts ?? []).map((part) => ({ part, message })),
+    );
+    const latest = [...proposalParts]
+      .reverse()
+      .find(
+        ({ part }) =>
+          part.type === "component" &&
+          part.data?.component_type === "graph_update_proposal",
+      );
+    const props = latest?.part.data?.props as
+      | {
+          mode?: string;
+          status?: string;
+          title?: string;
+          nodes?: Array<{
+            id?: string;
+            ref?: string;
+            node_id?: string | null;
+            label: string;
+            description?: string;
+            node_type?: string;
+          }>;
+          edges?: Array<{
+            source_ref?: string;
+            target_ref?: string;
+            relation?: string;
+          }>;
+        }
+      | undefined;
+    if (!props || props.mode !== "create") return;
+    const refToId = new Map(
+      (props.nodes ?? []).map((node) => [
+        node.ref,
+        node.node_id || node.ref || node.id,
+      ]),
+    );
+    window.dispatchEvent(
+      new CustomEvent("learngraph:goal-graph-preview", {
+        detail: {
+          submittedPrompt: "",
+          title: props.title,
+          answers: [],
+          questionCount: 0,
+          phase:
+            props.status === "confirmed"
+              ? "approved"
+              : props.status === "proposed"
+                ? "reviewing"
+                : "draft",
+          graphNodes: (props.nodes ?? []).map((node) => ({
+            id: node.node_id || node.ref || node.id,
+            label: node.label,
+            description: node.description ?? "",
+            node_type: node.node_type ?? "concept",
+          })),
+          graphEdges: (props.edges ?? []).map((edge, index) => ({
+            id: `proposal-edge-${index}`,
+            source_node_id:
+              refToId.get(edge.source_ref ?? "") ?? edge.source_ref ?? "",
+            target_node_id:
+              refToId.get(edge.target_ref ?? "") ?? edge.target_ref ?? "",
+            relation: edge.relation ?? "related",
+          })),
+        },
+      }),
+    );
+  }, [goalMode, messages, responseMode]);
   const closeSessionMutation = useMutation({
     mutationFn: () => {
       if (!currentSession || sessionId === "new") {
@@ -5724,12 +5823,39 @@ export function ChatCanvasPage() {
             })
           : Promise.resolve(),
       ]);
+      // 确认 create 提案视作通过审核：拉取已发布的真实图谱并广播到右侧预览。
+      if (
+        changeSet.status === "confirmed" &&
+        changeSet.mode === "create" &&
+        changeSet.graph_id
+      ) {
+        try {
+          const publishedGraph = await getGraph(changeSet.graph_id);
+          window.dispatchEvent(
+            new CustomEvent("learngraph:goal-graph-preview", {
+              detail: {
+                submittedPrompt: "",
+                title: publishedGraph.title,
+                answers: [],
+                questionCount: 0,
+                phase: "approved",
+                graphNodes: publishedGraph.nodes,
+                graphEdges: publishedGraph.edges,
+              },
+            }),
+          );
+        } catch {
+          // 右侧预览降级：消息内的提案快照仍会展示为已通过审核，不做阻塞。
+        }
+      }
       setLocalMessages([]);
       setRejectProposalId(null);
       setRejectReason("");
       toast.success(
         changeSet.status === "confirmed"
-          ? `图谱提案已写入修订 v${changeSet.confirmed_revision}`
+          ? changeSet.mode === "create"
+            ? `图谱已通过审核并发布（修订 v${changeSet.confirmed_revision}）`
+            : `图谱提案已写入修订 v${changeSet.confirmed_revision}`
           : changeSet.status === "undone"
             ? "图谱提案写入已撤销"
             : "图谱提案已拒绝，正式图谱未被修改",

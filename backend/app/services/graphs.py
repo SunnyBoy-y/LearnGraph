@@ -91,6 +91,10 @@ class GraphService:
             ),
             remote_capability=self.model_provider.remote_capability,
         )
+        # Release preflight writes (catalog price seed / audit) BEFORE the
+        # long generate_json call; a dirty session would hold the single
+        # SQLite write lock across the whole remote call.
+        self.db.commit()
         raw = self.model_provider.generate_json(prompt, schema_name, schema)
         usage = dict(getattr(self.model_provider, "last_usage", {}) or {})
         self.billing.record_usage(

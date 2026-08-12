@@ -33,6 +33,7 @@ import {
   Route,
   Save,
   Search,
+  ShieldCheck,
   Sparkles,
   Split,
   Target,
@@ -167,6 +168,8 @@ type ShelfBook = {
   progress: string;
   icon: typeof Database;
   isGoalBook: boolean;
+  /** 候选图谱：不可直接学习，需先经审核发布。 */
+  needsReview: boolean;
 };
 
 const graphStateLabels: Record<string, string> = {
@@ -259,6 +262,7 @@ function shelfBooks(
             : book.progress,
       icon: graph ? Database : CircleDot,
       isGoalBook: !graph,
+      needsReview: graph?.status === "candidate",
     };
   });
   const graphEntries = graphSummaries
@@ -276,6 +280,7 @@ function shelfBooks(
           : `修订 ${graph.revision}`,
       icon: Database,
       isGoalBook: false,
+      needsReview: graph.status === "candidate",
     }));
   return [...goalEntries, ...graphEntries];
 }
@@ -334,6 +339,7 @@ function GraphBookshelf({
   selectedId,
   onDelete,
   onOpen,
+  onReview,
   onStartGoal,
   onStartLearning,
 }: {
@@ -341,6 +347,7 @@ function GraphBookshelf({
   selectedId?: string;
   onDelete: (book: ShelfBook) => void;
   onOpen: (book: ShelfBook) => void;
+  onReview: (book: ShelfBook) => void;
   onStartGoal: () => void;
   onStartLearning: (book: ShelfBook) => void;
 }) {
@@ -503,22 +510,33 @@ function GraphBookshelf({
                   </span>
                 </button>
                 <div className="graph-library__book-actions">
-                  <Button
-                    onClick={() =>
-                      entry.graphId ? onStartLearning(entry) : onStartGoal()
-                    }
-                    size="xs"
-                    variant={entry.graphId ? "default" : "outline"}
-                  >
-                    {entry.graphId ? (
-                      <>
-                        <BookOpen className="size-3.5" />
-                        立即学习
-                      </>
-                    ) : (
-                      "继续澄清"
-                    )}
-                  </Button>
+                  {entry.needsReview && entry.graphId ? (
+                    <Button
+                      onClick={() => onReview(entry)}
+                      size="xs"
+                      variant="secondary"
+                    >
+                      <ShieldCheck className="size-3.5" />
+                      去审核
+                    </Button>
+                  ) : (
+                    <Button
+                      onClick={() =>
+                        entry.graphId ? onStartLearning(entry) : onStartGoal()
+                      }
+                      size="xs"
+                      variant={entry.graphId ? "default" : "outline"}
+                    >
+                      {entry.graphId ? (
+                        <>
+                          <BookOpen className="size-3.5" />
+                          立即学习
+                        </>
+                      ) : (
+                        "继续澄清"
+                      )}
+                    </Button>
+                  )}
                   <Button
                     aria-label={`删除图谱书架条目 ${entry.title}`}
                     className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -587,6 +605,17 @@ function GraphBookshelf({
             >
               <RotateCcw />
             </Button>
+            {selectedBook?.needsReview && selectedBook.graphId ? (
+              <Button
+                aria-label={`审核图谱书架条目 ${selectedBook.title}`}
+                onClick={() => onReview(selectedBook)}
+                size="icon-sm"
+                title={`审核「${selectedBook.title}」并发布`}
+                variant="secondary"
+              >
+                <ShieldCheck />
+              </Button>
+            ) : null}
             {selectedBook ? (
               <Button
                 aria-label={`删除图谱书架条目 ${selectedBook.title}`}
@@ -885,6 +914,13 @@ export function GraphWorkspacePage() {
     });
   }, [activeGraphId, maximumDepth, workbenchGraph]);
 
+  // 回到书架视图时清空已记录的深度状态：之后从书架打开任意一本图谱，
+  // 都视为“首次打开”并恢复默认全展开（否则上次手动收起的层级会残留）。
+  useEffect(() => {
+    if (activeGraphId) return;
+    depthStateRef.current = { graphId: undefined, maximumDepth: 0 };
+  }, [activeGraphId]);
+
   useEffect(() => {
     setDepthLimit((current) =>
       Math.min(maximumDepth, Math.max(current, requestedNodeDepth)),
@@ -1139,6 +1175,18 @@ export function GraphWorkspacePage() {
     toast.message(`正在为「${book.title}」创建学习项目…`);
   }
 
+  /** 候选图谱直达审核发布页：避免后台创建的图谱卡在待审核无法学习。 */
+  function reviewGraph(goalId: string, graphId: string) {
+    navigate(
+      `${base}/goals/${encodeURIComponent(goalId)}/graph-review?graph=${encodeURIComponent(graphId)}`,
+    );
+  }
+
+  function reviewBook(book: ShelfBook) {
+    if (!book.graphId) return;
+    reviewGraph(book.goalId, book.graphId);
+  }
+
   function startGoalClarification() {
     const returnTo = hasOpenedGraph
       ? `${base}/graphs/${graphId}${selectedShelfId ? `?shelf=${encodeURIComponent(selectedShelfId)}` : ""}`
@@ -1217,6 +1265,7 @@ export function GraphWorkspacePage() {
           books={libraryBooks}
           onDelete={(book) => void requestGoalDeletion(book)}
           onOpen={openBook}
+          onReview={reviewBook}
           onStartGoal={startGoalClarification}
           onStartLearning={startBookLearning}
           selectedId={selectedShelfId}
@@ -1345,6 +1394,7 @@ export function GraphWorkspacePage() {
                 openBook(book);
                 setLibraryOpen(false);
               }}
+              onReview={reviewBook}
               onStartGoal={startGoalClarification}
               onStartLearning={startBookLearning}
               selectedId={selectedBook?.id}
@@ -1433,6 +1483,16 @@ export function GraphWorkspacePage() {
                   <Brain className="size-4" />
                   能力成长视图
                 </DropdownMenuItem>
+                {activeGraph?.status === "candidate" ? (
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      reviewGraph(activeGraph.goal_id, activeGraph.id)
+                    }
+                  >
+                    <ShieldCheck className="size-4" />
+                    审核待发布图谱
+                  </DropdownMenuItem>
+                ) : null}
                 {activeGraph && !selectedBook?.isGoalBook ? (
                   <DropdownMenuItem onSelect={() => setGraphReviewOpen(true)}>
                     <GitCompareArrows className="size-4" />
@@ -1460,6 +1520,14 @@ export function GraphWorkspacePage() {
                 <Sparkles className="size-4" />
                 继续澄清
               </Button>
+            ) : activeGraph?.status === "candidate" ? (
+              <Button
+                onClick={() => reviewGraph(activeGraph.goal_id, activeGraph.id)}
+                size="sm"
+              >
+                <ShieldCheck className="size-4" />
+                去审核
+              </Button>
             ) : activeGraph ? (
               <Button
                 onClick={() =>
@@ -1473,6 +1541,7 @@ export function GraphWorkspacePage() {
                     progress: "",
                     icon: Database,
                     isGoalBook: false,
+                    needsReview: false,
                   })
                 }
                 size="sm"

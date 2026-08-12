@@ -278,11 +278,12 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
     OfficialSkillSpec(
         key="graph-generation",
         display_name="知识图谱生成",
-        version="1.0.0",
+        version="1.0.1",
         dir_name="graph_generation",
         description=(
             "Generate or update a reviewable knowledge-graph proposal from a "
-            "learning goal or course material via lg_graph_propose_change."
+            "learning goal or course material via lg_graph_create (new graph) "
+            "or lg_graph_propose_change (update)."
         ),
         grant_reason="official_skill_auto_enable",
     ),

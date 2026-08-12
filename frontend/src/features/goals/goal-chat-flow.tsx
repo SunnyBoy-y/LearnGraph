@@ -79,6 +79,12 @@ type GoalSetupOptions = {
    * root-first so the user sees the root preview immediately.
    */
   graphMode?: "fast" | "thinking";
+  /**
+   * Whether the wizard broadcasts progress to the right-hand goal graph
+   * preview rail. Agent mode (智能体) drives the rail from conversation parts
+   * instead, so callers should disable this to avoid clobbering it.
+   */
+  previewEnabled?: boolean;
 };
 
 function initialGoalDraft(goal: Goal): GoalConfirmRequest {
@@ -157,6 +163,7 @@ export function useGoalSetupFlow({
   modelId,
   thinkingMode,
   graphMode = "thinking",
+  previewEnabled = true,
 }: GoalSetupOptions) {
   const queryClient = useQueryClient();
   const wasEnabled = useRef(enabled);
@@ -458,7 +465,7 @@ export function useGoalSetupFlow({
   }, [graph.data?.revision]);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || !previewEnabled) return;
     const currentGraph = graph.data;
     const building = stage === "graph_building";
     // While the candidate is still streaming, prefer the incremental preview so
@@ -498,6 +505,7 @@ export function useGoalSetupFlow({
     clarify.isPending,
     enabled,
     graph.data,
+    previewEnabled,
     result,
     stage,
     streamPreview.edges,

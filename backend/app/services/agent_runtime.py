@@ -291,27 +291,97 @@ class AgentToolRuntime:
             {
                 "type": "function",
                 "function": {
-                    "name": "lg_graph_propose_change",
+                    "name": "lg_graph_create",
                     "description": (
-                        "Create a reviewable target-graph proposal for the Goal "
-                        "bound to this session, or update the Graph bound to this "
-                        "session. This tool never publishes or mutates the formal "
-                        "graph. Hierarchy rules (enforced by host): contains edges "
-                        "define layers (parent -> child); layer 0 is the single root. "
-                        "First generation MUST include layer 0 + layer 1 only: root "
-                        "plus its direct contains children; no orphans and no depth>1. "
-                        "Each later split of a node must only add the next layer under "
-                        "that already-existing parent (contains parent_depth+1), not "
-                        "multi-layer chains or free-floating nodes. Also self-validate: "
-                        "read the current graph first when updating; keep exactly one "
-                        "root; never re-add existing concepts (update instead); every "
-                        "non-root node needs exactly one contains parent; avoid "
-                        "prerequisite/contains cycles and duplicate labels. Invalid "
-                        "proposals are rejected and no review card is shown."
+                        "Create a NEW reviewable target-graph proposal for the "
+                        "confirmed Goal bound to this session (first generation "
+                        "only). Use this only when the Goal has no graph yet; if a "
+                        "candidate or published graph already exists, use "
+                        "lg_graph_propose_change to update it instead. This tool "
+                        "writes a reviewable proposal and never mutates the "
+                        "formal graph by itself: the user confirms the review "
+                        "card, and that confirmation is treated as the review "
+                        "passing — the graph is created, published and the Goal "
+                        "approved at that moment, and the Session binds it. "
+                        "Hierarchy rules (enforced by "
+                        "host): contains edges define layers (parent -> child); "
+                        "layer 0 is the single root. First generation spans "
+                        "layer 0 (root), layer 1 (trunk) and up to two expansion "
+                        "layers per trunk node (layer-2 children, layer-3 "
+                        "grandchildren; max depth 3): no orphans and no skipped "
+                        "layers — every non-root node attaches directly under a "
+                        "contains parent exactly one layer above. Deeper layers "
+                        "are produced by later lg_graph_propose_change splits. "
+                        "Self-validate before calling: exactly one root; unique "
+                        "non-duplicate labels; every non-root node has exactly "
+                        "one contains parent; no prerequisite/contains cycles; "
+                        "no self-loop edges. "
+                        "Invalid proposals are rejected and no review card is "
+                        "shown."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "graph_title": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 80,
+                            },
+                            "summary": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2_000,
+                            },
+                            "nodes": {
+                                "type": "array",
+                                "items": node_schema,
+                                "minItems": 1,
+                                "maxItems": 16,
+                            },
+                            "edges": {
+                                "type": "array",
+                                "items": edge_schema,
+                                "maxItems": 32,
+                            },
+                        },
+                        "required": ["graph_title", "summary", "nodes", "edges"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lg_graph_propose_change",
+                    "description": (
+                        "Update an EXISTING candidate or published graph that "
+                        "belongs to the Goal of this session: propose an "
+                        "incremental reviewed change set (split a node into "
+                        "next-layer children, fix a label or description). Use "
+                        "lg_graph_create first when the Goal has no graph yet. "
+                        "This tool never publishes or mutates the formal graph; "
+                        "the user confirms the review card before the change is "
+                        "applied. graph_id defaults to the graph bound to this "
+                        "session, falling back to the session Goal's latest "
+                        "graph. Read the current graph first with lg_graph_read; "
+                        "keep exactly one root; never re-add existing concepts "
+                        "(update instead); every non-root node needs exactly one "
+                        "contains parent; avoid prerequisite/contains cycles and "
+                        "duplicate labels. A later split of a node must only add "
+                        "the next layer under that already-existing parent "
+                        "(contains parent_depth+1), not multi-layer chains or "
+                        "free-floating nodes. Invalid proposals are rejected and "
+                        "no review card is shown."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "graph_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 36,
+                                "description": "Optional explicit graph to update; defaults to the graph bound to this session or the Goal's latest graph.",
+                            },
                             "graph_title": {
                                 "type": "string",
                                 "minLength": 1,
@@ -437,7 +507,7 @@ class AgentToolRuntime:
                         "Confirm the Goal bound to this session (draft -> confirmed). "
                         "Call only after the user explicitly agreed to the Goal in this "
                         "conversation. Optionally update Goal fields in the same call. "
-                        "Once confirmed, lg_graph_propose_change becomes available."
+                        "Once confirmed, lg_graph_create becomes available."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2633,16 +2703,24 @@ class AgentToolRuntime:
         user_domains = (
             user_policy.allowed_domains if user_policy is not None else []
         )
+        from app.providers.factory import access_allow_all, access_allowlist_domains
+
+        unified_domains = access_allowlist_domains(
+            self.extensions.db, self.workspace_id
+        )
+        allow_all = access_allow_all(self.extensions.db, self.workspace_id)
         return {
             "allow_without_confirmation": bool(
                 value.get("allow_without_confirmation", False)
                 or (user_policy is not None and user_policy.allow_without_confirmation)
+                or allow_all
             ),
             "allowed_domains": list(
                 dict.fromkeys(
                     [
                         *workspace_domain_list,
                         *(item for item in user_domains if isinstance(item, str)),
+                        *sorted(unified_domains),
                     ]
                 )
             ),
@@ -2830,8 +2908,9 @@ class AgentToolRuntime:
                 "component_list",
             }:
                 return self._execute_component_admin_tool(name, arguments)
-            if name == "lg_graph_propose_change":
+            if name in {"lg_graph_create", "lg_graph_propose_change"}:
                 return self._execute_graph_proposal_tool(
+                    name,
                     arguments,
                     chat_session_id=chat_session_id,
                     assistant_message_id=assistant_message_id,
@@ -3100,13 +3179,21 @@ class AgentToolRuntime:
 
     def _execute_graph_proposal_tool(
         self,
+        tool_name: str,
         arguments: dict[str, Any],
         *,
         chat_session_id: str,
         assistant_message_id: str | None,
         source_message_id: str | None,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-        """Persist an inert graph change set from the current Agent turn."""
+        """Persist an inert graph change set from the current Agent turn.
+
+        ``lg_graph_create`` targets a fresh graph for the session Goal (create
+        mode); ``lg_graph_propose_change`` updates the existing graph linked to
+        the Goal (update mode). Writes stay reviewable, the created graph gets
+        its real IDs at confirmation, and a learning Session only ever binds a
+        published Graph.
+        """
 
         if not assistant_message_id or not source_message_id:
             raise AppError(
@@ -3147,31 +3234,96 @@ class AgentToolRuntime:
         )
         if goal is None:
             raise AppError(404, "goal_not_found", "The session Goal was not found")
-        if goal.status not in {"confirmed", "candidate_ready", "approved"}:
-            raise AppError(
-                409,
-                "goal_not_confirmed_for_graph",
-                "Confirm the Goal before proposing a graph",
-            )
-
+        is_create = tool_name == "lg_graph_create"
         graph = None
-        mode = "create"
+        mode = "create" if is_create else "update"
         base_revision = 0
-        if session.graph_id:
-            graph = db.scalar(
+        if is_create:
+            if goal.status not in {"confirmed", "candidate_ready", "approved"}:
+                raise AppError(
+                    409,
+                    "goal_not_confirmed_for_graph",
+                    "Confirm the Goal before creating a graph proposal",
+                )
+            existing_graph = db.scalar(
                 select(Graph).where(
                     Graph.workspace_id == self.workspace_id,
-                    Graph.id == session.graph_id,
                     Graph.goal_id == goal.id,
                 )
             )
+            if existing_graph is not None:
+                raise AppError(
+                    409,
+                    "graph_already_exists",
+                    "This Goal already has a graph; use lg_graph_propose_change to update it instead of creating another",
+                    {"graph_id": existing_graph.id, "graph_status": existing_graph.status},
+                )
+        else:
+            if goal.status not in {"confirmed", "candidate_ready", "approved"}:
+                raise AppError(
+                    409,
+                    "goal_not_confirmed_for_graph",
+                    "Confirm the Goal before proposing a graph update",
+                )
+            requested_graph_id = arguments.get("graph_id")
+            if isinstance(requested_graph_id, str) and requested_graph_id:
+                graph = db.scalar(
+                    select(Graph).where(
+                        Graph.workspace_id == self.workspace_id,
+                        Graph.id == requested_graph_id,
+                    )
+                )
+                if graph is None:
+                    raise AppError(
+                        404,
+                        "graph_not_found",
+                        "The requested Graph was not found",
+                    )
+                if graph.goal_id != goal.id:
+                    raise AppError(
+                        409,
+                        "graph_goal_mismatch",
+                        "The requested Graph does not belong to the session Goal",
+                    )
+            elif session.graph_id:
+                graph = db.scalar(
+                    select(Graph).where(
+                        Graph.workspace_id == self.workspace_id,
+                        Graph.id == session.graph_id,
+                        Graph.goal_id == goal.id,
+                    )
+                )
+                if graph is None:
+                    raise AppError(
+                        404,
+                        "graph_not_found",
+                        "The Graph bound to this session was not found",
+                    )
+            else:
+                graph = db.scalar(
+                    select(Graph)
+                    .where(
+                        Graph.workspace_id == self.workspace_id,
+                        Graph.goal_id == goal.id,
+                        Graph.status == "published",
+                    )
+                    .order_by(Graph.created_at.desc())
+                )
+                if graph is None:
+                    graph = db.scalar(
+                        select(Graph)
+                        .where(
+                            Graph.workspace_id == self.workspace_id,
+                            Graph.goal_id == goal.id,
+                        )
+                        .order_by(Graph.created_at.desc())
+                    )
             if graph is None:
                 raise AppError(
-                    404,
-                    "graph_not_found",
-                    "The Graph bound to this session was not found",
+                    409,
+                    "graph_update_target_required",
+                    "No graph is linked to this session Goal yet; use lg_graph_create to create one",
                 )
-            mode = "update"
             base_revision = graph.revision
 
         source_user_message = db.scalar(
@@ -3220,7 +3372,7 @@ class AgentToolRuntime:
             proposal=proposal,
             provider_trace={
                 "origin": "agent_tool",
-                "tool_name": "lg_graph_propose_change",
+                "tool_name": tool_name,
                 "source_assistant_message_id": assistant_message_id,
             },
         )
@@ -3236,6 +3388,7 @@ class AgentToolRuntime:
                 "base_revision": base_revision,
                 "status": item.status,
                 "review_required": True,
+                "graph_id_assigned_on_confirm": is_create,
                 "proposal": view["proposal"],
             },
             {
@@ -3264,8 +3417,8 @@ class AgentToolRuntime:
 
         ``lg_goal_create`` binds a reviewable Goal draft to the session so the
         Goal/Graph orchestration loop can act on it. ``lg_goal_confirm`` moves
-        it to ``confirmed`` (required before ``lg_graph_propose_change``). Both
-        write through the workspace-scoped session row and keep an audit trail.
+        it to ``confirmed`` (required before ``lg_graph_create``). Both write
+        through the workspace-scoped session row and keep an audit trail.
         """
 
         if name == "lg_goal_read":
@@ -3338,9 +3491,39 @@ class AgentToolRuntime:
                     Graph.goal_id == goal.id,
                 )
             )
+        if graph is None:
+            # The candidate graph created through a confirmed proposal is not
+            # bound to the Session (a learning Session can only bind a
+            # published Graph), so fall back to the Goal's latest graph so
+            # Goal/Graph tools can still address it by its real graph_id.
+            graph = db.scalar(
+                select(Graph)
+                .where(
+                    Graph.workspace_id == self.workspace_id,
+                    Graph.goal_id == goal.id,
+                    Graph.status == "published",
+                )
+                .order_by(Graph.created_at.desc())
+            )
+            if graph is None:
+                graph = db.scalar(
+                    select(Graph)
+                    .where(
+                        Graph.workspace_id == self.workspace_id,
+                        Graph.goal_id == goal.id,
+                    )
+                    .order_by(Graph.created_at.desc())
+                )
         return session, goal, graph
 
-    def _goal_tool_summary(self, goal, graph=None, *, session_id: str) -> dict[str, Any]:
+    def _goal_tool_summary(
+        self,
+        goal,
+        graph=None,
+        *,
+        session_id: str,
+        session_bound_graph_id: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "goal_id": goal.id,
             "title": goal.title,
@@ -3354,6 +3537,11 @@ class AgentToolRuntime:
             "session_id": session_id,
             "graph_id": graph.id if graph else None,
             "graph_status": getattr(graph, "status", None),
+            # A learning Session can only bind a published Graph: a
+            # candidate graph is addressable via graph_id but is not
+            # yet session-bound until the graph is published.
+            "graph_bound_to_session": bool(graph)
+            and graph.id == session_bound_graph_id,
         }
 
     def _execute_goal_read(
@@ -3376,13 +3564,16 @@ class AgentToolRuntime:
                 {"goal_bound": False},
                 [],
             )
-        summary = self._goal_tool_summary(goal, graph, session_id=session.id)
+        summary = self._goal_tool_summary(
+            goal, graph, session_id=session.id, session_bound_graph_id=session.graph_id
+        )
         return self._success(
             summary,
             {
                 "goal_id": goal.id,
                 "goal_status": goal.status,
                 "graph_bound": graph is not None,
+                "graph_bound_to_session": summary["graph_bound_to_session"],
             },
             [],
         )
@@ -3402,7 +3593,12 @@ class AgentToolRuntime:
         db = self.extensions.db
         session, existing_goal, graph = self._load_session_goal(chat_session_id)
         if existing_goal is not None:
-            summary = self._goal_tool_summary(existing_goal, graph, session_id=session.id)
+            summary = self._goal_tool_summary(
+                existing_goal,
+                graph,
+                session_id=session.id,
+                session_bound_graph_id=session.graph_id,
+            )
             return self._success(
                 {**summary, "already_bound": True},
                 {"goal_id": existing_goal.id, "already_bound": True, "goal_status": existing_goal.status},
@@ -3547,7 +3743,9 @@ class AgentToolRuntime:
             changed = True
         if not changed:
             # Still surface a stable result for the model.
-            summary = self._goal_tool_summary(goal, graph, session_id=session.id)
+            summary = self._goal_tool_summary(
+                goal, graph, session_id=session.id, session_bound_graph_id=session.graph_id
+            )
             return self._success(
                 {**summary, "already_confirmed": True},
                 {"goal_id": goal.id, "goal_status": goal.status},
@@ -3562,7 +3760,9 @@ class AgentToolRuntime:
         )
         db.commit()
         db.refresh(goal)
-        summary = self._goal_tool_summary(goal, graph, session_id=session.id)
+        summary = self._goal_tool_summary(
+            goal, graph, session_id=session.id, session_bound_graph_id=session.graph_id
+        )
         return self._success(
             {**summary, "already_confirmed": False},
             {
