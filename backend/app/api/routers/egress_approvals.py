@@ -145,6 +145,7 @@ def decide_egress_approval(
                     else item
                     for item in (message.parts or [])
                 ]
+            db.commit()
     return EgressAuthorizationRequestView.model_validate(request)
 
 

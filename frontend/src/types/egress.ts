@@ -16,6 +16,10 @@ export interface EgressAuthorizationCardData {
   tool_name?: string;
   tool_label?: string;
   hostname?: string;
+  requested_url?: string;
+  request_spec_sha256?: string;
+  resource_summary?: string;
+  destination_path?: string;
   message_zh?: string;
   /** Terminal decision persisted on the message part (approved / denied). */
   decision?: EgressAuthorizationDecision;
@@ -27,6 +31,7 @@ export interface EgressAuthorizationCardData {
 export type EgressAuthorizationStatus =
   | "pending"
   | "approved"
+  | "claimed"
   | "denied"
   | "expired"
   | "consumed";

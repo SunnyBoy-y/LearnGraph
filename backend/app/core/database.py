@@ -756,9 +756,11 @@ def _apply_sqlite_additive_migrations() -> None:
             "user_message_id": "VARCHAR(36)",
             "tool_call_id": "VARCHAR(160)",
             "resume_payload": "JSON",
+            "claimed_by": "VARCHAR(64)",
         },
         # Agent-published bidirectional sub-application: optional interaction
         # contract snapshot and the linked lightweight ComponentManifestVersion.
+        "external_acquisition_files": {},
         "subapp_bundles": {
             "interaction_contract": "JSON",
             "component_manifest_id": "VARCHAR(36)",

@@ -771,6 +771,68 @@ class ImageGenerationTask(Base, TimestampMixin, WorkspaceScopedMixin):
     )
 
 
+class ExternalAcquisitionReceipt(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Immutable provenance for content acquired outside the offline sandbox."""
+
+    __tablename__ = "external_acquisition_receipts"
+    __table_args__ = (
+        Index(
+            "ix_external_acquisition_receipts_workspace_spec",
+            "workspace_id",
+            "request_spec_sha256",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    actor_id: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    request_spec_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    requested_url: Mapped[str] = mapped_column(Text)
+    final_url: Mapped[str] = mapped_column(Text)
+    redirect_chain: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    resolved_addresses: Mapped[dict[str, list[str]]] = mapped_column(JSON, default=dict)
+    declared_mime: Mapped[str] = mapped_column(String(160), default="application/octet-stream")
+    detected_mime: Mapped[str] = mapped_column(String(160), default="application/octet-stream")
+    wire_bytes: Mapped[int] = mapped_column(Integer)
+    stored_bytes: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    destination_path: Mapped[str] = mapped_column(String(1000))
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    downloader_version: Mapped[str] = mapped_column(String(40), default="1")
+
+
+class ExternalAcquisitionFile(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Queryable link from an acquisition receipt to each downloaded file."""
+
+    __tablename__ = "external_acquisition_files"
+    __table_args__ = (
+        Index(
+            "ix_external_acquisition_files_receipt",
+            "receipt_id",
+        ),
+        Index(
+            "ix_external_acquisition_files_file",
+            "file_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    receipt_id: Mapped[str] = mapped_column(
+        ForeignKey("external_acquisition_receipts.id", ondelete="CASCADE"),
+        index=True,
+    )
+    file_id: Mapped[str | None] = mapped_column(
+        ForeignKey("files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    path: Mapped[str] = mapped_column(String(1000))
+    sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    mime_type: Mapped[str] = mapped_column(String(160), default="application/octet-stream")
+
+
 class FileRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "files"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -2710,6 +2772,7 @@ class WorkspaceSetting(Base, TimestampMixin, WorkspaceScopedMixin):
 # machinery. These tables never read/write ``web_fetch.policy``,
 # ``UserWebFetchPolicy``, or the reviewed ``{workspace_id}.json`` policy files.
 EGRESS_APPROVAL_CAPABILITY = "agent_egress"
+EXTERNAL_ACQUISITION_CAPABILITY = "external_acquisition"
 EGRESS_APPROVAL_DEFAULT_TTL_SECONDS = 900  # pending deadline: 15 minutes
 EGRESS_APPROVAL_MAX_TTL_SECONDS = 86400
 
@@ -2790,6 +2853,9 @@ class EgressAuthorizationRequest(Base, TimestampMixin, WorkspaceScopedMixin):
     consumed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Atomic allow_once claim: set by claim_once() to the executing actor before
+    # the host is used; release_once() clears it, consume_once() finalizes it.
+    claimed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Assistant message that carries the durable ``egress_authorization`` card
     # part; the decision endpoint rewrites that part to its terminal state so
     # the transcript stays consistent across reloads. Agent-mode challenges

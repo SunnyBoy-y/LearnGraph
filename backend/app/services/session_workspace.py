@@ -93,6 +93,7 @@ class BlobStore:
         blob: ContentBlob,
         original_name: str,
         actor_id: str,
+        source: str = "agent",
     ) -> FileRecord:
         """Create a downloadable FileRecord that reuses the blob's object_key.
 
@@ -114,13 +115,12 @@ class BlobStore:
         )
         if by_hash_name is not None:
             return by_hash_name
-        # Same object_key + same name is also an exact duplicate.
+        # FileRecord.object_key is globally unique: one physical content object
+        # can back many session paths, but only one downloadable logical record.
+        # Reuse it regardless of display name rather than violating that unique
+        # constraint when identical bytes appear at different GitHub paths.
         existing = self.db.scalar(
-            select(FileRecord).where(
-                FileRecord.workspace_id == self.workspace_id,
-                FileRecord.object_key == blob.object_key,
-                FileRecord.original_name == name,
-            )
+            select(FileRecord).where(FileRecord.object_key == blob.object_key)
         )
         if existing is not None:
             return existing
@@ -138,6 +138,9 @@ class BlobStore:
             storage_status="stored",
             parse_capability="attachment_only",
             parse_status="not_requested",
+            source=source,
+            created_by=actor_id,
+            updated_by=actor_id,
         )
         self.db.add(record)
         self.db.flush()
@@ -218,6 +221,7 @@ class SessionWorkspaceService:
         source: str = "agent",
         mime_type: str | None = None,
         publish_file: bool = False,
+        commit: bool = True,
     ) -> dict[str, Any]:
         safe_path = validate_agent_workspace_path(path)
         if role not in {"input", "work", "output"}:
@@ -228,10 +232,17 @@ class SessionWorkspaceService:
         file_id: str | None = None
         if publish_file or role == "output" or safe_path.startswith("outputs/"):
             file_record = self.blobs.ensure_file_record(
-                blob=blob, original_name=PurePosixPath(safe_path).name, actor_id=self.actor_id
+                blob=blob,
+                original_name=PurePosixPath(safe_path).name,
+                actor_id=self.actor_id,
+                source=source,
             )
             file_id = file_record.id
-            role = "output"
+            # A downloadable FileRecord is independent from workspace placement.
+            # Trusted downloads remain read-oriented inputs even though the UI can
+            # offer their FileRecord for download. Explicit outputs keep output.
+            if role == "output" or safe_path.startswith("outputs/"):
+                role = "output"
 
         entry = self.db.scalar(
             select(SessionWorkspaceEntry).where(
@@ -280,8 +291,10 @@ class SessionWorkspaceService:
                 "size_bytes": blob.size_bytes,
             },
         )
-        self.db.commit()
-        self.db.refresh(entry)
+        self.db.flush()
+        if commit:
+            self.db.commit()
+            self.db.refresh(entry)
         return self._view(entry)
 
     def get_entry(self, chat_session_id: str, path: str) -> SessionWorkspaceEntry:

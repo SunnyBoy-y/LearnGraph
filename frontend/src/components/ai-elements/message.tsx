@@ -329,6 +329,11 @@ export type MessageResponseComponents = {
     children?: ReactNode;
     [key: string]: unknown;
   }) => ReactNode;
+  img?: (props: {
+    src?: string;
+    alt?: string;
+    [key: string]: unknown;
+  }) => ReactNode;
   [key: string]: unknown;
 };
 

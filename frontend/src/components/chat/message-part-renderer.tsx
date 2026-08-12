@@ -655,6 +655,25 @@ function TextWithCitations({
           </a>
         );
       },
+      img: ({ src, alt, ...props }) => {
+        if (
+          typeof src === "string" &&
+          src.toLowerCase().startsWith("sandbox:")
+        ) {
+          // Inline-downloaded image markers are replaced by real image parts
+          // once the turn finalizes; render a subtle placeholder meanwhile so
+          // the stream never shows a broken-image icon.
+          return (
+            <span
+              aria-label={alt ?? "图片加载中"}
+              className="inline-flex h-24 w-44 items-center justify-center rounded-lg border border-dashed border-muted bg-muted/30 px-3 text-xs text-muted-foreground"
+            >
+              正在嵌入图片…
+            </span>
+          );
+        }
+        return <img alt={alt} src={src} {...props} />;
+      },
     }),
     [lookup],
   );
@@ -1310,11 +1329,14 @@ function EgressAuthorizationCard({ data }: { data: EgressAuthorizationCardData }
         // turn and re-run the model (D2.1 T4.1).
         await resumeEgressApproval(requestId);
       } else if (decision !== "deny" && data.hostname) {
-        // Agent-mode fallback: prompt the model to retry the sandbox command
-        // that needed the host; the grant/lease is consumed on the next attempt.
+        // Agent-mode fallback: prompt the model to retry the exact tool request.
+        // Trusted downloads bind allow_once to request_spec_sha256 server-side.
+        const isAcquisition = data.tool_name === "download_external_image" || data.tool_name === "download_github_source";
         window.dispatchEvent(new CustomEvent("learngraph:compose", {
           detail: {
-            content: `已批准沙箱访问主机 ${data.hostname}。请继续执行刚才需要该主机的命令。`,
+            content: isAcquisition
+              ? `已批准${data.tool_label || "外部下载工具"}访问主机 ${data.hostname}。请使用与刚才完全相同的参数继续该下载。`
+              : `已批准沙箱访问主机 ${data.hostname}。请继续执行刚才需要该主机的命令。`,
             autoSend: true,
           },
         }));
@@ -1335,16 +1357,19 @@ function EgressAuthorizationCard({ data }: { data: EgressAuthorizationCardData }
       setError(cause instanceof Error ? cause.message : "授权操作失败");
     }
   };
+  const isAcquisition = data.tool_name === "download_external_image" || data.tool_name === "download_github_source";
+  const capabilityLabel = isAcquisition ? (data.tool_label || "外部下载工具") : "沙箱出站访问";
   if (!requestId) return null;
   if (state === "approved" || state === "denied") {
-    return <section className="mt-3 rounded-xl border border-muted p-4 text-sm text-muted-foreground">{state === "approved" ? "沙箱出站访问已获授权。" : "已拒绝沙箱出站访问。"}</section>;
+    return <section className="mt-3 rounded-xl border border-muted p-4 text-sm text-muted-foreground">{state === "approved" ? `${capabilityLabel}已获授权。` : `已拒绝${capabilityLabel}。`}</section>;
   }
   return (
-    <section aria-label="沙箱出站授权" className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20">
+    <section aria-label={isAcquisition ? "外部下载授权" : "沙箱出站授权"} className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20">
       <div>
-        <strong className="text-amber-700 dark:text-amber-400">需要沙箱出站授权</strong>
-        <p className="mt-1 break-words text-sm text-foreground">{data.message_zh || `沙箱内的智能体需要访问主机 ${data.hostname || "该"}主机，是否批准？`}</p>
+        <strong className="text-amber-700 dark:text-amber-400">需要{capabilityLabel}授权</strong>
+        <p className="mt-1 break-words text-sm text-foreground">{data.message_zh || `智能体需要访问主机 ${data.hostname || "该"}主机，是否批准？`}</p>
         {data.hostname ? <p className="mt-1 text-xs text-muted-foreground">主机：{data.hostname}</p> : null}
+        {data.destination_path ? <p className="mt-1 break-all text-xs text-muted-foreground">写入：{data.destination_path}</p> : null}
       </div>
       {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
       <div className="flex flex-wrap gap-2">
@@ -1353,8 +1378,9 @@ function EgressAuthorizationCard({ data }: { data: EgressAuthorizationCardData }
         <Button disabled={state === "submitting"} onClick={() => void decide("deny")} size="sm" variant="ghost">拒绝</Button>
       </div>
       <p className="text-[11px] leading-4 text-muted-foreground">
-        此授权只放行沙箱容器访问该主机的网络流量（网络层）。搜索与网页抓取的
-        应用层白名单相互独立，不会因本次放行而自动生效。
+        {isAcquisition
+          ? "下载由宿主侧受控网关执行；沙箱仍保持断网。允许一次会绑定本次资源请求摘要，重定向到新主机时会再次审批。"
+          : "此授权只放行沙箱容器访问该主机的网络流量（网络层）。搜索与网页抓取的应用层白名单相互独立。"}
       </p>
     </section>
   );

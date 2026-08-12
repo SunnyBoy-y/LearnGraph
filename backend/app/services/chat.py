@@ -28,6 +28,7 @@ from app.domain.models import (
     ChatSession,
     ContextSummary,
     Evidence,
+    ExternalAcquisitionFile,
     FileRecord,
     FileTextChunk,
     Goal,
@@ -3165,6 +3166,119 @@ class ChatService:
             },
         )
         return self._encode_event(event)
+    # ------------------------------------------------------------------
+    # Inline embedding of agent-downloaded images in the answer text
+    # ------------------------------------------------------------------
+
+    # Model-authored marker: ![alt](sandbox:inputs/images/<name>). The path
+    # must reference a file downloaded through download_external_image so the
+    # marker can be resolved to a durable session FileRecord and rendered as
+    # an inline image part exactly where the model placed it.
+    _INLINE_IMAGE_MARKER_RE = re.compile(
+        r"!\[([^\]\n]*)\]\(\s*sandbox:([^)\s]+)\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _resolve_inline_image_markers(
+        self,
+        text: str,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Split ``text`` on resolved ``![alt](sandbox:path)`` markers.
+
+        Returns ``(segments, images)`` where ``segments`` holds the text
+        before/after each marker (``len(segments) == len(images) + 1``).
+        Markers whose path does not resolve to a downloaded session file are
+        left untouched inside the text (treated as literal markdown).
+        """
+        if not text or "sandbox:" not in text:
+            return [text], []
+        segments: list[str] = []
+        images: list[dict[str, Any]] = []
+        cursor = 0
+        for match in self._INLINE_IMAGE_MARKER_RE.finditer(text):
+            alt = (match.group(1) or "").strip()
+            raw_path = (match.group(2) or "").strip()
+            if not raw_path:
+                continue
+            path = raw_path[2:] if raw_path.startswith("./") else raw_path
+            path = path.lstrip("/")
+            acquired = self.db.scalar(
+                select(ExternalAcquisitionFile).where(
+                    ExternalAcquisitionFile.workspace_id == self.workspace_id,
+                    ExternalAcquisitionFile.path == path,
+                )
+            )
+            if acquired is None or not acquired.file_id:
+                continue
+            segments.append(text[cursor : match.start()])
+            images.append(
+                {
+                    "file_id": acquired.file_id,
+                    "mime_type": acquired.mime_type or "image/*",
+                    "path": path,
+                    "size_bytes": acquired.size_bytes,
+                    "sha256": acquired.sha256,
+                    "title": "已下载的图片",
+                    "alt": (alt or "已下载的图片")[:240],
+                    "kind": "download",
+                    "provenance": "external_acquisition",
+                }
+            )
+            cursor = match.end()
+        if not images:
+            return [text], []
+        segments.append(text[cursor:])
+        return segments, images
+
+    def _splice_inline_image_parts(
+        self,
+        *,
+        final_text: str,
+        text_record: MessagePartRecord,
+        message_version_id: str,
+    ) -> tuple[str, str, list[MessagePartRecord]] | None:
+        """Persist inline-downloaded images as ordered text/image parts.
+
+        When the model embeds ``![alt](sandbox:path)`` markers in its final
+        answer, the single text part is split into text segments interleaved
+        with ``image`` parts so the UI renders the pictures exactly where the
+        model placed them. Returns ``None`` when there is nothing to splice;
+        otherwise ``(first_segment, full_clean_text, extra_records)``.
+        """
+        segments, images = self._resolve_inline_image_markers(final_text)
+        if not images:
+            return None
+        extra_records: list[MessagePartRecord] = []
+        shared_ordinal = text_record.ordinal
+        for index, image_data in enumerate(images):
+            extra_records.append(
+                self.message_parts.add(
+                    MessagePartRecord(
+                        workspace_id=self.workspace_id,
+                        message_version_id=message_version_id,
+                        ordinal=shared_ordinal,
+                        part_type="image",
+                        status="completed",
+                        content=str(image_data["title"]),
+                        data=image_data,
+                    )
+                )
+            )
+            segment = segments[index + 1]
+            if segment:
+                extra_records.append(
+                    self.message_parts.add(
+                        MessagePartRecord(
+                            workspace_id=self.workspace_id,
+                            message_version_id=message_version_id,
+                            ordinal=shared_ordinal,
+                            part_type="text",
+                            status="completed",
+                            content=segment,
+                        )
+                    )
+                )
+        return segments[0], "".join(segments), extra_records
 
     def _emit_sandbox_side_effect_parts(
         self,
@@ -3269,6 +3383,10 @@ class ChatService:
                         "tool_name": egress_auth.get("tool_name") or "sandbox_exec",
                         "tool_label": egress_auth.get("tool_label") or "沙箱命令工具",
                         "hostname": egress_auth.get("hostname") or "",
+                        "requested_url": egress_auth.get("requested_url"),
+                        "request_spec_sha256": egress_auth.get("request_spec_sha256"),
+                        "resource_summary": egress_auth.get("resource_summary"),
+                        "destination_path": egress_auth.get("destination_path"),
                         "message_zh": egress_auth.get("message_zh")
                         or "沙箱出站访问需要用户授权。",
                     },
@@ -10375,10 +10493,35 @@ class ChatService:
                         ),
                     ),
                 }
+                splice = self._splice_inline_image_parts(
+                    final_text=final_text,
+                    text_record=text_record,
+                    message_version_id=version.id,
+                )
+                if splice is not None:
+                    first_segment, clean_full_text, inline_image_records = splice
+                else:
+                    first_segment, clean_full_text, inline_image_records = (
+                        final_text,
+                        final_text,
+                        [],
+                    )
                 text_record.status = "completed"
-                text_record.content = final_text
-                message.content = final_text
-                message.parts = assembled_parts("completed", final_text)
+                text_record.content = first_segment
+                message.content = clean_full_text
+                message.parts = assembled_parts("completed", first_segment)
+                if inline_image_records:
+                    message.parts.extend(
+                        self._part_snapshot(
+                            record.id,
+                            record.part_type,
+                            "completed",
+                            record.content,
+                            record.data,
+                            sequence=record.ordinal,
+                        )
+                        for record in inline_image_records
+                    )
                 version.status = "completed"
                 version.provider_trace = dict(provider_trace)
                 message.status = "completed"
@@ -10396,11 +10539,36 @@ class ChatService:
                             text_record.id,
                             "text",
                             "completed",
-                            final_text,
+                            first_segment,
                         )
                     },
                 )
                 sequence += 1
+                inline_completed_events: list[str] = []
+                for inline_record in inline_image_records:
+                    inline_completed_events.append(
+                        self._encode_event(
+                            self._append_event(
+                                session_id=session_id,
+                                message_id=message.id,
+                                message_version_id=version.id,
+                                part_id=inline_record.id,
+                                sequence=sequence,
+                                event_type="part.completed",
+                                payload={
+                                    "part": self._part_snapshot(
+                                        inline_record.id,
+                                        inline_record.part_type,
+                                        "completed",
+                                        inline_record.content,
+                                        inline_record.data,
+                                        sequence=inline_record.ordinal,
+                                    )
+                                },
+                            )
+                        )
+                    )
+                    sequence += 1
                 completed = self._append_event(
                     session_id=session_id,
                     message_id=message.id,
@@ -10415,6 +10583,8 @@ class ChatService:
                 )
                 terminal_event_persisted = True
                 yield self._encode_event(text_completed)
+                for inline_completed_event in inline_completed_events:
+                    yield inline_completed_event
                 yield self._encode_event(completed)
             except _GenerationCancellationRequested:
                 record_active_usage()
@@ -13626,10 +13796,36 @@ class ChatService:
                         ),
                     ),
                 }
+                splice = self._splice_inline_image_parts(
+                    final_text=final_text,
+                    text_record=text_record,
+                    message_version_id=assistant_version.id,
+                )
+                if splice is not None:
+                    first_segment, clean_full_text, inline_image_records = splice
+                else:
+                    first_segment, clean_full_text, inline_image_records = (
+                        final_text,
+                        final_text,
+                        [],
+                    )
                 text_record.status = "completed"
-                text_record.content = final_text
-                assistant_message.content = final_text
-                assistant_message.parts = assembled_parts("completed", final_text)
+                text_record.content = first_segment
+                assistant_message.content = clean_full_text
+                parts = assembled_parts("completed", first_segment)
+                if inline_image_records:
+                    parts.extend(
+                        self._part_snapshot(
+                            record.id,
+                            record.part_type,
+                            "completed",
+                            record.content,
+                            record.data,
+                            sequence=record.ordinal,
+                        )
+                        for record in inline_image_records
+                    )
+                assistant_message.parts = parts
                 part_completed_event = self._append_event(
                     session_id=session_id,
                     message_id=assistant_message.id,
@@ -13642,11 +13838,36 @@ class ChatService:
                             text_record.id,
                             "text",
                             "completed",
-                            final_text,
+                            first_segment,
                         )
                     },
                 )
                 sequence += 1
+                inline_completed_events: list[str] = []
+                for inline_record in inline_image_records:
+                    inline_completed_events.append(
+                        self._encode_event(
+                            self._append_event(
+                                session_id=session_id,
+                                message_id=assistant_message.id,
+                                message_version_id=assistant_version.id,
+                                part_id=inline_record.id,
+                                sequence=sequence,
+                                event_type="part.completed",
+                                payload={
+                                    "part": self._part_snapshot(
+                                        inline_record.id,
+                                        inline_record.part_type,
+                                        "completed",
+                                        inline_record.content,
+                                        inline_record.data,
+                                        sequence=inline_record.ordinal,
+                                    )
+                                },
+                            )
+                        )
+                    )
+                    sequence += 1
 
                 assistant_message.status = "completed"
                 assistant_version.status = "completed"
@@ -13698,6 +13919,8 @@ class ChatService:
                 sequence += 1
                 terminal_event_persisted = True
                 yield self._encode_event(part_completed_event)
+                for inline_completed_event in inline_completed_events:
+                    yield inline_completed_event
                 yield self._encode_event(completed_event)
             except _GenerationCancellationRequested:
                 discard_provider_response_state()

@@ -164,6 +164,10 @@ class AgentToolRuntime:
         # addressable in Agent mode; without these tools the model cannot see
         # or reference an image from an earlier turn.
         definitions.extend(self._session_file_tool_definitions())
+        # Trusted host-side acquisition bridges public search results and the
+        # durable session workspace without granting network access to sandbox
+        # commands. Every remote host still passes generic egress approval.
+        definitions.extend(self._external_acquisition_tool_definitions())
         # Progressive disclosure is gated by settings so a single feature flag
         # can restore the previous eager behavior without code changes. When the
         # flag is off, family/activation args are dropped and every eligible
@@ -809,7 +813,11 @@ class AgentToolRuntime:
                     "文搜图/图搜图 provider lane (阿里云百炼 web_search_image / "
                     "image_search via the Responses API). Pass only a text query "
                     "for text-to-image search, or add a public image URL for "
-                    "reverse image search."
+                    "reverse image search. After the results come back, if the "
+                    "user wants the actual image files (to view, analyze, edit, "
+                    "or use in materials), call download_external_image with the "
+                    "selected image URLs — pass several URLs in the urls array "
+                    "to download them in parallel."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2599,6 +2607,128 @@ class AgentToolRuntime:
             },
         ]
 
+    @staticmethod
+    def _external_acquisition_tool_definitions() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "download_external_image",
+                    "description": (
+                        "Download one or more public images through LearnGraph's trusted "
+                        "host-side acquisition gateway. The sandbox has NO internet: this "
+                        "is the only way to turn a remote image link into a real image file "
+                        "the sandbox can read. Call it AFTER search_images (文搜图/图搜图) "
+                        "returns useful image URLs, or when the user pastes image links they "
+                        "want saved. Pass a single url with destination_path, or several URLs "
+                        "in the urls array (2-8) with destination_dir to download them in "
+                        "PARALLEL. Images are verified, sanitized (metadata stripped), "
+                        "hashed, and injected into the offline session workspace with an "
+                        "immutable provenance receipt. IMPORTANT: after a successful download, "
+                        "embed the picture directly inside your final answer at the exact "
+                        "position you want with markdown-image syntax "
+                        "![简短描述](sandbox:目的地路径), using the destination_path for a single "
+                        "download, or the per-file path values returned in the tool result for "
+                        "a batch, e.g. ![架构示意图](sandbox:inputs/images/architecture.png). "
+                        "Only files written by this tool can be embedded inline this way."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "format": "uri",
+                                "description": "Single public HTTPS image URL (use EITHER url or urls, not both).",
+                            },
+                            "urls": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "uri"},
+                                "minItems": 2,
+                                "maxItems": 8,
+                                "description": "Multiple image URLs to download in parallel (use EITHER url or urls, not both).",
+                            },
+                            "destination_path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                                "description": (
+                                    "Sandbox-relative target file for a SINGLE image, normally "
+                                    "inputs/images/<name>. Your final answer can embed this "
+                                    "image inline by writing ![简短描述](sandbox:<destination_path>) "
+                                    "at the desired position."
+                                ),
+                            },
+                            "destination_dir": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                                "description": "Sandbox-relative directory for MULTIPLE images; defaults to inputs/images.",
+                            },
+                            "expected_sha256": {
+                                "type": "string",
+                                "pattern": "^[0-9a-fA-F]{64}$",
+                                "description": "Optional expected SHA-256 for a SINGLE image; omit for url batches.",
+                            },
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "download_github_source",
+                    "description": (
+                        "Acquire a GitHub file, directory, or bounded repository snapshot "
+                        "so the sandbox can study real source code WITHOUT any network: the "
+                        "sandbox cannot run git clone. Call it when the user wants to learn "
+                        "from, read, or download a GitHub project, or shares a GitHub URL. "
+                        "Resolves the requested ref to an immutable commit, downloads regular "
+                        "files through approved GitHub hosts (symlinks/submodules/LFS are "
+                        "refused), creates a per-file hash manifest, and injects everything "
+                        "into the offline workspace."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "owner": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 100,
+                                "description": "GitHub owner/org from the URL, e.g. https://github.com/OWNER/repo.",
+                            },
+                            "repo": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 100,
+                                "description": "GitHub repository name from the URL.",
+                            },
+                            "ref": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 200,
+                                "description": "Branch/tag/commit to pin, e.g. main or v1.0.0; omit for HEAD.",
+                            },
+                            "path": {
+                                "type": "string",
+                                "maxLength": 1000,
+                                "description": "Optional subdirectory or single file path inside the repo; omit for the whole repository.",
+                            },
+                            "destination_root": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                                "description": "Sandbox-relative destination, normally inputs/github/<repo>.",
+                            },
+                        },
+                        "required": ["owner", "repo", "destination_root"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
     def _fetch_tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {
@@ -3019,6 +3149,15 @@ class AgentToolRuntime:
                     result,
                     {"query": result["query"], "result_count": len(sources)},
                     sources,
+                )
+            if name in {"download_external_image", "download_github_source"}:
+                return self._execute_external_acquisition(
+                    name,
+                    tool_call,
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    source_message_id=source_message_id,
                 )
             if name == "fetch_web_page":
                 policy = self._web_fetch_policy()
@@ -6765,6 +6904,291 @@ class AgentToolRuntime:
             sources,
         )
 
+    def _execute_external_acquisition(
+        self,
+        tool_name: str,
+        tool_call: dict[str, Any],
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+        assistant_message_id: str | None = None,
+        source_message_id: str | None = None,
+        _retried: bool = False,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        import logging
+
+        from app.domain.models import (
+            EXTERNAL_ACQUISITION_CAPABILITY,
+            EgressAuthorizationRequest,
+            HostAuthorizationGrant,
+        )
+        from app.services.egress_approvals import EgressApprovalService
+
+        _logger = logging.getLogger(__name__)
+        from app.services.external_acquisition import (
+            AcquisitionApprovalRequired,
+            ExternalAcquisitionService,
+        )
+
+        settings = self.settings or get_settings()
+        acquisition = ExternalAcquisitionService(
+            self.extensions.db,
+            self.workspace_id,
+            self.actor_id,
+            settings,
+        )
+        if tool_name == "download_external_image":
+            unknown = set(arguments) - {"url", "urls", "destination_path", "destination_dir", "expected_sha256"}
+            url = arguments.get("url")
+            urls = arguments.get("urls")
+            destination = arguments.get("destination_path")
+            destination_dir = arguments.get("destination_dir")
+            expected_sha = arguments.get("expected_sha256")
+            has_url = isinstance(url, str) and bool(url.strip())
+            has_urls = (
+                isinstance(urls, list)
+                and len(urls) >= 2
+                and all(isinstance(item, str) and item.strip() for item in urls)
+            )
+            sha_valid = expected_sha is None or (
+                isinstance(expected_sha, str)
+                and len(expected_sha) == 64
+                and all(char in "0123456789abcdefABCDEF" for char in expected_sha)
+            )
+            if unknown or has_url == has_urls or not sha_valid:
+                raise AppError(422, "invalid_tool_arguments", "download_external_image arguments are invalid")
+            kind = "image"
+            label = "可信图片下载工具"
+            if has_url:
+                if not isinstance(destination, str) or not destination.strip():
+                    raise AppError(422, "invalid_tool_arguments", "download_external_image requires destination_path for a single url")
+                normalized = {
+                    "url": url.strip(),
+                    "destination_path": destination.strip(),
+                }
+                if expected_sha:
+                    normalized["expected_sha256"] = expected_sha.casefold()
+                purpose = f"下载并验证图片 {url.strip()}"
+            else:
+                normalized = {
+                    "urls": sorted({item.strip() for item in urls}),
+                    "destination_dir": (
+                        destination_dir.strip()
+                        if isinstance(destination_dir, str) and destination_dir.strip()
+                        else "inputs/images"
+                    ),
+                }
+                purpose = f"并行下载 {len(normalized['urls'])} 张图片"
+        else:
+            unknown = set(arguments) - {"owner", "repo", "ref", "path", "destination_root"}
+            owner = arguments.get("owner")
+            repo = arguments.get("repo")
+            destination = arguments.get("destination_root")
+            ref = arguments.get("ref", "HEAD")
+            source_path = arguments.get("path", "")
+            if (
+                unknown
+                or not isinstance(owner, str)
+                or not owner.strip()
+                or not isinstance(repo, str)
+                or not repo.strip()
+                or not isinstance(destination, str)
+                or not destination.strip()
+                or not isinstance(ref, str)
+                or not isinstance(source_path, str)
+            ):
+                raise AppError(422, "invalid_tool_arguments", "download_github_source arguments are invalid")
+            normalized = {
+                "owner": owner.strip(),
+                "repo": repo.strip(),
+                "ref": ref.strip() or "HEAD",
+                "path": source_path.strip(),
+                "destination_root": destination.strip(),
+            }
+            kind = "github_snapshot"
+            label = "GitHub 源码下载工具"
+            purpose = f"下载 GitHub 源码 {owner.strip()}/{repo.strip()}@{ref.strip() or 'HEAD'}"
+
+        _spec, spec_sha = acquisition.canonical_spec(kind, normalized)
+        approval_service = EgressApprovalService(
+            self.extensions.db,
+            self.workspace_id,
+            settings,
+            capability=EXTERNAL_ACQUISITION_CAPABILITY,
+        )
+        allowed_hosts = set(approval_service.effective_allowed_hosts(actor_id=self.actor_id))
+        related_requests = self.extensions.db.scalars(
+            select(EgressAuthorizationRequest).where(
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.capability == EXTERNAL_ACQUISITION_CAPABILITY,
+                EgressAuthorizationRequest.requested_by == self.actor_id,
+                EgressAuthorizationRequest.chat_session_id == chat_session_id,
+                EgressAuthorizationRequest.status.in_(["approved", "consumed"]),
+                EgressAuthorizationRequest.expires_at > datetime.now(timezone.utc),
+            )
+        ).all()
+        matching_once: list[EgressAuthorizationRequest] = []
+        approval_by_host: dict[str, str] = {}
+        grants = self.extensions.db.scalars(
+            select(HostAuthorizationGrant).where(
+                HostAuthorizationGrant.workspace_id == self.workspace_id,
+                HostAuthorizationGrant.capability == EXTERNAL_ACQUISITION_CAPABILITY,
+                HostAuthorizationGrant.revoked_at.is_(None),
+            )
+        ).all()
+        for grant in grants:
+            if grant.hostname in allowed_hosts and grant.source_request_id:
+                approval_by_host[grant.hostname] = grant.source_request_id
+        for request in related_requests:
+            context = request.request_context if isinstance(request.request_context, dict) else {}
+            if context.get("request_spec_sha256") != spec_sha:
+                continue
+            approval_by_host[request.hostname] = request.id
+            if request.status == "approved" and request.decision == "allow_once":
+                matching_once.append(request)
+                allowed_hosts.add(request.hostname)
+
+        claimed: list[EgressAuthorizationRequest] = []
+
+        def release_claimed() -> None:
+            for request in claimed:
+                try:
+                    approval_service.release_once(request_id=request.id)
+                except Exception:
+                    _logger.exception(
+                        "failed to release acquisition approval %s",
+                        request.id,
+                    )
+
+        try:
+            # Atomically claim every matching single-use lease BEFORE any network
+            # activity. A concurrent caller can only claim each lease once.
+            for request in list(matching_once):
+                claim = approval_service.claim_once(
+                    request_id=request.id,
+                    actor_id=self.actor_id,
+                )
+                if claim is None:
+                    release_claimed()
+                    if _retried:
+                        # Already retried: drop this host and continue without it.
+                        allowed_hosts.discard(request.hostname)
+                        matching_once.remove(request)
+                    else:
+                        return self._execute_external_acquisition(
+                            tool_name,
+                            tool_call,
+                            arguments,
+                            chat_session_id=chat_session_id,
+                            assistant_message_id=assistant_message_id,
+                            source_message_id=source_message_id,
+                            _retried=True,
+                        )
+                else:
+                    claimed.append(claim)
+            if tool_name == "download_external_image":
+                if "urls" in normalized:
+                    result = acquisition.download_images(
+                        chat_session_id=chat_session_id,
+                        allowed_hosts=allowed_hosts,
+                        request_spec_sha256=spec_sha,
+                        approval_by_host=approval_by_host,
+                        **normalized,
+                    )
+                else:
+                    result = acquisition.download_image(
+                        chat_session_id=chat_session_id,
+                        allowed_hosts=allowed_hosts,
+                        request_spec_sha256=spec_sha,
+                        approval_by_host=approval_by_host,
+                        **normalized,
+                    )
+            else:
+                result = acquisition.download_github_source(
+                    chat_session_id=chat_session_id,
+                    allowed_hosts=allowed_hosts,
+                    request_spec_sha256=spec_sha,
+                    approval_by_host=approval_by_host,
+                    **normalized,
+                )
+        except AcquisitionApprovalRequired as exc:
+            release_claimed()
+            request = approval_service.create_request(
+                hostname=exc.hostname,
+                requested_by=self.actor_id,
+                chat_session_id=chat_session_id,
+                purpose=purpose,
+                request_context={
+                    "tool_name": tool_name,
+                    "tool_label": label,
+                    "origin": "external_acquisition",
+                    "request_spec_sha256": spec_sha,
+                    "resource_summary": purpose,
+                    "destination_path": normalized.get("destination_path")
+                    or normalized.get("destination_root"),
+                },
+                dedupe_key=f"acquire:{spec_sha[:32]}:{exc.hostname}"[:80],
+                tool_call_id=str(tool_call.get("id") or "") or None,
+                assistant_message_id=assistant_message_id,
+                user_message_id=source_message_id,
+            )
+            if request.status == "approved":
+                # Unified allowlist can approve synchronously; retry once with the
+                # newly materialized persistent grant instead of showing a card.
+                return self._execute_external_acquisition(
+                    tool_name,
+                    tool_call,
+                    arguments,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    source_message_id=source_message_id,
+                    _retried=True,
+                )
+            return self._failure(
+                "egress_authorization_required",
+                "外部资源下载需要用户授权",
+                data={
+                    "authorization_request_id": request.id,
+                    "tool_call_id": str(tool_call.get("id") or ""),
+                    "tool_name": tool_name,
+                    "tool_label": label,
+                    "hostname": request.hostname,
+                    "requested_url": normalized.get("url"),
+                    "request_spec_sha256": spec_sha,
+                    "resource_summary": purpose,
+                    "destination_path": normalized.get("destination_path")
+                    or normalized.get("destination_root"),
+                    "message_zh": f"{purpose}，需要访问主机 {request.hostname}，是否批准？",
+                },
+            )
+
+        except Exception:
+            release_claimed()
+            raise
+        for request in claimed:
+            approval_service.consume_once(request_id=request.id)
+        if tool_name == "download_external_image" and "urls" in normalized:
+            # Batch parallel download: the result text lists every image, so no
+            # single-file artifact card is emitted.
+            meta: dict[str, Any] = {
+                "tool": tool_name,
+                "request_spec_sha256": spec_sha,
+                "downloaded_count": len(result.get("downloaded", [])),
+                "failed_count": len(result.get("failed", [])),
+            }
+        else:
+            meta = {
+                "tool": tool_name,
+                "request_spec_sha256": spec_sha,
+                "file_id": result.get("file_id"),
+                "path": result.get("path") or result.get("destination_root"),
+                "size_bytes": result.get("size_bytes") or result.get("total_bytes"),
+                "sha256": result.get("blob_sha256") or result.get("manifest_sha256"),
+                "mime_type": result.get("mime_type"),
+                "title": "已下载的图片" if tool_name == "download_external_image" else "GitHub 源码快照",
+            }
+        return self._success(result, meta, [])
+
     def _fetch_web_page(
         self,
         arguments: dict[str, Any],
@@ -7771,6 +8195,10 @@ class AgentToolRuntime:
                 "tool_name": details.get("tool_name") or "sandbox_exec",
                 "tool_label": details.get("tool_label") or "沙箱命令工具",
                 "hostname": details.get("hostname"),
+                "requested_url": details.get("requested_url"),
+                "request_spec_sha256": details.get("request_spec_sha256"),
+                "resource_summary": details.get("resource_summary"),
+                "destination_path": details.get("destination_path"),
                 "message_zh": details.get("message_zh")
                 or "沙箱出站访问需要用户授权。",
             }

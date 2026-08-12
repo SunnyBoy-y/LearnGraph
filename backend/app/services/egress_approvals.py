@@ -39,6 +39,7 @@ from app.core.config import Settings
 from app.core.errors import AppError
 from app.domain.models import (
     EGRESS_APPROVAL_CAPABILITY,
+    EXTERNAL_ACQUISITION_CAPABILITY,
     EGRESS_APPROVAL_DEFAULT_TTL_SECONDS,
     EGRESS_APPROVAL_MAX_TTL_SECONDS,
     EgressAuthorizationRequest,
@@ -70,10 +71,15 @@ class EgressApprovalService:
         db: Session,
         workspace_id: str,
         settings: Settings | None = None,
+        *,
+        capability: str = EGRESS_APPROVAL_CAPABILITY,
     ) -> None:
+        if capability not in {EGRESS_APPROVAL_CAPABILITY, EXTERNAL_ACQUISITION_CAPABILITY}:
+            raise ValueError("Unsupported egress approval capability")
         self.db = db
         self.workspace_id = workspace_id
         self.settings = settings
+        self.capability = capability
         self.audit = AuditRepository(db, workspace_id)
 
     # -- internal helpers ----------------------------------------------------
@@ -217,7 +223,7 @@ class EgressApprovalService:
         grant = self.db.scalar(
             select(HostAuthorizationGrant).where(
                 HostAuthorizationGrant.workspace_id == self.workspace_id,
-                HostAuthorizationGrant.capability == EGRESS_APPROVAL_CAPABILITY,
+                HostAuthorizationGrant.capability == request.capability,
                 HostAuthorizationGrant.subject_type == "workspace",
                 HostAuthorizationGrant.subject_id == self.workspace_id,
                 HostAuthorizationGrant.hostname == request.hostname,
@@ -226,7 +232,7 @@ class EgressApprovalService:
         if grant is None:
             grant = HostAuthorizationGrant(
                 workspace_id=self.workspace_id,
-                capability=EGRESS_APPROVAL_CAPABILITY,
+                capability=request.capability,
                 subject_type="workspace",
                 subject_id=self.workspace_id,
                 hostname=request.hostname,
@@ -291,6 +297,7 @@ class EgressApprovalService:
         existing = self.db.scalar(
             select(EgressAuthorizationRequest).where(
                 EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.capability == self.capability,
                 EgressAuthorizationRequest.hostname == canonical,
                 EgressAuthorizationRequest.dedupe_key == source,
                 EgressAuthorizationRequest.status == "pending",
@@ -335,7 +342,7 @@ class EgressApprovalService:
         request = EgressAuthorizationRequest(
             workspace_id=self.workspace_id,
             hostname=canonical,
-            capability=EGRESS_APPROVAL_CAPABILITY,
+            capability=self.capability,
             requested_by=requested_by,
             chat_session_id=chat_session_id,
             request_context=context or None,
@@ -358,7 +365,7 @@ class EgressApprovalService:
             resource_type="egress_authorization_request",
             resource_id=request.id,
             outcome="pending",
-            details={"hostname": canonical, "capability": EGRESS_APPROVAL_CAPABILITY},
+            details={"hostname": canonical, "capability": self.capability},
         )
         self.db.commit()
         self.db.refresh(request)
@@ -402,7 +409,7 @@ class EgressApprovalService:
         request = EgressAuthorizationRequest(
             workspace_id=self.workspace_id,
             hostname=hostname,
-            capability=EGRESS_APPROVAL_CAPABILITY,
+            capability=self.capability,
             requested_by=requested_by,
             chat_session_id=chat_session_id,
             request_context=context or None,
@@ -434,19 +441,20 @@ class EgressApprovalService:
             outcome="approved",
             details={
                 "hostname": hostname,
-                "capability": EGRESS_APPROVAL_CAPABILITY,
+                "capability": self.capability,
                 "reason": "unified_allowlist" if not access_allow_all(self.db, self.workspace_id) else "allow_all",
             },
         )
         self.db.commit()
         self.db.refresh(request)
-        try:
-            self.ensure_agent_egress_policy(now=now)
-        except Exception:
-            logger.exception(
-                "agent egress policy refresh failed after auto-approval for workspace %s",
-                self.workspace_id,
-            )
+        if self.capability == EGRESS_APPROVAL_CAPABILITY:
+            try:
+                self.ensure_agent_egress_policy(now=now)
+            except Exception:
+                logger.exception(
+                    "agent egress policy refresh failed after auto-approval for workspace %s",
+                    self.workspace_id,
+                )
         return request
 
     def decide(
@@ -519,13 +527,14 @@ class EgressApprovalService:
         )
         self.db.commit()
         self.db.refresh(request)
-        try:
-            self.ensure_agent_egress_policy(now=current)
-        except Exception:
-            logger.exception(
-                "agent egress policy refresh failed after decision for workspace %s",
-                self.workspace_id,
-            )
+        if self.capability == EGRESS_APPROVAL_CAPABILITY:
+            try:
+                self.ensure_agent_egress_policy(now=current)
+            except Exception:
+                logger.exception(
+                    "agent egress policy refresh failed after decision for workspace %s",
+                    self.workspace_id,
+                )
         return request
 
     def list_requests(
@@ -595,6 +604,80 @@ class EgressApprovalService:
         self.db.commit()
         return result.rowcount or 0
 
+    def claim_once(
+        self,
+        *,
+        request_id: str,
+        actor_id: str,
+        now: datetime | None = None,
+    ) -> EgressAuthorizationRequest | None:
+        """Atomically claim a single-use lease before its host may be used.
+
+        The conditional UPDATE ``status='approved' AND decision='allow_once'
+        AND consumed_at IS NULL`` is the concurrency gate: exactly one caller
+        wins for one execution. The loser gets ``None`` and must not proceed.
+        On success the row is marked ``claimed`` with the actor id; the caller
+        finishes with ``consume_once`` (success) or ``release_once`` (failure).
+        """
+        current = now or _utc_now()
+        result = self.db.execute(
+            update(EgressAuthorizationRequest)
+            .where(
+                EgressAuthorizationRequest.id == request_id,
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.status == "approved",
+                EgressAuthorizationRequest.decision == "allow_once",
+                EgressAuthorizationRequest.consumed_at.is_(None),
+                EgressAuthorizationRequest.expires_at > current,
+            )
+            .values(status="claimed", claimed_by=actor_id, consumed_at=current)
+            .execution_options(synchronize_session=False)
+        )
+        self.db.commit()
+        if result.rowcount != 1:
+            request = self._load(request_id)
+            if request.status == "approved" and _as_utc(request.expires_at) <= current:
+                request.status = "expired"
+                self.db.commit()
+                self.db.refresh(request)
+            return None
+        request = self._load(request_id)
+        self.audit.record(
+            actor_id=actor_id,
+            action="agent_egress.authorization_claimed",
+            resource_type="egress_authorization_request",
+            resource_id=request.id,
+            outcome="claimed",
+            details={"hostname": request.hostname, "decision": "allow_once"},
+        )
+        self.db.commit()
+        self.db.refresh(request)
+        return request
+
+    def release_once(
+        self,
+        *,
+        request_id: str,
+        now: datetime | None = None,
+    ) -> EgressAuthorizationRequest:
+        """Release a claimed lease back to ``approved`` after a failed execution."""
+        request = self._load(request_id)
+        if request.status == "claimed" and request.decision == "allow_once":
+            request.status = "approved"
+            request.claimed_by = None
+            request.consumed_at = None
+            self.audit.record(
+                actor_id=request.requested_by,
+                action="agent_egress.authorization_released",
+                resource_type="egress_authorization_request",
+                resource_id=request.id,
+                outcome="approved",
+                details={"hostname": request.hostname, "decision": "allow_once"},
+            )
+            self.db.commit()
+            self.db.refresh(request)
+        return request
+
     def consume_once(
         self,
         *,
@@ -606,13 +689,17 @@ class EgressApprovalService:
 
         ``allow_once`` is a single-use lease; once a derived policy consumed it,
         this marks it ``consumed`` so it cannot be reused. Idempotent and a
-        no-op for ``allow_always`` (persistent grants are not leases).
+        no-op for ``allow_always`` (persistent grants are not leases). A
+        ``claimed`` row is finalized here; unclaimed approvals are also consumed
+        for callers that do not use the atomic claim path.
         """
         request = self._load(request_id)
-        if request.status != "approved" or request.decision != "allow_once":
+        if request.decision != "allow_once":
+            return request
+        if request.status == "consumed":
             return request
         request.status = "consumed"
-        request.consumed_at = now or _utc_now()
+        request.consumed_at = request.consumed_at or now or _utc_now()
         self.audit.record(
             actor_id=request.requested_by,
             action="agent_egress.authorization_consumed",
@@ -623,13 +710,14 @@ class EgressApprovalService:
         )
         self.db.commit()
         self.db.refresh(request)
-        try:
-            self.ensure_agent_egress_policy()
-        except Exception:
-            logger.exception(
-                "agent egress policy refresh failed after consume for workspace %s",
-                self.workspace_id,
-            )
+        if self.capability == EGRESS_APPROVAL_CAPABILITY:
+            try:
+                self.ensure_agent_egress_policy()
+            except Exception:
+                logger.exception(
+                    "agent egress policy refresh failed after consume for workspace %s",
+                    self.workspace_id,
+                )
         return request
 
     # -- allowlist resolution (T4.1 / Phase 2 consumption point) --------------
@@ -646,7 +734,7 @@ class EgressApprovalService:
         grants = self.db.scalars(
             select(HostAuthorizationGrant).where(
                 HostAuthorizationGrant.workspace_id == self.workspace_id,
-                HostAuthorizationGrant.capability == EGRESS_APPROVAL_CAPABILITY,
+                HostAuthorizationGrant.capability == self.capability,
                 HostAuthorizationGrant.revoked_at.is_(None),
             )
         ).all()

@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     workspace_storage_quota_bytes: int = 10 * 1024 * 1024 * 1024
     max_backup_bytes: int = 1024 * 1024 * 1024
     max_document_parse_bytes: int = 50 * 1024 * 1024
+    # Trusted host-side acquisition. Remote bytes are verified and persisted
+    # before they are linked into a sandbox session; the sandbox stays offline.
+    external_download_timeout_seconds: float = 20.0
+    external_download_max_redirects: int = 3
+    external_image_download_max_bytes: int = 20 * 1024 * 1024
+    external_image_download_max_pixels: int = 40_000_000
+    external_image_download_max_parallel: int = 4
+    external_github_metadata_max_bytes: int = 8 * 1024 * 1024
+    external_github_file_max_bytes: int = 10 * 1024 * 1024
+    external_github_total_max_bytes: int = 100 * 1024 * 1024
+    external_github_max_files: int = 2_000
     research_poll_seconds: float = 0.25
     research_max_polls: int = 20
     durable_queue_enabled: bool = True
