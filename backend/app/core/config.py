@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     # before they are linked into a sandbox session; the sandbox stays offline.
     external_download_timeout_seconds: float = 20.0
     external_download_max_redirects: int = 3
+    # Reuse DNS answers that already passed public-address classification within
+    # one acquisition (multi-file GitHub snapshots, parallel image batches) so the
+    # same host is not re-resolved per file; denied/empty answers are never cached.
+    external_download_dns_cache_ttl_seconds: float = 300.0
+    external_download_dns_cache_max_entries: int = 128
+    # Keep-alive reuse of the pinned (host, IP) HTTPS connection: GitHub snapshots
+    # issue one request per file, so reusing one TLS connection avoids a fresh
+    # handshake per file. 0 disables reuse entirely (every connection closed).
+    external_download_max_idle_connections: int = 4
+    external_download_idle_connection_timeout_seconds: float = 60.0
     external_image_download_max_bytes: int = 20 * 1024 * 1024
     external_image_download_max_pixels: int = 40_000_000
     external_image_download_max_parallel: int = 4
@@ -159,6 +169,13 @@ class Settings(BaseSettings):
     # command/MCP call). A hanging upstream must not stall the whole generation
     # chain; the tool returns a timeout failure and the chain can continue.
     agent_tool_timeout_seconds: int = 120
+    # Hosted 文搜图/图搜图 (Qwen Responses web_search_image / image_search)
+    # provider timeout. Image search is slower than plain web search (the
+    # upstream runs a real web search and may process an input_image for
+    # reverse search), so it gets its own budget instead of the generic 60s
+    # QwenResponsesToolProvider default. Must stay below
+    # agent_tool_timeout_seconds so the outer tool deadline never preempts it.
+    hosted_image_search_timeout_seconds: int = Field(default=90, ge=1, le=300)
     sandbox_cpu_count: float = 2.0
     sandbox_memory_bytes: int = 2 * 1024 * 1024 * 1024
     sandbox_memory_swap_bytes: int = 2 * 1024 * 1024 * 1024

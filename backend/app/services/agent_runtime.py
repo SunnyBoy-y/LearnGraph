@@ -64,6 +64,10 @@ AGENT_TOOL_RESULT_MAX_BYTES = 128 * 1024
 MAX_PARALLEL_RESEARCH_CHILDREN = 4
 DEFAULT_CLOCK_TIMEZONE = "UTC"
 MAX_AGENT_IMAGE_PROMPT_CHARS = 2_000
+# Hosted 文搜图/图搜图 is slower than plain web search and occasionally
+# exceeds its HTTP budget on the first attempt; one extra try converts a
+# transient upstream slowness into a success instead of a tool failure.
+IMAGE_SEARCH_TIMEOUT_RETRIES = 1
 # Session file tools: durable chat attachments and generated images.
 SESSION_FILE_LIST_MAX = 50
 SESSION_FILE_TEXT_MAX_BYTES = 1 * 1024 * 1024
@@ -813,11 +817,14 @@ class AgentToolRuntime:
                     "文搜图/图搜图 provider lane (阿里云百炼 web_search_image / "
                     "image_search via the Responses API). Pass only a text query "
                     "for text-to-image search, or add a public image URL for "
-                    "reverse image search. After the results come back, if the "
-                    "user wants the actual image files (to view, analyze, edit, "
-                    "or use in materials), call download_external_image with the "
-                    "selected image URLs — pass several URLs in the urls array "
-                    "to download them in parallel."
+                    "reverse image search. Keep the query short and "
+                    "single-language (about 60 characters or fewer): long or "
+                    "mixed-language queries make the upstream slower and can "
+                    "time out. After the results come back, if the user wants "
+                    "the actual image files (to view, analyze, edit, or use in "
+                    "materials), call download_external_image with the selected "
+                    "image URLs — pass several URLs in the urls array to "
+                    "download them in parallel."
                 ),
                 "parameters": {
                     "type": "object",
@@ -829,10 +836,11 @@ class AgentToolRuntime:
                         },
                         "image_url": {
                             "type": "string",
-                            "format": "uri",
                             "description": (
                                 "Optional public image URL for reverse image search "
-                                "(图搜图); omit for text-to-image search (文搜图)."
+                                "(图搜图); omit for text-to-image search (文搜图). "
+                                "Must be a public http(s) URL; the server validates it "
+                                "against the authorized domains."
                             ),
                         },
                     },
@@ -7327,20 +7335,37 @@ class AgentToolRuntime:
                     if isinstance(item, str) and item.strip()
                 }
                 require_public_http_url(image_url.strip(), domains)
-            images = provider.image_search(
-                query.strip(),
-                image_url=image_url.strip() if isinstance(image_url, str) else None,
-            )
         except UnsafeFetchURL as exc:
             raise AppError(
                 422,
                 "image_search_url_blocked",
                 "The reverse-image URL is not a safe public URL",
             ) from exc
-        except SearchProviderTimeout as exc:
-            raise AppError(504, "search_provider_timeout", "Image search timed out") from exc
-        except SearchProviderError as exc:
-            raise AppError(502, "search_provider_failed", "Image search failed") from exc
+        timeout_seconds = getattr(provider, "timeout_seconds", None)
+        images: list[dict[str, str]] = []
+        last_timeout: SearchProviderTimeout | None = None
+        for _attempt in range(1 + IMAGE_SEARCH_TIMEOUT_RETRIES):
+            try:
+                images = provider.image_search(
+                    query.strip(),
+                    image_url=image_url.strip() if isinstance(image_url, str) else None,
+                )
+                break
+            except SearchProviderTimeout as exc:
+                # Transient upstream slowness; retry before failing.
+                last_timeout = exc
+            except SearchProviderError as exc:
+                raise AppError(502, "search_provider_failed", "Image search failed") from exc
+        else:
+            budget = f" after {timeout_seconds}s" if timeout_seconds else ""
+            raise AppError(
+                504,
+                "search_provider_timeout",
+                f"Image search timed out{budget} across "
+                f"{1 + IMAGE_SEARCH_TIMEOUT_RETRIES} attempts; the provider is slow "
+                "(not an argument error). Retry with a shorter single-language "
+                "query or try again later",
+            ) from last_timeout
         result = {"query": query.strip(), "images": images}
         return self._success(
             result,

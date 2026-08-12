@@ -38,9 +38,10 @@ import {
 } from "@/components/ai-elements/message";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import {
-  groupQuestionParts,
+  groupAnswerParts,
   QuestionSetPager,
 } from "@/components/chat/question-set-pager";
+import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
 import {
   groupPartsForDisplay,
@@ -992,12 +993,20 @@ export function DocumentChatPanel({
               />
             );
             const renderAnswerParts = (answerParts: MessagePart[]) =>
-              groupQuestionParts(answerParts).map((group) => {
+              groupAnswerParts(answerParts).map((group) => {
                 if (group.kind === "question_set") {
                   return (
                     <QuestionSetPager
                       key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
                       questions={group.questions}
+                    />
+                  );
+                }
+                if (group.kind === "image_strip") {
+                  return (
+                    <SandboxImageStrip
+                      key={`image-strip-${group.parts[0]?.id ?? "empty"}`}
+                      parts={group.parts}
                     />
                   );
                 }

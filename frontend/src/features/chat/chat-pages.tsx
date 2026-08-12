@@ -162,9 +162,10 @@ import {
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
 import {
-  groupQuestionParts,
+  groupAnswerParts,
   QuestionSetPager,
 } from "@/components/chat/question-set-pager";
+import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
   locateSelectionInContent,
@@ -1692,7 +1693,7 @@ function AssistantMessageInner({
     />
   );
   const renderAnswerParts = (parts: MessagePart[]) =>
-    groupQuestionParts(parts).map((group) => {
+    groupAnswerParts(parts).map((group) => {
       if (group.kind === "question_set") {
         return (
           <QuestionSetPager
@@ -1716,6 +1717,14 @@ function AssistantMessageInner({
               })
             }
             questions={group.questions}
+          />
+        );
+      }
+      if (group.kind === "image_strip") {
+        return (
+          <SandboxImageStrip
+            key={`image-strip-${group.parts[0]?.id ?? "empty"}`}
+            parts={group.parts}
           />
         );
       }

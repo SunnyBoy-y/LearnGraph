@@ -3249,14 +3249,33 @@ class ChatService:
         if not images:
             return None
         extra_records: list[MessagePartRecord] = []
-        shared_ordinal = text_record.ordinal
+        # message_parts has a UNIQUE(workspace_id, message_version_id, ordinal)
+        # constraint, so every part needs its own strictly increasing ordinal.
+        # Inline images must render right after the answer text, so they take
+        # ordinals immediately after text_record. Parts that were inserted
+        # before the splice (agent steps / tool calls / side-effect cards) are
+        # shifted up to make room; otherwise the image parts would carry
+        # ordinals after the tool parts and reorder after a page refresh.
+        insert_count = len(images) + sum(
+            1 for index in range(len(images)) if segments[index + 1]
+        )
+        existing_after = self.db.scalars(
+            select(MessagePartRecord).where(
+                MessagePartRecord.workspace_id == self.workspace_id,
+                MessagePartRecord.message_version_id == message_version_id,
+                MessagePartRecord.ordinal > text_record.ordinal,
+            )
+        ).all()
+        for part in existing_after:
+            part.ordinal += insert_count
+        next_ordinal = text_record.ordinal + 1
         for index, image_data in enumerate(images):
             extra_records.append(
                 self.message_parts.add(
                     MessagePartRecord(
                         workspace_id=self.workspace_id,
                         message_version_id=message_version_id,
-                        ordinal=shared_ordinal,
+                        ordinal=next_ordinal,
                         part_type="image",
                         status="completed",
                         content=str(image_data["title"]),
@@ -3264,6 +3283,7 @@ class ChatService:
                     )
                 )
             )
+            next_ordinal += 1
             segment = segments[index + 1]
             if segment:
                 extra_records.append(
@@ -3271,13 +3291,14 @@ class ChatService:
                         MessagePartRecord(
                             workspace_id=self.workspace_id,
                             message_version_id=message_version_id,
-                            ordinal=shared_ordinal,
+                            ordinal=next_ordinal,
                             part_type="text",
                             status="completed",
                             content=segment,
                         )
                     )
                 )
+                next_ordinal += 1
         return segments[0], "".join(segments), extra_records
 
     def _emit_sandbox_side_effect_parts(

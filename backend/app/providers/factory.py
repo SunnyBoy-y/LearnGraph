@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -1538,6 +1540,7 @@ def _qwen_companion_for_workspace(
     *,
     capability: str,
     provider_types: tuple[str, ...] = ("qwen",),
+    timeout_seconds: float | None = None,
 ) -> QwenResponsesToolProvider | None:
     """Resolve an explicitly enabled Qwen model as a mixed-model tool lane.
 
@@ -1595,13 +1598,16 @@ def _qwen_companion_for_workspace(
             continue
         if not api_key:
             continue
-        return QwenResponsesToolProvider(
+        kwargs: dict[str, Any] = dict(
             provider_id=provider.id,
             model_id=model_id,
             base_url=provider.base_url,
             api_key=api_key,
             extra_headers=_extra_headers_from_capabilities(capabilities),
         )
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = float(timeout_seconds)
+        return QwenResponsesToolProvider(**kwargs)
     return None
 
 
@@ -1625,6 +1631,7 @@ def image_search_provider_for_workspace(
         settings,
         capability="hosted_image_search",
         provider_types=tuple(IMAGE_SEARCH_PROVIDER_TYPES),
+        timeout_seconds=settings.hosted_image_search_timeout_seconds,
     )
     if dedicated is not None:
         return dedicated
@@ -1633,6 +1640,7 @@ def image_search_provider_for_workspace(
         workspace_id,
         settings,
         capability="hosted_image_search",
+        timeout_seconds=settings.hosted_image_search_timeout_seconds,
     )
 
 

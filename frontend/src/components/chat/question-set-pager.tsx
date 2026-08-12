@@ -8,6 +8,7 @@ import {
   XCircle,
 } from "lucide-react";
 
+import { isSandboxImageArtifactPart } from "@/components/chat/sandbox-image-artifact";
 import {
   OptionGroup,
   type OptionGroupChoice,
@@ -872,4 +873,34 @@ export function groupQuestionParts(parts: MessagePart[]): Array<
     groups.push({ kind: "part", part });
   }
   return groups;
+}
+
+/**
+ * Final answer-body grouping used by every chat renderer:
+ * question pager groups from {@link groupQuestionParts}, plus adjacent sandbox
+ * image artifacts merged into a single inline image strip. Only strictly
+ * adjacent image parts are merged — text/cards in between split the stream so
+ * the horizontal-scroll strip never swallows images separated by prose.
+ */
+export type AnswerGroup =
+  | { kind: "part"; part: MessagePart }
+  | { kind: "question_set"; parts: MessagePart[]; questions: QuestionItem[] }
+  | { kind: "image_strip"; parts: MessagePart[] };
+
+export function groupAnswerParts(parts: MessagePart[]): AnswerGroup[] {
+  const groups = groupQuestionParts(parts);
+  const result: AnswerGroup[] = [];
+  for (const group of groups) {
+    if (group.kind === "part" && isSandboxImageArtifactPart(group.part)) {
+      const last = result[result.length - 1];
+      if (last && last.kind === "image_strip") {
+        last.parts.push(group.part);
+      } else {
+        result.push({ kind: "image_strip", parts: [group.part] });
+      }
+      continue;
+    }
+    result.push(group);
+  }
+  return result;
 }

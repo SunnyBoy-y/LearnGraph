@@ -4,13 +4,16 @@ import {
   Check,
   Download,
   ExternalLink,
+  Eye,
   FileText,
   ImageIcon,
   LoaderCircle,
+  Maximize2,
   Network,
   Quote,
   ShieldAlert,
   Sparkles,
+  X,
 } from "lucide-react";
 
 import { MessageResponse } from "@/components/ai-elements/message";
@@ -33,8 +36,13 @@ import {
   ToolOutput,
 } from "@/components/ai-elements/tool";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
+import {
+  isSandboxImageArtifactPart,
+  SandboxImageArtifact,
+} from "@/components/chat/sandbox-image-artifact";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
+import { FilePreviewCanvas } from "@/components/resources/file-preview";
 import { downloadFile } from "@/api/files";
 import { confirmSkillDeletion } from "@/api/extensions";
 import { approveResearch } from "@/api/research";
@@ -49,6 +57,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -66,6 +82,7 @@ import {
   rewriteAllCitations,
 } from "@/lib/document-citations";
 import { decodeUrlForDisplay } from "@/lib/url-display";
+import { resolveFilePreviewKind } from "@/lib/file-preview";
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
 import type { FetchAuthorizationData, FetchAuthorizationDecision } from "@/types/fetch-authorization";
@@ -779,10 +796,49 @@ function UserConfirmationPart({ data }: { data: PartData }) {
   );
 }
 
+/**
+ * 二级弹窗图片预览（复用 chat-image-lightbox 样式，与流式图片灯箱一致）。
+ */
+function ImageLightbox({
+  alt,
+  filename,
+  onOpenChange,
+  open,
+  src,
+}: {
+  alt: string;
+  filename: string;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+  src: string;
+}) {
+  return (
+    <Dialog onOpenChange={onOpenChange} open={open}>
+      <DialogContent
+        aria-describedby={undefined}
+        className="chat-image-lightbox"
+        showCloseButton={false}
+      >
+        <DialogTitle className="sr-only">预览图片 {filename}</DialogTitle>
+        <img alt={alt} className="chat-image-lightbox__image" src={src} />
+        <div className="chat-image-lightbox__toolbar">
+          <DialogClose asChild>
+            <button type="button">
+              <X className="size-4" />
+              关闭
+            </button>
+          </DialogClose>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ImagePart({ data, status }: { data: PartData; status: string }) {
   const directSrc = safeHref(data?.src ?? data?.url);
   const fileId = typeof data?.file_id === "string" ? data.file_id : "";
   const [fileSrc, setFileSrc] = useState("");
+  const [lightboxOpen, setLightboxOpen] = useState(false);
   useEffect(() => {
     if (!fileId || directSrc) return;
     let objectUrl = "";
@@ -803,22 +859,139 @@ function ImagePart({ data, status }: { data: PartData; status: string }) {
   const alt = typeof data?.alt === "string" ? data.alt : title;
   const src = directSrc || fileSrc;
   return (
-    <figure className="message-image">
+    <figure className="message-image-thumb">
       {src && status === "completed" ? (
-        <img alt={alt} src={src} />
+        <>
+          <button
+            aria-label={`放大预览 ${title}`}
+            className="message-image-thumb__frame"
+            onClick={() => setLightboxOpen(true)}
+            type="button"
+          >
+            <img alt={alt} src={src} />
+            <span className="message-image-thumb__zoom">
+              <Maximize2 className="size-3.5" />
+            </span>
+          </button>
+          <figcaption className="message-image-thumb__meta">
+            <strong title={title}>{title}</strong>
+          </figcaption>
+        </>
       ) : (
-        <div>
+        <div className="message-image-thumb__state">
           <ImageIcon className="size-6" />
           <strong>{title}</strong>
           <span>{status}</span>
         </div>
       )}
+      {src ? (
+        <ImageLightbox
+          alt={alt}
+          filename={title}
+          onOpenChange={setLightboxOpen}
+          open={lightboxOpen}
+          src={src}
+        />
+      ) : null}
     </figure>
+  );
+}
+
+/**
+ * 文档类附件的内置预览弹窗：按需下载内容并复用 FilePreviewCanvas
+ * （pdf/word/ppt/xlsx/音频/视频/html/文本 均有浏览器内查看器）。
+ */
+function AttachmentPreviewDialog({
+  fileId,
+  filename,
+  kindLabel,
+  mimeType,
+  onOpenChange,
+  open,
+}: {
+  fileId: string;
+  filename: string;
+  kindLabel: string;
+  mimeType: string;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+}) {
+  const [blob, setBlob] = useState<Blob | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!open || !fileId || blob) return;
+    let cancelled = false;
+    setLoading(true);
+    setFailed(false);
+    void downloadFile(fileId)
+      .then((next) => {
+        if (!cancelled) setBlob(next);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [blob, fileId, open]);
+
+  return (
+    <Dialog
+      onOpenChange={(next) => {
+        if (!next) setBlob(null);
+        onOpenChange(next);
+      }}
+      open={open}
+    >
+      <DialogContent
+        className="flex max-h-[min(92svh,58rem)] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl"
+        showCloseButton
+      >
+        <DialogHeader className="shrink-0 border-b px-5 py-4 pr-12">
+          <DialogTitle className="truncate">{filename}</DialogTitle>
+          <DialogDescription className="truncate">
+            {kindLabel} · 内置预览
+          </DialogDescription>
+        </DialogHeader>
+        <div className="min-h-0 flex-1 overflow-auto bg-muted/15">
+          {loading ? (
+            <div
+              className="grid min-h-[24rem] place-items-center gap-2 text-sm text-muted-foreground"
+              role="status"
+            >
+              <LoaderCircle className="size-4 animate-spin" />
+              正在加载预览…
+            </div>
+          ) : failed ? (
+            <div
+              className="grid min-h-[24rem] place-items-center p-8 text-sm text-destructive"
+              role="alert"
+            >
+              预览加载失败，请下载后使用本地应用查看。
+            </div>
+          ) : blob ? (
+            <FilePreviewCanvas
+              blob={blob}
+              className="min-h-[32rem]"
+              filename={filename}
+              mimeType={mimeType}
+            />
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
 function AttachmentPart({ data, status }: { data: PartData; status: string }) {
   const [downloading, setDownloading] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
   const fileId = typeof data?.file_id === "string" ? data.file_id : "";
   const href = safeHref(data?.url ?? data?.src);
   const filename =
@@ -827,14 +1000,46 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
       : typeof data?.original_name === "string"
         ? data.original_name
         : "学习资料";
-  const mime = typeof data?.mime_type === "string" ? data.mime_type : "";
+  const mediaType =
+    typeof data?.mime_type === "string"
+      ? data.mime_type
+      : typeof data?.media_type === "string"
+        ? data.media_type
+        : "";
+  const previewKind = resolveFilePreviewKind(filename, mediaType);
+  const isImage = previewKind === "image";
   const kind = data?.relation === "context_reference"
     ? "回答引用的上下文"
-    : mime.includes("presentation") || /\.pptx?$/i.test(filename)
-    ? "演示文稿"
-    : mime.includes("word") || /\.docx?$/i.test(filename)
-      ? "文档"
-      : mime || "文件";
+    : isImage
+      ? "图片"
+      : mediaType.includes("presentation") || /\.pptx?$/i.test(filename)
+        ? "演示文稿"
+        : mediaType.includes("word") || /\.docx?$/i.test(filename)
+          ? "文档"
+          : mediaType || "文件";
+  // 图片走缩略图 + 灯箱；其余类型支持浏览器内预览，unsupported 只能下载。
+  const canPreview =
+    !isImage && previewKind !== "unsupported" && Boolean(fileId);
+
+  // 图片附件缩略图：优先直接地址，否则按 file_id 拉取内容。
+  const [imageSrc, setImageSrc] = useState("");
+  useEffect(() => {
+    if (!isImage || !fileId || href) return;
+    let objectUrl = "";
+    let cancelled = false;
+    void downloadFile(fileId)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setImageSrc(objectUrl);
+      })
+      .catch(() => setImageSrc(""));
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [href, fileId, isImage]);
+  const imageHref = href || imageSrc;
 
   async function download() {
     if (downloading) return;
@@ -853,23 +1058,93 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
     }
   }
 
+  if (isImage) {
+    return (
+      <div className="message-attachment message-attachment--image">
+        <button
+          aria-label={`预览图片 ${filename}`}
+          className="message-attachment__thumb"
+          disabled={!imageHref}
+          onClick={() => setLightboxOpen(true)}
+          type="button"
+        >
+          {imageHref ? (
+            <img alt={filename} src={imageHref} />
+          ) : (
+            <span className="message-attachment__thumb-placeholder">
+              <ImageIcon className="size-5" />
+            </span>
+          )}
+          <span className="message-attachment__thumb-zoom">
+            <Maximize2 className="size-3.5" />
+          </span>
+        </button>
+        <div className="message-attachment__footer">
+          <span className="message-attachment__meta">
+            <strong title={filename}>{filename}</strong>
+            <small>{kind}{status !== "completed" ? ` · ${status}` : ""}</small>
+          </span>
+          <Button
+            aria-label={`下载 ${filename}`}
+            disabled={downloading || (!fileId && !href)}
+            onClick={() => void download()}
+            size="icon-sm"
+            variant="ghost"
+          >
+            {downloading ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+          </Button>
+        </div>
+        {imageHref ? (
+          <ImageLightbox
+            alt={filename}
+            filename={filename}
+            onOpenChange={setLightboxOpen}
+            open={lightboxOpen}
+            src={imageHref}
+          />
+        ) : null}
+      </div>
+    );
+  }
+
   return (
-    <div className="message-attachment">
-      <span className="message-attachment__icon"><FileText className="size-4" /></span>
-      <span className="message-attachment__meta">
-        <strong title={filename}>{filename}</strong>
-        <small>{kind}{status !== "completed" ? ` · ${status}` : ""}</small>
-      </span>
-      <Button
-        aria-label={`下载 ${filename}`}
-        disabled={downloading || (!fileId && !href)}
-        onClick={() => void download()}
-        size="icon-sm"
-        variant="ghost"
-      >
-        {downloading ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
-      </Button>
-    </div>
+    <>
+      <div className="message-attachment">
+        <span className="message-attachment__icon"><FileText className="size-4" /></span>
+        <span className="message-attachment__meta">
+          <strong title={filename}>{filename}</strong>
+          <small>{kind}{status !== "completed" ? ` · ${status}` : ""}</small>
+        </span>
+        {canPreview ? (
+          <Button
+            aria-label={`预览 ${filename}`}
+            onClick={() => setPreviewOpen(true)}
+            size="icon-sm"
+            title="预览"
+            variant="ghost"
+          >
+            <Eye className="size-4" />
+          </Button>
+        ) : null}
+        <Button
+          aria-label={`下载 ${filename}`}
+          disabled={downloading || (!fileId && !href)}
+          onClick={() => void download()}
+          size="icon-sm"
+          variant="ghost"
+        >
+          {downloading ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
+        </Button>
+      </div>
+      <AttachmentPreviewDialog
+        fileId={fileId}
+        filename={filename}
+        kindLabel={kind}
+        mimeType={mediaType}
+        onOpenChange={setPreviewOpen}
+        open={previewOpen}
+      />
+    </>
   );
 }
 
@@ -1580,6 +1855,11 @@ export function MessagePartRenderer({
     case "magic_card":
       return <MagicCardHost data={part.data ?? {}} />;
     case "sandbox": {
+      // Published image files render as inline embedded previews (no manual
+      // 预览 click needed); the strip groups adjacent ones side by side.
+      if (isSandboxImageArtifactPart(part)) {
+        return <SandboxImageArtifact part={part} />;
+      }
       const kind = part.data?.kind;
       if (kind === "file" || typeof part.data?.file_id === "string") {
         return <SandboxFileArtifact data={part.data ?? {}} />;
@@ -1596,6 +1876,9 @@ export function MessagePartRenderer({
     case "subapp_artifact":
       return <SandboxArtifact data={part.data ?? {}} />;
     case "sandbox_artifact":
+      if (isSandboxImageArtifactPart(part)) {
+        return <SandboxImageArtifact part={part} />;
+      }
       return <SandboxFileArtifact data={part.data ?? {}} />;
     case "skill_trigger": {
       const skillName =
