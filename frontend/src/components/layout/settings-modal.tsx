@@ -1,12 +1,20 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { X } from "lucide-react";
+import { Check, ChevronDown, Settings, X } from "lucide-react";
 
 import {
   Dialog,
   DialogContent,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import {
@@ -148,36 +156,86 @@ export function SettingsModal({
         <section className="flex min-h-0 min-w-0 flex-col">
           <header
             className={cn(
-              "flex shrink-0 items-center gap-2 border-b bg-background/95 px-3 backdrop-blur-xl",
-              // Mobile: room for category select + safe-area for notch.
-              "min-h-14 gap-y-1 py-2 pt-[max(0.5rem,env(safe-area-inset-top))] sm:h-12 sm:min-h-0 sm:py-0 sm:pt-0",
+              "settings-modal__topbar flex shrink-0 items-center gap-2 border-b bg-background/90 px-3 backdrop-blur-xl",
+              // Mobile: polished app-bar with notch-safe spacing and a large touch target.
+              "min-h-[4.5rem] py-2 pt-[max(0.5rem,env(safe-area-inset-top))] sm:h-12 sm:min-h-0 sm:py-0 sm:pt-0",
             )}
           >
-            <div className="min-w-0 flex-1 sm:hidden">
-              <p className="mb-1 text-[11px] font-medium leading-none text-muted-foreground">
-                设置
-              </p>
-              <select
-                aria-label="设置分类"
-                className="h-10 w-full rounded-xl border bg-background px-2.5 text-sm outline-none"
-                value={activeItem?.path ?? settingsNav[0]?.path}
-                onChange={(event) =>
-                  navigate(`/w/${workspaceId}/${event.target.value}`)
-                }
-              >
-                {sections.map((section, sectionIndex) => (
-                  <optgroup
-                    key={section.title ?? sectionIndex}
-                    label={section.title ?? "设置"}
+            <div className="flex min-w-0 flex-1 items-center gap-2.5 sm:hidden">
+              <div className="grid size-10 shrink-0 place-items-center rounded-2xl bg-foreground text-background shadow-sm">
+                <Settings className="size-[18px]" />
+              </div>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="group flex h-11 min-w-0 flex-1 items-center gap-2 rounded-2xl px-2.5 text-left outline-none transition-colors hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring/40 data-[state=open]:bg-muted"
+                    aria-label={`切换设置分类，当前为${activeItem?.label ?? "设置"}`}
                   >
-                    {section.items.map((item) => (
-                      <option key={item.path} value={item.path}>
-                        {item.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
-              </select>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[10px] font-semibold uppercase leading-none tracking-[0.16em] text-muted-foreground/70">
+                        设置
+                      </span>
+                      <span className="mt-1 block truncate text-[15px] font-semibold leading-none tracking-tight">
+                        {activeItem?.label ?? "选择分类"}
+                      </span>
+                    </span>
+                    <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="start"
+                  sideOffset={8}
+                  collisionPadding={12}
+                  className="settings-mobile-menu max-h-[min(68dvh,34rem)] w-[calc(100vw-1.5rem)] min-w-0 overflow-y-auto !rounded-[1.25rem] border bg-popover/98 !p-2 !shadow-2xl ring-1 ring-foreground/5 backdrop-blur-xl"
+                >
+                  <DropdownMenuLabel className="px-2.5 pb-2 pt-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/70">
+                    设置分类
+                  </DropdownMenuLabel>
+                  {sections.map((section, sectionIndex) => (
+                    <div key={section.title ?? sectionIndex}>
+                      {sectionIndex > 0 ? (
+                        <DropdownMenuSeparator className="mx-2 my-2" />
+                      ) : null}
+                      {section.title ? (
+                        <DropdownMenuLabel className="px-2.5 pb-1 pt-1 text-[10px] uppercase tracking-wider text-muted-foreground/60">
+                          {section.title}
+                        </DropdownMenuLabel>
+                      ) : null}
+                      {section.items.map((item) => {
+                        const Icon = item.icon;
+                        const active = isSettingsNavActive(pathname, item);
+                        return (
+                          <DropdownMenuItem
+                            key={item.path}
+                            onSelect={() =>
+                              navigate(`/w/${workspaceId}/${item.path}`)
+                            }
+                            className={cn(
+                              "mb-0.5 min-h-12 gap-3 rounded-xl px-2.5 py-2.5 text-sm",
+                              active &&
+                                "bg-foreground text-background focus:bg-foreground focus:text-background [&_svg]:text-background",
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                "grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground",
+                                active && "bg-background/15 text-background",
+                              )}
+                            >
+                              <Icon className="size-4" />
+                            </span>
+                            <span className="min-w-0 flex-1 truncate font-medium">
+                              {item.label}
+                            </span>
+                            {active ? <Check className="size-4 shrink-0" /> : null}
+                          </DropdownMenuItem>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
             <p className="hidden min-w-0 flex-1 truncate text-sm font-medium sm:block">
               {activeItem?.label ?? "设置"}
@@ -185,7 +243,7 @@ export function SettingsModal({
             <button
               type="button"
               onClick={() => handleOpenChange(false)}
-              className="grid size-11 shrink-0 place-items-center rounded-xl text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:bg-muted sm:size-8 sm:rounded-lg"
+              className="grid size-11 shrink-0 place-items-center rounded-2xl border border-border/70 bg-background/80 text-muted-foreground shadow-sm transition-all hover:bg-muted hover:text-foreground active:scale-95 sm:size-8 sm:rounded-lg sm:border-0 sm:bg-transparent sm:shadow-none"
               aria-label="关闭设置"
             >
               <X className="size-5 sm:size-4" />

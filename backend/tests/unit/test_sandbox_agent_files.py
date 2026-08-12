@@ -8,7 +8,9 @@ cleanup path degrades gracefully).
 
 from __future__ import annotations
 
+import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from sqlalchemy.pool import StaticPool
 from app.core.config import get_settings
 from app.core.database import Base
 from app.core.errors import AppError
+from app.core.scheduler import _prune_orphaned_sandbox_snapshots
 from app.domain import models as m
 from app.domain.schemas.sandbox import SandboxAgentEnvironmentRequest
 from app.providers.ports.sandbox import SandboxSessionHandle
@@ -467,3 +470,36 @@ class TestEnvInfo:
         )
         assert isinstance(result.get("python_packages"), list)
         assert result["file_limit_bytes"] > 0
+
+
+def test_snapshot_cleanup_removes_only_stale_snapshot_directories(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "sandbox-workspaces"
+    owner_root = workspace_root / "user-1"
+    owner_root.mkdir(parents=True)
+
+    stale = owner_root / ".learngraph-command-snapshot-stale"
+    stale.mkdir()
+    (stale / "work.py").write_text("print('stale')", encoding="utf-8")
+    fresh = owner_root / ".learngraph-command-snapshot-fresh"
+    fresh.mkdir()
+    ordinary = owner_root / "session-1"
+    ordinary.mkdir()
+    prefixed_file = owner_root / ".learngraph-command-snapshot-not-a-directory"
+    prefixed_file.write_text("keep", encoding="utf-8")
+
+    now = datetime.now(timezone.utc)
+    stale_timestamp = (now - timedelta(hours=1)).timestamp()
+    os.utime(stale, (stale_timestamp, stale_timestamp))
+    os.utime(prefixed_file, (stale_timestamp, stale_timestamp))
+
+    removed = _prune_orphaned_sandbox_snapshots(
+        workspace_root,
+        now=now,
+        grace_seconds=600,
+    )
+
+    assert removed == 1
+    assert not stale.exists()
+    assert fresh.exists()
+    assert ordinary.exists()
+    assert prefixed_file.exists()

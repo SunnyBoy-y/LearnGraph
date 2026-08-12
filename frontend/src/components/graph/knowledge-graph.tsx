@@ -28,17 +28,29 @@ import {
 } from "@xyflow/react";
 import {
   Box,
+  Check,
+  Download,
   GitFork,
   LayoutDashboard,
   Minus,
+  MoreHorizontal,
   Plus,
   RotateCcw,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { StarRating } from "@/components/common/primitives";
+import { toast } from "sonner";
 import {
   TREE_CARD_W,
   TREE_MAIN_W,
@@ -52,6 +64,14 @@ import {
   type TreeNodeKind,
 } from "./knowledge-graph-layout";
 import { NodeExploreChip, RecommendDots } from "./node-explore";
+import {
+  buildGraphSvg,
+  downloadPngFile,
+  downloadSvgFile,
+  sanitizeFilename,
+  type GraphExportEdge,
+  type GraphExportNode,
+} from "./graph-export";
 
 export type KnowledgeNodeData = {
   label: string;
@@ -423,6 +443,12 @@ export function KnowledgeGraph({
   const [flowInstance, setFlowInstance] =
     useState<ReactFlowInstance<KnowledgeNode>>();
   const [zoom, setZoom] = useState(1);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exporting, setExporting] = useState<false | "svg" | "png">(false);
+  /** Narrow canvas: toolbar buttons collapse into a single "more" menu. */
+  const [toolbarNarrow, setToolbarNarrow] = useState(false);
+  /** Controlled state avoids the mobile pointer gesture losing Radix's toggle. */
+  const [toolbarMenuOpen, setToolbarMenuOpen] = useState(false);
   const [positionOverrides, setPositionOverrides] = useState<
     Record<string, { x: number; y: number }>
   >({});
@@ -437,6 +463,24 @@ export function KnowledgeGraph({
     height: number;
     zoom: number;
   } | undefined>(undefined);
+
+  // Collapse the header toolbar into a "more" menu when the canvas itself is
+  // narrow (the canvas is often narrower than the viewport, e.g. inside a
+  // split workbench column), so buttons never overflow or wrap awkwardly.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      setToolbarNarrow(entry.contentRect.width < 560);
+    });
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!toolbarNarrow) setToolbarMenuOpen(false);
+  }, [toolbarNarrow]);
   const focusId =
     internalSelectedIds[0] ?? selectedId ?? selectedIds?.[0] ?? undefined;
 
@@ -926,6 +970,93 @@ export function KnowledgeGraph({
     });
   };
 
+  /** Serialize the current visible graph into a standalone SVG/PNG file. */
+  const exportGraph = async (format: "svg" | "png") => {
+    if (!flowInstance || exporting) return;
+    setExporting(format);
+    try {
+      const currentNodes = flowInstance.getNodes();
+      const currentEdges = flowInstance.getEdges();
+      const exportNodes: GraphExportNode[] = currentNodes.map((node) => {
+        const isRoot =
+          Boolean(node.data.root) ||
+          node.data.kind === "root" ||
+          node.data.depth === 0;
+        const width =
+          node.measured?.width ??
+          (view === "tree"
+            ? isRoot
+              ? TREE_ROOT_SIZE
+              : node.data.kind === "main"
+                ? TREE_MAIN_W
+                : TREE_CARD_W
+            : node.data.rootEmphasis
+              ? 154
+              : 142);
+        const height =
+          node.measured?.height ??
+          (view === "tree"
+            ? isRoot
+              ? TREE_ROOT_SIZE
+              : TREE_NODE_H
+            : node.data.rootEmphasis
+              ? 154
+              : 90);
+        return {
+          id: node.id,
+          x: node.position.x,
+          y: node.position.y,
+          width,
+          height,
+          label: node.data.label ?? "",
+          description: node.data.description,
+          nodeType: node.data.nodeType,
+          kind: node.data.kind,
+          depth: node.data.depth,
+          root: isRoot,
+          rootEmphasis: Boolean(node.data.rootEmphasis),
+          tree: view === "tree",
+          statusLabel: masteryProgressLabel(node.data.stars, node.data.state),
+          step: node.data.step,
+          stepTotal: node.data.stepTotal,
+          collapsed: Boolean(node.data.collapsed),
+          hiddenCount: node.data.hiddenCount,
+        };
+      });
+      const nodeById = new Map(exportNodes.map((node) => [node.id, node]));
+      const exportEdges: GraphExportEdge[] = [];
+      for (const edge of currentEdges) {
+        const source = nodeById.get(edge.source);
+        const target = nodeById.get(edge.target);
+        if (!source || !target) continue;
+        const data = edge.data as Record<string, unknown> | undefined;
+        exportEdges.push({
+          id: edge.id,
+          sourceX: source.x + source.width / 2,
+          sourceY: source.y + source.height / 2,
+          targetX: target.x + target.width / 2,
+          targetY: target.y + target.height / 2,
+          targetWidth: target.width,
+          targetHeight: target.height,
+          spine: view === "tree" && Boolean(data?.spine),
+          active: Boolean(data?.active),
+          dim: Boolean(data?.dim),
+        });
+      }
+      const svg = buildGraphSvg(exportNodes, exportEdges, { title });
+      const base = sanitizeFilename(title);
+      if (format === "svg") {
+        downloadSvgFile(svg, `${base}.svg`);
+      } else {
+        await downloadPngFile(svg, `${base}.png`);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "图谱导出失败，请重试");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const handleCanvasKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!interactive) return;
     const target = event.target as HTMLElement;
@@ -971,10 +1102,10 @@ export function KnowledgeGraph({
       role={interactive ? "application" : undefined}
       tabIndex={interactive ? 0 : undefined}
     >
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between p-4">
-        <div className="pointer-events-auto">
-          <p className="text-sm font-semibold">{title}</p>
-          <p className="text-[11px] text-muted-foreground">
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 p-4">
+        <div className="pointer-events-auto min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold">{title}</p>
+          <p className="truncate text-[11px] text-muted-foreground">
             {view === "tree"
               ? `知识树 · 主干 + 左右分支 · 0–${Math.min(maxDepth ?? structuredTree.maxDepth, structuredTree.maxDepth)} 层`
               : view === "spatial"
@@ -982,77 +1113,220 @@ export function KnowledgeGraph({
                 : "平铺布局 · 按层级排列的紧凑网格"}
           </p>
         </div>
-        {interactive && (
-          <div className="pointer-events-auto flex items-center gap-1 rounded-xl border bg-card/90 p-1">
-            {showZoomControls ? (
-              <>
-                <Button
-                  aria-label="缩小图谱"
-                  disabled={!flowInstance || zoom <= minimumZoom + 0.01}
-                  onClick={() => zoomBy(-0.15)}
-                  size="icon-sm"
-                  title="缩小（-）"
-                  variant="ghost"
+        {interactive &&
+          (toolbarNarrow ? (
+            <div className="nodrag nopan nowheel pointer-events-auto shrink-0 rounded-xl border bg-card/90 p-1">
+              <DropdownMenu
+                modal={false}
+                open={toolbarMenuOpen}
+                onOpenChange={setToolbarMenuOpen}
+              >
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    aria-label="图谱操作"
+                    className="touch-manipulation"
+                    onClick={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onTouchStart={(event) => event.stopPropagation()}
+                    size="icon-sm"
+                    title="图谱操作（缩放 / 布局 / 导出 / 重置）"
+                    variant="ghost"
+                  >
+                    <MoreHorizontal />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  align="end"
+                  className="z-[80] min-w-48"
+                  collisionPadding={12}
+                  side="bottom"
+                  sideOffset={8}
                 >
-                  <ZoomOut />
-                </Button>
-                <output
-                  aria-live="polite"
-                  className="min-w-10 text-center text-[10px] tabular-nums text-muted-foreground"
-                >
-                  {Math.round(zoom * 100)}%
-                </output>
-                <Button
-                  aria-label="放大图谱"
-                  disabled={!flowInstance || zoom >= maximumZoom - 0.01}
-                  onClick={() => zoomBy(0.15)}
-                  size="icon-sm"
-                  title="放大（+）"
-                  variant="ghost"
-                >
-                  <ZoomIn />
-                </Button>
-              </>
-            ) : null}
-            <Button
-              aria-label="树形布局"
-              onClick={() => selectLayout("tree")}
-              size="icon-sm"
-              title="树形布局"
-              variant={view === "tree" ? "secondary" : "ghost"}
-            >
-              <GitFork />
-            </Button>
-            <Button
-              aria-label="空间布局"
-              onClick={() => selectLayout("spatial")}
-              size="icon-sm"
-              title="空间布局"
-              variant={view === "spatial" ? "secondary" : "ghost"}
-            >
-              <Box />
-            </Button>
-            <Button
-              aria-label="平铺布局"
-              onClick={() => selectLayout("flat")}
-              size="icon-sm"
-              title="平铺布局"
-              variant={view === "flat" ? "secondary" : "ghost"}
-            >
-              <LayoutDashboard />
-            </Button>
-            <Button
-              aria-label="重置图谱视图"
-              disabled={!flowInstance}
-              onClick={resetView}
-              size="icon-sm"
-              title="重置视图（0）"
-              variant="ghost"
-            >
-              <RotateCcw />
-            </Button>
-          </div>
-        )}
+                  {showZoomControls ? (
+                    <>
+                      <div className="flex items-center justify-between px-2 pt-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">
+                          缩放
+                        </span>
+                        <output
+                          aria-live="polite"
+                          className="min-w-10 text-right text-[10px] tabular-nums text-muted-foreground"
+                        >
+                          {Math.round(zoom * 100)}%
+                        </output>
+                      </div>
+                      <div className="flex items-center gap-1 px-1.5 pb-1">
+                        <Button
+                          aria-label="缩小图谱"
+                          disabled={!flowInstance || zoom <= minimumZoom + 0.01}
+                          onClick={() => zoomBy(-0.15)}
+                          size="sm"
+                          variant="ghost"
+                        >
+                          <ZoomOut />
+                          缩小
+                        </Button>
+                        <Button
+                          aria-label="放大图谱"
+                          disabled={!flowInstance || zoom >= maximumZoom - 0.01}
+                          onClick={() => zoomBy(0.15)}
+                          size="sm"
+                          variant="ghost"
+                        >
+                          <ZoomIn />
+                          放大
+                        </Button>
+                      </div>
+                      <DropdownMenuSeparator />
+                    </>
+                  ) : null}
+                  <DropdownMenuLabel>布局</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onClick={() => selectLayout("tree")}
+                  >
+                    <span className="flex size-4 items-center justify-center">
+                      {view === "tree" && <Check className="size-3.5" />}
+                    </span>
+                    树形布局
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onClick={() => selectLayout("spatial")}
+                  >
+                    <span className="flex size-4 items-center justify-center">
+                      {view === "spatial" && <Check className="size-3.5" />}
+                    </span>
+                    空间布局
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="gap-2"
+                    onClick={() => selectLayout("flat")}
+                  >
+                    <span className="flex size-4 items-center justify-center">
+                      {view === "flat" && <Check className="size-3.5" />}
+                    </span>
+                    平铺布局
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel>导出</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    disabled={exporting === "svg"}
+                    onSelect={() => void exportGraph("svg")}
+                  >
+                    导出为 SVG（矢量）
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={exporting === "png"}
+                    onSelect={() => void exportGraph("png")}
+                  >
+                    导出为 PNG（高清）
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem disabled={!flowInstance} onClick={resetView}>
+                    重置视图
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          ) : (
+            <div className="pointer-events-auto flex shrink-0 items-center gap-1 rounded-xl border bg-card/90 p-1">
+              {showZoomControls ? (
+                <>
+                  <Button
+                    aria-label="缩小图谱"
+                    disabled={!flowInstance || zoom <= minimumZoom + 0.01}
+                    onClick={() => zoomBy(-0.15)}
+                    size="icon-sm"
+                    title="缩小（-）"
+                    variant="ghost"
+                  >
+                    <ZoomOut />
+                  </Button>
+                  <output
+                    aria-live="polite"
+                    className="min-w-10 text-center text-[10px] tabular-nums text-muted-foreground"
+                  >
+                    {Math.round(zoom * 100)}%
+                  </output>
+                  <Button
+                    aria-label="放大图谱"
+                    disabled={!flowInstance || zoom >= maximumZoom - 0.01}
+                    onClick={() => zoomBy(0.15)}
+                    size="icon-sm"
+                    title="放大（+）"
+                    variant="ghost"
+                  >
+                    <ZoomIn />
+                  </Button>
+                </>
+              ) : null}
+              <Button
+                aria-label="树形布局"
+                onClick={() => selectLayout("tree")}
+                size="icon-sm"
+                title="树形布局"
+                variant={view === "tree" ? "secondary" : "ghost"}
+              >
+                <GitFork />
+              </Button>
+              <Button
+                aria-label="空间布局"
+                onClick={() => selectLayout("spatial")}
+                size="icon-sm"
+                title="空间布局"
+                variant={view === "spatial" ? "secondary" : "ghost"}
+              >
+                <Box />
+              </Button>
+              <Button
+                aria-label="平铺布局"
+                onClick={() => selectLayout("flat")}
+                size="icon-sm"
+                title="平铺布局"
+                variant={view === "flat" ? "secondary" : "ghost"}
+              >
+                <LayoutDashboard />
+              </Button>
+              <DropdownMenu open={exportOpen} onOpenChange={setExportOpen}>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    aria-label="导出图谱"
+                    disabled={!flowInstance || nodes.length === 0 || exporting !== false}
+                    size="icon-sm"
+                    title="导出图谱为图片（SVG 矢量 / PNG 高清）"
+                    variant="ghost"
+                  >
+                    <Download />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-40">
+                  <DropdownMenuItem
+                    disabled={exporting === "svg"}
+                    onSelect={() => void exportGraph("svg")}
+                  >
+                    导出为 SVG（矢量）
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={exporting === "png"}
+                    onSelect={() => void exportGraph("png")}
+                  >
+                    导出为 PNG（高清）
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <Button
+                aria-label="重置图谱视图"
+                disabled={!flowInstance}
+                onClick={resetView}
+                size="icon-sm"
+                title="重置视图（0）"
+                variant="ghost"
+              >
+                <RotateCcw />
+              </Button>
+            </div>
+          ))}
       </div>
       <ReactFlow
         colorMode="light"

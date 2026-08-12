@@ -2510,7 +2510,8 @@ body.is-resizing .workspace-resizer {
 
 .graph-workbench-page {
   display: flex !important;
-  min-height: calc(100dvh - 64px);
+  height: 100dvh;
+  min-height: 100dvh !important;
   flex-direction: column;
   gap: 0 !important;
   padding-top: 12px !important;
@@ -2611,7 +2612,7 @@ body.is-resizing .workspace-resizer {
   .graph-library-detail__canvas { height: 56dvh; min-height: 380px; }
   .graph-library-detail__footer { align-items: flex-start; flex-direction: column; gap: 14px; }
   .graph-library-detail__focus { margin-left: 0; }
-  .graph-workbench-page { min-height: calc(100dvh - 48px); }
+  .graph-workbench-page { height: auto; min-height: 100dvh !important; }
   .graph-workbench-canvas__header { align-items: flex-start; flex-direction: column; }
   .graph-workbench-canvas__body { grid-template-columns: 1fr; }
   .graph-workbench-controls { grid-template-columns: minmax(0, 1fr) auto; }

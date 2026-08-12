@@ -135,8 +135,8 @@ class Settings(BaseSettings):
     # they can become the runtime image reference.
     sandbox_prebuilt_image: str | None = None
     sandbox_task_ttl_seconds: int = 3_600
-    sandbox_container_idle_ttl_seconds: int = 180
-    sandbox_container_absolute_ttl_seconds: int = 1_800
+    sandbox_container_idle_ttl_seconds: int = 600
+    sandbox_container_absolute_ttl_seconds: int = 3_600
     sandbox_workspace_idle_ttl_seconds: int = 1_800
     sandbox_workspace_absolute_ttl_seconds: int = 86_400
     sandbox_workspace_root: str = "./data/sandbox-workspaces"
@@ -161,11 +161,17 @@ class Settings(BaseSettings):
     sandbox_build_npm_registry: str | None = None
     # This is a logical, actual-usage ceiling for the bind-mounted workspace;
     # Docker does not preallocate this amount when a sandbox starts.
-    sandbox_disk_bytes: int = 20 * 1024 * 1024 * 1024
+    sandbox_disk_bytes: int = 2 * 1024 * 1024 * 1024
     sandbox_file_count: int = 20_000
     sandbox_directory_count: int = 5_000
     sandbox_snapshot_reserve_bytes: int = 256 * 1024 * 1024
-    sandbox_output_bytes: int = 5 * 1024 * 1024
+    # Safety snapshots live beside a user's session directories while a command
+    # runs. A crashed backend can strand them, so the cleanup sweep removes only
+    # snapshots older than this grace period.
+    sandbox_snapshot_cleanup_grace_seconds: int = 600
+    # Combined stdout/stderr captured for one command. Generated files use the
+    # workspace/artifact path and must not be transported through process output.
+    sandbox_output_bytes: int = 20 * 1024 * 1024
     sandbox_active_per_user: int = 2
     sandbox_queued_tasks_per_user: int = 5
     sandbox_retained_workspaces_per_user: int = 10
@@ -186,8 +192,10 @@ class Settings(BaseSettings):
     subapp_preview_port: int | None = None
     # bootstrap to admins; this env flag sets the initial deployment default.
     sandbox_bootstrap_member_allowed: bool = True
-    sandbox_agent_file_bytes: int = 20 * 1024 * 1024 * 1024
-    sandbox_agent_archive_bytes: int = 1 * 1024 * 1024 * 1024
+    sandbox_agent_file_bytes: int = 256 * 1024 * 1024
+    # Docker get_archive wraps one file in tar metadata, so keep a bounded margin
+    # above the per-file limit while rejecting whole-workspace multi-GiB archives.
+    sandbox_agent_archive_bytes: int = 320 * 1024 * 1024
     sandbox_agent_command_args_max: int = 32
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60

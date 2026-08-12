@@ -4,6 +4,7 @@ import asyncio
 import logging
 import shutil
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import select, update
 
@@ -27,6 +28,60 @@ from app.services.sandbox_bootstrap import backend_for_settings
 
 
 logger = logging.getLogger(__name__)
+
+_SANDBOX_COMMAND_SNAPSHOT_PREFIX = ".learngraph-command-snapshot-"
+
+
+def _prune_orphaned_sandbox_snapshots(
+    workspace_root: Path,
+    *,
+    now: datetime,
+    grace_seconds: int,
+) -> int:
+    """Remove stale command safety snapshots left behind by crashed workers.
+
+    A live Agent command owns exactly one snapshot below its user directory and
+    removes it in ``finally``. The grace period must stay above the maximum
+    command runtime so the periodic sweep cannot race a healthy execution.
+    Symlinks and unexpected filesystem entries are never followed or removed.
+    """
+
+    cutoff_timestamp = now.timestamp() - max(1, grace_seconds)
+    removed = 0
+    try:
+        owner_directories = tuple(workspace_root.iterdir())
+    except OSError:
+        logger.exception("Sandbox snapshot root scan failed")
+        return 0
+    for owner_directory in owner_directories:
+        try:
+            if owner_directory.is_symlink() or not owner_directory.is_dir():
+                continue
+            candidates = tuple(owner_directory.iterdir())
+        except OSError:
+            logger.exception(
+                "Sandbox snapshot owner scan failed",
+                extra={"owner_directory": str(owner_directory)},
+            )
+            continue
+        for candidate in candidates:
+            if not candidate.name.startswith(_SANDBOX_COMMAND_SNAPSHOT_PREFIX):
+                continue
+            try:
+                if candidate.is_symlink() or not candidate.is_dir():
+                    continue
+                if candidate.stat().st_mtime > cutoff_timestamp:
+                    continue
+                shutil.rmtree(candidate)
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.exception(
+                    "Orphaned sandbox command snapshot cleanup failed",
+                    extra={"snapshot_path": str(candidate)},
+                )
+    return removed
 
 
 def run_workspace_mastery_tick(
@@ -349,7 +404,13 @@ async def memory_extraction_scheduler(
 def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
     settings = get_settings()
     current = now or utc_now()
-    totals = {"cooled": 0, "cleaned": 0, "recovered": 0, "cleanup_blocked": 0}
+    totals = {
+        "cooled": 0,
+        "cleaned": 0,
+        "recovered": 0,
+        "cleanup_blocked": 0,
+        "snapshots_cleaned": 0,
+    }
     workspace_root = settings.resolved_sandbox_workspace_root
     workspace_root.mkdir(parents=True, exist_ok=True)
     # Warm web_fetch pool containers are not DB-tracked; prune idle ones here
@@ -360,6 +421,16 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
         prune_fetch_pools()
     except Exception:
         logger.exception("Web fetch container pool prune failed")
+
+    snapshot_grace_seconds = max(
+        settings.sandbox_snapshot_cleanup_grace_seconds,
+        settings.sandbox_wall_time_seconds + 120,
+    )
+    totals["snapshots_cleaned"] = _prune_orphaned_sandbox_snapshots(
+        workspace_root,
+        now=current,
+        grace_seconds=snapshot_grace_seconds,
+    )
 
     def aware(value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:

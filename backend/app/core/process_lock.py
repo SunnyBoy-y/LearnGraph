@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.domain.models import AdvisoryLock
@@ -39,40 +39,59 @@ def acquire_advisory_lock(
     token = uuid4().hex
     now = utc_now()
     expires_at = now + timedelta(seconds=ttl_seconds)
-    row = db.scalar(select(AdvisoryLock).where(AdvisoryLock.name == name))
-    if row is None:
-        db.add(
-            AdvisoryLock(
-                name=name,
-                token=token,
-                expires_at=expires_at,
-                created_at=now,
-                updated_at=now,
+    try:
+        row = db.scalar(select(AdvisoryLock).where(AdvisoryLock.name == name))
+        if row is None:
+            db.add(
+                AdvisoryLock(
+                    name=name,
+                    token=token,
+                    expires_at=expires_at,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-        )
-        try:
-            db.commit()
-            return token
-        except IntegrityError:
-            # Another process won the insert race.
-            db.rollback()
-            return None
-    if row.expires_at is None or row.expires_at < now:
-        row.token = token
-        row.expires_at = expires_at
-        row.updated_at = now
-        try:
-            db.commit()
-            return token
-        except IntegrityError:  # pragma: no cover - defensive
-            db.rollback()
-            return None
-    return None
+            try:
+                db.commit()
+                return token
+            except IntegrityError:
+                # Another process won the insert race.
+                db.rollback()
+                return None
+        expires = row.expires_at
+        if expires is not None and expires.tzinfo is None:
+            # SQLite drops the UTC tzinfo on storage; interpret the stored
+            # wall-clock value as UTC before comparing with the aware `now`.
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires is None or expires < now:
+            row.token = token
+            row.expires_at = expires_at
+            row.updated_at = now
+            try:
+                db.commit()
+                return token
+            except IntegrityError:  # pragma: no cover - defensive
+                db.rollback()
+                return None
+        return None
+    except OperationalError:
+        # SQLite write-lock contention (another process claiming/releasing
+        # the lease, or shutdown overlap): skip this round instead of crashing
+        # the scheduler task; the next interval retries.
+        db.rollback()
+        return None
 
 
 def release_advisory_lock(db: Session, name: str, token: str) -> None:
-    """Release the lease only if we still own it (token match)."""
-    row = db.scalar(select(AdvisoryLock).where(AdvisoryLock.name == name))
-    if row is not None and row.token == token:
-        db.delete(row)
-        db.commit()
+    """Release the lease only if we still own it (token match).
+
+    A release that hits write-lock contention is dropped silently: the lease
+    expires on its own (``ttl_seconds``) so the next claim is not blocked.
+    """
+    try:
+        row = db.scalar(select(AdvisoryLock).where(AdvisoryLock.name == name))
+        if row is not None and row.token == token:
+            db.delete(row)
+            db.commit()
+    except OperationalError:
+        db.rollback()
