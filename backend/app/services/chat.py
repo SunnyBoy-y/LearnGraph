@@ -3467,8 +3467,19 @@ class ChatService:
         output: str,
         meta: dict,
         sources: list[dict],
+        tool_call_id: str = "",
     ) -> None:
-        """Best-effort ``agent.run_completed`` event; never blocks tool execution."""
+        """Best-effort ``agent.run_completed`` event; never blocks tool execution.
+
+        The idempotency key must be unique per tool call: a single assistant
+        turn can invoke several tools (one provider ``tool_calls`` round), and
+        they all share the same run id. Reusing ``agent-run:{run_id}:{succeeded}``
+        made the second tool's append hit a 409 conflict, which rolled the
+        SAVEPOINT back and left the very next stream commit racing the shared
+        session's connection state — surfacing as an instant SQLite
+        ``database is locked`` on the tool-record UPDATE. Each tool call now
+        appends its own event to the run stream instead of conflicting.
+        """
         try:
             settings = get_settings()
             if not settings.memory_agent_run_enabled:
@@ -3514,7 +3525,9 @@ class ChatService:
                         if succeeded
                         else MemoryEventType.AGENT_RUN_FAILED,
                         producer="agent",
-                        idempotency_key=f"agent-run:{run_id[:64]}:{succeeded}",
+                        idempotency_key=(
+                            f"agent-run:{run_id[:64]}:{succeeded}:{tool_call_id[:24]}"
+                        ),
                         payload={
                             "result_summary": str(output or "")[:10_000],
                             "tool_call_refs": [],
@@ -3662,6 +3675,7 @@ class ChatService:
                             output="",
                             meta={},
                             sources=[],
+                            tool_call_id=str(tool_call.get("id") or ""),
                         )
                         return (
                             json.dumps(
@@ -3697,6 +3711,7 @@ class ChatService:
                     output="",
                     meta={},
                     sources=[],
+                    tool_call_id=str(tool_call.get("id") or ""),
                 )
                 raise
             output, meta, sources = result
@@ -3707,6 +3722,7 @@ class ChatService:
                 output=output,
                 meta=meta,
                 sources=sources,
+                tool_call_id=str(tool_call.get("id") or ""),
             )
             return result
 
@@ -4502,13 +4518,23 @@ class ChatService:
         )
         value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
         domains = value.get("allowed_domains")
+        from app.providers.factory import access_allow_all, access_allowlist_domains
+
+        unified_domains = access_allowlist_domains(self.db, self.workspace_id)
+        allow_all = access_allow_all(self.db, self.workspace_id)
+        legacy_domains = (
+            [item for item in domains if isinstance(item, str)]
+            if isinstance(domains, list)
+            else []
+        )
         return {
             "allow_without_confirmation": bool(
                 value.get("allow_without_confirmation", False)
+            )
+            or allow_all,
+            "allowed_domains": list(
+                dict.fromkeys([*legacy_domains, *sorted(unified_domains)])
             ),
-            "allowed_domains": [item for item in domains if isinstance(item, str)]
-            if isinstance(domains, list)
-            else [],
         }
 
     def _user_fetch_policy(self) -> dict[str, Any]:
@@ -5133,6 +5159,10 @@ class ChatService:
                 web_search_results_present=bool(source_context),
             )
 
+        # Commit any prompt-build writes (context compaction, source
+        # parts) BEFORE the long stream_chat call so the resumed turn never
+        # holds the SQLite write lock across the remote model stream.
+        self.db.commit()
         final_text = ""
         try:
             if structured_chat:
@@ -5393,6 +5423,10 @@ class ChatService:
             )
             self.db.delete(pending_auth_part)
             self.db.flush()
+            # Commit the card removal BEFORE the long stream_chat call so the
+            # resumed turn never holds the SQLite write lock across the
+            # remote model stream.
+            self.db.commit()
 
         self._ensure_model_provider_available()
         final_text = ""
@@ -5574,19 +5608,34 @@ class ChatService:
                 "Generate a new candidate target graph. Return at least two add nodes, exactly one root node "
                 "(layer 0), and only edges whose endpoints use refs declared in nodes. Hierarchy is mandatory: "
                 "contains edges define the teaching tree (broader parent -> narrower child). The first draft "
-                "MUST include layer 0 and layer 1 only — every non-root node is a direct contains child of the "
-                "root, with no orphans and no depth>1 chains. Deeper layers are created later by splitting a "
-                "chosen node. Use prerequisite only for a real learning dependency, never just to force an "
-                "order. Avoid duplicate or near-duplicate labels. Keep this bounded initial draft within the "
-                "response schema; it is not a claim of a complete curriculum."
+                "spans layer 0 (root), layer 1 (trunk) and up to two expansion layers per trunk node (layer-2 "
+                "children, layer-3 grandchildren; max depth 3): every non-root node attaches directly under a "
+                "contains parent exactly one layer above, with no orphans and no skipped layers. Deeper layers "
+                "are created later by splitting a chosen node. Use prerequisite only for a real learning "
+                "dependency, never just to force an order. Avoid duplicate or near-duplicate labels. Keep this "
+                "bounded initial draft within the response schema; it is not a claim of a complete curriculum."
             )
         else:
             target_graph_id = payload.graph_id or session.graph_id
+            if target_graph_id is None and session.goal_id:
+                # A learning Session can only bind a published Graph, so a
+                # candidate graph created through a confirmed proposal is not
+                # bound to the session. Fall back to the Goal's latest graph.
+                latest_goal_graph = self.db.scalar(
+                    select(Graph)
+                    .where(
+                        Graph.workspace_id == self.workspace_id,
+                        Graph.goal_id == session.goal_id,
+                    )
+                    .order_by(Graph.created_at.desc())
+                )
+                if latest_goal_graph is not None:
+                    target_graph_id = latest_goal_graph.id
             if target_graph_id is None:
                 raise AppError(
                     409,
                     "graph_update_target_required",
-                    "Bind a graph to this session or provide graph_id for propose_update",
+                    "Bind a published Graph to this session or provide graph_id for propose_update",
                 )
             graph = self.db.scalar(
                 select(Graph).where(
@@ -5806,6 +5855,15 @@ class ChatService:
                 model_prompt,
                 "chat_graph_proposal",
             )
+            # Commit preflight writes (catalog price seed, audit rows) BEFORE
+            # the long generate_json call. Holding a dirty ORM session across
+            # a remote model call keeps the single SQLite write lock for the
+            # whole call and starves every concurrent writer (the streaming
+            # chat commits, other scheduler sweeps), which then fail with
+            # "database is locked" after the busy timeout. Same rule as the
+            # other preflight call sites and the memory-extraction sweep
+            # bookmark commits.
+            self.db.commit()
             started_at = time.monotonic()
             try:
                 raw = self.model_provider.generate_json(
@@ -5819,6 +5877,10 @@ class ChatService:
                 proposal = candidate
             except Exception as exc:
                 errors.append(type(exc).__name__)
+                # Never carry a dirty transaction into the next attempt's
+                # long model call; roll back so the next preflight starts
+                # from a clean transaction.
+                self.db.rollback()
             if provider_returned:
                 attempt_usage = dict(getattr(self.model_provider, "last_usage", {}) or {})
                 self.billing.record_usage(
@@ -8303,6 +8365,46 @@ class ChatService:
             self.db.commit()
         return self._event_envelope(record)
 
+    def _append_event_locked_retry(
+        self,
+        *,
+        redo: Callable[[], None] | None = None,
+        **event_kwargs: Any,
+    ) -> SSEEventEnvelope:
+        """Append a stream event, retrying the commit on transient SQLite locks.
+
+        Terminal tool-round events (``part.completed``/``part.failed``) are the
+        first writes after the agent tool executor thread finished on the shared
+        session. A transient ``database is locked`` here used to kill the whole
+        stream; the retry rolls back, re-applies the caller's ORM mutations via
+        ``redo``, and appends again. Loaded rows are expired by the rollback and
+        reload lazily; the event record itself is re-created by the next append.
+        """
+
+        from sqlalchemy.exc import OperationalError
+
+        from app.core.database import _is_sqlite_locked_error
+
+        last_error: OperationalError | None = None
+        for attempt in range(1, 5):
+            try:
+                return self._append_event(**event_kwargs)
+            except OperationalError as exc:
+                if not _is_sqlite_locked_error(exc):
+                    raise
+                last_error = exc
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                if attempt >= 4:
+                    break
+                if redo is not None:
+                    redo()
+                time.sleep(0.15 * (2 ** (attempt - 1)))
+        assert last_error is not None
+        raise last_error
+
     def _start_graph_proposal_worker(
         self,
         *,
@@ -9691,6 +9793,11 @@ class ChatService:
                                     sequence += 1
                                     yield pending_image_event
                                 yield ": agent-tool-running\n\n"
+                                # Commit pending tool-call part/event writes
+                                # BEFORE the (possibly long) tool execution so
+                                # the stream never holds the SQLite write lock
+                                # across it.
+                                self._flush_event_buffer()
                                 result_content, result_meta, result_sources = (
                                     self._execute_agent_tool(
                                         tool_call,
@@ -9705,20 +9812,23 @@ class ChatService:
                                     injected_image_parts.extend(
                                         self._pop_injected_image_parts(result_meta)
                                     )
-                                tool_record.status = (
-                                    "completed"
-                                    if result_meta.get("status") == "completed"
-                                    else "failed"
-                                )
-                                tool_record.content = (
-                                    "工具调用完成"
-                                    if tool_record.status == "completed"
-                                    else "工具调用未完成"
-                                )
-                                tool_record.data = {
-                                    **tool_record.data,
-                                    "output": result_meta,
-                                }
+                                def _apply_tool_completion_fields() -> None:
+                                    tool_record.status = (
+                                        "completed"
+                                        if result_meta.get("status") == "completed"
+                                        else "failed"
+                                    )
+                                    tool_record.content = (
+                                        "工具调用完成"
+                                        if tool_record.status == "completed"
+                                        else "工具调用未完成"
+                                    )
+                                    tool_record.data = {
+                                        **tool_record.data,
+                                        "output": result_meta,
+                                    }
+
+                                _apply_tool_completion_fields()
                                 tool_results.append(
                                     {
                                         "tool_call_id": str(tool_call.get("id") or ""),
@@ -9738,7 +9848,8 @@ class ChatService:
                                         for fam in activation.get("families") or ():
                                             if isinstance(fam, str) and fam:
                                                 activated_capability_families.add(fam)
-                                tool_completed = self._append_event(
+                                tool_completed = self._append_event_locked_retry(
+                                    redo=_apply_tool_completion_fields,
                                     session_id=session_id,
                                     message_id=message.id,
                                     message_version_id=version.id,
@@ -12920,6 +13031,11 @@ class ChatService:
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
                                 yield ": agent-tool-running\n\n"
+                                # Commit pending tool-call part/event writes
+                                # BEFORE the (possibly long) tool execution so
+                                # the stream never holds the SQLite write lock
+                                # across it.
+                                self._flush_event_buffer()
                                 result_content, result_meta, result_sources = self._execute_agent_tool(
                                     tool_call,
                                     payload.allowed_domains,
@@ -12935,20 +13051,23 @@ class ChatService:
                                     injected_image_parts.extend(
                                         self._pop_injected_image_parts(result_meta)
                                     )
-                                tool_record.status = (
-                                    "completed"
-                                    if result_meta.get("status") == "completed"
-                                    else "failed"
-                                )
-                                tool_record.content = (
-                                    "工具调用完成"
-                                    if tool_record.status == "completed"
-                                    else "工具调用未完成"
-                                )
-                                tool_record.data = {
-                                    **tool_record.data,
-                                    "output": result_meta,
-                                }
+                                def _apply_tool_completion_fields() -> None:
+                                    tool_record.status = (
+                                        "completed"
+                                        if result_meta.get("status") == "completed"
+                                        else "failed"
+                                    )
+                                    tool_record.content = (
+                                        "工具调用完成"
+                                        if tool_record.status == "completed"
+                                        else "工具调用未完成"
+                                    )
+                                    tool_record.data = {
+                                        **tool_record.data,
+                                        "output": result_meta,
+                                    }
+
+                                _apply_tool_completion_fields()
                                 tool_results.append(
                                     {
                                         "tool_call_id": tool_id,
@@ -12968,7 +13087,8 @@ class ChatService:
                                         for fam in activation.get("families") or ():
                                             if isinstance(fam, str) and fam:
                                                 activated_capability_families.add(fam)
-                                tool_completed = self._append_event(
+                                tool_completed = self._append_event_locked_retry(
+                                    redo=_apply_tool_completion_fields,
                                     session_id=session_id,
                                     message_id=assistant_message.id,
                                     message_version_id=assistant_version.id,

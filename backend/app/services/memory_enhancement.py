@@ -408,6 +408,8 @@ def semantic_boosts_for_records(
         except AppError:
             # Budget exhausted: degrade to heuristic recall instead of billing.
             return {}
+        # Release preflight writes BEFORE the long embed call.
+        db.commit()
         started_at = time.monotonic()
         used_tokens = 0
         if stale:
@@ -506,6 +508,8 @@ def semantic_boosts_for_documents(
             )
         except AppError:
             return {}
+        # Release preflight writes BEFORE the long embed call.
+        db.commit()
         started_at = time.monotonic()
         used_tokens = 0
         if stale:
@@ -630,6 +634,8 @@ def reindex_memory_embeddings(
             estimated_output_tokens=0,
             remote_capability=True,
         )
+        # Release preflight writes BEFORE the long embed call.
+        db.commit()
         started_at = time.monotonic()
         try:
             vectors = provider.embed([texts[record.id] for record in pending])
@@ -1143,6 +1149,10 @@ def extract_session_memories(
         if force:
             raise
         return {"status": "budget_blocked", "drafts_created": 0}
+    # Release preflight writes (catalog price seed / audit) BEFORE the long
+    # generate_json call; the sweep must not hold the single SQLite write
+    # lock across the remote model call.
+    db.commit()
     started_at = time.monotonic()
     call_error: Exception | None = None
     payload: dict[str, Any] = {}
@@ -1566,6 +1576,10 @@ def summarize_session_context(
         if force:
             raise
         return {"status": "budget_blocked"}
+    # Release preflight writes (catalog price seed / audit) BEFORE the long
+    # generate_json call; the sweep must not hold the single SQLite write
+    # lock across the remote model call.
+    db.commit()
     started_at = time.monotonic()
     call_error: Exception | None = None
     payload: dict[str, Any] = {}

@@ -472,6 +472,9 @@ class MemoryProfileService:
             estimated_output_tokens=estimated_output_tokens,
             remote_capability=bool(getattr(model, "remote_capability", True)),
         )
+        # Release preflight writes (catalog price seed / audit) BEFORE the
+        # long generate_json call.
+        self.db.commit()
         started_at = time.monotonic()
         error: Exception | None = None
         payload: dict[str, Any] = {}

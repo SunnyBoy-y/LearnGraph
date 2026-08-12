@@ -287,6 +287,8 @@ class DictationService:
             estimated_output_tokens=0,
             remote_capability=True,
         )
+        # Release preflight writes BEFORE the long transcribe call.
+        self.db.commit()
         started = time.monotonic()
         try:
             result = provider.transcribe(

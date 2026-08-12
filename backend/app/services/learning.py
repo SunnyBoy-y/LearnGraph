@@ -481,6 +481,8 @@ class ExerciseService:
                 ),
                 remote_capability=True,
             )
+            # Release preflight writes BEFORE the long generate_json call.
+            self.db.commit()
             provider_returned = False
             result: ModelGeneratedExerciseSet | None = None
             try:
@@ -905,6 +907,8 @@ class ExerciseService:
                 errors.append(type(exc).__name__)
                 break
 
+            # Release preflight writes BEFORE the long generate_json call.
+            self.db.commit()
             provider_returned = False
             result: ModelShortAnswerGrade | None = None
             try:
