@@ -309,6 +309,36 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         ),
         grant_reason="official_skill_auto_enable",
     ),
+    OfficialSkillSpec(
+        key="node-learning",
+        display_name="节点学习编排",
+        version="1.0.0",
+        dir_name="node_learning",
+        description=(
+            "图谱节点学习专用编排：用户选中学习节点、要求讲解某个知识点时，"
+            "按成本阶梯组合图文（引用图/搜图/生图）、图表、选项题、双向交互与"
+            "动画教学等多维形式讲解，控制成本与效果的平衡；到期复习→review-coach，"
+            "图谱结构变更→graph-generation。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        keywords=(
+            "学习节点", "节点学习", "讲解", "教教我", "展开讲讲", "图解", "配图",
+            "图表", "选择题", "自测", "练习", "交互", "动画", "学习卡片", "一页纸",
+            "知识点", "教学",
+        ),
+        required_tools=(
+            "canvas_emit_trusted_component",
+            "canvas_emit_magic_card",
+            "create_chart",
+            "generate_image",
+            "search_images",
+            "download_external_image",
+            "lg_graph_read",
+            "lg_learning_mastery_read",
+            "lg_learning_evidence_record",
+            "sandbox_publish_file",
+        ),
+    ),
     # ------------------------------------------------------------------
     # Built-in sandbox capability skills. Every workspace gets the same set
     # (idempotent per-workspace install with a durable system grant). The

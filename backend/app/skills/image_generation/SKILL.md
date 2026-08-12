@@ -13,6 +13,16 @@ description: 用宿主 generate_image 工具完成文生图与图生图编辑：
 
 > **不是本 Skill 的职责**：找互联网上已有的图片（那是 `search_images` 文搜图/图搜图）；解释图片内容（那是视觉模型 / `read_session_file`）。**搜图 ≠ 生图**，先判断用户要的是"找"还是"造/改"。
 
+## 搜图后下载（文搜图/图搜图 → 真实图片文件）
+
+`search_images` 返回的只是链接，沙箱无网无法直接访问。用户要"用图 / 看图 / 分析 / 存下来"时，必须接 `download_external_image`：
+
+- **单张**：`url` + `destination_path`（如 `inputs/images/xxx.png`）。
+- **多张**：`urls` 数组（2–8 张）+ `destination_dir`，宿主侧**并行下载**，每张图单独净化、哈希、出来源凭据。
+- 下载走审批制：命中统一白名单自动放行，否则弹审批卡，用户批准后模型用相同参数重试。
+- 下载成功后返回 `file_id`，后续引用/再编辑以 `file_id` 为准（读图走 `read_session_file`，编辑走 `generate_image` 图生图）。
+- 部分失败不中断：结果里有 `failed` 列表，如实向用户汇报失败项与原因。
+
 ## 渐进式工具语义（先探索 → 再读取 → 最后生成）
 
 工具调用必须按顺序渐进，禁止跳步、禁止凭记忆描述旧图：
@@ -26,7 +36,7 @@ description: 用宿主 generate_image 工具完成文生图与图生图编辑：
 
 ## 决策要点
 
-- **搜图 ≠ 生图**：找现成图 → `search_images`；造新图 / 改图 → 本 Skill 的 `generate_image`。
+- **搜图 ≠ 生图**：找现成图 → `search_images`；造新图 / 改图 → 本 Skill 的 `generate_image`。搜图后要真实文件 → `download_external_image`（多张用 `urls` 并行下载）。
 - 尺寸：16:9 → `2048x1152`；9:16 → `1152x2048`；4:3 → `1536x1152`；3:4 → `1152x1536`；不确定 → `auto`。
 - 图生图一次最多 4 张源图（`source_file_ids` ≤ 4），且生成模型必须支持图片编辑（如 qwen-image-edit-max / gpt-image-2）。
 - 未配置图片生成 Provider 时工具会明确失败；如实告知用户到 Provider 管理启用，不假装生成成功。
