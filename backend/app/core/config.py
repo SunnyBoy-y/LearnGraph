@@ -319,18 +319,23 @@ class Settings(BaseSettings):
     # opts in with the exact issuer URLs it trusts.
     mcp_oauth_trusted_issuers: Annotated[set[str], NoDecode] = Field(default_factory=set)
     external_catalog_timeout_seconds: float = 12.0
-    # Progressive disclosure for Agent Skill prompt injection: bodies within
-    # these budgets are injected inline; the rest become one-line catalog
-    # entries the model expands on demand via the lg_skill_read tool.
+    # Progressive disclosure budgets for Agent Skill prompt injection. Cold
+    # Skills are metadata-only by default; these limits apply to explicitly
+    # activated/context-bound bodies or legacy preload mode.
     skill_prompt_inline_char_limit: int = 4_000
     skill_prompt_total_char_budget: int = 16_000
     skill_prompt_catalog_max_entries: int = 24
+    # Strict Agent Skills progressive disclosure: startup context contains only
+    # compact metadata. Full SKILL.md bodies are loaded after capability
+    # activation (or an explicit lg_skill_read). Context-bound official Skills
+    # may still opt in through activated_skill_keys.
+    skill_prompt_preload_bodies_enabled: bool = False
     # Progressive disclosure for Agent tools (capability catalog): when enabled,
     # the Agent starts with a small core plus lg_capability_search/activate and
     # loads tool schemas / Skill contracts on demand in later rounds. Per-turn
     # activation never mutates durable grants or server/skill enabled state and
-    # never bypasses host authorization. Disabled = eager definitions (current).
-    agent_progressive_tool_disclosure_enabled: bool = False
+    # never bypasses host authorization. Disabled restores eager definitions.
+    agent_progressive_tool_disclosure_enabled: bool = True
     # Agent self-service extension management (lg_skill_install / lg_mcp_register
     # etc.). Installs stay commit-pinned and audited; disable to make skills and
     # MCP servers user-click-only.

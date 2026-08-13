@@ -428,6 +428,10 @@ function fuzzyMatchesModelId(text: string, query: string): boolean {
 export function ProvidersPage() {
   const queryClient = useQueryClient();
   const [roleFilter, setRoleFilter] = useState<ProviderRole | "all">("model");
+  // 文搜图/图搜图 tab 内的能力筛选：all | text(文搜图) | image(图搜图) | both(都支持)
+  const [imageModeFilter, setImageModeFilter] = useState<
+    "all" | "text" | "image" | "both"
+  >("all");
   const providers = useQuery({
     queryKey: ["providers"],
     queryFn: listProviders,
@@ -744,7 +748,18 @@ export function ProvidersPage() {
   );
   const filteredProviders = providers.data.filter((provider) => {
     if (roleFilter === "all") return true;
-    return catalogByType.get(provider.provider_type)?.role === roleFilter;
+    const providerRole = catalogByType.get(provider.provider_type)?.role;
+    if (providerRole !== roleFilter) return false;
+    if (roleFilter === "image_search" && imageModeFilter !== "all") {
+      const modes =
+        catalogByType.get(provider.provider_type)?.image_search_modes ?? [];
+      if (imageModeFilter === "both") {
+        if (!(modes.includes("text") && modes.includes("image"))) return false;
+      } else if (!modes.includes(imageModeFilter)) {
+        return false;
+      }
+    }
+    return true;
   });
   return (
     <PageFrame>
@@ -794,6 +809,30 @@ export function ProvidersPage() {
             ))}
           </div>
         </div>
+        {roleFilter === "image_search" ? (
+          <div className="border-b px-5 py-3">
+            <p className="mb-2 text-xs font-medium text-muted-foreground">
+              能力筛选
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {IMAGE_SEARCH_MODE_FILTERS.map((option) => (
+                <button
+                  aria-pressed={imageModeFilter === option.value}
+                  className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                    imageModeFilter === option.value
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-border bg-background text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                  }`}
+                  key={option.value}
+                  onClick={() => setImageModeFilter(option.value)}
+                  type="button"
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <div className="overflow-x-auto">
           <table className="w-full min-w-[980px] text-left text-sm">
             <thead className="bg-muted/35 text-xs text-muted-foreground">
@@ -835,7 +874,8 @@ export function ProvidersPage() {
                   isVisionProvider ||
                   isDeepResearchProvider ||
                   isEmbeddingProvider ||
-                  isImageSearchProvider;
+                  (isImageSearchProvider &&
+                    providerSpec?.supports_model_discovery === true);
                 const supportsModelDiscovery =
                   providerSpec?.supports_model_discovery === true;
                 const supportsProbe = providerSpec?.supports_probe === true;
@@ -970,6 +1010,9 @@ export function ProvidersPage() {
                         <div>
                           <div className="flex flex-wrap items-center gap-1.5">
                             <p className="font-medium">{provider.display_name}</p>
+                            {providerSpec?.role === "image_search" ? (
+                              <ImageSearchBadges spec={providerSpec} />
+                            ) : null}
                             {isOfficialOpenAi ? (
                               <span className="rounded-md border border-foreground/15 bg-foreground/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-foreground">
                                 OpenAI 官方
@@ -1911,6 +1954,50 @@ export function ProvidersPage() {
   );
 }
 
+const IMAGE_SEARCH_MODE_FILTERS: Array<{
+  value: "all" | "text" | "image" | "both";
+  label: string;
+}> = [
+  { value: "all", label: "全部" },
+  { value: "text", label: "文搜图" },
+  { value: "image", label: "图搜图" },
+  { value: "both", label: "都支持" },
+];
+
+/** 文搜图/图搜图供应商行内标签：免费徽标 + 能力 tag。 */
+function ImageSearchBadges({ spec }: { spec: ProviderTypeCatalogItem }) {
+  const modes = spec.image_search_modes ?? [];
+  const hasText = modes.includes("text");
+  const hasImage = modes.includes("image");
+  const modeLabel = hasText
+    ? hasImage
+      ? "都支持"
+      : "仅文搜图"
+    : hasImage
+      ? "仅图搜图"
+      : null;
+  return (
+    <>
+      {spec.is_free ? (
+        <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+          免费
+        </span>
+      ) : null}
+      {modeLabel ? (
+        <span
+          className={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${
+            hasText && hasImage
+              ? "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-300"
+              : "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-300"
+          }`}
+        >
+          {modeLabel}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 function providerRoleLabel(role: ProviderRole) {
   switch (role) {
     case "model":
@@ -2387,7 +2474,7 @@ function roleQuickProviders(
     .map((item) => ({
       id: item.provider_type,
       name: item.label,
-      description: item.description,
+      description: item.is_free ? `免费 · ${item.description}` : item.description,
       baseUrl: item.default_base_url ?? "",
       brandId: item.brand_id ?? undefined,
       iconUrl:

@@ -552,6 +552,10 @@ class ProviderTypeCatalogView(BaseModel):
     documentation_url: str | None = None
     key_management_url: str | None = None
     supports_account_balance: bool = False
+    # image_search 角色：能力 tag（text=文搜图，image=图搜图），空表示非图搜角色。
+    image_search_modes: tuple[Literal["text", "image"], ...] = ()
+    # 免费供应商标记；无需 Key 且无需 Base URL 的免费源创建实例时默认启用。
+    is_free: bool = False
 
 
 class ProviderView(ORMModel):

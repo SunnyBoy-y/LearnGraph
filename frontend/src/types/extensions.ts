@@ -23,7 +23,7 @@ export interface MCPServerCreate {
   agent_auto_invoke?: boolean;
 }
 
-export interface BuiltinMcpTool {
+export interface BuiltinNativeTool {
   tool: string;
   function_name: string;
   description: string;
@@ -46,6 +46,7 @@ export interface MCPServer {
   manifest_json: UnknownRecord;
   manifest_hash: string;
   requested_tools: string[];
+  discovered_tools: string[];
   required_permissions: string[];
   status: string;
   enabled: boolean;

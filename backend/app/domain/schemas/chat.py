@@ -601,3 +601,27 @@ class ConceptBranchPromoteRequest(BaseModel):
         if self.action == "merge_summary" and not self.summary.strip():
             raise ValueError("summary is required for merge_summary")
         return self
+
+
+class SessionFileView(BaseModel):
+    """One durable file tied to a chat session (unified file-area view).
+
+    Merges message attachments (FileReference), generated images
+    (ImageGenerationTask) and session workspace entries (external downloads,
+    agent writes). ``file_id`` is null only for workspace-only entries that
+    have no downloadable FileRecord.
+    """
+
+    file_id: str | None = None
+    filename: str
+    mime_type: str
+    size_bytes: int
+    origin: str
+    relation: str | None = None
+    path: str | None = None
+    source: str | None = None
+    message_id: str | None = None
+    is_image: bool = False
+    storage_status: str | None = None
+    prompt_summary: str | None = None
+    created_at: str | None = None

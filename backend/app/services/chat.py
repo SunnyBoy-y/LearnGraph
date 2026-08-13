@@ -3709,6 +3709,7 @@ class ChatService:
         assistant_message_id: str | None,
         assistant_version_id: str | None,
         source_message_id: str | None,
+        disclosed_tool_names: set[str],
     ) -> tuple[Any | None, float | None]:
         """Submit the tool call on the shared executor and return (future, deadline)."""
         if self.agent_tool_runtime is None or not chat_session_id:
@@ -3726,6 +3727,7 @@ class ChatService:
             assistant_version_id=assistant_version_id,
             source_message_id=source_message_id,
             model_supports_image_input=self._agent_model_supports_image_input(),
+            disclosed_tool_names=disclosed_tool_names,
         )
         return future, time.monotonic() + timeout_seconds
 
@@ -3759,6 +3761,7 @@ class ChatService:
         source_message_id: str | None = None,
         pending_future: Any | None = None,
         pending_deadline: float | None = None,
+        disclosed_tool_names: set[str] | None = None,
     ) -> tuple[str, dict, list[dict]]:
         """Execute an allow-listed, side-effect-free model tool call.
 
@@ -3801,6 +3804,7 @@ class ChatService:
                             assistant_version_id=assistant_version_id,
                             source_message_id=source_message_id,
                             model_supports_image_input=self._agent_model_supports_image_input(),
+                            disclosed_tool_names=disclosed_tool_names,
                         )
                         wait_seconds = timeout_seconds
                     try:
@@ -3841,6 +3845,7 @@ class ChatService:
                         assistant_version_id=assistant_version_id,
                         source_message_id=source_message_id,
                         model_supports_image_input=self._agent_model_supports_image_input(),
+                        disclosed_tool_names=disclosed_tool_names,
                     )
             except Exception:
                 self._record_agent_run_event(
@@ -9945,6 +9950,10 @@ class ChatService:
                                         assistant_message_id=message.id,
                                         assistant_version_id=version.id,
                                         source_message_id=parent.id,
+                                        disclosed_tool_names={
+                                            str(item.get("function", {}).get("name") or "")
+                                            for item in retry_tool_definitions
+                                        },
                                     )
                                 )
                                 if isinstance(result_meta, dict):
@@ -13234,6 +13243,10 @@ class ChatService:
                                     assistant_message_id=assistant_message.id,
                                     assistant_version_id=assistant_version.id,
                                     source_message_id=user_message.id,
+                                    disclosed_tool_names={
+                                        str(item.get("function", {}).get("name") or "")
+                                        for item in tool_definitions
+                                    },
                                 )
                                 if cancelled():
                                     raise _GenerationCancellationRequested()

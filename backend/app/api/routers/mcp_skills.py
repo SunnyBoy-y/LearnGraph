@@ -121,10 +121,10 @@ def transport_capabilities(
     settings: AppSettings,
 ) -> list[TransportCapabilityView]:
     """查询 MCP 传输能力。无请求体，输出当前实现支持的协议、认证方式和可用状态。"""
-    del db, context, settings
+    del db, context
     return [
         TransportCapabilityView.model_validate(item)
-        for item in MCPAndSkillService.transport_capabilities()
+        for item in MCPAndSkillService.transport_capabilities(settings)
     ]
 
 

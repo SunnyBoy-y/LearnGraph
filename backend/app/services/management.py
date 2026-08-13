@@ -78,6 +78,7 @@ from app.providers.catalog import (
     IMAGE_SEARCH_PROVIDER_TYPES,
     MEMORY_PROVIDER_TYPES,
     MODEL_PROVIDER_TYPES,
+    REST_IMAGE_SEARCH_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
     TRANSCRIPTION_PROVIDER_TYPES,
     VISION_PROVIDER_TYPES,
@@ -476,6 +477,13 @@ class ProviderService:
             and not spec.requires_secret
             and bool(payload.base_url)
         )
+        # 免费且无需 Key / Base URL 的供应商（如 Openverse 匿名文搜图）创建即启用，
+        # 用户可随时在 Provider 管理里关闭。
+        auto_enable_keyless_free = (
+            spec.is_free and not spec.requires_secret and not spec.requires_base_url
+        )
+        if auto_enable_keyless_free:
+            capabilities["remote_calls_enabled"] = True
         provider = self.providers.add(
             ProviderConfig(
                 workspace_id=self.workspace_id,
@@ -484,13 +492,17 @@ class ProviderService:
                 base_url=payload.base_url,
                 api_key_masked=masked,
                 secret_fingerprint=fingerprint,
-                enabled=False,
-                remote_capability=False,
+                enabled=auto_enable_keyless_free,
+                remote_capability=auto_enable_keyless_free,
                 capabilities=capabilities,
                 status=(
-                    "configured_disabled"
-                    if secret or configured_without_secret
-                    else "unconfigured"
+                    "enabled_unverified"
+                    if auto_enable_keyless_free
+                    else (
+                        "configured_disabled"
+                        if secret or configured_without_secret
+                        else "unconfigured"
+                    )
                 ),
             )
         )
@@ -963,7 +975,27 @@ class ProviderService:
                 "search" if provider.provider_type in SEARCH_PROVIDER_TYPES else "fetch",
             )
             provider.status = "enabled_unverified"
-        elif enabled and provider.provider_type in IMAGE_SEARCH_PROVIDER_TYPES:
+        elif enabled and provider.provider_type in REST_IMAGE_SEARCH_PROVIDER_TYPES:
+            # 轻量 REST 文搜图 lane（Tavily / Openverse / Pexels / Pixabay）：
+            # 无需模型；需要密钥的供应商启用前必须已配置加密 Secret，
+            # 无需密钥的（Openverse 匿名）可直接启用。
+            spec = provider_type_spec(provider.provider_type)
+            keyless = spec is not None and not spec.requires_secret
+            if not keyless and self._active_secret_record(provider.id) is None:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "该文搜图供应商需要先配置 API Key 才能启用",
+                )
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "image_search"
+            provider.status = "enabled_unverified"
+        elif (
+            enabled
+            and provider.provider_type
+            in IMAGE_SEARCH_PROVIDER_TYPES - REST_IMAGE_SEARCH_PROVIDER_TYPES
+        ):
             # 文搜图/图搜图专用通道（qwen_image_search）：仅通过 DashScope
             # Responses API 提供服务，启用前必须配置 base URL、加密密钥和
             # 默认模型（模型需声明 hosted_image_search 且走 Responses 协议，

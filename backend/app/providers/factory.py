@@ -23,9 +23,11 @@ from app.providers.catalog import (
     IMAGE_SEARCH_PROVIDER_TYPES,
     MEMORY_PROVIDER_TYPES,
     MODEL_PROVIDER_TYPES,
+    REST_IMAGE_SEARCH_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
     TRANSCRIPTION_PROVIDER_TYPES,
     VISION_PROVIDER_TYPES,
+    provider_type_spec,
 )
 
 from app.providers.ports.fetch import FetchProviderPort
@@ -72,6 +74,7 @@ from app.providers.remote.images import (
     OpenAIImagesProvider,
     UnavailableImageGenerationProvider,
 )
+from app.providers.remote.image_search import ImageSearchProvider
 from app.providers.remote.ollama import (
     OllamaChatProvider,
     OllamaEmbeddingProvider,
@@ -1611,6 +1614,56 @@ def _qwen_companion_for_workspace(
     return None
 
 
+def _rest_image_search_provider_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+) -> ImageSearchProvider | None:
+    """Resolve an enabled lightweight REST 文搜图 lane (Tavily/Openverse/Pexels/Pixabay).
+
+    Used as the fallback when no Qwen Responses companion with
+    ``hosted_image_search`` is configured. These lanes are text-only; the
+    runtime surfaces a clear error when an Agent passes ``image_url``.
+    """
+
+    candidates = list(
+        db.scalars(
+            select(ProviderConfig)
+            .where(
+                ProviderConfig.workspace_id == workspace_id,
+                ProviderConfig.enabled.is_(True),
+                ProviderConfig.remote_capability.is_(True),
+                ProviderConfig.provider_type.in_(REST_IMAGE_SEARCH_PROVIDER_TYPES),
+            )
+            .order_by(*_provider_priority_order())
+        ).all()
+    )
+    for provider in candidates:
+        spec = provider_type_spec(provider.provider_type)
+        if spec is None:
+            continue
+        api_key: str | None = None
+        if spec.requires_secret:
+            try:
+                api_key = _secret_for_provider(db, workspace_id, provider, settings)
+            except Exception:
+                continue
+            if not api_key:
+                continue
+        base_url = provider.base_url or spec.default_base_url
+        if not base_url:
+            continue
+        return ImageSearchProvider(
+            provider_id=provider.id,
+            provider_type=provider.provider_type,
+            base_url=base_url,
+            api_key=api_key,
+            extra_headers=_extra_headers_from_capabilities(dict(provider.capabilities or {})),
+            timeout_seconds=float(settings.hosted_image_search_timeout_seconds),
+        )
+    return None
+
+
 def image_search_provider_for_workspace(
     db: Session,
     workspace_id: str,
@@ -1620,9 +1673,11 @@ def image_search_provider_for_workspace(
 
     Prefers an explicitly enabled ``qwen_image_search`` provider; falls back to
     a general Qwen model companion whose snapshot declares
-    ``hosted_image_search`` and the Responses protocol.  Both paths speak the
-    Responses API only (``POST /responses`` with the ``web_search_image`` /
-    ``image_search`` tools), which is the documented transport for these tools.
+    ``hosted_image_search`` and the Responses protocol, then to the lightweight
+    REST 文搜图 lane (Tavily / Openverse / Pexels / Pixabay) when no Qwen
+    Responses path is configured.  The Qwen paths speak the Responses API only
+    (``POST /responses`` with the ``web_search_image`` / ``image_search``
+    tools), which is the documented transport for these tools.
     """
 
     dedicated = _qwen_companion_for_workspace(
@@ -1630,18 +1685,23 @@ def image_search_provider_for_workspace(
         workspace_id,
         settings,
         capability="hosted_image_search",
-        provider_types=tuple(IMAGE_SEARCH_PROVIDER_TYPES),
+        provider_types=tuple(
+            IMAGE_SEARCH_PROVIDER_TYPES - REST_IMAGE_SEARCH_PROVIDER_TYPES
+        ),
         timeout_seconds=settings.hosted_image_search_timeout_seconds,
     )
     if dedicated is not None:
         return dedicated
-    return _qwen_companion_for_workspace(
+    fallback = _qwen_companion_for_workspace(
         db,
         workspace_id,
         settings,
         capability="hosted_image_search",
         timeout_seconds=settings.hosted_image_search_timeout_seconds,
     )
+    if fallback is not None:
+        return fallback
+    return _rest_image_search_provider_for_workspace(db, workspace_id, settings)
 
 
 def memory_provider_for_workspace(

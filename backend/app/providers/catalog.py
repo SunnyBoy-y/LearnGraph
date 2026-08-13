@@ -44,6 +44,12 @@ class ProviderTypeSpec:
     documentation_url: str | None = None
     key_management_url: str | None = None
     supports_account_balance: bool = False
+    # image_search 角色专属：供应商支持的图搜能力（text=文搜图，image=图搜图）。
+    # 空元组表示非图搜角色；("text", "image") 表示两种都支持。
+    image_search_modes: tuple[Literal["text", "image"], ...] = ()
+    # 免费供应商标记：前端展示"免费"徽标；无需 Key 且无需 Base URL 的免费源
+    # 在创建实例时默认启用（可由用户随时关闭）。
+    is_free: bool = False
 
     def view(self) -> dict[str, object]:
         return asdict(self)
@@ -146,6 +152,81 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         brand_icon_url="https://models.dev/logos/alibaba.svg",
         documentation_url="https://help.aliyun.com/zh/model-studio/web-search-image",
         key_management_url="https://bailian.console.aliyun.com/?tab=model#/api-key",
+        image_search_modes=("text", "image"),
+    ),
+    ProviderTypeSpec(
+        provider_type="tavily_image_search",
+        role="image_search",
+        label="Tavily 文搜图",
+        description=(
+            "Tavily Search 的 include_images 模式：注册即送 1000 credits/月、"
+            "无需绑卡，返回公网网页配图。只支持文搜图（文本描述 → 图片），"
+            "不支持图搜图。"
+        ),
+        requires_base_url=True,
+        requires_secret=True,
+        default_base_url="https://api.tavily.com",
+        probe_notice="探测会真实调用一次图片搜索，消耗 1 credit。",
+        brand_id="tavily",
+        brand_icon_url="https://tavily.com/favicon.ico",
+        documentation_url="https://docs.tavily.com/documentation/api-reference/endpoint/search",
+        key_management_url="https://app.tavily.com",
+        image_search_modes=("text",),
+        is_free=True,
+    ),
+    ProviderTypeSpec(
+        provider_type="openverse_image_search",
+        role="image_search",
+        label="Openverse 文搜图",
+        description=(
+            "Openverse 开放版权图片库（Wikimedia / Flickr 等 8 亿+ 条记录）："
+            "可匿名调用、无需 API Key，有速率限制。只支持文搜图，"
+            "适合给知识卡片配可安全展示的开放授权图片。"
+        ),
+        requires_base_url=False,
+        requires_secret=False,
+        default_base_url="https://api.openverse.org",
+        probe_notice="探测会匿名调用一次图片搜索，不消耗任何 Key 或额度。",
+        brand_id="openverse",
+        documentation_url="https://docs.openverse.org/api/reference/",
+        image_search_modes=("text",),
+        is_free=True,
+    ),
+    ProviderTypeSpec(
+        provider_type="pexels_image_search",
+        role="image_search",
+        label="Pexels 文搜图",
+        description=(
+            "Pexels API（官方完全免费，200 requests/小时、20,000 requests/月）："
+            "搜索 Pexels 摄影图库。只支持文搜图，适合背景 / Hero / 概念配图。"
+        ),
+        requires_base_url=False,
+        requires_secret=True,
+        default_base_url="https://api.pexels.com",
+        probe_notice="探测会真实调用一次图片搜索，计入每小时 200 次限额。",
+        brand_id="pexels",
+        documentation_url="https://www.pexels.com/api/documentation/",
+        key_management_url="https://www.pexels.com/api/",
+        image_search_modes=("text",),
+        is_free=True,
+    ),
+    ProviderTypeSpec(
+        provider_type="pixabay_image_search",
+        role="image_search",
+        label="Pixabay 文搜图",
+        description=(
+            "Pixabay 免费图片/视频 REST API：搜索 Pixabay 免版权图库。"
+            "只支持文搜图，适合摄影 / 插画 / 概念配图。"
+        ),
+        requires_base_url=False,
+        requires_secret=True,
+        default_base_url="https://pixabay.com/api",
+        probe_notice="探测会真实调用一次图片搜索，计入 Pixabay 免费 API 限额。",
+        brand_id="pixabay",
+        documentation_url="https://pixabay.com/api/docs/",
+        key_management_url="https://pixabay.com/api/docs/",
+        image_search_modes=("text",),
+        is_free=True,
     ),
     ProviderTypeSpec(
         provider_type="codex_chatgpt",
@@ -709,6 +790,17 @@ SEARCH_PROVIDER_TYPES = frozenset(
 )
 IMAGE_SEARCH_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "image_search"
+)
+# 轻量 REST 文搜图 lane（无需 Responses 协议/模型）：Tavily include_images、
+# Openverse、Pexels、Pixabay。它们只支持文搜图，由
+# image_search_provider_for_workspace 作为 qwen 专用通道的回退使用。
+REST_IMAGE_SEARCH_PROVIDER_TYPES = frozenset(
+    {
+        "tavily_image_search",
+        "openverse_image_search",
+        "pexels_image_search",
+        "pixabay_image_search",
+    }
 )
 FETCH_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "fetch"

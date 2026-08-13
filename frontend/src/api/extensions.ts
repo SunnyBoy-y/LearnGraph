@@ -1,5 +1,5 @@
 import type {
-  BuiltinMcpTool,
+  BuiltinNativeTool,
   ExtensionInvocation,
   ExtensionPermissionGrant,
   ExternalCatalogSource,
@@ -42,8 +42,8 @@ export function registerMcpServer(
   return apiClient.post<MCPServer, MCPServerCreate>("/mcp/servers", payload);
 }
 
-export function listBuiltinMcpTools(): Promise<BuiltinMcpTool[]> {
-  return apiClient.get<BuiltinMcpTool[]>("/skills/builtin-tools");
+export function listBuiltinNativeTools(): Promise<BuiltinNativeTool[]> {
+  return apiClient.get<BuiltinNativeTool[]>("/skills/builtin-tools");
 }
 
 export function refreshMcpServer(serverId: string): Promise<MCPRefreshResult> {

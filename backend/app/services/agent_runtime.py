@@ -30,8 +30,6 @@ from app.core.errors import AppError
 from app.domain.models import (
     ChatSession,
     FileRecord,
-    FileReference,
-    ImageGenerationTask,
     Message,
     MessagePartRecord,
 )
@@ -806,44 +804,61 @@ class AgentToolRuntime:
             and callable(getattr(provider, "image_search", None))
         )
 
-    @staticmethod
-    def _image_search_tool_definition() -> dict[str, Any]:
+    def _image_search_tool_definition(self) -> dict[str, Any]:
+        # Lightweight REST 文搜图 lanes (Tavily/Openverse/Pexels/Pixabay) are
+        # text-only: hide the image_url parameter so the Agent never attempts a
+        # reverse search that the lane cannot serve.
+        supports_reverse = bool(
+            getattr(self.image_search_provider, "supports_reverse_image", True)
+        )
+        if supports_reverse:
+            mode_description = (
+                "Pass only a text query for text-to-image search (文搜图), or add "
+                "a public image URL for reverse image search (图搜图). "
+            )
+        else:
+            mode_description = (
+                "The active provider lane only supports 文搜图 (text-to-image "
+                "search): never pass an image_url — reverse image search is not "
+                "available on this lane. "
+            )
+        properties: dict[str, Any] = {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+            },
+        }
+        if supports_reverse:
+            properties["image_url"] = {
+                "type": "string",
+                "description": (
+                    "Optional public image URL for reverse image search "
+                    "(图搜图); omit for text-to-image search (文搜图). "
+                    "Must be a public http(s) URL; the server validates it "
+                    "against the authorized domains."
+                ),
+            }
         return {
             "type": "function",
             "function": {
                 "name": "search_images",
                 "description": (
                     "Search the public web for images through the configured "
-                    "文搜图/图搜图 provider lane (阿里云百炼 web_search_image / "
-                    "image_search via the Responses API). Pass only a text query "
-                    "for text-to-image search, or add a public image URL for "
-                    "reverse image search. Keep the query short and "
-                    "single-language (about 60 characters or fewer): long or "
-                    "mixed-language queries make the upstream slower and can "
-                    "time out. After the results come back, if the user wants "
-                    "the actual image files (to view, analyze, edit, or use in "
-                    "materials), call download_external_image with the selected "
-                    "image URLs — pass several URLs in the urls array to "
-                    "download them in parallel."
+                    "文搜图/图搜图 provider lane. "
+                    + mode_description
+                    + "Keep the query short and single-language (about 60 "
+                    "characters or fewer): long or mixed-language queries make "
+                    "the upstream slower and can time out. After the results "
+                    "come back, if the user wants the actual image files (to "
+                    "view, analyze, edit, or use in materials), call "
+                    "download_external_image with the selected image URLs — "
+                    "pass several URLs in the urls array to download them in "
+                    "parallel."
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 500,
-                        },
-                        "image_url": {
-                            "type": "string",
-                            "description": (
-                                "Optional public image URL for reverse image search "
-                                "(图搜图); omit for text-to-image search (文搜图). "
-                                "Must be a public http(s) URL; the server validates it "
-                                "against the authorized domains."
-                            ),
-                        },
-                    },
+                    "properties": properties,
                     "required": ["query"],
                     "additionalProperties": False,
                 },
@@ -2977,6 +2992,7 @@ class AgentToolRuntime:
         assistant_version_id: str | None = None,
         source_message_id: str | None = None,
         model_supports_image_input: bool = False,
+        disclosed_tool_names: set[str] | None = None,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         function = tool_call.get("function")
         if not isinstance(function, dict):
@@ -2984,6 +3000,12 @@ class AgentToolRuntime:
         name = function.get("name")
         if not isinstance(name, str) or not name:
             return self._failure("invalid_tool_call", "Tool call has no function name")
+        if disclosed_tool_names is not None and name not in disclosed_tool_names:
+            return self._failure(
+                "agent_tool_not_disclosed",
+                "The requested tool was not disclosed for this model round; "
+                "search and activate the capability before calling it",
+            )
         try:
             arguments = self._parse_arguments(function.get("arguments"))
             if name == "search_session_fragments":
@@ -7355,7 +7377,11 @@ class AgentToolRuntime:
                 # Transient upstream slowness; retry before failing.
                 last_timeout = exc
             except SearchProviderError as exc:
-                raise AppError(502, "search_provider_failed", "Image search failed") from exc
+                raise AppError(
+                    502,
+                    "search_provider_failed",
+                    f"Image search failed: {exc}",
+                ) from exc
         else:
             budget = f" after {timeout_seconds}s" if timeout_seconds else ""
             raise AppError(
@@ -7617,73 +7643,16 @@ class AgentToolRuntime:
         cross_session = target_session_id != chat_session_id
         db = self.extensions.db
 
-        entries: dict[str, dict[str, Any]] = {}
-        attachment_rows = db.execute(
-            select(FileRecord, Message, FileReference)
-            .join(FileReference, FileReference.file_id == FileRecord.id)
-            .join(Message, FileReference.target_id == Message.id)
-            .where(
-                FileReference.workspace_id == self.workspace_id,
-                FileReference.target_type == "message",
-                Message.session_id == target_session_id,
-                FileRecord.workspace_id == self.workspace_id,
-            )
-            .order_by(Message.created_at)
-        ).all()
-        for file, message, reference in attachment_rows:
-            entries.setdefault(
-                file.id,
-                {
-                    "file_id": file.id,
-                    "filename": file.original_name,
-                    "mime_type": file.mime_type,
-                    "size_bytes": file.size_bytes,
-                    # ImageGenerationService also records generated files as
-                    # message references; keep their origin distinguishable
-                    # from files the user uploaded.
-                    "origin": (
-                        "generated_image"
-                        if reference.relation == "generated_image"
-                        else "user_attachment"
-                    ),
-                    "relation": reference.relation,
-                    "message_id": message.id,
-                    "is_image": is_image_attachment(file),
-                    "storage_status": file.storage_status,
-                    "created_at": (
-                        file.created_at.isoformat() if file.created_at else None
-                    ),
-                },
-            )
-        generated_rows = db.execute(
-            select(FileRecord, ImageGenerationTask)
-            .join(ImageGenerationTask, ImageGenerationTask.file_id == FileRecord.id)
-            .where(
-                ImageGenerationTask.workspace_id == self.workspace_id,
-                ImageGenerationTask.session_id == target_session_id,
-                ImageGenerationTask.status == "completed",
-            )
-            .order_by(ImageGenerationTask.created_at)
-        ).all()
-        for file, task in generated_rows:
-            entries.setdefault(
-                file.id,
-                {
-                    "file_id": file.id,
-                    "filename": file.original_name,
-                    "mime_type": file.mime_type,
-                    "size_bytes": file.size_bytes,
-                    "origin": "generated_image",
-                    "message_id": task.message_id,
-                    "prompt_summary": task.prompt_summary or None,
-                    "is_image": True,
-                    "storage_status": file.storage_status,
-                    "created_at": (
-                        task.created_at.isoformat() if task.created_at else None
-                    ),
-                },
-            )
-        listed = sorted(entries.values(), key=lambda item: item["created_at"] or "")
+        # Merge FileReference + ImageGenerationTask + session_workspace_entries
+        # so download_external_image results (which never create a
+        # FileReference) are visible exactly like sandbox_list_files sees them.
+        from app.services.session_files import collect_session_files
+
+        listed = collect_session_files(
+            db,
+            workspace_id=self.workspace_id,
+            session_id=target_session_id,
+        )
         truncated = len(listed) > SESSION_FILE_LIST_MAX
         if truncated:
             listed = listed[-SESSION_FILE_LIST_MAX:]

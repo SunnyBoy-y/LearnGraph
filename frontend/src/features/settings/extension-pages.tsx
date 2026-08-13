@@ -25,7 +25,7 @@ import {
   installSkill,
   invokeMcpTool,
   invokeSkill,
-  listBuiltinMcpTools,
+  listBuiltinNativeTools,
   listMcpServers,
   listPlugins,
   listProviders,
@@ -74,7 +74,7 @@ import {
 import { SkillPackageEditor } from "@/features/settings/skill-package-editor";
 import { AddSkillDialog } from "@/features/settings/skills-hub-extras";
 import type {
-  BuiltinMcpTool,
+  BuiltinNativeTool,
   MCPServer,
   MCPServerCreate,
   McpRegistrySearchItem,
@@ -976,7 +976,7 @@ function BuiltinToolDetailDialog({
   tool,
   onOpenChange,
 }: {
-  tool: BuiltinMcpTool | null;
+  tool: BuiltinNativeTool | null;
   onOpenChange: (open: boolean) => void;
 }) {
   const [locale, setLocale] = useState<"zh" | "en">("zh");
@@ -1102,8 +1102,8 @@ export function ToolsPage({
     queryFn: listMcpServers,
   });
   const builtinTools = useQuery({
-    queryKey: ["builtin-mcp-tools"],
-    queryFn: listBuiltinMcpTools,
+    queryKey: ["builtin-native-tools"],
+    queryFn: listBuiltinNativeTools,
     enabled: showMcp,
   });
   const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
@@ -1129,7 +1129,7 @@ export function ToolsPage({
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
     void queryClient.invalidateQueries({ queryKey: ["skills"] });
-    void queryClient.invalidateQueries({ queryKey: ["builtin-mcp-tools"] });
+    void queryClient.invalidateQueries({ queryKey: ["builtin-native-tools"] });
   };
   const installMcp = useMutation({
     mutationFn: registerMcpServer,
@@ -1149,7 +1149,7 @@ export function ToolsPage({
   });
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
   const [skillSearch, setSkillSearch] = useState("");
-  const [viewingBuiltinTool, setViewingBuiltinTool] = useState<BuiltinMcpTool | null>(
+  const [viewingBuiltinTool, setViewingBuiltinTool] = useState<BuiltinNativeTool | null>(
     null,
   );
   const [deleteTarget, setDeleteTarget] = useState<Skill | null>(null);
@@ -1445,7 +1445,7 @@ export function ToolsPage({
         <div className="border-b p-5">
           <SectionHeading
             description={`${builtinTools.data?.length ?? 0} 个第一方工具 · 随系统提供，只读`}
-            title="系统自带 MCP"
+            title="LearnGraph 原生工具"
           />
         </div>
         {builtinTools.data?.length ? (
@@ -1483,7 +1483,7 @@ export function ToolsPage({
             ))}
           </div>
         ) : (
-          <p className="py-10 text-center text-sm text-muted-foreground">暂无系统自带 MCP 工具</p>
+          <p className="py-10 text-center text-sm text-muted-foreground">暂无 LearnGraph 原生工具</p>
         )}
       </Surface>
       <Surface className="overflow-hidden">
@@ -1507,12 +1507,26 @@ export function ToolsPage({
                     <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
                       {server.endpoint_url ?? "stdio runner 未配置"}
                     </p>
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {server.requested_tools.map((tool) => (
-                        <Badge key={tool} variant="secondary">
-                          {tool}
-                        </Badge>
-                      ))}
+                    <div className="mt-2 space-y-1.5">
+                      <p className="text-[11px] text-muted-foreground">
+                        已探测工具（当前快照）
+                      </p>
+                      <div className="flex flex-wrap gap-1">
+                        {server.discovered_tools.map((tool) => (
+                          <Badge key={tool} variant="secondary">
+                            {tool}
+                          </Badge>
+                        ))}
+                        {!server.discovered_tools.length ? (
+                          <span className="text-xs text-muted-foreground">尚未探测</span>
+                        ) : null}
+                      </div>
+                      <p className="text-[11px] text-muted-foreground">
+                        已审核调用范围：{server.requested_tools.join("、") || "无"}
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        Agent 自动调用：{server.agent_auto_invoke ? "允许" : "禁止"}
+                      </p>
                     </div>
                     {server.last_error ? (
                       <p className="mt-2 text-xs text-destructive">
@@ -1540,7 +1554,9 @@ export function ToolsPage({
                         })
                       }
                       serverName={server.display_name}
-                      tools={server.requested_tools}
+                      tools={server.discovered_tools.filter((tool) =>
+                        server.requested_tools.includes(tool),
+                      )}
                     />
                     <EditMcpDialog
                       busy={updateMcpMutation.isPending}

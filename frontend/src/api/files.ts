@@ -14,6 +14,7 @@ import type {
   FileRecord,
   FileReference,
   FileStorageSummary,
+  SessionFile,
   FileTextChunk,
 } from "@/types/files";
 import type { DeleteImpact } from "@/types/workflow";
@@ -250,4 +251,11 @@ export function deleteFilesBatch(
     file_ids: fileIds,
     confirmation_text: confirmationText,
   });
+}
+
+/** List every durable file tied to a chat session (unified file-area view). */
+export function listSessionFiles(sessionId: string): Promise<SessionFile[]> {
+  return apiClient.get<SessionFile[]>(
+    `/sessions/${encodeURIComponent(sessionId)}/files`,
+  );
 }

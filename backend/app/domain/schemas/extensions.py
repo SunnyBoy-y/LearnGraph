@@ -228,6 +228,7 @@ class MCPServerView(ORMModel):
     manifest_json: dict[str, Any]
     manifest_hash: str
     requested_tools: list[str]
+    discovered_tools: list[str] = Field(default_factory=list)
     required_permissions: list[str]
     status: str
     enabled: bool

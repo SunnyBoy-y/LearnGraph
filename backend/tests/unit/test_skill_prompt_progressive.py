@@ -15,6 +15,7 @@ Runs entirely against an in-memory scratch DB; no network, no ports.
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -27,6 +28,7 @@ from app.core.security import Principal
 from app.domain import models as m
 from app.domain.extension_models import ExtensionPermissionGrant, SkillRecord
 from app.domain.models import utc_now
+from app.services.agent_runtime import AgentToolRuntime
 from app.services.mcp_skills import MCPAndSkillService
 
 WORKSPACE = "ws-skill-progressive"
@@ -67,6 +69,7 @@ def _add_package_skill(
     instructions: str,
     *,
     last_used_at=None,
+    description: str | None = None,
 ) -> SkillRecord:
     skill = SkillRecord(
         id=f"sk-{skill_key}",
@@ -78,7 +81,9 @@ def _add_package_skill(
         generated_by="user_import",
         kind="agent_skill_package",
         package_format="skill_md_v1",
-        manifest_json={"description": f"desc {skill_key}"},
+        manifest_json={
+            "description": description if description is not None else f"desc {skill_key}"
+        },
         manifest_hash="0" * 64,
         instructions_markdown=instructions,
         required_tools=[],
@@ -133,12 +138,133 @@ def test_lru_orders_recently_used_first(db: Session) -> None:
     _add_package_skill(db, "charlie", "charlie instructions", last_used_at=now - timedelta(hours=1))
     for skill in db.query(SkillRecord).all():
         _grant(db, skill)
-    service = _service(db, _settings())
+    service = _service(db, _settings(skill_prompt_preload_bodies_enabled=True))
     text = service.agent_skill_package_instructions()
     for key in ("alpha", "bravo", "charlie"):
         assert f"### Skill: {key}" in text
     assert text.index("### Skill: bravo") < text.index("### Skill: charlie")
     assert text.index("### Skill: charlie") < text.index("### Skill: alpha")
+
+
+def test_strict_disclosure_keeps_cold_skill_body_out_of_prompt(db: Session) -> None:
+    skill = _add_package_skill(db, "alpha", "SECRET WORKFLOW BODY")
+    _grant(db, skill)
+    service = _service(db, _settings())
+
+    text = service.agent_skill_package_instructions()
+
+    assert "SECRET WORKFLOW BODY" not in text
+    assert "- `alpha`" in text
+    activated = service.agent_skill_package_instructions(
+        activated_skill_keys={"alpha"}
+    )
+    assert "SECRET WORKFLOW BODY" in activated
+
+
+def test_descriptionless_skill_does_not_leak_body_into_discovery(db: Session) -> None:
+    skill = _add_package_skill(
+        db,
+        "alpha",
+        "UNTRUSTED PROMPT INJECTION BODY",
+        description="",
+    )
+    _grant(db, skill)
+    service = _service(db, _settings())
+
+    descriptor = service._skill_package_descriptor(skill)
+    prompt = service.agent_skill_package_instructions()
+
+    assert "UNTRUSTED PROMPT INJECTION BODY" not in descriptor["summary"]
+    assert "UNTRUSTED PROMPT INJECTION BODY" not in prompt
+    assert descriptor["summary"] == "alpha"
+
+
+def test_package_activation_returns_full_skill_contract(db: Session) -> None:
+    skill = _add_package_skill(db, "alpha", "FULL ACTIVATED WORKFLOW")
+    _grant(db, skill)
+    service = _service(db, _settings())
+
+    result = service.activate_capabilities(["skill:alpha"])
+
+    assert result["activated_capability_ids"] == ["skill:alpha"]
+    assert result["loaded_skill_contracts"][0]["content"] == "FULL ACTIVATED WORKFLOW"
+
+
+def test_capability_activate_schema_supports_family_only_and_bounds_ids() -> None:
+    parameters = MCPAndSkillService._capability_activate_tool_definition()["function"][
+        "parameters"
+    ]
+
+    assert parameters["properties"]["capability_ids"]["maxItems"] == 4
+    assert {tuple(item["required"]) for item in parameters["anyOf"]} == {
+        ("capability_ids",),
+        ("families",),
+    }
+
+
+def test_stdio_capability_is_fail_closed_when_runner_disabled() -> None:
+    capability = next(
+        item
+        for item in MCPAndSkillService.transport_capabilities(_settings())
+        if item["transport"] == "stdio"
+    )
+
+    assert capability["available"] is False
+    assert capability["supports_real_execution"] is False
+
+
+def test_family_only_activation_is_accepted(db: Session) -> None:
+    service = _service(db, _settings())
+
+    result = service.activate_capabilities([], families=["builtin_extension"])
+
+    assert result["activated_families"] == ["builtin_extension"]
+
+
+def test_progressive_builtin_definitions_keep_core_and_load_selected(db: Session) -> None:
+    service = _service(db, _settings())
+
+    initial = service.agent_tool_definitions(
+        capability_families=set(), activated_capabilities=set()
+    )
+    initial_names = {item["function"]["name"] for item in initial}
+    assert "lg_graph_read" in initial_names
+    assert "lg_usage_budget_create" not in initial_names
+
+    loaded = service.agent_tool_definitions(
+        capability_families=set(),
+        activated_capabilities={"builtin:builtin.usage.budget.create"},
+    )
+    assert "lg_usage_budget_create" in {
+        item["function"]["name"] for item in loaded
+    }
+
+
+def test_execute_rejects_tool_not_disclosed_for_round() -> None:
+    runtime = AgentToolRuntime.__new__(AgentToolRuntime)
+
+    _content, meta, _sources = runtime.execute(
+        {
+            "id": "call-1",
+            "function": {"name": "get_current_time", "arguments": "{}"},
+        },
+        allowed_domains=[],
+        chat_session_id="session-1",
+        disclosed_tool_names={"lg_capability_search"},
+    )
+
+    assert meta["reason"] == "agent_tool_not_disclosed"
+
+
+def test_mcp_tool_level_activation_matches_only_selected_tool() -> None:
+    server = SimpleNamespace(server_key="github")
+
+    assert MCPAndSkillService._mcp_tool_activated(
+        server, "create_issue", {"mcp:github:create_issue"}, set()
+    )
+    assert not MCPAndSkillService._mcp_tool_activated(
+        server, "search_code", {"mcp:github:create_issue"}, set()
+    )
 
 
 def test_catalog_truncation_notice(db: Session) -> None:

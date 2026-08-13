@@ -208,3 +208,26 @@ export interface FileReference {
   metadata_json: Record<string, unknown>
   created_at: IsoDateTime
 }
+
+/** One durable file tied to a chat session (unified file-area view). */
+export interface SessionFile {
+  file_id: string | null
+  filename: string
+  mime_type: string
+  size_bytes: number
+  origin:
+    | 'user_attachment'
+    | 'generated_image'
+    | 'external_download'
+    | 'agent_workspace_file'
+    | 'session_workspace'
+    | string
+  relation: string | null
+  path: string | null
+  source: string | null
+  message_id: string | null
+  is_image: boolean
+  storage_status: string | null
+  prompt_summary: string | null
+  created_at: string | null
+}

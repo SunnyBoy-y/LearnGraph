@@ -26,7 +26,10 @@ import modelscopeMark from "@/assets/brands/si-modelscope.svg";
 import moonshotMark from "@/assets/brands/si-moonshot.svg";
 import ollamaMark from "@/assets/brands/si-ollama.svg";
 import openrouterMark from "@/assets/brands/si-openrouter.svg";
+import openverseMark from "@/assets/brands/openverse.ico";
 import perplexityMark from "@/assets/brands/si-perplexity.svg";
+import pexelsMark from "@/assets/brands/si-pexels.svg";
+import pixabayMark from "@/assets/brands/si-pixabay.svg";
 import qwenMark from "@/assets/brands/si-qwen.svg";
 import searxngMark from "@/assets/brands/si-searxng.svg";
 import tavilyMark from "@/assets/brands/tavily.ico";
@@ -62,7 +65,10 @@ const BRAND_ICONS: Record<string, string> = {
   moonshot: moonshotMark,
   ollama: ollamaMark,
   openrouter: openrouterMark,
+  openverse: openverseMark,
   perplexity: perplexityMark,
+  pexels: pexelsMark,
+  pixabay: pixabayMark,
   qianfan: baiduMark,
   qwen: qwenMark,
   searxng: searxngMark,

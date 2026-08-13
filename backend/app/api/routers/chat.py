@@ -53,6 +53,7 @@ from app.domain.schemas.chat import (
     SessionAutoTitleRequest,
     SessionContextUsageView,
     SessionCreateRequest,
+    SessionFileView,
     SessionView,
     SuggestedPromptBatchView,
     SuggestedPromptGenerateRequest,
@@ -1190,6 +1191,34 @@ def get_session_context_usage(
             provider_id=provider_id,
         ).context_usage(session_id, agent_mode=agent_mode)
     )
+
+
+@router.get("/{session_id}/files", response_model=list[SessionFileView])
+def list_session_files(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> list[SessionFileView]:
+    """List every durable file tied to the session (unified file-area view).
+
+    Merges message attachments (FileReference), generated images
+    (ImageGenerationTask) and session workspace entries — external downloads
+    and agent writes included, which previously only ``sandbox_list_files``
+    could see. Same data the Agent ``list_session_files`` tool returns.
+    """
+
+    require_session_access(session_id, "read", db, context)
+    from app.services.session_files import collect_session_files
+
+    return [
+        SessionFileView.model_validate(item)
+        for item in collect_session_files(
+            db,
+            workspace_id=context.workspace_id,
+            session_id=session_id,
+        )
+    ]
 
 
 @router.get(

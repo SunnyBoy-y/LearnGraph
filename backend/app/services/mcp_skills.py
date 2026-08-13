@@ -148,6 +148,19 @@ MANAGEMENT_TOOL_NAMES = {
     "builtin.mcp.delete",
 }
 
+# Small, high-recall L1 set. These low-risk/read-heavy tools remain visible in
+# progressive mode; the rest of the first-party extension catalog is loaded by
+# capability id/family. Skill usage announcement stays resident because a
+# loaded SKILL.md explicitly requires it before applying the workflow.
+CORE_BUILTIN_TOOL_NAMES = {
+    "builtin.review.list_due",
+    "builtin.graph.read",
+    "builtin.roadmap.read",
+    "builtin.action.list",
+    "builtin.learning.mastery.read",
+    "builtin.skills.announce_usage",
+}
+
 # The same bounded definitions back both declarative Skills and Agent function
 # calls.  They intentionally expose domain operations rather than database or
 # HTTP implementation details, so a tool cannot escape its workspace scope.
@@ -646,6 +659,8 @@ CAPABILITY_SEARCH_FUNCTION_NAME = "lg_capability_search"
 CAPABILITY_ACTIVATE_FUNCTION_NAME = "lg_capability_activate"
 CAPABILITY_SEARCH_MAX_QUERY_CHARS = 500
 CAPABILITY_SEARCH_MAX_RESULTS = 8
+CAPABILITY_ACTIVATE_MAX_IDS = 4
+CAPABILITY_ACTIVATE_MAX_SKILL_CONTRACT_CHARS = 32_000
 CAPABILITY_FAMILIES = ("skill", "mcp", "builtin_extension")
 CAPABILITY_KINDS = (
     "builtin_tool",
@@ -945,9 +960,10 @@ class MCPAndSkillService:
             "function": {
                 "name": CAPABILITY_ACTIVATE_FUNCTION_NAME,
                 "description": (
-                    "Activate one or more catalog capabilities for this Agent turn so their "
-                    "tool schemas or Skill contracts become available on the next model "
-                    "round. Call capability_search first to obtain capability_ids. "
+                    "Activate one or more catalog capabilities for this Agent turn. Tool "
+                    "schemas become available on the next model round; Agent Skill package "
+                    "contracts are returned immediately in this tool result. Call "
+                    "capability_search first to obtain capability_ids. "
                     "Activation is per-turn only: it never grants durable permissions, never "
                     "enables a server or Skill, never refreshes MCP snapshots, and cannot "
                     "bypass host authorization."
@@ -959,6 +975,7 @@ class MCPAndSkillService:
                             "type": "array",
                             "items": {"type": "string"},
                             "minItems": 1,
+                            "maxItems": CAPABILITY_ACTIVATE_MAX_IDS,
                             "description": (
                                 "capability_id values from capability_search, e.g. "
                                 "'skill:graph-generation' or 'mcp:github'."
@@ -967,13 +984,19 @@ class MCPAndSkillService:
                         "families": {
                             "type": "array",
                             "items": {"type": "string", "enum": list(CAPABILITY_FAMILIES)},
+                            "minItems": 1,
+                            "maxItems": len(CAPABILITY_FAMILIES),
                             "description": (
-                                "Optional: activate every eligible capability in a family "
-                                "(skill, mcp, builtin_extension)."
+                                "Optional: activate eligible callable schemas in a family "
+                                "(skill, mcp, builtin_extension). File-package Skill contracts "
+                                "still require an exact capability_id to bound result size."
                             ),
                         },
                     },
-                    "required": ["capability_ids"],
+                    "anyOf": [
+                        {"required": ["capability_ids"]},
+                        {"required": ["families"]},
+                    ],
                     "additionalProperties": False,
                 },
             },
@@ -987,9 +1010,26 @@ class MCPAndSkillService:
 
     @staticmethod
     def _mcp_tool_activated(
-        server: MCPServer, active_ids: set[str], active_families: set[str]
+        server: MCPServer,
+        tool_name: str,
+        active_ids: set[str],
+        active_families: set[str],
     ) -> bool:
-        return f"mcp:{server.server_key}" in active_ids or "mcp" in active_families
+        return (
+            f"mcp:{server.server_key}" in active_ids
+            or f"mcp:{server.server_key}:{tool_name}" in active_ids
+            or "mcp" in active_families
+        )
+
+    @staticmethod
+    def _builtin_activated(
+        tool: str, active_ids: set[str], active_families: set[str]
+    ) -> bool:
+        return (
+            tool in CORE_BUILTIN_TOOL_NAMES
+            or f"builtin:{tool}" in active_ids
+            or "builtin_extension" in active_families
+        )
 
     def _builtin_descriptor(self, tool: str, spec: dict[str, Any]) -> dict[str, Any]:
         description = _short_summary(spec.get("description"))
@@ -1012,7 +1052,7 @@ class MCPAndSkillService:
             "hash": "",
             "status": "available",
             "authorized": True,
-            "activation_required": False,
+            "activation_required": tool not in CORE_BUILTIN_TOOL_NAMES,
             "permissions": list(BUILTIN_TOOL_PERMISSIONS.get(tool, [])),
             "function_name": spec["function_name"],
         }
@@ -1035,8 +1075,10 @@ class MCPAndSkillService:
             raw_kw = skill.manifest_json.get("keywords")
             if isinstance(raw_kw, list):
                 extra_keywords = [str(item) for item in raw_kw if isinstance(item, str)]
-        instructions = (skill.instructions_markdown or "").strip()
-        when_to_use = description or _short_summary(instructions, limit=160)
+        # Discovery metadata must never be synthesized from untrusted SKILL.md
+        # instructions. Packages without a description remain discoverable by
+        # key/name and load their body only after explicit activation/read.
+        when_to_use = description
         return {
             "capability_id": f"skill:{skill.skill_key}",
             "kind": "skill_package",
@@ -1044,7 +1086,7 @@ class MCPAndSkillService:
             "category": category,
             "name": skill.name,
             "title": skill.name,
-            "summary": _short_summary(description or instructions),
+            "summary": _short_summary(description or skill.name),
             "when_to_use": _short_summary(when_to_use),
             "capability_ids": capability_ids,
             "keywords": [
@@ -1281,6 +1323,12 @@ class MCPAndSkillService:
         ``agent_auto_invoke``, never refreshes MCP snapshots, and never changes
         authorization hashes.
         """
+        if len(capability_ids or []) > CAPABILITY_ACTIVATE_MAX_IDS:
+            raise AppError(
+                422,
+                "capability_activation_limit",
+                f"Activate at most {CAPABILITY_ACTIVATE_MAX_IDS} capability_ids per call",
+            )
         if not capability_ids and not families:
             raise AppError(
                 422,
@@ -1312,12 +1360,48 @@ class MCPAndSkillService:
                 "Some requested capabilities are unavailable for this workspace",
                 {"denied": denied},
             )
+        loaded_skill_contracts: list[dict[str, Any]] = []
+        package_descriptors = [
+            by_id[cid]
+            for cid in resolved
+            if by_id[cid].get("kind") == "skill_package"
+        ]
+        contract_limit = min(
+            SKILL_READ_MAX_CONTENT_CHARS,
+            CAPABILITY_ACTIVATE_MAX_SKILL_CONTRACT_CHARS
+            // max(1, len(package_descriptors)),
+        )
+        for descriptor in package_descriptors:
+            skill_key = str(descriptor["capability_id"]).removeprefix("skill:")
+            skill = next(
+                (item for item in self._authorized_packages() if item.skill_key == skill_key),
+                None,
+            )
+            if skill is None:
+                continue
+            content = (skill.instructions_markdown or "").strip()
+            loaded_content = content[:contract_limit]
+            loaded_skill_contracts.append(
+                {
+                    "skill_key": skill.skill_key,
+                    "name": skill.name,
+                    "content": loaded_content,
+                    "truncated": len(content) > len(loaded_content),
+                    "reader": SKILL_READ_FUNCTION_NAME,
+                    "note": (
+                        "Call lg_skill_used before applying this workflow. Read bundled "
+                        "references with lg_skill_read only when the workflow requires them."
+                    ),
+                }
+            )
         return {
             "activated_capability_ids": sorted(set(resolved)),
             "activated_families": active_families,
+            "loaded_skill_contracts": loaded_skill_contracts,
             "note": (
-                "Activation is per-turn and only affects which schemas/contracts load on "
-                "the next model round; it does not grant durable permissions."
+                "Activation is per-turn. Tool schemas load on the next model round; "
+                "Agent Skill package contracts are included in this result. Activation "
+                "does not grant durable permissions."
             ),
         }
 
@@ -1372,7 +1456,7 @@ class MCPAndSkillService:
         return self._invocation_data(invocation)
 
     def _invoke_capability_activate(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raw_ids = arguments.get("capability_ids")
+        raw_ids = arguments.get("capability_ids") or []
         raw_families = arguments.get("families") or []
         if not isinstance(raw_ids, list) or not all(isinstance(v, str) for v in raw_ids):
             raise AppError(
@@ -1477,7 +1561,11 @@ class MCPAndSkillService:
                 },
             }
             for tool, spec in BUILTIN_TOOL_SPECS.items()
-            if self_service_enabled or tool not in MANAGEMENT_TOOL_NAMES
+            if (self_service_enabled or tool not in MANAGEMENT_TOOL_NAMES)
+            and (
+                not progressive
+                or self._builtin_activated(tool, active_ids, active_families)
+            )
         )
         if self._authorized_packages():
             definitions.append(
@@ -1579,7 +1667,7 @@ class MCPAndSkillService:
                 if not isinstance(input_schema, dict):
                     continue
                 if progressive and not self._mcp_tool_activated(
-                    server, active_ids, active_families
+                    server, name, active_ids, active_families
                 ):
                     continue
                 definitions.append(
@@ -1611,6 +1699,9 @@ class MCPAndSkillService:
         """
 
         activated = activated_skill_keys or set()
+        preload_bodies = bool(
+            getattr(self.settings, "skill_prompt_preload_bodies_enabled", False)
+        )
         inline_limit = max(500, int(getattr(self.settings, "skill_prompt_inline_char_limit", 4_000)))
         total_budget = max(2_000, int(getattr(self.settings, "skill_prompt_total_char_budget", 16_000)))
         catalog_max = max(1, int(getattr(self.settings, "skill_prompt_catalog_max_entries", 24)))
@@ -1665,10 +1756,12 @@ class MCPAndSkillService:
             if not instructions:
                 continue
             is_activated = skill.skill_key in activated
-            # Progressive disclosure: inline small bodies within budget, list
-            # the rest as catalog entries the model expands via lg_skill_read.
+            # Strict progressive disclosure: cold Skills stay metadata-only.
+            # Explicit/contextual activation loads the body; legacy preload mode
+            # may still inline small bodies within the configured budget.
             inline = is_activated or (
-                len(instructions) <= inline_limit
+                preload_bodies
+                and len(instructions) <= inline_limit
                 and used_budget + len(instructions) <= total_budget
             )
             category_tag = f"[{category}] " if category else ""
@@ -1687,7 +1780,7 @@ class MCPAndSkillService:
                     f"{body}"
                 )
             elif len(catalog_lines) < catalog_max:
-                summary = " ".join((description or instructions).split())[:200]
+                summary = " ".join((description or skill.name).split())[:200]
                 scripts_note = " · bundled scripts (sandbox-only)" if skill.has_scripts else ""
                 catalog_lines.append(
                     f"- `{skill.skill_key}` · {category_tag}{skill.name}: "
@@ -2012,8 +2105,30 @@ class MCPAndSkillService:
         }
 
     @staticmethod
-    def transport_capabilities() -> list[dict[str, Any]]:
+    def transport_capabilities(settings: Settings | None = None) -> list[dict[str, Any]]:
         stdio = UnavailableStdioMCPAdapter()
+        stdio_runner = DockerStdioMCPRunner(settings) if settings is not None else None
+        try:
+            stdio_available = bool(stdio_runner and stdio_runner.available)
+            stdio_reason = (
+                "Isolated Docker stdio execution is available; each server still "
+                "requires a digest-pinned, explicitly approved launch spec."
+                if stdio_available
+                else (
+                    stdio_runner.unavailable_reason
+                    if stdio_runner is not None
+                    else stdio.unavailable_reason
+                )
+            )
+        except Exception:
+            # Capability reporting is fail-closed: a broken/missing Docker probe
+            # must never advertise host execution as ready.
+            stdio_available = False
+            stdio_reason = (
+                stdio_runner.unavailable_reason
+                if stdio_runner is not None
+                else stdio.unavailable_reason
+            )
         return [
             {
                 "transport": "streamable_http",
@@ -2028,11 +2143,11 @@ class MCPAndSkillService:
             },
             {
                 "transport": "stdio",
-                "available": stdio.available,
-                "protocol_version": None,
-                "supports_real_execution": False,
-                "supports_encrypted_bearer_reference": False,
-                "reason": stdio.unavailable_reason,
+                "available": stdio_available,
+                "protocol_version": PROTOCOL_VERSION if stdio_available else None,
+                "supports_real_execution": stdio_available,
+                "supports_encrypted_bearer_reference": stdio_available,
+                "reason": stdio_reason,
             },
         ]
 
@@ -2048,10 +2163,16 @@ class MCPAndSkillService:
 
     def server_view_data(self, server: MCPServer) -> dict[str, Any]:
         credential = self._credential(server)
+        snapshot = self._current_snapshot(server)
         return {
             **server.__dict__,
             "auth_configured": credential is not None,
             "auth_masked": credential.secret_masked if credential else None,
+            "discovered_tools": [
+                str(tool.get("name") or "")
+                for tool in (snapshot.tools if snapshot else [])
+                if tool.get("name")
+            ],
         }
 
     def create_server(self, payload: MCPServerCreateRequest) -> MCPServer:

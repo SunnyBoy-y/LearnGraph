@@ -116,6 +116,7 @@ const KnowledgeGraph = lazy(() =>
   })),
 );
 import { NodeExploreChain } from "@/components/graph/node-explore";
+import { SessionFilesList } from "@/features/chat/session-files-list";
 import {
   archiveProject,
   archiveSession,
@@ -3273,7 +3274,7 @@ function ChatGraphRail({
   sessionId?: string;
   workspaceId: string;
 }) {
-  const [view, setView] = useState<"learning" | "capability">("learning");
+  const [view, setView] = useState<"learning" | "capability" | "files">("learning");
   const [boundOverride, setBoundOverride] = useState<{
     graphId: string;
     graphTitle: string;
@@ -3345,8 +3346,22 @@ function ChatGraphRail({
         >
           能力成长
         </Button>
+        <Button
+          aria-selected={view === "files"}
+          onClick={() => setView("files")}
+          role="tab"
+          size="xs"
+          variant="ghost"
+        >
+          会话文件
+        </Button>
       </div>
-      {isLearning ? (
+      {view === "files" ? (
+        <SessionFilesList
+          sessionId={sessionId}
+          workspaceId={workspaceId}
+        />
+      ) : isLearning ? (
         binding ? (
           <BoundGraphRail
             graphId={binding.graphId}

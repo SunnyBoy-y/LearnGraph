@@ -29,6 +29,10 @@ export interface ProviderTypeCatalogItem {
   documentation_url: string | null;
   key_management_url: string | null;
   supports_account_balance: boolean;
+  /** image_search 角色能力 tag：text=文搜图，image=图搜图；空数组表示非图搜角色。 */
+  image_search_modes?: Array<"text" | "image">;
+  /** 免费供应商标记；无需 Key/Base URL 的免费源创建实例时默认启用。 */
+  is_free: boolean;
 }
 
 export interface ProviderCreateRequest {
