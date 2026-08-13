@@ -243,10 +243,21 @@ export function listMessageVersions(sessionId: string, messageId: string): Promi
   return apiClient.get<MessageVersion[]>(`/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/versions`)
 }
 
-export function getMessageSnapshot(sessionId: string, messageId: string, messageVersionId?: string): Promise<MessageSnapshot> {
+export function getMessageSnapshot(
+  sessionId: string,
+  messageId: string,
+  messageVersionId?: string,
+  options: ApiRequestOptions = {},
+): Promise<MessageSnapshot> {
   return apiClient.get<MessageSnapshot>(
     `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
-    { query: { message_version_id: messageVersionId } },
+    {
+      ...options,
+      query: {
+        ...options.query,
+        message_version_id: messageVersionId,
+      },
+    },
   )
 }
 
@@ -309,11 +320,16 @@ export function retrySessionMessage(
 export function listSessionMessageEvents(
   sessionId: string,
   messageId: string,
-  options: { afterEventId?: string; messageVersionId?: string } = {},
+  options: {
+    afterEventId?: string
+    messageVersionId?: string
+    signal?: AbortSignal
+  } = {},
 ): Promise<SessionMessageStreamData[]> {
   return apiClient.get<SessionMessageStreamData[]>(
     `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/events`,
     {
+      signal: options.signal,
       query: {
         after_event_id: options.afterEventId,
         message_version_id: options.messageVersionId,

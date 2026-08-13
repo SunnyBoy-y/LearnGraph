@@ -35,9 +35,15 @@ router = APIRouter(prefix="/api/v1/subapps", tags=["subapp-preview"])
 health_router = APIRouter(prefix="/api/v1", tags=["subapp-preview"])
 
 
+@health_router.get("/livez")
+async def livez() -> dict[str, str]:
+    """Process/event-loop liveness probe used by the development supervisor."""
+    return {"status": "ok"}
+
+
 @health_router.get("/health")
 def health() -> dict[str, str]:
-    """Readiness endpoint used by the development process monitor."""
+    """Readiness endpoint retained for diagnostics and compatibility."""
     return {"status": "ok"}
 
 

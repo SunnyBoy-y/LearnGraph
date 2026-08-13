@@ -30,9 +30,6 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB, WorkspaceContext
 from app.core.errors import AppError
 from app.domain.models import (
     Message,
-    MessageControl,
-    MessageVersion,
-    ProviderResponseState,
     Workspace,
 )
 from app.domain.schemas.chat import (
@@ -267,57 +264,10 @@ def _detached_message_stream(
                 last_event_id=last_event_id,
             )
 
-    def _on_disconnect() -> None:
-        """A1-4: when the client leaves before completion, cancel the run if
-        it is NOT resumable (no provider continuation state), so an abandoned
-        generation does not keep billing indefinitely. Resumable (checkpointed)
-        messages keep running in the background for Last-Event-ID replay.
-        """
-        try:
-            with session_factory() as disconnect_db:
-                running = disconnect_db.scalar(
-                    select(MessageVersion)
-                    .join(Message, Message.id == MessageVersion.message_id)
-                    .where(
-                        Message.session_id == session_id,
-                        Message.workspace_id == context.workspace_id,
-                        MessageVersion.status.in_(("streaming", "submitted", "pending")),
-                    )
-                    .order_by(MessageVersion.created_at.desc())
-                    .limit(1)
-                )
-                if running is None:
-                    return
-                resumable = (
-                    disconnect_db.scalar(
-                        select(ProviderResponseState).where(
-                            ProviderResponseState.message_version_id == running.id
-                        )
-                    )
-                    is not None
-                )
-                if resumable:
-                    return
-                control = disconnect_db.get(MessageControl, running.id)
-                if control is None:
-                    disconnect_db.add(
-                        MessageControl(
-                            workspace_id=context.workspace_id,
-                            message_version_id=running.id,
-                            cancel_requested=True,
-                        )
-                    )
-                else:
-                    control.cancel_requested = True
-                disconnect_db.commit()
-        except Exception:
-            pass
-
     return _detached_sse_transport(
         produce,
         session_id=session_id,
         thread_name=f"learngraph-message-{session_id[:8]}",
-        on_disconnect=_on_disconnect,
     )
 
 

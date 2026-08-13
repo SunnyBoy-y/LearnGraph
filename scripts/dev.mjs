@@ -15,8 +15,13 @@ const HEALTH_INTERVAL_MS = 500
 // while healthy, then tighten only after a failure so crash recovery stays
 // quick without flooding uvicorn access logs during normal development.
 const HEALTH_MONITOR_INTERVAL_MS = 15_000
-const HEALTH_MONITOR_FAILURE_INTERVAL_MS = 2_000
-const HEALTH_MONITOR_FAILURE_LIMIT = 5
+const HEALTH_MONITOR_FAILURE_INTERVAL_MS = 5_000
+const HEALTH_MONITOR_FAILURE_LIMIT = 6
+// Liveness must tolerate brief event-loop/CPU pressure from long Agent turns.
+// A 2-second timeout previously aborted a healthy probe and the supervisor then
+// force-killed the backend, guaranteeing an SSE ECONNRESET mid-generation.
+const HEALTH_REQUEST_TIMEOUT_MS = 10_000
+const HEALTH_FINAL_CONFIRM_TIMEOUT_MS = 30_000
 const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000
 const BACKEND_RESTART_DELAY_MS = 1_000
 
@@ -263,20 +268,40 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-async function checkHealth(url) {
+async function checkHealth(url, timeoutMs = HEALTH_REQUEST_TIMEOUT_MS) {
   const controller = new AbortController()
-  const requestTimeout = setTimeout(() => controller.abort(), 2_000)
+  const startedAt = Date.now()
+  const requestTimeout = setTimeout(
+    () => controller.abort(new Error(`liveness probe timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  )
   try {
-    const response = await fetch(url, { signal: controller.signal })
-    if (!response.ok) return { healthy: false, problem: `HTTP ${response.status}` }
+    const response = await fetch(url, {
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      return {
+        healthy: false,
+        problem: `HTTP ${response.status}`,
+        durationMs: Date.now() - startedAt,
+      }
+    }
     const payload = await response.json()
-    if (payload?.status === 'ok') return { healthy: true }
+    if (payload?.status === 'ok') {
+      return { healthy: true, durationMs: Date.now() - startedAt }
+    }
     return {
       healthy: false,
       problem: `HTTP ${response.status} returned status ${JSON.stringify(payload?.status)}`,
+      durationMs: Date.now() - startedAt,
     }
   } catch (error) {
-    return { healthy: false, problem: error instanceof Error ? error.message : String(error) }
+    return {
+      healthy: false,
+      problem: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+    }
   } finally {
     clearTimeout(requestTimeout)
   }
@@ -320,9 +345,25 @@ function watchHealth(url) {
         continue
       }
       failures += 1
-      lastProblem = check.problem
+      lastProblem = `${check.problem}; probe ${check.durationMs}ms`
       if (failures >= HEALTH_MONITOR_FAILURE_LIMIT) {
-        return `Backend stopped responding (${lastProblem}): ${url}.`
+        // A destructive restart aborts every in-flight Agent and SSE connection.
+        // Confirm with one long probe instead of treating a short scheduling
+        // delay as proof that the uvicorn worker is dead.
+        const confirmation = await checkHealth(
+          url,
+          HEALTH_FINAL_CONFIRM_TIMEOUT_MS,
+        )
+        if (confirmation.healthy) {
+          console.warn(
+            `\nBackend liveness recovered during final confirmation ` +
+              `(${confirmation.durationMs}ms): ${url}`,
+          )
+          failures = 0
+          continue
+        }
+        lastProblem = `${confirmation.problem}; final probe ${confirmation.durationMs}ms`
+        return `Backend liveness failed after ${HEALTH_MONITOR_FAILURE_LIMIT} probes (${lastProblem}): ${url}.`
       }
     }
     return null
@@ -577,8 +618,10 @@ async function main() {
     },
   )
 
-  const backendHealthUrl = `${backendOrigin}/api/v1/health`
-  const previewHealthUrl = `${previewOrigin}/api/v1/health`
+  // Supervisors must use pure process/event-loop liveness. `/health` also checks
+  // SQLite/provider readiness and can legitimately wait while Agent work is busy.
+  const backendHealthUrl = `${backendOrigin}/api/v1/livez`
+  const previewHealthUrl = `${previewOrigin}/api/v1/livez`
   let announcedReady = false
 
   // Supervise one child with startup polling + steady-state watch + restart on

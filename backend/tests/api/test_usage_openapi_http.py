@@ -9,6 +9,7 @@ from __future__ import annotations
 # 公开端点白名单（无需认证即可合法访问）
 PUBLIC_PREFIXES = (
     "/api/v1/health",
+    "/api/v1/livez",
     "/api/v1/auth/login",
     "/api/v1/auth/register",
     "/api/v1/auth/demo-login",
@@ -41,6 +42,22 @@ def test_health_public(client):
     r = client.get("/api/v1/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+def test_livez_public_and_database_free(client, monkeypatch):
+    """Supervisor liveness remains available when DB readiness is congested."""
+    from app.api import deps
+
+    def fail_if_database_requested():
+        raise AssertionError("livez must not open a database session")
+
+    monkeypatch.setattr(deps, "get_db", fail_if_database_requested)
+    r = client.get("/api/v1/livez")
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["status"] == "ok"
+    assert payload["service"] == "learngraph-backend"
+    assert isinstance(payload["pid"], int)
 
 
 def test_openapi_all_endpoints_reject_anonymous(client):

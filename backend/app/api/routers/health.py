@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter
 from sqlalchemy import select, text
 
@@ -9,6 +11,21 @@ from app.domain.schemas.common import HealthResponse
 
 
 router = APIRouter(tags=["health"])
+
+
+@router.get("/livez")
+async def livez() -> dict[str, str | int]:
+    """Process/event-loop liveness probe with no database dependencies.
+
+    The development supervisor must not kill active Agent runs merely because
+    SQLite readiness or the sync worker pool is temporarily busy.
+    """
+
+    return {
+        "status": "ok",
+        "service": "learngraph-backend",
+        "pid": os.getpid(),
+    }
 
 
 @router.get("/health", response_model=HealthResponse)

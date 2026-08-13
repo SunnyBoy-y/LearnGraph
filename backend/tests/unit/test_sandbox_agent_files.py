@@ -9,6 +9,7 @@ cleanup path degrades gracefully).
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -503,3 +504,41 @@ def test_snapshot_cleanup_removes_only_stale_snapshot_directories(tmp_path: Path
     assert fresh.exists()
     assert ordinary.exists()
     assert prefixed_file.exists()
+
+
+def test_snapshot_cleanup_removes_stale_snapshot_with_readonly_files(
+    tmp_path: Path,
+) -> None:
+    """Regression: Windows rmtree fails (WinError 5) on copied read-only files.
+
+    Snapshot copies keep the source read-only attribute (shutil.copy2), so a
+    stale snapshot holding such a file must still be pruned.
+    """
+    workspace_root = tmp_path / "sandbox-workspaces"
+    owner_root = workspace_root / "user-1"
+    snapshot = owner_root / ".learngraph-command-snapshot-stale"
+    inputs = snapshot / "inputs"
+    inputs.mkdir(parents=True)
+    zip_file = inputs / "软件工程概论复习资料2026.zip"
+    zip_file.write_bytes(b"PK\x03\x04fake-zip")
+    try:
+        os.chmod(zip_file, stat.S_IREAD)
+    except OSError:  # pragma: no cover - filesystems that ignore chmod
+        pass
+    try:
+        os.chmod(inputs, stat.S_IREAD)
+    except OSError:  # pragma: no cover - filesystems that ignore chmod
+        pass
+
+    now = datetime.now(timezone.utc)
+    stale_timestamp = (now - timedelta(hours=1)).timestamp()
+    os.utime(snapshot, (stale_timestamp, stale_timestamp))
+
+    removed = _prune_orphaned_sandbox_snapshots(
+        workspace_root,
+        now=now,
+        grace_seconds=600,
+    )
+
+    assert removed == 1
+    assert not snapshot.exists()

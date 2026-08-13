@@ -20,6 +20,7 @@ from app.core.scheduler import (
     memory_retention_scheduler,
     mcp_runner_cleanup_scheduler,
     sandbox_cleanup_scheduler,
+    wal_checkpoint_scheduler,
 )
 from app.services.durable_queue import (
     durable_queue_worker,
@@ -73,6 +74,8 @@ async def lifespan(_: FastAPI):
     mcp_runner_task: asyncio.Task[None] | None = None
     outbox_stop: asyncio.Event | None = None
     outbox_task: asyncio.Task[None] | None = None
+    wal_stop: asyncio.Event | None = None
+    wal_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
         scheduler_stop = asyncio.Event()
         scheduler_task = asyncio.create_task(mastery_scheduler(scheduler_stop))
@@ -91,6 +94,9 @@ async def lifespan(_: FastAPI):
     if settings.memory_outbox_worker_enabled:
         outbox_stop = asyncio.Event()
         outbox_task = asyncio.create_task(memory_outbox_scheduler(outbox_stop))
+    if settings.wal_checkpoint_interval_seconds > 0:
+        wal_stop = asyncio.Event()
+        wal_task = asyncio.create_task(wal_checkpoint_scheduler(wal_stop))
     try:
         yield
     finally:
@@ -115,6 +121,9 @@ async def lifespan(_: FastAPI):
         if outbox_stop is not None and outbox_task is not None:
             outbox_stop.set()
             await outbox_task
+        if wal_stop is not None and wal_task is not None:
+            wal_stop.set()
+            await wal_task
 
 
 class SecurityHeadersMiddleware:

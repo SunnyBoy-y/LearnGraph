@@ -91,6 +91,44 @@ def _is_sqlite_locked_error(exc: OperationalError) -> bool:
     return "database is locked" in message or "database table is locked" in message
 
 
+def run_wal_checkpoint(*, truncate: bool = True) -> dict[str, Any]:
+    """Best-effort SQLite WAL checkpoint; never blocks on a busy database.
+
+    A huge un-checkpointed WAL turns the first write commit past the
+    autocheckpoint threshold into a long-lived holder of the single SQLite
+    write lock (it copies many MB back into the main file), which can starve
+    concurrent message streams with ``database is locked``.  The periodic
+    maintenance loop (``scheduler.wal_checkpoint_scheduler``) keeps the WAL
+    small so autocheckpoint stays cheap.  When another writer is active SQLite
+    returns ``busy=1`` immediately instead of waiting, and we simply skip the
+    round.  ``TRUNCATE`` also returns the checkpointed frames to the OS; a
+    never-shrinking WAL is exactly the failure mode we are preventing.
+    """
+
+    if not is_sqlite:
+        return {"ok": False, "skipped": True, "reason": "not_sqlite"}
+    try:
+        with engine.connect() as conn:
+            mode = "TRUNCATE" if truncate else "PASSIVE"
+            busy, log_frames, checkpointed_frames = conn.execute(
+                text(f"PRAGMA wal_checkpoint({mode})")
+            ).fetchone()
+            return {
+                "ok": bool(busy == 0),
+                "busy": int(busy),
+                "log_frames": int(log_frames),
+                "checkpointed_frames": int(checkpointed_frames),
+            }
+    except Exception as exc:  # defensive: maintenance must never crash
+        return {
+            "ok": False,
+            "busy": 1,
+            "log_frames": 0,
+            "checkpointed_frames": 0,
+            "error": str(exc)[:160],
+        }
+
+
 T = TypeVar("T")
 
 

@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # multi-second chat/memory commits; the retry helpers and the B1-7 sweep
     # mutex absorb the residual contention.
     sqlite_busy_timeout_ms: int = 10_000
+    # Period (seconds) of the background SQLite WAL checkpoint maintenance
+    # loop. A multi-MB WAL makes the next autocheckpoint write many MB back
+    # into the main file while holding the single SQLite write lock, which can
+    # starve concurrent chat streams with ``database is locked``. Keeping the
+    # WAL small (TRUNCATE checkpoint every interval, skipped when busy) keeps
+    # autocheckpoint cheap. 0 disables the loop.
+    wal_checkpoint_interval_seconds: int = 30
     storage_root: Path = Path("./data/storage")
     memory_root: Path = Path("./data/memory")
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173", "http://127.0.0.1:5173"]

@@ -165,7 +165,14 @@ def workspace_context(
         ),
         None,
     )
-    if path_resource is not None:
+    # Sub-application session routes (`/api/v1/subapps/sessions/{session_id}/...`)
+    # reuse the `session_id` path parameter, but that id is a sub-app session
+    # capability id, not a chat session id. The subapp router applies its own
+    # workspace-scoped session lookup (`SubAppService._get_session` filters by
+    # workspace_id), so the generic chat-session ACL gate below would otherwise
+    # 404 every session-scoped subapp call before it reaches the service.
+    is_subapp_session_path = request.url.path.startswith("/api/v1/subapps/sessions/")
+    if path_resource is not None and not is_subapp_session_path:
         resource_type, resource_id = path_resource
         resource_permission = (
             "read"

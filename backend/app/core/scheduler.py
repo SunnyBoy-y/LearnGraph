@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
+import stat
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +33,51 @@ from app.services.sandbox_bootstrap import backend_for_settings
 logger = logging.getLogger(__name__)
 
 _SANDBOX_COMMAND_SNAPSHOT_PREFIX = ".learngraph-command-snapshot-"
+
+# Windows refuses to unlink files that carry the read-only attribute, and
+# snapshot copies preserve it through shutil.copy2. Clear the bit and retry a
+# few times so transient locks (e.g. antivirus scanners) do not fail the sweep.
+_WIN_RM_RETRIES = 5
+_WIN_RM_RETRY_DELAY_SECONDS = 0.2
+
+
+def _force_rmtree(path: Path) -> None:
+    """Remove a directory tree even when entries carry the read-only attribute.
+
+    Plain ``shutil.rmtree`` raises PermissionError (WinError 5) on Windows as
+    soon as a copied file kept its read-only bit. The per-entry error handler
+    clears the attribute and briefly retries; on other platforms this behaves
+    exactly like ``shutil.rmtree``.
+    """
+
+    if os.name != "nt":
+        shutil.rmtree(path)
+        return
+
+    def _on_rm_error(func, target, exc) -> None:
+        # Python 3.12+ onexc passes the OSError; older onerror passes a 3-tuple.
+        error = exc[1] if isinstance(exc, tuple) else exc
+        if isinstance(error, FileNotFoundError) and Path(target) != path:
+            # Raced with a concurrent deletion of an inner entry: fine.
+            return
+        try:
+            os.chmod(target, stat.S_IWRITE)
+        except OSError:
+            pass
+        for attempt in range(_WIN_RM_RETRIES):
+            try:
+                func(target)
+                return
+            except OSError as retry_error:
+                if attempt == _WIN_RM_RETRIES - 1:
+                    raise retry_error from error
+                time.sleep(_WIN_RM_RETRY_DELAY_SECONDS)
+
+    try:
+        # onexc (OSError instance) is available since Python 3.12.
+        shutil.rmtree(path, onexc=_on_rm_error)
+    except TypeError:
+        shutil.rmtree(path, onerror=_on_rm_error)
 
 
 def _prune_orphaned_sandbox_snapshots(
@@ -72,7 +120,7 @@ def _prune_orphaned_sandbox_snapshots(
                     continue
                 if candidate.stat().st_mtime > cutoff_timestamp:
                     continue
-                shutil.rmtree(candidate)
+                _force_rmtree(candidate)
                 removed += 1
             except FileNotFoundError:
                 continue
@@ -572,7 +620,7 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
                                 "Sandbox workspace cleanup escaped managed root"
                             )
                         if candidate.exists():
-                            shutil.rmtree(candidate)
+                            _force_rmtree(candidate)
                     session.status = "deleted"
                     session.lifecycle_state = "EXPIRED"
                     session.cleanup_status = "cleaned"
@@ -686,6 +734,40 @@ async def mcp_runner_cleanup_scheduler(
             await asyncio.to_thread(run_mcp_runner_cleanup_sweep)
         except Exception:
             logger.exception("Periodic MCP runner cleanup wake-up failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+async def wal_checkpoint_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    """Periodically compact the SQLite WAL so autocheckpoint stays cheap.
+
+    See ``app.core.database.run_wal_checkpoint`` for why: a multi-MB WAL turns
+    the first write commit past the autocheckpoint threshold into a long-lived
+    holder of the single SQLite write lock, which can starve concurrent
+    message streams with ``database is locked``.  The checkpoint itself is
+    best-effort and never waits on a busy database; this loop only keeps the
+    WAL small so normal commits stay fast.  Disabled when
+    ``wal_checkpoint_interval_seconds`` is 0.
+    """
+
+    interval = max(
+        5,
+        interval_seconds
+        if interval_seconds is not None
+        else get_settings().wal_checkpoint_interval_seconds,
+    )
+    if interval <= 0:
+        return
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_wal_checkpoint)
+        except Exception:
+            logger.debug("WAL checkpoint round skipped", exc_info=True)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

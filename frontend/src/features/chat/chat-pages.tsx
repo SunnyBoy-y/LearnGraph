@@ -659,7 +659,7 @@ const TERMINAL_MESSAGE_STATUSES = [
   // UI renders a "已中断（后端重启）" affordance + retry button instead of error.
   "interrupted",
 ] as const;
-const IN_FLIGHT_MESSAGE_STATUSES = ["pending", "streaming"] as const;
+const IN_FLIGHT_MESSAGE_STATUSES = ["pending", "submitted", "streaming"] as const;
 
 /** Sidebar/top-bar title for sessions created by edit/branch. */
 function branchSessionTitle(sourceTitle: string | null | undefined): string {
@@ -2478,6 +2478,7 @@ export function ChatCanvasPage() {
   const [composerInstanceKey, setComposerInstanceKey] =
     useState(conversationResetKey);
   const resumeInFlightRef = useRef<string | null>(null);
+  const resumeRetryCountsRef = useRef(new Map<string, number>());
   const [rejectProposalId, setRejectProposalId] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState("");
   const [closeDialogOpen, setCloseDialogOpen] = useState(false);
@@ -3531,6 +3532,32 @@ export function ChatCanvasPage() {
     }
   }, [messages, sessionId]);
 
+  // A reload can race the producer's first database commit: the first history
+  // hydrate may see neither the just-submitted user turn nor its assistant row.
+  // Recheck a few times after mount so the normal in-flight replay effect below
+  // can attach as soon as the durable message becomes visible. This is bounded
+  // (not a permanent poll) and stops early once a stream is found.
+  useEffect(() => {
+    if (!sessionId || sessionId === "new") return;
+    const queryKey = workspaceQueryKey(workspaceId, "messages", sessionId);
+    const timers = [750, 2_000, 5_000].map((delay) =>
+      window.setTimeout(() => {
+        if (isSessionStreaming(sessionId)) return;
+        const cached = queryClient.getQueryData<Message[]>(queryKey) ?? [];
+        const hasInFlight = cached.some(
+          (message) =>
+            message.role === "assistant" &&
+            IN_FLIGHT_MESSAGE_STATUSES.includes(
+              message.status as (typeof IN_FLIGHT_MESSAGE_STATUSES)[number],
+            ),
+        );
+        if (hasInFlight) return;
+        void queryClient.invalidateQueries({ exact: true, queryKey });
+      }, delay),
+    );
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [conversationResetKey, queryClient, sessionId, workspaceId]);
+
   // After refresh (or remount), detect in-flight assistant messages and resume
   // durable event replay so the user can keep receiving the answer.
   useEffect(() => {
@@ -3658,6 +3685,7 @@ export function ChatCanvasPage() {
               inFlight.id,
               {
                 afterEventId: lastEventId || undefined,
+                signal: controller.signal,
               },
             );
             replay.forEach((event) =>
@@ -3695,6 +3723,8 @@ export function ChatCanvasPage() {
             const refreshed = await getMessageSnapshot(
               streamSessionId,
               inFlight.id,
+              undefined,
+              { signal: controller.signal },
             );
             if (
               refreshed &&
@@ -3721,7 +3751,10 @@ export function ChatCanvasPage() {
           } catch {
             // ignore and keep polling events
           }
-          await new Promise((resolve) => window.setTimeout(resolve, pollDelayMs));
+          await waitForStreamReconnect(
+            Math.max(0, STREAM_RECONNECT_DELAYS_MS.findIndex((delay) => delay >= pollDelayMs)),
+            controller.signal,
+          );
         }
         await frameQueue.drain();
         if (terminalFailure) {
@@ -3759,6 +3792,26 @@ export function ChatCanvasPage() {
           return;
         }
       } catch (error) {
+        // The old latch permanently blocked all later attempts. Retry a failed
+        // replay a bounded number of times with back-off; do not spin forever
+        // when the API/provider is genuinely unavailable.
+        const retryCount = (resumeRetryCountsRef.current.get(inFlight.id) ?? 0) + 1;
+        resumeRetryCountsRef.current.set(inFlight.id, retryCount);
+        if (!controller.signal.aborted && retryCount <= 2) {
+          window.setTimeout(() => {
+            if (resumeInFlightRef.current === inFlight.id) {
+              resumeInFlightRef.current = null;
+            }
+            void queryClient.invalidateQueries({
+              exact: true,
+              queryKey: workspaceQueryKey(
+                workspaceId,
+                "messages",
+                streamSessionId,
+              ),
+            });
+          }, retryCount * 5_000);
+        }
         markSessionRunning(streamSessionId, false);
         if (controller.signal.aborted) {
           if (isViewing()) setStatus("ready");
@@ -3774,6 +3827,12 @@ export function ChatCanvasPage() {
           });
         }
       } finally {
+        if (completed || terminalFailure) {
+          resumeRetryCountsRef.current.delete(inFlight.id);
+          if (resumeInFlightRef.current === inFlight.id) {
+            resumeInFlightRef.current = null;
+          }
+        }
         clearSessionStream(streamSessionId, controller);
         if (abortRef.current === controller) abortRef.current = null;
         if (activeMessageId.current === inFlight.id)
@@ -6748,6 +6807,7 @@ export function ChatCanvasPage() {
                 {
                   afterEventId: lastEventId || undefined,
                   messageVersionId,
+                  signal: controller.signal,
                 },
               );
               replay.forEach((event) =>
