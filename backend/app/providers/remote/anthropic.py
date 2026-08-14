@@ -18,6 +18,7 @@ from app.providers.remote.openai import (
     merge_provider_request_headers,
     validate_http_base_url,
 )
+from app.providers.remote.schema_compat import sanitize_json_schema
 
 
 def normalize_anthropic_api_base_url(base_url: str) -> str:
@@ -347,8 +348,10 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                     {
                         "name": function.get("name") or "",
                         "description": function.get("description") or "",
-                        "input_schema": function.get("parameters")
-                        or {"type": "object", "properties": {}},
+                        "input_schema": sanitize_json_schema(
+                            function.get("parameters")
+                            or {"type": "object", "properties": {}}
+                        ),
                     }
                 )
             elif tool.get("name"):
@@ -356,9 +359,11 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                     {
                         "name": tool.get("name") or "",
                         "description": tool.get("description") or "",
-                        "input_schema": tool.get("input_schema")
-                        or tool.get("parameters")
-                        or {"type": "object", "properties": {}},
+                        "input_schema": sanitize_json_schema(
+                            tool.get("input_schema")
+                            or tool.get("parameters")
+                            or {"type": "object", "properties": {}}
+                        ),
                     }
                 )
         return converted or None

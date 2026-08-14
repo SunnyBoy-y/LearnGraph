@@ -13,6 +13,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from app.providers.model_options import ModelCallOptions
 from app.providers.qwen_catalog import is_dashscope_origin
 from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
+from app.providers.remote.schema_compat import sanitize_tool_definitions
 
 
 class ProviderHTTPError(RuntimeError):
@@ -971,7 +972,9 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
             "include": ["reasoning.encrypted_content"],
         }
         if tools:
-            payload["tools"] = self._response_tool_definitions(tools)
+            payload["tools"] = self._response_tool_definitions(
+                sanitize_tool_definitions(tools)
+            )
         payload = self._apply_call_options(payload, responses=True)
         if self.actual_reasoning_effort is not None:
             reasoning = payload.get("reasoning")
@@ -1360,7 +1363,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             "stream_options": {"include_usage": True},
         }
         if tools:
-            payload["tools"] = tools
+            payload["tools"] = sanitize_tool_definitions(tools)
         payload = self._apply_call_options(payload, responses=False)
         tool_aggregates: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None

@@ -16,6 +16,7 @@ from app.providers.remote.openai import (
     normalize_openai_api_base_url,
     validate_http_base_url,
 )
+from app.providers.remote.schema_compat import sanitize_tool_definitions
 
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
@@ -361,7 +362,13 @@ def normalize_ollama_tool_definitions(tools: list[dict[str, Any]]) -> list[dict[
     schemas containing ``maxLength`` (notably a value of 2000 inside an array
     item). LearnGraph validates tool arguments again before execution, so this
     compatibility copy only relaxes model-side constrained decoding.
+
+    The definitions are sanitized first (type arrays, ``anyOf`` unions) so the
+    same schemas that reach OpenAI-compatible and Gemini gateways also reach
+    Ollama in the shared single-``type`` subset.
     """
+
+    tools = sanitize_tool_definitions(tools)
 
     def normalize(value: Any) -> Any:
         if isinstance(value, dict):

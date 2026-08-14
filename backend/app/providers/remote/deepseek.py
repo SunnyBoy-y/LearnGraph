@@ -20,6 +20,7 @@ from app.providers.remote.openai import (
     ProviderTimeoutError,
     merge_provider_request_headers,
 )
+from app.providers.remote.schema_compat import sanitize_tool_definitions
 
 
 class DeepSeekBalanceError(RuntimeError):
@@ -260,7 +261,7 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
             "stream_options": {"include_usage": True},
         }
         if tools:
-            payload["tools"] = tools
+            payload["tools"] = sanitize_tool_definitions(tools)
         payload = self._apply_call_options(payload, responses=False)
         tool_aggregates: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
