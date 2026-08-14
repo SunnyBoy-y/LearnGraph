@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test
+      - run: npm run build:check
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Syntax check
+        run: >
+          uv run --locked python -c
+          "from pathlib import Path; files = sorted(Path('app').rglob('*.py'));
+          assert files; [compile(f.read_bytes(), str(f), 'exec') for f in files];
+          print(f'Syntax checked {len(files)} Python files.')"
+      - name: Import application
+        run: uv run --locked python -c "from app.main import app; assert app.title"
+      - name: Unit and API tests
+        run: uv run --locked --extra test pytest tests -q

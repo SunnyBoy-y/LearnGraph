@@ -1,0 +1,120 @@
+name: learngraph
+
+# Self-hosted LearnGraph: same-origin Web UI + API on 8080, subapp preview on 8001.
+#
+#   docker compose up --build
+#   open http://127.0.0.1:8080
+#
+# Provider secrets use the environment master-key provider. When
+# LEARNGRAPH_MASTER_KEY is unset, the entrypoint generates one and stores it
+# on the data volume so encrypted keys survive restarts.
+#
+# Sandbox containers need the host Docker Engine and a host-visible workspace
+# path. On Linux, add the sandbox override:
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
+#
+# SQLite plus the embedded schedulers are single-process. Do not raise uvicorn
+# --workers above 1.
+
+x-app-environment: &app-environment
+  LEARNGRAPH_ENV: ${LEARNGRAPH_ENV:-development}
+  LEARNGRAPH_DEPLOYMENT_PROFILE: ${LEARNGRAPH_DEPLOYMENT_PROFILE:-self_hosted_team}
+  LEARNGRAPH_SECRET_PROVIDER: environment
+  LEARNGRAPH_MASTER_KEY: ${LEARNGRAPH_MASTER_KEY:-}
+  LEARNGRAPH_BOOTSTRAP_ADMIN_PASSWORD: ${LEARNGRAPH_BOOTSTRAP_ADMIN_PASSWORD:-}
+  LEARNGRAPH_FRONTEND_DIST: /app/frontend-dist
+  LEARNGRAPH_DATA_ROOT: /data
+  LEARNGRAPH_DATABASE_URL: sqlite:////data/learngraph.db
+  LEARNGRAPH_STORAGE_ROOT: /data/storage
+  LEARNGRAPH_MEMORY_ROOT: /data/memory
+  LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: /data/sandbox-workspaces
+  LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
+  LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:8001}
+  LEARNGRAPH_SUBAPP_PREVIEW_PORT: "8001"
+  LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:8080","http://localhost:8080"]}
+  LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS: ${LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS:-true}
+  LEARNGRAPH_SANDBOX_ENABLED: ${LEARNGRAPH_SANDBOX_ENABLED:-true}
+  LEARNGRAPH_SANDBOX_PREBUILT_IMAGE: ${LEARNGRAPH_SANDBOX_PREBUILT_IMAGE:-crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:1.0.0}
+
+services:
+  app:
+    image: ${LEARNGRAPH_IMAGE:-learngraph:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${LEARNGRAPH_PORT:-8080}:8000"
+    environment:
+      <<: *app-environment
+    volumes:
+      - learngraph-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/livez', timeout=4)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    stop_grace_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  preview:
+    image: ${LEARNGRAPH_IMAGE:-learngraph:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "app.preview:preview_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+        "--proxy-headers",
+        "--forwarded-allow-ips",
+        "*",
+      ]
+    ports:
+      - "${LEARNGRAPH_PREVIEW_PORT:-8001}:8001"
+    environment:
+      <<: *app-environment
+    volumes:
+      - learngraph-data:/data
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/v1/livez', timeout=4)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    stop_grace_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  learngraph-data:

@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     wal_checkpoint_interval_seconds: int = 30
     storage_root: Path = Path("./data/storage")
     memory_root: Path = Path("./data/memory")
+    # Production SPA directory served by the API process. Empty keeps the
+    # API-only layout used by `npm run dev` (Vite owns the frontend origin).
+    frontend_dist: str | None = None
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     demo_username: str = "demo"
     demo_password: str = "learn-graph-local"
@@ -366,6 +369,25 @@ class Settings(BaseSettings):
             backend_root = Path(__file__).resolve().parents[2]
             configured = backend_root / configured
         return configured.resolve()
+
+    @property
+    def resolved_frontend_dist(self) -> Path | None:
+        """Return the SPA directory when it contains a production index.html."""
+
+        raw = (self.frontend_dist or "").strip()
+        if not raw:
+            return None
+        configured = Path(raw).expanduser()
+        if not configured.is_absolute():
+            backend_root = Path(__file__).resolve().parents[2]
+            configured = backend_root / configured
+        try:
+            configured = configured.resolve()
+        except OSError:
+            return None
+        if configured.is_dir() and (configured / "index.html").is_file():
+            return configured
+        return None
 
     @field_validator("cors_origins", mode="before")
     @classmethod

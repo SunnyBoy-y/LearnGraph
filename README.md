@@ -200,6 +200,34 @@ LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN=https://my-tunnel.example.com:23351
 
 `npm run dev` 会读取上述环境变量并完成 allowedHosts / CORS / preview origin 接线；脚本不再提供 `--public-origin` 之类的命令行捷径，公网访问一律由环境变量显式配置。
 
+### Docker Compose（可选）
+
+适合想先跑起来、或不想在本机装 Node / Python 的自托管体验。镜像同时包含前端生产构建和 FastAPI；浏览器走同源 `/api/v1`。
+
+```bash
+docker compose up --build
+```
+
+| 服务 | 默认地址 |
+| --- | --- |
+| Web + API | `http://127.0.0.1:8080` |
+| 子应用 Preview | `http://127.0.0.1:8001` |
+| Health | `http://127.0.0.1:8080/api/v1/health` |
+
+数据写在 named volume `learngraph-data`。未设置 `LEARNGRAPH_MASTER_KEY` 时，入口脚本会生成一把主密钥并保存在卷里，这样页面里保存的 Provider Secret 重启后仍能解密。首次启动请看 `app` 容器日志里的管理员临时密码。
+
+Agent 沙箱要调用**宿主** Docker Engine，并且 bind mount 路径对 dockerd 必须是宿主机路径。Linux 可用覆盖文件：
+
+```bash
+export LEARNGRAPH_DATA_DIR=/var/lib/learngraph
+export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
+docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
+```
+
+Windows / Docker Desktop 请继续用上面的 `npm run dev` 跑后端，让本机 Docker 提供沙箱；不要把 Compose 里的 named volume 路径传给 dockerd。
+
+更完整的变量说明见仓库根目录 `.env.example` 和 `backend/.env.example`。
+
 
 ### 首次登录
 
@@ -267,6 +295,8 @@ LearnGraph/
 │     └─ domain/         模型与 Schema（含记忆事件模型）
 ├─ docs/                 可公开部署的开发者 HTML 文档（GitHub Pages）
 ├─ scripts/              跨平台启动与检查脚本
+├─ Dockerfile            应用镜像（前端生产构建 + FastAPI）
+├─ docker-compose.yml    自托管编排（Web/API + Preview）
 └─ .github/assets/       README 公共素材
 ```
 
@@ -283,6 +313,7 @@ LearnGraph/
 | `npm run check:frontend` | 仅执行前端检查 |
 | `npm run check:backend` | 仅执行后端检查 |
 | `npm run build:frontend` | 构建前端生产产物 |
+| `docker compose up --build` | 用容器启动 Web/API 与 Preview |
 
 `npm run dev` 会从 5173 开始自动选择第一个可用的前端端口，终端会显示实际地址。公共代码快照不包含内部开发文档、测试夹具或浏览器产物，因此 `npm run check` 不代表真实 E2E 或远程 Provider 验收已经完成。
 
