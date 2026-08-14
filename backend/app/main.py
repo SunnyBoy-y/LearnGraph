@@ -13,6 +13,7 @@ from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.database import init_database
 from app.core.errors import install_error_handlers
+from app.frontend_static import install_frontend_static
 from app.core.seed import ensure_demo_data
 from app.core.scheduler import (
     mastery_scheduler,
@@ -204,3 +205,4 @@ app.add_middleware(
 app.add_middleware(SecurityHeadersMiddleware)
 install_error_handlers(app)
 app.include_router(api_router)
+install_frontend_static(app, settings.resolved_frontend_dist)

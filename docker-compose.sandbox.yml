@@ -1,0 +1,39 @@
+# Linux-only override: let the API container drive the host Docker Engine.
+#
+# Bind-mount the same absolute host path into the container so sandbox
+# workspace bind sources are valid for dockerd. Docker Desktop / Windows
+# cannot use this same-path trick; keep using `npm run dev` for sandbox there.
+#
+#   export LEARNGRAPH_DATA_DIR=/var/lib/learngraph
+#   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
+#
+# The container user must be able to talk to the Docker socket. If bootstrap
+# reports "Docker Engine is unavailable", pass the host docker GID:
+#   export DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+
+services:
+  app:
+    group_add:
+      - ${DOCKER_GID:-998}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}:${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
+    environment:
+      LEARNGRAPH_DATA_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
+      LEARNGRAPH_DATABASE_URL: sqlite:///${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/learngraph.db
+      LEARNGRAPH_STORAGE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/storage
+      LEARNGRAPH_MEMORY_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/memory
+      LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/sandbox-workspaces
+      LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/egress-policies
+      LEARNGRAPH_SANDBOX_ENABLED: "true"
+
+  preview:
+    volumes:
+      - ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}:${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
+    environment:
+      LEARNGRAPH_DATA_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
+      LEARNGRAPH_DATABASE_URL: sqlite:///${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/learngraph.db
+      LEARNGRAPH_STORAGE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/storage
+      LEARNGRAPH_MEMORY_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/memory
+      LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/sandbox-workspaces
+      LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/egress-policies
