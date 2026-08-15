@@ -22,6 +22,7 @@ import type {
   ProviderSecretLifecycle,
   ProviderTypeCatalogItem,
   SecretStoreStatus,
+  HostBridgeStatus,
   MasterKeyRotation,
 } from "@/types/providers";
 
@@ -252,6 +253,10 @@ export function probeProvider(providerId: string): Promise<Provider> {
 
 export function getSecretStoreStatus(): Promise<SecretStoreStatus> {
   return apiClient.get<SecretStoreStatus>("/providers/secret-store/status");
+}
+
+export function getHostBridgeStatus(): Promise<HostBridgeStatus> {
+  return apiClient.get<HostBridgeStatus>("/providers/host-bridge/status");
 }
 
 export function rotateProviderSecret(

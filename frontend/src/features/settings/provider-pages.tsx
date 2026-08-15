@@ -52,6 +52,7 @@ import {
   getProviderBalance,
   getProviderModelCapabilities,
   getProviderModelDefaults,
+  getHostBridgeStatus,
   getSecretStoreStatus,
   listProviderCatalog,
   listProviders,
@@ -150,6 +151,7 @@ import {
 import type {
   CodexDeviceLoginStart,
   CopilotDeviceLoginStart,
+  HostBridgeStatus,
   Provider,
   ProviderBalance,
   ProviderModelCapabilities,
@@ -425,6 +427,38 @@ function fuzzyMatchesModelId(text: string, query: string): boolean {
   return index === query.length;
 }
 
+function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
+  // 仅当：容器化部署启用了 bridge 地址，且工作区配置了依赖 bridge 的本地
+  // loopback provider（Ollama 等）时才提示；源码模式或无关 provider 不打扰。
+  if (!status?.host_bridge_url || !status.has_local_loopback_providers) return null;
+  const ready = status.bridge_reachable === true && status.bridge_token_ready;
+  const title = ready
+    ? "宿主机 Host Service Bridge 已就绪"
+    : "要使用本机模型服务，请先启动宿主机 Host Service Bridge";
+  return (
+    <div
+      className={
+        ready
+          ? "mx-5 mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800"
+          : "mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"
+      }
+    >
+      <p className="font-medium">{title}</p>
+      {!ready && (
+        <p className="mt-1 whitespace-pre-line text-xs leading-relaxed">
+          {status.guidance}
+        </p>
+      )}
+      {ready && status.bridge_reachable === true && (
+        <p className="mt-1 text-xs">
+          bridge：{status.host_bridge_url}
+          {status.auto_derived ? "（自动推导）" : ""}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function ProvidersPage() {
   const queryClient = useQueryClient();
   const [roleFilter, setRoleFilter] = useState<ProviderRole | "all">("model");
@@ -443,6 +477,14 @@ export function ProvidersPage() {
   const secretStore = useQuery({
     queryKey: ["provider-secret-store"],
     queryFn: getSecretStoreStatus,
+  });
+  // 整体 Docker 部署下，本机模型服务需经宿主机 Host Service Bridge 转发。
+  // 状态端点返回 bridge 可达性/token 就绪/是否存在依赖 bridge 的本地 provider，
+  // 以及可直接展示的操作指引（guidance）。
+  const hostBridge = useQuery({
+    queryKey: ["provider-host-bridge-status"],
+    queryFn: getHostBridgeStatus,
+    staleTime: 30_000,
   });
   const [secretTarget, setSecretTarget] = useState<Provider | null>(null);
   const [secretValue, setSecretValue] = useState("");
@@ -785,6 +827,7 @@ export function ProvidersPage() {
         eyebrow="Provider gateway"
         title="Provider 管理"
       />
+      <HostBridgeHint status={hostBridge.data} />
       <Surface className="overflow-hidden">
         <div className="provider-list-heading border-b p-5">
           <SectionHeading title="服务与模型" />

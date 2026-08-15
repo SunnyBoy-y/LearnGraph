@@ -460,6 +460,16 @@ export interface SecretStoreStatus {
   active_key_version: number | null;
 }
 
+export interface HostBridgeStatus {
+  deployment_profile: string;
+  host_bridge_url: string | null;
+  auto_derived: boolean;
+  bridge_reachable: boolean | null;
+  bridge_token_ready: boolean;
+  has_local_loopback_providers: boolean;
+  guidance: string;
+}
+
 export interface MasterKeyRotation {
   provider: string;
   previous_key_version: number;
