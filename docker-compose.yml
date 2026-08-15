@@ -32,6 +32,16 @@ name: learngraph
 #
 # SQLite plus the embedded schedulers are single-process. Do not raise uvicorn
 # --workers above 1.
+#
+# Host loopback services (Ollama, LM Studio, local HTTP MCP, local APIs) are
+# NOT reachable from inside the app container: 127.0.0.1 in a container is the
+# container itself. The recommended production shape is the Host Service
+# Bridge (see docs/host-service-bridge.md): a host-side daemon exposes only
+# registered services, and the backend rewrites loopback provider URLs to it
+# (LEARNGRAPH_HOST_BRIDGE_URL). The extra_hosts entry below is the transport
+# prerequisite for that bridge (and a deliberate escape hatch for direct
+# host.docker.internal access in dev): it makes the Docker gateway resolvable
+# on both Docker Desktop and native Linux Docker.
 
 x-app-environment: &app-environment
   LEARNGRAPH_ENV: ${LEARNGRAPH_ENV:-development}
@@ -48,6 +58,10 @@ x-app-environment: &app-environment
   LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
   LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:18001}
   LEARNGRAPH_SUBAPP_PREVIEW_PORT: "8001"
+  # Host Service Bridge endpoint on the real machine. When set, loopback
+  # provider/MCP URLs are rewritten to it (see docs/host-service-bridge.md).
+  # Empty keeps source-mode direct access semantics.
+  LEARNGRAPH_HOST_BRIDGE_URL: ${LEARNGRAPH_HOST_BRIDGE_URL:-}
   LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:18000","http://localhost:18000"]}
   LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS: ${LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS:-true}
   LEARNGRAPH_SANDBOX_ENABLED: ${LEARNGRAPH_SANDBOX_ENABLED:-true}
@@ -64,6 +78,11 @@ services:
       # (listenHost defaults to 127.0.0.1). Set LEARNGRAPH_LISTEN_HOST=0.0.0.0
       # to expose on LAN/public.
       - "${LEARNGRAPH_LISTEN_HOST:-127.0.0.1}:${LEARNGRAPH_PORT:-18000}:8000"
+    extra_hosts:
+      # Docker gateway alias used by the Host Service Bridge (and by
+      # host.docker.internal URLs during migration). Required so app/preview
+      # can reach the real machine's bridge listener.
+      - "host.docker.internal:host-gateway"
     environment:
       <<: *app-environment
     volumes:
@@ -109,6 +128,8 @@ services:
       ]
     ports:
       - "${LEARNGRAPH_LISTEN_HOST:-127.0.0.1}:${LEARNGRAPH_PREVIEW_PORT:-18001}:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       <<: *app-environment
     volumes:
