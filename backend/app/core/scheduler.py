@@ -27,7 +27,7 @@ from app.providers.local.memory import LocalWorkspaceMemoryProvider
 from app.services.mastery import MasteryService
 from app.services.memory import MemoryService
 from app.providers.ports.sandbox import SandboxSessionHandle
-from app.services.sandbox_bootstrap import backend_for_settings
+from app.providers.sandbox_registry import get_sandbox_backend_registry
 
 
 logger = logging.getLogger(__name__)
@@ -542,7 +542,9 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
                 db.commit()
                 if session.backend_session_ref:
                     try:
-                        backend_for_settings(settings, session.runtime_kind).delete(
+                        get_sandbox_backend_registry().for_backend_id(
+                            session.backend_id, settings, session.runtime_kind
+                        ).delete(
                             SandboxSessionHandle(session.id, session.backend_session_ref)
                         )
                     except Exception as exc:
@@ -602,7 +604,9 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
             )
             try:
                 if session.backend_session_ref:
-                    backend_for_settings(settings, session.runtime_kind).delete(
+                    get_sandbox_backend_registry().for_backend_id(
+                        session.backend_id, settings, session.runtime_kind
+                    ).delete(
                         SandboxSessionHandle(session.id, session.backend_session_ref)
                     )
                 session.backend_session_ref = None
@@ -683,19 +687,10 @@ def run_mcp_runner_cleanup_sweep(*, now: datetime | None = None) -> dict[str, in
     """
 
     from app.domain.extension_models import MCPRunnerSession
-    from app.providers.remote.sandbox import DockerSandboxBackend
-    from app.services.sandbox_runtime import resolve_sandbox_image
 
     settings = get_settings()
     current = now or utc_now()
     totals = {"terminated": 0, "deleted": 0, "skipped": 0}
-    image_ref = resolve_sandbox_image(settings)
-    backend = DockerSandboxBackend(
-        enabled=settings.sandbox_enabled,
-        image_ref=image_ref or "",
-        runtime_kind="python-node",
-        archive_bytes=settings.sandbox_agent_archive_bytes,
-    )
     with SessionLocal() as db:
         sessions = list(
             db.scalars(
@@ -708,6 +703,9 @@ def run_mcp_runner_cleanup_sweep(*, now: datetime | None = None) -> dict[str, in
         for session in sessions:
             totals["terminated"] += 1
             try:
+                backend = get_sandbox_backend_registry().for_backend_id(
+                    session.backend_id, settings, "python-node"
+                )
                 backend.delete(
                     backend.resume(session.session_id, session.backend_ref)
                 )

@@ -598,10 +598,10 @@ class DocumentLearningService:
                     SandboxBackendError,
                     SandboxBackendUnavailable,
                 )
-                from app.services.sandbox import SandboxService
+                from app.services.sandbox import SandboxTaskService
 
                 try:
-                    artifact = SandboxService(
+                    artifact = SandboxTaskService(
                         self.db,
                         self.workspace_id,
                         self.actor_id,

@@ -414,8 +414,7 @@ class SandboxFetchProvider:
 
 
 def _backend_for_settings(settings: Settings):
-    # Lazy import: sandbox_bootstrap imports sandbox_runtime (safe) but not
-    # factory / sandbox service, so importing here keeps the module cycle-free.
-    from app.services.sandbox_bootstrap import backend_for_settings
+    # Lazy import keeps the module cycle-free.
+    from app.providers.sandbox_registry import get_sandbox_backend_registry
 
-    return backend_for_settings(settings)
+    return get_sandbox_backend_registry().default(settings)

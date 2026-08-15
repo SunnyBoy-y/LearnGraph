@@ -89,6 +89,35 @@ def _record_ledger_baseline(connection: Connection) -> None:
     del connection
 
 
+def _sandbox_backend_resource_ref(connection: Connection) -> None:
+    """Additive columns that let existing sessions route to their owning backend.
+
+    New sessions record the backend that created them (``docker`` today,
+    ``sandboxd`` after the control-plane migration). Existing rows keep their
+    legacy ``backend_session_ref`` untouched; the new columns are nullable (or
+    defaulted) so no data rewrite is required.
+    """
+    sandbox_columns = {
+        column["name"] for column in inspect(connection).get_columns("sandbox_sessions")
+    }
+    if "backend_resource_ref" not in sandbox_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE sandbox_sessions ADD COLUMN backend_resource_ref VARCHAR(255)"
+        )
+    if "backend_protocol_version" not in sandbox_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE sandbox_sessions ADD COLUMN backend_protocol_version VARCHAR(40)"
+        )
+    mcp_columns = {
+        column["name"] for column in inspect(connection).get_columns("mcp_runner_sessions")
+    }
+    if "backend_id" not in mcp_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE mcp_runner_sessions "
+            "ADD COLUMN backend_id VARCHAR(80) NOT NULL DEFAULT 'docker'"
+        )
+
+
 def _subapp_interaction_events(connection: Connection) -> None:
     """Create the additive sub-application interaction event ledger."""
 
@@ -113,6 +142,11 @@ MIGRATIONS = (
         "v1.0.0",
         "Schema Revision Ledger baseline — all tables up to P0 sandbox hardening",
         _record_ledger_baseline,
+    ),
+    SchemaMigration(
+        "v1.1.0",
+        "Additive sandbox backend routing columns for mixed-backend drain",
+        _sandbox_backend_resource_ref,
     ),
 )
 

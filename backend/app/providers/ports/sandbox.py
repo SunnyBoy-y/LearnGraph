@@ -29,6 +29,10 @@ class SandboxCreateSpec:
     # validated envelope carrying the policy digest, internal network name and
     # proxy URL; it never carries secrets or raw allow-list hostnames.
     egress: dict[str, Any] | None = None
+    # Logical, portable identity of the workspace (opaque relative key owned by
+    # the backend). Backends MUST NOT interpret it as a host path. The legacy
+    # ``workspace_path`` above remains only for the pre-daemon Docker backend.
+    workspace_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

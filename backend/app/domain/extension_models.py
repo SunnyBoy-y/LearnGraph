@@ -180,6 +180,9 @@ class MCPRunnerSession(Base, TimestampMixin, WorkspaceScopedMixin):
     server_id: Mapped[str] = mapped_column(String(36), index=True)
     session_id: Mapped[str] = mapped_column(String(120), index=True)
     backend_ref: Mapped[str] = mapped_column(String(255))
+    # Backend that provisioned this runner (default "docker" for legacy rows);
+    # cleanup MUST route through the recorded backend, never the current default.
+    backend_id: Mapped[str] = mapped_column(String(80), default="docker")
     status: Mapped[str] = mapped_column(String(24), default="running", index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 

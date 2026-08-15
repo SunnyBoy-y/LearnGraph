@@ -60,7 +60,11 @@ from app.providers.factory import transcription_provider_for_workspace
 from app.providers.remote.transcription import TranscriptionProviderError
 from app.services.billing import BillingService
 from app.services.chat_attachment_policy import AUDIO_EXTENSIONS
-from app.providers.ports.sandbox import SandboxCreateSpec, SandboxSessionHandle
+from app.providers.ports.sandbox import (
+    SandboxBackendPort,
+    SandboxCreateSpec,
+    SandboxSessionHandle,
+)
 from app.providers.remote.sandbox import (
     SandboxBackendError,
     SandboxBackendUnavailable,
@@ -76,7 +80,8 @@ from app.providers.remote.sandbox import (
 from app.providers.storage_factory import object_storage_provider
 from app.repositories.audit import AuditRepository
 from app.services.authorization import AuthorizationService
-from app.services.sandbox_bootstrap import backend_for_settings, get_bootstrap_service
+from app.services.sandbox_bootstrap import get_bootstrap_service
+from app.providers.sandbox_registry import get_sandbox_backend_registry
 from app.services.sandbox_runtime import (
     resolve_sandbox_image,
     resolve_sandbox_image_for_runtime,
@@ -281,10 +286,87 @@ def web_fetch_egress_envelope(
     }
 
 
+def _effective_network_policy(
+    envelope: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Durable effective network metadata for a sandbox session.
+
+    Reflects what the runtime actually got: without a valid reviewed policy the
+    envelope is ``None`` and the container stays fully offline. When egress was
+    attached we record the reviewed policy digest only — never proxy
+    credentials or raw allow-lists.
+    """
+    if not envelope:
+        return {"mode": "none", "allowed_hosts": []}
+    return {
+        "mode": "egress",
+        "policy_digest": str(envelope.get("policy_digest") or ""),
+        "allowed_hosts": [],
+    }
+
+
+def sandbox_backend_report(db: Session) -> dict[str, Any]:
+    """Mixed-backend drain report (admin/ops view).
+
+    Counts every non-cleaned sandbox session by owning backend id and lifecycle
+    state, plus legacy MCP runner records and sandboxd resource refs. This is
+    the single source of truth for deciding whether legacy Docker resources can
+    be cut off (see docs/sandboxd-migration-todo.md TODO-029/031).
+    """
+    from app.domain.extension_models import MCPRunnerSession
+
+    sessions = list(
+        db.scalars(
+            select(SandboxSession).where(SandboxSession.cleanup_status != "cleaned")
+        ).all()
+    )
+    by_backend: dict[str, dict[str, int]] = {}
+    legacy = 0
+    sandboxd = 0
+    for session in sessions:
+        backend_id = session.backend_id or "unknown"
+        bucket = by_backend.setdefault(backend_id, {"total": 0, "states": {}})
+        bucket["total"] += 1
+        state = session.lifecycle_state or "UNKNOWN"
+        bucket["states"][state] = bucket["states"].get(state, 0) + 1
+        if backend_id == "docker":
+            legacy += 1
+        elif backend_id == "sandboxd":
+            sandboxd += 1
+    mcp_legacy = int(
+        db.scalar(
+            select(func.count()).select_from(MCPRunnerSession).where(
+                MCPRunnerSession.backend_id == "docker",
+                MCPRunnerSession.status != "terminated",
+            )
+        )
+        or 0
+    )
+    legacy_sessions_with_ref = sum(
+        1
+        for session in sessions
+        if (session.backend_id or "docker") == "docker" and session.backend_session_ref
+    )
+    sandboxd_with_resource_ref = sum(
+        1
+        for session in sessions
+        if session.backend_id == "sandboxd" and session.backend_resource_ref
+    )
+    return {
+        "by_backend": by_backend,
+        "legacy_docker_sessions_total": legacy,
+        "legacy_docker_sessions_with_container_ref": legacy_sessions_with_ref,
+        "legacy_mcp_runner_records": mcp_legacy,
+        "sandboxd_sessions_total": sandboxd,
+        "sandboxd_sessions_with_resource_ref": sandboxd_with_resource_ref,
+        "drain_ready": legacy == 0 and legacy_sessions_with_ref == 0 and mcp_legacy == 0,
+    }
+
+
 def agent_sandbox_readiness(settings: Settings, *, authorized: bool) -> dict[str, Any]:
     """Return the single readiness contract used by Agent UI and execution."""
 
-    backend = backend_for_settings(settings)
+    backend = get_sandbox_backend_registry().default(settings)
     if not authorized:
         return {
             "available": False,
@@ -352,6 +434,7 @@ class SandboxTaskService:
         *,
         workspace: Workspace | None = None,
         principal: Principal | None = None,
+        backend: SandboxBackendPort | None = None,
     ) -> None:
         self.db = db
         self.workspace_id = workspace_id
@@ -361,7 +444,7 @@ class SandboxTaskService:
         self.principal = principal
         self.audit = AuditRepository(db, workspace_id)
         self.storage = object_storage_provider(db, workspace_id, settings)
-        self.backend = backend_for_settings(settings)
+        self.backend = backend or get_sandbox_backend_registry().default(settings)
 
     def _egress_envelope(self) -> dict[str, Any] | None:
         """Build the reviewed outbound-egress reference for a sandbox runtime.
@@ -402,7 +485,7 @@ class SandboxTaskService:
         profile instead of the legacy python-node / python-node-browser pair.
         """
 
-        backend = backend_for_settings(self.settings)
+        backend = get_sandbox_backend_registry().default(self.settings)
         capability = backend.probe()
         resolved = resolve_sandbox_image(self.settings) or ""
         return {
@@ -613,6 +696,7 @@ class SandboxTaskService:
                         _sandbox_workspace_path(self.settings, workspace_relative_path)
                     ),
                     runtime_kind="python-node",
+                    workspace_key=workspace_relative_path,
                 )
             )
             raw = self.storage.read_bytes(
@@ -777,6 +861,7 @@ class SandboxTaskService:
                         session.runtime_started_at = utc_now()
                         session.runtime_last_used_at = session.runtime_started_at
                         self.db.commit()
+                        egress_envelope = self._egress_envelope()
                         try:
                             handle = self.backend.create(
                                 SandboxCreateSpec(
@@ -793,10 +878,12 @@ class SandboxTaskService:
                                     )
                                 ),
                                 runtime_kind=session.runtime_kind,
-                                egress=self._egress_envelope(),
+                                egress=egress_envelope,
+                                workspace_key=session.workspace_relative_path or session.id,
                                 )
                             )
                             session.backend_session_ref = handle.backend_ref
+                            session.network_policy = _effective_network_policy(egress_envelope)
                             self.db.commit()
                         except Exception:
                             session.lifecycle_state = "COLD"
@@ -947,7 +1034,9 @@ class SandboxTaskService:
         self.db.commit()
         if session.backend_session_ref:
             try:
-                backend_for_settings(self.settings, session.runtime_kind).delete(
+                get_sandbox_backend_registry().for_backend_id(
+                    session.backend_id, self.settings, session.runtime_kind
+                ).delete(
                     SandboxSessionHandle(session.id, session.backend_session_ref)
                 )
             except SandboxBackendError as exc:
@@ -1039,6 +1128,7 @@ class SandboxAgentWorkspaceService:
         *,
         workspace: Workspace | None = None,
         principal: Principal | None = None,
+        backend: SandboxBackendPort | None = None,
     ) -> None:
         self.db = db
         self.workspace_id = workspace_id
@@ -1047,7 +1137,7 @@ class SandboxAgentWorkspaceService:
         self.workspace = workspace
         self.principal = principal
         self.audit = AuditRepository(db, workspace_id)
-        self.backend = backend_for_settings(settings)
+        self.backend = backend or get_sandbox_backend_registry().default(settings)
         self.workspace_files = SessionWorkspaceService(db, workspace_id, actor_id, settings)
         self.authz = SandboxAuthorizationService(db, workspace_id, actor_id)
 
@@ -1239,7 +1329,9 @@ class SandboxAgentWorkspaceService:
         return self._new_session(chat_session_id, runtime_kind)
 
     def _runtime_backend(self, session: SandboxSession):
-        return backend_for_settings(self.settings, session.runtime_kind)
+        return get_sandbox_backend_registry().for_backend_id(
+            session.backend_id, self.settings, session.runtime_kind
+        )
 
     def _ensure_runtime_capacity(self, session: SandboxSession) -> None:
         _enforce_sandbox_capacity(
@@ -1296,6 +1388,7 @@ class SandboxAgentWorkspaceService:
             session.runtime_last_used_at = session.runtime_started_at
             self.db.commit()
             try:
+                egress_envelope = self._egress_envelope()
                 handle = backend.create(
                     SandboxCreateSpec(
                         session_id=session.id,
@@ -1311,10 +1404,12 @@ class SandboxAgentWorkspaceService:
                             )
                         ),
                         runtime_kind=session.runtime_kind,
-                        egress=self._egress_envelope(),
+                        egress=egress_envelope,
+                        workspace_key=session.workspace_relative_path or session.id,
                     )
                 )
                 session.backend_session_ref = handle.backend_ref
+                session.network_policy = _effective_network_policy(egress_envelope)
                 session.status = "ready"
                 self.db.commit()
             except Exception:
@@ -2407,7 +2502,18 @@ class SandboxAgentWorkspaceService:
         except AppError:
             data = None
         if data is None:
-            data = self._read_workspace_bytes_from_host(session, path)
+            if session.backend_id == "sandboxd":
+                # The sandboxd control plane has no host bind mount: read
+                # through the daemon File API with a bounded limit instead.
+                try:
+                    handle = self._ensure_backend_session(session)
+                    data = self._runtime_backend(session).read(
+                        handle, path, self.settings.sandbox_agent_file_bytes
+                    )
+                except (SandboxBackendUnavailable, SandboxBackendError):
+                    data = None
+            else:
+                data = self._read_workspace_bytes_from_host(session, path)
         if data is None:
             raise AppError(
                 404,
@@ -2535,9 +2641,12 @@ class SandboxAgentWorkspaceService:
 
         This bypasses the container archive size limit for large media while
         never following a sandbox-created symlink outside the managed
-        workspace root.
+        workspace root. It is a legacy Docker-backend path: sandboxd sessions
+        have no host mount and must never read through this function.
         """
 
+        if session.backend_id == "sandboxd":
+            return None
         if not session.workspace_relative_path:
             return None
         try:

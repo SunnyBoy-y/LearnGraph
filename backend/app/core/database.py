@@ -267,8 +267,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via _apply_migration) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.0.0"
-CURRENT_SCHEMA_DESCRIPTION = "Schema Revision Ledger baseline — all tables up to P0 sandbox hardening"
+CURRENT_SCHEMA_REVISION = "v1.1.0"
+CURRENT_SCHEMA_DESCRIPTION = "Additive sandbox backend routing columns for mixed-backend drain"
 
 
 def _compute_schema_checksum() -> str:

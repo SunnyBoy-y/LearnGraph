@@ -1816,6 +1816,12 @@ class SandboxSession(Base, TimestampMixin, WorkspaceScopedMixin):
     )
     backend_id: Mapped[str] = mapped_column(String(80), default="docker")
     backend_session_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Stable resource reference owned by the creating backend (e.g. a sandboxd
+    # sandbox/workspace id). Distinct from backend_session_ref, which remains
+    # the legacy raw Docker container id used only during mixed-backend drain.
+    backend_resource_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Protocol/daemon version negotiated at create time (diagnostics only).
+    backend_protocol_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
     manifest_hash: Mapped[str] = mapped_column(String(64))
     policy_revision: Mapped[str] = mapped_column(String(40), default="sandbox-policy-v1")
     runtime_kind: Mapped[str] = mapped_column(String(40), default="python-node", index=True)

@@ -244,9 +244,9 @@ class FileService:
         )
 
     def capabilities(self):
-        from app.services.sandbox_bootstrap import backend_for_settings
+        from app.providers.sandbox_registry import get_sandbox_backend_registry
 
-        sandbox = backend_for_settings(self.settings).probe()
+        sandbox = get_sandbox_backend_registry().default(self.settings).probe()
         legacy_doc_available = (
             sandbox.available and "legacy_doc_extract" in sandbox.capabilities
         )
