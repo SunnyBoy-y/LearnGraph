@@ -1,9 +1,20 @@
 name: learngraph
 
-# Self-hosted LearnGraph: same-origin Web UI + API on 8080, subapp preview on 8001.
+# Self-hosted LearnGraph. Production shape matches the source-launch topology
+# (one Web/API entry + one preview origin), not the dev-server ports:
+#   - Web + API are same-origin on ONE entry port (the API serves the built
+#     frontend), so the browser needs a single address.
+#   - The subapp preview is a separate origin the browser loads in an iframe
+#     (capability-token authorized), so it gets its own published port.
+#   - The API's internal port 8000 is NOT published separately.
+#
+# Defaults bind to 127.0.0.1 only and use high ports (18000/18001) to avoid
+# collisions with common dev ports. For LAN/public exposure set
+# LEARNGRAPH_LISTEN_HOST=0.0.0.0 (mirrors `npm run dev -- --lan`) plus your
+# own LEARNGRAPH_PORT / LEARNGRAPH_PREVIEW_PORT.
 #
 #   docker compose up --build
-#   open http://127.0.0.1:8080
+#   open http://127.0.0.1:18000
 #
 # Provider secrets use the environment master-key provider. When
 # LEARNGRAPH_MASTER_KEY is unset, the entrypoint generates one and stores it
@@ -12,6 +23,12 @@ name: learngraph
 # Sandbox containers need the host Docker Engine and a host-visible workspace
 # path. On Linux, add the sandbox override:
 #   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
+#
+# Reviewed outbound egress (审批制出网) is fully wired: the egress-proxy
+# service is the only component with internet egress for sandboxes. Dynamic
+# sandbox containers join the internal `learngraph-egress` network and can
+# only reach the proxy, which re-authorizes every CONNECT against the
+# workspace policy digest (see backend/app/services/sandbox_network_policy.py).
 #
 # SQLite plus the embedded schedulers are single-process. Do not raise uvicorn
 # --workers above 1.
@@ -29,9 +46,9 @@ x-app-environment: &app-environment
   LEARNGRAPH_MEMORY_ROOT: /data/memory
   LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: /data/sandbox-workspaces
   LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
-  LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:8001}
+  LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:18001}
   LEARNGRAPH_SUBAPP_PREVIEW_PORT: "8001"
-  LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:8080","http://localhost:8080"]}
+  LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:18000","http://localhost:18000"]}
   LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS: ${LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS:-true}
   LEARNGRAPH_SANDBOX_ENABLED: ${LEARNGRAPH_SANDBOX_ENABLED:-true}
   LEARNGRAPH_SANDBOX_PREBUILT_IMAGE: ${LEARNGRAPH_SANDBOX_PREBUILT_IMAGE:-crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:1.0.0}
@@ -43,7 +60,10 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${LEARNGRAPH_PORT:-8080}:8000"
+      # Host binding default is loopback-only, mirroring `npm run dev`
+      # (listenHost defaults to 127.0.0.1). Set LEARNGRAPH_LISTEN_HOST=0.0.0.0
+      # to expose on LAN/public.
+      - "${LEARNGRAPH_LISTEN_HOST:-127.0.0.1}:${LEARNGRAPH_PORT:-18000}:8000"
     environment:
       <<: *app-environment
     volumes:
@@ -88,7 +108,7 @@ services:
         "*",
       ]
     ports:
-      - "${LEARNGRAPH_PREVIEW_PORT:-8001}:8001"
+      - "${LEARNGRAPH_LISTEN_HOST:-127.0.0.1}:${LEARNGRAPH_PREVIEW_PORT:-18001}:8001"
     environment:
       <<: *app-environment
     volumes:
@@ -116,5 +136,59 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  egress-proxy:
+    # The only component with sandbox internet egress. Attached to the
+    # internal `learngraph-egress` network (which dynamic sandbox containers
+    # join via the host Docker Engine) plus the default outbound network.
+    # Reads reviewed policy files from the shared data volume; every
+    # allow/deny decision is appended to the JSONL audit log.
+    image: ${LEARNGRAPH_IMAGE:-learngraph:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["tini", "--", "python", "-m", "app.services.egress_proxy_main"]
+    environment:
+      LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
+      LEARNGRAPH_SANDBOX_EGRESS_PROXY_HOST: "0.0.0.0"
+      LEARNGRAPH_SANDBOX_EGRESS_PROXY_PORT: "8888"
+      LEARNGRAPH_EGRESS_PROXY_AUDIT_LOG: /data/egress-audit.jsonl
+    volumes:
+      - learngraph-data:/data
+    networks:
+      - default
+      - learngraph-egress
+    user: "1000:1000"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s = socket.create_connection(('127.0.0.1', 8888), timeout=4); s.close()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+    stop_grace_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   learngraph-data:
+
+networks:
+  # Internal bridge on the host Docker Engine: dynamic sandbox containers join
+  # it by name, so the network name MUST stay exactly `learngraph-egress`
+  # (matching LEARNGRAPH_SANDBOX_EGRESS_NETWORK) and is pinned to skip the
+  # compose project-name prefix.
+  learngraph-egress:
+    internal: true
+    name: learngraph-egress

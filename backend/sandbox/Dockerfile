@@ -5,8 +5,16 @@
 # Playwright Core remains the CDP client only; it never downloads a browser.
 # A separate Node stage supplies a current, reproducible Node 22 runtime while
 # Python remains the project-standard 3.12 runtime.
+#
+# Base images are parameterized so registry-restricted build hosts (e.g. Aliyun
+# ACR build runners that cannot reach Docker Hub) can point at a mirrored copy
+# via build args NODE_BASE / PYTHON_BASE. Local builds keep the official
+# defaults. Global ARGs must live above the first FROM to be usable there.
 
-FROM node:22-bookworm-slim AS node-runtime
+ARG NODE_BASE=node:22-bookworm-slim
+ARG PYTHON_BASE=python:3.12-slim-bookworm
+
+FROM ${NODE_BASE} AS node-runtime
 
 FROM node-runtime AS toolchain
 ARG NPM_REGISTRY=https://registry.npmjs.org/
@@ -17,7 +25,7 @@ RUN npm config set registry "${NPM_REGISTRY}" \
     && mv node_modules /node_modules \
     && npm cache clean --force
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM ${PYTHON_BASE} AS runtime
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
 # Copy the official Node runtime as a complete /usr/local tree: node, npm,

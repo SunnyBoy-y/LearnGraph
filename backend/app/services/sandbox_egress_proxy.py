@@ -89,7 +89,7 @@ class SandboxEgressProxy:
         max_idle_seconds: float = DEFAULT_MAX_IDLE_SECONDS,
         max_tunnel_bytes: int = DEFAULT_MAX_TUNNEL_BYTES,
     ) -> None:
-        if policy is None and policy_provider is None and not policy_registry:
+        if policy is None and policy_provider is None and policy_registry is None:
             raise ValueError("SandboxEgressProxy requires a policy, policy_provider, or policy_registry")
         self.policy = policy
         self.policy_provider = policy_provider

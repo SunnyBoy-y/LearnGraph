@@ -103,8 +103,8 @@ jobs:
           docker compose up -d --no-build
           trap 'docker compose logs --no-color || true; docker compose down -v' EXIT
           for attempt in $(seq 1 40); do
-            if curl -fsS http://127.0.0.1:8080/api/v1/livez >/dev/null \
-              && curl -fsS http://127.0.0.1:8001/api/v1/livez >/dev/null; then
+            if curl -fsS http://127.0.0.1:18000/api/v1/livez >/dev/null \
+              && curl -fsS http://127.0.0.1:18001/api/v1/livez >/dev/null; then
               break
             fi
             if [ "$attempt" -eq 40 ]; then
@@ -113,18 +113,30 @@ jobs:
             fi
             sleep 3
           done
-          curl -fsS http://127.0.0.1:8080/api/v1/health | tee /tmp/health.json
+          curl -fsS http://127.0.0.1:18000/api/v1/health | tee /tmp/health.json
           python - <<'PY'
           import json
           payload = json.loads(open("/tmp/health.json", encoding="utf-8").read())
           assert payload["status"] == "ok", payload
           assert payload["service"] == "learngraph-backend", payload
           PY
-          curl -fsS -D /tmp/spa.headers -o /tmp/spa.html http://127.0.0.1:8080/
+          curl -fsS -D /tmp/spa.headers -o /tmp/spa.html http://127.0.0.1:18000/
           grep -q "<div id=\"root\">" /tmp/spa.html
           grep -qi "text/html" /tmp/spa.headers
-          curl -fsS -o /tmp/route.html http://127.0.0.1:8080/auth/login
+          curl -fsS -o /tmp/route.html http://127.0.0.1:18000/auth/login
           grep -q "<div id=\"root\">" /tmp/route.html
+          # Egress proxy must be listening inside its container and healthy.
+          egress_id=$(docker compose ps -q egress-proxy)
+          for attempt in $(seq 1 20); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' "$egress_id" 2>/dev/null || echo missing)
+            [ "$status" = "healthy" ] && break
+            [ "$attempt" -eq 20 ] && { echo "egress-proxy not healthy: $status" >&2; exit 1; }
+            sleep 3
+          done
+          docker compose exec -T egress-proxy python -c "import socket; socket.create_connection(('127.0.0.1', 8888), timeout=4).close()"
+          # The egress network must exist on the host Docker Engine and be
+          # internal (dynamic sandbox containers join it by name).
+          docker network inspect --format '{{.Internal}} {{.Name}}' learngraph-egress | grep -q 'true'
 
       - name: Push image
         if: github.event_name != 'pull_request'

@@ -61,6 +61,20 @@ export default defineConfig(({ mode }) => {
                 minSize: 20_000,
                 maxSize: 320_000,
               },
+              {
+                // Recharts has a cyclic internal module graph; splitting it
+                // across chunks (maxSize or entriesAware above) makes a shared
+                // constant undefined at module-init time in the browser,
+                // crashing the whole app with "Cannot read properties of
+                // undefined (reading 'axis')" on any chart page. It MUST stay
+                // in exactly ONE chunk, so disable entry-aware splitting.
+                name: 'recharts',
+                test: /node_modules[\\/]recharts[\\/]/,
+                priority: 20,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
             ],
           },
         },

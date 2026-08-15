@@ -216,3 +216,6 @@ backend/sandbox/.spec-test.json
 
 # Blog deliverables (engineering retrospective series) — generated output, kept local
 /blog-output/
+
+# Docker 自托管备份产物（含主密钥，等同敏感数据）— 由 scripts/docker-update.sh 生成
+/backups/
