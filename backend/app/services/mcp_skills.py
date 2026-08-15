@@ -63,6 +63,11 @@ from app.providers.ports.mcp import (
     MCPTransportTimeout,
     MCPTransportUnavailable,
 )
+from app.providers.host_service_resolver import (
+    is_loopback_url,
+    resolve_loopback_url,
+    sanitize_service_id,
+)
 from app.providers.remote.mcp_http import PROTOCOL_VERSION, StreamableHTTPMCPAdapter
 from app.providers.remote.mcp_stdio import DockerStdioMCPRunner, StdioIsolatedMCPAdapter
 from app.repositories.audit import AuditRepository
@@ -3692,11 +3697,37 @@ class MCPAndSkillService:
             return UnavailableStdioMCPAdapter()
         if not server.endpoint_url:
             raise MCPTransportUnavailable("MCP HTTP endpoint is not configured")
+        # Host Service Bridge: a containerized deployment keeps the logical
+        # loopback MCP endpoint in the row and reaches the real machine through
+        # the host-side bridge (/services/mcp-<server_key>/...). The bridge
+        # host is explicitly trusted for plaintext HTTP - it is the authorized,
+        # audited path to host loopback services.
+        bridge_url = self.settings.host_bridge_url
+        allow_private_hosts: frozenset[str] = frozenset()
+        if (
+            bridge_url
+            and self.settings.deployment_profile != "personal_desktop"
+            and is_loopback_url(server.endpoint_url)
+        ):
+            service_id = f"mcp-{sanitize_service_id(server.server_key)}"
+            server.endpoint_url = resolve_loopback_url(
+                service_id=service_id,
+                base_url=server.endpoint_url,
+                host_bridge_url=bridge_url,
+                deployment_profile=self.settings.deployment_profile,
+            )
+            try:
+                bridge_host = (urlsplit(bridge_url).hostname or "").casefold()
+            except ValueError:
+                bridge_host = ""
+            if bridge_host:
+                allow_private_hosts = frozenset({bridge_host})
         return StreamableHTTPMCPAdapter(
             server.endpoint_url,
             bearer_token=self._credential_secret(server),
             timeout_ms=server.timeout_ms,
             max_response_bytes=server.max_result_bytes,
+            allow_private_hosts=allow_private_hosts,
         )
 
     def _runner_credential_token(self, server: MCPServer) -> dict[str, Any] | None:

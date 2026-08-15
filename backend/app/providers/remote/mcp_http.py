@@ -24,11 +24,18 @@ PROTOCOL_VERSION = "2025-11-25"
 COMPATIBLE_PROTOCOL_VERSIONS = {"2025-11-25", "2025-06-18", "2025-03-26"}
 
 
-def validate_mcp_http_endpoint(endpoint_url: str) -> str:
+def validate_mcp_http_endpoint(
+    endpoint_url: str, *, allow_private_hosts: frozenset[str] = frozenset()
+) -> str:
     """Reject credentials, fragments and non-loopback plaintext/private targets.
 
     Localhost HTTP is allowed for a deliberately configured local MCP service.
     Public endpoints must use HTTPS. Redirects remain disabled in the adapter.
+
+    ``allow_private_hosts`` names explicitly trusted hosts (the Host Service
+    Bridge gateway, e.g. ``host.docker.internal``) whose plaintext HTTP is
+    accepted even though they do not resolve to loopback — the bridge itself
+    is the authorized, audited path to real-machine loopback services.
     """
 
     parsed = urlsplit(endpoint_url.strip())
@@ -47,11 +54,12 @@ def validate_mcp_http_endpoint(endpoint_url: str) -> str:
     except (OSError, ValueError) as exc:
         raise MCPTransportUnavailable("MCP endpoint hostname could not be resolved") from exc
     is_loopback = bool(addresses) and all(address.is_loopback for address in addresses)
-    if parsed.scheme == "http" and not is_loopback:
+    explicitly_allowed = host in allow_private_hosts
+    if parsed.scheme == "http" and not is_loopback and not explicitly_allowed:
         raise MCPTransportUnavailable(
             "Plain HTTP MCP endpoints are allowed only on loopback addresses"
         )
-    if not is_loopback and any(not address.is_global for address in addresses):
+    if not is_loopback and any(not address.is_global for address in addresses) and not explicitly_allowed:
         raise MCPTransportUnavailable(
             "MCP endpoint resolved to a private, link-local, or reserved address"
         )
@@ -70,8 +78,11 @@ class StreamableHTTPMCPAdapter:
         bearer_token: str | None,
         timeout_ms: int,
         max_response_bytes: int,
+        allow_private_hosts: frozenset[str] = frozenset(),
     ) -> None:
-        self.endpoint_url = validate_mcp_http_endpoint(endpoint_url)
+        self.endpoint_url = validate_mcp_http_endpoint(
+            endpoint_url, allow_private_hosts=allow_private_hosts
+        )
         self.bearer_token = bearer_token
         self.timeout_seconds = timeout_ms / 1000
         self.max_response_bytes = max_response_bytes
