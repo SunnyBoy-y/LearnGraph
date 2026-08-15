@@ -107,6 +107,53 @@ export default defineConfig(({ mode }) => {
                 minSize: 0,
                 maxSize: Number.POSITIVE_INFINITY,
               },
+              {
+                // pptx-preview has an internal module graph with mutual
+                // imports; entry-aware splitting scattered it across ~20
+                // chunks that import each other in cycles, which can crash
+                // at module-init in the browser (same failure mode as the
+                // recharts white screen) whenever a PPT attachment is
+                // previewed. Keep it in ONE chunk.
+                name: 'pptx-preview',
+                test: /node_modules[\\/](pptx-preview|echarts|zrender)[\\/]/,
+                priority: 30,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
+                // streamdown's markdown parsing chain (streamdown +
+                // micromark + mdast/hast/unist + remark/rehype + unified +
+                // vfile) is a cyclic module graph; entry-aware splitting
+                // scattered it across ~9 chunks that import each other in
+                // cycles, which can crash at module-init (same failure mode
+                // as the recharts white screen) whenever a chat message or
+                // document renders markdown. Keep the chain in ONE chunk.
+                // @streamdown/* code-highlight data is intentionally NOT
+                // pinned here (it is not part of the cycle); pinning it drags
+                // ~10 MB of shiki grammar data into the chunk.
+                name: 'markdown-render',
+                test: /node_modules[\\/](streamdown|micromark(-[a-z0-9-]+)?|mdast-util-[a-z0-9-]+|hast-util-[a-z0-9-]+|unist-util-[a-z0-9-]+|remark(-[a-z0-9-]+)?|rehype(-[a-z0-9-]+)?|unified|vfile(-[a-z0-9-]+)?|markdown-table|lowlight|refractor|character-entities(-legacy)?|decode-named-character-reference|property-information|space-separated-tokens|comma-separated-tokens|html-void-elements|web-namespaces|zwitch|trim-lines|ccount|longest-streak|escape-string-regexp|bail|extend|trough|is-plain-obj|inline-style-parser|style-to-object|style-to-js|html-url-attributes|estree-util-[a-z0-9-]+|@ungap|remend|rehype-harden)[\\/]/,
+                priority: 30,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
+                // mermaid (via @streamdown/mermaid) is a huge cyclic module
+                // graph (d3/dagre/cytoscape/venn…); entry-aware splitting
+                // used to break it into cyclic chunks. Keep mermaid and its
+                // dedicated deps in ONE chunk so diagram rendering cannot
+                // crash at module-init. Deliberately exclude widely shared
+                // deps (dayjs/uuid/dompurify/marked/stylis) so non-diagram
+                // pages never pull this chunk in.
+                name: 'mermaid',
+                test: /node_modules[\\/](mermaid|@mermaid-js|@braintree|@iconify|@upsetjs|cytoscape(-[a-z0-9-]+)?|d3(-[a-z0-9-]+)?|dagre-d3-es|es-toolkit|katex|khroma|non-layered-tidy-tree-layout|roughjs|ts-dedent)[\\/]/,
+                priority: 30,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
             ],
           },
         },
