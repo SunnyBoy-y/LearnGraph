@@ -29,6 +29,7 @@ from app.providers.catalog import (
     VISION_PROVIDER_TYPES,
     provider_type_spec,
 )
+from app.providers.host_service_resolver import resolve_host_service_url
 
 from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.image_generation import ImageGenerationProviderPort
@@ -408,7 +409,18 @@ def model_provider_for_workspace(
         elif provider.provider_type == "anthropic_messages":
             effective_base_url = normalize_anthropic_api_base_url(provider.base_url)
         elif is_ollama_provider_type(provider.provider_type) or provider.provider_type == "ollama_cloud":
-            effective_base_url = normalize_ollama_api_base_url(provider.base_url)
+            # Host Service Resolver: a containerized deployment keeps the
+            # logical 127.0.0.1 URL in the provider row and rewrites it through
+            # the host-side bridge so real-machine Ollama stays reachable from
+            # inside Docker (source installs pass through unchanged).
+            effective_base_url = normalize_ollama_api_base_url(
+                resolve_host_service_url(
+                    provider_type=provider.provider_type,
+                    base_url=provider.base_url,
+                    host_bridge_url=settings.host_bridge_url,
+                    deployment_profile=settings.deployment_profile,
+                )
+            )
         else:
             effective_base_url = provider.base_url
         extra_headers = _extra_headers_from_capabilities(capabilities)

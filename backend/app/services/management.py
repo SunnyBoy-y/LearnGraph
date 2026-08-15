@@ -3074,8 +3074,15 @@ class ProviderService:
             if provider.provider_type in {"ollama", "ollama_embedding"}:
                 from app.providers.remote.ollama import discover_ollama_models
 
+                from app.providers.host_service_resolver import resolve_host_service_url
+
                 return discover_ollama_models(
-                    base_url=provider.base_url,
+                    base_url=resolve_host_service_url(
+                        provider_type=provider.provider_type,
+                        base_url=provider.base_url,
+                        host_bridge_url=self.settings.host_bridge_url,
+                        deployment_profile=self.settings.deployment_profile,
+                    ),
                     api_key=self._optional_secret(provider.id),
                     extra_headers=extra_headers,
                 )

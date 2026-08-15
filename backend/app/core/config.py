@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     # managed TLS termination / reverse proxy in front.
     deployment_profile: str = "personal_desktop"
 
+    # Host Service Bridge endpoint (host-side daemon, see
+    # docs/host-service-bridge.md). When set on a containerized deployment
+    # (self_hosted_team/cloud_saas), the Host Service Resolver rewrites
+    # loopback provider/MCP URLs to {host_bridge_url}/services/<id>/...
+    # so real-machine services (Ollama, LM Studio, local MCP, local APIs)
+    # stay reachable from inside Docker. Leave unset on source installs:
+    # loopback URLs then resolve directly.
+    host_bridge_url: str | None = None
+
     env: str = "development"
     database_url: str = "sqlite:///./data/learngraph.db"
     # SQLite write-lock busy wait (milliseconds). Feeds both the pysqlite
@@ -163,6 +172,10 @@ class Settings(BaseSettings):
     # Sandbox API. The deployment id MUST match the daemon's SANDBOXD_DEPLOYMENT_ID.
     sandboxd_url: str | None = None
     sandboxd_token_file: str | None = None
+    # Optional separate credential for the daemon's bootstrap/admin control
+    # plane (pull + digest + smoke). When empty, bootstrap reports an explicit
+    # "admin control plane not configured" state instead of attempting a job.
+    sandboxd_admin_token_file: str | None = None
     sandboxd_deployment_id: str = "default"
     sandboxd_connect_timeout_seconds: float = 3.0
     sandboxd_request_timeout_seconds: float = 190.0

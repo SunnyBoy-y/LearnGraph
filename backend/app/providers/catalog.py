@@ -346,6 +346,9 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
             "本地 Ollama 的 OpenAI 兼容 Chat 接口，支持模型发现、工具调用，"
             "以及 thinking 模型的原生 think 参数（low/medium/high/max）。"
             "默认无需 API Key；若启用了 OLLAMA_API_KEY 可在此填写。"
+            "地址始终填本机逻辑地址 http://127.0.0.1:11434/v1：整体 Docker "
+            "部署时由 Host Service Bridge 自动转发到宿主机（见 "
+            "docs/host-service-bridge.md），源码启动时直连。"
         ),
         requires_base_url=True,
         requires_secret=False,
@@ -355,6 +358,8 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         probe_notice=(
             "探测会调用 Ollama GET /v1/models（失败时回退 /api/tags），不会生成内容。"
             "请确认本机已启动 ollama serve，并已 pull 至少一个模型。"
+            "整体 Docker 部署时请确认宿主机 Host Service Bridge 已注册 "
+            "ollama 服务且本容器已设置 LEARNGRAPH_HOST_BRIDGE_URL。"
         ),
         brand_id="ollama",
         brand_icon_url="https://cdn.simpleicons.org/ollama",
