@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEPLOYMENT_PROFILES = frozenset({"personal_desktop", "self_hosted_team", "cloud_saas"})
@@ -158,6 +158,16 @@ class Settings(BaseSettings):
     # executable; the backend still reports an explicit unavailable state.
     sandbox_enabled: bool = True
     sandbox_backend: str = "docker"
+    # sandboxd control-plane connection (required when sandbox_backend=sandboxd).
+    # The daemon owns Docker Engine; LearnGraph only consumes its authenticated
+    # Sandbox API. The deployment id MUST match the daemon's SANDBOXD_DEPLOYMENT_ID.
+    sandboxd_url: str | None = None
+    sandboxd_token_file: str | None = None
+    sandboxd_deployment_id: str = "default"
+    sandboxd_connect_timeout_seconds: float = 3.0
+    sandboxd_request_timeout_seconds: float = 190.0
+    sandboxd_protocol_min: str = "1.0"
+    sandboxd_protocol_max: str = "1.0"
     # Optional immutable runtime image override for CI/offline deployments.
     # When empty, runtime resolution uses the digest persisted by Bootstrap.
     sandbox_image: str | None = None
@@ -443,9 +453,20 @@ class Settings(BaseSettings):
     @classmethod
     def validate_sandbox_backend(cls, value: str) -> str:
         normalized = value.strip().casefold()
-        if normalized != "docker":
-            raise ValueError("The current backend supports only the explicit docker sandbox")
+        if normalized not in {"docker", "sandboxd"}:
+            raise ValueError("sandbox_backend must be 'docker' or 'sandboxd'")
         return normalized
+
+    @model_validator(mode="after")
+    def validate_sandboxd_connection(self) -> "Settings":
+        if self.sandbox_backend == "sandboxd":
+            if not (self.sandboxd_url or "").strip():
+                raise ValueError("LEARNGRAPH_SANDBOXD_URL is required when sandbox_backend=sandboxd")
+            if not (self.sandboxd_token_file or "").strip():
+                raise ValueError(
+                    "LEARNGRAPH_SANDBOXD_TOKEN_FILE is required when sandbox_backend=sandboxd"
+                )
+        return self
 
     @field_validator("sandbox_agent_file_bytes")
     @classmethod

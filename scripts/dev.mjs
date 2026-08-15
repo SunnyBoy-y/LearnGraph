@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -426,6 +427,8 @@ async function stopAllChildren() {
   await Promise.allSettled(active.map(stopChild))
 }
 
+// Placeholder removed — sandboxd is started inside run() via startSandboxd.
+
 function describeExit(result) {
   if (result.error) return `${result.label} could not start: ${result.error.message}`
   if (result.signal) return `${result.label} exited after ${result.signal}.`
@@ -524,6 +527,47 @@ async function main() {
   }
   const previewOrigin = `http://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${previewPort}`
 
+  // sandboxd control plane (Phase 2+): when the backend is configured with
+  // LEARNGRAPH_SANDBOX_BACKEND=sandboxd, manage a local daemon process so the
+  // app never talks to Docker Engine directly. A development token is
+  // generated under the ignored .sandboxd/ directory.
+  const sandboxdEnabled =
+    (process.env.LEARNGRAPH_SANDBOX_BACKEND?.trim() || backendEnv.LEARNGRAPH_SANDBOX_BACKEND?.trim() || 'docker') === 'sandboxd'
+
+  const startSandboxd = () => {
+    const sandboxdDir = path.join(repoRoot, 'sandboxd')
+    const tokenDir = path.join(backendDir, 'data', '.sandboxd')
+    const tokenFile = path.join(tokenDir, 'sandboxd-token')
+    const stateFile = path.join(tokenDir, 'state.db')
+    mkdirSync(tokenDir, { recursive: true })
+    if (!existsSync(tokenFile)) {
+      writeFileSync(tokenFile, randomBytes(32).toString('hex'), { mode: 0o600 })
+    }
+    const sandboxdPort = Number(process.env.LEARNGRAPH_SANDBOXD_PORT?.trim() || 8090)
+    console.log(`\nStarting sandboxd at http://127.0.0.1:${sandboxdPort} (backend=${backendOrigin}) ...`)
+    return spawnTracked(
+      'Sandboxd',
+      'uv',
+      ['run', '--locked', 'python', '-m', 'sandboxd.main'],
+      {
+        cwd: sandboxdDir,
+        detached: true,
+        env: {
+          ...process.env,
+          SANDBOXD_LISTEN_HOST: '127.0.0.1',
+          SANDBOXD_PORT: String(sandboxdPort),
+          SANDBOXD_TOKEN_FILE: tokenFile,
+          SANDBOXD_STATE_PATH: stateFile,
+          SANDBOXD_DEPLOYMENT_ID: process.env.LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID?.trim() || 'dev-local',
+          SANDBOXD_RUNTIME_IMAGE: process.env.LEARNGRAPH_SANDBOX_IMAGE?.trim() || '',
+          // Local dev: egress proxy is optional; keep the daemon fully offline
+          // unless the operator explicitly starts one.
+          SANDBOXD_EGRESS_ENABLED: process.env.LEARNGRAPH_SANDBOXD_EGRESS_ENABLED?.trim() || 'false',
+        },
+      },
+    )
+  }
+
   const startBackend = () => {
     console.log(`\nStarting backend at ${backendOrigin} ...`)
     return spawnTracked(
@@ -554,6 +598,14 @@ async function main() {
           // explicitly configured a real domain (persisted frontend config or
           // LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN still wins inside the backend).
           LEARNGRAPH_SUBAPP_PREVIEW_PORT: String(previewPort),
+          ...(sandboxdEnabled
+            ? {
+                LEARNGRAPH_SANDBOX_BACKEND: 'sandboxd',
+                LEARNGRAPH_SANDBOXD_URL: `http://127.0.0.1:${process.env.LEARNGRAPH_SANDBOXD_PORT?.trim() || 8090}`,
+                LEARNGRAPH_SANDBOXD_TOKEN_FILE: path.join(backendDir, 'data', '.sandboxd', 'sandboxd-token'),
+                LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID: process.env.LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID?.trim() || 'dev-local',
+              }
+            : {}),
           ...(previewPublicOrigin
             ? { LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: previewPublicOrigin }
             : {}),
@@ -711,6 +763,10 @@ async function main() {
     }
   }
 
+  // sandboxd control plane runs alongside the app whenever the backend is
+  // configured with LEARNGRAPH_SANDBOX_BACKEND=sandboxd.
+  const sandboxd = sandboxdEnabled ? startSandboxd() : null
+
   // Both backends run concurrently; either one surfacing a fatal condition
   // (signal or frontend exit) propagates to the caller.
   await Promise.race([
@@ -719,6 +775,10 @@ async function main() {
     }),
     supervise('Preview', startPreview, previewHealthUrl),
   ])
+
+  if (sandboxd) {
+    stopChild(sandboxd)
+  }
 }
 
 try {

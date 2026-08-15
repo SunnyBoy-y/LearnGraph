@@ -1,39 +1,105 @@
-# Linux-only override: let the API container drive the host Docker Engine.
+# Linux override: add the isolated sandboxd control plane.
 #
-# Bind-mount the same absolute host path into the container so sandbox
-# workspace bind sources are valid for dockerd. Docker Desktop / Windows
-# cannot use this same-path trick; keep using `npm run dev` for sandbox there.
+# sandboxd is the ONLY component that talks to Docker Engine: it mounts the
+# host Docker socket and manages sandbox containers, named volumes and
+# per-sandbox egress networks. The LearnGraph app never sees the socket and
+# never needs host/container same-path workspace bindings.
 #
-#   export LEARNGRAPH_DATA_DIR=/var/lib/learngraph
+#   export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # optional host data path
+#   mkdir -p secrets && openssl rand -hex 32 > secrets/sandboxd-token
 #   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
 #
-# The container user must be able to talk to the Docker socket. If bootstrap
-# reports "Docker Engine is unavailable", pass the host docker GID:
+# The sandboxd container must be able to talk to the Docker socket. If its
+# health check reports "Docker Engine is unavailable", pass the host GID:
 #   export DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+#
+# Docker Desktop / Windows cannot use this socket override; keep using
+# `npm run dev` (which manages a local sandboxd process) for sandbox there.
 
 services:
+  # LearnGraph app: consumes the sandboxd Sandbox API only.
   app:
+    environment:
+      LEARNGRAPH_SANDBOX_BACKEND: sandboxd
+      LEARNGRAPH_SANDBOXD_URL: http://sandboxd:8090
+      LEARNGRAPH_SANDBOXD_TOKEN_FILE: /run/secrets/sandboxd-token
+      LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
+      LEARNGRAPH_SANDBOX_ENABLED: "true"
+    secrets:
+      - sandboxd-token
+    networks:
+      - default
+      - sandbox-control
+    depends_on:
+      sandboxd:
+        condition: service_healthy
+
+  # The only Docker control plane. No host ports are published; the daemon
+  # listens on the internal `sandbox-control` network only.
+  sandboxd:
+    image: ${LEARNGRAPH_IMAGE:-learngraph:local}
+    build:
+      context: .
+      dockerfile: sandboxd/Dockerfile
+    environment:
+      SANDBOXD_LISTEN_HOST: "0.0.0.0"
+      SANDBOXD_PORT: "8090"
+      SANDBOXD_TOKEN_FILE: /run/secrets/sandboxd-token
+      SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
+      # Immutable runtime image digest for sandbox runners. Empty keeps the
+      # daemon fail-closed (readiness reports the missing runtime).
+      SANDBOXD_RUNTIME_IMAGE: ${LEARNGRAPH_SANDBOX_IMAGE:-}
+      SANDBOXD_EGRESS_ENABLED: "true"
+      SANDBOXD_EGRESS_PROXY_URL: http://egress-proxy:8888
+      SANDBOXD_STATE_PATH: /var/lib/sandboxd/state.db
+      SANDBOXD_SECCOMP_DIR: /app/sandbox-profiles
+      SANDBOXD_MAX_ACTIVE: "20"
     group_add:
       - ${DOCKER_GID:-998}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}:${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
-    environment:
-      LEARNGRAPH_DATA_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
-      LEARNGRAPH_DATABASE_URL: sqlite:///${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/learngraph.db
-      LEARNGRAPH_STORAGE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/storage
-      LEARNGRAPH_MEMORY_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/memory
-      LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/sandbox-workspaces
-      LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/egress-policies
-      LEARNGRAPH_SANDBOX_ENABLED: "true"
+      - sandboxd-state:/var/lib/sandboxd
+    secrets:
+      - sandboxd-token
+    networks:
+      - sandbox-control
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/v1/health/live', timeout=4)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  preview:
-    volumes:
-      - ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}:${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
-    environment:
-      LEARNGRAPH_DATA_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}
-      LEARNGRAPH_DATABASE_URL: sqlite:///${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/learngraph.db
-      LEARNGRAPH_STORAGE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/storage
-      LEARNGRAPH_MEMORY_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/memory
-      LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/sandbox-workspaces
-      LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: ${LEARNGRAPH_DATA_DIR:-/var/lib/learngraph}/egress-policies
+secrets:
+  sandboxd-token:
+    file: ${LEARNGRAPH_SANDBOXD_TOKEN_FILE:-./secrets/sandboxd-token}
+
+volumes:
+  sandboxd-state:
+
+networks:
+  # Internal control network between app and sandboxd. The daemon publishes no
+  # host port; sandbox runner containers are attached to per-sandbox egress
+  # networks by the daemon and never join this network.
+  sandbox-control:
+    internal: true

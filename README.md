@@ -168,7 +168,7 @@ npm run dev
 需要修改端口时：
 
 ```bash
-npm run dev -- --frontend-port 5174 --backend-port 8001
+npm run dev -- --frontend-port 5174 --backend-port 8021
 ```
 
 ### 公网访问（内网穿透，可选）
@@ -202,31 +202,82 @@ LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN=https://my-tunnel.example.com:23351
 
 ### Docker Compose（可选）
 
-适合想先跑起来、或不想在本机装 Node / Python 的自托管体验。镜像同时包含前端生产构建和 FastAPI；浏览器走同源 `/api/v1`。
+适合想先跑起来、或不想在本机装 Node / Python 的自托管体验。镜像同时包含前端生产构建和 FastAPI。生产形态是**单入口**：浏览器访问一个地址即可拿到页面和同源 `/api/v1`（前端是构建产物，由 API 进程托管——源码里的 5173 是 Vite 开发服务器，生产不存在该组件）。
 
 ```bash
 docker compose up --build
 ```
 
-| 服务 | 默认地址 |
-| --- | --- |
-| Web + API | `http://127.0.0.1:8080` |
-| 子应用 Preview | `http://127.0.0.1:8001` |
-| Health | `http://127.0.0.1:8080/api/v1/health` |
+| 服务 | 默认地址 | 说明 |
+| --- | --- | --- |
+| Web + API（单入口） | `http://127.0.0.1:18000` | 页面与 `/api/v1` 同源；API 内部端口 8000 不单独发布 |
+| 子应用 Preview | `http://127.0.0.1:18001` | 独立 origin，浏览器 iframe 按 capability token 加载 |
+| Health | `http://127.0.0.1:18000/api/v1/health` | |
+
+默认只绑定 `127.0.0.1` 且使用高位端口（18000/18001），避免与常见开发端口（5173/8000/8001/8080）撞车；这与你源码启动的监听行为一致（`npm run dev` 默认也只监听 127.0.0.1）。公网/局域网部署：
+
+```bash
+export LEARNGRAPH_LISTEN_HOST=0.0.0.0   # 等价于 npm run dev -- --lan
+export LEARNGRAPH_PORT=18000            # 自行选端口
+export LEARNGRAPH_PREVIEW_PORT=18001
+# LAN 部署时 Preview 必须能被浏览器直接访问：
+export LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN=http://<你的IP或域名>:18001
+docker compose up --build
+```
 
 数据写在 named volume `learngraph-data`。未设置 `LEARNGRAPH_MASTER_KEY` 时，入口脚本会生成一把主密钥并保存在卷里，这样页面里保存的 Provider Secret 重启后仍能解密。首次启动请看 `app` 容器日志里的管理员临时密码。
 
-Agent 沙箱要调用**宿主** Docker Engine，并且 bind mount 路径对 dockerd 必须是宿主机路径。Linux 可用覆盖文件：
+Compose 栈默认自带 **沙箱审批制出网（egress）**：`egress-proxy` 服务是沙箱唯一的外网出口，动态沙箱容器加入内部网络 `learngraph-egress`，每个 CONNECT 都按工作区策略 digest 重新授权（私网/环回/云元数据地址始终拒绝），审计记录写到数据卷 `egress-audit.jsonl`。无需额外部署代理或手动建网。
+
+Agent 沙箱默认通过**独立的 sandboxd 控制面**运行：Docker socket 只挂给 sandboxd，LearnGraph 业务进程只消费其版本化、认证的 Sandbox API（不直接控制 Docker Engine，也不依赖宿主/容器同路径 bind）。Linux 启用覆盖文件：
 
 ```bash
+mkdir -p secrets && openssl rand -hex 32 > secrets/sandboxd-token
 export LEARNGRAPH_DATA_DIR=/var/lib/learngraph
 export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
 docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
 ```
 
-Windows / Docker Desktop 请继续用上面的 `npm run dev` 跑后端，让本机 Docker 提供沙箱；不要把 Compose 里的 named volume 路径传给 dockerd。
+覆盖模式下：`app` 无 Docker socket、无 same-path bind；`sandboxd` 独占 socket 并通过 `sandbox-control` 内部网络提供服务，不发布宿主端口；sandbox 使用独立 named volume 与 per-sandbox 内部 egress 网络；runner 镜像须为不可变 sha256 digest（通过 sandboxd Bootstrap 安装，或设置 `LEARNGRAPH_SANDBOX_IMAGE`）。若你此前手动建过 `learngraph-egress` 网络，请先删除（`docker network rm learngraph-egress`），由 Compose/daemon 统一管理。
+
+Windows / Docker Desktop 请继续用上面的 `npm run dev` 跑后端，让本机 Docker 提供沙箱（sandboxd 模式下需额外启动本地 sandboxd 进程，见 `sandboxd/` 与 `backend/.env.example`）；不要把 Compose 里的 named volume 路径传给 dockerd。本地开发同样可以启用 egress（与 Docker 部署同款代理）：
+
+```bash
+docker network create learngraph-egress
+# 沙箱容器通过 host.docker.internal 解析到宿主机上的代理
+LEARNGRAPH_SANDBOX_EGRESS_PROXY_URL=http://host.docker.internal:8888 \
+  uv run python -m app.services.egress_proxy_main
+```
 
 更完整的变量说明见仓库根目录 `.env.example` 和 `backend/.env.example`。
+
+### 升级与数据安全
+
+**数据在哪里**：所有持久化数据（SQLite 库、上传文件、主密钥、egress 策略与审计）都在数据卷 `learngraph_learngraph-data`（容器内 `/data`），与镜像/容器完全解耦。**升级镜像、重建容器都不会丢数据**；`docker compose down`（不带 `-v`）也不会删数据。⚠️ 只有 `docker compose down -v` 会永久删除数据卷——升级操作请一律使用下面的脚本，脚本从不使用 `-v`。
+
+**一键升级**（宿主机执行，含数据安全护栏）：
+
+```bash
+# 检查当前版本与栈状态（只读）
+./scripts/docker-update.sh --check
+
+# 升级到新版本：自动完成 备份 → 拉新镜像 → 替换容器 → 健康检查 → 失败自动回滚
+./scripts/docker-update.sh ghcr.io/<owner>/learngraph:v1.2.0
+
+# 只做数据备份（可放入定时任务做日常备份）
+./scripts/docker-update.sh --backup-only
+```
+
+升级脚本保证：升级前对 SQLite 做**在线备份**（WAL 安全、业务不停）+ **数据卷整体打包**（含密钥/文件/审计）+ **sandboxd 状态卷备份**（启用 sandboxd override 时自动检测）；新容器通过健康检查才算成功，失败自动回滚旧镜像（sandboxd 模式下同时校验控制面健康）；备份保留最近 10 份（`BACKUP_KEEP` 可调），输出到 `backups/`（**备份文件含主密钥，等同敏感数据，请妥善保管/异地存放**）。
+
+**热更新触发方式**（按运维强度从低到高）：
+- **手动**：SSH 到宿主机执行上面的一行命令（最可靠，推荐起步）
+- **Web 触发**：在宿主机的 Cron/任务计划里定时调用 `docker-update.sh --backup-only`，配合 registry 版本检测即可实现"检查到新版本后自动更新"
+- **全自动**：叠加一个 [Watchtower](https://github.com/containrrr/watchtower) 容器监控镜像 tag 自动替换（需自担自动更新的风险面）
+
+**停机窗口**：当前架构是单实例（SQLite 单写者 + 内嵌调度器），热更新 = **秒级到分钟级短暂中断**（备份 + 容器替换 + 健康检查）。要求零停机滚动更新需要切到 PostgreSQL + 多副本（`infrastructure` extra 已含 psycopg，`storage_factory` 已支持 MinIO），届时再引入 leader 选举调度。
+
+**升级前检查清单**：① `./scripts/docker-update.sh --check` 确认栈健康；② 手动执行一次 `--backup-only` 验证备份产物存在且可解压；③ 大版本升级前在测试环境完整演练一次恢复（备份解压 → `docker compose up` → 数据可读）。
 
 
 ### 首次登录

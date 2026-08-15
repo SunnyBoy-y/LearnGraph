@@ -32,6 +32,32 @@ jobs:
       - run: npm run test
       - run: npm run build:check
 
+  sandboxd:
+    name: sandboxd (control plane unit/contract)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sandboxd
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --extra test
+      - name: Syntax check
+        run: >
+          uv run --locked python -c
+          "from pathlib import Path; files = sorted(Path('sandboxd').rglob('*.py'));
+          assert files; [compile(f.read_bytes(), str(f), 'exec') for f in files];
+          print(f'Syntax checked {len(files)} Python files.')"
+      - name: Import check
+        run: uv run --locked python -c "from sandboxd.main import create_app; assert create_app"
+      - name: Unit and contract tests (local-only tests, skipped when absent)
+        run: >
+          if [ -d tests ]; then uv run --locked --extra test pytest tests -q; else
+          echo 'sandboxd tests are kept local-only per project convention; skipping.'; fi
+
   backend:
     name: Backend
     runs-on: ubuntu-latest
