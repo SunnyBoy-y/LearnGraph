@@ -29,7 +29,11 @@ from app.providers.catalog import (
     VISION_PROVIDER_TYPES,
     provider_type_spec,
 )
-from app.providers.host_service_resolver import resolve_host_service_url
+from app.providers.host_service_resolver import (
+    HOST_BRIDGE_TOKEN_HEADER,
+    read_bridge_token,
+    resolve_host_service_url,
+)
 
 from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.image_generation import ImageGenerationProviderPort
@@ -424,6 +428,21 @@ def model_provider_for_workspace(
         else:
             effective_base_url = provider.base_url
         extra_headers = _extra_headers_from_capabilities(capabilities)
+        # Authenticate the outbound bridge hop when a loopback provider URL
+        # was rewritten to the Host Service Bridge (token file is mounted by
+        # compose; missing token simply means the bridge will deny — the
+        # frontend surfaces that with an actionable hint).
+        if (
+            effective_base_url
+            and settings.effective_host_bridge_url
+            and is_ollama_provider_type(provider.provider_type)
+        ):
+            bridge_token = read_bridge_token(settings.host_bridge_token_file)
+            if bridge_token:
+                extra_headers = {
+                    **(extra_headers or {}),
+                    HOST_BRIDGE_TOKEN_HEADER: bridge_token,
+                }
         effective_model_capabilities = model_capabilities_for_model(
             capabilities,
             resolved_model_id,

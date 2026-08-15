@@ -64,7 +64,9 @@ from app.providers.ports.mcp import (
     MCPTransportUnavailable,
 )
 from app.providers.host_service_resolver import (
+    HOST_BRIDGE_TOKEN_HEADER,
     is_loopback_url,
+    read_bridge_token,
     resolve_loopback_url,
     sanitize_service_id,
 )
@@ -3722,12 +3724,18 @@ class MCPAndSkillService:
                 bridge_host = ""
             if bridge_host:
                 allow_private_hosts = frozenset({bridge_host})
+        extra_headers: dict[str, str] = {}
+        if bridge_url:
+            bridge_token = read_bridge_token(self.settings.host_bridge_token_file)
+            if bridge_token:
+                extra_headers = {HOST_BRIDGE_TOKEN_HEADER: bridge_token}
         return StreamableHTTPMCPAdapter(
             server.endpoint_url,
             bearer_token=self._credential_secret(server),
             timeout_ms=server.timeout_ms,
             max_response_bytes=server.max_result_bytes,
             allow_private_hosts=allow_private_hosts,
+            extra_headers=extra_headers,
         )
 
     def _runner_credential_token(self, server: MCPServer) -> dict[str, Any] | None:

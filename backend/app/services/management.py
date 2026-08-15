@@ -211,6 +211,46 @@ def _is_dashscope_host(base_url: str | None) -> bool:
     return host in _DASHSCOPE_BALANCE_HOSTS or host.endswith(".maas.aliyuncs.com")
 
 
+def _tcp_reachable(url: str, *, timeout_seconds: float = 2.0) -> bool:
+    """Probe whether a host:port accepts TCP connections (no auth needed)."""
+    import socket as _socket
+
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            return False
+        with _socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _host_bridge_guidance(
+    *,
+    effective: str | None,
+    reachable: bool | None,
+    token_ready: bool,
+) -> str:
+    """Compose the frontend hint for the Host Service Bridge state."""
+    if not effective:
+        return ""
+    if reachable is False:
+        return (
+            "宿主机 Host Service Bridge 未运行。请在宿主机执行 "
+            "`node scripts/host-bridge.mjs`（自动生成 token 与服务注册表），"
+            "然后重启容器：`docker compose restart app preview`。"
+        )
+    if not token_ready:
+        return (
+            "宿主机 Host Service Bridge 已运行，但容器尚未挂载其 token。"
+            "请确认已在宿主机执行 `node scripts/host-bridge.mjs`，"
+            "然后重启容器：`docker compose restart app preview`。"
+        )
+    return "宿主机 Host Service Bridge 已就绪，本机模型服务（Ollama 等）可正常使用。"
+
+
 class ProviderService:
     def __init__(self, db: Session, workspace_id: str, actor_id: str, settings: Settings) -> None:
         self.db = db
@@ -599,6 +639,45 @@ class ProviderService:
                 "backend_name": "unavailable",
                 "active_key_version": None,
             }
+
+    def host_bridge_status(self) -> dict:
+        """Frontend guidance for the Host Service Bridge (whole-app Docker).
+
+        Reports whether the bridge endpoint is in effect, reachable from the
+        container (TCP probe), whether the bearer token file is mounted, and
+        whether this workspace configures loopback local providers (Ollama)
+        that depend on the bridge. Guidance is a ready-to-show Chinese hint
+        with the exact host-side commands.
+        """
+        from app.providers.host_service_resolver import is_loopback_url, read_bridge_token
+
+        effective = self.settings.effective_host_bridge_url
+        auto_derived = bool(effective) and not self.settings.host_bridge_url
+        bridge_reachable: bool | None = None
+        if effective:
+            bridge_reachable = _tcp_reachable(effective, timeout_seconds=2.0)
+        token_ready = read_bridge_token(self.settings.host_bridge_token_file) is not None
+        local_loopback = [
+            p
+            for p in self.list()
+            if p.provider_type in {"ollama", "ollama_embedding"}
+            and p.base_url
+            and is_loopback_url(p.base_url)
+        ]
+        guidance = _host_bridge_guidance(
+            effective=effective,
+            reachable=bridge_reachable,
+            token_ready=token_ready,
+        )
+        return {
+            "deployment_profile": self.settings.deployment_profile,
+            "host_bridge_url": effective,
+            "auto_derived": auto_derived,
+            "bridge_reachable": bridge_reachable,
+            "bridge_token_ready": token_ready,
+            "has_local_loopback_providers": bool(local_loopback),
+            "guidance": guidance,
+        }
 
     def rotate_secret(
         self, provider_id: str, payload: ProviderSecretRotateRequest
@@ -3074,8 +3153,17 @@ class ProviderService:
             if provider.provider_type in {"ollama", "ollama_embedding"}:
                 from app.providers.remote.ollama import discover_ollama_models
 
-                from app.providers.host_service_resolver import resolve_host_service_url
+                from app.providers.host_service_resolver import (
+                    HOST_BRIDGE_TOKEN_HEADER,
+                    read_bridge_token,
+                    resolve_host_service_url,
+                )
 
+                probe_headers = dict(extra_headers or {})
+                if self.settings.effective_host_bridge_url:
+                    bridge_token = read_bridge_token(self.settings.host_bridge_token_file)
+                    if bridge_token:
+                        probe_headers[HOST_BRIDGE_TOKEN_HEADER] = bridge_token
                 return discover_ollama_models(
                     base_url=resolve_host_service_url(
                         provider_type=provider.provider_type,
@@ -3084,7 +3172,7 @@ class ProviderService:
                         deployment_profile=self.settings.deployment_profile,
                     ),
                     api_key=self._optional_secret(provider.id),
-                    extra_headers=extra_headers,
+                    extra_headers=probe_headers,
                 )
             if provider.provider_type == "ollama_cloud":
                 from app.providers.remote.ollama import discover_ollama_cloud_models

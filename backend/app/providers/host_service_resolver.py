@@ -28,11 +28,17 @@ registry id the operator reviews on the host (e.g. ``ollama``).
 """
 
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1"})
 
 PERSONAL_DESKTOP_PROFILE = "personal_desktop"
+
+# Header the backend sends to the Host Service Bridge for authentication.
+# Kept separate from Authorization so provider/MCP target credentials
+# (e.g. Ollama's conventional "Bearer ollama") never collide with it.
+HOST_BRIDGE_TOKEN_HEADER = "X-LearnGraph-Host-Bridge-Token"
 
 _PATH_SAFE_RE = re.compile(r"[^a-z0-9._-]")
 
@@ -46,6 +52,22 @@ def sanitize_service_id(value: str) -> str:
     them in a bridge URL.
     """
     return _PATH_SAFE_RE.sub("-", (value or "").strip().casefold()) or "unknown"
+
+
+def read_bridge_token(token_file: str | Path | None) -> str | None:
+    """Read the bridge bearer token from a mounted secret file (cached-free).
+
+    Missing, unreadable or empty files yield ``None`` so callers can simply
+    skip the token header and let the bridge deny the call (fail closed) —
+    the frontend surfaces that state with an actionable hint.
+    """
+    if not token_file:
+        return None
+    try:
+        raw = Path(token_file).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    return raw or None
 
 
 def is_loopback_url(url: str) -> bool:

@@ -34,6 +34,7 @@ from app.domain.schemas.management import (
     ProviderBalanceQueryResultView,
     ProviderBalanceView,
     SecretStoreStatusView,
+    HostBridgeStatusView,
     WorkspaceSecretReferenceUpsertRequest,
     WorkspaceSecretReferenceView,
 )
@@ -99,6 +100,15 @@ def secret_store_status(
 ) -> SecretStoreStatusView:
     return SecretStoreStatusView.model_validate(
         service(db, context, settings).secret_store_status()
+    )
+
+
+@router.get("/host-bridge/status", response_model=HostBridgeStatusView)
+def host_bridge_status(
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> HostBridgeStatusView:
+    return HostBridgeStatusView.model_validate(
+        service(db, context, settings).host_bridge_status()
     )
 
 

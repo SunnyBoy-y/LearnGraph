@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # explicitly to override; set this to false to disable bridging entirely
     # (e.g. a cloud SaaS deployment with no local bridge).
     host_bridge_auto: bool = True
+    # Path to the bridge bearer token file (written by scripts/host-bridge.mjs
+    # on the real machine as data/host-bridge/token). Compose mounts it into
+    # the app/preview containers so the backend can authenticate outbound
+    # bridge calls (X-LearnGraph-Host-Bridge-Token). Empty means the backend
+    # calls the bridge without a token (denied unless the bridge is configured
+    # to skip auth).
+    host_bridge_token_file: Path | None = None
 
     @property
     def effective_host_bridge_url(self) -> str | None:

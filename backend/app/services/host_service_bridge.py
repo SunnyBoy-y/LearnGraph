@@ -354,9 +354,14 @@ class HostServiceBridge:
         )
 
     def _require_token(self, request: Request) -> None:
+        # The backend reaches the bridge through host.docker.internal and
+        # authenticates with the X-LearnGraph-Host-Bridge-Token header (its
+        # provider/MCP requests carry their own Authorization for the target
+        # service, which must not collide with the bridge credential).
         auth = request.headers.get("authorization", "")
+        x_token = request.headers.get("x-learngraph-host-bridge-token", "")
         expected = f"Bearer {self.token}"
-        if auth != expected:
+        if auth != expected and x_token != self.token:
             self._audit(decision="deny", service_id=None, path=request.url.path, request=request, reason="missing_or_invalid_token")
             raise HostServiceDenied("missing or invalid bearer token")
 

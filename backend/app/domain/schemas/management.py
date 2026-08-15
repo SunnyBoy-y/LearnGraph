@@ -907,6 +907,18 @@ class SecretStoreStatusView(BaseModel):
     active_key_version: int | None
 
 
+class HostBridgeStatusView(BaseModel):
+    """Frontend guidance for the Host Service Bridge (whole-app Docker)."""
+
+    deployment_profile: str
+    host_bridge_url: str | None
+    auto_derived: bool
+    bridge_reachable: bool | None
+    bridge_token_ready: bool
+    has_local_loopback_providers: bool
+    guidance: str
+
+
 class MasterKeyRotationView(BaseModel):
     provider: str
     previous_key_version: int

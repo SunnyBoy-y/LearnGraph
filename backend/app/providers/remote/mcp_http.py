@@ -79,6 +79,7 @@ class StreamableHTTPMCPAdapter:
         timeout_ms: int,
         max_response_bytes: int,
         allow_private_hosts: frozenset[str] = frozenset(),
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.endpoint_url = validate_mcp_http_endpoint(
             endpoint_url, allow_private_hosts=allow_private_hosts
@@ -86,6 +87,7 @@ class StreamableHTTPMCPAdapter:
         self.bearer_token = bearer_token
         self.timeout_seconds = timeout_ms / 1000
         self.max_response_bytes = max_response_bytes
+        self.extra_headers = dict(extra_headers or {})
 
     def probe(self) -> MCPProbeResult:
         try:
@@ -171,6 +173,9 @@ class StreamableHTTPMCPAdapter:
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         }
+        # Bridge-hop credential (X-LearnGraph-Host-Bridge-Token) goes first so
+        # it can never override the target MCP server's Authorization.
+        headers.update(self.extra_headers)
         if self.bearer_token:
             headers["Authorization"] = f"Bearer {self.bearer_token}"
         if protocol_version:

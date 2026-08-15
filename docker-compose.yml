@@ -86,8 +86,16 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       <<: *app-environment
+      # Bridge bearer token mounted from the real machine (written by
+      # scripts/host-bridge.mjs). The backend sends it as
+      # X-LearnGraph-Host-Bridge-Token on outbound bridge calls. If the file
+      # is absent (bridge not launched yet) the mount becomes an empty dir and
+      # the backend simply skips the header — the providers page shows an
+      # actionable hint instead of failing silently.
+      LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE: /run/secrets/host-bridge-token
     volumes:
       - learngraph-data:/data
+      - "${LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE:-./data/host-bridge/token}:/run/secrets/host-bridge-token:ro"
     healthcheck:
       test:
         [
@@ -133,8 +141,10 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       <<: *app-environment
+      LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE: /run/secrets/host-bridge-token
     volumes:
       - learngraph-data:/data
+      - "${LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE:-./data/host-bridge/token}:/run/secrets/host-bridge-token:ro"
     depends_on:
       app:
         condition: service_healthy
