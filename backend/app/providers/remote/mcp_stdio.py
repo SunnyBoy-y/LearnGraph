@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -21,8 +22,8 @@ from app.providers.ports.mcp import (
 )
 from app.providers.ports.mcp_runner import MCPRunnerPort
 from app.providers.ports.sandbox import SandboxCreateSpec
+from app.providers.sandbox_registry import get_sandbox_backend_registry
 from app.providers.remote.sandbox import (
-    DockerSandboxBackend,
     SandboxBackendError,
     SandboxOutputLimitExceeded,
     SandboxWorkspaceQuotaExceeded,
@@ -91,13 +92,11 @@ class DockerStdioMCPRunner(MCPRunnerPort):
             )
         return "The configured MCP stdio sandbox image is not available in Docker Engine"
 
-    def _backend(self) -> DockerSandboxBackend:
-        return DockerSandboxBackend(
-            enabled=self.settings.sandbox_enabled,
-            image_ref=self.image_ref or "",
-            runtime_kind=RUNTIME_KIND,
-            archive_bytes=self.settings.sandbox_agent_archive_bytes,
-        )
+    def _backend(self):
+        # Resolves through the backend registry (docker today, sandboxd after
+        # the control-plane migration). The factory uses the same pinned image
+        # resolution as ``self.image_ref``.
+        return get_sandbox_backend_registry().default(self.settings, RUNTIME_KIND)
 
     def _persist_runner_session(
         self,
@@ -170,6 +169,10 @@ class DockerStdioMCPRunner(MCPRunnerPort):
         workspace_root = Path(self.settings.sandbox_workspace_root).expanduser().resolve()
         workspace_root.mkdir(parents=True, exist_ok=True)
         session_id = f"mcp-stdio-{launch_spec.get('server_id', 'server')}-{uuid4().hex[:12]}"
+        # Each provisioned runner gets its own isolated workspace directory; the
+        # shared workspace root is never mounted into a sandbox.
+        workspace_path = workspace_root / f"mcp-{session_id}"
+        workspace_path.mkdir(parents=True, exist_ok=True)
         handle = self._backend().create(
             SandboxCreateSpec(
                 session_id=session_id,
@@ -179,10 +182,11 @@ class DockerStdioMCPRunner(MCPRunnerPort):
                 cpu_count=1.0,
                 pids_max=64,
                 disk_bytes=16 * 1024 * 1024,
-                workspace_path=str(workspace_root),
+                workspace_path=str(workspace_path),
                 runtime_kind=RUNTIME_KIND,
                 # Never enables egress; the container stays on network_mode="none".
                 egress=None,
+                workspace_key=session_id,
             )
         )
         self._persist_runner_session(
@@ -197,6 +201,7 @@ class DockerStdioMCPRunner(MCPRunnerPort):
             "session_id": handle.session_id,
             "server_id": launch_spec.get("server_id"),
             "workspace_id": launch_spec.get("workspace_id"),
+            "workspace_dir": str(workspace_path),
         }
 
     def _launch_file(self, launch_spec: dict[str, Any], credential_envelope: dict[str, Any] | None) -> dict[str, Any]:
@@ -323,10 +328,23 @@ class DockerStdioMCPRunner(MCPRunnerPort):
             )
         except Exception:  # noqa: BLE001 - best-effort cleanup
             pass
+        self._remove_runner_workspace(launch_spec)
         self._mark_runner_session_terminated(
             workspace_id=str(launch_spec.get("workspace_id") or ""),
             session_id=str(launch_spec.get("session_id") or ""),
         )
+
+    def _remove_runner_workspace(self, launch_spec: dict[str, Any]) -> None:
+        """Best-effort removal of the isolated runner workspace directory."""
+        workspace_dir = launch_spec.get("workspace_dir")
+        if workspace_dir:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+            return
+        session_id = str(launch_spec.get("session_id") or "")
+        if not session_id:
+            return
+        root = Path(self.settings.sandbox_workspace_root).expanduser().resolve()
+        shutil.rmtree(root / f"mcp-{session_id}", ignore_errors=True)
 
 
 class StdioIsolatedMCPAdapter:

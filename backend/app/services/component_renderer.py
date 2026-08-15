@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import html
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
-from app.providers.remote.sandbox import DockerSandboxBackend
+from app.providers.sandbox_registry import get_sandbox_backend_registry
 from app.providers.ports.sandbox import SandboxCreateSpec
-from app.services.sandbox_runtime import resolve_sandbox_image_for_runtime
+from app.services.sandbox_runtime import resolve_sandbox_image
 
 # The preview document is a fixed, server-owned template. Third-party component
 # data is schema-validated inert JSON rendered into an HTML-escaped <pre>; no
@@ -85,15 +86,7 @@ class ComponentRendererService:
     def renderer_available(self) -> bool:
         if not self.settings.component_renderer_enabled:
             return False
-        image_ref = resolve_sandbox_image_for_runtime(self.settings, RUNTIME_KIND)
-        if not image_ref:
-            return False
-        backend = DockerSandboxBackend(
-            enabled=self.settings.sandbox_enabled,
-            image_ref=image_ref,
-            runtime_kind=RUNTIME_KIND,
-            archive_bytes=self.settings.sandbox_agent_archive_bytes,
-        )
+        backend = get_sandbox_backend_registry().default(self.settings, RUNTIME_KIND)
         capability = backend.probe()
         return bool(capability.available)
 
@@ -143,15 +136,7 @@ class ComponentRendererService:
         }
 
     def _sandbox_render(self, preview_html: str, manifest: Any) -> bool:
-        image_ref = resolve_sandbox_image_for_runtime(self.settings, RUNTIME_KIND)
-        if not image_ref:
-            return False
-        backend = DockerSandboxBackend(
-            enabled=self.settings.sandbox_enabled,
-            image_ref=image_ref,
-            runtime_kind=RUNTIME_KIND,
-            archive_bytes=self.settings.sandbox_agent_archive_bytes,
-        )
+        backend = get_sandbox_backend_registry().default(self.settings, RUNTIME_KIND)
         capability = backend.probe()
         if not capability.available:
             return False
@@ -159,18 +144,23 @@ class ComponentRendererService:
         workspace_root = Path(self.settings.sandbox_workspace_root).expanduser().resolve()
         workspace_root.mkdir(parents=True, exist_ok=True)
         session_id = f"component-render-{manifest.id}"
+        # Each render gets its own isolated workspace directory; the shared
+        # workspace root is never mounted into a sandbox.
+        workspace_path = workspace_root / f"component-{session_id}"
+        workspace_path.mkdir(parents=True, exist_ok=True)
         handle = backend.create(
             SandboxCreateSpec(
                 session_id=session_id,
-                image_ref=image_ref,
+                image_ref=resolve_sandbox_image(self.settings) or "",
                 memory_bytes=256 * 1024 * 1024,
                 memory_swap_bytes=256 * 1024 * 1024,
                 cpu_count=1.0,
                 pids_max=64,
                 disk_bytes=16 * 1024 * 1024,
-                workspace_path=str(workspace_root),
+                workspace_path=str(workspace_path),
                 runtime_kind=RUNTIME_KIND,
                 egress=None,
+                workspace_key=session_id,
             )
         )
         try:
@@ -191,3 +181,4 @@ class ComponentRendererService:
                 backend.delete(handle)
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
+            shutil.rmtree(workspace_path, ignore_errors=True)
