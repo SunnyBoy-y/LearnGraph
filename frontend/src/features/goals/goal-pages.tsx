@@ -663,6 +663,14 @@ export function GraphReviewPage() {
     },
     onError: (error) => toast.error(error.message),
   });
+  // NOTE: this useMemo MUST stay above the early returns below. React requires
+  // hooks to be called unconditionally on every render; a hook after a
+  // conditional return changes the hook count between the loading and loaded
+  // renders and crashes the whole app with React error #310 (white screen).
+  const reviewGraph = useMemo(
+    () => (graph.data ? toReviewGraphView(graph.data) : undefined),
+    [graph.data],
+  );
 
   if (graphs.isPending || (Boolean(graphId) && graph.isPending))
     return (
@@ -696,10 +704,6 @@ export function GraphReviewPage() {
     graph.data.nodes[0];
   const allAccepted = graph.data.nodes.length > 0;
   const actionsDisabled = graph.data.status === "published";
-  const reviewGraph = useMemo(
-    () => (graph.data ? toReviewGraphView(graph.data) : undefined),
-    [graph.data],
-  );
 
   return (
     <PageFrame>
