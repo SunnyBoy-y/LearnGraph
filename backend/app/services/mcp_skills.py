@@ -3702,7 +3702,7 @@ class MCPAndSkillService:
         # the host-side bridge (/services/mcp-<server_key>/...). The bridge
         # host is explicitly trusted for plaintext HTTP - it is the authorized,
         # audited path to host loopback services.
-        bridge_url = self.settings.host_bridge_url
+        bridge_url = self.settings.effective_host_bridge_url
         allow_private_hosts: frozenset[str] = frozenset()
         if (
             bridge_url

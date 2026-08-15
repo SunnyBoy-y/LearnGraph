@@ -26,13 +26,34 @@ class Settings(BaseSettings):
     deployment_profile: str = "personal_desktop"
 
     # Host Service Bridge endpoint (host-side daemon, see
-    # docs/host-service-bridge.md). When set on a containerized deployment
+    # doc/host-service-bridge.md). When set on a containerized deployment
     # (self_hosted_team/cloud_saas), the Host Service Resolver rewrites
     # loopback provider/MCP URLs to {host_bridge_url}/services/<id>/...
     # so real-machine services (Ollama, LM Studio, local MCP, local APIs)
     # stay reachable from inside Docker. Leave unset on source installs:
     # loopback URLs then resolve directly.
     host_bridge_url: str | None = None
+    # When true (default), containerized deployments auto-derive the bridge
+    # endpoint as http://host.docker.internal:34115 — compose already wires
+    # extra_hosts host.docker.internal:host-gateway, so no per-user config is
+    # needed for the standard self-hosted shape. Set LEARNGRAPH_HOST_BRIDGE_URL
+    # explicitly to override; set this to false to disable bridging entirely
+    # (e.g. a cloud SaaS deployment with no local bridge).
+    host_bridge_auto: bool = True
+
+    @property
+    def effective_host_bridge_url(self) -> str | None:
+        """Resolve the bridge endpoint for the active deployment shape.
+
+        Priority: explicit ``host_bridge_url`` > auto-derived
+        ``http://host.docker.internal:34115`` on containerized profiles (when
+        ``host_bridge_auto``) > None (source installs keep direct loopback).
+        """
+        if self.host_bridge_url:
+            return self.host_bridge_url
+        if self.host_bridge_auto and self.deployment_profile != "personal_desktop":
+            return "http://host.docker.internal:34115"
+        return None
 
     env: str = "development"
     database_url: str = "sqlite:///./data/learngraph.db"

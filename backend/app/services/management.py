@@ -3080,7 +3080,7 @@ class ProviderService:
                     base_url=resolve_host_service_url(
                         provider_type=provider.provider_type,
                         base_url=provider.base_url,
-                        host_bridge_url=self.settings.host_bridge_url,
+                        host_bridge_url=self.settings.effective_host_bridge_url,
                         deployment_profile=self.settings.deployment_profile,
                     ),
                     api_key=self._optional_secret(provider.id),

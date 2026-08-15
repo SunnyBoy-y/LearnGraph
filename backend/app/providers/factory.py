@@ -417,7 +417,7 @@ def model_provider_for_workspace(
                 resolve_host_service_url(
                     provider_type=provider.provider_type,
                     base_url=provider.base_url,
-                    host_bridge_url=settings.host_bridge_url,
+                    host_bridge_url=settings.effective_host_bridge_url,
                     deployment_profile=settings.deployment_profile,
                 )
             )
