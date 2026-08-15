@@ -62,6 +62,38 @@ export default defineConfig(({ mode }) => {
                 maxSize: 320_000,
               },
               {
+                // React and its runtime share module-init-time state
+                // (dispatcher, ReactSharedInternals, jsx-runtime, scheduler).
+                // Entry-aware splitting scatters those modules across chunks
+                // (react even ended up inside the recharts chunk), which can
+                // leave shared constants undefined at init time in the browser
+                // and white-screen whole routes. Keep the React family in
+                // exactly ONE chunk.
+                name: 'react',
+                test: /node_modules[\\/](react|react-dom|react-is|react-router|react-router-dom|scheduler)[\\/]/,
+                priority: 30,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
+                // motion (framer-motion v12) has the same cyclic module graph
+                // problem: rolldown split AnimatePresence into its own chunk
+                // while the rest of motion lived in an entriesAware vendor
+                // chunk, so providers/document-learning/memory pages could
+                // crash at module-init with undefined shared state (the same
+                // failure mode as the recharts white screen). Keep the whole
+                // motion family in ONE chunk. `motion` is a re-export shim
+                // over `framer-motion`, so both packages (plus motion-dom /
+                // motion-utils) must be covered.
+                name: 'motion',
+                test: /node_modules[\\/](motion|framer-motion|motion-dom|motion-utils)[\\/]/,
+                priority: 30,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
                 // Recharts has a cyclic internal module graph; splitting it
                 // across chunks (maxSize or entriesAware above) makes a shared
                 // constant undefined at module-init time in the browser,
