@@ -87,13 +87,19 @@ class TestBootstrapStartRequestSchema:
 
 
 class TestBootstrapStartModeSelection:
+    # These tests exercise the legacy in-process ``docker`` backend routing of
+    # SandboxBootstrapService.start(). Pin the backend explicitly (init args
+    # beat a local .env LEARNGRAPH_SANDBOX_BACKEND=sandboxd) so the suite stays
+    # deterministic; the sandboxd routing has its own tests below.
+    LEGACY = {"sandbox_backend": "docker"}
+
     def test_prebuilt_mode_rejected_without_configuration(self, monkeypatch) -> None:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
         # tests/api/conftest.py disables the sandbox by default; the bootstrap
         # gate tests opt back in explicitly. Explicit None also beats a local
         # .env LEARNGRAPH_SANDBOX_PREBUILT_IMAGE (init args > env > dotenv).
-        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=None)  # sandbox_prebuilt_image defaults to None
+        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=None, **self.LEGACY)  # sandbox_prebuilt_image defaults to None
         result = service.start(settings, actor_id="u-test", mode="prebuilt")
         assert result["accepted"] is False
         assert result["error_code"] == "prebuilt_image_not_configured"
@@ -102,7 +108,7 @@ class TestBootstrapStartModeSelection:
     def test_build_mode_accepted_without_configuration(self, monkeypatch) -> None:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
-        settings = Settings(sandbox_enabled=True)
+        settings = Settings(sandbox_enabled=True, **self.LEGACY)
         # Do not let the worker thread actually touch Docker.
         monkeypatch.setattr(service, "_run_job", lambda job, s: None)
         result = service.start(settings, actor_id="u-test", mode="build")
@@ -114,7 +120,7 @@ class TestBootstrapStartModeSelection:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
         monkeypatch.setattr(service, "_run_job", lambda job, s: None)
-        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=ACR_REF)
+        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=ACR_REF, **self.LEGACY)
         result = service.start(settings, actor_id="u-test", mode="prebuilt")
         assert result["accepted"] is True
         assert result["job"]["mode"] == "prebuilt"
@@ -123,7 +129,7 @@ class TestBootstrapStartModeSelection:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
         monkeypatch.setattr(service, "_run_job", lambda job, s: None)
-        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=ACR_REF)
+        settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=ACR_REF, **self.LEGACY)
         result = service.start(settings, actor_id="u-test", mode="auto")
         assert result["accepted"] is True
         assert result["job"]["mode"] == "auto"
@@ -131,7 +137,7 @@ class TestBootstrapStartModeSelection:
     def test_invalid_mode_rejected(self, monkeypatch) -> None:
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
-        result = service.start(settings := Settings(), actor_id="u-test", mode="nope")
+        result = service.start(settings := Settings(**self.LEGACY), actor_id="u-test", mode="nope")
         assert result["accepted"] is False
         assert result["error_code"] == "invalid_bootstrap_mode"
 

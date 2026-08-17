@@ -527,21 +527,26 @@ async function main() {
   }
   const previewOrigin = `http://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${previewPort}`
 
-  // sandboxd control plane (Phase 2+): when the backend is configured with
-  // LEARNGRAPH_SANDBOX_BACKEND=sandboxd, manage a local daemon process so the
-  // app never talks to Docker Engine directly. A development token is
-  // generated under the ignored .sandboxd/ directory.
+  // sandboxd control plane (default): manage a local daemon process so the app
+  // never talks to Docker Engine directly (the app no longer ships the docker
+  // SDK; only the explicit `docker` backend needs the legacy-docker extra). A
+  // development token is generated under the ignored .sandboxd/ directory.
   const sandboxdEnabled =
-    (process.env.LEARNGRAPH_SANDBOX_BACKEND?.trim() || backendEnv.LEARNGRAPH_SANDBOX_BACKEND?.trim() || 'docker') === 'sandboxd'
+    (process.env.LEARNGRAPH_SANDBOX_BACKEND?.trim() || backendEnv.LEARNGRAPH_SANDBOX_BACKEND?.trim() || 'sandboxd') === 'sandboxd'
 
   const startSandboxd = () => {
     const sandboxdDir = path.join(repoRoot, 'sandboxd')
     const tokenDir = path.join(backendDir, 'data', '.sandboxd')
     const tokenFile = path.join(tokenDir, 'sandboxd-token')
+    const adminTokenFile = path.join(tokenDir, 'sandboxd-admin-token')
     const stateFile = path.join(tokenDir, 'state.db')
     mkdirSync(tokenDir, { recursive: true })
     if (!existsSync(tokenFile)) {
       writeFileSync(tokenFile, randomBytes(32).toString('hex'), { mode: 0o600 })
+    }
+    // Separate higher-privilege bootstrap token (pull + digest + smoke).
+    if (!existsSync(adminTokenFile)) {
+      writeFileSync(adminTokenFile, randomBytes(32).toString('hex'), { mode: 0o600 })
     }
     const sandboxdPort = Number(process.env.LEARNGRAPH_SANDBOXD_PORT?.trim() || 8090)
     console.log(`\nStarting sandboxd at http://127.0.0.1:${sandboxdPort} (backend=${backendOrigin}) ...`)
@@ -557,6 +562,7 @@ async function main() {
           SANDBOXD_LISTEN_HOST: '127.0.0.1',
           SANDBOXD_PORT: String(sandboxdPort),
           SANDBOXD_TOKEN_FILE: tokenFile,
+          SANDBOXD_ADMIN_TOKEN_FILE: adminTokenFile,
           SANDBOXD_STATE_PATH: stateFile,
           SANDBOXD_DEPLOYMENT_ID: process.env.LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID?.trim() || 'dev-local',
           SANDBOXD_RUNTIME_IMAGE: process.env.LEARNGRAPH_SANDBOX_IMAGE?.trim() || '',
@@ -603,6 +609,7 @@ async function main() {
                 LEARNGRAPH_SANDBOX_BACKEND: 'sandboxd',
                 LEARNGRAPH_SANDBOXD_URL: `http://127.0.0.1:${process.env.LEARNGRAPH_SANDBOXD_PORT?.trim() || 8090}`,
                 LEARNGRAPH_SANDBOXD_TOKEN_FILE: path.join(backendDir, 'data', '.sandboxd', 'sandboxd-token'),
+                LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE: path.join(backendDir, 'data', '.sandboxd', 'sandboxd-admin-token'),
                 LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID: process.env.LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID?.trim() || 'dev-local',
               }
             : {}),

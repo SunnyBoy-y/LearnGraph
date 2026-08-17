@@ -143,7 +143,7 @@ def effective_bootstrap_source(settings: Settings) -> tuple[str, str | None]:
     source = load_bootstrap_source(settings)
     mode = source.mode if source is not None else "auto"
     prebuilt = source.prebuilt_image if source is not None else None
-    env_ref = (settings.sandbox_prebuilt_image or "").strip()
+    env_ref = (settings.effective_sandbox_prebuilt_image or "").strip()
     if env_ref:
         prebuilt = env_ref
     return mode, prebuilt

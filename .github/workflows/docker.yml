@@ -13,6 +13,7 @@ on:
       - "backend/sandbox/**"
       - "backend/pyproject.toml"
       - "backend/uv.lock"
+      - "sandboxd/**"
       - ".github/workflows/docker.yml"
   push:
     branches:
@@ -30,6 +31,7 @@ on:
       - "backend/sandbox/**"
       - "backend/pyproject.toml"
       - "backend/uv.lock"
+      - "sandboxd/**"
       - ".github/workflows/docker.yml"
   workflow_dispatch:
 
@@ -149,3 +151,115 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  sandboxd:
+    name: sandboxd control plane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build sandboxd image
+        run: docker build -f sandboxd/Dockerfile -t sandboxd:ci .
+
+      - name: Build app image
+        run: docker build -f Dockerfile -t learngraph:ci .
+
+      - name: App image must NOT bundle the docker SDK
+        run: |
+          set -euo pipefail
+          if docker run --rm --entrypoint python learngraph:ci -c "import docker" >/dev/null 2>&1; then
+            echo "app image must NOT bundle the docker SDK (sandboxd owns Docker)" >&2
+            exit 1
+          fi
+          echo "app image has no docker SDK: ok"
+
+      - name: Run sandboxd against the host socket and assert the control plane
+        run: |
+          set -euo pipefail
+          secrets_dir=/tmp/sandboxd-ci-secrets
+          mkdir -p "$secrets_dir"
+          openssl rand -hex 32 > "$secrets_dir/token"
+          openssl rand -hex 32 > "$secrets_dir/admin-token"
+          socket_gid=$(stat -c %g /var/run/docker.sock)
+          docker network create sandbox-control-ci >/dev/null 2>&1 || true
+          docker run -d --name sandboxd-ci \
+            --network sandbox-control-ci \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --group-add "$socket_gid" \
+            -e SANDBOXD_LISTEN_HOST=0.0.0.0 \
+            -e SANDBOXD_PORT=8090 \
+            -e SANDBOXD_TOKEN_FILE=/run/secrets/token \
+            -e SANDBOXD_ADMIN_TOKEN_FILE=/run/secrets/admin-token \
+            -e SANDBOXD_DEPLOYMENT_ID=ci \
+            -e SANDBOXD_EGRESS_ENABLED=false \
+            -e SANDBOXD_STATE_PATH=/tmp/state.db \
+            -v "$secrets_dir":/run/secrets:ro \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            sandboxd:ci
+          trap 'docker rm -f sandboxd-ci >/dev/null 2>&1 || true; docker network rm sandbox-control-ci >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec sandboxd-ci python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/v1/health/live', timeout=3)" >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "sandboxd did not become live" >&2
+              docker logs sandboxd-ci || true
+              exit 1
+            fi
+            sleep 2
+          done
+          docker exec sandboxd-ci python - <<'PY'
+          import json
+          import urllib.request
+
+          def get(path: str, token: str):
+              req = urllib.request.Request(
+                  "http://127.0.0.1:8090" + path,
+                  headers={"Authorization": "Bearer " + token},
+              )
+              return json.load(urllib.request.urlopen(req, timeout=5))
+
+          token = open("/run/secrets/token", encoding="utf-8").read().strip()
+          ready = get("/v1/health/ready", token)
+          assert ready.get("docker") is True, ready
+          caps = get("/v1/capabilities", token)
+          assert "max_file_bytes" in (caps.get("limits") or {}), caps
+          print("sandboxd docker ping ok; control plane authenticated")
+          PY
+          # A non-managed network name must never be touchable through the API:
+          # create without an immutable runtime image must fail closed.
+          docker exec sandboxd-ci python - <<'PY'
+          import json
+          import urllib.request
+          token = open("/run/secrets/token", encoding="utf-8").read().strip()
+          body = json.dumps({
+              "protocol_version": "1.0",
+              "session_id": "ci-fail-closed",
+              "workspace_key": "ci-fail-closed",
+              "owner": {"deployment_id": "ci", "workspace_id": "", "session_id": "ci-fail-closed"},
+              "runtime_kind": "python-node",
+              "memory_bytes": 268435456,
+              "memory_swap_bytes": 268435456,
+              "cpu_count": 1.0,
+              "pids_max": 64,
+              "disk_bytes": 1048576,
+              "egress": None,
+              "ttl_seconds": 3600,
+              "idempotency_key": "ci-fail-closed",
+          }).encode("utf-8")
+          req = urllib.request.Request(
+              "http://127.0.0.1:8090/v1/sandboxes",
+              data=body,
+              headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              urllib.request.urlopen(req, timeout=5)
+          except urllib.error.HTTPError as exc:
+              assert exc.code in (400, 503), exc.code
+              print("create without runtime image fails closed: ok")
+          else:
+              raise AssertionError("create without runtime image must fail closed")
+          PY

@@ -3,12 +3,21 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEPLOYMENT_PROFILES = frozenset({"personal_desktop", "self_hosted_team", "cloud_saas"})
+
+# Release-default prebuilt sandbox runner image. Bump this constant with every
+# release: deployments that do NOT set LEARNGRAPH_SANDBOX_PREBUILT_IMAGE pick up
+# the new runner automatically when they upgrade the code, so open-source users
+# never need to edit their .env to follow a newer runner build. Setting the env
+# var still pins an explicit reference (admin lock).
+DEFAULT_SANDBOX_PREBUILT_IMAGE = (
+    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.4"
+)
 
 
 class Settings(BaseSettings):
@@ -194,7 +203,10 @@ class Settings(BaseSettings):
     # the feature by default does not make an unpinned/missing runner image
     # executable; the backend still reports an explicit unavailable state.
     sandbox_enabled: bool = True
-    sandbox_backend: str = "docker"
+    # The sandboxd control plane is the runtime of record since the execution
+    # pool migration; the legacy in-process Docker backend ("docker") is kept
+    # only as a migration shim for deployments that have not switched yet.
+    sandbox_backend: str = "sandboxd"
     # sandboxd control-plane connection (required when sandbox_backend=sandboxd).
     # The daemon owns Docker Engine; LearnGraph only consumes its authenticated
     # Sandbox API. The deployment id MUST match the daemon's SANDBOXD_DEPLOYMENT_ID.
@@ -215,7 +227,20 @@ class Settings(BaseSettings):
     # Optional Docker Hub/registry image fetched by Bootstrap instead of locally
     # building the runner. Tags are resolved to an immutable RepoDigest before
     # they can become the runtime image reference.
+    # When unset, effective_sandbox_prebuilt_image falls back to the code
+    # release default (DEFAULT_SANDBOX_PREBUILT_IMAGE), so upgrading the code
+    # carries the new runner version without touching operator .env files.
     sandbox_prebuilt_image: str | None = None
+
+    @property
+    def effective_sandbox_prebuilt_image(self) -> str | None:
+        """Resolve the prebuilt runner image reference for this deployment.
+
+        Explicit LEARNGRAPH_SANDBOX_PREBUILT_IMAGE wins; otherwise the code
+        release default follows code upgrades (open-source users never edit
+        their .env to get a newer runner).
+        """
+        return (self.sandbox_prebuilt_image or "").strip() or DEFAULT_SANDBOX_PREBUILT_IMAGE
     sandbox_task_ttl_seconds: int = 3_600
     sandbox_container_idle_ttl_seconds: int = 600
     sandbox_container_absolute_ttl_seconds: int = 3_600
@@ -269,6 +294,37 @@ class Settings(BaseSettings):
     sandbox_host_max_allocated_cpu_ratio: float = 0.80
     sandbox_host_minimum_free_disk_bytes: int = 20 * 1024 * 1024 * 1024
     sandbox_agent_enabled: bool = True
+    # ── Execution pool / unified scheduler ─────────────────────────────
+    # Platform hard caps (never exceeded, even by admin overrides).
+    sandbox_hard_max_instances_per_user: int = 8
+    sandbox_hard_max_parallel_execs_per_instance: int = 8
+    # Deployment defaults (admin/user overrides may lower but not raise past hard caps).
+    sandbox_default_max_instances_per_user: int = 2
+    sandbox_default_max_parallel_execs_per_instance: int = 4
+    sandbox_default_queue_depth_per_user: int = 50
+    sandbox_queue_deadline_seconds: int = 1_800
+    sandbox_job_wall_time_seconds: int = 600
+    sandbox_execution_lease_seconds: int = 300
+    sandbox_reservation_ttl_seconds: int = 120
+    sandbox_scheduler_interval_seconds: int = 5
+    sandbox_scheduler_workers: int = 4
+    # Execution-pool instance reuse: when enabled, a user's chat workspaces
+    # share the user's warm sandboxd instance (one physical container per
+    # instance, chat workspaces isolated by directory prefix). The legacy
+    # per-chat container path remains for the docker backend.
+    sandbox_instance_pooling_enabled: bool = True
+    sandbox_probe_high_watermark: float = 0.80
+    sandbox_probe_low_watermark: float = 0.60
+    sandbox_probe_low_recovery_rounds: int = 6
+    # Workload-class resource hints (server-side authoritative; Agents never
+    # supply raw resource numbers). Keys: read_only / python / build / browser.
+    sandbox_workload_classes: dict[str, dict[str, Any]] = {
+        "read_only": {"cpu": 0.1, "memory_bytes": 64 * 1024 * 1024, "pids": 8},
+        "python": {"cpu": 0.5, "memory_bytes": 512 * 1024 * 1024, "pids": 64},
+        "build": {"cpu": 1.5, "memory_bytes": 1536 * 1024 * 1024, "pids": 256},
+        "browser": {"cpu": 1.0, "memory_bytes": 2048 * 1024 * 1024, "pids": 256},
+    }
+    # ── End execution pool ─────────────────────────────────────────────
     # Multi-file teaching application previews are served only through an
     # independent origin (separate process/port or a real reverse-proxied
     # domain). This env override is a deployment default; an administrator can
@@ -286,8 +342,23 @@ class Settings(BaseSettings):
     # above the per-file limit while rejecting whole-workspace multi-GiB archives.
     sandbox_agent_archive_bytes: int = 320 * 1024 * 1024
     sandbox_agent_command_args_max: int = 32
+    # ── Sandbox toolkit (bash / git / patch / notebook / subagent / network) ──
+    sandbox_bash_enabled: bool = True
+    sandbox_bash_max_chars: int = 16_384
+    sandbox_git_enabled: bool = True
+    sandbox_patch_max_bytes: int = 2_000_000
+    sandbox_notebook_enabled: bool = True
+    sandbox_subagent_enabled: bool = True
+    sandbox_subagent_max_rounds: int = 6
+    sandbox_subagent_max_seconds: int = 300
+    # Host-side network tools for the sandbox (search/fetch). The sandbox
+    # container itself stays offline; requests go through the reviewed
+    # authorization pipeline on the host.
+    sandbox_network_tools_enabled: bool = True
     sandbox_cleanup_scheduler_enabled: bool = True
     sandbox_cleanup_interval_seconds: int = 60
+    sandbox_execution_scheduler_enabled: bool = True
+    sandbox_execution_scheduler_interval_seconds: int = 5
     # --- Reviewed outbound egress (P2-C) -------------------------------------
     # Sandbox egress is on by default for the local product experience, but it
     # still requires a valid per-workspace reviewed policy file; without one the
@@ -500,13 +571,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_sandboxd_connection(self) -> "Settings":
+        # sandbox_backend=sandboxd without a configured daemon connection is
+        # valid: the app starts and every sandbox probe reports an explicit
+        # "backend unavailable" (fail closed). This keeps the default flipped to
+        # sandboxd without breaking bare source checkouts that have not wired a
+        # daemon yet.
         if self.sandbox_backend == "sandboxd":
             if not (self.sandboxd_url or "").strip():
-                raise ValueError("LEARNGRAPH_SANDBOXD_URL is required when sandbox_backend=sandboxd")
+                self.sandboxd_url = "http://127.0.0.1:8090"
             if not (self.sandboxd_token_file or "").strip():
-                raise ValueError(
-                    "LEARNGRAPH_SANDBOXD_TOKEN_FILE is required when sandbox_backend=sandboxd"
-                )
+                self.sandboxd_token_file = "./data/.sandboxd/sandboxd-token"
         return self
 
     @field_validator("sandbox_agent_file_bytes")
@@ -555,11 +629,18 @@ class Settings(BaseSettings):
             if self.cors_origins and any("0.0.0.0" in o for o in self.cors_origins):
                 warnings.append("personal_desktop: CORS origins should not contain 0.0.0.0")
         if self.deployment_profile in ("self_hosted_team", "cloud_saas"):
-            if self.sandbox_enabled and self.sandbox_backend != "docker":
+            if self.sandbox_enabled and self.sandbox_backend == "docker":
                 warnings.append(
-                    f"{self.deployment_profile}: sandbox_backend must be 'docker'"
+                    f"{self.deployment_profile}: docker backend 已弃用（drain-only），"
+                    "生产部署请使用 sandboxd 控制面（docker-compose.sandbox.yml / docker/wrapper）"
                 )
         return warnings
+
+
+# `from __future__ import annotations` defers field annotations to strings;
+# pydantic 2.13+ needs an explicit rebuild so forward references (e.g. `Any`
+# inside generic dict annotations) resolve before validation runs.
+Settings.model_rebuild()
 
 
 @lru_cache

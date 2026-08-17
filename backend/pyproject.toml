@@ -22,7 +22,6 @@ dependencies = [
   "pypdf>=5,<7",
   "xlrd>=2.0.2,<3",
   "pillow>=10,<12",
-  "docker>=7.1,<8",
   # Pure-Python HTML→Markdown main-text extraction. Used by the sandbox
   # web_fetch task (and its unit tests) to turn untrusted HTML into inert
   # Markdown before it ever reaches the host.
@@ -38,11 +37,22 @@ test = [
   "pytest>=8.3,<10",
   "pytest-cov>=6,<8",
 ]
+# Legacy in-process Docker sandbox backend (drain-only). The sandboxd control
+# plane owns Docker Engine for production; this extra exists so operators can
+# still run the pre-migration ``docker`` backend during a phased cutover.
+legacy-docker = [
+  "docker>=7.1,<8",
+]
 infrastructure = [
   "minio>=7.2,<8",
   "psycopg[binary]>=3.2,<4",
   "pymysql>=1.1,<2",
   "redis>=5,<7",
+]
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: requires an explicitly configured sandboxd/Docker runtime (opt-in, local only)",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -561,6 +561,8 @@ class SandboxBootstrapService:
         self._thread: threading.Thread | None = None
 
     def status(self, settings: Settings) -> dict[str, Any]:
+        if (settings.sandbox_backend or "").strip().casefold() == "sandboxd":
+            return self._sandboxd_status(settings)
         docker_reachable, docker_detail = self._probe_docker()
         docker_installed = docker_reachable or shutil.which("docker") is not None
         image = resolve_sandbox_image(settings)
@@ -678,9 +680,265 @@ class SandboxBootstrapService:
             "remediation_steps": remediation,
         }
 
+    def _sandboxd_client(self, settings: Settings):
+        """Build an admin-capable SandboxdClient or return ``(None, reason)``.
+
+        Bootstrap is a higher-privilege surface: it requires the daemon's
+        separate admin token. The service token alone can still report daemon
+        readiness, so status degrades gracefully instead of failing hard.
+        """
+        from app.providers.remote.sandboxd_client import SandboxdClient
+
+        url = (settings.sandboxd_url or "").strip()
+        if not url:
+            return None, "sandboxd URL is not configured"
+        token_file = (settings.sandboxd_token_file or "").strip()
+        if not token_file:
+            return None, "sandboxd token file is not configured"
+        admin_token_file = (settings.sandboxd_admin_token_file or "").strip()
+        if not admin_token_file:
+            return None, "sandboxd admin token file is not configured"
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+            admin_token = Path(admin_token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            return None, f"sandboxd token file is unreadable: {type(exc).__name__}"
+        if not token or not admin_token:
+            return None, "sandboxd token file is empty"
+        return (
+            SandboxdClient(
+                url=url,
+                token=token,
+                admin_token=admin_token,
+                deployment_id=settings.sandboxd_deployment_id,
+                connect_timeout=settings.sandboxd_connect_timeout_seconds,
+                request_timeout=settings.sandboxd_request_timeout_seconds,
+                protocol_min=settings.sandboxd_protocol_min,
+                protocol_max=settings.sandboxd_protocol_max,
+            ),
+            None,
+        )
+
+    def _sandboxd_status(self, settings: Settings) -> dict[str, Any]:
+        """sandboxd-mode bootstrap status (daemon owns Docker + runtime store)."""
+        from app.providers.remote.sandboxd_client import (
+            SandboxdProtocolError,
+            SandboxdUnavailable,
+        )
+
+        with self._lock:
+            job = self._job
+            active = job.to_public() if job and job.status == "running" else None
+            last_failed = job.to_public() if job and job.status == "failed" else None
+
+        client, client_error = self._sandboxd_client(settings)
+        daemon_reachable = False
+        docker_reachable = False
+        daemon_detail: str | None = client_error
+        daemon_reasons: list[str] = []
+        runtimes: list[dict[str, Any]] = []
+        admin_configured = client is not None
+        if client is not None:
+            try:
+                ready = client.get_ready()
+                daemon_reachable = bool(ready.get("ready"))
+                docker_reachable = bool(ready.get("docker"))
+                daemon_reasons = [str(r) for r in (ready.get("reasons") or [])]
+            except (SandboxdUnavailable, SandboxdProtocolError) as exc:
+                daemon_detail = str(exc)
+            try:
+                runtimes = client.list_runtimes()
+            except (SandboxdUnavailable, SandboxdProtocolError) as exc:
+                if daemon_detail is None:
+                    daemon_detail = str(exc)
+
+        record = next(
+            (r for r in runtimes if r.get("runtime_kind") == "python-node"),
+            None,
+        )
+        image_digest = (
+            str(record["image_digest"])
+            if record and image_ref_is_pinned(str(record.get("image_digest") or ""))
+            else None
+        )
+        image_ready = bool(record and record.get("smoke_status") == "passed")
+
+        try:
+            _, effective_prebuilt = effective_bootstrap_source(settings)
+            prebuilt_ref = _prebuilt_image_ref(effective_prebuilt) if effective_prebuilt else None
+        except ValueError:
+            prebuilt_ref = None
+
+        remediation: list[str] = []
+        can_initialize = settings.sandbox_enabled and daemon_reachable and admin_configured
+        if not settings.sandbox_enabled:
+            remediation.append("部署已关闭沙箱（LEARNGRAPH_SANDBOX_ENABLED=false）")
+            can_initialize = False
+        elif not daemon_reachable:
+            remediation.extend(
+                [
+                    "确认 sandboxd 控制面已启动且健康",
+                    daemon_detail or "sandboxd 不可达",
+                ]
+                + daemon_reasons
+            )
+            can_initialize = False
+        elif not admin_configured:
+            remediation.append("sandboxd admin token 未配置，无法初始化沙箱运行环境")
+            can_initialize = False
+        elif image_ready:
+            remediation.append("沙箱运行环境已就绪，可直接在会话中使用 Agent 文件与代码能力")
+            can_initialize = True
+        else:
+            remediation.extend(
+                [
+                    "点击「初始化沙箱」让 sandboxd 拉取并冒烟检查预构建 Runner 镜像",
+                    "sandboxd 模式只支持 prebuilt 镜像；本地构建仅在 docker backend 下可用",
+                ]
+            )
+            if prebuilt_ref is None:
+                remediation.append("请先配置 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE")
+            if record is not None and record.get("smoke_status") not in (None, "passed"):
+                remediation.append(f"最近一次运行环境状态：{record.get('smoke_status')}")
+
+        return {
+            "docker_installed": daemon_reachable,
+            "docker_reachable": docker_reachable,
+            "docker_detail": daemon_detail,
+            "sandbox_enabled": settings.sandbox_enabled,
+            "image_ready": image_ready,
+            "image_digest": image_digest,
+            "browser_image_ready": image_ready,
+            "browser_image_digest": image_digest,
+            "member_bootstrap_allowed": effective_member_bootstrap_allowed(settings),
+            "bootstrap_policy": load_bootstrap_policy(settings).to_dict()
+            if load_bootstrap_policy(settings)
+            else None,
+            "prebuilt_image_configured": bool(prebuilt_ref),
+            "prebuilt_image_ref": _friendly_image_ref(prebuilt_ref) if prebuilt_ref else None,
+            "bootstrap_mode": effective_bootstrap_source(settings)[0],
+            "image_source": "sandboxd",
+            "phase": active["phase"] if active else ("ready" if image_ready else "idle"),
+            "progress_percent": active["progress_percent"] if active else (100 if image_ready else 0),
+            "message": (
+                active["message"]
+                if active
+                else ("沙箱运行环境已就绪" if image_ready else "尚未初始化沙箱运行环境")
+            ),
+            "detail": active["detail"] if active else None,
+            "can_initialize": bool(can_initialize and active is None),
+            "active_job": active,
+            "last_failed_job": last_failed,
+            "remediation_steps": remediation,
+        }
+
+    def _start_sandboxd(
+        self, settings: Settings, *, actor_id: str, mode: str
+    ) -> dict[str, Any]:
+        """sandboxd-mode bootstrap: daemon pulls + pins + smokes the prebuilt image.
+
+        The daemon API is synchronous for the pull/bootstrap operation, so the
+        job completes inline (no worker thread) while still publishing a
+        compatible ``BootstrapJob`` view for the UI poll.
+        """
+        from app.providers.remote.sandboxd_client import (
+            SandboxdProtocolError,
+            SandboxdUnavailable,
+        )
+
+        if mode not in ("auto", "prebuilt", "build"):
+            return {
+                "accepted": False,
+                "error_code": "invalid_bootstrap_mode",
+                "error_message": f"Unsupported sandbox bootstrap mode: {mode}",
+                "job": None,
+                "status": self._sandboxd_status(settings),
+            }
+        if not settings.sandbox_enabled:
+            return {
+                "accepted": False,
+                "error_code": "sandbox_disabled",
+                "error_message": "Sandbox execution is disabled by deployment configuration",
+                "job": None,
+                "status": self._sandboxd_status(settings),
+            }
+        if mode == "build":
+            return {
+                "accepted": False,
+                "error_code": "sandboxd_build_unsupported",
+                "error_message": (
+                    "sandboxd 控制面只支持 prebuilt 镜像（拉取 + 摘要固定 + 冒烟检查）；"
+                    "本地构建仅在 docker backend 下可用"
+                ),
+                "job": None,
+                "status": self._sandboxd_status(settings),
+            }
+
+        client, client_error = self._sandboxd_client(settings)
+        if client is None:
+            return {
+                "accepted": False,
+                "error_code": "sandboxd_admin_unavailable",
+                "error_message": client_error or "sandboxd admin control plane is unavailable",
+                "job": None,
+                "status": self._sandboxd_status(settings),
+            }
+
+        _, effective_prebuilt = effective_bootstrap_source(settings)
+        try:
+            prebuilt_ref = _prebuilt_image_ref(effective_prebuilt) if effective_prebuilt else None
+        except ValueError as exc:
+            return {
+                "accepted": False,
+                "error_code": "prebuilt_image_invalid",
+                "error_message": str(exc),
+                "job": None,
+                "status": self._sandboxd_status(settings),
+            }
+        if not prebuilt_ref:
+            return {
+                "accepted": False,
+                "error_code": "prebuilt_image_not_configured",
+                "error_message": (
+                    "sandboxd 模式需要配置预构建沙箱镜像"
+                    "（LEARNGRAPH_SANDBOX_PREBUILT_IMAGE 或设置页镜像来源）"
+                ),
+                "job": None,
+                "status": self._sandboxd_status(settings),
+            }
+
+        with self._lock:
+            if self._job is not None and self._job.status == "running":
+                return {
+                    "accepted": True,
+                    "joined_existing": True,
+                    "job": self._job.to_public(),
+                    "status": self._sandboxd_status(settings),
+                }
+            job = BootstrapJob(id=str(uuid.uuid4()), actor_id=actor_id, mode=mode)
+            self._job = job
+            self._set_phase(job, "pull_runner", 45, "由 sandboxd 拉取预构建 Runner 镜像…")
+
+        try:
+            result = client.install_runtime("python-node", prebuilt_ref)
+            digest = str(result.get("image_digest") or "")
+            with self._lock:
+                self._succeed(job, digest=digest, browser_digest=digest)
+        except (SandboxdUnavailable, SandboxdProtocolError) as exc:
+            with self._lock:
+                self._fail(job, "sandboxd_bootstrap_failed", str(exc))
+        return {
+            "accepted": True,
+            "joined_existing": False,
+            "job": job.to_public(),
+            "status": self._sandboxd_status(settings),
+        }
+
     def start(
         self, settings: Settings, *, actor_id: str, mode: str = "auto"
     ) -> dict[str, Any]:
+        if (settings.sandbox_backend or "").strip().casefold() == "sandboxd":
+            return self._start_sandboxd(settings, actor_id=actor_id, mode=mode)
         if mode not in ("auto", "prebuilt", "build"):
             return {
                 "accepted": False,
@@ -1068,7 +1326,10 @@ class SandboxBootstrapService:
             import docker
         except ImportError as exc:
             raise RuntimeError(
-                "Docker SDK is not installed; install the backend docker dependency"
+                "Docker SDK is not installed; this build only ships the sandboxd "
+                "control plane. Either enable LEARNGRAPH_SANDBOX_BACKEND=sandboxd "
+                "(default, recommended) or, to keep the legacy in-process docker "
+                "backend, install the extra: uv sync --extra legacy-docker"
             ) from exc
         return docker.from_env()
 

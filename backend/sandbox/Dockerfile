@@ -14,6 +14,12 @@
 ARG NODE_BASE=node:22-bookworm-slim
 ARG PYTHON_BASE=python:3.12-slim-bookworm
 
+# Runner ABI contract: sandboxd refuses to bootstrap any image whose
+# com.learngraph.runner-abi label is missing or outside the accepted range
+# (sandboxd/sandboxd/config.py -> RUNNER_ABI_MIN / RUNNER_ABI_MAX). Bump this
+# ARG together with the sandboxd range whenever the runner contract changes.
+ARG RUNNER_ABI=1
+
 FROM ${NODE_BASE} AS node-runtime
 
 FROM node-runtime AS toolchain
@@ -27,6 +33,11 @@ RUN npm config set registry "${NPM_REGISTRY}" \
 
 FROM ${PYTHON_BASE} AS runtime
 ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG RUNNER_ABI
+
+# sandboxd verifies this label during prebuilt bootstrap
+# (install_runtime -> runner_abi_mismatch if missing or out of range).
+LABEL com.learngraph.runner-abi="${RUNNER_ABI}"
 
 # Copy the official Node runtime as a complete /usr/local tree: node, npm,
 # npx, corepack and their symlinks stay version-consistent without installing
