@@ -29,6 +29,10 @@ from sandboxd.protocol import (
     FileIndex,
     FixedExecRequest,
     HealthReady,
+    KernelCellRequest,
+    KernelCellResult,
+    KernelOpenRequest,
+    KernelOpenResult,
     SandboxView,
 )
 
@@ -88,6 +92,16 @@ class SandboxAPI:
             raise HTTPException(status_code=400, detail="X-Sandbox-Scope must be deployment|session")
         return scope_key(parts[0], parts[1])
 
+    @staticmethod
+    def _fence(request: Request) -> int | None:
+        value = request.headers.get("X-Sandbox-Fence")
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="X-Sandbox-Fence must be an integer")
+
     def build_router(self) -> APIRouter:
         router = APIRouter(prefix="/v1")
 
@@ -121,7 +135,7 @@ class SandboxAPI:
             x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
         ) -> SandboxView:
             try:
-                return self.controller.get(sandbox_id, self._scope(request, x_sandbox_scope))
+                return self.controller.get(sandbox_id, self._scope(request, x_sandbox_scope), fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
 
@@ -132,7 +146,7 @@ class SandboxAPI:
             x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
         ) -> SandboxView:
             try:
-                return self.controller.resume(sandbox_id, self._scope(request, x_sandbox_scope))
+                return self.controller.resume(sandbox_id, self._scope(request, x_sandbox_scope), fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
 
@@ -143,7 +157,7 @@ class SandboxAPI:
             x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
         ) -> SandboxView:
             try:
-                return self.controller.stop(sandbox_id, self._scope(request, x_sandbox_scope))
+                return self.controller.stop(sandbox_id, self._scope(request, x_sandbox_scope), fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
 
@@ -184,7 +198,7 @@ class SandboxAPI:
             if len(data) != size:
                 return JSONResponse(status_code=400, content={"error": {"code": "invalid_request", "message": "body length mismatch"}})
             try:
-                self.controller.write_file(sandbox_id, self._scope(request, x_sandbox_scope), path, data, mode=mode)
+                self.controller.write_file(sandbox_id, self._scope(request, x_sandbox_scope), path, data, mode=mode, fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
             return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -199,7 +213,7 @@ class SandboxAPI:
         ) -> Response:
             bounded = max(1, min(limit, self.controller.config.max_file_bytes))
             try:
-                data = self.controller.read_file(sandbox_id, self._scope(request, x_sandbox_scope), path, bounded)
+                data = self.controller.read_file(sandbox_id, self._scope(request, x_sandbox_scope), path, bounded, fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
             return Response(content=data, media_type="application/octet-stream")
@@ -212,7 +226,7 @@ class SandboxAPI:
             x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
         ) -> Response:
             try:
-                self.controller.delete_file(sandbox_id, self._scope(request, x_sandbox_scope), path)
+                self.controller.delete_file(sandbox_id, self._scope(request, x_sandbox_scope), path, fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
             return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -229,7 +243,7 @@ class SandboxAPI:
             bounded = max(1, min(limit, 10_000))
             try:
                 return self.controller.list_files(
-                    sandbox_id, self._scope(request, x_sandbox_scope), prefix, bounded, cursor
+                    sandbox_id, self._scope(request, x_sandbox_scope), prefix, bounded, cursor, fence=self._fence(request)
                 )
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
@@ -244,7 +258,7 @@ class SandboxAPI:
             x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
         ) -> ExecResult:
             try:
-                outcome = self.controller.exec_fixed(sandbox_id, self._scope(request, x_sandbox_scope), body)
+                outcome = self.controller.exec_fixed(sandbox_id, self._scope(request, x_sandbox_scope), body, fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
             return outcome.result
@@ -257,7 +271,7 @@ class SandboxAPI:
             x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
         ) -> ExecResult:
             try:
-                outcome = self.controller.exec_agent(sandbox_id, self._scope(request, x_sandbox_scope), body)
+                outcome = self.controller.exec_agent(sandbox_id, self._scope(request, x_sandbox_scope), body, fence=self._fence(request))
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
             return outcome.result
@@ -279,9 +293,67 @@ class SandboxAPI:
                 "truncated": bool(record["truncated"]),
                 "latency_ms": record["latency_ms"],
                 "argv_digest": record["argv_digest"],
+                "cancel_requested_at": record.get("cancel_requested_at"),
+                "finished_reason": record.get("finished_reason"),
                 "started_at": record["started_at"],
                 "finished_at": record["finished_at"],
             }
+
+        @router.post("/executions/{execution_id}/cancel", dependencies=[Depends(self.service_auth)])
+        def cancel_execution(
+            execution_id: str,
+            request: Request,
+            x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
+        ) -> dict:
+            try:
+                return self.controller.cancel_execution(
+                    execution_id, self._scope(request, x_sandbox_scope)
+                )
+            except SandboxdError as exc:
+                return _error_response(exc, request_id_header(request))
+
+        # --- kernels (persistent in-container REPL) --------------------------
+
+        @router.post("/sandboxes/{sandbox_id}/kernels", dependencies=[Depends(self.service_auth)])
+        def kernel_open(
+            sandbox_id: str,
+            body: KernelOpenRequest,
+            request: Request,
+            x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
+        ) -> KernelOpenResult:
+            try:
+                return self.controller.kernel_open(
+                    sandbox_id, self._scope(request, x_sandbox_scope), body
+                )
+            except SandboxdError as exc:
+                return _error_response(exc, request_id_header(request))
+
+        @router.post("/kernels/{kernel_id}/execute", dependencies=[Depends(self.service_auth)])
+        def kernel_execute(
+            kernel_id: str,
+            body: KernelCellRequest,
+            request: Request,
+            x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
+        ) -> KernelCellResult:
+            try:
+                return self.controller.kernel_execute(
+                    kernel_id, self._scope(request, x_sandbox_scope), body
+                )
+            except SandboxdError as exc:
+                return _error_response(exc, request_id_header(request))
+
+        @router.delete("/kernels/{kernel_id}", dependencies=[Depends(self.service_auth)])
+        def kernel_close(
+            kernel_id: str,
+            request: Request,
+            x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope"),
+        ) -> dict:
+            try:
+                return self.controller.kernel_close(
+                    kernel_id, self._scope(request, x_sandbox_scope)
+                )
+            except SandboxdError as exc:
+                return _error_response(exc, request_id_header(request))
 
         # --- admin / bootstrap surface --------------------------------------
 

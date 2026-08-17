@@ -35,6 +35,10 @@ from sandboxd.protocol import (
     FileListEntry,
     FixedExecRequest,
     HealthReady,
+    KernelCellRequest,
+    KernelCellResult,
+    KernelOpenRequest,
+    KernelOpenResult,
     RUNTIME_KINDS,
     SandboxView,
 )
@@ -100,6 +104,21 @@ def _payload_hash(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _limits_match(existing_limits: dict[str, Any], body: CreateSandboxRequest) -> bool:
+    """True when an existing sandbox's resource/egress profile is compatible.
+
+    Same-user instance reuse must not silently downgrade/upgrade the physical
+    container; incompatible requests keep the legacy idempotency semantics.
+    """
+    return (
+        int(existing_limits.get("memory_bytes") or 0) == body.memory_bytes
+        and int(existing_limits.get("memory_swap_bytes") or 0) == body.memory_swap_bytes
+        and abs(float(existing_limits.get("cpu_count") or 0) - body.cpu_count) < 1e-6
+        and int(existing_limits.get("pids_max") or 0) == body.pids_max
+        and int(existing_limits.get("disk_bytes") or 0) == body.disk_bytes
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -123,6 +142,8 @@ class SandboxController:
         self._lock = threading.RLock()
         self._reconcile_status = "not_run"
         self._reconcile_reason: list[str] = []
+        # kernel_id -> {kernel_id, sandbox_id, scope, interpreter, workspace_relative}
+        self._kernels: dict[str, dict[str, str]] = {}
 
     # --- protocol surface --------------------------------------------------
 
@@ -138,7 +159,20 @@ class SandboxController:
 
     def capacity(self) -> Capacity:
         cpu, memory = self.runtime.capacity()
-        return Capacity(cpu_count=cpu, memory_bytes=memory)
+        observed: dict[str, Any] = {}
+        observe = getattr(self.runtime, "observe", None)
+        if callable(observe):
+            try:
+                observed = observe() or {}
+            except Exception:  # noqa: BLE001 - probe never fails the endpoint
+                observed = {}
+        return Capacity(
+            cpu_count=cpu,
+            memory_bytes=memory,
+            observed_memory_bytes=int(observed.get("observed_memory_bytes") or 0),
+            observed_cpu_percent=float(observed.get("observed_cpu_percent") or 0.0),
+            active_containers=int(observed.get("active_containers") or 0),
+        )
 
     # --- bootstrap ---------------------------------------------------------
 
@@ -155,13 +189,21 @@ class SandboxController:
         """Validate a prebuilt runner image and record it as the active runtime.
 
         This is the prebuilt (pull) bootstrap path: the tag is pulled, resolved
-        to a single immutable RepoDigest, and its runner ABI label is verified
-        before the record is persisted. Local image builds stay a legacy
-        app-side operation for the ``docker`` backend only.
+        to a single immutable RepoDigest, its runner ABI label is verified, and
+        a bounded offline smoke (Python + Node probes under the hardened
+        profile) must pass before the record is persisted. Local image builds
+        stay a legacy app-side operation for the ``docker`` backend only.
         """
         if runtime_kind not in RUNTIME_KINDS:
             raise SandboxdError("invalid_request", f"unsupported runtime kind: {runtime_kind}")
-        digest, labels = self.runtime.pull_and_resolve_digest(image_tag)
+        try:
+            digest, labels = self.runtime.pull_and_resolve_digest(image_tag)
+        except Exception as exc:  # noqa: BLE001 - map runtime failures to the protocol
+            raise SandboxdError(
+                "runtime_unavailable",
+                f"bootstrap pull failed for {image_tag}: {type(exc).__name__}",
+                retryable=True,
+            ) from exc
         runner_abi = str(labels.get("com.learngraph.runner-abi") or "")
         if not runner_abi:
             raise SandboxdError(
@@ -173,20 +215,29 @@ class SandboxController:
                 "runner_abi_mismatch",
                 f"runner ABI {runner_abi} is outside [{RUNNER_ABI_MIN}, {RUNNER_ABI_MAX}]",
             )
+        try:
+            smoke_ok, smoke_detail = self.runtime.smoke_test(digest, runtime_kind)
+        except Exception as exc:  # noqa: BLE001 - smoke must not crash the daemon
+            smoke_ok, smoke_detail = False, f"{type(exc).__name__}: {exc}"
+        if not smoke_ok:
+            raise SandboxdError(
+                "runtime_unavailable",
+                f"bootstrap smoke failed for {image_tag}: {smoke_detail or 'unknown error'}",
+            )
         self.store.upsert_runtime(
             runtime_kind=runtime_kind,
             image_digest=digest,
             runner_abi=runner_abi,
             source="prebuilt",
             labels=labels,
-            smoke_status="labels_verified",
+            smoke_status="passed",
         )
         return {
             "runtime_kind": runtime_kind,
             "image_digest": digest,
             "runner_abi": runner_abi,
             "source": "prebuilt",
-            "smoke_status": "labels_verified",
+            "smoke_status": "passed",
         }
 
     def list_runtimes(self) -> list[dict[str, Any]]:
@@ -236,6 +287,28 @@ class SandboxController:
             raise SandboxdError("owner_mismatch", "deployment id does not match this sandboxd instance")
 
         owner_scope = scope_key(body.owner.deployment_id, body.owner.session_id)
+        # Execution-pool reuse: the same deployment+session_id maps to one
+        # physical sandbox (a user's warm instance). A still-alive sandbox for
+        # this session with a compatible resource/egress profile is returned
+        # instead of creating a duplicate, so every chat workspace of the same
+        # user shares the user's instance container.
+        existing = self.store.get_sandbox_by_session(
+            self.config.deployment_id, body.session_id
+        )
+        if existing is not None:
+            try:
+                expires = datetime.fromisoformat(existing.expires_at)
+            except ValueError:
+                expires = _utc_now()
+            if (
+                expires > _utc_now()
+                and existing.state not in {"DELETING", "ERROR"}
+                and existing.owner_scope == owner_scope
+                and _limits_match(existing.limits, body)
+                and (existing.policy_digest or None)
+                == ((body.egress.policy_digest.casefold()) if body.egress else None)
+            ):
+                return self._view(existing)
         payload_hash = _payload_hash(body.model_dump(mode="json"))
         proceed, replay = self.store.begin_idempotent(
             owner_scope, body.idempotency_key, "create", payload_hash
@@ -248,7 +321,11 @@ class SandboxController:
                 )
             if replay.state == "succeeded" and replay.result_json:
                 view = SandboxView.model_validate_json(replay.result_json)
-                return view
+                # The sandbox record may have been swept by the TTL sweep while
+                # the idempotency ledger survived; re-create in that case
+                # instead of returning a dead resource id.
+                if self.store.get_sandbox(view.sandbox_id) is not None:
+                    return view
             raise SandboxdError(
                 "execution_indeterminate",
                 "create is still in progress or its outcome is unknown; retry with the same key",
@@ -348,7 +425,7 @@ class SandboxController:
 
     # --- helpers -----------------------------------------------------------
 
-    def _require(self, sandbox_id: str, scope: str) -> SandboxRecord:
+    def _require(self, sandbox_id: str, scope: str, fence: int | None = None) -> SandboxRecord:
         record = self.store.get_sandbox(sandbox_id)
         if record is None:
             raise SandboxdError("sandbox_not_found", "sandbox was not found")
@@ -356,6 +433,16 @@ class SandboxController:
             raise SandboxdError("owner_mismatch", "sandbox is owned by a different scope")
         if record.deployment_id != self.config.deployment_id:
             raise SandboxdError("owner_mismatch", "sandbox belongs to a different deployment")
+        # Fencing: once a sandbox enters DELETING its fence generation is
+        # bumped, invalidating every in-flight RPC that still holds the old
+        # generation. A caller without a fence header is only accepted while
+        # the fence is still 0 (pre-delete steady state).
+        fence_required = int(record.fence_generation or 0)
+        if fence_required > 0 and fence != fence_required:
+            raise SandboxdError(
+                "stale_fence",
+                "sandbox lease generation is stale; the sandbox is being reclaimed",
+            )
         try:
             expires = datetime.fromisoformat(record.expires_at)
         except ValueError:
@@ -382,8 +469,8 @@ class SandboxController:
             workspace_key=record.workspace_key,
         )
 
-    def get(self, sandbox_id: str, scope: str) -> SandboxView:
-        return self._view(self._require(sandbox_id, scope))
+    def get(self, sandbox_id: str, scope: str, fence: int | None = None) -> SandboxView:
+        return self._view(self._require(sandbox_id, scope, fence=fence))
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -413,9 +500,9 @@ class SandboxController:
             )
             return self.runtime.create(spec)
 
-    def resume(self, sandbox_id: str, scope: str) -> SandboxView:
+    def resume(self, sandbox_id: str, scope: str, fence: int | None = None) -> SandboxView:
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             if record.state in {"DELETING", "ERROR"}:
                 raise SandboxdError("invalid_state", f"sandbox is in state {record.state}")
             handle = self._ensure_runtime(record)
@@ -425,11 +512,12 @@ class SandboxController:
             )
             return self._view(self.store.get_sandbox(sandbox_id))
 
-    def stop(self, sandbox_id: str, scope: str) -> SandboxView:
+    def stop(self, sandbox_id: str, scope: str, fence: int | None = None) -> SandboxView:
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             if record.state not in {"RUNNING", "STARTING"}:
                 return self._view(record)
+            self._close_kernels_for(sandbox_id, scope)
             self.runtime.stop(RuntimeHandle(record.sandbox_id, record.container_id))
             now = _utc_now().isoformat(timespec="seconds")
             self.store.update_sandbox(sandbox_id, state="STOPPED", last_used_at=now)
@@ -443,20 +531,137 @@ class SandboxController:
                 return
             if record.owner_scope != scope or record.deployment_id != self.config.deployment_id:
                 raise SandboxdError("owner_mismatch", "sandbox is owned by a different scope")
-            self.store.update_sandbox(sandbox_id, state="DELETING")
+            # Bump the fence BEFORE deleting resources: every in-flight exec/file
+            # RPC carrying the old generation is rejected while the writable
+            # layer is being torn down.
+            self.store.update_sandbox(
+                sandbox_id,
+                state="DELETING",
+                fence_generation=int(record.fence_generation or 0) + 1,
+            )
             try:
+                self._close_kernels_for(sandbox_id, scope)
                 self.runtime.delete(RuntimeHandle(record.sandbox_id, record.container_id))
             finally:
                 self.store.delete_sandbox(sandbox_id)
 
+    def _close_kernels_for(self, sandbox_id: str, scope: str) -> None:
+        """Best-effort teardown of every kernel attached to a sandbox."""
+        for kernel_id, record in list(self._kernels.items()):
+            if record.get("sandbox_id") != sandbox_id or record.get("scope") != scope:
+                continue
+            try:
+                handle = RuntimeHandle(sandbox_id, None)
+                self.runtime.stop_kernel(
+                    handle,
+                    kernel_id,
+                    record.get("workspace_relative") or ".",
+                )
+            except Exception:  # noqa: BLE001 - teardown is best-effort
+                logger.debug("kernel %s teardown failed during sandbox %s cleanup", kernel_id, sandbox_id)
+            self._kernels.pop(kernel_id, None)
+
+    # --- kernels ------------------------------------------------------------
+
+    def kernel_open(
+        self, sandbox_id: str, scope: str, body: KernelOpenRequest
+    ) -> KernelOpenResult:
+        with self._lock:
+            record = self._require(sandbox_id, scope)
+            workspace_relative = _safe_path(body.workspace_relative or ".", allow_dot=True)
+            handle = self._ensure_runtime(record)
+            try:
+                kernel_id = self.runtime.start_kernel(
+                    handle, workspace_relative, body.interpreter
+                )
+            except Exception as exc:  # noqa: BLE001 - map runtime failures
+                raise SandboxdError(
+                    "execution_failed",
+                    f"kernel start failed: {type(exc).__name__}: {exc}",
+                ) from exc
+            self._kernels[kernel_id] = {
+                "kernel_id": kernel_id,
+                "sandbox_id": sandbox_id,
+                "scope": scope,
+                "interpreter": body.interpreter,
+                "workspace_relative": workspace_relative,
+            }
+            self._touch(sandbox_id)
+            return KernelOpenResult(kernel_id=kernel_id, interpreter=body.interpreter)
+
+    def kernel_execute(
+        self, kernel_id: str, scope: str, body: KernelCellRequest
+    ) -> KernelCellResult:
+        with self._lock:
+            kernel = self._kernels.get(kernel_id)
+            if kernel is None or kernel.get("scope") != scope:
+                raise SandboxdError("kernel_not_found", "kernel was not found or is not owned by this scope")
+            sandbox_id = kernel["sandbox_id"]
+            record = self._require(sandbox_id, scope)
+            handle = self._ensure_runtime(record)
+            try:
+                result = self.runtime.exec_kernel_cell(
+                    handle,
+                    kernel_id,
+                    kernel.get("workspace_relative") or ".",
+                    body.code,
+                    timeout_seconds=body.timeout_seconds,
+                    output_limit=body.output_limit,
+                )
+            except Exception as exc:  # noqa: BLE001 - map runtime failures
+                raise SandboxdError(
+                    "execution_failed",
+                    f"kernel cell execution failed: {type(exc).__name__}: {exc}",
+                ) from exc
+            self._touch(sandbox_id)
+        stdout_text = result.stdout.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(stdout_text)
+        except json.JSONDecodeError:
+            payload = {
+                "ok": False,
+                "stdout": "",
+                "stderr": stdout_text[:4_096] or "kernel client returned no structured result",
+                "result_repr": None,
+                "timed_out": result.timed_out,
+            }
+        return KernelCellResult(
+            kernel_id=kernel_id,
+            ok=bool(payload.get("ok")),
+            stdout=str(payload.get("stdout") or ""),
+            stderr=str(payload.get("stderr") or ""),
+            result_repr=payload.get("result_repr"),
+            timed_out=bool(payload.get("timed_out") or result.timed_out),
+        )
+
+    def kernel_close(self, kernel_id: str, scope: str) -> dict[str, Any]:
+        with self._lock:
+            kernel = self._kernels.get(kernel_id)
+            if kernel is None or kernel.get("scope") != scope:
+                raise SandboxdError("kernel_not_found", "kernel was not found or is not owned by this scope")
+            sandbox_id = kernel["sandbox_id"]
+            self._kernels.pop(kernel_id, None)
+            try:
+                record = self.store.get_sandbox(sandbox_id)
+                if record is not None and record.owner_scope == scope:
+                    handle = self._ensure_runtime(record)
+                    self.runtime.stop_kernel(
+                        handle,
+                        kernel_id,
+                        kernel.get("workspace_relative") or ".",
+                    )
+            except Exception:  # noqa: BLE001 - kernel teardown is best-effort
+                logger.debug("kernel %s close teardown failed", kernel_id)
+            return {"kernel_id": kernel_id, "closed": True}
+
     # --- files -------------------------------------------------------------
 
-    def write_file(self, sandbox_id: str, scope: str, path: str, data: bytes, *, mode: int = 0o644) -> None:
+    def write_file(self, sandbox_id: str, scope: str, path: str, data: bytes, *, mode: int = 0o644, fence: int | None = None) -> None:
         safe_value = _safe_path(path)
         if len(data) > self.config.max_file_bytes:
             raise SandboxdError("file_too_large", "file exceeds the daemon file limit")
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             handle = self._ensure_runtime(record)
             try:
                 self.runtime.write_file(handle, safe_value, data, mode=mode)
@@ -466,29 +671,29 @@ class SandboxController:
                 raise SandboxdError("output_limit_exceeded", str(exc)) from exc
             self._touch(sandbox_id)
 
-    def delete_file(self, sandbox_id: str, scope: str, path: str) -> None:
+    def delete_file(self, sandbox_id: str, scope: str, path: str, *, fence: int | None = None) -> None:
         safe_value = _safe_path(path)
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             handle = self._ensure_runtime(record)
             self.runtime.delete_file(handle, safe_value)
             self._touch(sandbox_id)
 
-    def read_file(self, sandbox_id: str, scope: str, path: str, limit_bytes: int) -> bytes:
+    def read_file(self, sandbox_id: str, scope: str, path: str, limit_bytes: int, *, fence: int | None = None) -> bytes:
         safe_value = _safe_path(path)
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             handle = self._ensure_runtime(record)
             data = self.runtime.read_file(handle, safe_value, limit_bytes)
             self._touch(sandbox_id)
             return data
 
-    def list_files(self, sandbox_id: str, scope: str, prefix: str, limit: int, cursor: str | None) -> FileIndex:
+    def list_files(self, sandbox_id: str, scope: str, prefix: str, limit: int, cursor: str | None, *, fence: int | None = None) -> FileIndex:
         safe_prefix = _safe_path(prefix or ".", allow_dot=True)
         if safe_prefix == ".":
             safe_prefix = ""
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             handle = self._ensure_runtime(record)
             entries, next_cursor = self.runtime.list_files(handle, safe_prefix, limit, cursor)
             self._touch(sandbox_id)
@@ -522,11 +727,15 @@ class SandboxController:
         timeout_seconds: int,
         output_limit: int,
         idempotency_key: str,
+        fence: int | None = None,
     ) -> ExecOutcome:
         validated_argv = self._validate_argv(argv)
         safe_cwd = _safe_path(cwd or ".", allow_dot=True)
+        # Short critical section: ownership/state/idempotency/record bookkeeping
+        # only. The actual Docker exec runs OUTSIDE the global lock so parallel
+        # executions (and other sandboxes) are not serialized by this daemon.
         with self._lock:
-            record = self._require(sandbox_id, scope)
+            record = self._require(sandbox_id, scope, fence=fence)
             payload = {
                 "argv": argv,
                 "cwd": cwd,
@@ -574,27 +783,37 @@ class SandboxController:
                 state="in_progress",
                 result_json=json.dumps({"execution_id": execution_id}),
             )
-            try:
-                handle = self._ensure_runtime(record)
-                if operation == "fixed":
-                    result = self.runtime.exec_fixed(
-                        handle, validated_argv, timeout_seconds=timeout_seconds, output_limit=output_limit
-                    )
-                else:
-                    result = self.runtime.exec_agent(
-                        handle,
-                        validated_argv,
-                        cwd=cwd,
-                        timeout_seconds=timeout_seconds,
-                        output_limit=output_limit,
-                    )
-            except DockerRuntimeUnavailable as exc:
+            handle = self._ensure_runtime(record)
+        # Outside the global lock: a slow/hung exec must not block other
+        # sandboxes or executions.
+        try:
+            if operation == "fixed":
+                result = self.runtime.exec_fixed(
+                    handle,
+                    validated_argv,
+                    execution_id=execution_id,
+                    timeout_seconds=timeout_seconds,
+                    output_limit=output_limit,
+                )
+            else:
+                result = self.runtime.exec_agent(
+                    handle,
+                    validated_argv,
+                    execution_id=execution_id,
+                    cwd=cwd,
+                    timeout_seconds=timeout_seconds,
+                    output_limit=output_limit,
+                )
+        except DockerRuntimeUnavailable as exc:
+            with self._lock:
                 self.store.complete_idempotent(key_scope, idempotency_key, state="failed", error_code="runtime_unavailable")
-                raise SandboxdError("runtime_unavailable", str(exc), retryable=True) from exc
-            except DockerRuntimeError as exc:
+            raise SandboxdError("runtime_unavailable", str(exc), retryable=True) from exc
+        except DockerRuntimeError as exc:
+            with self._lock:
                 self.store.complete_idempotent(key_scope, idempotency_key, state="failed", error_code="execution_failed")
-                raise SandboxdError("execution_failed", str(exc)) from exc
+            raise SandboxdError("execution_failed", str(exc)) from exc
 
+        with self._lock:
             self._touch(sandbox_id)
             max_transport = self.config.max_stdout_bytes
             stdout_text = result.stdout.decode("utf-8", errors="replace")[:max_transport]
@@ -622,13 +841,51 @@ class SandboxController:
                 timed_out=result.timed_out,
                 truncated=result.truncated,
                 latency_ms=result.latency_ms,
+                finished_reason=status,
             )
             self.store.complete_idempotent(
                 key_scope, idempotency_key, state="succeeded", result_json=exec_result.model_dump_json()
             )
             return ExecOutcome(result=exec_result)
 
-    def exec_fixed(self, sandbox_id: str, scope: str, body: FixedExecRequest) -> ExecOutcome:
+    def cancel_execution(self, execution_id: str, scope: str) -> dict[str, Any]:
+        """Request cancellation of a live execution.
+
+        Marks the execution ``cancelling`` durably and best-effort asks the
+        runtime to stop the process tree. The synchronous exec path cannot be
+        interrupted mid-flight without a container supervisor; the mark is what
+        the scheduler and operators observe, and the supervisor phase (task
+        cgroup / process-group TERM→KILL) plugs in at ``runtime.cancel_exec``.
+        """
+        record = self.store.get_execution(execution_id)
+        if record is None:
+            raise SandboxdError("sandbox_not_found", "execution was not found")
+        sandbox = self.store.get_sandbox(record["sandbox_id"])
+        if (
+            sandbox is None
+            or sandbox.owner_scope != scope
+            or sandbox.deployment_id != self.config.deployment_id
+        ):
+            raise SandboxdError("owner_mismatch", "execution belongs to a different scope")
+        with self._lock:
+            cancelled = self.store.cancel_execution(execution_id)
+        if cancelled:
+            cancel_callable = getattr(self.runtime, "cancel_exec", None)
+            if callable(cancel_callable):
+                try:
+                    cancel_callable(
+                        RuntimeHandle(sandbox.sandbox_id, sandbox.container_id),
+                        execution_id,
+                    )
+                except Exception:  # noqa: BLE001 - best-effort process termination
+                    logger.exception("runtime cancel failed for execution %s", execution_id)
+        return {
+            "execution_id": execution_id,
+            "sandbox_id": sandbox.sandbox_id,
+            "status": "cancelling" if cancelled else record["status"],
+        }
+
+    def exec_fixed(self, sandbox_id: str, scope: str, body: FixedExecRequest, *, fence: int | None = None) -> ExecOutcome:
         _safe_path(body.input_path)
         _safe_path(body.output_path)
         argv = (
@@ -650,9 +907,10 @@ class SandboxController:
             timeout_seconds=body.timeout_seconds,
             output_limit=body.output_limit,
             idempotency_key=body.idempotency_key,
+            fence=fence,
         )
 
-    def exec_agent(self, sandbox_id: str, scope: str, body: AgentExecRequest) -> ExecOutcome:
+    def exec_agent(self, sandbox_id: str, scope: str, body: AgentExecRequest, *, fence: int | None = None) -> ExecOutcome:
         return self._exec_common(
             sandbox_id,
             scope,
@@ -662,6 +920,7 @@ class SandboxController:
             timeout_seconds=body.timeout_seconds,
             output_limit=body.output_limit,
             idempotency_key=body.idempotency_key,
+            fence=fence,
         )
 
     # --- reconciliation and TTL --------------------------------------------

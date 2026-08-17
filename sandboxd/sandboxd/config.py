@@ -57,6 +57,11 @@ class SandboxdConfig:
     runtime_image: str | None
     egress_network_enabled: bool
     egress_proxy_url: str | None
+    # Container name/ID (or compose service name) of the egress proxy. The
+    # daemon attaches the proxy container to every per-sandbox egress network
+    # so runners can reach it. When empty, a container carrying the compose
+    # service label ``com.docker.compose.service=egress-proxy`` is discovered.
+    egress_proxy_container: str | None
     max_request_bytes: int
     max_file_bytes: int
     max_stdout_bytes: int
@@ -100,6 +105,7 @@ class SandboxdConfig:
             runtime_image=runtime_image,
             egress_network_enabled=egress_network_enabled,
             egress_proxy_url=egress_proxy_url,
+            egress_proxy_container=(os.environ.get("SANDBOXD_EGRESS_PROXY_CONTAINER") or "").strip() or None,
             max_request_bytes=_env_int("SANDBOXD_MAX_REQUEST_BYTES", 16 * 1024 * 1024, minimum=64 * 1024),
             max_file_bytes=_env_int("SANDBOXD_MAX_FILE_BYTES", 256 * 1024 * 1024, minimum=1024),
             max_stdout_bytes=_env_int("SANDBOXD_MAX_STDOUT_BYTES", 256 * 1024, minimum=16 * 1024),

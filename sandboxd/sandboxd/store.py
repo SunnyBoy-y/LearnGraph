@@ -43,6 +43,7 @@ class SandboxRecord:
     created_at: str
     updated_at: str
     last_used_at: str
+    fence_generation: int = 0
 
     @property
     def limits(self) -> dict[str, Any]:
@@ -97,7 +98,8 @@ class SandboxdStore:
                     expires_at TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    last_used_at TEXT NOT NULL
+                    last_used_at TEXT NOT NULL,
+                    fence_generation INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS ix_sandboxes_owner
                     ON sandboxes (deployment_id, owner_scope, state);
@@ -129,7 +131,9 @@ class SandboxdStore:
                     latency_ms INTEGER,
                     argv_digest TEXT NOT NULL,
                     started_at TEXT NOT NULL,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    cancel_requested_at TEXT,
+                    finished_reason TEXT
                 );
                 CREATE INDEX IF NOT EXISTS ix_executions_sandbox
                     ON executions (sandbox_id, started_at);
@@ -171,8 +175,9 @@ class SandboxdStore:
                     owner_session_id, session_id, workspace_key, runtime_kind,
                     state, volume_name, container_id, image_digest, runner_abi,
                     policy_digest, egress_network, limits_json, ttl_seconds,
-                    expires_at, created_at, updated_at, last_used_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    expires_at, created_at, updated_at, last_used_at,
+                    fence_generation
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.sandbox_id, record.deployment_id, record.owner_scope,
@@ -182,7 +187,7 @@ class SandboxdStore:
                     record.image_digest, record.runner_abi, record.policy_digest,
                     record.egress_network, record.limits_json, record.ttl_seconds,
                     record.expires_at, record.created_at, record.updated_at,
-                    record.last_used_at,
+                    record.last_used_at, record.fence_generation,
                 ),
             )
 
@@ -215,7 +220,7 @@ class SandboxdStore:
         allowed = {
             "state", "container_id", "policy_digest", "egress_network",
             "expires_at", "updated_at", "last_used_at", "runner_abi",
-            "image_digest",
+            "image_digest", "fence_generation",
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -264,6 +269,7 @@ class SandboxdStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             last_used_at=row["last_used_at"],
+            fence_generation=int(row["fence_generation"] or 0),
         )
 
     # --- idempotency -------------------------------------------------------
@@ -344,13 +350,14 @@ class SandboxdStore:
         timed_out: bool,
         truncated: bool,
         latency_ms: int | None,
+        finished_reason: str | None = None,
     ) -> None:
         now = _utc_now()
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE executions SET status = ?, exit_code = ?, timed_out = ?, truncated = ?, latency_ms = ?, finished_at = ? "
+                "UPDATE executions SET status = ?, exit_code = ?, timed_out = ?, truncated = ?, latency_ms = ?, finished_at = ?, finished_reason = ? "
                 "WHERE execution_id = ?",
-                (status, exit_code, 1 if timed_out else 0, 1 if truncated else 0, latency_ms, now, execution_id),
+                (status, exit_code, 1 if timed_out else 0, 1 if truncated else 0, latency_ms, now, finished_reason, execution_id),
             )
 
     def get_execution(self, execution_id: str) -> dict[str, Any] | None:
@@ -359,6 +366,25 @@ class SandboxdStore:
                 "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def cancel_execution(self, execution_id: str) -> bool:
+        """Mark an execution cancel-requested. Returns True when a live
+        (running) execution was marked; False when it is already terminal."""
+        now = _utc_now()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] in ("succeeded", "failed", "timeout", "cancelled"):
+                return False
+            conn.execute(
+                "UPDATE executions SET cancel_requested_at = ?, status = ?, finished_reason = ? "
+                "WHERE execution_id = ?",
+                (now, "cancelling", "cancelled", execution_id),
+            )
+            return True
 
     # --- runtimes (bootstrap records) --------------------------------------
 

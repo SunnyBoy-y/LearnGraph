@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -40,6 +41,7 @@ def create_app(
             docker_host=config.docker_host,
             runtime_image=config.runtime_image,
             egress_proxy_url=config.egress_proxy_url,
+            egress_proxy_container=config.egress_proxy_container,
             seccomp_dir=config.seccomp_dir,
             workspace_uid=config.workspace_uid,
         )
@@ -57,8 +59,33 @@ def create_app(
     app.middleware("http")(request_id_middleware)
     app.include_router(api.build_router())
 
-    sweep_thread: threading.Thread | None = None
     stop_event = threading.Event()
+
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI):
+        store.init()
+        if config.reconcile_on_start:
+            try:
+                controller.reconcile()
+            except Exception:  # noqa: BLE001
+                logger.exception("startup reconciliation failed")
+        sweep_thread: threading.Thread | None = None
+        if start_workers:
+            sweep_thread = threading.Thread(
+                target=_ttl_sweep_loop,
+                args=(controller, config.ttl_sweep_interval_seconds, stop_event),
+                name="sandboxd-ttl-sweep",
+                daemon=True,
+            )
+            sweep_thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            if sweep_thread is not None:
+                sweep_thread.join(timeout=2)
+
+    app.router.lifespan_context = _lifespan
 
     @app.middleware("http")
     async def _error_envelope(request: Request, call_next):
@@ -78,29 +105,6 @@ def create_app(
                     }
                 },
             )
-
-    @app.on_event("startup")
-    def _startup() -> None:
-        store.init()
-        if config.reconcile_on_start:
-            try:
-                controller.reconcile()
-            except Exception:  # noqa: BLE001
-                logger.exception("startup reconciliation failed")
-        if start_workers:
-            nonlocal stop_event, sweep_thread
-            stop_event = threading.Event()
-            sweep_thread = threading.Thread(
-                target=_ttl_sweep_loop,
-                args=(controller, config.ttl_sweep_interval_seconds, stop_event),
-                name="sandboxd-ttl-sweep",
-                daemon=True,
-            )
-            sweep_thread.start()
-
-    @app.on_event("shutdown")
-    def _shutdown() -> None:
-        stop_event.set()
 
     return app
 

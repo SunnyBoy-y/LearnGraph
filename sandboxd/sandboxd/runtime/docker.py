@@ -22,10 +22,11 @@ import io
 import json
 import logging
 import re
-import select
 import struct
 import tarfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -100,11 +101,15 @@ def _seccomp_options(seccomp_dir: str, runtime_kind: str) -> list[str]:
 
 
 _WALK_USAGE_SCRIPT = (
-    "import json, os; "
-    "root='/workspace'; total=files=dirs=0; "
-    "[None for dirpath, dirnames, filenames in os.walk(root) "
-    "for _ in (dirs := dirs + 1) for name in filenames "
-    "if not (lambda p: (total := total + (os.path.getsize(p) if os.path.isfile(p) else 0), files := files + 1)[0])(os.path.join(dirpath, name))]; "
+    "import json, os\n"
+    "root = '/workspace'\n"
+    "total = files = dirs = 0\n"
+    "for dp, dns, fns in os.walk(root):\n"
+    "    dirs += 1\n"
+    "    for name in fns:\n"
+    "        p = os.path.join(dp, name)\n"
+    "        total += os.path.getsize(p) if os.path.isfile(p) else 0\n"
+    "        files += 1\n"
     "print(json.dumps({'bytes': total, 'files': files, 'dirs': dirs}))"
 )
 
@@ -119,6 +124,7 @@ class DockerRuntimeBackend:
         docker_host: str | None = None,
         runtime_image: str | None = None,
         egress_proxy_url: str | None = None,
+        egress_proxy_container: str | None = None,
         seccomp_dir: str = "",
         workspace_uid: str = RUNNER_UID,
     ) -> None:
@@ -126,12 +132,16 @@ class DockerRuntimeBackend:
         self.docker_host = docker_host
         self.runtime_image = runtime_image or ""
         self.egress_proxy_url = egress_proxy_url
+        self.egress_proxy_container = egress_proxy_container
         self.seccomp_dir = seccomp_dir
         self.workspace_uid = workspace_uid
         self._managed_labels = {
             "com.learngraph.managed": "true",
             "com.learngraph.deployment_id": deployment_id,
         }
+        # execution_id -> {exec_id, pid, container_id} for task-level cancel.
+        self._active_execs: dict[str, dict[str, Any]] = {}
+        self._active_execs_lock = threading.Lock()
 
     # --- docker client -----------------------------------------------------
 
@@ -158,20 +168,20 @@ class DockerRuntimeBackend:
             pass
 
     def probe(self) -> RuntimeCapability:
-        if not image_ref_is_pinned(self.runtime_image):
-            return RuntimeCapability(
-                False, "no immutable sha256 runtime image is configured for sandboxd"
-            )
+        """Probe Docker Engine reachability only.
+
+        Runtime image presence is a controller/store concern (env pin or
+        Bootstrap-installed record); the adapter must not fail-closed just
+        because no env image was provided when a Bootstrap record exists.
+        """
         client = None
         try:
             client = self._client()
-            image = client.images.get(self.runtime_image)
-            if not image:
-                return RuntimeCapability(False, "configured runtime image is not present in Docker Engine")
+            client.ping()
         except DockerRuntimeUnavailable as exc:
             return RuntimeCapability(False, str(exc))
         except Exception:
-            return RuntimeCapability(False, "configured runtime image is not present in Docker Engine")
+            return RuntimeCapability(False, "Docker Engine is unavailable")
         finally:
             self._close(client)
         return RuntimeCapability(True)
@@ -181,6 +191,44 @@ class DockerRuntimeBackend:
         try:
             info = client.info()
             return int(info.get("NCPU") or 0), int(info.get("MemTotal") or 0)
+        finally:
+            self._close(client)
+
+    def observe(self) -> dict[str, Any]:
+        """Aggregate live resource usage of this deployment's managed
+        containers (memory working-set). Host totals are returned alongside so
+        schedulers can compute pressure ratios for dynamic admission."""
+        client = self._client()
+        try:
+            info = client.info()
+            host_cpu = int(info.get("NCPU") or 0)
+            host_memory = int(info.get("MemTotal") or 0)
+            observed_memory = 0
+            active_containers = 0
+            try:
+                containers = client.containers.list(
+                    filters={
+                        "label": f"com.learngraph.deployment_id={self.deployment_id}"
+                    }
+                )
+            except Exception:  # noqa: BLE001 - probe is best-effort
+                containers = []
+            for container in containers:
+                try:
+                    stat = container.stats(stream=False)
+                except Exception:  # noqa: BLE001 - one bad container must not fail the probe
+                    continue
+                mem = (stat.get("memory_stats") or {}).get("usage") or 0
+                if mem:
+                    observed_memory += int(mem)
+                    active_containers += 1
+            return {
+                "host_cpu_count": host_cpu,
+                "host_memory_bytes": host_memory,
+                "observed_memory_bytes": observed_memory,
+                "observed_cpu_percent": 0.0,
+                "active_containers": active_containers,
+            }
         finally:
             self._close(client)
 
@@ -202,6 +250,33 @@ class DockerRuntimeBackend:
         labels.update(spec.labels)
         return labels
 
+    def _egress_proxy_container(self, client: Any):
+        """Locate the egress proxy container to attach to per-sandbox networks.
+
+        Resolution order: configured container name/ID, then the compose
+        service label. Failing to find the proxy is a hard error (fail closed)
+        so a misconfigured egress never silently dead-ends runners.
+        """
+        name = (self.egress_proxy_container or "").strip()
+        candidates: list[Any] = []
+        if name:
+            try:
+                candidates = [client.containers.get(name)]
+            except Exception:  # noqa: BLE001
+                candidates = []
+        if not candidates:
+            try:
+                candidates = client.containers.list(
+                    filters={"label": "com.docker.compose.service=egress-proxy"}
+                )
+            except Exception:  # noqa: BLE001
+                candidates = []
+        if not candidates:
+            raise DockerRuntimeUnavailable(
+                "egress proxy container was not found (configure SANDBOXD_EGRESS_PROXY_CONTAINER)"
+            )
+        return candidates[0]
+
     def _ensure_egress_network(self, client: Any, spec: RuntimeCreateSpec) -> str | None:
         if not spec.policy_digest or not spec.egress_network or not self.egress_proxy_url:
             return None
@@ -213,11 +288,10 @@ class DockerRuntimeBackend:
                 raise DockerRuntimeUnavailable(
                     f"egress network {spec.egress_network} exists but is not managed by this deployment"
                 )
-            return spec.egress_network
         except DockerRuntimeUnavailable:
             raise
         except Exception:
-            client.networks.create(
+            network = client.networks.create(
                 spec.egress_network,
                 driver="bridge",
                 internal=True,
@@ -227,7 +301,31 @@ class DockerRuntimeBackend:
                     "com.learngraph.sandbox_id": spec.sandbox_id,
                 },
             )
-            return spec.egress_network
+        # Attach the egress proxy to the per-sandbox network so the runner can
+        # actually reach it, and alias it with the proxy URL hostname (e.g.
+        # ``egress-proxy``) so ``HTTP(S)_PROXY=http://egress-proxy:8888``
+        # resolves inside the isolated network. Idempotent: an
+        # already-attached proxy is skipped.
+        from urllib.parse import urlsplit
+
+        proxy_host = ""
+        try:
+            proxy_host = (urlsplit(self.egress_proxy_url).hostname or "").strip()
+        except Exception:  # noqa: BLE001
+            proxy_host = ""
+        proxy = self._egress_proxy_container(client)
+        try:
+            attached = [c.id for c in network.containers]
+        except Exception:  # noqa: BLE001
+            attached = []
+        if proxy.id not in attached:
+            try:
+                network.connect(proxy, aliases=[proxy_host] if proxy_host else None)
+            except Exception as exc:  # noqa: BLE001
+                raise DockerRuntimeUnavailable(
+                    f"failed to attach egress proxy to {spec.egress_network}: {type(exc).__name__}"
+                ) from exc
+        return spec.egress_network
 
     def create(self, spec: RuntimeCreateSpec) -> RuntimeHandle:
         if not image_ref_is_pinned(spec.image_ref):
@@ -349,7 +447,7 @@ class DockerRuntimeBackend:
         tag = (image_tag or "").strip()
         if not tag:
             raise DockerRuntimeError("bootstrap image tag must not be empty")
-        if "@sha256:" in tag:
+        if "@sha256:" in tag or tag.startswith("sha256:"):
             # Already an immutable reference; verify presence without pulling.
             digest_ref = tag
         else:
@@ -388,6 +486,100 @@ class DockerRuntimeBackend:
         finally:
             self._close(client)
         return digest_ref, labels
+
+    def smoke_test(
+        self, image_ref: str, runtime_kind: str, *, timeout_seconds: int = 120
+    ) -> tuple[bool, str]:
+        """Run a bounded offline smoke of a pinned runner image.
+
+        Creates a short-lived hardened container (no workspace volume, network
+        none, runner UID, read-only rootfs, drop ALL, NNP, seccomp, resource
+        limits, tmpfs) and executes fixed interpreter probes (Python + Node).
+        The container is always removed in ``finally``; a crash leaves no
+        managed smoke container behind.
+        """
+        if not image_ref_is_pinned(image_ref):
+            return False, "image is not an immutable sha256 digest"
+        client = self._client()
+        container = None
+        try:
+            from docker.types import Ulimit
+
+            client.images.get(image_ref)
+            shm_size = (
+                CODE_SHM_SIZE
+                if runtime_kind == CODE_RUNTIME_KIND
+                else BROWSER_SHM_SIZE
+            )
+            container = client.containers.create(
+                image_ref,
+                command=["sleep", "infinity"],
+                detach=True,
+                name=f"lg-sandboxd-smoke-{uuid.uuid4().hex[:8]}",
+                labels={
+                    "com.learngraph.managed": "true",
+                    "com.learngraph.deployment_id": self.deployment_id,
+                    "com.learngraph.smoke": "true",
+                },
+                network_mode="none",
+                environment=[
+                    "HOME=/tmp",
+                    "XDG_CONFIG_HOME=/tmp/.config",
+                    "XDG_CACHE_HOME=/tmp/.cache",
+                ],
+                read_only=True,
+                user=self.workspace_uid,
+                cap_drop=["ALL"],
+                security_opt=_seccomp_options(self.seccomp_dir, runtime_kind),
+                mem_limit=512 * 1024 * 1024,
+                memswap_limit=512 * 1024 * 1024,
+                pids_limit=128,
+                nano_cpus=1_000_000_000,
+                ulimits=[
+                    Ulimit(
+                        name="fsize",
+                        soft=64 * 1024 * 1024,
+                        hard=64 * 1024 * 1024,
+                    )
+                ],
+                shm_size=shm_size,
+                tmpfs={"/tmp": "rw,noexec,nosuid,nodev,size=67108864,mode=1777"},
+            )
+            container.start()
+            probes = (
+                (
+                    "python",
+                    "-c",
+                    "import sys, json; print(json.dumps({'python': sys.version.split()[0]}))",
+                ),
+                ("node", "--version"),
+            )
+            for argv in probes:
+                result = self._run_exec(
+                    client,
+                    container,
+                    argv,
+                    workdir="/tmp",
+                    timeout_seconds=timeout_seconds,
+                    output_limit=16 * 1024,
+                )
+                if result.timed_out:
+                    return False, f"smoke timed out for {' '.join(argv)}"
+                if result.exit_code != 0:
+                    detail = result.stderr.decode("utf-8", "replace").strip()[:300]
+                    return False, f"smoke failed for {' '.join(argv)}: {detail or result.exit_code}"
+            return True, ""
+        except DockerRuntimeUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - smoke must never crash the daemon
+            return False, f"smoke failed: {type(exc).__name__}"
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True, v=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._close(client)
 
     def list_managed(self, deployment_id: str) -> list[tuple[str, str]]:
         """Return ``(sandbox_id, created_at)`` for managed containers of a deployment.
@@ -469,14 +661,92 @@ class DockerRuntimeBackend:
                 except Exception:  # noqa: BLE001
                     logger.warning("failed to remove managed volume for %s", handle.sandbox_id)
             for network in client.networks.list(filters={"label": _label_filter(labels)}):
-                try:
-                    network.remove()
-                except Exception:  # noqa: BLE001
-                    logger.warning("failed to remove managed network for %s", handle.sandbox_id)
+                # The egress proxy stays attached to every per-sandbox network.
+                # After ``container.remove(force=True)`` the sandbox endpoint is
+                # cleaned asynchronously, so disconnecting it can transiently
+                # 404 and network removal can fail while the endpoint lingers.
+                # Retry with a short backoff until the network is actually gone.
+                removed = False
+                last_error: Exception | None = None
+                for attempt in range(6):
+                    try:
+                        # ``networks.list()`` attrs omit the Containers map, so
+                        # ``network.containers`` is empty there. Re-fetch the
+                        # network fresh to enumerate real endpoints (the egress
+                        # proxy stays attached until disconnected).
+                        fresh = client.api.inspect_network(network.id)
+                        for container_id in (fresh.get("Containers") or {}):
+                            try:
+                                network.disconnect(container_id)
+                            except Exception:  # noqa: BLE001 - endpoint already gone
+                                pass
+                        network.remove()
+                        removed = True
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = exc
+                        if attempt == 5:
+                            break
+                        time.sleep(0.5)
+                if not removed:
+                    logger.warning(
+                        "failed to remove managed network %s for %s: %s",
+                        network.name,
+                        handle.sandbox_id,
+                        last_error,
+                    )
         finally:
             self._close(client)
 
     # --- exec --------------------------------------------------------------
+
+    def _track_exec(self, execution_id: str, entry: dict[str, Any]) -> None:
+        with self._active_execs_lock:
+            self._active_execs[execution_id] = entry
+
+    def _untrack_exec(self, execution_id: str) -> None:
+        with self._active_execs_lock:
+            self._active_execs.pop(execution_id, None)
+
+    def _lookup_exec(self, execution_id: str) -> dict[str, Any] | None:
+        with self._active_execs_lock:
+            return dict(self._active_execs[execution_id]) if execution_id in self._active_execs else None
+
+    def _terminate_process_group(
+        self,
+        client: Any,
+        container: Any,
+        pid: int | None,
+        *,
+        grace_seconds: float = 2.0,
+    ) -> None:
+        """TERM → grace → KILL a process group inside the container.
+
+        Never kills the container: a sibling execution (same user, different
+        chat workspace) must keep running when one task times out, is
+        truncated, or is cancelled.
+        """
+        if not pid or pid <= 0:
+            return
+        for signal in ("TERM", "KILL"):
+            try:
+                kill_exec = client.api.exec_create(
+                    container.id,
+                    ["kill", "-" + signal, "--", f"-{pid}"],
+                    user=RUNNER_UID,
+                    privileged=False,
+                    tty=False,
+                )
+                client.api.exec_start(kill_exec)
+            except Exception:  # noqa: BLE001 - best-effort process termination
+                logger.debug(
+                    "process-group %s signal %s failed for pid %s",
+                    signal,
+                    pid,
+                    container.id,
+                )
+            if signal == "TERM":
+                time.sleep(max(0.0, grace_seconds))
 
     def _run_exec(
         self,
@@ -487,6 +757,7 @@ class DockerRuntimeBackend:
         workdir: str,
         timeout_seconds: int,
         output_limit: int,
+        execution_id: str | None = None,
     ) -> RuntimeExecResult:
         started = time.monotonic()
         environment = {
@@ -494,6 +765,89 @@ class DockerRuntimeBackend:
             "XDG_CONFIG_HOME": "/tmp/.config",
             "XDG_CACHE_HOME": "/tmp/.cache",
         }
+        # Wrap argv in setsid so the command becomes its own process-group
+        # leader (PID == PGID). On timeout/truncate/cancel we can then target
+        # exactly that process group instead of the whole container.
+        deadline = started + max(1, timeout_seconds)
+        timed_out, truncated, exec_id, pid, stdout, stderr = self._exec_and_stream(
+            client,
+            container,
+            ("setsid",) + tuple(argv),
+            workdir=workdir,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            output_limit=output_limit,
+        )
+        # A wrapped setsid exec that exits 127 usually means the image has no
+        # setsid binary; retry once with the plain argv so the command still
+        # runs (cancel degrades to best-effort for that exec).
+        if not timed_out and not truncated and pid is None:
+            try:
+                inspect = client.api.exec_inspect(exec_id)
+                exit_127 = inspect.get("ExitCode") == 127
+            except Exception:  # noqa: BLE001
+                exit_127 = False
+            if exit_127:
+                timed_out, truncated, exec_id, pid, stdout, stderr = self._exec_and_stream(
+                    client,
+                    container,
+                    tuple(argv),
+                    workdir=workdir,
+                    environment=environment,
+                    timeout_seconds=timeout_seconds,
+                    deadline=deadline,
+                    output_limit=output_limit,
+                )
+
+        if execution_id:
+            self._track_exec(
+                execution_id,
+                {
+                    "exec_id": exec_id,
+                    "pid": pid,
+                    "container_id": container.id,
+                    "deadline": deadline,
+                },
+            )
+        try:
+            if timed_out or truncated:
+                # Task-level termination: kill only this process group.
+                self._terminate_process_group(client, container, pid)
+                exit_code = -1
+            else:
+                try:
+                    inspect = client.api.exec_inspect(exec_id)
+                    exit_code = inspect.get("ExitCode")
+                except Exception:  # noqa: BLE001
+                    exit_code = None
+        finally:
+            if execution_id:
+                self._untrack_exec(execution_id)
+        latency_ms = int((time.monotonic() - started) * 1000)
+        return RuntimeExecResult(
+            exit_code=exit_code,
+            stdout=bytes(stdout),
+            stderr=bytes(stderr),
+            timed_out=timed_out,
+            truncated=truncated,
+            latency_ms=latency_ms,
+        )
+
+    def _exec_and_stream(
+        self,
+        client: Any,
+        container: Any,
+        argv: tuple[str, ...],
+        *,
+        workdir: str,
+        environment: dict[str, str],
+        timeout_seconds: int,
+        deadline: float,
+        output_limit: int,
+    ) -> tuple[bool, bool, str, int | None, bytearray, bytearray]:
+        """Start one exec, stream its output with a bounded reader, and return
+        ``(timed_out, truncated, exec_id, pid, stdout, stderr)``."""
         try:
             exec_id = client.api.exec_create(
                 container.id,
@@ -507,65 +861,54 @@ class DockerRuntimeBackend:
         except Exception as exc:
             raise DockerRuntimeError(f"failed to create exec: {type(exc).__name__}") from exc
 
-        deadline = started + max(1, timeout_seconds)
         stdout = bytearray()
         stderr = bytearray()
         timed_out = False
         truncated = False
+        pid: int | None = None
+        socket = None
         try:
             socket = client.api.exec_start(exec_id, socket=True, demux=False)
-            socket.settimeout(0.5)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-                ready, _, _ = select.select([socket], [], [], min(remaining, 1.0))
-                if not ready:
-                    continue
-                frame = self._read_frame(socket)
-                if frame is None:
-                    break
-                stream_type, payload = frame
-                if stream_type == 1:
-                    stdout.extend(payload)
-                elif stream_type == 2:
-                    stderr.extend(payload)
-                if len(stdout) + len(stderr) > output_limit:
-                    truncated = True
-                    break
-        except (OSError, TimeoutError):
-            # Deadline exceeded while waiting for frames.
-            timed_out = True
+            # Best-effort PID capture right after start (only visible while the
+            # exec is running). Falls back to None, making cancel best-effort.
+            try:
+                inspect = client.api.exec_inspect(exec_id)
+                raw_pid = inspect.get("Pid") or inspect.get("pid")
+                pid = int(raw_pid) if raw_pid else None
+            except Exception:  # noqa: BLE001
+                pid = None
+            frames: list[tuple[int, bytes]] = []
+
+            def _read_all() -> None:
+                while True:
+                    frame = self._read_frame(socket)
+                    if frame is None:
+                        return
+                    frames.append(frame)
+
+            reader = threading.Thread(target=_read_all, daemon=True)
+            reader.start()
+            reader.join(timeout=max(0.1, deadline - time.monotonic()))
+            if reader.is_alive():
+                timed_out = True
+            else:
+                for stream_type, payload in frames:
+                    if stream_type == 1:
+                        stdout.extend(payload)
+                    elif stream_type == 2:
+                        stderr.extend(payload)
+                    if len(stdout) + len(stderr) > output_limit:
+                        truncated = True
+                        break
         except Exception as exc:  # noqa: BLE001
             raise DockerRuntimeError(f"failed to stream exec output: {type(exc).__name__}") from exc
         finally:
-            try:
-                socket.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-        if timed_out or truncated:
-            try:
-                client.api.kill(container.id, signal="SIGKILL")
-            except Exception:  # noqa: BLE001
-                pass
-            exit_code = -1
-        else:
-            try:
-                inspect = client.api.exec_inspect(exec_id)
-                exit_code = inspect.get("ExitCode")
-            except Exception:  # noqa: BLE001
-                exit_code = None
-        latency_ms = int((time.monotonic() - started) * 1000)
-        return RuntimeExecResult(
-            exit_code=exit_code,
-            stdout=bytes(stdout),
-            stderr=bytes(stderr),
-            timed_out=timed_out,
-            truncated=truncated,
-            latency_ms=latency_ms,
-        )
+            if socket is not None:
+                try:
+                    socket.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return timed_out, truncated, exec_id, pid, stdout, stderr
 
     @staticmethod
     def _read_frame(socket) -> tuple[int, bytes] | None:
@@ -600,19 +943,38 @@ class DockerRuntimeBackend:
         return container
 
     def exec_fixed(
-        self, handle: RuntimeHandle, argv: tuple[str, ...], *, timeout_seconds: int, output_limit: int
+        self,
+        handle: RuntimeHandle,
+        argv: tuple[str, ...],
+        *,
+        execution_id: str,
+        timeout_seconds: int,
+        output_limit: int,
     ) -> RuntimeExecResult:
         client = self._client()
         try:
             container = self._ensure_running(client, handle)
             return self._run_exec(
-                client, container, argv, workdir=WORKSPACE_MOUNT, timeout_seconds=timeout_seconds, output_limit=output_limit
+                client,
+                container,
+                argv,
+                workdir=WORKSPACE_MOUNT,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
+                execution_id=execution_id,
             )
         finally:
             self._close(client)
 
     def exec_agent(
-        self, handle: RuntimeHandle, argv: tuple[str, ...], *, cwd: str, timeout_seconds: int, output_limit: int
+        self,
+        handle: RuntimeHandle,
+        argv: tuple[str, ...],
+        *,
+        execution_id: str,
+        cwd: str,
+        timeout_seconds: int,
+        output_limit: int,
     ) -> RuntimeExecResult:
         safe_cwd = validate_relative_path(cwd or ".", allow_dot=True)
         workdir = WORKSPACE_MOUNT if safe_cwd.value == "." else f"{WORKSPACE_MOUNT}/{safe_cwd.value}"
@@ -620,10 +982,144 @@ class DockerRuntimeBackend:
         try:
             container = self._ensure_running(client, handle)
             return self._run_exec(
-                client, container, argv, workdir=workdir, timeout_seconds=timeout_seconds, output_limit=output_limit
+                client,
+                container,
+                argv,
+                workdir=workdir,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
+                execution_id=execution_id,
             )
         finally:
             self._close(client)
+
+    # --- kernels (persistent in-container REPL) ----------------------------
+
+    @staticmethod
+    def _kernel_dir(workspace_relative: str) -> str:
+        safe = validate_relative_path(workspace_relative or ".", allow_dot=True).value
+        base = "" if safe == "." else f"{safe}/"
+        return f"{base}.learngraph"
+
+    def start_kernel(
+        self, handle: RuntimeHandle, workspace_relative: str, interpreter: str
+    ) -> str:
+        from sandboxd.kernel import KERNEL_CLIENT_SOURCE, KERNEL_SERVER_SOURCE
+
+        if interpreter != "python":
+            raise DockerRuntimeError(f"unsupported kernel interpreter: {interpreter}")
+        client = self._client()
+        try:
+            container = self._ensure_running(client, handle)
+            kernel_id = f"k_{uuid.uuid4().hex[:16]}"
+            kernel_dir = self._kernel_dir(workspace_relative)
+            port_file = f"{WORKSPACE_MOUNT}/{kernel_dir}/kernel_{kernel_id}.port"
+            server_script = f"{WORKSPACE_MOUNT}/{kernel_dir}/kernel_server.py"
+            self.write_file(handle, f"{kernel_dir}/kernel_server.py", KERNEL_SERVER_SOURCE.encode("utf-8"), mode=0o644)
+            self.write_file(handle, f"{kernel_dir}/kernel_client.py", KERNEL_CLIENT_SOURCE.encode("utf-8"), mode=0o644)
+            exec_id = client.api.exec_create(
+                container.id,
+                ["python", server_script, kernel_id, port_file, workspace_relative or "."],
+                user=RUNNER_UID,
+                workdir=WORKSPACE_MOUNT,
+                environment={"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "XDG_CACHE_HOME": "/tmp/.cache"},
+                privileged=False,
+                tty=False,
+            )
+            client.api.exec_start(exec_id, detach=True)
+            # Wait for the port file (bounded poll); the server writes it after
+            # binding the listener.
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    data = self.read_file(handle, f"{kernel_dir}/kernel_{kernel_id}.port", 1024)
+                    json.loads(data.decode("utf-8"))
+                    return kernel_id
+                except (DockerRuntimeError, DockerRuntimeUnavailable, json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    time.sleep(0.3)
+            raise DockerRuntimeError("kernel server did not start within the deadline")
+        finally:
+            self._close(client)
+
+    def exec_kernel_cell(
+        self,
+        handle: RuntimeHandle,
+        kernel_id: str,
+        workspace_relative: str,
+        code: str,
+        *,
+        timeout_seconds: int,
+        output_limit: int,
+    ) -> RuntimeExecResult:
+        client = self._client()
+        try:
+            container = self._ensure_running(client, handle)
+            kernel_dir = self._kernel_dir(workspace_relative)
+            port_file = f"{WORKSPACE_MOUNT}/{kernel_dir}/kernel_{kernel_id}.port"
+            cell_file = f"{kernel_dir}/cell_{kernel_id}_{uuid.uuid4().hex[:8]}.py"
+            client_script = f"{WORKSPACE_MOUNT}/{kernel_dir}/kernel_client.py"
+            self.write_file(handle, cell_file, code.encode("utf-8"), mode=0o644)
+            argv = ("python", client_script, port_file, f"{WORKSPACE_MOUNT}/{cell_file}", f"cell_{uuid.uuid4().hex[:8]}")
+            return self._run_exec(
+                client,
+                container,
+                argv,
+                workdir=WORKSPACE_MOUNT,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
+            )
+        finally:
+            self._close(client)
+
+    def stop_kernel(
+        self, handle: RuntimeHandle, kernel_id: str, workspace_relative: str
+    ) -> None:
+        client = self._client()
+        try:
+            container = self._ensure_running(client, handle)
+            kernel_dir = self._kernel_dir(workspace_relative)
+            port_file = f"{WORKSPACE_MOUNT}/{kernel_dir}/kernel_{kernel_id}.port"
+            kill_script = (
+                "import json,os,signal;"
+                f"d=json.load(open({port_file!r}));"
+                "os.kill(d['pid'],signal.SIGTERM)"
+            )
+            try:
+                self._run_exec(
+                    client,
+                    container,
+                    ("python", "-c", kill_script),
+                    workdir=WORKSPACE_MOUNT,
+                    timeout_seconds=30,
+                    output_limit=64 * 1024,
+                )
+            except Exception:  # noqa: BLE001 - best-effort kernel teardown
+                pass
+            try:
+                self.delete_file(handle, f"{kernel_dir}/kernel_{kernel_id}.port")
+            except Exception:  # noqa: BLE001 - watchdog cleanup is best-effort
+                pass
+        finally:
+            self._close(client)
+
+    def cancel_exec(self, handle: RuntimeHandle, execution_id: str) -> bool:
+        """Terminate the process group of a live execution (best-effort).
+
+        Returns True when the execution was tracked (and termination was
+        attempted); False when it already finished or is unknown.
+        """
+        entry = self._lookup_exec(execution_id)
+        if entry is None:
+            return False
+        client = self._client()
+        try:
+            container = self._container(client, handle)
+            self._terminate_process_group(client, container, entry.get("pid"))
+        except Exception:  # noqa: BLE001 - best-effort cancel
+            logger.exception("cancel failed for execution %s", execution_id)
+        finally:
+            self._close(client)
+        return True
 
     # --- files -------------------------------------------------------------
 
@@ -679,8 +1175,14 @@ class DockerRuntimeBackend:
                 for member in tar:
                     if not member.isfile():
                         continue
+                    # extractfile once per member: a streaming tar cannot seek
+                    # backwards, so re-extracting the same member raises
+                    # tarfile.StreamError.
+                    fileobj = tar.extractfile(member)
+                    if fileobj is None:
+                        continue
                     while True:
-                        chunk = member_fileobj_read(tar, member, 64 * 1024)
+                        chunk = fileobj.read(64 * 1024)
                         if not chunk:
                             break
                         data.extend(chunk)
@@ -705,15 +1207,13 @@ class DockerRuntimeBackend:
         script = (
             "import json, os, sys; "
             "root='/workspace'; prefix=sys.argv[1]; limit=int(sys.argv[2]); offset=int(sys.argv[3]); "
-            "entries=[]; count=0; "
-            "walk=[(os.path.join(dp, n)) for dp, dns, fns in os.walk(root) for n in sorted(dns + fns)]; "
-            "[None for p in walk if os.path.isfile(p) "
-            "for rel in [os.path.relpath(p, root).replace(os.sep, '/')] "
-            "if (not prefix or rel.startswith(prefix)) "
-            "and (count := count + 1) > offset "
-            "and len(entries) < limit "
-            "and entries.append([rel, os.path.getsize(p) if os.path.isfile(p) else 0])]; "
-            "print(json.dumps({'entries': entries, 'next': offset + len(entries)}))"
+            "walk=[os.path.join(dp, n) for dp, dns, fns in os.walk(root) for n in sorted(dns + fns)]; "
+            "items=[(os.path.relpath(p, root).replace(os.sep, '/'), os.path.getsize(p)) "
+            "for p in walk if os.path.isfile(p) "
+            "and (not prefix or os.path.relpath(p, root).replace(os.sep, '/').startswith(prefix))]; "
+            "selected=items[offset:offset + limit]; "
+            "print(json.dumps({'entries': [[rel, sz] for rel, sz in selected], "
+            "'next': offset + len(selected)}))"
         )
         client = self._client()
         try:
@@ -808,18 +1308,20 @@ class _StreamReader(io.RawIOBase):
         return chunk
 
 
-def member_fileobj_read(tar: tarfile.TarFile, member: tarfile.TarInfo, size: int) -> bytes:
-    fileobj = tar.extractfile(member)
-    if fileobj is None:
-        return b""
-    return fileobj.read(size)
-
-
 def _tar_single_file(relative_path: str, data: bytes, *, mode: int) -> io.BytesIO:
-    """Build a strict single-file tar archive with a validated member name."""
+    """Build a strict single-file tar archive with a validated member name.
+
+    uid/gid are pinned to the runner user (65532) so the Docker daemon's
+    ``put_archive`` extraction chowns the file to the exec user; otherwise the
+    archive lands as root-owned and the hardened runner cannot read it.
+    """
     info = tarfile.TarInfo(name=relative_path)
     info.size = len(data)
     info.mode = mode
+    info.uid = 65532
+    info.gid = 65532
+    info.uname = "learngraph"
+    info.gname = "learngraph"
     info.mtime = int(time.time())
     info.type = tarfile.REGTYPE
     stream = io.BytesIO()

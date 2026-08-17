@@ -97,6 +97,32 @@ class ExecResult(BaseModel):
     status: Literal["succeeded", "failed", "timeout", "cancelled", "indeterminate"]
 
 
+class KernelOpenRequest(BaseModel):
+    workspace_relative: str = "."
+    interpreter: Literal["python"] = "python"
+
+
+class KernelOpenResult(BaseModel):
+    kernel_id: str
+    interpreter: str
+    status: str = "running"
+
+
+class KernelCellRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=262_144)
+    timeout_seconds: int = Field(ge=1, le=3600, default=180)
+    output_limit: int = Field(ge=1024, le=512 * 1024 * 1024, default=20 * 1024 * 1024)
+
+
+class KernelCellResult(BaseModel):
+    kernel_id: str
+    ok: bool
+    stdout: str = ""
+    stderr: str = ""
+    result_repr: str | None = None
+    timed_out: bool = False
+
+
 class FileListEntry(BaseModel):
     path: str
     size_bytes: int
@@ -123,6 +149,7 @@ class Capabilities(BaseModel):
             "idempotency",
             "per_sandbox_egress_network",
             "resource_usage",
+            "kernels",
         ]
     )
     limits: dict[str, int] = Field(
@@ -147,6 +174,12 @@ class HealthReady(BaseModel):
 class Capacity(BaseModel):
     cpu_count: int
     memory_bytes: int
+    # Live observed usage of this deployment's managed containers (best-effort;
+    # 0 when the probe is unavailable). Used by the scheduler for pressure-based
+    # dynamic admission — never as the sole admission signal.
+    observed_memory_bytes: int = 0
+    observed_cpu_percent: float = 0.0
+    active_containers: int = 0
 
 
 # Stable error codes (contract). Client maps them onto its own exceptions.
@@ -174,5 +207,6 @@ ERROR_CODES = frozenset(
         "docker_unavailable",
         "idempotency_conflict",
         "invalid_request",
+        "kernel_not_found",
     }
 )

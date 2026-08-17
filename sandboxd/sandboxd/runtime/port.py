@@ -64,6 +64,8 @@ class RuntimeBackendPort(Protocol):
 
     def probe(self) -> RuntimeCapability: ...
     def capacity(self) -> tuple[int, int]: ...
+    def pull_and_resolve_digest(self, image_tag: str) -> tuple[str, dict[str, str]]: ...
+    def smoke_test(self, image_ref: str, runtime_kind: str, *, timeout_seconds: int = 120) -> tuple[bool, str]: ...
     def create(self, spec: RuntimeCreateSpec) -> RuntimeHandle: ...
     def resume(self, sandbox_id: str, container_id: str | None) -> RuntimeHandle: ...
     def stop(self, handle: RuntimeHandle) -> None: ...
@@ -76,8 +78,38 @@ class RuntimeBackendPort(Protocol):
     ) -> tuple[list[RuntimeFileEntry], str | None]: ...
     def workspace_usage(self, handle: RuntimeHandle) -> dict[str, int]: ...
     def exec_fixed(
-        self, handle: RuntimeHandle, argv: tuple[str, ...], *, timeout_seconds: int, output_limit: int
+        self,
+        handle: RuntimeHandle,
+        argv: tuple[str, ...],
+        *,
+        execution_id: str,
+        timeout_seconds: int,
+        output_limit: int,
     ) -> RuntimeExecResult: ...
     def exec_agent(
-        self, handle: RuntimeHandle, argv: tuple[str, ...], *, cwd: str, timeout_seconds: int, output_limit: int
+        self,
+        handle: RuntimeHandle,
+        argv: tuple[str, ...],
+        *,
+        execution_id: str,
+        cwd: str,
+        timeout_seconds: int,
+        output_limit: int,
     ) -> RuntimeExecResult: ...
+    def cancel_exec(self, handle: RuntimeHandle, execution_id: str) -> bool: ...
+    def start_kernel(
+        self, handle: RuntimeHandle, workspace_relative: str, interpreter: str
+    ) -> str: ...
+    def exec_kernel_cell(
+        self,
+        handle: RuntimeHandle,
+        kernel_id: str,
+        workspace_relative: str,
+        code: str,
+        *,
+        timeout_seconds: int,
+        output_limit: int,
+    ) -> RuntimeExecResult: ...
+    def stop_kernel(
+        self, handle: RuntimeHandle, kernel_id: str, workspace_relative: str
+    ) -> None: ...
