@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from datetime import timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any
@@ -15,6 +16,9 @@ from app.core.errors import AppError
 from app.domain.models import CapabilityGrant, SandboxDestructiveGrant, new_id, utc_now
 from app.providers.remote.sandbox import (
     DESTRUCTIVE_COMMANDS,
+    GIT_EXECUTABLE,
+    GIT_WORKTREE_MUTATORS,
+    SHELL_EXECUTABLES,
     SandboxCapabilityMismatch,
     validate_agent_workspace_path,
 )
@@ -22,6 +26,137 @@ from app.repositories.audit import AuditRepository
 
 
 DEFAULT_GRANT_TTL_SECONDS = 5 * 60
+
+# Shell command names that mutate/delete workspace files.  ``mv`` is included
+# because it rewrites paths; ``>``/``>>`` redirects are writes and are not
+# authorization-worthy (mirrors the write tools).
+SHELL_DESTRUCTIVE_COMMANDS = frozenset(
+    {"rm", "rmdir", "unlink", "shred", "wipefs", "mkfs", "dd", "truncate", "mv"}
+)
+
+
+def _require_work_tree_paths(
+    paths: list[str], *, source: str
+) -> dict[str, Any]:
+    """Shared hardening for classifier results: only ``work/``-tree deletes are
+    grantable (mirrors SandboxAuthorizationService.grant); anything else is a
+    hard policy block."""
+    cleaned: list[str] = []
+    for item in paths:
+        if "\\" in item or ":" in item or item.startswith("/") or ".." in item:
+            return {
+                "action": "delete_path",
+                "paths": [item],
+                "hard_blocked": True,
+                "reason": f"{source} targets a non-portable or host-like path",
+            }
+        try:
+            cleaned.append(validate_agent_workspace_path(item))
+        except SandboxCapabilityMismatch:
+            return {
+                "action": "delete_path",
+                "paths": [item],
+                "hard_blocked": True,
+                "reason": f"{source} path is not a valid session-relative path",
+            }
+    if not cleaned:
+        return {
+            "action": "delete_path",
+            "paths": [],
+            "hard_blocked": True,
+            "reason": f"{source} without a scoped workspace path is blocked",
+        }
+    for item in cleaned:
+        if not (item == "work" or item.startswith("work/")):
+            return {
+                "action": "delete_path",
+                "paths": [item],
+                "hard_blocked": True,
+                "reason": (
+                    "Only the session work/ tree is deletable; use "
+                    "sandbox_delete_file for durable single-file deletes"
+                ),
+            }
+    return {
+        "action": "delete_path",
+        "paths": cleaned,
+        "hard_blocked": False,
+        "reason": "Session workspace delete requires explicit user authorization",
+    }
+
+
+def classify_destructive_shell(command: str) -> dict[str, Any] | None:
+    """Classify a ``bash -lc`` command string for workspace deletions.
+
+    Tokenizes with ``shlex`` (no execution).  A destructive command name with
+    workspace-relative ``work/`` paths is authorization-eligible; host-like,
+    absolute, ``..`` or non-``work/`` paths are hard-blocked; destructive
+    commands without any path are hard-blocked (same policy as argv rm).
+    """
+
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # Unbalanced quotes/escapes: not classifiable; let bash fail at runtime.
+        return None
+    control_tokens = {"&&", "||", ";", "|", "&", ">", ">>", "<", "<<", "(", ")", "`"}
+    for index, token in enumerate(tokens):
+        base = PurePosixPath(token.replace("\\", "/")).name.casefold()
+        if base not in SHELL_DESTRUCTIVE_COMMANDS:
+            continue
+        paths: list[str] = []
+        for argument in tokens[index + 1:]:
+            if argument in control_tokens:
+                break
+            if argument.startswith("-"):
+                continue
+            paths.append(argument)
+        return _require_work_tree_paths(paths, source="Destructive shell command")
+    return None
+
+
+def classify_destructive_git(argv: tuple[str, ...]) -> dict[str, Any] | None:
+    """Classify ``git`` argv for workspace-tree mutations.
+
+    ``rm`` / ``mv`` / ``checkout -- <path>`` / ``restore <path>`` / ``revert``
+    with explicit ``work/`` paths are authorization-eligible; ``clean`` /
+    ``reset`` without a scoped path are hard-blocked (there is no safe grant
+    unit for them).
+    """
+
+    if len(argv) < 2 or argv[0].casefold() != GIT_EXECUTABLE:
+        return None
+    subcommand = argv[1].casefold()
+    if subcommand not in GIT_WORKTREE_MUTATORS:
+        return None
+    if subcommand in {"clean", "reset", "revert"}:
+        has_scoped_path = any(
+            not argument.startswith("-")
+            and not argument.startswith("work/")
+            and ".." not in argument
+            and not argument.startswith("/")
+            for argument in argv[2:]
+        )
+        if not has_scoped_path:
+            return {
+                "action": "delete_path",
+                "paths": [],
+                "hard_blocked": True,
+                "reason": (
+                    "git clean/reset/revert without a scoped work/ path is blocked; "
+                    "use per-path git rm/checkout/restore with authorization"
+                ),
+            }
+    if subcommand == "clean":
+        return None
+    paths: list[str] = []
+    for argument in argv[2:]:
+        if argument == "--" or argument.startswith("-"):
+            continue
+        if argument in {"HEAD", "HEAD~1", "HEAD^", "stash", "@", "@~1"}:
+            continue
+        paths.append(argument)
+    return _require_work_tree_paths(paths, source=f"git {subcommand}")
 
 
 def classify_destructive_argv(argv: tuple[str, ...]) -> dict[str, Any] | None:
@@ -360,6 +495,17 @@ class SandboxAuthorizationService:
         self.db.commit()
         return tuple(sorted({grant.path_prefix for grant in matches.values()}))
 
+    def classify_argv(self, argv: tuple[str, ...]) -> dict[str, Any] | None:
+        """Dispatch destructive-command classification by entrypoint."""
+        if not argv:
+            return None
+        executable = PurePosixPath(argv[0].replace("\\", "/")).name.casefold()
+        if executable in SHELL_EXECUTABLES:
+            return classify_destructive_shell(argv[-1] if argv else "")
+        if executable == GIT_EXECUTABLE:
+            return classify_destructive_git(argv)
+        return classify_destructive_argv(argv)
+
     def authorize_or_raise(
         self,
         *,
@@ -368,7 +514,7 @@ class SandboxAuthorizationService:
     ) -> dict[str, Any] | None:
         """Return None if allowed; raise AppError if blocked / needs auth."""
 
-        intent = classify_destructive_argv(argv)
+        intent = self.classify_argv(argv)
         if intent is None:
             return None
         if intent.get("hard_blocked"):

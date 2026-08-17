@@ -1857,6 +1857,133 @@ class SandboxSession(Base, TimestampMixin, WorkspaceScopedMixin):
     command_generation: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class SandboxInstance(Base, TimestampMixin, WorkspaceScopedMixin):
+    """A user-owned warm execution container (execution pool unit).
+
+    One user may own 0..N instances; each instance is a backend resource that
+    can run multiple executions concurrently. The instance is the unit of
+    scheduling, lifecycle and cleanup — NOT the chat session.
+    """
+
+    __tablename__ = "sandbox_instances"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    backend_id: Mapped[str] = mapped_column(String(80), default="sandboxd")
+    backend_resource_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    backend_protocol_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    runtime_profile: Mapped[str] = mapped_column(String(40), default="code-medium", index=True)
+    image_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    skill_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    runner_abi: Mapped[str] = mapped_column(String(40), default="1")
+    state: Mapped[str] = mapped_column(
+        String(32), default="PROVISIONING", index=True
+    )  # PROVISIONING/READY/BUSY/SATURATED/DEGRADED/DRAINING/DESTROYING/DESTROYED
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    resource_envelope: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reserved_vector: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    active_executions: Mapped[int] = mapped_column(Integer, default=0)
+    max_parallel_execs: Mapped[int] = mapped_column(Integer, default=4)
+    idle_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    last_health_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    cleanup_status: Mapped[str] = mapped_column(String(32), default="not_started", index=True)
+    cleanup_error_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+
+class SandboxWorkspace(Base, TimestampMixin, WorkspaceScopedMixin):
+    """A chat-session workspace directory inside the user's execution pool.
+
+    Workspaces are durable and decoupled from instance/container lifecycle:
+    an instance can be destroyed while its workspaces persist on the user
+    volume and are remounted later. Directory isolation (not security
+    isolation) is the boundary between chat sessions of the same user.
+    """
+
+    __tablename__ = "sandbox_workspaces"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "owner_user_id", "chat_session_id", name="uq_sandbox_workspace_chat"
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    workspace_key: Mapped[str] = mapped_column(String(120), index=True)
+    storage_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    dirty_generation: Mapped[int] = mapped_column(Integer, default=0)
+    last_accessed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    retention_idle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retention_abs_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cleanup_status: Mapped[str] = mapped_column(String(32), default="not_started", index=True)
+    cleanup_error_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+
+class SandboxJob(Base, TimestampMixin, WorkspaceScopedMixin):
+    """A schedulable unit of sandbox work (agent command / fixed task / skill run).
+
+    The unified scheduler claims QUEUED jobs, reserves capacity on a user
+    instance, and only then starts an execution. Capacity shortage keeps the
+    job QUEUED instead of failing the caller; the caller sees
+    HTTP 202 + job_id + state and follows the job status stream.
+    """
+
+    __tablename__ = "sandbox_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "owner_user_id", "idempotency_key_hash",
+            name="uq_sandbox_job_idempotency",
+        ),
+        Index("ix_sandbox_jobs_sched", "status", "available_at", "priority"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(24), default="agent_command", index=True)
+    sandbox_workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    workload_class: Mapped[str] = mapped_column(String(40), default="default")
+    request_vector: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SandboxReservation(Base, TimestampMixin, WorkspaceScopedMixin):
+    """An atomic capacity reservation on a user instance for a job.
+
+    Held by the scheduler between admission and execution start; expired
+    reservations release capacity without killing anything.
+    """
+
+    __tablename__ = "sandbox_reservations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    instance_id: Mapped[str] = mapped_column(String(36), index=True)
+    resource_vector: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    token_hash: Mapped[str] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default="HELD", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class SandboxTask(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "sandbox_tasks"
     __table_args__ = (
@@ -1891,6 +2018,10 @@ class SandboxExecution(Base, TimestampMixin, WorkspaceScopedMixin):
     sandbox_session_id: Mapped[str] = mapped_column(
         ForeignKey("sandbox_sessions.id", ondelete="CASCADE"), index=True
     )
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    instance_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    reservation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    workspace_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     task_id: Mapped[str] = mapped_column(
         ForeignKey("sandbox_tasks.id", ondelete="CASCADE"), index=True
     )
@@ -1902,6 +2033,10 @@ class SandboxExecution(Base, TimestampMixin, WorkspaceScopedMixin):
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
     timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     resource_usage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     stdout_summary: Mapped[str] = mapped_column(Text, default="")
@@ -1933,6 +2068,8 @@ class SandboxAgentCommand(Base, TimestampMixin, WorkspaceScopedMixin):
     sandbox_session_id: Mapped[str] = mapped_column(
         ForeignKey("sandbox_sessions.id", ondelete="CASCADE"), index=True
     )
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    instance_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     chat_session_id: Mapped[str] = mapped_column(
         ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
     )
@@ -2106,6 +2243,58 @@ class SandboxDestructiveGrant(Base, TimestampMixin, WorkspaceScopedMixin):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     reason: Mapped[str] = mapped_column(Text, default="")
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SandboxTodo(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Session-scoped agent task checklist (sandbox_todo tool).
+
+    One row per chat session; items are a JSON list of
+    ``{id, text, status: open|done, created_at, updated_at}``.  The checklist
+    is host-side state and survives sandbox container restarts.
+    """
+
+    __tablename__ = "sandbox_todos"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "owner_user_id", "chat_session_id",
+            name="uq_sandbox_todo_chat",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    sandbox_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sandbox_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SandboxKernel(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Host-side audit record for a persistent in-container REPL kernel.
+
+    The kernel itself lives in the sandboxd-managed container; this row keeps
+    ownership/cleanup metadata so app cleanup can tear kernels down with the
+    session.
+    """
+
+    __tablename__ = "sandbox_kernels"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    sandbox_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sandbox_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    kernel_id: Mapped[str] = mapped_column(String(64), index=True)
+    interpreter: Mapped[str] = mapped_column(String(20), default="python")
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    last_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
 
 
 class CapabilityGrant(Base, TimestampMixin, WorkspaceScopedMixin):

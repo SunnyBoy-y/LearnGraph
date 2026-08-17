@@ -3277,7 +3277,7 @@ class AgentToolRuntime:
                     agent_authorized=self.sandbox_authorized,
                 )
                 status = str(result.get("status") or "completed")
-                if status not in {"completed", "ready"} and name == "sandbox_exec":
+                if status in {"failed", "sandbox_timeout", "sandbox_command_failed"} and name == "sandbox_exec":
                     return self._failure(
                         str(result.get("error_class") or "sandbox_execution_failed"),
                         str(result.get("stderr") or result.get("error_class") or "Sandbox command failed"),

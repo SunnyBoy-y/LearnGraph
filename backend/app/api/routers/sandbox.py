@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, Header, Query, status
@@ -39,6 +40,7 @@ from app.domain.schemas.sandbox import (
     SandboxDestructiveGrantRequest,
     SandboxDestructiveGrantView,
     SandboxExecutionView,
+    SandboxJobView,
     SandboxProfileView,
     SandboxSessionView,
     SandboxTaskCreateRequest,
@@ -434,6 +436,147 @@ def get_agent_command(
     return SandboxAgentCommandView.model_validate(
         agent_service(db, context, settings).get_command(command_id)
     )
+
+
+@router.get("/jobs/{job_id}", response_model=SandboxJobView)
+def get_sandbox_job(
+    job_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxJobView:
+    """Query a unified-scheduler sandbox job (queue/run status)."""
+    require_agent_sandbox_permission(context)
+    from app.services.sandbox_scheduler import SandboxSchedulerService
+
+    job = SandboxSchedulerService(db, settings).get_job(
+        job_id,
+        workspace_id=context.workspace_id,
+        owner_user_id=context.principal.user_id,
+    )
+    return SandboxJobView.model_validate(job)
+
+
+@router.get("/jobs/{job_id}/stream")
+async def stream_sandbox_job(
+    job_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+):
+    """SSE status stream for a unified-scheduler sandbox job.
+
+    Emits ``sandbox.job.updated`` events whenever the job state changes and a
+    final event on terminal states (SUCCEEDED / FAILED / CANCELLED / EXPIRED).
+    The stream is scoped to the caller's workspace + user and closes after the
+    terminal event.
+    """
+    require_agent_sandbox_permission(context)
+    import asyncio
+
+    from fastapi.responses import StreamingResponse
+
+    from app.core.database import SessionLocal
+    from app.services.sandbox_scheduler import SandboxSchedulerService
+
+    TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
+    _JOB_SSE_TYPES = {
+        "QUEUED": "queued",
+        "STARTING": "starting",
+        "RUNNING": "running",
+        "SUCCEEDED": "succeeded",
+        "FAILED": "failed",
+        "CANCELLED": "cancelled",
+        "EXPIRED": "expired",
+    }
+
+    def _load_job():
+        with SessionLocal() as session:
+            return SandboxSchedulerService(session, settings).get_job(
+                job_id,
+                workspace_id=context.workspace_id,
+                owner_user_id=context.principal.user_id,
+            )
+
+    def _event(job) -> str:
+        lines = [
+            "event: sandbox.job.updated",
+            f"id: {job.id}",
+            "data: " + json.dumps(
+                {
+                    "job_id": job.id,
+                    "status": _JOB_SSE_TYPES.get(job.status, job.status.casefold()),
+                    "reason": job.reason,
+                    "kind": job.kind,
+                    "attempt": job.attempt,
+                    "created_at": job.created_at.isoformat() if job.created_at else None,
+                    "started_at": job.started_at.isoformat() if job.started_at else None,
+                    "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+                    "error_class": job.error_class,
+                    "error_message": job.error_message,
+                },
+                ensure_ascii=False,
+            ),
+            "",
+        ]
+        return "\n".join(lines)
+
+    # Validate ownership up-front so 404/403 surfaces immediately.
+    initial = _load_job()
+
+    async def event_stream():
+        last_key = (initial.status, initial.reason)
+        yield _event(initial)
+        if initial.status in TERMINAL:
+            return
+        while True:
+            await asyncio.sleep(2)
+            try:
+                fresh = _load_job()
+            except AppError:
+                # Job disappeared mid-stream: surface a terminal event.
+                yield (
+                    "event: sandbox.job.updated\n"
+                    'data: {"job_id": "%s", "status": "failed", "reason": "job_not_found"}\n\n'
+                    % job_id
+                )
+                return
+            key = (fresh.status, fresh.reason)
+            if key != last_key:
+                last_key = key
+                yield _event(fresh)
+            if fresh.status in TERMINAL:
+                return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=SandboxJobView)
+def cancel_sandbox_job(
+    job_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> SandboxJobView:
+    """Cancel a queued or running sandbox job."""
+    require_agent_sandbox_permission(context)
+    from app.services.sandbox_scheduler import SandboxSchedulerService
+
+    scheduler = SandboxSchedulerService(db, settings)
+    job = scheduler.get_job(
+        job_id,
+        workspace_id=context.workspace_id,
+        owner_user_id=context.principal.user_id,
+    )
+    job = scheduler.cancel_job(job)
+    return SandboxJobView.model_validate(job)
 
 
 @router.post("/agent/environment")

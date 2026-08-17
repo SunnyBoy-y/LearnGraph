@@ -28,6 +28,7 @@ from app.domain.models import (
     FileRecord,
     SandboxAgentCommand,
     SandboxExecution,
+    SandboxInstance,
     SandboxSession,
     SandboxTask,
     Workspace,
@@ -36,22 +37,33 @@ from app.domain.models import (
 )
 from app.services.sandbox_authz import (
     SandboxAuthorizationService,
-    classify_destructive_argv,
     destructive_intent_digest,
 )
+from app.services.sandbox_toolkit import SandboxToolkitMixin
 from app.services.session_workspace import SessionWorkspaceService
 from app.domain.schemas.sandbox import (
+    SandboxAgentBashRequest,
     SandboxAgentCommandRequest,
     SandboxAgentFileEditRequest,
     SandboxAgentFileAppendRequest,
     SandboxAgentEnvironmentRequest,
+    SandboxAgentFetchRequest,
+    SandboxAgentGitCloneRequest,
+    SandboxAgentGitRequest,
     SandboxAgentImagePublishRequest,
     SandboxAgentFileDeleteRequest,
     SandboxAgentFileGrepRequest,
     SandboxAgentFileListRequest,
     SandboxAgentFileReadRequest,
     SandboxAgentFileWriteRequest,
+    SandboxAgentNotebookRequest,
+    SandboxAgentPatchRequest,
+    SandboxAgentSearchRequest,
     SandboxAgentSessionCreateRequest,
+    SandboxAgentSkillListRequest,
+    SandboxAgentSkillReadRequest,
+    SandboxAgentSubagentRequest,
+    SandboxAgentTodoRequest,
     SandboxAgentTranscribeRequest,
     SandboxAgentVideoInfoRequest,
     SandboxTaskCreateRequest,
@@ -89,6 +101,61 @@ from app.services.sandbox_runtime import (
 
 _sandbox_capacity_lock = threading.RLock()
 logger = logging.getLogger(__name__)
+
+
+def _workload_class_for_argv(argv: Iterable[str]) -> str:
+    """Map a validated argv to a workload class for server-side admission.
+
+    Read-only scans get the cheapest envelope; heavy toolchains get bounded
+    envelopes. The mapping is a hint only — the deployment's authoritative
+    per-class resource vectors live in ``Settings.sandbox_workload_classes``.
+    """
+    lowered = [str(part).casefold() for part in argv]
+    joined = " ".join(lowered)
+    if any(
+        token in lowered
+        for token in (
+            "grep",
+            "rg",
+            "find",
+            "ls",
+            "cat",
+            "head",
+            "tail",
+            "wc",
+            "sed",
+            "awk",
+            "diff",
+            "file",
+            "stat",
+        )
+    ) and not any(token in joined for token in ("npm", "pip", "python", "node")):
+        return "read_only"
+    if any(token in lowered for token in ("npm", "pnpm", "yarn", "vite", "webpack", "tsc")):
+        return "build"
+    if any(token in lowered for token in ("chromium", "playwright", "puppeteer")):
+        return "browser"
+    if any(token in lowered for token in ("python", "node", "ffmpeg")):
+        return "python"
+    return "default"
+
+
+def _runtime_image_pinned(backend: Any, settings: Settings, local_resolved: str, runtime_kind: str = "python-node") -> bool:
+    """Image-pinned status for UI/environment info.
+
+    The sandboxd backend reports whether its control plane has an installed
+    (smoke-passed) runtime; the legacy Docker backend and the
+    admin-plane-unavailable case fall back to the locally persisted/env digest.
+    """
+    probe = getattr(backend, "runtime_image_pinned", None)
+    if callable(probe):
+        try:
+            result = probe(runtime_kind)
+        except Exception:  # noqa: BLE001 - never let a probe break the profile
+            result = None
+        if result is not None:
+            return result
+    return image_ref_is_pinned(local_resolved)
 
 def _sandbox_workspace_root(settings: Settings) -> Path:
     root = settings.resolved_sandbox_workspace_root
@@ -495,7 +562,7 @@ class SandboxTaskService:
             "available": capability.available,
             "capabilities": list(capability.capabilities),
             "reason": capability.reason,
-            "image_pinned": image_ref_is_pinned(resolved),
+            "image_pinned": _runtime_image_pinned(backend, self.settings, resolved),
         }
 
     def list_sessions(
@@ -1110,13 +1177,16 @@ def _redacted_agent_argv(argv: tuple[str, ...]) -> list[str]:
     return result
 
 
-class SandboxAgentWorkspaceService:
+class SandboxAgentWorkspaceService(SandboxToolkitMixin):
     """Persisted, shell-free Agent workspace operations over a hardened backend.
 
     The service deliberately owns only the execution boundary.  Agent planning
     and business-domain tools stay in Chat/MCP services.  A caller must make a
     separate authorization decision before using ``execute_agent_tool``; HTTP
     routes enforce ``workspace.manage`` directly.
+
+    The extended tool set (bash / todo / patch / git / search / fetch /
+    subagent / skills / notebook) lives in :class:`SandboxToolkitMixin`.
     """
 
     def __init__(
@@ -1342,6 +1412,233 @@ class SandboxAgentWorkspaceService:
             self._runtime_backend(session),
         )
 
+    # ── execution-pool instance reuse (design doc §3.1, §5) ─────────────
+
+    def _chat_workspace_key(self, chat_session_id: str) -> str:
+        """Stable, opaque per-chat workspace key inside a shared instance."""
+        digest = hashlib.sha256(
+            f"{self.workspace_id}:{chat_session_id}".encode("utf-8")
+        ).hexdigest()
+        return digest[:20]
+
+    def _pooling_enabled(self, session: SandboxSession) -> bool:
+        return bool(
+            self.settings.sandbox_instance_pooling_enabled
+            and (session.backend_id or "docker") == "sandboxd"
+        )
+
+    def _container_prefix(self, chat_session_id: str) -> str:
+        return f"sessions/{self._chat_workspace_key(chat_session_id)}"
+
+    def _container_path(self, chat_session_id: str, path: str) -> str:
+        return f"{self._container_prefix(chat_session_id)}/{path.lstrip('/')}"
+
+    def _acquire_instance(self, runtime_kind: str) -> SandboxInstance:
+        """Find the user's pooled warm instance, or create one (bounded).
+
+        Raises ``AppError(429, sandbox_user_concurrency_limit)`` when the
+        user's instance quota is exhausted so the unified scheduler queues the
+        job instead of failing the caller.
+        """
+        active_states = ("PROVISIONING", "READY", "BUSY", "SATURATED")
+        # Prefer an instance that still has free parallelism.
+        instance = self.db.scalar(
+            select(SandboxInstance)
+            .where(
+                SandboxInstance.workspace_id == self.workspace_id,
+                SandboxInstance.owner_user_id == self.actor_id,
+                SandboxInstance.runtime_profile == runtime_kind,
+                SandboxInstance.state.in_(active_states),
+                SandboxInstance.active_executions < SandboxInstance.max_parallel_execs,
+            )
+            .order_by(
+                SandboxInstance.active_executions.asc(),
+                SandboxInstance.created_at.asc(),
+            )
+            .limit(1)
+        )
+        if instance is not None:
+            return instance
+        # No free-parallelism instance: every active instance is saturated.
+        # Create another instance when the user's quota allows; otherwise the
+        # caller queues (429 → CAPACITY_CODES → SandboxJob).
+        count = int(
+            self.db.scalar(
+                select(func.count(SandboxInstance.id)).where(
+                    SandboxInstance.workspace_id == self.workspace_id,
+                    SandboxInstance.owner_user_id == self.actor_id,
+                    SandboxInstance.state.in_(active_states),
+                )
+            )
+            or 0
+        )
+        from app.services.sandbox_scheduler import (
+            effective_max_instances,
+            effective_max_parallel,
+            workspace_scheduling_policy,
+        )
+
+        policy = workspace_scheduling_policy(self.db, self.workspace_id)
+        effective_max = effective_max_instances(self.settings, policy)
+        if count >= effective_max:
+            raise AppError(
+                429,
+                "sandbox_user_concurrency_limit",
+                "The active sandbox limit for this user has been reached",
+            )
+        instance = SandboxInstance(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            backend_id="sandboxd",
+            runtime_profile=runtime_kind,
+            state="PROVISIONING",
+            resource_envelope={
+                "cpu": self.settings.sandbox_cpu_count,
+                "memory_bytes": self.settings.sandbox_memory_bytes,
+                "pids": self.settings.sandbox_pids_max,
+                "disk_bytes": self.settings.sandbox_disk_bytes,
+            },
+            max_parallel_execs=effective_max_parallel(
+                self.settings, workspace_scheduling_policy(self.db, self.workspace_id)
+            ),
+            active_executions=0,
+        )
+        self.db.add(instance)
+        self.db.commit()
+        self.db.refresh(instance)
+        return instance
+
+    def _release_instance(self, instance_id: str) -> None:
+        instance = self.db.get(SandboxInstance, instance_id)
+        if instance is None:
+            return
+        instance.active_executions = max(0, int(instance.active_executions or 0) - 1)
+        if instance.active_executions == 0:
+            if instance.idle_since is None:
+                instance.idle_since = utc_now()
+            instance.state = "READY"
+        else:
+            instance.state = "BUSY"
+            instance.idle_since = None
+        instance.last_health_check_at = utc_now()
+        self.db.commit()
+
+    def _release_instance_for_session(self, session: SandboxSession) -> None:
+        """Release the borrow taken by ``_borrow_instance`` (command runs).
+
+        Pooled sessions point ``backend_session_ref`` at the shared instance's
+        resource ref, so the borrow is located through that ref.
+        """
+        if not self._pooling_enabled(session) or not session.backend_session_ref:
+            return
+        instance = self.db.scalar(
+            select(SandboxInstance).where(
+                SandboxInstance.backend_resource_ref == session.backend_session_ref
+            )
+        )
+        if instance is not None:
+            self._release_instance(instance.id)
+
+    def _borrow_instance(self, session: SandboxSession) -> None:
+        """Count one running command on the shared instance (parallelism)."""
+        instance = self.db.scalar(
+            select(SandboxInstance).where(
+                SandboxInstance.backend_resource_ref == session.backend_session_ref
+            )
+        )
+        if instance is None:
+            return
+        instance.active_executions = int(instance.active_executions or 0) + 1
+        instance.state = "BUSY"
+        instance.idle_since = None
+        self.db.commit()
+
+    def _ensure_pooled_backend_session(
+        self, session: SandboxSession, backend
+    ) -> SandboxSessionHandle:
+        """Run a chat execution on the user's shared warm instance.
+
+        Chat workspaces are isolated by a ``sessions/{chat_key}`` directory
+        prefix inside the instance container (same-user chats are NOT security
+        boundaries — the prefix prevents file pollution only).
+        """
+        instance = self._acquire_instance(session.runtime_kind)
+        if instance.backend_resource_ref:
+            try:
+                handle = backend.resume(instance.id, instance.backend_resource_ref)
+                session.backend_session_ref = instance.backend_resource_ref
+                self.db.commit()
+                self._ensure_chat_dir(backend, handle, session.chat_session_id)
+                return handle
+            except SandboxBackendError:
+                instance.backend_resource_ref = None
+        with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
+            self.db.refresh(instance)
+            if instance.backend_resource_ref:
+                handle = backend.resume(instance.id, instance.backend_resource_ref)
+            else:
+                self._ensure_runtime_capacity(session)
+                capability = backend.probe()
+                if not capability.available:
+                    raise SandboxBackendUnavailable(
+                        capability.reason or "Sandbox backend is unavailable"
+                    )
+                image_ref = resolve_sandbox_image_for_runtime(
+                    self.settings, session.runtime_kind
+                )
+                instance.state = "PROVISIONING"
+                self.db.commit()
+                try:
+                    egress_envelope = self._egress_envelope()
+                    handle = backend.create(
+                        SandboxCreateSpec(
+                            session_id=instance.id,
+                            image_ref=image_ref or "",
+                            memory_bytes=self.settings.sandbox_memory_bytes,
+                            memory_swap_bytes=self.settings.sandbox_memory_swap_bytes,
+                            cpu_count=self.settings.sandbox_cpu_count,
+                            pids_max=self.settings.sandbox_pids_max,
+                            disk_bytes=self.settings.sandbox_disk_bytes,
+                            workspace_path=str(
+                                _sandbox_workspace_path(
+                                    self.settings, f"{self.actor_id}/{instance.id}"
+                                )
+                            ),
+                            runtime_kind=session.runtime_kind,
+                            egress=egress_envelope,
+                            workspace_key=instance.id,
+                        )
+                    )
+                    instance.backend_resource_ref = handle.backend_ref
+                    instance.state = "READY"
+                    instance.expires_at = utc_now() + timedelta(
+                        seconds=self.settings.sandbox_container_absolute_ttl_seconds
+                    )
+                    self.db.commit()
+                except Exception:
+                    instance.state = "ERROR"
+                    instance.cleanup_status = "cleanup_blocked"
+                    self.db.commit()
+                    raise
+            session.backend_session_ref = handle.backend_ref
+            session.lifecycle_state = "RUNNING"
+            session.runtime_started_at = utc_now()
+            session.runtime_last_used_at = utc_now()
+            session.status = "ready"
+            self.db.commit()
+        self._ensure_chat_dir(backend, handle, session.chat_session_id)
+        return handle
+
+    def _ensure_chat_dir(
+        self, backend, handle: SandboxSessionHandle, chat_session_id: str
+    ) -> None:
+        """Best-effort create the chat workspace dir inside the shared instance."""
+        try:
+            prefix = self._container_prefix(chat_session_id)
+            backend.write_agent_file(handle, f"{prefix}/.keep", b"")
+        except (SandboxBackendUnavailable, SandboxBackendError):
+            pass
+
     def _touch_session(self, session: SandboxSession) -> None:
         now = utc_now()
         absolute_expires_at = session.absolute_expires_at
@@ -1360,6 +1657,8 @@ class SandboxAgentWorkspaceService:
         if not self.settings.sandbox_agent_enabled:
             raise SandboxBackendUnavailable("Agent sandbox execution is disabled by deployment configuration")
         backend = self._runtime_backend(session)
+        if self._pooling_enabled(session):
+            return self._ensure_pooled_backend_session(session, backend)
         if session.backend_session_ref:
             try:
                 return backend.resume(session.id, session.backend_session_ref)
@@ -1427,6 +1726,12 @@ class SandboxAgentWorkspaceService:
         )
 
     def _discard_killed_runtime(self, session: SandboxSession) -> None:
+        if self._pooling_enabled(session):
+            # Shared warm instance: task-level termination happens inside the
+            # daemon (process group only); the instance container must survive
+            # a single task timeout so sibling chat tasks keep running.
+            self._release_instance_for_session(session)
+            return
         if session.backend_session_ref:
             try:
                 self._runtime_backend(session).delete(
@@ -1592,6 +1897,7 @@ class SandboxAgentWorkspaceService:
         payload: SandboxAgentCommandRequest,
         *,
         idempotency_key: str | None,
+        timeout_seconds: int | None = None,
     ) -> SandboxAgentCommand:
         argv, _ = self._validate_command(payload)
         argv_digest = hashlib.sha256("\0".join(argv).encode()).hexdigest()
@@ -1621,7 +1927,7 @@ class SandboxAgentWorkspaceService:
             payload.chat_session_id,
             payload.runtime,
         )
-        intent = classify_destructive_argv(argv)
+        intent = self.authz.classify_argv(argv)
         destructive_paths = tuple(intent.get("paths") or ()) if intent else ()
         if destructive_paths:
             intent_digest = destructive_intent_digest(
@@ -1654,13 +1960,25 @@ class SandboxAgentWorkspaceService:
         lease_token_hash, command_generation = self._claim_command_lease(session, command)
         try:
             handle = self._ensure_backend_session(session)
+            if self._pooling_enabled(session):
+                self._borrow_instance(session)
             command.status = "running"
             self.db.commit()
+            if self._pooling_enabled(session):
+                prefix = self._container_prefix(payload.chat_session_id)
+                cwd_relative = (
+                    prefix if payload.cwd in ("", ".") else f"{prefix}/{payload.cwd}"
+                )
+                destructive_prefixes = tuple(
+                    f"{prefix}/{item}" for item in destructive_prefixes
+                )
+            else:
+                cwd_relative = payload.cwd
             result = self._runtime_backend(session).exec_agent(
                 handle,
                 argv,
-                cwd_relative=payload.cwd,
-                timeout_seconds=self.settings.sandbox_wall_time_seconds,
+                cwd_relative=cwd_relative,
+                timeout_seconds=timeout_seconds or self.settings.sandbox_wall_time_seconds,
                 output_limit=self.settings.sandbox_output_bytes,
                 destructive_path_prefixes=destructive_prefixes,
             )
@@ -1791,6 +2109,8 @@ class SandboxAgentWorkspaceService:
                 "Sandbox Agent command execution failed",
                 type(exc).__name__,
             )
+        finally:
+            self._release_instance_for_session(session)
 
     def _fail_command(
         self,
@@ -1864,6 +2184,7 @@ class SandboxAgentWorkspaceService:
         if not isinstance(manifest, dict) or manifest.get("schema_version") != "1.0":
             raise AppError(503, "sandbox_environment_unavailable", "Sandbox environment manifest is invalid")
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        backend = self._runtime_backend(session)
         return {
             **manifest,
             "sandbox_session_id": session.id,
@@ -1871,7 +2192,12 @@ class SandboxAgentWorkspaceService:
             "workspace_limit_bytes": self.settings.sandbox_disk_bytes,
             "output_limit_bytes": self.settings.sandbox_output_bytes,
             "network": session.network_policy.get("mode", "none"),
-            "image_pinned": image_ref_is_pinned(resolve_sandbox_image(self.settings) or ""),
+            "image_pinned": _runtime_image_pinned(
+                backend,
+                self.settings,
+                resolve_sandbox_image(self.settings) or "",
+                session.runtime_kind,
+            ),
         }
 
     def publish_image(self, payload: SandboxAgentImagePublishRequest) -> dict[str, Any]:
@@ -1882,8 +2208,13 @@ class SandboxAgentWorkspaceService:
         except AppError:
             try:
                 handle = self._ensure_backend_session(session)
+                container_path = (
+                    self._container_path(payload.chat_session_id, path)
+                    if self._pooling_enabled(session)
+                    else path
+                )
                 data = self._runtime_backend(session).read(
-                    handle, path, self.settings.sandbox_agent_file_bytes
+                    handle, container_path, self.settings.sandbox_agent_file_bytes
                 )
             except (SandboxBackendUnavailable, SandboxBackendError) as exc:
                 raise AppError(422, "sandbox_file_unavailable", "Sandbox image file cannot be read") from exc
@@ -1938,7 +2269,12 @@ class SandboxAgentWorkspaceService:
             raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
         session, handle = self._resolve_file_session(payload.sandbox_session_id, payload.chat_session_id)
         try:
-            self._runtime_backend(session).write_agent_file(handle, path, data)
+            container_path = (
+                self._container_path(payload.chat_session_id, path)
+                if self._pooling_enabled(session)
+                else path
+            )
+            self._runtime_backend(session).write_agent_file(handle, container_path, data)
         except SandboxWorkspaceQuotaExceeded as exc:
             self.db.commit()
             raise AppError(
@@ -2104,8 +2440,13 @@ class SandboxAgentWorkspaceService:
         if data is None:
             try:
                 handle = self._ensure_backend_session(session)
+                container_path = (
+                    self._container_path(payload.chat_session_id, path)
+                    if self._pooling_enabled(session)
+                    else path
+                )
                 data = self._runtime_backend(session).read(
-                    handle, path, self.settings.sandbox_agent_file_bytes
+                    handle, container_path, self.settings.sandbox_agent_file_bytes
                 )
             except SandboxBackendUnavailable as exc:
                 self._mark_session_failed(session)
@@ -2192,13 +2533,23 @@ class SandboxAgentWorkspaceService:
         }
         try:
             handle = self._ensure_backend_session(session)
+            prefix = (
+                self._container_prefix(payload.chat_session_id)
+                if self._pooling_enabled(session)
+                else None
+            )
             for item in self._runtime_backend(session).list_files(
                 handle, limit_entries=200
             ):
-                existing = by_path.get(item.path)
+                container_path = item.path
+                if prefix and container_path.startswith(prefix + "/"):
+                    container_path = container_path[len(prefix) + 1 :]
+                elif prefix and container_path == prefix:
+                    continue
+                existing = by_path.get(container_path)
                 if existing is None:
-                    by_path[item.path] = {
-                        "path": item.path,
+                    by_path[container_path] = {
+                        "path": container_path,
                         "size_bytes": item.size_bytes,
                         "role": "work",
                         "file_id": None,
@@ -2400,7 +2751,12 @@ class SandboxAgentWorkspaceService:
         # Docker unavailability must not fail the durable delete.
         try:
             handle = self._ensure_backend_session(session)
-            self._runtime_backend(session).delete_agent_file(handle, path)
+            container_path = (
+                self._container_path(payload.chat_session_id, path)
+                if self._pooling_enabled(session)
+                else path
+            )
+            self._runtime_backend(session).delete_agent_file(handle, container_path)
         except (SandboxBackendUnavailable, SandboxBackendError):
             pass
         session.status = "ready"
@@ -2507,8 +2863,13 @@ class SandboxAgentWorkspaceService:
                 # through the daemon File API with a bounded limit instead.
                 try:
                     handle = self._ensure_backend_session(session)
+                    container_path = (
+                        self._container_path(payload.chat_session_id, path)
+                        if self._pooling_enabled(session)
+                        else path
+                    )
                     data = self._runtime_backend(session).read(
-                        handle, path, self.settings.sandbox_agent_file_bytes
+                        handle, container_path, self.settings.sandbox_agent_file_bytes
                     )
                 except (SandboxBackendUnavailable, SandboxBackendError):
                     data = None
@@ -2723,9 +3084,14 @@ class SandboxAgentWorkspaceService:
                 data = self.workspace_files.materialize_bytes(
                     chat_session_id, str(view["path"])
                 )
+                container_path = (
+                    self._container_path(chat_session_id, str(view["path"]))
+                    if session is not None and self._pooling_enabled(session)
+                    else str(view["path"])
+                )
                 # backend.write uses mode 0o444 — appropriate for inputs/.
                 self._runtime_backend(session).write(
-                    handle, str(view["path"]), data
+                    handle, container_path, data
                 )
                 if session is not None:
                     view_path = str(view["path"])
@@ -2964,6 +3330,53 @@ class SandboxAgentWorkspaceService:
             {
                 "type": "function",
                 "function": {
+                    "name": "sandbox_get_job",
+                    "description": (
+                        "Query the status of a previously submitted sandbox job "
+                        "(returned as job_id by sandbox_exec when the execution pool "
+                        "queues the command because capacity is busy). Status values: "
+                        "QUEUED / STARTING / RUNNING / SUCCEEDED / FAILED / CANCELLED / "
+                        "EXPIRED. When queued, wait before retrying instead of "
+                        "re-submitting the command."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "job_id": {
+                                "type": "string",
+                                "description": "The job_id returned by sandbox_exec.",
+                            },
+                        },
+                        "required": ["job_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_cancel_job",
+                    "description": (
+                        "Cancel a queued or running sandbox job by job_id. Queued jobs "
+                        "are cancelled immediately; running jobs are terminated after "
+                        "the execution supervisor stops the process tree."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "job_id": {
+                                "type": "string",
+                                "description": "The job_id returned by sandbox_exec.",
+                            },
+                        },
+                        "required": ["job_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "sandbox_validate_web_app",
                     "description": (
                         "Validate a multi-file HTML/React/Vue teaching app after a successful build. "
@@ -3106,6 +3519,265 @@ class SandboxAgentWorkspaceService:
                     },
                 },
             },
+            # ── Sandbox toolkit (bash / todo / patch / git / search / fetch /
+            #    subagent / skills / notebook) ──────────────────────────────
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_bash",
+                    "description": (
+                        "Run an arbitrary shell command string inside the sandbox container via "
+                        "bash -lc (the string is one argv element; no host shell is involved). "
+                        "Use this for toolchain work, file inspection, piping, loops and anything "
+                        "sandbox_exec's script-file rule cannot express. Destructive commands "
+                        "(rm/mv/... on work/ paths) require the same single-use user authorization "
+                        "as sandbox_delete_file. The container stays offline: pip/npm install and "
+                        "network access fail unless an approved egress policy is active. Interactive "
+                        "or long-running foreground processes are blocked by the wall-clock timeout; "
+                        "prefer writing a script for multi-line logic."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "Shell command string, e.g. 'ls -la work && python main.py'."},
+                            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "description": "Optional wall-clock cap (defaults to the sandbox command limit)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_todo",
+                    "description": (
+                        "Maintain a session-scoped task checklist (host-side, survives container "
+                        "restarts). Actions: add(text), done(item_id), remove(item_id), list, clear. "
+                        "Use it to track multi-step plans instead of relying on conversation memory."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["list", "add", "done", "remove", "clear"], "description": "Checklist operation (default list)."},
+                            "text": {"type": "string", "description": "New item text for action=add."},
+                            "item_id": {"type": "string", "description": "Item id for action=done/remove (returned by add/list)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_apply_patch",
+                    "description": (
+                        "Apply a unified diff (git-diff format) to the durable session workspace "
+                        "host-side. Supports file create/modify/delete with fuzzy context matching "
+                        "(fuzz=3 by default). File deletions go through the same single-use "
+                        "authorization as sandbox_delete_file. Prefer this over many small "
+                        "sandbox_edit_file calls when a change spans multiple hunks or files; the "
+                        "patch text is returned as the tool result and applied atomically per file."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string", "description": "Unified diff text (--- a/…, +++ b/…, @@ -l,c +l,c @@ hunks)."},
+                            "fuzz": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Context fuzz tolerance (default 3)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["patch"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_git",
+                    "description": (
+                        "Run local git operations inside the sandbox workspace (offline; the "
+                        "container cannot reach the network). argv-style: sandbox_git(args=[\"-C\", \"work/repo\", \"log\", \"--oneline\"]). "
+                        "Destructive worktree mutations (git rm/checkout --/restore/mv on work/ "
+                        "paths) require single-use user authorization. Network git commands "
+                        "(clone/fetch/pull) fail here — use sandbox_git_clone for approved clones."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "args": {"type": "array", "items": {"type": "string"}, "description": "Git subcommand and arguments, e.g. [\"status\"] or [\"-C\", \"work/repo\", \"commit\", \"-am\", \"msg\"]."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["args"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_git_clone",
+                    "description": (
+                        "Clone a public GitHub repository through the reviewed egress approval "
+                        "channel. The network transfer runs host-side (the sandbox container stays "
+                        "offline); the approved snapshot is materialized into the workspace and a "
+                        "container-side git repository is initialized on it so subsequent "
+                        "sandbox_git operations work. The first call raises an authorization card "
+                        "the user must approve (single-use or persistent)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "owner": {"type": "string", "description": "GitHub owner/org, e.g. 'anthropics'."},
+                            "repo": {"type": "string", "description": "Repository name."},
+                            "ref": {"type": "string", "description": "Branch/tag/commit to pin (default HEAD)."},
+                            "path": {"type": "string", "description": "Optional subdirectory to clone."},
+                            "destination_root": {"type": "string", "description": "Workspace destination, e.g. 'work/git/<repo>'."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["owner", "repo", "destination_root"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_search_web",
+                    "description": (
+                        "Search the web through the user-authorized SearchProvider. Host-side: the "
+                        "sandbox container stays offline and results are limited to authorized "
+                        "domains. Use for current information, docs lookups and quick facts."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query (1-500 chars)."},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Result cap (default 6)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_fetch",
+                    "description": (
+                        "Read the full content of a public URL through the reviewed fetch "
+                        "authorization channel (host-side; the sandbox container stays offline). "
+                        "The first request to a new host raises an authorization card; approved "
+                        "domains are reused afterwards. Returns the extracted page text."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "format": "uri", "description": "Public https URL to fetch."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["url"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_subagent",
+                    "description": (
+                        "Spawn a nested sandbox sub-agent: it runs its own agent loop in the "
+                        "background with a restricted offline tool subset (file tools, bash, exec, "
+                        "todo, patch, git) and returns a subagent_id. Poll with sandbox_subagent_status "
+                        "until status is completed, then read its result text. Use it to parallelize "
+                        "independent research/implementation work inside the same workspace."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string", "description": "Self-contained task description for the sub-agent."},
+                            "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional sandbox tool-name subset; defaults to the offline tool set."},
+                            "max_rounds": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Tool round cap (default 6)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["prompt"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_subagent_status",
+                    "description": "Poll the status and final result of a sandbox_subagent job (status: queued/running/completed/failed/cancelled).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subagent_id": {"type": "string", "description": "The subagent_id returned by sandbox_subagent."},
+                        },
+                        "required": ["subagent_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_skill_list",
+                    "description": "List the official LearnGraph skills (key, category, description) available for sandbox workflows.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sandbox_session_id": session_property},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_skill_read",
+                    "description": "Read the full SKILL.md instructions of an official skill (returned key from sandbox_skill_list).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "skill_key": {"type": "string", "description": "Official skill key, e.g. 'sandbox-files'."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["skill_key"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_notebook",
+                    "description": (
+                        "Persistent in-container Python REPL kernel. action=open starts a kernel "
+                        "(returns kernel_id); action=execute(kernel_id, code) runs a cell and keeps "
+                        "state across calls; action=close(kernel_id) tears it down. Use it instead of "
+                        "repeated sandbox_exec when you need live interpreter state (imports, "
+                        "variables) across steps."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["open", "execute", "close", "status"], "description": "Kernel operation (default open)."},
+                            "kernel_id": {"type": "string", "description": "Kernel id returned by action=open; required for execute/close/status."},
+                            "code": {"type": "string", "description": "Python cell source for action=execute."},
+                            "interpreter": {"type": "string", "enum": ["python"], "description": "Kernel interpreter (python only in v1)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
         ]
 
     _AGENT_SESSION_ID_PLACEHOLDERS = frozenset(
@@ -3197,12 +3869,55 @@ class SandboxAgentWorkspaceService:
             if name == "sandbox_delete_file":
                 return self.delete_file(SandboxAgentFileDeleteRequest.model_validate(payload))
             if name == "sandbox_exec":
-                command = self.execute_command(
-                    SandboxAgentCommandRequest.model_validate(payload),
-                    idempotency_key=None,
-                )
+                from app.services.sandbox_scheduler import CAPACITY_CODES, SandboxSchedulerService
+
+                request = SandboxAgentCommandRequest.model_validate(payload)
+                try:
+                    command = self.execute_command(request, idempotency_key=None)
+                except AppError as exc:
+                    if exc.code not in CAPACITY_CODES:
+                        raise
+                    # Capacity shortage → queue the command instead of failing
+                    # the Agent. The unified scheduler resumes it when capacity
+                    # frees up; the caller follows job state via sandbox_get_job.
+                    scheduler = SandboxSchedulerService(self.db, self.settings)
+                    job = scheduler.submit_job(
+                        workspace_id=self.workspace_id,
+                        owner_user_id=self.actor_id,
+                        chat_session_id=request.chat_session_id,
+                        kind="agent_command",
+                        payload=request.model_dump(mode="json"),
+                        workload_class=_workload_class_for_argv(request.argv),
+                        idempotency_key=None,
+                    )
+                    self.db.refresh(job)
+                    return {
+                        "id": job.id,
+                        "job_id": job.id,
+                        "sandbox_session_id": None,
+                        "status": "queued",
+                        "reason": job.reason or "waiting_capacity",
+                        "exit_code": None,
+                        "error_class": None,
+                        "stdout": "",
+                        "stderr": "",
+                        "timed_out": False,
+                        "truncated": False,
+                        "summary": {
+                            "type": "sandbox_status",
+                            "status": "queued",
+                            "data": {
+                                "phase": "queued",
+                                "job_id": job.id,
+                                "reason": job.reason or "waiting_capacity",
+                                "argv_redacted": _redacted_agent_argv(request.argv),
+                                "chat_session_id": request.chat_session_id,
+                            },
+                        },
+                    }
                 return {
                     "id": command.id,
+                    "job_id": getattr(command, "job_id", None),
                     "sandbox_session_id": command.sandbox_session_id,
                     "status": command.status,
                     "exit_code": command.exit_code,
@@ -3223,6 +3938,70 @@ class SandboxAgentWorkspaceService:
                             "stderr_summary": (command.stderr_summary or "")[:400],
                             "sandbox_session_id": command.sandbox_session_id,
                             "chat_session_id": command.chat_session_id,
+                        },
+                    },
+                }
+            if name == "sandbox_get_job":
+                from app.services.sandbox_scheduler import SandboxSchedulerService
+
+                job_id = payload.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    raise AppError(
+                        422, "invalid_tool_arguments", "sandbox_get_job requires a job_id"
+                    )
+                scheduler = SandboxSchedulerService(self.db, self.settings)
+                job = scheduler.get_job(
+                    job_id,
+                    workspace_id=self.workspace_id,
+                    owner_user_id=self.actor_id,
+                )
+                return {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "reason": job.reason,
+                    "kind": job.kind,
+                    "attempt": job.attempt,
+                    "created_at": job.created_at.isoformat() if job.created_at else None,
+                    "started_at": job.started_at.isoformat() if job.started_at else None,
+                    "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+                    "error_class": job.error_class,
+                    "error_message": job.error_message,
+                    "summary": {
+                        "type": "sandbox_status",
+                        "status": job.status,
+                        "data": {
+                            "phase": job.status.lower(),
+                            "job_id": job.id,
+                            "reason": job.reason,
+                        },
+                    },
+                }
+            if name == "sandbox_cancel_job":
+                from app.services.sandbox_scheduler import SandboxSchedulerService
+
+                job_id = payload.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    raise AppError(
+                        422, "invalid_tool_arguments", "sandbox_cancel_job requires a job_id"
+                    )
+                scheduler = SandboxSchedulerService(self.db, self.settings)
+                job = scheduler.get_job(
+                    job_id,
+                    workspace_id=self.workspace_id,
+                    owner_user_id=self.actor_id,
+                )
+                job = scheduler.cancel_job(job)
+                return {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "reason": job.reason,
+                    "summary": {
+                        "type": "sandbox_status",
+                        "status": job.status,
+                        "data": {
+                            "phase": job.status.lower(),
+                            "job_id": job.id,
+                            "reason": job.reason,
                         },
                     },
                 }
@@ -3268,6 +4047,32 @@ class SandboxAgentWorkspaceService:
                     if isinstance(payload.get("sandbox_session_id"), str)
                     else None,
                 )
+            # ── Sandbox toolkit (bash / todo / patch / git / search / fetch /
+            #    subagent / skills / notebook) ──────────────────────────────
+            if name == "sandbox_bash":
+                return self.toolkit_bash(SandboxAgentBashRequest.model_validate(payload))
+            if name == "sandbox_todo":
+                return self.toolkit_todo(SandboxAgentTodoRequest.model_validate(payload))
+            if name == "sandbox_apply_patch":
+                return self.toolkit_apply_patch(SandboxAgentPatchRequest.model_validate(payload))
+            if name == "sandbox_git":
+                return self.toolkit_git(SandboxAgentGitRequest.model_validate(payload))
+            if name == "sandbox_git_clone":
+                return self.toolkit_git_clone(SandboxAgentGitCloneRequest.model_validate(payload))
+            if name == "sandbox_search_web":
+                return self.toolkit_search_web(SandboxAgentSearchRequest.model_validate(payload))
+            if name == "sandbox_fetch":
+                return self.toolkit_fetch(SandboxAgentFetchRequest.model_validate(payload))
+            if name == "sandbox_subagent":
+                return self.toolkit_subagent(SandboxAgentSubagentRequest.model_validate(payload))
+            if name == "sandbox_subagent_status":
+                return self.toolkit_subagent_status(payload)
+            if name == "sandbox_skill_list":
+                return self.toolkit_skill_list(SandboxAgentSkillListRequest.model_validate(payload))
+            if name == "sandbox_skill_read":
+                return self.toolkit_skill_read(SandboxAgentSkillReadRequest.model_validate(payload))
+            if name == "sandbox_notebook":
+                return self.toolkit_notebook(SandboxAgentNotebookRequest.model_validate(payload))
         except ValidationError as exc:
             issues = [
                 {
@@ -3294,6 +4099,44 @@ class SandboxAgentWorkspaceService:
             ) from exc
         raise AppError(404, "sandbox_agent_tool_not_found", "Sandbox Agent tool is not registered")
 
+    def materialize_shared_skill(
+        self,
+        chat_session_id: str,
+        skill_key: str,
+        files: list[tuple[str, bytes]],
+        *,
+        readme: str | None = None,
+    ) -> str:
+        """Write a skill package into the user's shared capability area.
+
+        The shared area lives at ``shared/skills/{skill_key}`` inside the user's
+        instance volume — materialized ONCE per user instead of being copied
+        into every chat workspace (design doc §10). Only text files reach the
+        container; the sandbox stays offline and secret-free. Returns the
+        container-relative path (relative to /workspace).
+        """
+        sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", skill_key or "skill")[:60].strip("._")
+        if not sanitized:
+            sanitized = "skill"
+        session = self._resolve_session(None, chat_session_id)
+        handle = self._ensure_backend_session(session)
+        backend = self._runtime_backend(session)
+        prefix = f"shared/skills/{sanitized}"
+        written = 0
+        for rel, data in files:
+            safe_rel = validate_agent_workspace_path(rel)
+            backend.write_agent_file(handle, f"{prefix}/{safe_rel}", data)
+            written += 1
+        if readme:
+            backend.write_agent_file(handle, f"{prefix}/README.md", readme.encode("utf-8"))
+        logger.info(
+            "materialized shared skill %s (%d files) for chat %s",
+            prefix,
+            written,
+            chat_session_id,
+        )
+        return prefix
+
     def publish_workspace_file(
         self,
         *,
@@ -3312,7 +4155,12 @@ class SandboxAgentWorkspaceService:
             # Best-effort container dual-write; unified file zone does not require Docker.
             try:
                 handle = self._ensure_backend_session(session)
-                self._runtime_backend(session).write_agent_file(handle, path, data)
+                container_path = (
+                    self._container_path(chat_session_id, path)
+                    if self._pooling_enabled(session)
+                    else path
+                )
+                self._runtime_backend(session).write_agent_file(handle, container_path, data)
             except (SandboxBackendUnavailable, SandboxBackendError):
                 pass
         else:
@@ -3321,8 +4169,13 @@ class SandboxAgentWorkspaceService:
             except AppError:
                 try:
                     handle = self._ensure_backend_session(session)
+                    container_path = (
+                        self._container_path(chat_session_id, path)
+                        if self._pooling_enabled(session)
+                        else path
+                    )
                     data = self._runtime_backend(session).read(
-                        handle, path, self.settings.sandbox_agent_file_bytes
+                        handle, container_path, self.settings.sandbox_agent_file_bytes
                     )
                 except (SandboxBackendUnavailable, SandboxBackendError) as exc:
                     raise AppError(422, "sandbox_file_unavailable", "Sandbox Agent file cannot be read") from exc

@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
@@ -642,6 +642,158 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
     return totals
 
 
+def run_execution_pool_sweep(*, now: datetime | None = None) -> dict[str, int]:
+    """Execution-pool lifecycle sweep (execution pool design doc §9).
+
+    Owns the NEW tables (sandbox_instances / sandbox_workspaces /
+    sandbox_reservations). The legacy SandboxSession sweep above keeps the
+    compatible runtime view. Rules:
+
+    - reservations past their TTL are released;
+    - workspaces past retention TTL are cleaned (instance untouched);
+    - instances past warm-idle TTL with no active/reserved work are destroyed
+      (the real backend container is deleted too; failures quarantine);
+    - instances past max age are drained (no new jobs), then destroyed once
+      active work reaches zero. A running instance is never deleted by TTL.
+    """
+    from app.domain.models import SandboxInstance, SandboxReservation, SandboxWorkspace
+    from app.services.sandbox import _sandbox_workspace_path
+    # _force_rmtree is defined in this module (scheduler.py) — reuse it.
+
+    settings = get_settings()
+    current = now or utc_now()
+    totals = {
+        "reservations_expired": 0,
+        "workspaces_cleaned": 0,
+        "instances_destroyed": 0,
+        "instances_drained": 0,
+        "instances_blocked": 0,
+    }
+
+    def destroy_instance(instance: SandboxInstance) -> None:
+        """Delete the real backend resource, then mark the instance destroyed.
+
+        Workspace/chat data lives in the instance volume (sandboxd named
+        volume), so destroying an instance also removes its volume; the
+        ``SandboxWorkspace`` retention rows are cleaned separately and may be
+        re-materialized on the next instance. Failures quarantine the instance
+        (state preserved, cleanup_status=cleanup_blocked) so a half-deleted
+        resource is never handed to another user.
+        """
+        if instance.backend_resource_ref:
+            try:
+                backend = get_sandbox_backend_registry().for_backend_id(
+                    instance.backend_id, settings, instance.runtime_profile
+                )
+                backend.delete(
+                    SandboxSessionHandle(instance.id, instance.backend_resource_ref)
+                )
+            except Exception:  # noqa: BLE001 - quarantine instead of losing the ledger
+                logger.exception(
+                    "execution-pool instance backend delete failed for %s",
+                    instance.id,
+                )
+                instance.cleanup_status = "cleanup_blocked"
+                instance.cleanup_error_class = "backend_delete_failed"
+                totals["instances_blocked"] += 1
+                return
+        instance.backend_resource_ref = None
+        instance.state = "DESTROYED"
+        instance.cleanup_status = "cleaned"
+        instance.cleanup_error_class = None
+        totals["instances_destroyed"] += 1
+
+    with SessionLocal() as db:
+        released = db.execute(
+            update(SandboxReservation)
+            .where(
+                SandboxReservation.status == "HELD",
+                SandboxReservation.expires_at <= current,
+            )
+            .values(status="EXPIRED", released_at=current)
+        )
+        totals["reservations_expired"] = int(released.rowcount or 0)
+        db.commit()
+
+        # Workspace retention: idle/absolute TTLs are stored on the row; clean
+        # the on-disk chat subtree, keep the instance.
+        expired_workspaces = list(
+            db.scalars(
+                select(SandboxWorkspace).where(
+                    SandboxWorkspace.cleanup_status != "cleaned",
+                    (
+                        (SandboxWorkspace.retention_idle_at.is_not(None))
+                        & (SandboxWorkspace.retention_idle_at <= current)
+                    )
+                    | (
+                        (SandboxWorkspace.retention_abs_at.is_not(None))
+                        & (SandboxWorkspace.retention_abs_at <= current)
+                    ),
+                )
+            ).all()
+        )
+        for workspace in expired_workspaces:
+            try:
+                relative = f"{workspace.owner_user_id}/{workspace.workspace_key}"
+                target = _sandbox_workspace_path(settings, relative)
+                if target.exists():
+                    _force_rmtree(target)
+                workspace.cleanup_status = "cleaned"
+                totals["workspaces_cleaned"] += 1
+            except Exception:  # noqa: BLE001 - quarantine instead of crashing
+                logger.exception(
+                    "execution-pool workspace cleanup failed for %s",
+                    workspace.id,
+                )
+                workspace.cleanup_status = "cleanup_blocked"
+        db.commit()
+
+        # Instance lifecycle.
+        instances = list(
+            db.scalars(
+                select(SandboxInstance).where(
+                    SandboxInstance.state.notin_(("DESTROYED", "DESTROYING"))
+                )
+            ).all()
+        )
+        for instance in instances:
+            if instance.active_executions and instance.active_executions > 0:
+                # A running instance is never removed by TTL.
+                continue
+            held_reservation = db.scalar(
+                select(func.count(SandboxReservation.id)).where(
+                    SandboxReservation.instance_id == instance.id,
+                    SandboxReservation.status == "HELD",
+                )
+            )
+            if held_reservation and held_reservation > 0:
+                continue
+            idle_since = instance.idle_since
+            if idle_since is not None and getattr(idle_since, "tzinfo", None) is None:
+                idle_since = idle_since.replace(tzinfo=current.tzinfo)
+            expires_at = instance.expires_at
+            if expires_at is not None and getattr(expires_at, "tzinfo", None) is None:
+                expires_at = expires_at.replace(tzinfo=current.tzinfo)
+            warm_idle = (
+                idle_since is not None
+                and idle_since + timedelta(seconds=settings.sandbox_container_idle_ttl_seconds) <= current
+            )
+            max_age = expires_at is not None and expires_at <= current
+            if max_age:
+                if instance.state in {"READY", "BUSY", "SATURATED", "PROVISIONING"}:
+                    instance.state = "DRAINING"
+                    totals["instances_drained"] += 1
+                elif instance.state == "DRAINING":
+                    # No active work remains and the instance is past max age.
+                    destroy_instance(instance)
+            elif warm_idle and instance.state in {"READY", "BUSY", "SATURATED"}:
+                destroy_instance(instance)
+            else:
+                continue
+        db.commit()
+    return totals
+
+
 async def sandbox_cleanup_scheduler(
     stop: asyncio.Event,
     interval_seconds: int | None = None,
@@ -664,12 +816,50 @@ async def sandbox_cleanup_scheduler(
             continue
         try:
             await asyncio.to_thread(run_sandbox_cleanup_sweep)
+            await asyncio.to_thread(run_execution_pool_sweep)
             with SessionLocal() as lock_db:
                 release_advisory_lock(lock_db, "sweep.sandbox_cleanup", lock_token)
         except Exception:
             logger.exception("Periodic sandbox cleanup wake-up failed")
             with SessionLocal() as lock_db:
                 release_advisory_lock(lock_db, "sweep.sandbox_cleanup", lock_token)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+async def sandbox_execution_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    """Periodic unified-scheduler tick for queued sandbox jobs.
+
+    Only one process runs each tick (advisory lock); the DB CAS inside
+    ``SandboxSchedulerService.schedule_once`` is the authoritative guard
+    against concurrent workers.
+    """
+    interval = max(
+        1,
+        interval_seconds
+        if interval_seconds is not None
+        else get_settings().sandbox_scheduler_interval_seconds,
+    )
+    while not stop.is_set():
+        with SessionLocal() as lock_db:
+            lock_token = acquire_advisory_lock(lock_db, "sweep.sandbox_execution", ttl_seconds=60)
+        if lock_token is not None:
+            try:
+                from app.services.sandbox_scheduler import run_scheduler_tick
+
+                counters = await asyncio.to_thread(run_scheduler_tick)
+                if counters.get("claimed"):
+                    logger.debug("sandbox execution tick counters=%s", counters)
+            except Exception:
+                logger.exception("Sandbox execution scheduler tick failed")
+            finally:
+                with SessionLocal() as lock_db:
+                    release_advisory_lock(lock_db, "sweep.sandbox_execution", lock_token)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

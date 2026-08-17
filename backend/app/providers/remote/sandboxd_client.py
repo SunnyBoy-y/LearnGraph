@@ -83,9 +83,11 @@ class SandboxdClient:
         protocol_min: str = "1.0",
         protocol_max: str = "1.0",
         client: httpx.Client | None = None,
+        admin_token: str | None = None,
     ) -> None:
         self.url = url.rstrip("/")
         self._token = token
+        self._admin_token = admin_token
         self.deployment_id = deployment_id
         self._connect_timeout = connect_timeout
         self._request_timeout = request_timeout
@@ -115,9 +117,11 @@ class SandboxdClient:
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        admin: bool = False,
     ) -> httpx.Response:
+        token = self._admin_token if admin else self._token
         request_headers = {
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": f"Bearer {token}",
             "X-Request-Id": uuid.uuid4().hex[:16],
         }
         if session_id is not None:
@@ -179,6 +183,10 @@ class SandboxdClient:
         response = self._request("GET", "/v1/capacity")
         body = response.json()
         return int(body.get("cpu_count") or 0), int(body.get("memory_bytes") or 0)
+
+    def capacity_detail(self) -> dict[str, Any]:
+        response = self._request("GET", "/v1/capacity")
+        return response.json()
 
     # --- sandbox lifecycle -------------------------------------------------
 
@@ -278,4 +286,70 @@ class SandboxdClient:
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:
         response = self._request("GET", f"/v1/executions/{execution_id}")
+        return response.json()
+
+    # --- kernels -------------------------------------------------------------
+
+    def kernel_open(self, sandbox_id: str, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"/v1/sandboxes/{sandbox_id}/kernels",
+            session_id=session_id,
+            json_body=body,
+        )
+        return response.json()
+
+    def kernel_execute(self, kernel_id: str, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"/v1/kernels/{kernel_id}/execute",
+            session_id=session_id,
+            json_body=body,
+        )
+        return response.json()
+
+    def kernel_close(self, kernel_id: str, session_id: str) -> dict[str, Any]:
+        response = self._request(
+            "DELETE",
+            f"/v1/kernels/{kernel_id}",
+            session_id=session_id,
+        )
+        return response.json()
+
+    # --- bootstrap / admin control plane ------------------------------------
+
+    def install_runtime(self, runtime_kind: str, image_tag: str) -> dict[str, Any]:
+        """Ask the daemon to pull + pin + smoke a prebuilt runner image.
+
+        Requires the separate admin token; raises ``SandboxdUnavailable`` when
+        the admin control plane is not configured on this client.
+        """
+        if not self._admin_token:
+            raise SandboxdUnavailable(
+                "sandboxd admin control plane is not configured on this client"
+            )
+        response = self._request(
+            "POST",
+            "/v1/bootstrap/jobs",
+            json_body={"runtime_kind": runtime_kind, "image_tag": image_tag},
+            admin=True,
+        )
+        return response.json()
+
+    def get_runtime(self, runtime_kind: str) -> dict[str, Any] | None:
+        if not self._admin_token:
+            raise SandboxdUnavailable(
+                "sandboxd admin control plane is not configured on this client"
+            )
+        response = self._request(
+            "GET", f"/v1/bootstrap/jobs/{runtime_kind}", admin=True
+        )
+        return response.json()
+
+    def list_runtimes(self) -> list[dict[str, Any]]:
+        if not self._admin_token:
+            raise SandboxdUnavailable(
+                "sandboxd admin control plane is not configured on this client"
+            )
+        response = self._request("GET", "/v1/runtimes", admin=True)
         return response.json()

@@ -117,6 +117,19 @@ AGENT_EXECUTABLES = frozenset(
         "nodejs",
     }
 )
+# Shell tool entrypoints (sandbox_bash).  Only the ``-lc``/``-c`` forms with a
+# single script argument are allowed; the script string may contain newlines
+# (multi-line commands) but never NUL/CR bytes.
+SHELL_EXECUTABLES = frozenset({"bash", "sh"})
+SHELL_EXEC_FLAGS = frozenset({"-lc", "-c"})
+# Git tool entrypoint (sandbox_git).  Subcommands that mutate the working tree
+# are classified destructively by the authz layer; ``clone`` is only reachable
+# through the sanctioned host-side approval tool (sandbox_git_clone) and will
+# simply fail here without an egress envelope.
+GIT_EXECUTABLE = "git"
+GIT_WORKTREE_MUTATORS = frozenset(
+    {"rm", "clean", "reset", "checkout", "restore", "mv", "revert"}
+)
 MAX_AGENT_ARCHIVE_BYTES = 16 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
@@ -211,13 +224,32 @@ def validate_agent_argv(argv: tuple[str, ...], *, max_args: int = 32) -> tuple[s
     if not argv or len(argv) > max_args:
         raise SandboxCapabilityMismatch("Agent command argv has an invalid number of arguments")
     normalized: list[str] = []
-    for value in argv:
+    for index, value in enumerate(argv):
         if not isinstance(value, str) or not value or len(value) > 4_096:
             raise SandboxCapabilityMismatch("Agent command arguments must be non-empty bounded strings")
-        if "\x00" in value or "\r" in value or "\n" in value:
+        if "\x00" in value or "\r" in value:
+            raise SandboxCapabilityMismatch("Agent command arguments cannot contain control characters")
+        if "\n" in value and not (
+            index == 2 and normalized and normalized[0].casefold() in SHELL_EXECUTABLES
+        ):
             raise SandboxCapabilityMismatch("Agent command arguments cannot contain control characters")
         normalized.append(value)
     executable = PurePosixPath(normalized[0].replace("\\", "/")).name.casefold()
+    if executable in SHELL_EXECUTABLES:
+        # sandbox_bash: ["bash", "-lc", "command"] — argv is never evaluated by
+        # a host shell; the string is passed as one argument to the container's
+        # bash. Interactive/stdio-hijacking flags are blocked.
+        if len(normalized) != 3:
+            raise SandboxCapabilityMismatch(
+                "Shell commands require exactly ['bash', '-lc', '<command>']"
+            )
+        if normalized[1] not in SHELL_EXEC_FLAGS:
+            raise SandboxCapabilityMismatch(
+                "Shell commands only allow the -lc / -c flags with a single script argument"
+            )
+        if len(normalized[2]) > 16_384:
+            raise SandboxCapabilityMismatch("Shell command script exceeds the length limit")
+        return tuple(normalized)
     if executable in DESTRUCTIVE_COMMANDS:
         # Destructive utilities are not shell-free "agent runners".  They are
         # classified here and must be authorized (or hard-blocked) by the service
@@ -237,6 +269,33 @@ def validate_agent_argv(argv: tuple[str, ...], *, max_args: int = 32) -> tuple[s
                 raise SandboxCapabilityMismatch(
                     "Destructive filesystem commands cannot escape the workspace"
                 )
+        return tuple(normalized)
+    if executable == GIT_EXECUTABLE:
+        # sandbox_git: ["git", "<subcommand>", ...].  Worktree-mutating
+        # subcommands are shape-validated here (workspace-relative paths only);
+        # authorization is enforced separately by the service layer.
+        if len(normalized) == 1:
+            raise SandboxCapabilityMismatch("Git commands require a subcommand")
+        subcommand = normalized[1]
+        if subcommand in {"config", "credential"} and any(
+            argument in {"--global", "--system", "store", "cache"}
+            for argument in normalized[2:]
+        ):
+            raise SandboxCapabilityMismatch(
+                "Global or credential git configuration is blocked in the sandbox"
+            )
+        if subcommand in GIT_WORKTREE_MUTATORS:
+            for argument in normalized[2:]:
+                if argument.startswith("-"):
+                    continue
+                if "\\" in argument or ":" in argument or argument.startswith("/") or argument.startswith(".."):
+                    raise SandboxCapabilityMismatch(
+                        "Git worktree mutations cannot target host or absolute paths"
+                    )
+                if ".." in PurePosixPath(argument).parts:
+                    raise SandboxCapabilityMismatch(
+                        "Git worktree mutations cannot escape the workspace"
+                    )
         return tuple(normalized)
     if executable not in AGENT_EXECUTABLES:
         raise SandboxCapabilityMismatch(
@@ -1058,3 +1117,28 @@ class DockerSandboxBackend(SandboxBackendPort):
             raise SandboxBackendError("Sandbox cleanup failed") from exc
         finally:
             client.close()
+
+    # Persistent REPL kernels are only supported by the sandboxd control plane;
+    # the legacy Docker backend fails closed.
+    def kernel_open(
+        self,
+        session: SandboxSessionHandle,
+        *,
+        workspace_relative: str,
+        interpreter: str,
+    ) -> str:
+        raise SandboxCapabilityMismatch("persistent kernels require the sandboxd backend")
+
+    def kernel_execute(
+        self,
+        session: SandboxSessionHandle,
+        kernel_id: str,
+        code: str,
+        *,
+        timeout_seconds: int,
+        output_limit: int,
+    ) -> dict[str, Any]:
+        raise SandboxCapabilityMismatch("persistent kernels require the sandboxd backend")
+
+    def kernel_close(self, session: SandboxSessionHandle, kernel_id: str) -> None:
+        raise SandboxCapabilityMismatch("persistent kernels require the sandboxd backend")

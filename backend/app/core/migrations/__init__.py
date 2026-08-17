@@ -124,6 +124,74 @@ def _subapp_interaction_events(connection: Connection) -> None:
     SubAppInteractionEvent.__table__.create(bind=connection, checkfirst=True)
 
 
+def _sandbox_execution_pool(connection: Connection) -> None:
+    """Create execution-pool tables (instance/workspace/job/reservation).
+
+    These are additive; existing sandbox_sessions/tasks/commands remain the
+    compatible runtime view during the migration window.
+    """
+    from app.domain.models import (
+        SandboxInstance,
+        SandboxJob,
+        SandboxReservation,
+        SandboxWorkspace,
+    )
+
+    for table in (
+        SandboxInstance.__table__,
+        SandboxWorkspace.__table__,
+        SandboxJob.__table__,
+        SandboxReservation.__table__,
+    ):
+        table.create(bind=connection, checkfirst=True)
+    job_columns = {
+        column["name"] for column in inspect(connection).get_columns("sandbox_jobs")
+    }
+    if "payload_json" not in job_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE sandbox_jobs ADD COLUMN payload_json JSON NOT NULL DEFAULT '{}'"
+        )
+    execution_columns = {
+        column["name"] for column in inspect(connection).get_columns("sandbox_executions")
+    }
+    for column, ddl in (
+        ("job_id", "ALTER TABLE sandbox_executions ADD COLUMN job_id VARCHAR(36)"),
+        ("instance_id", "ALTER TABLE sandbox_executions ADD COLUMN instance_id VARCHAR(36)"),
+        ("reservation_id", "ALTER TABLE sandbox_executions ADD COLUMN reservation_id VARCHAR(36)"),
+        ("workspace_key", "ALTER TABLE sandbox_executions ADD COLUMN workspace_key VARCHAR(120)"),
+        ("cancel_requested_at", "ALTER TABLE sandbox_executions ADD COLUMN cancel_requested_at DATETIME"),
+        ("finished_reason", "ALTER TABLE sandbox_executions ADD COLUMN finished_reason VARCHAR(40)"),
+    ):
+        if column not in execution_columns:
+            connection.exec_driver_sql(ddl)
+    command_columns = {
+        column["name"] for column in inspect(connection).get_columns("sandbox_agent_commands")
+    }
+    if "job_id" not in command_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE sandbox_agent_commands ADD COLUMN job_id VARCHAR(36)"
+        )
+    if "instance_id" not in command_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE sandbox_agent_commands ADD COLUMN instance_id VARCHAR(36)"
+        )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_sandbox_executions_job ON sandbox_executions (job_id)"
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_sandbox_agent_commands_job ON sandbox_agent_commands (job_id)"
+    )
+
+
+def _sandbox_toolkit_tables(connection: Connection) -> None:
+    """Create sandbox_todos / sandbox_kernels for the sandbox toolkit tools."""
+
+    from app.domain.models import SandboxKernel, SandboxTodo
+
+    SandboxTodo.__table__.create(bind=connection, checkfirst=True)
+    SandboxKernel.__table__.create(bind=connection, checkfirst=True)
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -147,6 +215,16 @@ MIGRATIONS = (
         "v1.1.0",
         "Additive sandbox backend routing columns for mixed-backend drain",
         _sandbox_backend_resource_ref,
+    ),
+    SchemaMigration(
+        "v1.2.0",
+        "Execution pool: sandbox instances/workspaces/jobs/reservations",
+        _sandbox_execution_pool,
+    ),
+    SchemaMigration(
+        "v1.3.0",
+        "Sandbox toolkit: sandbox_todos and sandbox_kernels tables",
+        _sandbox_toolkit_tables,
     ),
 )
 

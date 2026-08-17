@@ -120,6 +120,7 @@ class SandboxdBackend(SandboxBackendPort):
             self._client = SandboxdClient(
                 url=self.settings.sandboxd_url or "",
                 token=self._token,
+                admin_token=self._admin_token(),
                 deployment_id=self.settings.sandboxd_deployment_id,
                 connect_timeout=self.settings.sandboxd_connect_timeout_seconds,
                 request_timeout=self.settings.sandboxd_request_timeout_seconds,
@@ -128,6 +129,16 @@ class SandboxdBackend(SandboxBackendPort):
             )
             self._client_created = True
         return self._client
+
+    def _admin_token(self) -> str | None:
+        token_file = (self.settings.sandboxd_admin_token_file or "").strip()
+        if not token_file:
+            return None
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return token or None
 
     def _scope(self, session_id: str) -> str:
         return f"{self.settings.sandboxd_deployment_id}|{session_id}"
@@ -193,6 +204,31 @@ class SandboxdBackend(SandboxBackendPort):
         except (SandboxdUnavailable, SandboxdProtocolError) as exc:
             raise SandboxBackendUnavailable(str(exc)) from exc
 
+    def observed_pressure(self) -> dict[str, Any]:
+        """Live observed usage from the daemon (best-effort probe)."""
+        try:
+            return self._daemon().capacity_detail()
+        except (SandboxdUnavailable, SandboxdProtocolError):
+            return {}
+
+    def runtime_image_pinned(self, runtime_kind: str = "python-node") -> bool | None:
+        """Report whether the daemon has an installed (smoke-passed) runtime.
+
+        Returns ``None`` when the admin control plane is not configured or the
+        daemon is unreachable — the caller keeps its legacy fallback (local env
+        pin) instead of guessing.
+        """
+        try:
+            runtimes = self._daemon().list_runtimes()
+        except (SandboxdUnavailable, SandboxdProtocolError):
+            return None
+        for record in runtimes:
+            if record.get("runtime_kind") == runtime_kind:
+                return bool(record.get("image_digest")) and (
+                    record.get("smoke_status") == "passed"
+                )
+        return False
+
     # --- lifecycle ---------------------------------------------------------
 
     def create(self, spec: SandboxCreateSpec) -> SandboxSessionHandle:
@@ -219,10 +255,11 @@ class SandboxdBackend(SandboxBackendPort):
             "disk_bytes": spec.disk_bytes,
             "egress": egress_payload,
             "ttl_seconds": self._ttl_seconds(),
-            # A unique idempotency key per create attempt: the application
-            # already guards concurrent creates via DB lease/refresh, so a
-            # fresh key can never collide with a stale daemon replay.
-            "idempotency_key": f"create-{spec.session_id}-{uuid.uuid4().hex[:8]}",
+            # Stable idempotency key per session: the daemon also reuses a
+            # still-alive sandbox for the same session_id (execution pool), so
+            # retries with the same key replay or reuse instead of duplicating
+            # the physical container.
+            "idempotency_key": f"pool-{spec.session_id}",
         }
         try:
             body = self._daemon().create_sandbox(payload)
@@ -365,6 +402,63 @@ class SandboxdBackend(SandboxBackendPort):
         except SandboxdProtocolError as exc:
             raise _map_protocol_error(exc) from exc
         return _exec_result(result)
+
+    def kernel_open(
+        self,
+        session: SandboxSessionHandle,
+        *,
+        workspace_relative: str,
+        interpreter: str,
+    ) -> str:
+        body = {"workspace_relative": workspace_relative, "interpreter": interpreter}
+        try:
+            result = self._daemon().kernel_open(session.backend_ref, session.session_id, body)
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            raise _map_protocol_error(exc) from exc
+        kernel_id = str(result.get("kernel_id") or "")
+        if not kernel_id:
+            raise SandboxBackendError("sandboxd kernel_open returned no kernel_id")
+        return kernel_id
+
+    def kernel_execute(
+        self,
+        session: SandboxSessionHandle,
+        kernel_id: str,
+        code: str,
+        *,
+        timeout_seconds: int,
+        output_limit: int,
+    ) -> dict[str, Any]:
+        body = {
+            "code": code,
+            "timeout_seconds": timeout_seconds,
+            "output_limit": output_limit,
+        }
+        try:
+            result = self._daemon().kernel_execute(kernel_id, session.session_id, body)
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            raise _map_protocol_error(exc) from exc
+        return {
+            "ok": bool(result.get("ok")),
+            "stdout": str(result.get("stdout") or ""),
+            "stderr": str(result.get("stderr") or ""),
+            "result_repr": result.get("result_repr"),
+            "timed_out": bool(result.get("timed_out")),
+        }
+
+    def kernel_close(self, session: SandboxSessionHandle, kernel_id: str) -> None:
+        try:
+            self._daemon().kernel_close(kernel_id, session.session_id)
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            # kernel_not_found is idempotent for close.
+            if exc.code != "kernel_not_found":
+                raise _map_protocol_error(exc) from exc
 
 
 def _parse_fixed_argv(argv: tuple[str, ...]) -> tuple[str, str, str]:

@@ -106,3 +106,25 @@ class SandboxBackendPort(Protocol):
     def stop(self, session: SandboxSessionHandle) -> None: ...
 
     def delete(self, session: SandboxSessionHandle) -> None: ...
+
+    # Persistent in-container REPL kernels (sandbox_notebook).  Backends that
+    # do not support kernels raise SandboxCapabilityMismatch.
+    def kernel_open(
+        self,
+        session: SandboxSessionHandle,
+        *,
+        workspace_relative: str,
+        interpreter: str,
+    ) -> str: ...
+
+    def kernel_execute(
+        self,
+        session: SandboxSessionHandle,
+        kernel_id: str,
+        code: str,
+        *,
+        timeout_seconds: int,
+        output_limit: int,
+    ) -> dict[str, Any]: ...
+
+    def kernel_close(self, session: SandboxSessionHandle, kernel_id: str) -> None: ...

@@ -21,6 +21,7 @@ from app.core.scheduler import (
     memory_retention_scheduler,
     mcp_runner_cleanup_scheduler,
     sandbox_cleanup_scheduler,
+    sandbox_execution_scheduler,
     wal_checkpoint_scheduler,
 )
 from app.services.durable_queue import (
@@ -77,6 +78,8 @@ async def lifespan(_: FastAPI):
     outbox_task: asyncio.Task[None] | None = None
     wal_stop: asyncio.Event | None = None
     wal_task: asyncio.Task[None] | None = None
+    sandbox_exec_stop: asyncio.Event | None = None
+    sandbox_exec_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
         scheduler_stop = asyncio.Event()
         scheduler_task = asyncio.create_task(mastery_scheduler(scheduler_stop))
@@ -89,6 +92,9 @@ async def lifespan(_: FastAPI):
     if settings.sandbox_cleanup_scheduler_enabled:
         sandbox_stop = asyncio.Event()
         sandbox_task = asyncio.create_task(sandbox_cleanup_scheduler(sandbox_stop))
+    if settings.sandbox_execution_scheduler_enabled:
+        sandbox_exec_stop = asyncio.Event()
+        sandbox_exec_task = asyncio.create_task(sandbox_execution_scheduler(sandbox_exec_stop))
     if settings.mcp_stdio_cleanup_scheduler_enabled:
         mcp_runner_stop = asyncio.Event()
         mcp_runner_task = asyncio.create_task(mcp_runner_cleanup_scheduler(mcp_runner_stop))
@@ -116,6 +122,9 @@ async def lifespan(_: FastAPI):
         if sandbox_stop is not None and sandbox_task is not None:
             sandbox_stop.set()
             await sandbox_task
+        if sandbox_exec_stop is not None and sandbox_exec_task is not None:
+            sandbox_exec_stop.set()
+            await sandbox_exec_task
         if mcp_runner_stop is not None and mcp_runner_task is not None:
             mcp_runner_stop.set()
             await mcp_runner_task

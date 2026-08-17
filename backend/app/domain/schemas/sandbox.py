@@ -372,6 +372,7 @@ class SandboxAgentCommandView(ORMModel):
     workspace_id: str
     sandbox_session_id: str
     chat_session_id: str
+    job_id: str | None = None
     argv_redacted: list[str]
     cwd_relative: str
     status: str
@@ -386,6 +387,38 @@ class SandboxAgentCommandView(ORMModel):
     truncated: bool
     created_at: datetime
     updated_at: datetime
+
+
+class SandboxJobView(BaseModel):
+    """Public view of a queued/running sandbox job (unified scheduler)."""
+
+    id: str
+    workspace_id: str
+    owner_user_id: str
+    chat_session_id: str
+    kind: str
+    workload_class: str
+    status: str
+    reason: str | None = None
+    priority: int = 0
+    attempt: int = 0
+    queued_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    deadline_at: datetime | None = None
+    error_class: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SandboxJobSubmitView(BaseModel):
+    """HTTP 202 payload returned when a job is queued (or already terminal)."""
+
+    job_id: str
+    status: str
+    reason: str | None = None
+    retry_after_seconds: int = 5
 
 
 class SessionWorkspaceEntryView(BaseModel):
@@ -506,4 +539,115 @@ class SandboxDestructiveGrantView(BaseModel):
     granted_by: str
     expires_at: datetime
     reason: str
+
+
+# ── Sandbox toolkit (bash / todo / patch / git / search / fetch / subagent /
+#    skills / notebook) ────────────────────────────────────────────────────────
+
+
+class SandboxAgentBashRequest(BaseModel):
+    """Run a shell command string inside the sandbox container (bash -lc)."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    command: str = Field(min_length=1, max_length=16_384)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=600)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentTodoRequest(BaseModel):
+    """Session task checklist operations."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    action: Literal["list", "add", "done", "remove", "clear"] = "list"
+    text: str | None = Field(default=None, min_length=1, max_length=500)
+    item_id: str | None = Field(default=None, min_length=1, max_length=64)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentPatchRequest(BaseModel):
+    """Apply a unified diff to the durable session workspace (host-side)."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    patch: str = Field(min_length=1, max_length=2_000_000)
+    fuzz: int = Field(default=3, ge=0, le=10)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentGitRequest(BaseModel):
+    """Run local git operations inside the sandbox workspace (offline)."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    args: list[str] = Field(min_length=1, max_length=32)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentGitCloneRequest(BaseModel):
+    """Clone a public repository through the reviewed egress approval channel.
+
+    The network transfer runs host-side via the approved external-acquisition
+    pipeline (the sandbox container stays offline); the snapshot is materialized
+    into the workspace and a container-side git repository is initialized on it.
+    """
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    owner: str = Field(min_length=1, max_length=100)
+    repo: str = Field(min_length=1, max_length=100)
+    ref: str = Field(default="HEAD", min_length=1, max_length=200)
+    path: str = Field(default="", max_length=1000)
+    destination_root: str = Field(default="work/git/<repo>", min_length=1, max_length=1000)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentSearchRequest(BaseModel):
+    """Host-side web search through the user-authorized SearchProvider."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    query: str = Field(min_length=1, max_length=500)
+    max_results: int = Field(default=6, ge=1, le=12)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentFetchRequest(BaseModel):
+    """Host-side page fetch through the reviewed fetch authorization channel."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    url: str = Field(min_length=1, max_length=2000)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentSubagentRequest(BaseModel):
+    """Spawn a nested sandbox sub-agent with a restricted tool subset."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    prompt: str = Field(min_length=1, max_length=16_384)
+    tools: list[str] | None = Field(default=None, max_length=16)
+    max_rounds: int = Field(default=6, ge=1, le=12)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentSubagentStatusRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    subagent_id: str = Field(min_length=1, max_length=64)
+
+
+class SandboxAgentSkillListRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentSkillReadRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    skill_key: str = Field(min_length=1, max_length=200)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class SandboxAgentNotebookRequest(BaseModel):
+    """Persistent in-container REPL kernel (sandbox_notebook)."""
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    action: Literal["open", "execute", "close", "status"] = "open"
+    kernel_id: str | None = Field(default=None, min_length=1, max_length=64)
+    code: str | None = Field(default=None, min_length=1, max_length=262_144)
+    interpreter: Literal["python"] = "python"
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
     created_at: datetime
