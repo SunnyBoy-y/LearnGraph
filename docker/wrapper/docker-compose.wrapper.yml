@@ -1,0 +1,83 @@
+name: learngraph-wrapper
+
+# Host-side definition of the hardened DooD wrapper. This file is the ONLY
+# thing that runs on the host docker CLI; the wrapper container itself just
+# orchestrates, and the inner LearnGraph stack is created on the HOST daemon
+# through the mounted socket.
+#
+# The wrapper image is built by run.sh from a clean tar context (this compose
+# file deliberately has NO `build:` section — `docker compose build` on Docker
+# Desktop can bypass .dockerignore for huge dirs and contaminate the image).
+#
+# Start:  sh docker/wrapper/run.sh
+# Stop:   sh docker/wrapper/stop.sh
+# Docs:   doc/docker-wrapper.md
+
+services:
+  lg-wrapper:
+    image: ${LEARNGRAPH_WRAPPER_IMAGE:-learngraph-wrapper:local}
+    # No networking whatsoever: the CLI talks to the daemon over the unix
+    # socket only. If the host daemon uses a remote BuildKit builder
+    # (docker-container driver), give the wrapper access to that builder's
+    # network instead of `none`.
+    network_mode: "none"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    # Supplementary GID granting docker-socket access. Computed by run.sh;
+    # MUST match `stat -c %g /var/run/docker.sock` on the host.
+    group_add:
+      - ${DOCKER_GID:-0}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=134217728,mode=1777
+    environment:
+      # wrapper behaviour
+      LG_WRAPPER_ACTION: ${LG_WRAPPER_ACTION:-up}
+      LG_WRAPPER_BUILD: ${LG_WRAPPER_BUILD:-1}
+      LG_WRAPPER_WAIT_HEALTHY: ${LG_WRAPPER_WAIT_HEALTHY:-0}
+      LG_WRAPPER_DOWN_ON_EXIT: ${LG_WRAPPER_DOWN_ON_EXIT:-down}
+      LG_WRAPPER_FOLLOW_LOGS: ${LG_WRAPPER_FOLLOW_LOGS:-0}
+      LG_WRAPPER_SANDBOX: ${LG_WRAPPER_SANDBOX:-1}
+      # passthrough to the inner compose interpolation
+      LEARNGRAPH_ENV: ${LEARNGRAPH_ENV:-development}
+      LEARNGRAPH_MASTER_KEY: ${LEARNGRAPH_MASTER_KEY:-}
+      LEARNGRAPH_LISTEN_HOST: ${LEARNGRAPH_LISTEN_HOST:-127.0.0.1}
+      LEARNGRAPH_PORT: ${LEARNGRAPH_PORT:-18000}
+      LEARNGRAPH_PREVIEW_PORT: ${LEARNGRAPH_PREVIEW_PORT:-18001}
+      LEARNGRAPH_IMAGE: ${LEARNGRAPH_IMAGE:-learngraph:local}
+      # Code release default wins when unset (config.py DEFAULT_SANDBOX_PREBUILT_IMAGE).
+      LEARNGRAPH_SANDBOX_PREBUILT_IMAGE: ${LEARNGRAPH_SANDBOX_PREBUILT_IMAGE:-}
+      LEARNGRAPH_SANDBOX_IMAGE: ${LEARNGRAPH_SANDBOX_IMAGE:-}
+    volumes:
+      # The ONE privileged surface. Anything that can write this socket can
+      # control the host daemon (= host root). The wrapper is hardened so
+      # that nothing else inside it can be reached or executed.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - lg-wrapper-secrets:/run/secrets
+      - lg-wrapper-state:/run/wrapper-state
+    restart: unless-stopped
+    stop_grace_period: 90s
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /run/wrapper-state/ready && test -S /var/run/docker.sock && docker info >/dev/null 2>&1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # sandboxd tokens + bridge token + docker config: persist across restarts,
+  # never baked into the image.
+  lg-wrapper-secrets:
+  lg-wrapper-state:

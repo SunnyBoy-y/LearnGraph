@@ -4,6 +4,12 @@
 .agents
 .idea
 .vscode
+# Belt-and-braces nested variants: Docker Desktop's lazy context fetch has
+# been observed bypassing bare patterns for very large directories.
+**/.claude
+**/.agents
+**/.idea
+**/.vscode
 
 **/__pycache__
 **/*.py[cod]
@@ -17,6 +23,7 @@
 **/*.egg-info
 
 node_modules
+**/node_modules
 frontend/dist
 frontend/coverage
 **/.vite
