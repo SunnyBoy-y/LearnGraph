@@ -103,7 +103,15 @@ def _extract_tool_call(call: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     return call_id, name, arguments
 
 
-def _run_subagent(spec: SubagentSpec, job: SubagentJob) -> None:
+def _run_subagent(
+    spec: SubagentSpec,
+    job: SubagentJob,
+    *,
+    provider: Any = None,
+    sandbox_service: Any = None,
+) -> None:
+    """Run the nested loop. ``provider``/``sandbox_service`` may be injected
+    for tests; production constructs them from the workspace settings."""
     from app.core.config import get_settings
     from app.core.database import SessionLocal
     from app.providers.factory import model_provider_for_workspace
@@ -114,15 +122,17 @@ def _run_subagent(spec: SubagentSpec, job: SubagentJob) -> None:
     job.status = "running"
     job.started_at = time.time()
     deadline = job.started_at + spec.max_seconds
-    db = SessionLocal()
+    db: Any = None
     try:
-        sandbox = SandboxAgentWorkspaceService(
+        if sandbox_service is None or provider is None:
+            db = SessionLocal()
+        sandbox = sandbox_service or SandboxAgentWorkspaceService(
             db,
             spec.workspace_id,
             spec.actor_id,
             settings,
         )
-        provider = model_provider_for_workspace(db, spec.workspace_id, settings)
+        model_provider = provider or model_provider_for_workspace(db, spec.workspace_id, settings)
         allowed = (
             frozenset(spec.tools)
             if spec.tools
@@ -147,12 +157,14 @@ def _run_subagent(spec: SubagentSpec, job: SubagentJob) -> None:
         ]
         final_text = ""
         for _round in range(1, spec.max_rounds + 1):
+            if job.status == "cancelled":
+                return
             if time.time() > deadline:
                 raise TimeoutError(f"sub-agent exceeded its {spec.max_seconds}s wall-time budget")
             job.rounds = _round
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
-            for event in provider.stream_chat(messages, tools=definitions):
+            for event in model_provider.stream_chat(messages, tools=definitions):
                 if event.type == "text_delta" and event.content:
                     text_parts.append(event.content)
                 elif event.type == "tool_calls":
@@ -203,6 +215,8 @@ def _run_subagent(spec: SubagentSpec, job: SubagentJob) -> None:
             final_text = final_text or (
                 "（子代理达到最大轮数，未能给出最终答案）"
             )
+        if job.status == "cancelled":
+            return
         job.result = (final_text or "").strip()[:16_000]
         job.status = "completed"
     except Exception as exc:  # noqa: BLE001 - registry reports the failure
@@ -212,7 +226,8 @@ def _run_subagent(spec: SubagentSpec, job: SubagentJob) -> None:
         job.error_message = str(exc)[:500]
     finally:
         job.finished_at = time.time()
-        db.close()
+        if db is not None:
+            db.close()
 
 
 class SubagentRegistry:
@@ -234,7 +249,13 @@ class SubagentRegistry:
         self._jobs: dict[str, SubagentJob] = {}
         self._jobs_lock = threading.RLock()
 
-    def start(self, spec: SubagentSpec) -> SubagentJob:
+    def start(
+        self,
+        spec: SubagentSpec,
+        *,
+        provider: Any = None,
+        sandbox_service: Any = None,
+    ) -> SubagentJob:
         with self._jobs_lock:
             if len(self._jobs) >= self._MAX_JOBS:
                 # Evict the oldest finished job to keep the registry bounded.
@@ -253,6 +274,7 @@ class SubagentRegistry:
         thread = threading.Thread(
             target=_run_subagent,
             args=(spec, job),
+            kwargs={"provider": provider, "sandbox_service": sandbox_service},
             name=f"sandbox-subagent-{spec.subagent_id}",
             daemon=True,
         )
