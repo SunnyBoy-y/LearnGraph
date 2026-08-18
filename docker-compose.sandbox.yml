@@ -23,10 +23,12 @@ services:
       LEARNGRAPH_SANDBOX_BACKEND: sandboxd
       LEARNGRAPH_SANDBOXD_URL: http://sandboxd:8090
       LEARNGRAPH_SANDBOXD_TOKEN_FILE: /run/secrets/sandboxd-token
+      LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE: /run/secrets/sandboxd-admin-token
       LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
       LEARNGRAPH_SANDBOX_ENABLED: "true"
     secrets:
       - sandboxd-token
+      - sandboxd-admin-token
     networks:
       - default
       - sandbox-control
@@ -45,12 +47,14 @@ services:
       SANDBOXD_LISTEN_HOST: "0.0.0.0"
       SANDBOXD_PORT: "8090"
       SANDBOXD_TOKEN_FILE: /run/secrets/sandboxd-token
+      SANDBOXD_ADMIN_TOKEN_FILE: /run/secrets/sandboxd-admin-token
       SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
       # Immutable runtime image digest for sandbox runners. Empty keeps the
       # daemon fail-closed (readiness reports the missing runtime).
       SANDBOXD_RUNTIME_IMAGE: ${LEARNGRAPH_SANDBOX_IMAGE:-}
       SANDBOXD_EGRESS_ENABLED: "true"
       SANDBOXD_EGRESS_PROXY_URL: http://egress-proxy:8888
+      SANDBOXD_EGRESS_PROXY_CONTAINER: egress-proxy
       SANDBOXD_STATE_PATH: /var/lib/sandboxd/state.db
       SANDBOXD_SECCOMP_DIR: /app/sandbox-profiles
       SANDBOXD_MAX_ACTIVE: "20"
@@ -61,6 +65,7 @@ services:
       - sandboxd-state:/var/lib/sandboxd
     secrets:
       - sandboxd-token
+      - sandboxd-admin-token
     networks:
       - sandbox-control
     read_only: true
@@ -93,6 +98,10 @@ services:
 secrets:
   sandboxd-token:
     file: ${LEARNGRAPH_SANDBOXD_TOKEN_FILE:-./secrets/sandboxd-token}
+  # Higher-privilege bootstrap control plane (pull + digest + smoke). Generate a
+  # separate token: openssl rand -hex 32 > secrets/sandboxd-admin-token
+  sandboxd-admin-token:
+    file: ${LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE:-./secrets/sandboxd-admin-token}
 
 volumes:
   sandboxd-state:

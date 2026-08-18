@@ -3848,6 +3848,26 @@ class SettingsService:
             },
             "risk": "medium",
         },
+        # ── Execution-pool scheduling policy (admin override) ─────────────
+        # Workspace-level overrides for the unified sandbox scheduler. Each
+        # value clamps against the platform hard caps in Settings; null/absent
+        # fields fall back to deployment defaults. Managed by workspace admins
+        # (workspace.manage); Agents only ever observe job states, never these
+        # numbers.
+        "sandbox.scheduling_policy": {
+            "description": (
+                "Execution-pool scheduling policy: per-user warm instance cap, "
+                "parallel commands per instance, queue depth, and user weight"
+            ),
+            "default": {
+                "max_instances_per_user": None,
+                "max_parallel_execs_per_instance": None,
+                "queue_depth_per_user": None,
+                "user_weight": None,
+                "profiles": [],
+            },
+            "risk": "high",
+        },
     }
 
     def list(self) -> list[WorkspaceSetting]:
