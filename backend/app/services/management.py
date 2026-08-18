@@ -936,6 +936,9 @@ class ProviderService:
             )
             self.db.commit()
             self.db.refresh(provider)
+            invalidate_provider_plan_cache(
+                self.workspace_id, provider_id=provider.id
+            )
             return provider
         enabled = payload.enabled
         assert isinstance(enabled, bool)
@@ -1220,6 +1223,9 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return provider
 
     def update_model_capabilities(
@@ -1262,6 +1268,9 @@ class ProviderService:
             },
         )
         self.db.commit()
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "model_id": model_id,
@@ -1307,6 +1316,9 @@ class ProviderService:
             },
         )
         self.db.commit()
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "model_id": "*",
@@ -1431,6 +1443,9 @@ class ProviderService:
             },
         )
         self.db.commit()
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {"provider_id": provider.id, "models": synced, "warnings": warnings}
 
     @staticmethod
@@ -1563,6 +1578,9 @@ class ProviderService:
             details={"provider_id": provider.id, "model_id": normalized_model_id},
         )
         self.db.commit()
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "model_id": normalized_model_id,
@@ -1643,6 +1661,9 @@ class ProviderService:
             },
         )
         self.db.commit()
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "model_id": normalized_model_id,
@@ -1725,6 +1746,9 @@ class ProviderService:
             },
         )
         self.db.commit()
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "states": states,
@@ -1801,6 +1825,9 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "status": "refreshed",
@@ -1941,6 +1968,9 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {"provider_id": provider.id, "declaration_status": status}
 
     def validate_default_models(
@@ -2033,6 +2063,9 @@ class ProviderService:
                 details={"repaired_count": repaired_count},
             )
             self.db.commit()
+            invalidate_provider_plan_cache(
+                self.workspace_id, provider_id=provider_id or None
+            )
         return {
             "providers": entries,
             "repair_requested": repair,
@@ -2086,6 +2119,9 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "balance_credential_configured": True,
@@ -2553,6 +2589,9 @@ class ProviderService:
         )
         self.db.commit()
         self.db.refresh(provider)
+        invalidate_provider_plan_cache(
+            self.workspace_id, provider_id=provider.id
+        )
         return {
             "provider_id": provider.id,
             "config": self._stored_balance_query_config(provider),
