@@ -1451,6 +1451,33 @@ function MessageVersionNavigator({
   );
 }
 
+/**
+ * 用户发出新消息后，把该消息滚动到可视区顶端向下 1/5 处（上限位置），
+ * 使其不被底部悬浮输入框盖住；同时离开底部锁定，允许用户继续滚动画布。
+ */
+function scrollNewUserMessageToFifthLine(userMessageId: string) {
+  const attempt = () => {
+    const scroller = document.querySelector<HTMLElement>(
+      ".chat-canvas-page [role='log'] > div",
+    );
+    const el = document.getElementById(`conversation-jump-${userMessageId}`);
+    if (!scroller || !el) return false;
+    const targetTop =
+      scroller.getBoundingClientRect().top + scroller.clientHeight * 0.2;
+    const delta = el.getBoundingClientRect().top - targetTop;
+    const maxScroll = Math.max(
+      0,
+      scroller.scrollHeight - scroller.clientHeight,
+    );
+    const nextTop = Math.min(Math.max(0, scroller.scrollTop + delta), maxScroll);
+    scroller.scrollTo({ top: nextTop, behavior: "smooth" });
+    return true;
+  };
+  window.requestAnimationFrame(() => {
+    if (!attempt()) window.setTimeout(attempt, 120);
+  });
+}
+
 function UserMessage({
   message,
   editing,
@@ -5101,6 +5128,9 @@ export function ChatCanvasPage() {
         created_at: new Date().toISOString(),
       };
       setLocalMessages((current) => [...current, user, assistant]);
+      // 用户发出新消息后：把消息滚动到距顶部 1/5 处（上限），避免被底部
+      // 悬浮输入框盖住；同时解除 stick-to-bottom 锁定，允许继续下拉画布。
+      scrollNewUserMessageToFifthLine(user.id);
       setSelectionMenu(null);
       setStreamConnectionNotice(null);
       setStatus("submitted");
