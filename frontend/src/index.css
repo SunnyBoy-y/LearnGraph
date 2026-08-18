@@ -125,7 +125,7 @@
   --reading-heading-color: #202020;
   --reading-strong-weight: 600;
   --reading-heading-weight: 650;
-  --reading-max-width: 740px;
+  --reading-max-width: 772px;
   --reading-paragraph-gap: 0.9em;
   --reading-code-bg: #f3f3f3;
   --reading-code-color: #333;
@@ -1683,13 +1683,16 @@ body.is-resizing .workspace-resizer {
    LearnGraph Reading Typography v1 — 中间画布 Agent 长回答阅读层
    只作用于助手最终回答（.message-answer-segment）；思维链、用户气泡、
    输入框保持各自的紧凑样式。正文 400 → strong 600 → 标题 650，
-   行高 1.68，阅读核心 740px 居中（页面仍宽，文字窄排）。
+   行高 1.68，阅读核心 772px 居中（页面仍宽，文字窄排）。
    =========================================================================== */
 .is-assistant [data-message-content] {
   /* 沿用应用字体栈（Geist Variable 已加载），不引入第三方中文字体 */
   font-family: "Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  /* 允许答案正文里的宽元素（卡片/表格/代码块）突破窄排正文，不被裁剪 */
-  overflow: visible;
+  /* 整条消息体（思维链 + 最终回答 + 审批卡）与正文同宽居中，
+     保证"思考了 Xs"、表格/Magic Card 等控件与文字最左对齐 */
+  width: 100%;
+  max-width: var(--reading-max-width);
+  margin-inline: auto;
 }
 
 /* 阅读核心：文字窄排、居中；产物可另行突破宽度 */
@@ -1801,18 +1804,22 @@ body.is-resizing .workspace-resizer {
   margin: 1.5em 0;
 }
 
-/* ===== 产物放：大屏时 Magic Card / 沙箱产物 / 图表 / 表格 / 代码块突破窄排正文 =====
-   仅在 ≥1600px（中间栏足够宽）时启用，避免窄屏出现整栏横向滚动条。 */
-@media (min-width: 1600px) {
-  .is-assistant [data-message-content] .message-answer-segment > :is(.magic-card, .sandbox-artifact, .message-chart),
-  .is-assistant [data-message-content] .message-answer-segment [data-streamdown="table-wrapper"],
-  .is-assistant [data-message-content] .message-answer-segment [data-streamdown="code-block"] {
-    width: min(1000px, calc(100vw - 320px));
-    max-width: none;
-    position: relative;
-    left: 50%;
-    transform: translateX(-50%);
-  }
+/* ===== 控件对齐：表格 / Magic Card / 沙箱产物 / 图表等与文字宽度一致 =====
+   它们本身位于 message-answer-segment 内，天然与正文同宽；
+   这里只统一收窄审批卡等独立在消息体里的控件。 */
+.is-assistant [data-message-content] .message-deep-research-approvals {
+  width: 100%;
+  max-width: var(--reading-max-width);
+  margin-inline: auto;
+}
+
+/* ===== 消息尾部操作按钮（复制全文 / 重试 / 分支）：与文字最左对齐，
+   流式回答过程中也常显（此前 hover 才浮现 + 禁用态叠加导致近似不可见） ===== */
+.is-assistant > div:last-child {
+  width: 100%;
+  max-width: var(--reading-max-width);
+  margin-inline: auto;
+  opacity: 1;
 }
 
 @keyframes thinking-sheen { from { background-position: 100% 0; } to { background-position: -100% 0; } }
