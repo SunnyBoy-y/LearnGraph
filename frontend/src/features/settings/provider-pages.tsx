@@ -1633,6 +1633,7 @@ export function ProvidersPage() {
               const trimmedEndpoint = endpointValue.trim();
               const endpointValid =
                 !trimmedEndpoint || isValidHttpUrl(trimmedEndpoint);
+              const endpointPathHint = missingApiPathHint(trimmedEndpoint);
               return (
                 <>
                   <DialogHeader>
@@ -1668,9 +1669,14 @@ export function ProvidersPage() {
                         </p>
                       ) : (
                         <p className="text-xs text-muted-foreground">
-                          支持官方 API 或兼容网关地址。
+                          支持官方 API 或兼容网关地址。OpenAI 兼容网关的 API 地址通常以 /v1 结尾（如 http://localhost:8080/v1）。
                         </p>
                       )}
+                      {endpointValid && endpointPathHint ? (
+                        <p className="text-xs text-amber-600 dark:text-amber-400" role="note">
+                          {endpointPathHint}
+                        </p>
+                      ) : null}
                     </div>
                     {spec?.documentation_url || spec?.key_management_url ? (
                       <div className="flex flex-wrap gap-3 text-xs">
@@ -2812,6 +2818,49 @@ function invalidBaseUrlMessage(value: string): string {
   return "Base URL 必须以 http:// 或 https:// 开头，且包含有效的主机名";
 }
 
+/** 官方预设端点的主机名集合。这些端点不带 /v1 也是正确地址（如 DeepSeek 官方），不应误报缺路径。 */
+const KNOWN_OFFICIAL_ORIGINS = new Set(
+  QUICK_PROVIDERS.flatMap((preset) => [
+    preset.baseUrl,
+    ...Object.values(preset.endpoints ?? {}),
+  ])
+    .filter((endpoint): endpoint is string => Boolean(endpoint))
+    .map((endpoint) => {
+      try {
+        return new URL(endpoint).host.toLowerCase();
+      } catch {
+        return "";
+      }
+    })
+    .filter(Boolean),
+);
+
+/**
+ * 识别"看起来缺少 API 路径前缀"的 Base URL 并给出提示。
+ *
+ * OpenAI 兼容网关的 API 根地址通常以 /v1 结尾（如 http://localhost:8080/v1）。
+ * 若填成不带路径的网页地址（如 http://localhost:8080），请求会打到网站首页，
+ * 后端解析不到 SSE 流而报 "Compatible Chat stream ended before completion"。
+ * 已包含 /v1、/api、/anthropic 等 API 段的地址或官方厂商端点不提示。
+ */
+function missingApiPathHint(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (KNOWN_OFFICIAL_ORIGINS.has(url.host.toLowerCase())) return null;
+  const path = url.pathname.replace(/\/+$/, "");
+  if (/(^|\/)(v\d+|api|anthropic|openai|compatible-mode|responses)(\/|$)/i.test(path)) {
+    return null;
+  }
+  return `该地址看起来是网站首页而不是 API 端点。多数 OpenAI 兼容网关要求以 /v1 结尾（如 ${url.origin}/v1）；漏填会导致聊天报 "Compatible Chat stream ended before completion"。`;
+}
+
 function isKnownQuickEndpoint(preset: RoleQuickProvider, value: string) {
   const normalized = normalizedQuickEndpoint(value);
   return Boolean(normalized) && Object.values(
@@ -3140,6 +3189,7 @@ function ProviderDialog({
   // intercept such URLs before submission instead of surfacing a 500.
   const baseUrlValid =
     !trimmedBaseUrl || isValidHttpUrl(trimmedBaseUrl);
+  const baseUrlPathHint = missingApiPathHint(trimmedBaseUrl);
 
   return (
     <Dialog
@@ -3332,11 +3382,16 @@ function ProviderDialog({
                   ? `厂商预设为 DeepSeek，当前使用 ${selected?.label ?? "所选"} 协议。请确认该端点真实支持此协议；模型名称不会替你改写协议。`
                   : selected?.default_base_url
                     ? `官方默认：${selected.default_base_url}。也可填写兼容网关或代理地址。`
-                    : "支持官方 API 或兼容网关地址。"}
+                    : "支持官方 API 或兼容网关地址。OpenAI 兼容网关的 API 地址通常以 /v1 结尾（如 http://localhost:8080/v1）。"}
               </p>
               {trimmedBaseUrl && !baseUrlValid ? (
                 <p className="text-xs text-destructive" role="alert">
                   {invalidBaseUrlMessage(trimmedBaseUrl)}
+                </p>
+              ) : null}
+              {trimmedBaseUrl && baseUrlValid && baseUrlPathHint ? (
+                <p className="text-xs text-amber-600 dark:text-amber-400" role="note">
+                  {baseUrlPathHint}
                 </p>
               ) : null}
             </div>
@@ -3818,19 +3873,21 @@ function ModelCapabilitiesDialog({
     onError: (error) => toast.error(error.message),
   });
   const updateConnection = useMutation({
-    mutationFn: () => updateProvider(provider.id, {
-      provider_type: protocolType === provider.provider_type ? undefined : protocolType,
-      base_url: baseUrl.trim() || null,
-      extra_headers: parseExtraHeadersInput(headers),
-    }),
-    onSuccess: (updatedProvider) => {
+    mutationFn: ({ close = true }: { close?: boolean } = {}) =>
+      updateProvider(provider.id, {
+        provider_type:
+          protocolType === provider.provider_type ? undefined : protocolType,
+        base_url: baseUrl.trim() || null,
+        extra_headers: parseExtraHeadersInput(headers),
+      }).then((updatedProvider) => ({ updatedProvider, close })),
+    onSuccess: ({ updatedProvider, close }) => {
       queryClient.setQueryData<Provider[]>(["providers"], (current) =>
         current?.map((item) =>
           item.id === updatedProvider.id ? updatedProvider : item,
         ),
       );
       toast.success("连接配置已保存");
-      onClose();
+      if (close) onClose();
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
     onError: (error) => toast.error(error.message),
@@ -3847,15 +3904,29 @@ function ModelCapabilitiesDialog({
 
   function submit(event: FormEvent) {
     event.preventDefault();
+    const trimmedConnectionUrl = baseUrl.trim();
+    if (trimmedConnectionUrl && !isValidHttpUrl(trimmedConnectionUrl)) {
+      toast.error(invalidBaseUrlMessage(trimmedConnectionUrl));
+      return;
+    }
     if (editScope === "none") {
-      // Nothing is being edited — the footer action only commits the model
-      // on/off switches.
+      // 连接配置（URL/请求头/协议）在「连接配置」区有独立的「保存连接」按钮；
+      // 但用户在 URL 输入框按 Enter 或直接点底部「保存」时也会走到这里，
+      // 若连接已被改动不能静默丢弃——先提交模型开关，再一并保存连接。
+      const connectionDirty =
+        (baseUrl.trim() || null) !== (provider.base_url ?? null) ||
+        protocolType !== provider.provider_type ||
+        headers !== stringifyExtraHeaders(providerExtraHeaders(provider));
       updateProviderModelStates(provider.id, modelStates)
         .then((result) => {
-          toast.success("模型开关已保存");
           onStatesSaved(result);
           void queryClient.invalidateQueries({ queryKey: ["providers"] });
-          onClose();
+          if (connectionDirty) {
+            updateConnection.mutate({ close: true });
+          } else {
+            toast.success("模型开关已保存");
+            onClose();
+          }
         })
         .catch((error: Error) => toast.error(error.message));
       return;
@@ -4160,6 +4231,14 @@ function ModelCapabilitiesDialog({
                         </span>
                       );
                     }
+                    const hint = missingApiPathHint(trimmedConnectionUrl);
+                    if (hint) {
+                      return (
+                        <span className="mt-1 block text-xs text-amber-600 dark:text-amber-400" role="note">
+                          {hint}
+                        </span>
+                      );
+                    }
                     return null;
                   })()}
                 </Label>
@@ -4174,7 +4253,7 @@ function ModelCapabilitiesDialog({
                         toast.error(invalidBaseUrlMessage(trimmedConnectionUrl));
                         return;
                       }
-                      updateConnection.mutate();
+                      updateConnection.mutate({});
                     }}
                     type="button"
                     variant="outline"

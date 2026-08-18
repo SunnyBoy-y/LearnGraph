@@ -20,6 +20,7 @@ import {
   Gauge,
   HardDrive,
   KeyRound,
+  ListTree,
   MessageSquareText,
   Mic,
   Moon,
@@ -136,10 +137,12 @@ import {
   CHAT_DICTATION_CLEANUP_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
+  CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY,
   isChatContextUsageEnabled,
   isChatDictationCleanupEnabled,
   readChatDefaultResponseMode,
   readChatFeatureModelSetting,
+  readChatThinkingChainDefault,
 } from "@/lib/workspace-settings";
 import type { ResponseMode } from "@/lib/session-composer-prefs";
 import { cn } from "@/lib/utils";
@@ -2312,6 +2315,18 @@ export function WorkspaceSettingsPage() {
       toast.success("默认响应模式已更新");
     },
   });
+  const saveThinkingChainDefault = useMutation({
+    mutationFn: (default_state: "open" | "collapsed") =>
+      updateSetting(CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY, { default_state }),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("思维链默认状态已更新");
+    },
+  });
   const memoryEnhancement = useQuery({
     queryKey: ["memory-enhancement"],
     queryFn: getMemoryEnhancement,
@@ -2538,6 +2553,7 @@ export function WorkspaceSettingsPage() {
   const dictationCleanupEnabled = isChatDictationCleanupEnabled(settings.data);
   const contextUsageEnabled = isChatContextUsageEnabled(settings.data);
   const defaultResponseMode = readChatDefaultResponseMode(settings.data);
+  const thinkingChainDefaultOpen = readChatThinkingChainDefault(settings.data);
   const dictationCleanupModel = useMemo(
     () =>
       readChatFeatureModelSetting(
@@ -2828,6 +2844,37 @@ export function WorkspaceSettingsPage() {
                 <SelectItem value="fast">极速</SelectItem>
                 <SelectItem value="thinking">思考</SelectItem>
                 <SelectItem value="agentic">智能体</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <ListTree className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">思维链处理中默认状态</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  回答过程中是否默认展开思考过程（推理、过程回复与工具调用）；最终回答开始时总会自动收起一次，历史消息始终默认折叠
+                </p>
+              </div>
+            </div>
+            <Select
+              disabled={saveThinkingChainDefault.isPending}
+              onValueChange={(value) =>
+                saveThinkingChainDefault.mutate(
+                  value as "open" | "collapsed",
+                )
+              }
+              value={thinkingChainDefaultOpen ? "open" : "collapsed"}
+            >
+              <SelectTrigger
+                aria-label="思维链处理中默认状态"
+                className="w-[8.5rem] shrink-0"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="open">展开</SelectItem>
+                <SelectItem value="collapsed">折叠</SelectItem>
               </SelectContent>
             </Select>
           </div>

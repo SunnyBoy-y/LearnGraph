@@ -11,6 +11,8 @@ export const CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY =
   "chat.dictation_cleanup_model";
 export const CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY =
   "chat.default_response_mode";
+export const CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY =
+  "chat.thinking_chain_default";
 export { CHAT_RESPONSE_STYLE_SETTING_KEY } from "@/lib/response-style";
 
 export type ChatFeatureModelSetting = {
@@ -73,6 +75,25 @@ export function readChatDefaultResponseMode(
   return isResponseMode(record.response_mode)
     ? record.response_mode
     : DEFAULT_RESPONSE_MODE;
+}
+
+export type ThinkingChainDefaultState = "open" | "collapsed";
+
+/**
+ * Processing-phase default state of the thinking chain. Defaults to expanded
+ * so the user watches reasoning / plan / tool steps unfold live; history
+ * messages always load collapsed regardless of this preference.
+ */
+export function readChatThinkingChainDefault(
+  settings: WorkspaceSetting[] | undefined,
+): boolean {
+  const value = settings?.find(
+    (setting) => setting.key === CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY,
+  )?.value;
+  if (!value || typeof value !== "object") return true;
+  const record = value as Record<string, unknown>;
+  if (record.default_state === "collapsed") return false;
+  return true;
 }
 
 export function readChatFeatureModelSetting(
