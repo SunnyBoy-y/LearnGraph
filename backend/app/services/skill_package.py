@@ -403,6 +403,28 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
     OfficialSkillSpec(
+        key="ppt-agent",
+        display_name="PPT 设计流水线（ppt-agent）",
+        version="1.0.0",
+        dir_name="ppt_agent",
+        description=(
+            "把\"人类顶级 PPT 团队\"工作流固化为流水线：需求调研→大纲→资料检索→策划稿→"
+            "逐页 1280×720 整页 SVG 设计→网页预览→原生可编辑 .pptx（每个色块/文字/线条都是"
+            "原生 PowerPoint 形状，打开即可改字改色）。配图走 generate_image + base64 内联，"
+            "出片在离线沙箱（build_preview.py / build_pptx.py），视觉 QA 用 document-conversion "
+            "渲染逐页检查。朴素模板生成/读取/检查已有 PPTX 请用 pptx-generation。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        category="pptx",
+        capability_ids=("ppt.design", "ppt.svg", "ppt.pipeline"),
+        keywords=(
+            "ppt设计", "幻灯片设计", "整页svg", "演示设计", "设计稿",
+            "ppt美化", "deck设计", "答辩ppt", "路演ppt", "高端ppt",
+        ),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_exec", "skill.sandbox_run"),
+    ),
+    OfficialSkillSpec(
         key="spreadsheet-analysis",
         display_name="表格分析与处理",
         version="1.0.1",
@@ -558,6 +580,31 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "sandbox_grep",
             "sandbox_delete_file",
         ),
+    ),
+    OfficialSkillSpec(
+        key="subagent-orchestration",
+        display_name="子代理编排",
+        version="1.0.0",
+        dir_name="subagent_orchestration",
+        description=(
+            "沙箱子代理的编排与调用（sandbox_subagent / sandbox_subagent_status）："
+            "何时委派、如何写自包含子代理任务、选择工具子集、轮询与失败处理。"
+        ),
+        grant_reason="official_skill_auto_enable",
+        category="agent",
+        capability_ids=("agent.subagent", "agent.delegation"),
+        keywords=(
+            "子代理",
+            "subagent",
+            "并行",
+            "委派",
+            "delegation",
+            "sandbox_subagent",
+            "sandbox_subagent_status",
+            "后台任务",
+        ),
+        requires_runtime="sandbox",
+        required_tools=("sandbox_subagent", "sandbox_subagent_status"),
     ),
 )
 

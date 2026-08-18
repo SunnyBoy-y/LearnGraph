@@ -41,6 +41,15 @@ sandbox_exec 验证/批量/多文件处理（learngraph_tasks、fs 库）
 | `sandbox_edit_file` | 唯一串替换；先 read 拿 `expected_sha256` | 多处同改时 `replace_all`（≤100）；超过走 exec |
 | `sandbox_delete_file` | 删除 work/ 下单个文件（会弹用户授权） | inputs/outputs/宿主文件不可删 |
 | `sandbox_exec` | 跑 workspace 内 .py/.js 脚本 | 单文件小操作有专用工具时不要用（每次有快照开销） |
+| `sandbox_bash` | 任意 shell 命令串（bash -lc），工具链/管道/循环 | 单文件小操作有专用工具时不用；交互式/长驻前台进程会被墙钟超时杀掉 |
+| `sandbox_todo` | 多步任务的会话级清单 add/done/list | 单步任务不需要 |
+| `sandbox_apply_patch` | 多 hunk/多文件统一 diff（git 格式）一次应用 | 单点小改动用 edit_file 更直接 |
+| `sandbox_git` | 工作区内本地 git（status/log/commit/init），离线 | clone/fetch/pull 必须走 `sandbox_git_clone` 审批通道 |
+| `sandbox_git_clone` | 克隆公开 GitHub 仓库（宿主侧走审批，快照 + 容器侧 git init） | 有 egress 审批但无真实 git 历史，需要完整历史时另行处理 |
+| `sandbox_search_web` / `sandbox_fetch` | 宿主侧联网检索/抓取（走授权域），容器保持离线 | 需要未经授权域时不要用（会弹授权卡片） |
+| `sandbox_subagent` + `sandbox_subagent_status` | 并行委派独立子任务（受限工具集） | 简单任务直接自己做；子代理不能发起授权卡片 |
+| `sandbox_skill_list` / `sandbox_skill_read` | 查看/读取官方技能指令 | 运行中技能已注入 prompt 时不必重复读 |
+| `sandbox_notebook` | 需要跨步骤保持 Python 解释器状态（open/execute/close） | 一次性计算用 sandbox_exec 更省资源 |
 
 ## 组合路线
 
@@ -48,7 +57,13 @@ sandbox_exec 验证/批量/多文件处理（learngraph_tasks、fs 库）
 定位: list(pattern) → grep(pattern) → read(start_line..end_line)
 修改: read(拿 sha256) → edit(唯一串) → read 验证
 批量: write 脚本 → exec(python work/x.py) → grep 验证
+多文件: apply_patch(统一 diff) → read 验证
 删除: delete_file(work/…，用户授权) 或 exec 内授权删除
+版本: git init → add → commit（容器内）→ log/status
+联网: git_clone(审批) / search_web / fetch(授权域) → 宿主侧获取，容器离线
+并行: subagent(prompt) → subagent_status 轮询结果
+长会话: todo 清单跟踪多步计划
+交互状态: notebook open → execute(保持状态) → close
 ```
 
 ## 安全与限制

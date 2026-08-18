@@ -33,6 +33,42 @@ def _hash(value: Any) -> str:
     ).hexdigest()
 
 
+def _is_utf8(body: bytes) -> bool:
+    try:
+        body.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def _skill_readme(skill: Any, script_paths: list[str]) -> str:
+    """Container README for a shared skill package (usage + scope limits).
+
+    The sandbox stays offline and secret-free; scripts can only read files
+    inside the shared skill directory and the user's workspace volume.
+    """
+    scripts = "".join(f"- `{path}`\n" for path in script_paths if path.startswith("scripts/"))
+    return (
+        f"# {skill.name or skill.skill_key}\n\n"
+        f"Skill key: `{skill.skill_key}`\n\n"
+        "## 脚本（scripts/）\n"
+        f"{scripts or '- 无 scripts/'}\n"
+        "## 用法\n"
+        "在沙箱中运行（沙箱内离线，无网络、无凭据）：\n\n"
+        "```bash\n"
+        "# 查看本文件\n"
+        "cat README.md\n"
+        "# 运行脚本（示例）\n"
+        "python scripts/xxx.py --help\n"
+        "```\n"
+        "## 范围限制\n"
+        "- 沙箱默认离线：`pip install`、`npm install`、网络请求会失败。\n"
+        "- 脚本只能访问共用区 `shared/skills/` 与当前会话工作区，不能访问宿主文件。\n"
+        "- 脚本不得读取或写入密钥、凭据；沙箱不携带任何密钥。\n"
+        "- 超出沙箱 wall-time / 输出上限会被任务级终止（不会影响其他任务）。\n"
+    )
+
+
 class SkillSandboxRunService:
     def __init__(
         self,
@@ -206,39 +242,52 @@ class SkillSandboxRunService:
             sandbox_session = self.agent.create_session(
                 SandboxAgentSessionCreateRequest(chat_session_id=chat_session_id)
             )
-            # Materialize package scripts into sandbox workspace under skills/<key>/
-            # plus SKILL.md and the controlled references/examples directories so
-            # a script can read its own docs and templates. Only text files are
-            # copied; the sandbox stays offline and secret-free.
-            files = (
-                self.db.query(SkillPackageFile)
-                .filter_by(workspace_id=self.workspace_id, skill_id=skill.id, is_directory=False)
-                .all()
-            )
-            for row in files:
-                if not (
+            # Materialize package scripts into the shared capability area
+            # (once per user, not per chat) under shared/skills/<key>/ plus
+            # SKILL.md, a generated README, and the controlled
+            # references/examples directories. Only text files are copied; the
+            # sandbox stays offline and secret-free.
+            files = [
+                (row.relative_path, self.blobs.read_bytes(row.blob_sha256))
+                for row in (
+                    self.db.query(SkillPackageFile)
+                    .filter_by(workspace_id=self.workspace_id, skill_id=skill.id, is_directory=False)
+                    .all()
+                )
+                if (
                     row.relative_path == "SKILL.md"
                     or row.relative_path.startswith(("scripts/", "references/", "examples/"))
-                ):
-                    continue
-                body = self.blobs.read_bytes(row.blob_sha256)
-                try:
-                    text = body.decode("utf-8")
-                except UnicodeDecodeError:
-                    continue
-                rel = f"skills/{skill.skill_key}/{row.relative_path}"
-                self.agent.write_file(
-                    SandboxAgentFileWriteRequest(
-                        chat_session_id=chat_session_id,
-                        path=rel,
-                        content=text,
-                        sandbox_session_id=sandbox_session.id,
-                    )
                 )
+                and _is_utf8(self.blobs.read_bytes(row.blob_sha256))
+            ]
+            pooling = bool(
+                self.settings.sandbox_instance_pooling_enabled
+                and (sandbox_session.backend_id or "docker") == "sandboxd"
+            )
+            if pooling:
+                shared_rel = self.agent.materialize_shared_skill(
+                    chat_session_id,
+                    skill.skill_key,
+                    files,
+                    readme=_skill_readme(skill, [rel for rel, _ in files]),
+                )
+                run_rel = f"/workspace/{shared_rel}/{script_path}"
+            else:
+                for rel, body in files:
+                    text = body.decode("utf-8")
+                    self.agent.write_file(
+                        SandboxAgentFileWriteRequest(
+                            chat_session_id=chat_session_id,
+                            path=f"skills/{skill.skill_key}/{rel}",
+                            content=text,
+                            sandbox_session_id=sandbox_session.id,
+                        )
+                    )
+                run_rel = f"skills/{skill.skill_key}/{script_path}"
             command = self.agent.execute_command(
                 SandboxAgentCommandRequest(
                     chat_session_id=chat_session_id,
-                    argv=argv,
+                    argv=[runner, run_rel, *list(payload.argv_extra or [])],
                     cwd=".",
                     sandbox_session_id=sandbox_session.id,
                 ),
