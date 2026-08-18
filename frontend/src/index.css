@@ -115,6 +115,24 @@
   --lg-green-soft: #ededed;
   --lg-panel-bg: #fcfcfc;
   --lg-panel-border: transparent;
+  /* LearnGraph Reading Typography v1 — 中间画布 Agent 长回答阅读层 */
+  --reading-font-size: 16px;
+  --reading-line-height: 1.68;
+  --reading-text: #262626;
+  --reading-text-secondary: #666666;
+  --reading-text-muted: #8a8a8a;
+  --reading-strong-color: #202020;
+  --reading-heading-color: #202020;
+  --reading-strong-weight: 600;
+  --reading-heading-weight: 650;
+  --reading-max-width: 740px;
+  --reading-paragraph-gap: 0.9em;
+  --reading-code-bg: #f3f3f3;
+  --reading-code-color: #333;
+  --reading-quote-color: #555;
+  --reading-quote-border: #dedede;
+  --reading-hr-color: #e8e8e8;
+  --reading-marker: #737373;
   color-scheme: light;
 }
 
@@ -165,6 +183,18 @@
   --lg-warm: #2a2418;
   --lg-blue: #171c28;
   --lg-danger: #f07167;
+  /* Reading typography dark tokens */
+  --reading-text: oklch(.9 .006 100);
+  --reading-text-secondary: oklch(.72 .01 100);
+  --reading-text-muted: oklch(.6 .008 100);
+  --reading-strong-color: oklch(.96 .005 100);
+  --reading-heading-color: oklch(.96 .005 100);
+  --reading-code-bg: oklch(.26 .006 260);
+  --reading-code-color: oklch(.85 .008 100);
+  --reading-quote-color: oklch(.75 .008 100);
+  --reading-quote-border: oklch(.36 .008 260);
+  --reading-hr-color: oklch(.32 .008 260);
+  --reading-marker: oklch(.6 .008 100);
 }
 
 
@@ -1640,6 +1670,142 @@ body.is-resizing .workspace-resizer {
 /* Keep the last header cell clear of the in-box controls. */
 [data-streamdown="table-wrapper"]:has(> div:first-child:not(:only-child)) [data-streamdown="table-header-cell"]:last-child {
   padding-right: 5.5rem;
+}
+
+/* ===========================================================================
+   LearnGraph Reading Typography v1 — 中间画布 Agent 长回答阅读层
+   只作用于助手最终回答（.message-answer-segment）；思维链、用户气泡、
+   输入框保持各自的紧凑样式。正文 400 → strong 600 → 标题 650，
+   行高 1.68，阅读核心 740px 居中（页面仍宽，文字窄排）。
+   =========================================================================== */
+.is-assistant [data-message-content] {
+  /* 沿用应用字体栈（Geist Variable 已加载），不引入第三方中文字体 */
+  font-family: "Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 允许答案正文里的宽元素（卡片/表格/代码块）突破窄排正文，不被裁剪 */
+  overflow: visible;
+}
+
+/* 阅读核心：文字窄排、居中；产物可另行突破宽度 */
+.is-assistant [data-message-content] .message-answer-segment {
+  width: 100%;
+  max-width: var(--reading-max-width);
+  margin-inline: auto;
+
+  font-size: var(--reading-font-size);
+  line-height: var(--reading-line-height);
+  font-weight: 400;
+  color: var(--reading-text);
+
+  letter-spacing: 0;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ===== 段落：统一段距 0.9em ===== */
+.is-assistant [data-message-content] .message-answer-segment p {
+  margin: 0 0 var(--reading-paragraph-gap);
+}
+.is-assistant [data-message-content] .message-answer-segment p:last-child {
+  margin-bottom: 0;
+}
+
+/* ===== 强调：400 → 600，去掉过黑跳跃 ===== */
+.is-assistant [data-message-content] .message-answer-segment strong {
+  color: var(--reading-strong-color);
+  font-weight: var(--reading-strong-weight);
+}
+
+/* ===== 标题：统一 650，层级靠字号而非字重 ===== */
+.is-assistant [data-message-content] .message-answer-segment :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--reading-heading-color);
+  font-weight: var(--reading-heading-weight);
+  letter-spacing: -0.015em;
+}
+.is-assistant [data-message-content] .message-answer-segment h1 {
+  margin: 1.45em 0 0.65em;
+  font-size: 1.65em; /* ≈26px */
+  line-height: 1.25;
+}
+.is-assistant [data-message-content] .message-answer-segment h2 {
+  margin: 1.4em 0 0.6em;
+  font-size: 1.42em; /* ≈23px */
+  line-height: 1.3;
+}
+.is-assistant [data-message-content] .message-answer-segment h3 {
+  margin: 1.25em 0 0.5em;
+  font-size: 1.18em; /* ≈19px */
+  line-height: 1.4;
+}
+.is-assistant [data-message-content] .message-answer-segment h4 {
+  margin: 1.15em 0 0.45em;
+  font-size: 1em;
+  line-height: 1.5;
+}
+.is-assistant [data-message-content] .message-answer-segment h5,
+.is-assistant [data-message-content] .message-answer-segment h6 {
+  margin: 1.05em 0 0.4em;
+  font-size: 0.95em;
+  line-height: 1.5;
+}
+
+/* ===== 列表 ===== */
+.is-assistant [data-message-content] .message-answer-segment ul,
+.is-assistant [data-message-content] .message-answer-segment ol {
+  margin: 0.45em 0 0.95em;
+  padding-left: 1.45em;
+  list-style-position: outside;
+}
+.is-assistant [data-message-content] .message-answer-segment li {
+  margin: 0.2em 0;
+  padding: 0;
+}
+.is-assistant [data-message-content] .message-answer-segment li::marker {
+  color: var(--reading-marker);
+}
+.is-assistant [data-message-content] .message-answer-segment li > ul,
+.is-assistant [data-message-content] .message-answer-segment li > ol {
+  margin: 0.2em 0 0.4em;
+}
+
+/* ===== 引用 ===== */
+.is-assistant [data-message-content] .message-answer-segment blockquote {
+  margin: 1em 0;
+  padding: 0.15em 0 0.15em 1em;
+
+  color: var(--reading-quote-color);
+  border-left: 3px solid var(--reading-quote-border);
+  font-style: normal;
+}
+
+/* ===== 行内代码 ===== */
+.is-assistant [data-message-content] .message-answer-segment :not(pre) > code {
+  padding: 0.15em 0.32em;
+  border-radius: 5px;
+  font-size: 0.9em;
+  color: var(--reading-code-color);
+  background: var(--reading-code-bg);
+}
+
+/* ===== 分隔线 ===== */
+.is-assistant [data-message-content] .message-answer-segment hr {
+  border: 0;
+  border-top: 1px solid var(--reading-hr-color);
+  margin: 1.5em 0;
+}
+
+/* ===== 产物放：大屏时 Magic Card / 沙箱产物 / 图表 / 表格 / 代码块突破窄排正文 =====
+   仅在 ≥1600px（中间栏足够宽）时启用，避免窄屏出现整栏横向滚动条。 */
+@media (min-width: 1600px) {
+  .is-assistant [data-message-content] .message-answer-segment > :is(.magic-card, .sandbox-artifact, .message-chart),
+  .is-assistant [data-message-content] .message-answer-segment [data-streamdown="table-wrapper"],
+  .is-assistant [data-message-content] .message-answer-segment [data-streamdown="code-block"] {
+    width: min(1000px, calc(100vw - 320px));
+    max-width: none;
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+  }
 }
 
 @keyframes thinking-sheen { from { background-position: 100% 0; } to { background-position: -100% 0; } }
@@ -3400,8 +3566,8 @@ body.is-resizing .workspace-resizer {
 .graph-library-sheet .graph-library { min-height: 0; }
 
 .chat-canvas-page [data-message-selectable-text] {
-  font-size: 15px !important;
-  line-height: 1.75 !important;
+  font-size: var(--reading-font-size) !important;
+  line-height: var(--reading-line-height) !important;
 }
 .chat-canvas-page .chat-composer__textarea { font-size: 15px; line-height: 1.5; }
 

@@ -827,7 +827,7 @@ function TextWithCitations({
         <IncrementalMarkdown codeHighlight={codeHighlight} text={markdown} />
       ) : (
         <MessageResponse
-          className={cn("min-w-0 text-[15px] leading-7", className)}
+          className={cn("min-w-0", className)}
           codeHighlight={codeHighlight}
           components={components}
         >
