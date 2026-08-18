@@ -1813,13 +1813,16 @@ body.is-resizing .workspace-resizer {
   margin-inline: auto;
 }
 
-/* ===== 消息尾部操作按钮（复制全文 / 重试 / 分支）：与文字最左对齐，
-   流式回答过程中也常显（此前 hover 才浮现 + 禁用态叠加导致近似不可见） ===== */
+/* ===== 消息尾部操作按钮（复制全文 / 重试 / 分支）：与文字最左对齐；
+   流式回答过程中隐藏，回答结束 / 终止后才显示（用户需求） ===== */
 .is-assistant > div:last-child {
   width: 100%;
   max-width: var(--reading-max-width);
   margin-inline: auto;
-  opacity: 1;
+}
+.is-assistant[data-streaming] > div:last-child {
+  opacity: 0;
+  pointer-events: none;
 }
 
 @keyframes thinking-sheen { from { background-position: 100% 0; } to { background-position: -100% 0; } }
@@ -3361,7 +3364,8 @@ body.is-resizing .workspace-resizer {
 .activity-rail__details li::before { content: '·'; margin-right: 5px; color: #111; font-weight: 800; }
 .activity-drawer .activity-rail { min-height: 0; }
 .topbar-status { gap: 7px; color: var(--muted-foreground); }
-.topbar-status__dot { width: 7px; height: 7px; flex: none; border-radius: 999px; background: #c28a2c; box-shadow: 0 0 0 3px color-mix(in srgb, #c28a2c 13%, transparent); }
+/* 右上角状态点：绿 / 红 / 琥珀等一律不显示（用户要求） */
+.topbar-status__dot { display: none; width: 7px; height: 7px; flex: none; border-radius: 999px; background: #c28a2c; box-shadow: 0 0 0 3px color-mix(in srgb, #c28a2c 13%, transparent); }
 .topbar-status__dot.is-healthy { background: #2e8a63; box-shadow: 0 0 0 3px color-mix(in srgb, #2e8a63 13%, transparent); }
 /* Shared elevated surface used by PageFrame cards (Surface component). */
 .surface {

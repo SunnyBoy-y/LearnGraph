@@ -1886,6 +1886,13 @@ function AssistantMessageInner({
       className="max-w-none"
       data-message-id={message.id}
       data-selection-disabled={selectedVersionId ? "true" : undefined}
+      data-streaming={
+        IN_FLIGHT_MESSAGE_STATUSES.includes(
+          shown.status as (typeof IN_FLIGHT_MESSAGE_STATUSES)[number],
+        )
+          ? "true"
+          : undefined
+      }
       from="assistant"
       // Lazy versions trigger — see `versionsRequested` above.
       onMouseEnter={() => setVersionsRequested(true)}
