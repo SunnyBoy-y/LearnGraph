@@ -173,6 +173,7 @@ STREAM_EVENT_BATCH_COUNT = 64
 STREAM_EVENT_BATCH_SECONDS = 0.5
 STREAM_REPLAY_BATCH_SIZE = 500
 STREAM_EVENT_IMMEDIATE_TYPES = frozenset({
+    "answer.started",
     "graph.update.proposed",
     "message.cancelled",
     "message.completed",
@@ -2663,6 +2664,23 @@ class ChatService:
                         "natural — not a canned template, not the full answer.\n"
                         "After tool results, you may add a short progress note "
                         "before more tools if it helps the user follow along.\n"
+                        "Artifact placement: when a tool call will produce a "
+                        "visible artifact (image, interactive HTML / magic card, "
+                        "chart, or downloadable file), introduce it with a short "
+                        "line right before the call (e.g. 「下面先看整体结构：」), "
+                        "and after the artifact appears continue with a sentence "
+                        "that references it (e.g. 「从图中可以看到…」). Keep the "
+                        "narration next to each artifact instead of saving every "
+                        "explanation for the very end.\n"
+                        "Artifact references: to place a published artifact "
+                        "inside the final answer, copy its identifier from the "
+                        "tool result and write a tag at the exact spot, e.g. "
+                        "[[artifact:file_id:xxxx]] or [[artifact:bundle_id:xxxx]]. "
+                        "Optionally append |layout=side (text and artifact side by "
+                        "side), |layout=inline (compact), or |layout=block (full "
+                        "width, the default). The tag is invisible to the user and "
+                        "the artifact renders right there. If you do not reference "
+                        "an artifact, it is shown at the end of the answer.\n"
                         "End with the complete answer. Do not claim unfinished "
                         "work is done, and do not emit only tool calls with no "
                         "visible narration. For a user-facing teaching deliverable, "
@@ -3175,6 +3193,198 @@ class ChatService:
                 )
             },
         )
+    # Slow publish tools whose artifact only materializes after the tool
+    # returns: create a pending placeholder up front (reserving its ordinal
+    # position between the model's narration) and promote it in place later.
+    # Same contract as the generate_image placeholder above.
+    _SLOW_ARTIFACT_TOOLS = frozenset(
+        {
+            "sandbox_publish_web_app",
+            "sandbox_publish_image",
+            "sandbox_publish_file",
+        }
+    )
+
+    def _start_pending_artifact_placeholder(
+        self,
+        *,
+        session_id: str,
+        assistant_message_id: str,
+        assistant_version_id: str,
+        tool_name: str,
+        input_data: dict,
+        next_ordinal: int,
+        sequence: int,
+        streamed_parts: list,
+    ) -> tuple[MessagePartRecord, str] | None:
+        """Create a durable pending artifact part for a slow publish tool.
+
+        The artifact only exists after the sandbox publishes it; creating the
+        part up front reserves its ordinal so the chat canvas can render a
+        placeholder between the model's narration and later promote it in
+        place when the tool returns. Returns ``None`` for tools without a
+        placeholder contract.
+        """
+        if tool_name not in self._SLOW_ARTIFACT_TOOLS:
+            return None
+        if tool_name == "sandbox_publish_web_app":
+            part_type = "subapp_artifact"
+            title = " ".join(
+                str(input_data.get("title") or "交互式教学应用").split()
+            )[:120]
+            data = {
+                "title": title,
+                "phase": "publishing",
+                "progress_mode": "indeterminate",
+            }
+        elif tool_name == "sandbox_publish_image":
+            part_type = "image"
+            title = " ".join(
+                str(input_data.get("title") or "正在发布图片").split()
+            )[:120]
+            data = {
+                "title": title,
+                "alt": str(input_data.get("alt") or title)[:240],
+                "tool": tool_name,
+                "progress_mode": "indeterminate",
+                "aspect_ratio": "4 / 3",
+            }
+        else:  # sandbox_publish_file
+            part_type = "sandbox_artifact"
+            title = " ".join(
+                str(
+                    input_data.get("title")
+                    or input_data.get("path")
+                    or "发布文件"
+                ).split()
+            )[:120]
+            data = {
+                "title": title,
+                "kind": "file",
+                "phase": "publishing",
+                "progress_mode": "indeterminate",
+            }
+        record = self.message_parts.add(
+            MessagePartRecord(
+                workspace_id=self.workspace_id,
+                message_version_id=assistant_version_id,
+                ordinal=next_ordinal,
+                part_type=part_type,
+                status="pending",
+                content=title,
+                data=data,
+            )
+        )
+        streamed_parts.append(record)
+        started = self._append_event(
+            session_id=session_id,
+            message_id=assistant_message_id,
+            message_version_id=assistant_version_id,
+            part_id=record.id,
+            sequence=sequence,
+            event_type="part.started",
+            payload={
+                "part": self._part_snapshot(
+                    record.id,
+                    part_type,
+                    "pending",
+                    record.content,
+                    record.data,
+                    sequence=record.ordinal,
+                )
+            },
+        )
+        return record, self._encode_event(started)
+
+    def _finish_pending_artifact_placeholder(
+        self,
+        pending_record: MessagePartRecord,
+        *,
+        session_id: str,
+        assistant_message_id: str,
+        assistant_version_id: str,
+        result_meta: dict,
+        sequence: int,
+    ) -> str:
+        """Promote a pending publish placeholder to completed/failed in place.
+
+        Consumes ``result_meta["artifact"]`` so the generic side-effect
+        emitter does not create a second part (same contract as the
+        generate_image placeholder).
+        """
+        artifact = (
+            result_meta.get("artifact")
+            if isinstance(result_meta, dict)
+            else None
+        )
+        completed = (
+            isinstance(result_meta, dict)
+            and result_meta.get("status") == "completed"
+            and isinstance(artifact, dict)
+            and str(artifact.get("status") or "completed")
+            in {"completed", "ready"}
+        )
+        if completed:
+            data = (
+                artifact.get("data")
+                if isinstance(artifact.get("data"), dict)
+                else {}
+            )
+            if not isinstance(data, dict):
+                data = {}
+            merged = {
+                **(pending_record.data or {}),
+                **data,
+                "phase": "ready",
+                "progress_mode": "completed",
+            }
+            pending_record.status = "completed"
+            pending_record.content = str(
+                data.get("title")
+                or data.get("alt")
+                or pending_record.content
+                or "沙箱产物"
+            )
+            pending_record.data = merged
+            result_meta.pop("artifact", None)
+            event_type = "part.completed"
+        else:
+            error_message = "产物发布失败"
+            if isinstance(result_meta, dict):
+                error_message = str(
+                    result_meta.get("error_message")
+                    or result_meta.get("message")
+                    or result_meta.get("reason")
+                    or error_message
+                )
+            pending_record.status = "failed"
+            pending_record.data = {
+                **(pending_record.data or {}),
+                "phase": "failed",
+                "progress_mode": "failed",
+                "error_message": error_message,
+            }
+            event_type = "part.failed"
+        event = self._append_event(
+            session_id=session_id,
+            message_id=assistant_message_id,
+            message_version_id=assistant_version_id,
+            part_id=pending_record.id,
+            sequence=sequence,
+            event_type=event_type,
+            payload={
+                "part": self._part_snapshot(
+                    pending_record.id,
+                    pending_record.part_type,
+                    pending_record.status,
+                    pending_record.content,
+                    pending_record.data,
+                    sequence=pending_record.ordinal,
+                )
+            },
+        )
+        return self._encode_event(event)
+
         return self._encode_event(event)
     # ------------------------------------------------------------------
     # Inline embedding of agent-downloaded images in the answer text
@@ -3310,6 +3520,329 @@ class ChatService:
                 )
                 next_ordinal += 1
         return segments[0], "".join(segments), extra_records
+
+    # Answer-level artifact references: the model places
+    # [[artifact:file_id:<id>]] or [[artifact:bundle_id:<id>]] (optionally
+    # |layout=inline|block|side) inside its final answer text. The backend
+    # strips the tag and moves the referenced artifact part into the answer
+    # text at that position; unreferenced, unanchored artifact parts sink to
+    # the end of the answer body (fallback when the model does not follow the
+    # hinting primitive).
+    _ANSWER_MARKER_RE = re.compile(
+        r"!\[([^\]\n]*)\]\(\s*sandbox:([^)\s]+)\s*\)"
+        r"|\[\[\s*artifact\s*:\s*([a-z_]+)\s*:\s*([^|\]\s]+)"
+        r"(?:\s*\|\s*layout\s*=\s*([a-z_]+))?\s*\]\]",
+        re.IGNORECASE,
+    )
+    _ARTIFACT_PART_KINDS = frozenset(
+        {
+            "image",
+            "sandbox",
+            "sandbox_artifact",
+            "subapp_artifact",
+            "magic_card",
+            "component",
+            "chart",
+        }
+    )
+    _CHAIN_PART_KINDS = frozenset(
+        {
+            "reasoning_summary",
+            "reasoning_content",
+            "agent_step",
+            "tool_call",
+            "graph_context",
+            "sandbox_status",
+            "skill_trigger",
+            "graph_progress",
+        }
+    )
+
+    @staticmethod
+    def _is_chain_part_record(record) -> bool:
+        return record.part_type in ChatService._CHAIN_PART_KINDS
+
+    def _resolve_answer_markers(self, final_text, message_version_id):
+        """Split the final text into segments plus an ordered marker list.
+
+        ``len(segments) == len(markers) + 1``. Marker kinds:
+        ``image`` (inline sandbox download, new part), ``artifact`` (moves an
+        existing part), or ``drop`` (invalid reference — tag stripped, nothing
+        inserted). Invalid image markers stay in the text (existing behavior).
+        """
+        if not final_text:
+            return [final_text], []
+        segments: list[str] = []
+        markers: list[dict] = []
+        cursor = 0
+        for match in self._ANSWER_MARKER_RE.finditer(final_text):
+            if match.group(1) is not None:
+                raw_path = (match.group(2) or "").strip()
+                path = raw_path[2:] if raw_path.startswith("./") else raw_path
+                path = path.lstrip("/")
+                acquired = self.db.scalar(
+                    select(ExternalAcquisitionFile).where(
+                        ExternalAcquisitionFile.workspace_id == self.workspace_id,
+                        ExternalAcquisitionFile.path == path,
+                    )
+                )
+                if acquired is None or not acquired.file_id:
+                    # Unresolvable image marker: keep it literal in the text.
+                    continue
+                segments.append(final_text[cursor : match.start()])
+                markers.append(
+                    {
+                        "kind": "image",
+                        "data": {
+                            "file_id": acquired.file_id,
+                            "mime_type": acquired.mime_type or "image/*",
+                            "path": path,
+                            "size_bytes": acquired.size_bytes,
+                            "sha256": acquired.sha256,
+                            "title": "已下载的图片",
+                            "alt": (match.group(1) or "已下载的图片")[:240],
+                            "kind": "download",
+                            "provenance": "external_acquisition",
+                        },
+                    }
+                )
+                cursor = match.end()
+                continue
+            ref_kind = (match.group(3) or "").casefold()
+            ref_value = (match.group(4) or "").strip()
+            layout = (match.group(5) or "").casefold()
+            # Always split here so an invalid tag is stripped from the text.
+            segments.append(final_text[cursor : match.start()])
+            cursor = match.end()
+            if ref_kind not in {"file_id", "bundle_id"} or not ref_value:
+                markers.append({"kind": "drop"})
+                continue
+            referenced = self._find_referenced_part(
+                ref_kind, ref_value, message_version_id
+            )
+            if referenced is None:
+                markers.append({"kind": "drop"})
+                continue
+            markers.append(
+                {
+                    "kind": "artifact",
+                    "part": referenced,
+                    "layout": (
+                        layout if layout in {"inline", "block", "side"} else "block"
+                    ),
+                }
+            )
+        segments.append(final_text[cursor:])
+        return segments, markers
+
+    def _find_referenced_part(self, ref_kind, ref_value, message_version_id):
+        parts = self.db.scalars(
+            select(MessagePartRecord).where(
+                MessagePartRecord.workspace_id == self.workspace_id,
+                MessagePartRecord.message_version_id == message_version_id,
+            )
+        ).all()
+        for part in parts:
+            if part.part_type not in self._ARTIFACT_PART_KINDS:
+                continue
+            data = part.data or {}
+            if str(data.get(ref_kind) or "") == ref_value:
+                return part
+        return None
+
+    def _is_implicitly_anchored_artifact(
+        self, part, ordered, text_record_id
+    ) -> bool:
+        """Whether an artifact part sits next to a plan-narration text part.
+
+        Mirrors the frontend ``isArtifactAnchoringText`` rule: ignoring chain
+        parts (tools / reasoning / steps) and the final-answer text, the
+        nearest text-class neighbor is a ``plan_narration`` part → implicit
+        anchoring. Anchored artifacts keep their in-stream position so the
+        frontend Phase-1 interleaving still applies; everything else sinks.
+        """
+        index = next(
+            (i for i, item in enumerate(ordered) if item.id == part.id), -1
+        )
+        if index < 0:
+            return False
+
+        def nearest_text_class_neighbor(start: int, step: int):
+            stop = len(ordered) if step > 0 else -1
+            for i in range(start, stop, step):
+                neighbor = ordered[i]
+                if neighbor.id == text_record_id:
+                    continue
+                if neighbor.part_type == "acknowledgement":
+                    continue
+                if self._is_chain_part_record(neighbor):
+                    continue
+                return neighbor
+            return None
+
+        backward = nearest_text_class_neighbor(index - 1, -1)
+        if backward is not None and (
+            backward.part_type == "text"
+            and (backward.data or {}).get("kind") == "plan_narration"
+        ):
+            return True
+        forward = nearest_text_class_neighbor(index + 1, 1)
+        return bool(
+            forward is not None
+            and forward.part_type == "text"
+            and (forward.data or {}).get("kind") == "plan_narration"
+        )
+
+    def _splice_answer_parts(
+        self,
+        *,
+        final_text: str,
+        text_record: MessagePartRecord,
+        message_version_id: str,
+    ) -> tuple[
+        str,
+        str,
+        list[MessagePartRecord],
+        list[tuple[MessagePartRecord, str]],
+    ]:
+        """Finalize answer parts with artifact-reference orchestration.
+
+        Precedence:
+          1. explicit ``[[artifact:...]]`` reference → artifact rendered at
+             the tag position (tag stripped, layout applied);
+          2. implicit anchoring (plan-narration adjacency) → artifact keeps
+             its in-stream ordinal (frontend interleaving);
+          3. fallback → unreferenced / unanchored artifacts sink to the end of
+             the answer body.
+
+        Inline ``![alt](sandbox:path)`` images keep the existing splice
+        behavior (new image parts interleaved with text segments).
+
+        Returns ``(first_segment, clean_full_text, extra_records,
+        moved_records)``. ``extra_records`` are newly created parts (text
+        segments + inline images) that need ``part.completed`` events;
+        ``moved_records`` are ``(part, reason)`` pairs whose ordinal was
+        relocated (``artifact_reference`` / ``artifact_sink``) and need
+        ``part.replaced`` events.
+        """
+        segments, markers = self._resolve_answer_markers(
+            final_text, message_version_id
+        )
+        clean_full_text = "".join(segments)
+        all_parts = list(
+            self.db.scalars(
+                select(MessagePartRecord).where(
+                    MessagePartRecord.workspace_id == self.workspace_id,
+                    MessagePartRecord.message_version_id == message_version_id,
+                )
+            ).all()
+        )
+        all_parts.sort(key=lambda item: item.ordinal)
+
+        referenced_ids: set[str] = set()
+        referenced_parts: list[MessagePartRecord] = []
+        for marker in markers:
+            if marker["kind"] != "artifact":
+                continue
+            part = marker["part"]
+            if part.id in referenced_ids:
+                continue
+            referenced_ids.add(part.id)
+            referenced_parts.append(part)
+            layout = marker["layout"]
+            if layout:
+                part.data = {**(part.data or {}), "layout": layout}
+
+        artifact_parts = [
+            part
+            for part in all_parts
+            if part.id != text_record.id
+            and part.part_type in self._ARTIFACT_PART_KINDS
+        ]
+        anchored_ids = {
+            part.id
+            for part in artifact_parts
+            if part.id not in referenced_ids
+            and self._is_implicitly_anchored_artifact(
+                part, all_parts, text_record.id
+            )
+        }
+        sink_ids = {
+            part.id
+            for part in artifact_parts
+            if part.id not in referenced_ids and part.id not in anchored_ids
+        }
+
+        # Phase A: process parts (ack / chain / plan narration / anchored
+        # artifacts) keep their relative stream order ahead of the answer.
+        new_sequence: list[MessagePartRecord] = []
+        for part in all_parts:
+            if (
+                part.id == text_record.id
+                or part.id in referenced_ids
+                or part.id in sink_ids
+            ):
+                continue
+            new_sequence.append(part)
+        # Answer body: first text segment (text_record), then markers and
+        # text segments interleaved.
+        new_sequence.append(text_record)
+        extra_records: list[MessagePartRecord] = []
+        appended_referenced: set[str] = set()
+        for index, marker in enumerate(markers):
+            if marker["kind"] == "image":
+                image_record = self.message_parts.add(
+                    MessagePartRecord(
+                        workspace_id=self.workspace_id,
+                        message_version_id=message_version_id,
+                        ordinal=(-1_000_000 - len(new_sequence) - len(extra_records)),
+                        part_type="image",
+                        status="completed",
+                        content=str(
+                            marker["data"].get("title") or "已下载的图片"
+                        ),
+                        data=marker["data"],
+                    )
+                )
+                extra_records.append(image_record)
+                new_sequence.append(image_record)
+            elif marker["kind"] == "artifact":
+                part = marker["part"]
+                if part.id not in appended_referenced:
+                    appended_referenced.add(part.id)
+                    new_sequence.append(part)
+            segment = segments[index + 1]
+            if segment:
+                segment_record = self.message_parts.add(
+                    MessagePartRecord(
+                        workspace_id=self.workspace_id,
+                        message_version_id=message_version_id,
+                        ordinal=(-1_000_000 - len(new_sequence) - len(extra_records)),
+                        part_type="text",
+                        status="completed",
+                        content=segment,
+                    )
+                )
+                extra_records.append(segment_record)
+                new_sequence.append(segment_record)
+        # Sink: unreferenced / unanchored artifacts at the very end.
+        sink_parts = [part for part in all_parts if part.id in sink_ids]
+        new_sequence.extend(sink_parts)
+
+        # Two-phase ordinal reassignment so the UNIQUE
+        # (workspace_id, message_version_id, ordinal) constraint never fires.
+        for index, part in enumerate(new_sequence):
+            part.ordinal = -(index + 1)
+        self.db.flush()
+        for index, part in enumerate(new_sequence):
+            part.ordinal = index
+        self.db.flush()
+
+        moved_records: list[tuple[MessagePartRecord, str]] = [
+            (part, "artifact_reference") for part in referenced_parts
+        ]
+        moved_records.extend((part, "artifact_sink") for part in sink_parts)
+        return segments[0], clean_full_text, extra_records, moved_records
 
     def _emit_sandbox_side_effect_parts(
         self,
@@ -7746,6 +8279,8 @@ class ChatService:
         "generation_started_at",
         "generation_completed_at",
         "generation_duration_ms",
+        "final_answer_started_at",
+        "thinking_duration_ms",
         "image_input",
         "input_tokens",
         "output_tokens",
@@ -9459,6 +9994,39 @@ class ChatService:
             reasoning_records: list[MessagePartRecord] = []
             reasoning_text_by_part: dict[str, str] = {}
             terminal_event_persisted = False
+            answer_started = False
+            answer_started_at: datetime | None = None
+
+            def maybe_start_answer() -> Iterable[str]:
+                """Emit the final-answer boundary and freeze thinking duration."""
+                nonlocal answer_started, answer_started_at, provider_trace, sequence
+                if answer_started:
+                    return
+                started = utc_now()
+                answer_started = True
+                answer_started_at = started
+                thinking_ms = max(
+                    0,
+                    round((started - generation_started_at).total_seconds() * 1000),
+                )
+                provider_trace["final_answer_started_at"] = started.isoformat()
+                provider_trace["thinking_duration_ms"] = thinking_ms
+                envelope = self._append_event(
+                    session_id=session_id,
+                    message_id=message.id,
+                    message_version_id=version.id,
+                    part_id=text_record.id,
+                    sequence=sequence,
+                    event_type="answer.started",
+                    payload={
+                        "final_part_id": text_record.id,
+                        "boundary_sequence": text_record.ordinal,
+                        "started_at": started.isoformat(),
+                        "thinking_duration_ms": thinking_ms,
+                    },
+                )
+                sequence += 1
+                yield self._encode_event(envelope)
 
             def assembled_parts(text_status: str, text_content: str) -> list[dict]:
                 parts: list[dict] = []
@@ -9479,6 +10047,7 @@ class ChatService:
                         "text",
                         text_status,
                         text_content,
+                        text_record.data,
                         sequence=text_record.ordinal,
                     )
                 )
@@ -9729,6 +10298,8 @@ class ChatService:
                                     chunk = provider_event.content or ""
                                     if not chunk:
                                         continue
+                                    if not retry_agent_mode:
+                                        yield from maybe_start_answer()
                                     self._mark_first_token(
                                         active_attempt,
                                         provider_trace,
@@ -9861,6 +10432,8 @@ class ChatService:
                                     raise _GenerationCancellationRequested()
                                 if not chunk:
                                     continue
+                                if not retry_agent_mode:
+                                    yield from maybe_start_answer()
                                 # 极速/思考模式同样尽早推送原生搜索来源（URL）。
                                 sequence, next_ordinal, source_record, _native_pushed, native_events = self._push_native_sources_live(
                                     session_id=session_id,
@@ -10098,6 +10671,29 @@ class ChatService:
                                     next_ordinal += 1
                                     sequence += 1
                                     yield pending_image_event
+                                # Reserve the artifact ordinal for slow publish
+                                # tools (web app / image / file) so the canvas
+                                # can render a placeholder before the tool returns.
+                                pending_artifact_record: MessagePartRecord | None = None
+                                if (
+                                    tool_name in self._SLOW_ARTIFACT_TOOLS
+                                    and isinstance(input_data, dict)
+                                ):
+                                    started_artifact = self._start_pending_artifact_placeholder(
+                                        session_id=session_id,
+                                        assistant_message_id=message.id,
+                                        assistant_version_id=version.id,
+                                        tool_name=tool_name,
+                                        input_data=input_data,
+                                        next_ordinal=next_ordinal,
+                                        sequence=sequence,
+                                        streamed_parts=reasoning_records,
+                                    )
+                                    if started_artifact is not None:
+                                        pending_artifact_record, pending_artifact_event = started_artifact
+                                        next_ordinal += 1
+                                        sequence += 1
+                                        yield pending_artifact_event
                                 yield ": agent-tool-running\n\n"
                                 # Commit pending tool-call part/event writes
                                 # BEFORE the (possibly long) tool execution so
@@ -10198,6 +10794,21 @@ class ChatService:
                                     )
                                     sequence += 1
                                     yield finish_event
+                                if pending_artifact_record is not None:
+                                    finish_artifact_event = self._finish_pending_artifact_placeholder(
+                                        pending_artifact_record,
+                                        session_id=session_id,
+                                        assistant_message_id=message.id,
+                                        assistant_version_id=version.id,
+                                        result_meta=(
+                                            result_meta
+                                            if isinstance(result_meta, dict)
+                                            else {}
+                                        ),
+                                        sequence=sequence,
+                                    )
+                                    sequence += 1
+                                    yield finish_artifact_event
                                 for extra_event in self._emit_sandbox_side_effect_parts(
                                     session_id=session_id,
                                     assistant_message_id=message.id,
@@ -10558,6 +11169,7 @@ class ChatService:
                             final_text,
                         )
                         self.db.commit()
+                        yield from maybe_start_answer()
                         break
                     except (ProviderHTTPError, TimeoutError) as exc:
                         error_category = _stream_retry_category(exc)
@@ -10685,24 +11297,22 @@ class ChatService:
                         ),
                     ),
                 }
-                splice = self._splice_inline_image_parts(
-                    final_text=final_text,
-                    text_record=text_record,
-                    message_version_id=version.id,
-                )
-                if splice is not None:
-                    first_segment, clean_full_text, inline_image_records = splice
-                else:
-                    first_segment, clean_full_text, inline_image_records = (
-                        final_text,
-                        final_text,
-                        [],
+                first_segment, clean_full_text, extra_records, moved_records = (
+                    self._splice_answer_parts(
+                        final_text=final_text,
+                        text_record=text_record,
+                        message_version_id=version.id,
                     )
+                )
                 text_record.status = "completed"
                 text_record.content = first_segment
+                text_record.data = {
+                    **(text_record.data or {}),
+                    "kind": "final_answer",
+                }
                 message.content = clean_full_text
                 message.parts = assembled_parts("completed", first_segment)
-                if inline_image_records:
+                if extra_records:
                     message.parts.extend(
                         self._part_snapshot(
                             record.id,
@@ -10712,7 +11322,7 @@ class ChatService:
                             record.data,
                             sequence=record.ordinal,
                         )
-                        for record in inline_image_records
+                        for record in extra_records
                     )
                 version.status = "completed"
                 version.provider_trace = dict(provider_trace)
@@ -10732,30 +11342,58 @@ class ChatService:
                             "text",
                             "completed",
                             first_segment,
+                            text_record.data,
+                            sequence=text_record.ordinal,
                         )
                     },
                 )
                 sequence += 1
-                inline_completed_events: list[str] = []
-                for inline_record in inline_image_records:
-                    inline_completed_events.append(
+                extra_completed_events: list[str] = []
+                for extra_record in extra_records:
+                    extra_completed_events.append(
                         self._encode_event(
                             self._append_event(
                                 session_id=session_id,
                                 message_id=message.id,
                                 message_version_id=version.id,
-                                part_id=inline_record.id,
+                                part_id=extra_record.id,
                                 sequence=sequence,
                                 event_type="part.completed",
                                 payload={
                                     "part": self._part_snapshot(
-                                        inline_record.id,
-                                        inline_record.part_type,
+                                        extra_record.id,
+                                        extra_record.part_type,
                                         "completed",
-                                        inline_record.content,
-                                        inline_record.data,
-                                        sequence=inline_record.ordinal,
+                                        extra_record.content,
+                                        extra_record.data,
+                                        sequence=extra_record.ordinal,
                                     )
+                                },
+                            )
+                        )
+                    )
+                    sequence += 1
+                moved_events: list[str] = []
+                for moved_record, moved_reason in moved_records:
+                    moved_events.append(
+                        self._encode_event(
+                            self._append_event(
+                                session_id=session_id,
+                                message_id=message.id,
+                                message_version_id=version.id,
+                                part_id=moved_record.id,
+                                sequence=sequence,
+                                event_type="part.replaced",
+                                payload={
+                                    "part": self._part_snapshot(
+                                        moved_record.id,
+                                        moved_record.part_type,
+                                        moved_record.status,
+                                        moved_record.content,
+                                        moved_record.data,
+                                        sequence=moved_record.ordinal,
+                                    ),
+                                    "reason": moved_reason,
                                 },
                             )
                         )
@@ -10775,8 +11413,10 @@ class ChatService:
                 )
                 terminal_event_persisted = True
                 yield self._encode_event(text_completed)
-                for inline_completed_event in inline_completed_events:
-                    yield inline_completed_event
+                for extra_completed_event in extra_completed_events:
+                    yield extra_completed_event
+                for moved_event in moved_events:
+                    yield moved_event
                 yield self._encode_event(completed)
             except _GenerationCancellationRequested:
                 record_active_usage()
@@ -12352,7 +12992,7 @@ class ChatService:
                         sequence=streamed_part.ordinal,
                     )
                 )
-            parts.append(self._part_snapshot(text_record.id, "text", text_status, text_content, sequence=text_record.ordinal))
+            parts.append(self._part_snapshot(text_record.id, "text", text_status, text_content, text_record.data, sequence=text_record.ordinal))
             return parts
 
         assistant_message.parts = assembled_parts("pending", "")
@@ -12553,6 +13193,42 @@ class ChatService:
             provider_response_state: ProviderResponseState | None = None
             invocation_reasoning = ""
             invocation_reasoning_record: MessagePartRecord | None = None
+            # Monotonic final-answer boundary: emitted at most once per message.
+            # Once answer.started is sent the frontend collapses the process
+            # chain and freezes the thinking duration; it must never be revoked.
+            answer_started = False
+            answer_started_at: datetime | None = None
+
+            def maybe_start_answer() -> Iterable[str]:
+                """Emit the final-answer boundary and freeze thinking duration."""
+                nonlocal answer_started, answer_started_at, provider_trace, sequence
+                if answer_started:
+                    return
+                started = utc_now()
+                answer_started = True
+                answer_started_at = started
+                thinking_ms = max(
+                    0,
+                    round((started - generation_started_at).total_seconds() * 1000),
+                )
+                provider_trace["final_answer_started_at"] = started.isoformat()
+                provider_trace["thinking_duration_ms"] = thinking_ms
+                envelope = self._append_event(
+                    session_id=session_id,
+                    message_id=assistant_message.id,
+                    message_version_id=assistant_version.id,
+                    part_id=text_record.id,
+                    sequence=sequence,
+                    event_type="answer.started",
+                    payload={
+                        "final_part_id": text_record.id,
+                        "boundary_sequence": text_record.ordinal,
+                        "started_at": started.isoformat(),
+                        "thinking_duration_ms": thinking_ms,
+                    },
+                )
+                sequence += 1
+                yield self._encode_event(envelope)
 
             def checkpoint_stream_state() -> None:
                 text_record.status = "streaming"
@@ -13019,6 +13695,12 @@ class ChatService:
                                     chunk = provider_event.content or ""
                                     if not chunk:
                                         continue
+                                    # Non-agent turns never produce tools: the
+                                    # first visible text IS the final answer, so
+                                    # collapse the chain immediately (zero-latency
+                                    # boundary) instead of waiting for stream end.
+                                    if not payload.agent_mode:
+                                        yield from maybe_start_answer()
                                     self._mark_first_token(
                                         attempt,
                                         provider_trace,
@@ -13121,6 +13803,8 @@ class ChatService:
                                     continue
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
+                                if not payload.agent_mode:
+                                    yield from maybe_start_answer()
                                 # 极速/思考模式同样尽早推送原生搜索来源（URL）。
                                 sequence, next_stream_part_ordinal, source_record, _native_pushed, native_events = self._push_native_sources_live(
                                     session_id=session_id,
@@ -13390,6 +14074,29 @@ class ChatService:
                                     next_stream_part_ordinal += 1
                                     sequence += 1
                                     yield pending_image_event
+                                # Reserve the artifact ordinal for slow publish
+                                # tools (web app / image / file) so the canvas
+                                # can render a placeholder before the tool returns.
+                                pending_artifact_record: MessagePartRecord | None = None
+                                if (
+                                    tool_name in self._SLOW_ARTIFACT_TOOLS
+                                    and isinstance(input_data, dict)
+                                ):
+                                    started_artifact = self._start_pending_artifact_placeholder(
+                                        session_id=session_id,
+                                        assistant_message_id=assistant_message.id,
+                                        assistant_version_id=assistant_version.id,
+                                        tool_name=tool_name,
+                                        input_data=input_data,
+                                        next_ordinal=next_stream_part_ordinal,
+                                        sequence=sequence,
+                                        streamed_parts=streamed_parts,
+                                    )
+                                    if started_artifact is not None:
+                                        pending_artifact_record, pending_artifact_event = started_artifact
+                                        next_stream_part_ordinal += 1
+                                        sequence += 1
+                                        yield pending_artifact_event
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
                                 yield ": agent-tool-running\n\n"
@@ -13493,6 +14200,17 @@ class ChatService:
                                     )
                                     sequence += 1
                                     yield finish_event
+                                if pending_artifact_record is not None:
+                                    finish_artifact_event = self._finish_pending_artifact_placeholder(
+                                        pending_artifact_record,
+                                        session_id=session_id,
+                                        assistant_message_id=assistant_message.id,
+                                        assistant_version_id=assistant_version.id,
+                                        result_meta=result_meta if isinstance(result_meta, dict) else {},
+                                        sequence=sequence,
+                                    )
+                                    sequence += 1
+                                    yield finish_artifact_event
 
                                 # Promote structured sandbox side-effects into first-class
                                 # MessageParts so the session UI can render downloads,
@@ -13838,6 +14556,11 @@ class ChatService:
                         assistant_message.provider_trace = dict(provider_trace)
                         assistant_version.provider_trace = dict(provider_trace)
                         self._flush_event_buffer()
+                        # Agent path: this invocation finished without tool
+                        # calls, so the current text IS the final answer. Emit
+                        # the boundary before the loop exits so the frontend
+                        # collapses the chain exactly at the answer start.
+                        yield from maybe_start_answer()
                         break
                     except (ProviderHTTPError, TimeoutError) as exc:
                         if (
@@ -13992,24 +14715,22 @@ class ChatService:
                         ),
                     ),
                 }
-                splice = self._splice_inline_image_parts(
-                    final_text=final_text,
-                    text_record=text_record,
-                    message_version_id=assistant_version.id,
-                )
-                if splice is not None:
-                    first_segment, clean_full_text, inline_image_records = splice
-                else:
-                    first_segment, clean_full_text, inline_image_records = (
-                        final_text,
-                        final_text,
-                        [],
+                first_segment, clean_full_text, extra_records, moved_records = (
+                    self._splice_answer_parts(
+                        final_text=final_text,
+                        text_record=text_record,
+                        message_version_id=assistant_version.id,
                     )
+                )
                 text_record.status = "completed"
                 text_record.content = first_segment
+                text_record.data = {
+                    **(text_record.data or {}),
+                    "kind": "final_answer",
+                }
                 assistant_message.content = clean_full_text
                 parts = assembled_parts("completed", first_segment)
-                if inline_image_records:
+                if extra_records:
                     parts.extend(
                         self._part_snapshot(
                             record.id,
@@ -14019,7 +14740,7 @@ class ChatService:
                             record.data,
                             sequence=record.ordinal,
                         )
-                        for record in inline_image_records
+                        for record in extra_records
                     )
                 assistant_message.parts = parts
                 part_completed_event = self._append_event(
@@ -14035,30 +14756,58 @@ class ChatService:
                             "text",
                             "completed",
                             first_segment,
+                            text_record.data,
+                            sequence=text_record.ordinal,
                         )
                     },
                 )
                 sequence += 1
-                inline_completed_events: list[str] = []
-                for inline_record in inline_image_records:
-                    inline_completed_events.append(
+                extra_completed_events: list[str] = []
+                for extra_record in extra_records:
+                    extra_completed_events.append(
                         self._encode_event(
                             self._append_event(
                                 session_id=session_id,
                                 message_id=assistant_message.id,
                                 message_version_id=assistant_version.id,
-                                part_id=inline_record.id,
+                                part_id=extra_record.id,
                                 sequence=sequence,
                                 event_type="part.completed",
                                 payload={
                                     "part": self._part_snapshot(
-                                        inline_record.id,
-                                        inline_record.part_type,
+                                        extra_record.id,
+                                        extra_record.part_type,
                                         "completed",
-                                        inline_record.content,
-                                        inline_record.data,
-                                        sequence=inline_record.ordinal,
+                                        extra_record.content,
+                                        extra_record.data,
+                                        sequence=extra_record.ordinal,
                                     )
+                                },
+                            )
+                        )
+                    )
+                    sequence += 1
+                moved_events: list[str] = []
+                for moved_record, moved_reason in moved_records:
+                    moved_events.append(
+                        self._encode_event(
+                            self._append_event(
+                                session_id=session_id,
+                                message_id=assistant_message.id,
+                                message_version_id=assistant_version.id,
+                                part_id=moved_record.id,
+                                sequence=sequence,
+                                event_type="part.replaced",
+                                payload={
+                                    "part": self._part_snapshot(
+                                        moved_record.id,
+                                        moved_record.part_type,
+                                        moved_record.status,
+                                        moved_record.content,
+                                        moved_record.data,
+                                        sequence=moved_record.ordinal,
+                                    ),
+                                    "reason": moved_reason,
                                 },
                             )
                         )
@@ -14115,8 +14864,10 @@ class ChatService:
                 sequence += 1
                 terminal_event_persisted = True
                 yield self._encode_event(part_completed_event)
-                for inline_completed_event in inline_completed_events:
-                    yield inline_completed_event
+                for extra_completed_event in extra_completed_events:
+                    yield extra_completed_event
+                for moved_event in moved_events:
+                    yield moved_event
                 yield self._encode_event(completed_event)
             except _GenerationCancellationRequested:
                 discard_provider_response_state()
