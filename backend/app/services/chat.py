@@ -453,6 +453,13 @@ class _GenerationCancellationRequested(Exception):
 # proceeds with a timeout failure instead of blocking indefinitely.
 _AGENT_TOOL_EXECUTOR: ThreadPoolExecutor | None = None
 _AGENT_TOOL_EXECUTOR_LOCK = Lock()
+# Bounded process-wide executor for parallel-safe Agent tools. Only
+# PARALLEL_SAFE_TOOL_NAMES tools ever run here, and each run uses an isolated
+# SQLAlchemy Session via ``ChatService.tool_worker_factory``, so no ORM state
+# is shared across worker threads. The pool size is the process-wide
+# concurrency cap for parallel Agent tools.
+_AGENT_PARALLEL_TOOL_EXECUTOR: ThreadPoolExecutor | None = None
+_AGENT_PARALLEL_TOOL_EXECUTOR_SIZE = 1
 
 
 def _recreate_agent_tool_executor() -> None:
@@ -814,6 +821,7 @@ class ChatService:
         tenant_id: str = "local-tenant",
         context_builder: object | None = None,
         settings: Settings | None = None,
+        tool_worker_factory: Callable[[Session], AgentToolRuntime] | None = None,
     ) -> None:
         self.db = db
         self.workspace_id = workspace_id
@@ -835,6 +843,11 @@ class ChatService:
         self.learning_context_access_checker = learning_context_access_checker
         self.session_binding_access_checker = session_binding_access_checker
         self.agent_tool_runtime = agent_tool_runtime
+        # Isolated Session worker factory for parallel-safe Agent tools. When
+        # wired (by build_chat_service), a worker thread rebuilds an
+        # AgentToolRuntime on a fresh SessionLocal so sibling tools never share
+        # a SQLAlchemy Session/transaction.
+        self.tool_worker_factory = tool_worker_factory
         # A1-3: per-request tool-definitions cache (see invalidate below).
         self._tool_definitions_cache: dict[tuple, list[dict]] = {}
         self._toolset_version = 0
@@ -4292,6 +4305,225 @@ class ChatService:
                 yield ": agent-tool-running\n\n"
                 next_heartbeat = time.monotonic() + AGENT_TOOL_HEARTBEAT_SECONDS
             time.sleep(AGENT_TOOL_POLL_SECONDS)
+
+    def _agent_parallel_executor(self) -> ThreadPoolExecutor | None:
+        """Return the bounded process-wide parallel Agent-tool executor.
+
+        Mirrors the legacy single-worker executor lifecycle. The pool size is
+        the process-wide concurrency cap for parallel Agent tools; when the
+        setting changes the pool is re-created (never blocking the stream on
+        late workers, same policy as the legacy timeout path).
+        """
+
+        if not self.settings.agent_parallel_tools_enabled:
+            return None
+        max_workers = max(1, int(self.settings.agent_parallel_tools_max_workers))
+        global _AGENT_PARALLEL_TOOL_EXECUTOR, _AGENT_PARALLEL_TOOL_EXECUTOR_SIZE
+        with _AGENT_TOOL_EXECUTOR_LOCK:
+            current = _AGENT_PARALLEL_TOOL_EXECUTOR
+            if (
+                current is None
+                or current._shutdown
+                or current._broken
+                or _AGENT_PARALLEL_TOOL_EXECUTOR_SIZE != max_workers
+            ):
+                if current is not None and not current._shutdown:
+                    current.shutdown(wait=False, cancel_futures=True)
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+
+                _AGENT_PARALLEL_TOOL_EXECUTOR = _TPE(
+                    max_workers=max_workers,
+                    thread_name_prefix="agent-parallel-tool",
+                )
+                _AGENT_PARALLEL_TOOL_EXECUTOR_SIZE = max_workers
+            return _AGENT_PARALLEL_TOOL_EXECUTOR
+
+    def _run_agent_tool_isolated(
+        self,
+        tool_call: dict,
+        allowed_domains: list[str],
+        chat_session_id: str,
+        *,
+        assistant_message_id: str | None,
+        assistant_version_id: str | None,
+        source_message_id: str | None,
+        disclosed_tool_names: set[str],
+    ) -> tuple[str, dict, list[dict]]:
+        """Execute a parallel-safe tool on an isolated Session/worker thread.
+
+        Runs on the bounded parallel executor with a fresh ``SessionLocal`` and
+        a rebuilt ``AgentToolRuntime`` so sibling tools never share a
+        SQLAlchemy Session/transaction. Returns the same ``(content, meta,
+        sources)`` shape as ``_execute_agent_tool``; the caller records the
+        agent run event on the coordinator thread.
+        """
+
+        if self.tool_worker_factory is None:
+            return self._execute_agent_tool(
+                tool_call,
+                allowed_domains,
+                chat_session_id,
+                assistant_message_id=assistant_message_id,
+                assistant_version_id=assistant_version_id,
+                source_message_id=source_message_id,
+                disclosed_tool_names=disclosed_tool_names,
+            )
+        from app.core.database import SessionLocal
+
+        worker_db = SessionLocal()
+        try:
+            runtime = self.tool_worker_factory(worker_db)
+            return runtime.execute(
+                tool_call,
+                allowed_domains=allowed_domains,
+                chat_session_id=chat_session_id,
+                assistant_message_id=assistant_message_id,
+                assistant_version_id=assistant_version_id,
+                source_message_id=source_message_id,
+                model_supports_image_input=self._agent_model_supports_image_input(),
+                disclosed_tool_names=disclosed_tool_names,
+            )
+        finally:
+            worker_db.close()
+
+    def _await_agent_tool_isolated(
+        self,
+        future: Any,
+        tool_call: dict,
+        chat_session_id: str,
+        *,
+        run_id: str,
+    ) -> tuple[str, dict, list[dict]]:
+        """Await one parallel worker future with the legacy timeout semantics.
+
+        The worker thread keeps running after a soft timeout (its work cannot
+        be safely killed); the coordinator proceeds with a timeout failure and
+        the attempt token discards any late result.
+        """
+
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        timeout_seconds = self.settings.agent_tool_timeout_seconds
+        try:
+            if timeout_seconds and timeout_seconds > 0:
+                result = future.result(timeout=timeout_seconds)
+            else:
+                result = future.result()
+        except FutureTimeout:
+            future.cancel()
+            self._record_agent_run_event(
+                chat_session_id,
+                run_id,
+                succeeded=False,
+                output="",
+                meta={},
+                sources=[],
+                tool_call_id=str(tool_call.get("id") or ""),
+            )
+            return (
+                json.dumps(
+                    {
+                        "error": "agent_tool_timeout",
+                        "tool": tool_call.get("function", {}).get("name", ""),
+                        "timeout_seconds": timeout_seconds,
+                    },
+                    ensure_ascii=False,
+                ),
+                {
+                    "status": "failed",
+                    "reason": "agent_tool_timeout",
+                    "timeout_seconds": timeout_seconds,
+                },
+                [],
+            )
+        except Exception:
+            self._record_agent_run_event(
+                chat_session_id,
+                run_id,
+                succeeded=False,
+                output="",
+                meta={},
+                sources=[],
+                tool_call_id=str(tool_call.get("id") or ""),
+            )
+            raise
+        output, meta, sources = result
+        self._record_agent_run_event(
+            chat_session_id,
+            run_id,
+            succeeded=str(meta.get("status")) != "failed",
+            output=output,
+            meta=meta,
+            sources=sources,
+            tool_call_id=str(tool_call.get("id") or ""),
+        )
+        return result
+
+    def _can_parallelize_batch(self, tool_calls: list[dict]) -> bool:
+        """Whether this provider round may run its tools concurrently.
+
+        Every tool must be in the audited parallel-safe allowlist, the feature
+        must be enabled, and an isolated worker factory must be wired. Any
+        extension/unknown or side-effecting tool forces the whole batch back
+        to the legacy serial path.
+        """
+
+        if not self.settings.agent_parallel_tools_enabled:
+            return False
+        if self.tool_worker_factory is None:
+            return False
+        if len(tool_calls) < 2:
+            return False
+        from app.services.agent_tool_batch import PARALLEL_SAFE_TOOL_NAMES
+
+        for tool_call in tool_calls:
+            function = tool_call.get("function")
+            name = (
+                function.get("name")
+                if isinstance(function, dict)
+                and isinstance(function.get("name"), str)
+                else ""
+            )
+            if name not in PARALLEL_SAFE_TOOL_NAMES:
+                return False
+        return True
+
+    def _prestart_parallel_tools(
+        self,
+        tool_calls: list[dict],
+        allowed_domains: list[str],
+        chat_session_id: str,
+        *,
+        assistant_message_id: str | None,
+        assistant_version_id: str | None,
+        source_message_id: str | None,
+        disclosed_tool_names: set[str],
+    ) -> dict[int, Any] | None:
+        """Pre-submit a parallel-safe batch; returns ``{position: future}``.
+
+        All workers are started before the coordinator emits the per-tool
+        ``part.started`` events, so the actual execution overlaps while the
+        transcript and SSE stay serialized in provider call order.
+        """
+
+        if not self._can_parallelize_batch(tool_calls):
+            return None
+        executor = self._agent_parallel_executor()
+        if executor is None:
+            return None
+        futures: dict[int, Any] = {}
+        for position, tool_call in enumerate(tool_calls):
+            futures[position] = executor.submit(
+                self._run_agent_tool_isolated,
+                tool_call,
+                allowed_domains,
+                chat_session_id,
+                assistant_message_id=assistant_message_id,
+                assistant_version_id=assistant_version_id,
+                source_message_id=source_message_id,
+                disclosed_tool_names=disclosed_tool_names,
+            )
+        return futures
 
     def _execute_agent_tool(
         self,
@@ -10591,7 +10823,19 @@ class ChatService:
                             tool_results: list[dict[str, str]] = []
                             injected_image_parts: list[dict] = []
                             retry_agent_sources: list[dict] = []
-                            for tool_call in invocation_tool_calls:
+                            parallel_futures = self._prestart_parallel_tools(
+                                invocation_tool_calls,
+                                retry_context.allowed_domains,
+                                session_id,
+                                assistant_message_id=message.id,
+                                assistant_version_id=version.id,
+                                source_message_id=parent.id,
+                                disclosed_tool_names={
+                                    str(item.get("function", {}).get("name") or "")
+                                    for item in retry_tool_definitions
+                                },
+                            )
+                            for tool_index, tool_call in enumerate(invocation_tool_calls):
                                 if cancellation_requested():
                                     raise _GenerationCancellationRequested()
                                 function = tool_call.get("function")
@@ -10700,20 +10944,32 @@ class ChatService:
                                 # the stream never holds the SQLite write lock
                                 # across it.
                                 self._flush_event_buffer()
-                                result_content, result_meta, result_sources = (
-                                    self._execute_agent_tool(
-                                        tool_call,
-                                        retry_context.allowed_domains,
-                                        session_id,
-                                        assistant_message_id=message.id,
-                                        assistant_version_id=version.id,
-                                        source_message_id=parent.id,
-                                        disclosed_tool_names={
-                                            str(item.get("function", {}).get("name") or "")
-                                            for item in retry_tool_definitions
-                                        },
+                                if parallel_futures is not None:
+                                    result_content, result_meta, result_sources = (
+                                        self._await_agent_tool_isolated(
+                                            parallel_futures[tool_index],
+                                            tool_call,
+                                            session_id,
+                                            run_id=(
+                                                f"run_{message.id or parent.id or str(tool_call.get('id') or uuid4())}"
+                                            ),
+                                        )
                                     )
-                                )
+                                else:
+                                    result_content, result_meta, result_sources = (
+                                        self._execute_agent_tool(
+                                            tool_call,
+                                            retry_context.allowed_domains,
+                                            session_id,
+                                            assistant_message_id=message.id,
+                                            assistant_version_id=version.id,
+                                            source_message_id=parent.id,
+                                            disclosed_tool_names={
+                                                str(item.get("function", {}).get("name") or "")
+                                                for item in retry_tool_definitions
+                                            },
+                                        )
+                                    )
                                 if isinstance(result_meta, dict):
                                     injected_image_parts.extend(
                                         self._pop_injected_image_parts(result_meta)
@@ -13997,7 +14253,19 @@ class ChatService:
                             tool_results: list[dict] = []
                             injected_image_parts: list[dict] = []
                             agent_sources: list[dict] = []
-                            for tool_call in invocation_tool_calls:
+                            parallel_futures = self._prestart_parallel_tools(
+                                invocation_tool_calls,
+                                payload.allowed_domains,
+                                session_id,
+                                assistant_message_id=assistant_message.id,
+                                assistant_version_id=assistant_version.id,
+                                source_message_id=user_message.id,
+                                disclosed_tool_names={
+                                    str(item.get("function", {}).get("name") or "")
+                                    for item in tool_definitions
+                                },
+                            )
+                            for tool_index, tool_call in enumerate(invocation_tool_calls):
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
                                 tool_id = str(tool_call.get("id") or "")
@@ -14105,18 +14373,28 @@ class ChatService:
                                 # the stream never holds the SQLite write lock
                                 # across it.
                                 self._flush_event_buffer()
-                                result_content, result_meta, result_sources = self._execute_agent_tool(
-                                    tool_call,
-                                    payload.allowed_domains,
-                                    session_id,
-                                    assistant_message_id=assistant_message.id,
-                                    assistant_version_id=assistant_version.id,
-                                    source_message_id=user_message.id,
-                                    disclosed_tool_names={
-                                        str(item.get("function", {}).get("name") or "")
-                                        for item in tool_definitions
-                                    },
-                                )
+                                if parallel_futures is not None:
+                                    result_content, result_meta, result_sources = self._await_agent_tool_isolated(
+                                        parallel_futures[tool_index],
+                                        tool_call,
+                                        session_id,
+                                        run_id=(
+                                            f"run_{assistant_message.id or user_message.id or str(tool_call.get('id') or uuid4())}"
+                                        ),
+                                    )
+                                else:
+                                    result_content, result_meta, result_sources = self._execute_agent_tool(
+                                        tool_call,
+                                        payload.allowed_domains,
+                                        session_id,
+                                        assistant_message_id=assistant_message.id,
+                                        assistant_version_id=assistant_version.id,
+                                        source_message_id=user_message.id,
+                                        disclosed_tool_names={
+                                            str(item.get("function", {}).get("name") or "")
+                                            for item in tool_definitions
+                                        },
+                                    )
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
                                 agent_sources.extend(result_sources)
