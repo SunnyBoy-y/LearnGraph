@@ -17,6 +17,8 @@ import {
 } from "lucide-react";
 
 import { MessageResponse } from "@/components/ai-elements/message";
+import type { CodeHighlightMode } from "@/components/ai-elements/lazy-streamdown";
+import { IncrementalMarkdown } from "@/components/ai-elements/incremental-markdown";
 import {
   Reasoning,
   ReasoningContent,
@@ -44,6 +46,7 @@ import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
 import { FilePreviewCanvas } from "@/components/resources/file-preview";
 import { downloadFile } from "@/api/files";
+import { apiClient } from "@/api/client";
 import { confirmSkillDeletion } from "@/api/extensions";
 import { approveResearch } from "@/api/research";
 import { decideFetchAuthorization, resumeFetchAuthorization } from "@/api/fetch-authorizations";
@@ -128,6 +131,112 @@ function EmptyPart({ children }: { children: string }) {
   return (
     <div className="message-part-empty" role="status">
       {children}
+    </div>
+  );
+}
+
+function SandboxStatusPart({
+  data,
+  status,
+}: {
+  data: Record<string, unknown> | undefined;
+  status?: string;
+}) {
+  const authRequired = data?.auth_required === true;
+  const paths = Array.isArray(data?.paths)
+    ? data.paths.filter((item): item is string => typeof item === "string")
+    : [];
+  const jobId =
+    typeof data?.job_id === "string" && data.job_id ? data.job_id : undefined;
+  const [live, setLive] = useState<{ status?: string; reason?: string } | null>(null);
+
+  useEffect(() => {
+    if (!jobId) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const terminal = new Set(["succeeded", "failed", "cancelled", "expired"]);
+    const tick = async () => {
+      try {
+        const job = await apiClient.get<{
+          status: string;
+          reason?: string | null;
+        }>(`/sandbox/jobs/${jobId}`);
+        if (disposed) return;
+        const normalized = job.status?.toLowerCase() ?? "";
+        setLive({ status: normalized, reason: job.reason ?? undefined });
+        if (!terminal.has(normalized)) {
+          timer = window.setTimeout(tick, 3000);
+        }
+      } catch {
+        // Transient network/auth failure: keep polling at a slower interval.
+        if (!disposed) timer = window.setTimeout(tick, 5000);
+      }
+    };
+    timer = window.setTimeout(tick, 1200);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [jobId]);
+
+  const phase: string =
+    live?.status ?? (typeof data?.phase === "string" ? data.phase : status ?? "");
+  const reason: string =
+    live?.reason ?? (typeof data?.reason === "string" ? data.reason : "");
+  const queued = phase === "queued";
+  const cancelled = phase === "cancelled";
+  return (
+    <div
+      className={
+        authRequired
+          ? "rounded-xl border border-amber-300 bg-amber-50/70 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
+          : queued
+            ? "rounded-xl border border-sky-300 bg-sky-50/70 px-3 py-2 text-xs text-sky-950 dark:border-sky-900 dark:bg-sky-950/30 dark:text-sky-100"
+            : cancelled
+              ? "rounded-xl border border-slate-300 bg-slate-50/70 px-3 py-2 text-xs text-slate-700 dark:border-slate-800 dark:bg-slate-950/30 dark:text-slate-300"
+              : "rounded-xl border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+      }
+    >
+      <strong className="text-foreground">
+        {authRequired
+          ? "需要授权沙箱操作"
+          : queued
+            ? "沙箱任务排队中"
+            : cancelled
+              ? "沙箱任务已取消"
+              : "沙箱执行"}
+      </strong>
+      <span className="ml-2">
+        {phase}
+        {typeof data?.latency_ms === "number" ? ` · ${data.latency_ms} ms` : ""}
+        {typeof data?.exit_code === "number" ? ` · exit ${data.exit_code}` : ""}
+      </span>
+      {queued ? (
+        <p className="mt-1 leading-5">
+          服务器执行资源繁忙，任务已进入队列，资源可用后将自动开始，无需重新提交。
+          {reason ? `（${reason}）` : ""}
+        </p>
+      ) : null}
+      {typeof data?.message_zh === "string" && data.message_zh ? (
+        <p className="mt-1 leading-5">{data.message_zh}</p>
+      ) : null}
+      {authRequired && paths.length ? (
+        <ul className="mt-2 list-disc space-y-1 pl-5 font-mono text-[10px]">
+          {paths.map((path) => (
+            <li key={path}>{path}</li>
+          ))}
+        </ul>
+      ) : null}
+      {typeof data?.stdout_summary === "string" && data.stdout_summary ? (
+        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px]">
+          {data.stdout_summary}
+        </pre>
+      ) : null}
+      {typeof data?.stderr_summary === "string" && data.stderr_summary ? (
+        <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-amber-800 dark:text-amber-200">
+          {data.stderr_summary}
+        </pre>
+      ) : null}
     </div>
   );
 }
@@ -595,14 +704,25 @@ function WebCitationBadge({
   );
 }
 
+/**
+ * Streaming texts beyond this size switch from a full-document re-parse on
+ * every chunk to the incremental frozen-prefix renderer, which only re-parses
+ * the trailing blocks per frame.
+ */
+const INCREMENTAL_RENDER_MIN_CHARS = 8_192;
+
 function TextWithCitations({
   content,
   lookup,
   className,
+  codeHighlight = "shiki",
+  streaming = false,
 }: {
   content: string;
   lookup: CitationLookup;
   className?: string;
+  codeHighlight?: CodeHighlightMode;
+  streaming?: boolean;
 }) {
   const { markdown } = useMemo(
     () => rewriteAllCitations(content, lookup.webIndexes),
@@ -695,14 +815,25 @@ function TextWithCitations({
     [lookup],
   );
 
+  // Large streaming texts render through the incremental frozen-prefix
+  // renderer: only the trailing blocks re-parse per chunk, the frozen prefix
+  // keeps cached element identity (dsh IncrementalMarkdownParser port). Small
+  // or settled texts keep the single full-document render for exactness.
+  const useIncremental = streaming && markdown.length > INCREMENTAL_RENDER_MIN_CHARS;
+
   return (
     <div data-message-selectable-text>
-      <MessageResponse
-        className={cn("min-w-0 text-[15px] leading-7", className)}
-        components={components}
-      >
-        {markdown}
-      </MessageResponse>
+      {useIncremental ? (
+        <IncrementalMarkdown codeHighlight={codeHighlight} text={markdown} />
+      ) : (
+        <MessageResponse
+          className={cn("min-w-0 text-[15px] leading-7", className)}
+          codeHighlight={codeHighlight}
+          components={components}
+        >
+          {markdown}
+        </MessageResponse>
+      )}
     </div>
   );
 }
@@ -1777,7 +1908,12 @@ export function MessagePartRenderer({
       );
     case "text":
       return content ? (
-        <TextWithCitations content={content} lookup={citationLookup} />
+        <TextWithCitations
+          codeHighlight={streaming ? "plain" : "shiki"}
+          content={content}
+          lookup={citationLookup}
+          streaming={streaming}
+        />
       ) : null;
     case "reasoning_summary":
     case "reasoning_content": {
@@ -1934,50 +2070,8 @@ export function MessagePartRenderer({
           </span>
         </div>
       );
-    case "sandbox_status": {
-      const authRequired = part.data?.auth_required === true;
-      const paths = Array.isArray(part.data?.paths)
-        ? part.data.paths.filter((item): item is string => typeof item === "string")
-        : [];
-      return (
-        <div
-          className={
-            authRequired
-              ? "rounded-xl border border-amber-300 bg-amber-50/70 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
-              : "rounded-xl border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-          }
-        >
-          <strong className="text-foreground">
-            {authRequired ? "需要授权沙箱操作" : "沙箱执行"}
-          </strong>
-          <span className="ml-2">
-            {typeof part.data?.phase === "string" ? part.data.phase : part.status}
-            {typeof part.data?.latency_ms === "number" ? ` · ${part.data.latency_ms} ms` : ""}
-            {typeof part.data?.exit_code === "number" ? ` · exit ${part.data.exit_code}` : ""}
-          </span>
-          {typeof part.data?.message_zh === "string" && part.data.message_zh ? (
-            <p className="mt-1 leading-5">{part.data.message_zh}</p>
-          ) : null}
-          {authRequired && paths.length ? (
-            <ul className="mt-2 list-disc space-y-1 pl-5 font-mono text-[10px]">
-              {paths.map((path) => (
-                <li key={path}>{path}</li>
-              ))}
-            </ul>
-          ) : null}
-          {typeof part.data?.stdout_summary === "string" && part.data.stdout_summary ? (
-            <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px]">
-              {part.data.stdout_summary}
-            </pre>
-          ) : null}
-          {typeof part.data?.stderr_summary === "string" && part.data.stderr_summary ? (
-            <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-amber-800 dark:text-amber-200">
-              {part.data.stderr_summary}
-            </pre>
-          ) : null}
-        </div>
-      );
-    }
+    case "sandbox_status":
+      return <SandboxStatusPart data={part.data} status={part.status} />;
     case "image":
       return <ImagePart data={part.data} status={part.status} />;
     case "attachment":

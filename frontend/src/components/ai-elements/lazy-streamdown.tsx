@@ -15,36 +15,71 @@ type StreamdownModule = {
   plugins: Record<string, unknown>;
 };
 
-function loadStreamdown(): Promise<StreamdownModule> {
+/**
+ * Code-highlighting mode:
+ * - "shiki": full syntax highlighting via @streamdown/code (loads shiki).
+ * - "plain": no highlighting — the code fence renders as plain preformatted
+ *   text with line numbers. Used while a large text part is actively
+ *   streaming: re-tokenizing a multi-KB code block on every frame with shiki
+ *   costs ~0.4-1s CPU and ~35MB of garbage per render (the plugin's cache key
+ *   is content-based, so every streamed frame misses), which is the dominant
+ *   memory/CPU driver in long agentic threads. The part re-renders with shiki
+ *   once streaming finishes.
+ */
+export type CodeHighlightMode = "shiki" | "plain";
+
+/** A no-op highlighter: streamdown renders code fences as plain text + line numbers. */
+export function createPlainCodeHighlighter() {
+  return {
+    name: "plain",
+    type: "code-highlighter" as const,
+    supportsLanguage: () => true,
+    getSupportedLanguages: () => [],
+    getThemes: () => ["github-light"],
+    highlight: () => null,
+  };
+}
+
+function loadStreamdown(mode: CodeHighlightMode): Promise<StreamdownModule> {
+  const codePlugin =
+    mode === "plain"
+      ? Promise.resolve(createPlainCodeHighlighter())
+      : import("@streamdown/code").then((m) => m.code);
   return Promise.all([
     import("streamdown"),
     import("@streamdown/cjk"),
-    import("@streamdown/code"),
+    codePlugin,
     import("@streamdown/math"),
   ]).then(([streamdown, cjk, code, math]) => ({
     Streamdown: streamdown.Streamdown as StreamdownLike,
     plugins: {
       cjk: cjk.cjk,
-      code: code.code,
+      code,
       math: math.createMathPlugin({ singleDollarTextMath: true }),
     },
   }));
 }
 
-let cached: Promise<StreamdownModule> | undefined;
+let shikiCached: Promise<StreamdownModule> | undefined;
+let plainCached: Promise<StreamdownModule> | undefined;
 
 export function LazyStreamdown({
   children,
+  codeHighlight = "shiki",
   ...props
 }: {
   children: ReactNode;
+  codeHighlight?: CodeHighlightMode;
   [key: string]: unknown;
 }) {
   const [module, setModule] = useState<StreamdownModule | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    const promise = cached ?? (cached = loadStreamdown());
+    const promise =
+      codeHighlight === "plain"
+        ? (plainCached ??= loadStreamdown("plain"))
+        : (shikiCached ??= loadStreamdown("shiki"));
     promise
       .then((loaded) => {
         if (!cancelled) setModule(loaded);
@@ -55,7 +90,7 @@ export function LazyStreamdown({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [codeHighlight]);
 
   if (!module) {
     // Raw fallback while the renderer loads (or if dynamic import fails).

@@ -14,7 +14,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import {
-  currentActivityLabel,
+  currentActivityChips,
   formatThinkingDuration,
 } from "@/features/chat/chat-message-parts";
 import { cn } from "@/lib/utils";
@@ -23,19 +23,29 @@ import type { MessagePart } from "@/types/sessions";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 
 /**
- * Outer ChatGPT-style thinking collapsible.
+ * Outer ChatGPT-style thinking collapsible — one fold for the WHOLE process
+ * chain (reasoning + plan narration + tool calls in raw order).
  *
- * - Default closed ("正在思考" / "思考了 …").
- * - User may expand during streaming; the fold stays open while the turn is
- *   still generating (even as new tool/reasoning steps append).
- * - When streaming ends (final answer body is out), auto-collapse so the main
- *   answer sits cleanly below a collapsed thinking header.
+ * Phases:
+ * - thinking: message is streaming and the final-answer boundary has not been
+ *   reached yet. Defaults OPEN during processing (user setting), so the user
+ *   watches the process unfold in real time.
+ * - final_answer: the backend emitted `answer.started` — freeze the thinking
+ *   duration and auto-collapse ONCE. Re-expanding afterwards is never undone
+ *   by later deltas.
+ * - completed/failed/cancelled: terminal header ("思考了 X" / "处理失败 · 用时 X").
+ *
+ * History / replay messages always start collapsed.
  */
 export function ThinkingChain({
   chainParts,
   messageStatus,
   startedAt,
   completedDurationSec,
+  finalAnswerStarted = false,
+  thinkingDurationMs,
+  toolCallCount: toolCalls = 0,
+  defaultOpen = true,
   children,
   className,
 }: {
@@ -43,19 +53,39 @@ export function ThinkingChain({
   messageStatus: string;
   startedAt?: string;
   completedDurationSec?: number;
+  /** Whether the backend has emitted `answer.started` (final answer is out). */
+  finalAnswerStarted?: boolean;
+  /** Frozen thinking duration (ms) from `answer.started` / provider_trace. */
+  thinkingDurationMs?: number;
+  /** Settled tool-call count shown in the collapsed final header. */
+  toolCallCount?: number;
+  /** Processing-phase default open state (user setting; default open). */
+  defaultOpen?: boolean;
   children: ReactNode;
   className?: string;
 }) {
   const isStreaming = messageStatus === "streaming";
-  const [open, setOpen] = useState(false);
+  const isTerminal = !isStreaming;
+  const isFailed = messageStatus === "failed" || messageStatus === "cancelled";
+  const phase = finalAnswerStarted || isTerminal ? "answer" : "thinking";
+  const [open, setOpen] = useState(
+    () => (finalAnswerStarted || isTerminal ? false : defaultOpen),
+  );
   const userOpenedDuringStreamRef = useRef(false);
   const wasStreamingRef = useRef(isStreaming);
+  const hasAutoCollapsedAtFinalRef = useRef(false);
   const parsedStartedAt = startedAt ? Date.parse(startedAt) : Number.NaN;
   const startTimeRef = useRef<number>(
     Number.isFinite(parsedStartedAt) ? parsedStartedAt : Date.now(),
   );
   const [durationSec, setDurationSec] = useState<number | undefined>(undefined);
-  const activity = currentActivityLabel(messageStatus, chainParts);
+  const frozenSeconds =
+    typeof thinkingDurationMs === "number" &&
+    Number.isFinite(thinkingDurationMs) &&
+    thinkingDurationMs >= 0
+      ? Math.floor(thinkingDurationMs / 1_000)
+      : undefined;
+  const chips = currentActivityChips(messageStatus, chainParts);
 
   // Rebase optimistic client time onto the durable server start time once known.
   useEffect(() => {
@@ -67,7 +97,7 @@ export function ThinkingChain({
   // Only run the visible stopwatch while expanded. Each tick derives from wall
   // clock time, so background-tab throttling cannot make the counter drift.
   useEffect(() => {
-    if (!isStreaming || !open) return;
+    if (!isStreaming || phase !== "thinking" || !open) return;
     const updateDuration = () => {
       setDurationSec(
         Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1_000)),
@@ -76,7 +106,20 @@ export function ThinkingChain({
     updateDuration();
     const timer = window.setInterval(updateDuration, 1_000);
     return () => window.clearInterval(timer);
-  }, [isStreaming, open, parsedStartedAt]);
+  }, [isStreaming, phase, open, parsedStartedAt]);
+
+  // Freeze at the final-answer boundary: the backend already measured
+  // thinking_duration_ms (reasoning + tool rounds, excluding the answer).
+  useEffect(() => {
+    if (!finalAnswerStarted) return;
+    if (frozenSeconds !== undefined) {
+      setDurationSec(frozenSeconds);
+    } else if (phase === "answer") {
+      setDurationSec(
+        Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1_000)),
+      );
+    }
+  }, [finalAnswerStarted, frozenSeconds, phase]);
 
   // Freeze to the persisted server duration at the terminal event. The local
   // elapsed value is only a fallback for legacy responses without timing data.
@@ -93,8 +136,16 @@ export function ThinkingChain({
     }
   }, [isStreaming, completedDurationSec]);
 
-  // Streaming → completed: auto-collapse once. Manual expand mid-stream is
-  // intentionally kept open until this transition fires.
+  // Final-answer boundary: auto-collapse exactly once. Re-expanding afterwards
+  // is respected — later text deltas never force another collapse.
+  useEffect(() => {
+    if (!finalAnswerStarted || hasAutoCollapsedAtFinalRef.current) return;
+    hasAutoCollapsedAtFinalRef.current = true;
+    setOpen(false);
+  }, [finalAnswerStarted]);
+
+  // Streaming → completed (legacy messages without answer.started): collapse
+  // once the terminal event arrives, as before.
   useEffect(() => {
     if (isStreaming) {
       wasStreamingRef.current = true;
@@ -113,15 +164,22 @@ export function ThinkingChain({
 
   if (!chainParts.length) return null;
 
-  const headerLabel = isStreaming ? (
-    <Shimmer duration={1} className="text-[13px] font-medium">
-      {`正在思考${open ? ` ${formatThinkingDuration(durationSec ?? 0)}` : ""}`}
-    </Shimmer>
-  ) : (
-    <span className="text-[13px] font-medium text-muted-foreground">
-      思考了 {formatThinkingDuration(durationSec)}
-    </span>
-  );
+  const headerLabel =
+    phase === "thinking" ? (
+      <Shimmer duration={1} className="text-[13px] font-medium">
+        {`正在思考${open ? ` ${formatThinkingDuration(durationSec ?? 0)}` : ""}`}
+      </Shimmer>
+    ) : isFailed ? (
+      <span className="text-[13px] font-medium text-muted-foreground">
+        {messageStatus === "cancelled"
+          ? `已取消 · 用时 ${formatThinkingDuration(durationSec)}`
+          : `处理失败 · 用时 ${formatThinkingDuration(durationSec)}`}
+      </span>
+    ) : (
+      <span className="text-[13px] font-medium text-muted-foreground">
+        思考了 {formatThinkingDuration(durationSec ?? frozenSeconds)}
+      </span>
+    );
 
   return (
     <Collapsible
@@ -143,19 +201,29 @@ export function ThinkingChain({
         className="thinking-chain__trigger"
       >
         {headerLabel}
+        {phase === "thinking" && !open && chips.length > 0 ? (
+          <span
+            className="thinking-chain__chips"
+            role="status"
+            aria-live="polite"
+          >
+            {chips.map((chip) => (
+              <span className="thinking-chain__chip" key={chip}>
+                {chip}
+              </span>
+            ))}
+          </span>
+        ) : null}
+        {phase === "answer" && toolCalls > 0 ? (
+          <span className="thinking-chain__chip">{`${toolCalls} 次工具调用`}</span>
+        ) : null}
         <ChevronDown
           className={cn(
             "thinking-chain__chevron size-3.5 text-muted-foreground transition-transform",
-            open && "rotate-180",
+            !open && "rotate-[-90deg]",
           )}
         />
       </CollapsibleTrigger>
-      {isStreaming && !open && activity && activity !== "正在思考" ? (
-        <div className="thinking-chain__live" role="status" aria-live="polite">
-          <span className="thinking-chain__live-dot" />
-          <span>{activity}</span>
-        </div>
-      ) : null}
       <CollapsibleContent className="thinking-chain__content">
         <div className="thinking-chain__steps">{children}</div>
       </CollapsibleContent>

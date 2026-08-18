@@ -284,6 +284,14 @@ export interface Message {
   parts: MessagePart[]
   provider_trace: UnknownRecord
   created_at: IsoDateTime
+  /** Frontend-only transient: final-answer boundary received from the live
+   *  `answer.started` SSE event. Never part of the REST payload; after history
+   *  load it is re-derived from part marks + provider_trace. */
+  finalAnswerStarted?: {
+    finalPartId?: string
+    boundarySequence?: number
+    thinkingDurationMs?: number
+  }
 }
 
 /** Windowed list response from GET /sessions/{id}/messages. */
@@ -355,7 +363,24 @@ export interface MessageCompletedEvent {
   provider_trace: UnknownRecord
 }
 
+/** Monotonic final-answer boundary emitted once per message when the backend
+ *  confirms the current invocation will produce no more tool calls. The
+ *  frontend collapses the process chain at this boundary and freezes the
+ *  thinking duration. */
+export interface AnswerStartedEvent {
+  type?: 'answer.started'
+  event?: 'answer.started' | string
+  event_id?: string
+  message_id: string
+  final_part_id: string
+  /** Text part sequence that splits the process chain from the final answer. */
+  boundary_sequence?: number
+  started_at?: string
+  thinking_duration_ms?: number
+}
+
 export type SessionMessageStreamData =
   | MessagePartStreamEvent
   | MessageCompletedEvent
+  | AnswerStartedEvent
   | UnknownRecord

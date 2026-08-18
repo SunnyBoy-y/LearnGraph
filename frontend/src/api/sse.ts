@@ -11,6 +11,14 @@ export interface SseParseOptions {
   seenEventIds?: Set<string>
 }
 
+/**
+ * Cap for the SSE dedupe window. Very long agent streams emit tens of
+ * thousands of events; an unbounded Set would keep every id resident. Event
+ * sequences are monotonic, so ids older than the cursor are never re-seen;
+ * clearing at the cap costs nothing but the Set memory.
+ */
+const MAX_SEEN_EVENT_IDS = 4096
+
 interface ParsedBlock {
   event: string
   id?: string
@@ -102,6 +110,12 @@ export async function* parseSseResponse<TData = unknown>(
     const id = parsed.id || payloadEventId(data)
     if (dedupe && id) {
       if (seenEventIds.has(id)) return null
+      // Bound the dedupe window (dsh event-window style): very long agent
+      // streams can emit tens of thousands of events, and an unbounded Set
+      // would keep every id resident for the whole session. Event sequences
+      // are monotonic, so older ids are never seen again after the cursor
+      // passes them; clearing at the cap loses nothing but the Set memory.
+      if (seenEventIds.size >= MAX_SEEN_EVENT_IDS) seenEventIds.clear()
       seenEventIds.add(id)
     }
 

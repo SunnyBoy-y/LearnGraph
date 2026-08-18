@@ -194,7 +194,7 @@ export const ReasoningTrigger = memo(
             <ChevronDownIcon
               className={cn(
                 "size-4 transition-transform",
-                isOpen ? "rotate-180" : "rotate-0"
+                isOpen ? "rotate-0" : "rotate-[-90deg]"
               )}
             />
           </>

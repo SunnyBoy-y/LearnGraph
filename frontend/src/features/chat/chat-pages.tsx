@@ -282,6 +282,7 @@ import {
   isChatDictationCleanupEnabled,
   readChatDefaultResponseMode,
   readChatFeatureModelSetting,
+  readChatThinkingChainDefault,
   CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_SETTING_KEY,
@@ -289,6 +290,14 @@ import {
 } from "@/lib/workspace-settings";
 import { ContextUsageRing } from "@/components/chat/context-usage-ring";
 import { shouldShowSuggestedPromptError } from "@/lib/suggested-prompts";
+import {
+  clearSessionGoalDraft,
+  clearSessionGoalMode,
+  getSessionGoalDraft,
+  hasSessionGoalMode,
+  setSessionGoalDraft,
+  setSessionGoalMode,
+} from "@/lib/session-goal-mode";
 import { cn } from "@/lib/utils";
 import {
   workspaceQueryKey,
@@ -296,11 +305,13 @@ import {
 import {
   groupPartsForDisplay,
   isDeepResearchApprovalPart,
+  isReasoningTextPart,
   orderedMessageParts,
-  shouldShowThinkingPlaceholder,
   thinkingDurationSeconds,
+  toolCallCount,
 } from "@/features/chat/chat-message-parts";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
+import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
 import {
   GoalSetupConversation,
   useGoalSetupFlow,
@@ -415,7 +426,11 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
   const bootstrap = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "sandbox-bootstrap-status"),
     queryFn: getSandboxBootstrapStatus,
-    enabled: readiness.data?.code === "sandbox_backend_unavailable",
+    // Banner also needs bootstrap state when the daemon is reachable but the
+    // runner image is not initialized (readiness probe only pings Docker).
+    enabled:
+      readiness.data?.code === "sandbox_backend_unavailable" ||
+      readiness.data?.available === true,
     refetchInterval: (query) =>
       query.state.data?.active_job ? 1_500 : false,
   });
@@ -464,8 +479,8 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
   if (
     dismissed ||
     !readiness.data ||
-    readiness.data.available ||
-    readiness.data.code !== "sandbox_backend_unavailable"
+    (readiness.data.code !== "sandbox_backend_unavailable" &&
+      !(readiness.data.available && bootstrap.data && !bootstrap.data.image_ready))
   )
     return null;
 
@@ -1105,6 +1120,24 @@ function applyStreamUpdates(
             : part,
         ),
       };
+    if (eventType === "answer.started")
+      return {
+        ...current,
+        finalAnswerStarted: {
+          finalPartId:
+            typeof data.final_part_id === "string"
+              ? data.final_part_id
+              : undefined,
+          boundarySequence:
+            typeof data.boundary_sequence === "number"
+              ? data.boundary_sequence
+              : undefined,
+          thinkingDurationMs:
+            typeof data.thinking_duration_ms === "number"
+              ? data.thinking_duration_ms
+              : undefined,
+        },
+      };
     if (isMessagePart(data.part))
       return {
         ...current,
@@ -1170,11 +1203,16 @@ function findOptimisticCounterpart(
   return undefined;
 }
 
-function createAnimationFrameQueue<T>(onBatch: (batch: T[]) => void) {
+function createAnimationFrameQueue<T>(
+  onBatch: (batch: T[]) => void,
+  options: { minIntervalMs?: number } = {},
+) {
+  const minIntervalMs = options.minIntervalMs ?? 0;
   let pending: T[] = [];
   let frameId: number | null = null;
   let scheduledWithAnimationFrame = false;
   let drainResolvers: Array<() => void> = [];
+  let lastRenderAt = 0;
 
   const resolveDrains = () => {
     if (pending.length || frameId !== null) return;
@@ -1186,12 +1224,26 @@ function createAnimationFrameQueue<T>(onBatch: (batch: T[]) => void) {
     if (frameId !== null) return;
     const run = () => {
       frameId = null;
+      if (pending.length && minIntervalMs > 0) {
+        // Throttle stream re-renders (dsh frame-batched notifier style): large
+        // streaming text parts re-parse markdown + tokenize code per frame;
+        // skipping frames while events accumulate still yields 6-10fps
+        // typewriter updates and cuts render count proportionally.
+        const now = performance.now();
+        if (now - lastRenderAt < minIntervalMs) {
+          schedule();
+          return;
+        }
+        lastRenderAt = now;
+      } else if (minIntervalMs > 0) {
+        lastRenderAt = performance.now();
+      }
       const batchSize =
         pending.length > 90
-          ? STREAM_EVENTS_PER_FRAME * 4
+          ? STREAM_EVENTS_PER_FRAME * 12
           : pending.length > 30
-            ? STREAM_EVENTS_PER_FRAME * 2
-            : STREAM_EVENTS_PER_FRAME;
+            ? STREAM_EVENTS_PER_FRAME * 6
+            : STREAM_EVENTS_PER_FRAME * 3;
       const batch = pending.splice(0, batchSize);
       if (batch.length) onBatch(batch);
       if (pending.length) schedule();
@@ -1225,6 +1277,46 @@ function createAnimationFrameQueue<T>(onBatch: (batch: T[]) => void) {
       resolveDrains();
     },
   };
+}
+
+/**
+ * Declared render cadence per part type (dsh node-level `publication`
+ * pattern): each part type states how often its growth may commit a frame.
+ * Returns the minimum interval between stream re-renders; 0 = every frame.
+ * Text grows by re-parsing markdown + tokenizing code, so cadence scales
+ * with content size; reasoning/tool-call streams are cheaper.
+ */
+function partRenderMinIntervalMs(part: MessagePart): number {
+  switch (part.type) {
+    case "text":
+    case "acknowledgement": {
+      const len = (part.content ?? "").length;
+      if (len > 96_000) return 150;
+      if (len > 32_000) return 100;
+      if (len > 8_000) return 60;
+      return 0;
+    }
+    case "reasoning_summary":
+    case "reasoning_content":
+      return 40;
+    case "tool_call":
+      return typeof part.data?.argsRaw === "string" &&
+        part.data.argsRaw.length > 32_000
+        ? 100
+        : 0;
+    default:
+      return 0;
+  }
+}
+
+/** Streaming render throttle for a message: the strictest cadence across parts. */
+function streamRenderMinIntervalMs(parts: MessagePart[] | undefined): number {
+  let maxMs = 0;
+  for (const part of parts ?? []) {
+    const ms = partRenderMinIntervalMs(part);
+    if (ms > maxMs) maxMs = ms;
+  }
+  return maxMs;
 }
 
 function readTextSelection(): TextSelectionMenu | null {
@@ -1609,6 +1701,7 @@ function AssistantMessageInner({
   branchDisabled = false,
   branchDisabledReason,
   componentsInteractive = true,
+  thinkingChainDefaultOpen = true,
 }: {
   message: Message;
   sessionId: string;
@@ -1624,6 +1717,8 @@ function AssistantMessageInner({
   branchDisabledReason?: string;
   /** False while the assistant turn is still streaming so review cards stay locked. */
   componentsInteractive?: boolean;
+  /** Processing-phase default open state of the thinking chain (user setting). */
+  thinkingChainDefaultOpen?: boolean;
 }) {
   const messageContentRef = useRef<HTMLDivElement | null>(null);
   const persisted =
@@ -1665,8 +1760,16 @@ function AssistantMessageInner({
       ? imageInputTrace.model_id.trim()
       : null;
   const orderedParts = orderedMessageParts(shown.parts);
+  const finalAnswerStarted =
+    shown.finalAnswerStarted ?? message.finalAnswerStarted;
   // Thinking chain (reasoning + tools) is always rendered above the final body.
-  const displaySegments = groupPartsForDisplay(shown.parts);
+  // With the final-answer boundary we cut exactly once: everything before it
+  // stays inside the chain in raw stream order, the final answer renders
+  // outside. While streaming without a boundary everything lives in the chain.
+  const displaySegments = groupPartsForDisplay(shown.parts, {
+    boundary: finalAnswerStarted,
+    live: shown.status === "streaming",
+  });
   // Budget approval needs a clickable card outside the collapsed thinking fold.
   const deepResearchApprovalParts = orderedParts.filter(isDeepResearchApprovalPart);
   const fullText = shown.parts
@@ -1674,12 +1777,7 @@ function AssistantMessageInner({
     .map((part) => part.content ?? "")
     .filter((content) => content && content.trim() !== "正在思考")
     .join("\n");
-  // Empty stream before any chain/answer part arrives.
-  const isThinkingPlaceholder = shouldShowThinkingPlaceholder(
-    shown.status,
-    orderedParts,
-  );
-  const renderPart = (part: MessagePart) => (
+    const renderPart = (part: MessagePart) => (
     <ChatStreamPartRenderer
       interactive={componentsInteractive}
       key={part.id}
@@ -1726,6 +1824,18 @@ function AssistantMessageInner({
             key={`image-strip-${group.parts[0]?.id ?? "empty"}`}
             parts={group.parts}
           />
+        );
+      }
+      if (group.kind === "side_pair") {
+        // Model-authored |layout=side: text left, artifact right (flex row).
+        return (
+          <div
+            className="grid gap-3 sm:grid-cols-2 sm:items-start"
+            key={`side-pair-${group.artifact.id}`}
+          >
+            <div>{renderPart(group.text)}</div>
+            <div>{renderPart(group.artifact)}</div>
+          </div>
         );
       }
       return renderPart(group.part);
@@ -1808,12 +1918,6 @@ function AssistantMessageInner({
           </p>
         ) : null}
         <div ref={messageContentRef} className="contents">
-        {isThinkingPlaceholder ? (
-          <div className="message-thinking" role="status" aria-live="polite">
-            <span className="message-thinking__dot" />
-            <span>正在思考</span>
-          </div>
-        ) : null}
         {displaySegments.map((segment, index) =>
           segment.kind === "chain" ? (
             <div className="space-y-2" key={`chain-wrap-${message.id}-${index}`}>
@@ -1822,14 +1926,28 @@ function AssistantMessageInner({
                 completedDurationSec={thinkingDurationSeconds(
                   shown.provider_trace,
                 )}
+                defaultOpen={thinkingChainDefaultOpen}
+                finalAnswerStarted={Boolean(finalAnswerStarted)}
                 messageStatus={shown.status}
                 startedAt={
                   typeof shown.provider_trace.generation_started_at === "string"
                     ? shown.provider_trace.generation_started_at
                     : shown.created_at
                 }
+                thinkingDurationMs={finalAnswerStarted?.thinkingDurationMs}
+                toolCallCount={toolCallCount(orderedParts)}
               >
-                {segment.parts.map(renderPart)}
+                {segment.parts.map((part) =>
+                  isReasoningTextPart(part) ? (
+                    <ReasoningSummaryRow
+                      key={part.id}
+                      part={part}
+                      streaming={shown.status === "streaming"}
+                    />
+                  ) : (
+                    renderPart(part)
+                  ),
+                )}
               </ThinkingChain>
               {index === 0 && deepResearchApprovalParts.length ? (
                 <div className="message-deep-research-approvals space-y-3">
@@ -1936,7 +2054,8 @@ const areEqualAssistantMessage = (
   prev.branchDisabledReason === next.branchDisabledReason &&
   prev.componentsInteractive === next.componentsInteractive &&
   prev.selectionMarks === next.selectionMarks &&
-  prev.onOpenSelectionExplanation === next.onOpenSelectionExplanation;
+  prev.onOpenSelectionExplanation === next.onOpenSelectionExplanation &&
+  prev.thinkingChainDefaultOpen === next.thinkingChainDefaultOpen;
 
 type AssistantMessageMemoProps = Parameters<typeof AssistantMessageInner>[0];
 
@@ -2374,6 +2493,8 @@ export function ChatCanvasPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const goalMode = new URLSearchParams(location.search).get("mode") === "goal";
+  /** True when this session should restore goal mode after a session switch. */
+  const sessionGoalModeStored = hasSessionGoalMode(workspaceId, sessionId);
   const conversationResetKey = `${workspaceId}:${sessionId}`;
   const mentionMenuId = useId();
   const isPhoneLayout = usePhoneLayout();
@@ -2535,6 +2656,10 @@ export function ChatCanvasPage() {
     promise: Promise<Session>;
   } | null>(null);
   const preserveDraftForSessionRef = useRef<string | null>(null);
+  /** Scope (workspace:session) whose capture draft was already restored once. */
+  const goalDraftRestoredScopeRef = useRef<string>("");
+  /** True after the user manually exited goal mode; disables wizard snapshot restore. */
+  const goalModeExitedManuallyRef = useRef(false);
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const dictationStopRequestedRef = useRef(false);
   const dictationCleanupSessionRef = useRef<DictationCleanupSession | null>(
@@ -2595,6 +2720,35 @@ export function ChatCanvasPage() {
     setSearchRoute("disabled");
     setGenerationMode("text");
   }, [goalMode]);
+
+  // Remember goal mode per session while it is active: sidebar session
+  // switches navigate without the ?mode=goal query, so this flag is the only
+  // record that the session was in goal mode.
+  useEffect(() => {
+    if (goalMode) setSessionGoalMode(workspaceId, sessionId, true);
+  }, [goalMode, sessionId, workspaceId]);
+
+  // Returning to a session that was in goal mode re-applies the mode, unless
+  // the user explicitly exited it (leaveGoalMode clears the stored flag).
+  useEffect(() => {
+    if (goalMode || !hasSessionGoalMode(workspaceId, sessionId)) return;
+    const params = new URLSearchParams(location.search);
+    params.set("mode", "goal");
+    navigate(`${location.pathname}?${params.toString()}`, { replace: true });
+  }, [
+    goalMode,
+    location.pathname,
+    location.search,
+    navigate,
+    sessionId,
+    workspaceId,
+  ]);
+
+  // The capture-draft restore latch resets per session, so a fresh session can
+  // re-restore its draft while same-session deletions stay deleted.
+  useEffect(() => {
+    goalDraftRestoredScopeRef.current = "";
+  }, [conversationResetKey]);
 
   const [historyHasMoreBefore, setHistoryHasMoreBefore] = useState(false);
   const [historyTotalCount, setHistoryTotalCount] = useState(0);
@@ -2775,6 +2929,10 @@ export function ChatCanvasPage() {
   const settings = useQuery({ queryKey: workspaceQueryKey(workspaceId, "settings"), queryFn: listSettings });
   const workspaceDefaultResponseMode = useMemo(
     () => readChatDefaultResponseMode(settings.data),
+    [settings.data],
+  );
+  const thinkingChainDefaultOpen = useMemo(
+    () => readChatThinkingChainDefault(settings.data),
     [settings.data],
   );
   // Gate persist on a *state* marker, not a ref. When sessionId flips, this
@@ -3615,6 +3773,7 @@ export function ChatCanvasPage() {
       let terminalFailure = "";
       let lastEventId = "";
       const seenEventIds = new Set<string>();
+      let lastEventSeq = 0;
       const isViewing = () => viewingSessionIdRef.current === streamSessionId;
       const frameQueue = createAnimationFrameQueue<Record<string, unknown>>(
         (updates) => {
@@ -3639,16 +3798,31 @@ export function ChatCanvasPage() {
             ];
           });
         },
+        {
+          minIntervalMs: isViewing()
+            ? streamRenderMinIntervalMs(inFlight.parts)
+            : streamRenderMinIntervalMs(inFlight.parts) * 2,
+        },
       );
       const consume = (data: Record<string, unknown>) => {
         recordStreamDelta(inFlight.id, deltaTextOf(data));
         const eventId =
           typeof data.event_id === "string" ? data.event_id : "";
-        if (eventId && seenEventIds.has(eventId)) return;
-        if (eventId) {
+        // Sequence cursor dedupe (dsh event-window style): replay events are
+        // seq-monotonic, so a numeric cursor replaces the ever-growing Set
+        // with O(1) memory; the Set stays only as a fallback for events
+        // without a sequence field.
+        const sequence =
+          typeof data.sequence === "number" ? data.sequence : 0;
+        if (sequence > 0) {
+          if (sequence <= lastEventSeq) return;
+          lastEventSeq = sequence;
+        } else if (eventId && seenEventIds.has(eventId)) {
+          return;
+        } else if (eventId) {
           seenEventIds.add(eventId);
-          lastEventId = eventId;
         }
+        if (eventId) lastEventId = eventId;
         const type = streamEventType(data);
         if (type === "message.completed") completed = true;
         if (type === "message.failed")
@@ -4272,7 +4446,12 @@ export function ChatCanvasPage() {
     ],
   );
   useEffect(() => {
-    if (sessionId !== "new" || goalMode) return;
+    // A session switching back into goal mode (the restore effect re-applies
+    // ?mode=goal in the same commit) must stay on /chat/new instead of being
+    // promoted to a real draft session.
+    if (sessionId !== "new" || goalMode || sessionGoalModeStored) {
+      return;
+    }
     let cancelled = false;
 
     // Prefer reusing the single unused empty draft so /chat/new never multiplies.
@@ -4369,6 +4548,7 @@ export function ChatCanvasPage() {
     };
   }, [
     goalMode,
+    sessionGoalModeStored,
     location.key,
     navigate,
     queryClient,
@@ -4412,6 +4592,10 @@ export function ChatCanvasPage() {
         setLocalMessages([]);
         setPendingFiles([]);
         setComposerText("");
+        // Goal published: this session's setup is done, so it must not
+        // auto-restore goal mode or its capture draft on later visits.
+        clearSessionGoalMode(workspaceId, sessionId);
+        clearSessionGoalDraft(workspaceId, sessionId);
         navigate(`/w/${workspaceId}/chat/${learningSession.id}`, {
           replace: true,
         });
@@ -4449,6 +4633,8 @@ export function ChatCanvasPage() {
     graphMode: responseMode === "fast" ? "fast" : "thinking",
     // 智能体模式下右侧图谱预览由会话消息驱动，关闭向导自身的广播以免覆盖。
     previewEnabled: responseMode !== "agentic",
+    // 会话切换保留向导进度；手动点「目标」退出则丢弃进度，下次重新开始。
+    preserveOnDisable: !goalModeExitedManuallyRef.current,
   });
   useEffect(() => {
     if (!goalMode) return;
@@ -4458,6 +4644,39 @@ export function ChatCanvasPage() {
       }),
     );
   }, [composerText, goalMode]);
+
+  // Keep the capture-stage composer text in the per-session goal state so a
+  // session switch away and back restores exactly what the user was typing.
+  useEffect(() => {
+    if (
+      !goalMode ||
+      goalFlow.stage !== "capture" ||
+      !composerText.trim()
+    ) {
+      return;
+    }
+    setSessionGoalDraft(workspaceId, sessionId, composerText);
+  }, [composerText, goalFlow.stage, goalMode, sessionId, workspaceId]);
+
+  // Once the capture is submitted (or the wizard advances), the draft lives in
+  // the flow state — no longer needed as a standalone capture draft.
+  useEffect(() => {
+    if (goalMode && goalFlow.stage !== "capture") {
+      clearSessionGoalDraft(workspaceId, sessionId);
+    }
+  }, [goalFlow.stage, goalMode, sessionId, workspaceId]);
+
+  // Restore the capture draft after the wizard returns to the capture stage
+  // (e.g. session switch back). Guarded by the latch ref so deleting the text
+  // within the same session does not resurrect it.
+  useEffect(() => {
+    if (!goalMode || goalFlow.stage !== "capture" || composerText) return;
+    const scope = `${workspaceId}:${sessionId}`;
+    if (goalDraftRestoredScopeRef.current === scope) return;
+    goalDraftRestoredScopeRef.current = scope;
+    const draft = getSessionGoalDraft(workspaceId, sessionId);
+    if (draft) setComposerText(draft);
+  }, [composerText, goalFlow.stage, goalMode, sessionId, workspaceId]);
 
   // 智能体模式：把会话消息里的 create 图谱提案实时同步到右侧「目标图谱预览」，
   // 提案待审核 → reviewing；确认后（状态为 confirmed）→ approved（通过审核）。
@@ -5127,6 +5346,11 @@ export function ChatCanvasPage() {
                 : message,
             ),
           ),
+        {
+          minIntervalMs: isViewingStream()
+            ? streamRenderMinIntervalMs(assistant.parts)
+            : streamRenderMinIntervalMs(assistant.parts) * 2,
+        },
       );
       try {
         for (
@@ -5571,32 +5795,56 @@ export function ChatCanvasPage() {
     [prepareStoredFile, queryClient, responseMode, workspaceId],
   );
 
-  const convertLongPaste = useMutation({
-    mutationFn: (content: string) => {
-      const timestamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
-      return uploadAndIndex(
-        new File([content], `chat-note-${timestamp}.md`, {
-          type: "text/markdown",
-        }),
+  // 大文本粘贴被拦截后：点击「放入文本框」时把内容写回输入框（优先光标处，
+  // 无光标信息时追加到末尾），随后该文本不再作为附件。
+  const insertLongPasteToComposer = useCallback(() => {
+    if (longPaste === null) return;
+    const el = composerTextareaRef.current;
+    if (el) {
+      const start = el.selectionStart ?? composerText.length;
+      const end = el.selectionEnd ?? composerText.length;
+      setComposerText(
+        composerText.slice(0, start) + longPaste + composerText.slice(end),
       );
-    },
-    onSuccess: (file) => {
-      setPendingFiles((current) => [
-        ...current.filter((item) => item.id !== file.id),
-        file,
-      ]);
+    } else {
       setComposerText((current) =>
-        longPaste ? current.replace(longPaste, "").trim() : current,
+        current ? `${current}\n${longPaste}` : longPaste,
       );
-      setLongPaste(null);
-      toast.success(`“${file.original_name}”已解析，将随下一条消息发送`);
-    },
-    onError: (error) => toast.error(error.message),
-  });
+    }
+    setLongPaste(null);
+    window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
+  }, [composerText, longPaste]);
+
+  const discardLongPaste = useCallback(() => setLongPaste(null), []);
 
   const submitPrompt = useCallback(
     async (message: PromptInputMessage) => {
       try {
+        // 大文本粘贴自动转成的附件：仅发送时上传入库（发送前不入库）。
+        const longPasteParts: PromptInputMessage["files"] =
+          longPaste === null
+            ? []
+            : (() => {
+                const timestamp = new Date()
+                  .toISOString()
+                  .replaceAll(/[:.]/g, "-");
+                const filename = `chat-note-${timestamp}.md`;
+                const localFile = new File([longPaste], filename, {
+                  type: "text/markdown",
+                });
+                return [
+                  {
+                    filename,
+                    localFile,
+                    mediaType: "text/markdown",
+                    type: "file",
+                    // FileUIPart 类型要求 url；上传路径优先使用 localFile，
+                    // 此 blob URL 仅作占位，随页面卸载由浏览器回收。
+                    url: URL.createObjectURL(localFile),
+                  },
+                ];
+              })();
+        const files = [...message.files, ...longPasteParts];
         const hasImageMention = /^\s*@绘图(?=\s|$)/u.test(message.text);
         const requestedGenerationMode: GenerationMode =
           hasImageMention || generationMode === "image" ? "image" : "text";
@@ -5605,7 +5853,7 @@ export function ChatCanvasPage() {
           responseMode !== "agentic"
         ) {
           const blockedNames = [
-            ...message.files
+            ...files
               .filter(
                 (part) =>
                   !classifyNonAgentAttachment({
@@ -5667,7 +5915,7 @@ export function ChatCanvasPage() {
         }
         if (
           requestedGenerationMode === "image" &&
-          (message.files.length > 0 || pendingFiles.length > 0) &&
+          (files.length > 0 || pendingFiles.length > 0) &&
           !isImageEditModel(selectedImageModel)
         ) {
           toast.error("图生图和图片编辑仅支持支持参考图的绘图模型。");
@@ -5675,7 +5923,7 @@ export function ChatCanvasPage() {
         }
         if (
           requestedGenerationMode === "image" &&
-          message.files.some(
+          files.some(
             (part) =>
               !IMAGE_EDIT_MIME_TYPES.has(
                 (part.mediaType ?? "").toLowerCase(),
@@ -5694,7 +5942,7 @@ export function ChatCanvasPage() {
               )
             : pendingFiles;
         const uploaded = await Promise.all(
-          message.files.map(async (part, index) => {
+          files.map(async (part, index) => {
             if (!part.url && !part.localFile)
               throw new Error(
                 `附件 ${part.filename ?? index + 1} 缺少可读取内容`,
@@ -5748,6 +5996,7 @@ export function ChatCanvasPage() {
             });
             setPendingFiles([]);
             setComposerText("");
+            setLongPaste(null);
             setGenerationMode("text");
             void sending.catch(() => undefined);
             return true;
@@ -5764,6 +6013,7 @@ export function ChatCanvasPage() {
           await goalFlow.submit(content, fileIds);
           setPendingFiles([]);
           setComposerText("");
+          setLongPaste(null);
           return true;
         } else {
           const sending = send(content, {
@@ -5778,6 +6028,7 @@ export function ChatCanvasPage() {
           });
           setPendingFiles([]);
           setComposerText("");
+          setLongPaste(null);
           setGenerationMode("text");
           void sending.catch(() => undefined);
           return true;
@@ -5794,6 +6045,7 @@ export function ChatCanvasPage() {
       goalFlow,
       goalMode,
       imageSize,
+      longPaste,
       pendingFiles,
       prepareStoredFile,
       responseMode,
@@ -6743,6 +6995,7 @@ export function ChatCanvasPage() {
       let lastEventId = "";
       let messageVersionId = "";
       const seenEventIds = new Set<string>();
+      let lastEventSeq = 0;
       const frameQueue = createAnimationFrameQueue<Record<string, unknown>>(
         (updates) =>
           setLocalMessages((current) =>
@@ -6752,15 +7005,26 @@ export function ChatCanvasPage() {
                 : message,
             ),
           ),
+        {
+          minIntervalMs: isViewingRetry()
+            ? streamRenderMinIntervalMs(retryMessage.parts)
+            : streamRenderMinIntervalMs(retryMessage.parts) * 2,
+        },
       );
       const consumeRetryEvent = (data: Record<string, unknown>) => {
         const eventId =
           typeof data.event_id === "string" ? data.event_id : "";
-        if (eventId && seenEventIds.has(eventId)) return;
-        if (eventId) {
+        const sequence =
+          typeof data.sequence === "number" ? data.sequence : 0;
+        if (sequence > 0) {
+          if (sequence <= lastEventSeq) return;
+          lastEventSeq = sequence;
+        } else if (eventId && seenEventIds.has(eventId)) {
+          return;
+        } else if (eventId) {
           seenEventIds.add(eventId);
-          lastEventId = eventId;
         }
+        if (eventId) lastEventId = eventId;
         if (
           typeof data.message_version_id === "string" &&
           data.message_version_id
@@ -6992,6 +7256,7 @@ export function ChatCanvasPage() {
             : "已完成";
 
   const enterGoalMode = useCallback(() => {
+    goalModeExitedManuallyRef.current = false;
     setComposerText((current) =>
       current.replace(/(^|\s)@[^\s@]*$/u, "$1").trimEnd(),
     );
@@ -7006,13 +7271,26 @@ export function ChatCanvasPage() {
   }, [location.pathname, location.search, navigate]);
 
   const leaveGoalMode = useCallback(() => {
+    // Manual exit is the only way to cancel a session's goal state: forget the
+    // stored flag, the capture draft and any saved wizard progress.
+    goalModeExitedManuallyRef.current = true;
+    clearSessionGoalMode(workspaceId, sessionId);
+    clearSessionGoalDraft(workspaceId, sessionId);
+    goalFlow.clearProgress();
     const params = new URLSearchParams(location.search);
     params.delete("mode");
     const query = params.toString();
     navigate(`${location.pathname}${query ? `?${query}` : ""}`, {
       replace: true,
     });
-  }, [location.pathname, location.search, navigate]);
+  }, [
+    goalFlow,
+    location.pathname,
+    location.search,
+    navigate,
+    sessionId,
+    workspaceId,
+  ]);
 
   const canUseNetworkSearch = Boolean(
     hasAuthorizedAgentSearchProvider ||
@@ -7725,6 +8003,7 @@ export function ChatCanvasPage() {
                     minHeight={140}
                   >
                     <AssistantMessage
+                      thinkingChainDefaultOpen={thinkingChainDefaultOpen}
                       branchDisabled={
                         !persisted ||
                         message.session_id !== sessionId ||
@@ -8028,22 +8307,21 @@ export function ChatCanvasPage() {
           <div className="mb-2 flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 shadow-sm dark:border-amber-900 dark:bg-amber-950/45 dark:text-amber-100">
             <FilePlus2 className="size-4" />
             <span className="min-w-0 flex-1">
-              <strong>检测到单次粘贴超过 10,000 字符。</strong>
-              原文仍保留，可选择转换为私有 Markdown 附件。
+              <strong>检测到单次粘贴超过 10,000 字符，已自动转为附件。</strong>
+              该附件仅在发送时上传入库（发送前不会保存）；点击「放入文本框」将改按普通文本发送。
             </span>
             <Button
-              onClick={() => setLongPaste(null)}
+              onClick={discardLongPaste}
               size="xs"
               variant="outline"
             >
-              保留文本
+              移除
             </Button>
             <Button
-              disabled={convertLongPaste.isPending}
-              onClick={() => convertLongPaste.mutate(longPaste)}
+              onClick={insertLongPasteToComposer}
               size="xs"
             >
-              {convertLongPaste.isPending ? "上传并解析中…" : "转换附件"}
+              放入文本框
             </Button>
           </div>
         ) : null}
@@ -8459,7 +8737,12 @@ export function ChatCanvasPage() {
               }}
               onPaste={(event) => {
                 const text = event.clipboardData.getData("text");
-                if (Array.from(text).length > 10_000) setLongPaste(text);
+                if (Array.from(text).length > 10_000) {
+                  // 大文本粘贴自动转为待发送附件：拦截默认插入，避免把上万
+                  // 字符直接塞进输入框；附件仅发送时上传，发送前不入库。
+                  event.preventDefault();
+                  setLongPaste(text);
+                }
               }}
               placeholder={
                 goalMode

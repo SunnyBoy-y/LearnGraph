@@ -23,6 +23,46 @@ export const REASONING_TEXT_PART_TYPES = new Set<MessagePart["type"]>([
 ]);
 
 /**
+ * Agent-produced artifacts (images, html files, magic cards, charts…) that must
+ * render in the answer body where the final answer references them — never
+ * hidden inside the collapsed thinking chain. They keep their stream position
+ * ahead of the final-answer text.
+ */
+export const ARTIFACT_PART_TYPES = new Set<MessagePart["type"]>([
+  "image",
+  "sandbox",
+  "sandbox_artifact",
+  "subapp_artifact",
+  "magic_card",
+  "component",
+  "chart",
+]);
+
+/** Layout hint carried on an artifact part by the model's [[artifact:...|layout=]] reference. */
+export const ARTIFACT_LAYOUTS = new Set(["inline", "block", "side"]);
+
+export function artifactLayout(part: MessagePart): string | undefined {
+  const layout = part.data?.layout;
+  return typeof layout === "string" && ARTIFACT_LAYOUTS.has(layout)
+    ? layout
+    : undefined;
+}
+
+/** Artifact explicitly placed side-by-side with its introducing text segment. */
+export function isSideLayoutArtifactPart(part: MessagePart): boolean {
+  return isArtifactPart(part) && artifactLayout(part) === "side";
+}
+
+/** Artifact placed inline as a compact card inside the text flow. */
+export function isInlineLayoutArtifactPart(part: MessagePart): boolean {
+  return isArtifactPart(part) && artifactLayout(part) === "inline";
+}
+
+export function isArtifactPart(part: MessagePart): boolean {
+  return ARTIFACT_PART_TYPES.has(part.type);
+}
+
+/**
  * Stable presentation order.
  *
  * Prefer process (thinking chain) above answer content when sequence is
@@ -60,6 +100,25 @@ export function isDeepResearchApprovalPart(part: MessagePart): boolean {
   return (output as { user_approval_required?: unknown }).user_approval_required === true;
 }
 
+/** Graph review card that is deferred to the end of the answer body. */
+export function isGraphUpdateProposalPart(part: MessagePart): boolean {
+  return (
+    part.type === "component" &&
+    part.data?.component_type === "graph_update_proposal"
+  );
+}
+
+/**
+ * Chain-internal presentation order: parts keep their stream position so each
+ * "思考过程" block stays next to the tool round it belongs to (a reasoning part
+ * that arrives after a tool call renders right below that tool row, never
+ * hoisted above the whole process). `processParts` is already in stream order,
+ * so this is a defensive copy — no grouping.
+ */
+export function orderChainParts(parts: MessagePart[]): MessagePart[] {
+  return [...parts];
+}
+
 export function isReasoningTextPart(part: MessagePart): boolean {
   return REASONING_TEXT_PART_TYPES.has(part.type);
 }
@@ -93,6 +152,55 @@ export function isHostAgentBoilerplate(part: MessagePart): boolean {
 /** Model-authored intermediate narration promoted before tool rounds. */
 export function isPlanNarrationPart(part: MessagePart): boolean {
   return part.type === "text" && part.data?.kind === "plan_narration";
+}
+
+/** Text part explicitly marked by the backend as the final answer start. */
+export function isFinalAnswerPart(part: MessagePart): boolean {
+  return part.type === "text" && part.data?.kind === "final_answer";
+}
+
+/**
+ * Frontend-transient final-answer boundary delivered by the `answer.started`
+ * SSE event. Not part of the REST payload; after history load the boundary is
+ * re-derived from part `data.kind === "final_answer"` marks instead.
+ */
+export interface FinalAnswerBoundaryInfo {
+  finalPartId?: string;
+  boundarySequence?: number;
+  thinkingDurationMs?: number;
+}
+
+/**
+ * Index (into an `orderedMessageParts` array) of the first part that starts the
+ * final answer, or -1 when no boundary is known yet. Prefers the live
+ * `answer.started` boundary, then the durable part mark.
+ */
+export function findFinalAnswerBoundaryIndex(
+  ordered: MessagePart[],
+  boundary?: FinalAnswerBoundaryInfo,
+): number {
+  if (boundary) {
+    if (boundary.finalPartId) {
+      const byId = ordered.findIndex((part) => part.id === boundary.finalPartId);
+      if (byId >= 0) return byId;
+    }
+    if (typeof boundary.boundarySequence === "number") {
+      const bySequence = ordered.findIndex(
+        (part) => part.sequence === boundary.boundarySequence,
+      );
+      if (bySequence >= 0) return bySequence;
+    }
+  }
+  return ordered.findIndex(isFinalAnswerPart);
+}
+
+/** Number of settled tool calls in the chain (for the collapsed summary chip). */
+export function toolCallCount(parts: MessagePart[]): number {
+  return parts.filter(
+    (part) =>
+      part.type === "tool_call" &&
+      (part.status === "completed" || part.status === "failed"),
+  ).length;
 }
 
 export function orderedMessageParts(parts: MessagePart[]) {
@@ -164,59 +272,177 @@ export type DisplaySegment =
   | { kind: "parts"; parts: MessagePart[] }
   | { kind: "chain"; parts: MessagePart[] };
 
-export function groupPartsForDisplay(parts: MessagePart[]): DisplaySegment[] {
-  const { chainParts, answerParts } = partitionMessageParts(parts);
+export interface DisplayGroupOptions {
+  /** Live final-answer boundary from the `answer.started` SSE event. */
+  boundary?: FinalAnswerBoundaryInfo;
+  /** True while the message is still streaming: without a boundary every
+   *  process part (including unclassified text that may later become
+   *  plan_narration) renders inside the chain in raw stream order. */
+  live?: boolean;
+}
+
+/**
+ * Text part with no content yet (the shared streaming placeholder or an
+ * unpopulated draft). Renders nothing, never anchors anything.
+ */
+function isContentlessTextPart(part: MessagePart): boolean {
+  return (
+    part.type === "text" &&
+    !part.content?.trim() &&
+    !part.content_delta?.trim()
+  );
+}
+
+/** Parts that never participate in adjacency / grouping decisions. */
+function isInvisiblePart(part: MessagePart): boolean {
+  return (
+    isPlaceholderAcknowledgement(part) ||
+    isHostAgentBoilerplate(part) ||
+    isContentlessTextPart(part)
+  );
+}
+
+/**
+ * Whether a pre-answer text part (plan narration / plain narration) "anchors"
+ * an artifact and therefore belongs in the answer body next to it.
+ *
+ * The rule is pure ordinal adjacency: ignoring process parts (tools, reasoning,
+ * agent steps, status rows) and invisible parts, the nearest text-class
+ * neighbor of this text part is an artifact part (image, sandbox artifact,
+ * magic card, component, chart…). Narration that introduces an artifact
+ * ("下面先看整体结构：") or explains one ("从图中可以看到…") stays in the
+ * answer body; pure process narration ("我先查一下文档…" with no visible
+ * result) stays inside the collapsed thinking chain.
+ *
+ * Deterministic: the same parts array always yields the same classification,
+ * so live streaming and a page refresh never disagree.
+ */
+export function isArtifactAnchoringText(
+  ordered: MessagePart[],
+  index: number,
+): boolean {
+  if (ordered[index]?.type !== "text") return false;
+  // Messages without any artifact have nothing to anchor; keep every
+  // pre-answer narration in the chain (status quo for plain Q&A).
+  if (!ordered.some(isArtifactPart)) return false;
+  for (let offset = index - 1; offset >= 0; offset -= 1) {
+    const neighbor = ordered[offset];
+    if (isInvisiblePart(neighbor)) continue;
+    if (isChainPart(neighbor)) continue;
+    if (isArtifactPart(neighbor)) return true;
+    // Nearest text-class neighbor is not an artifact: backward side does not
+    // anchor. Keep scanning forward — the text may still introduce the
+    // artifact that follows it.
+    break;
+  }
+  for (let offset = index + 1; offset < ordered.length; offset += 1) {
+    const neighbor = ordered[offset];
+    if (isInvisiblePart(neighbor)) continue;
+    if (isChainPart(neighbor)) continue;
+    return isArtifactPart(neighbor);
+  }
+  return false;
+}
+
+/**
+ * Split an assistant message for rendering (unified rule, replaces the old
+ * boundary-cut + hoisting logic):
+ *
+ * - chain (fold): reasoning / tools / agent steps / status rows, PLUS
+ *   pre-answer narration that does NOT anchor an artifact (smart filter);
+ * - answer body: final-answer text, artifacts, and narration that anchors
+ *   artifacts — all in pure ordinal stream order, so images / HTML cards /
+ *   charts render exactly where the model's words reference them.
+ *
+ * Legacy messages (no `kind` marks and no live boundary) keep the old
+ * type-based partition so history renders unchanged.
+ */
+export function groupPartsForDisplay(
+  parts: MessagePart[],
+  options?: DisplayGroupOptions,
+): DisplaySegment[] {
+  const ordered = orderedMessageParts(parts);
+  const boundaryIndex = findFinalAnswerBoundaryIndex(ordered, options?.boundary);
+  // New-protocol messages carry a live boundary, durable `kind` marks on
+  // text parts, or the streaming flag (unclassified stream text waits inside
+  // the chain until the boundary/kind arrives). Old history has none of these
+  // and keeps the legacy type-based partition.
+  const hasProtocolMarks =
+    options?.boundary !== undefined ||
+    options?.live === true ||
+    ordered.some(
+      (part) => part.type === "text" && typeof part.data?.kind === "string",
+    );
+
+  const processParts: MessagePart[] = [];
+  const answerParts: MessagePart[] = [];
+  const deferredGraphProposals: MessagePart[] = [];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const part = ordered[index];
+    if (isPlaceholderAcknowledgement(part) || isHostAgentBoilerplate(part)) {
+      continue;
+    }
+    // Graph review cards stay at the end of the answer body so mid-turn tool
+    // emission does not interrupt narration; actions are also locked while
+    // the assistant message is still streaming.
+    if (isGraphUpdateProposalPart(part)) {
+      deferredGraphProposals.push(part);
+      continue;
+    }
+    // Reasoning + tools + agent steps always fold into the thinking chain,
+    // no matter where in the stream they were emitted (trailing reasoning
+    // summaries included).
+    if (isChainPart(part)) {
+      processParts.push(part);
+      continue;
+    }
+
+    if (part.type === "text") {
+      // Empty streaming placeholder: render nothing (stays invisible inside
+      // the chain) until real content arrives.
+      if (isContentlessTextPart(part)) {
+        processParts.push(part);
+        continue;
+      }
+      if (!hasProtocolMarks) {
+        // Legacy message: keep every non-empty text in the body in stream
+        // order (historical behavior; artifacts already interleave by
+        // ordinal).
+        answerParts.push(part);
+        continue;
+      }
+      // Final answer: from the live boundary or the durable kind mark.
+      const isFinalAnswer =
+        isFinalAnswerPart(part) ||
+        (boundaryIndex >= 0 && index >= boundaryIndex);
+      if (isFinalAnswer) {
+        answerParts.push(part);
+        continue;
+      }
+      // Pre-answer narration leaves the chain only when it anchors an
+      // artifact; process narration stays folded.
+      if (isArtifactAnchoringText(ordered, index)) {
+        answerParts.push(part);
+        continue;
+      }
+      processParts.push(part);
+      continue;
+    }
+
+    // Everything else (artifacts, sources, quiz, attachments…) belongs to the
+    // answer body at its ordinal position.
+    answerParts.push(part);
+  }
+
+  answerParts.push(...deferredGraphProposals);
   const segments: DisplaySegment[] = [];
-  // Thinking always sits at the top of the assistant turn.
-  if (chainParts.length) {
-    segments.push({ kind: "chain", parts: chainParts });
+  if (processParts.length) {
+    segments.push({ kind: "chain", parts: orderChainParts(processParts) });
   }
   if (answerParts.length) {
     segments.push({ kind: "parts", parts: answerParts });
   }
   return segments;
-}
-
-function hasVisiblePartContent(part: MessagePart) {
-  if (part.type === "acknowledgement") {
-    if (isPlaceholderAcknowledgement(part)) return false;
-    return Boolean(part.content?.trim());
-  }
-  if (isHostAgentBoilerplate(part)) return false;
-  if (part.type === "image") return true;
-  if (
-    part.type === "sandbox" ||
-    part.type === "sandbox_artifact" ||
-    part.type === "sandbox_status" ||
-    part.type === "magic_card" ||
-    part.type === "component"
-  ) {
-    return true;
-  }
-  if (part.content?.trim() || part.content_delta?.trim()) return true;
-  return ["agent_step", "tool_call", "graph_context", "skill_trigger"].includes(
-    part.type,
-  );
-}
-
-export function shouldShowThinkingPlaceholder(
-  status: string,
-  parts: MessagePart[],
-) {
-  if (status !== "streaming") return false;
-  // Outer ThinkingChain owns the progress cue when chain parts exist.
-  if (parts.some(isChainPart)) return false;
-  // Model text / reasoning already streaming — no host placeholder.
-  if (
-    parts.some(
-      (part) =>
-        (part.type === "text" || isReasoningTextPart(part)) &&
-        Boolean(part.content?.trim() || part.content_delta?.trim()),
-    )
-  ) {
-    return false;
-  }
-  return !parts.some(hasVisiblePartContent);
 }
 
 /**
@@ -326,6 +552,88 @@ export function currentActivityLabel(
   return null;
 }
 
+/**
+ * Granular activity chips shown next to the collapsed chain title while
+ * processing, e.g. ["正在思考", "正在调用工具", "search xxx"]. Derived from
+ * the newest live parts only — no backend change needed.
+ */
+export function currentActivityChips(
+  status: string,
+  parts: MessagePart[],
+): string[] {
+  if (status !== "streaming") return [];
+  const ordered = orderedMessageParts(parts);
+  const chips: string[] = [];
+
+  const activeReasoning = [...ordered]
+    .reverse()
+    .find(
+      (part) =>
+        (part.type === "reasoning_summary" ||
+          part.type === "reasoning_content") &&
+        (part.status === "streaming" || part.status === "pending"),
+    );
+  if (activeReasoning) chips.push("正在思考");
+
+  const activeTools = [...ordered]
+    .reverse()
+    .filter(
+      (part) =>
+        part.type === "tool_call" &&
+        (part.status === "streaming" || part.status === "pending"),
+    )
+    .slice(0, 2);
+  for (const tool of activeTools) {
+    const toolName =
+      typeof tool.data?.tool_name === "string" ? tool.data.tool_name : "";
+    const title =
+      typeof tool.data?.title === "string" ? tool.data.title.trim() : "";
+    if (title) {
+      chips.push(title);
+      continue;
+    }
+    if (toolName === "search_web" || /search|检索|搜索/i.test(toolName)) {
+      const input = tool.data?.input as { query?: unknown } | undefined;
+      const query =
+        typeof input?.query === "string" ? input.query.trim() : "";
+      chips.push(query ? `search ${query}` : "正在搜索");
+      continue;
+    }
+    chips.push(toolName ? `tool · ${toolName}` : "正在调用工具");
+  }
+
+  if (!activeReasoning && chips.length === 0) {
+    const activeSandbox = [...ordered]
+      .reverse()
+      .find(
+        (part) =>
+          part.type === "sandbox_status" &&
+          (part.status === "streaming" || part.status === "pending"),
+      );
+    if (activeSandbox) {
+      const phase =
+        typeof activeSandbox.data?.phase === "string"
+          ? activeSandbox.data.phase
+          : "";
+      chips.push(phase ? `沙箱 · ${phase}` : "正在执行沙箱");
+    }
+  }
+
+  if (chips.length === 0) {
+    const latestPlan = [...ordered]
+      .reverse()
+      .find(
+        (part) => isPlanNarrationPart(part) && Boolean(part.content?.trim()),
+      );
+    if (latestPlan?.content?.trim()) {
+      const text = latestPlan.content.trim().replace(/\s+/g, " ");
+      chips.push(text.length > 24 ? `${text.slice(0, 24)}…` : text);
+    }
+  }
+
+  return [...new Set(chips)].slice(0, 3);
+}
+
 export function formatThinkingDuration(seconds: number | undefined): string {
   if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) {
     return "几秒";
@@ -354,6 +662,17 @@ export function formatThinkingDuration(seconds: number | undefined): string {
 export function thinkingDurationSeconds(
   providerTrace: UnknownRecord,
 ): number | undefined {
+  // Frozen thinking duration (excludes final-answer generation) preferred —
+  // it is the number the user sees on the collapsed chain header.
+  const thinkingMs = providerTrace.thinking_duration_ms;
+  if (
+    typeof thinkingMs === "number" &&
+    Number.isFinite(thinkingMs) &&
+    thinkingMs >= 0
+  ) {
+    return Math.max(0, Math.floor(thinkingMs / 1_000));
+  }
+
   const milliseconds = providerTrace.generation_duration_ms;
   if (
     typeof milliseconds === "number" &&

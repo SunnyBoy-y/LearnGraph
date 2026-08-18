@@ -63,6 +63,28 @@ type GoalAnswer = {
   values: string[];
 };
 
+/**
+ * Progress snapshot of an in-flight goal setup, keyed by `scopeKey` so a
+ * session switch (which temporarily disables the flow) can restore the exact
+ * stage the user left. Cleared when the user manually exits goal mode or the
+ * goal is published.
+ */
+type GoalFlowSnapshot = {
+  stage: GoalSetupStage;
+  submittedPrompt: string;
+  result: GoalClarifyResponse | undefined;
+  answers: Record<string, GoalAnswer>;
+  questionIndex: number;
+  draft: GoalConfirmRequest | undefined;
+  graphId: string;
+  acceptedNodeIds: string[];
+  streamPreview: {
+    title: string;
+    nodes: GraphStreamNode[];
+    edges: GraphStreamEdge[];
+  };
+};
+
 type GoalSetupOptions = {
   enabled: boolean;
   onPublished: (result: { goal: Goal; graph: Graph }) => Promise<void> | void;
@@ -85,6 +107,13 @@ type GoalSetupOptions = {
    * instead, so callers should disable this to avoid clobbering it.
    */
   previewEnabled?: boolean;
+  /**
+   * Whether leaving goal mode (enabled → false) keeps a progress snapshot that
+   * a later re-entry restores. Session switches should preserve progress;
+   * manual exits (目标按钮取消) must discard it so the next entry starts fresh.
+   * Defaults to true.
+   */
+  preserveOnDisable?: boolean;
 };
 
 function initialGoalDraft(goal: Goal): GoalConfirmRequest {
@@ -164,11 +193,14 @@ export function useGoalSetupFlow({
   thinkingMode,
   graphMode = "thinking",
   previewEnabled = true,
+  preserveOnDisable = true,
 }: GoalSetupOptions) {
   const queryClient = useQueryClient();
   const wasEnabled = useRef(enabled);
   const activeScopeKey = useRef(enabled ? scopeKey : "");
   const observedGraphRevision = useRef<number | undefined>(undefined);
+  /** Wizard progress per scope, restored when the same session re-enters goal mode. */
+  const flowSnapshotsRef = useRef<Map<string, GoalFlowSnapshot>>(new Map());
   const [stage, setStage] = useState<GoalSetupStage>("capture");
   const [submittedPrompt, setSubmittedPrompt] = useState("");
   const [result, setResult] = useState<GoalClarifyResponse>();
@@ -388,6 +420,9 @@ export function useGoalSetupFlow({
     },
     onSuccess: async (published) => {
       setStage("complete");
+      // The goal is bound to a session now — a later manual re-entry into
+      // goal mode for this scope must start a fresh wizard, not resume one.
+      flowSnapshotsRef.current.delete(scopeKey);
       await Promise.all([
         queryClient.invalidateQueries({
           queryKey: workspaceQueryKey(workspaceId, "goals"),
@@ -412,37 +447,106 @@ export function useGoalSetupFlow({
 
   useEffect(() => {
     const scopeChanged = activeScopeKey.current !== scopeKey;
-    if (enabled && (!wasEnabled.current || scopeChanged)) {
-      graphStreamAbortRef.current?.abort();
-      graphStreamAbortRef.current = null;
-      setStage("capture");
-      setSubmittedPrompt("");
-      setResult(undefined);
-      setAnswers({});
-      setQuestionIndex(0);
-      setDraft(undefined);
-      setGraphId("");
-      setAcceptedNodeIds(new Set());
-      setStreamPreview({ title: "", nodes: [], edges: [] });
-      observedGraphRevision.current = undefined;
-      resetClarify();
-      resetPrepareGraph();
-      resetUpdateNode();
-      resetRetryNode();
-      resetRemoveNode();
-      resetPublish();
+    if (enabled) {
+      if (!wasEnabled.current || scopeChanged) {
+        const saved = flowSnapshotsRef.current.get(scopeKey);
+        if (saved) {
+          // Re-entering goal mode for a session the user left mid-setup —
+          // restore the exact wizard state instead of losing it.
+          flowSnapshotsRef.current.delete(scopeKey);
+          setStage(saved.stage);
+          setSubmittedPrompt(saved.submittedPrompt);
+          setResult(saved.result);
+          setAnswers(saved.answers);
+          setQuestionIndex(saved.questionIndex);
+          setDraft(saved.draft);
+          setGraphId(saved.graphId);
+          setAcceptedNodeIds(new Set(saved.acceptedNodeIds));
+          setStreamPreview(saved.streamPreview);
+          observedGraphRevision.current = undefined;
+          // A mid-flight graph build was aborted on disable; clear its error
+          // so the restored review shows a clean regeneration affordance.
+          resetPrepareGraph();
+        } else {
+          graphStreamAbortRef.current?.abort();
+          graphStreamAbortRef.current = null;
+          setStage("capture");
+          setSubmittedPrompt("");
+          setResult(undefined);
+          setAnswers({});
+          setQuestionIndex(0);
+          setDraft(undefined);
+          setGraphId("");
+          setAcceptedNodeIds(new Set());
+          setStreamPreview({ title: "", nodes: [], edges: [] });
+          observedGraphRevision.current = undefined;
+          resetClarify();
+          resetPrepareGraph();
+          resetUpdateNode();
+          resetRetryNode();
+          resetRemoveNode();
+          resetPublish();
+        }
+      }
+      activeScopeKey.current = scopeKey;
+    } else if (wasEnabled.current && activeScopeKey.current) {
+      if (preserveOnDisable) {
+        // Goal mode turned off for the session that was active (session
+        // switch). Remember progress so switching back restores it; completed
+        // wizards are excluded because publishing already transitioned to a
+        // learning session.
+        if (stage !== "complete") {
+          if (stage === "graph_building") {
+            // Kill the in-flight candidate stream: it must not keep mutating
+            // state while the user is away, and the wizard would otherwise
+            // restore a dead "building" UI. The aborted mutation settles to
+            // goal_review, which matches the corrected snapshot stage below.
+            graphStreamAbortRef.current?.abort();
+            graphStreamAbortRef.current = null;
+          }
+          flowSnapshotsRef.current.set(activeScopeKey.current, {
+            stage: stage === "graph_building" ? "goal_review" : stage,
+            submittedPrompt,
+            result,
+            answers,
+            questionIndex,
+            draft,
+            graphId,
+            acceptedNodeIds: [...acceptedNodeIds],
+            streamPreview,
+          });
+          while (flowSnapshotsRef.current.size > 8) {
+            const oldest = flowSnapshotsRef.current.keys().next().value;
+            if (oldest === undefined) break;
+            flowSnapshotsRef.current.delete(oldest);
+          }
+        }
+      } else {
+        // Manual exit (目标按钮取消): discard any saved progress so the next
+        // entry starts a fresh wizard.
+        flowSnapshotsRef.current.delete(activeScopeKey.current);
+      }
     }
-    if (enabled) activeScopeKey.current = scopeKey;
     wasEnabled.current = enabled;
   }, [
+    acceptedNodeIds,
+    answers,
+    draft,
     enabled,
+    graphId,
+    preserveOnDisable,
+    questionIndex,
     resetClarify,
     resetPrepareGraph,
     resetPublish,
     resetRemoveNode,
     resetRetryNode,
     resetUpdateNode,
+    result,
     scopeKey,
+    stage,
+    streamPreview,
+    submittedPrompt,
   ]);
 
   useEffect(() => {
@@ -579,11 +683,19 @@ export function useGoalSetupFlow({
     setStage("clarifying");
   }
 
+  /** Forget any saved wizard progress for the currently active scope (manual exit). */
+  function clearProgress() {
+    if (activeScopeKey.current) {
+      flowSnapshotsRef.current.delete(activeScopeKey.current);
+    }
+  }
+
   return {
     acceptedNodeIds,
     allNodesAccepted,
     answers,
     busy,
+    clearProgress,
     confirmAndGenerateGraph,
     draft,
     error,

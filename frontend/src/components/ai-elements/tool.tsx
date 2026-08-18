@@ -97,7 +97,7 @@ export const ToolHeader = ({
         </span>
         {getStatusBadge(state)}
       </div>
-      <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+      <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=closed]:rotate-[-90deg]" />
     </CollapsibleTrigger>
   );
 };

@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 
 import { isSandboxImageArtifactPart } from "@/components/chat/sandbox-image-artifact";
+import { isSideLayoutArtifactPart } from "@/features/chat/chat-message-parts";
 import {
   OptionGroup,
   type OptionGroupChoice,
@@ -885,7 +886,14 @@ export function groupQuestionParts(parts: MessagePart[]): Array<
 export type AnswerGroup =
   | { kind: "part"; part: MessagePart }
   | { kind: "question_set"; parts: MessagePart[]; questions: QuestionItem[] }
-  | { kind: "image_strip"; parts: MessagePart[] };
+  | { kind: "image_strip"; parts: MessagePart[] }
+  | {
+      kind: "side_pair";
+      /** Introducing text segment (the reference tag's preceding prose). */
+      text: MessagePart;
+      /** Artifact explicitly placed next to the text via |layout=side. */
+      artifact: MessagePart;
+    };
 
 export function groupAnswerParts(parts: MessagePart[]): AnswerGroup[] {
   const groups = groupQuestionParts(parts);
@@ -902,5 +910,27 @@ export function groupAnswerParts(parts: MessagePart[]): AnswerGroup[] {
     }
     result.push(group);
   }
-  return result;
+  // Model-authored |layout=side references: pair the artifact with the text
+  // segment that immediately precedes it so they render side by side.
+  const paired: AnswerGroup[] = [];
+  for (let index = 0; index < result.length; index += 1) {
+    const current = result[index];
+    const next = result[index + 1];
+    if (
+      current.kind === "part" &&
+      current.part.type === "text" &&
+      next?.kind === "part" &&
+      isSideLayoutArtifactPart(next.part)
+    ) {
+      paired.push({
+        kind: "side_pair",
+        text: current.part,
+        artifact: next.part,
+      });
+      index += 1;
+      continue;
+    }
+    paired.push(current);
+  }
+  return paired;
 }

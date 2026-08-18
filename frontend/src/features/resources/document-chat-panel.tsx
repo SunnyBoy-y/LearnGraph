@@ -43,9 +43,12 @@ import {
 } from "@/components/chat/question-set-pager";
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
+import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
 import {
   groupPartsForDisplay,
+  isReasoningTextPart,
   thinkingDurationSeconds,
+  toolCallCount,
 } from "@/features/chat/chat-message-parts";
 import { Button } from "@/components/ui/button";
 import {
@@ -685,6 +688,25 @@ export function DocumentChatPanel({
                     status: type === "message.cancelled" ? "cancelled" : "failed",
                   };
                 }
+                if (type === "answer.started") {
+                  return {
+                    ...message,
+                    finalAnswerStarted: {
+                      finalPartId:
+                        typeof data.final_part_id === "string"
+                          ? data.final_part_id
+                          : undefined,
+                      boundarySequence:
+                        typeof data.boundary_sequence === "number"
+                          ? data.boundary_sequence
+                          : undefined,
+                      thinkingDurationMs:
+                        typeof data.thinking_duration_ms === "number"
+                          ? data.thinking_duration_ms
+                          : undefined,
+                    },
+                  };
+                }
                 return isMessagePart(data.part)
                   ? { ...message, parts: appendPart(message.parts, data.part) }
                   : message;
@@ -1010,17 +1032,35 @@ export function DocumentChatPanel({
                     />
                   );
                 }
+                if (group.kind === "side_pair") {
+                  // Model-authored |layout=side: text left, artifact right.
+                  return (
+                    <div
+                      className="grid gap-3 sm:grid-cols-2 sm:items-start"
+                      key={`side-pair-${group.artifact.id}`}
+                    >
+                      <div>{renderPart(group.text)}</div>
+                      <div>{renderPart(group.artifact)}</div>
+                    </div>
+                  );
+                }
                 return renderPart(group.part);
               });
             return (
               <AiMessage from={message.role === "user" ? "user" : "assistant"} key={message.id}>
                 <MessageContent className={message.role === "assistant" ? "w-full gap-2" : undefined}>
-                  {groupPartsForDisplay(parts).map((segment, index) =>
+                  {groupPartsForDisplay(parts, {
+                    boundary: message.finalAnswerStarted,
+                    live: message.status === "streaming",
+                  }).map((segment, index) =>
                     segment.kind === "chain" ? (
                       <ThinkingChain
                         chainParts={segment.parts}
                         completedDurationSec={thinkingDurationSeconds(
                           message.provider_trace,
+                        )}
+                        finalAnswerStarted={Boolean(
+                          message.finalAnswerStarted,
                         )}
                         key={`chain-${message.id}-${index}`}
                         messageStatus={message.status}
@@ -1030,8 +1070,22 @@ export function DocumentChatPanel({
                             ? message.provider_trace.generation_started_at
                             : message.created_at
                         }
+                        thinkingDurationMs={
+                          message.finalAnswerStarted?.thinkingDurationMs
+                        }
+                        toolCallCount={toolCallCount(parts)}
                       >
-                        {segment.parts.map(renderPart)}
+                        {segment.parts.map((part) =>
+                          isReasoningTextPart(part) ? (
+                            <ReasoningSummaryRow
+                              key={part.id}
+                              part={part}
+                              streaming={streaming}
+                            />
+                          ) : (
+                            renderPart(part)
+                          ),
+                        )}
                       </ThinkingChain>
                     ) : (
                       <div
