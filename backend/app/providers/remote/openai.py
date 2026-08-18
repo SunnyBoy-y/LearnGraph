@@ -1217,8 +1217,38 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         raw: dict[str, Any],
         fallback_index: int,
     ) -> None:
-        raw_index = raw.get("index", fallback_index)
-        index = raw_index if isinstance(raw_index, int) and raw_index >= 0 else fallback_index
+        if "index" not in raw:
+            # Gateways that omit ``index`` on every chunk (one tool call per SSE
+            # chunk, always fallback 0) would silently merge distinct calls into
+            # one aggregate. Prefer correlating by the stable call id when the
+            # gateway sends one; if the fallback slot is already occupied by a
+            # different id, fail loudly instead of merging.
+            raw_id = raw.get("id")
+            if isinstance(raw_id, str) and raw_id:
+                matched: int | None = None
+                for existing_index, existing in aggregates.items():
+                    if existing.get("id") == raw_id:
+                        matched = existing_index
+                        break
+                if matched is not None:
+                    index = matched
+                else:
+                    existing = aggregates.get(fallback_index)
+                    if (
+                        existing is not None
+                        and existing.get("id")
+                        and existing.get("id") != raw_id
+                    ):
+                        raise ProviderResponseError(
+                            "Compatible Chat streamed tool calls without an index "
+                            "and with conflicting ids; cannot merge safely"
+                        )
+                    index = fallback_index
+            else:
+                index = fallback_index
+        else:
+            raw_index = raw.get("index")
+            index = raw_index if isinstance(raw_index, int) and raw_index >= 0 else fallback_index
         item = aggregates.setdefault(
             index,
             {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},

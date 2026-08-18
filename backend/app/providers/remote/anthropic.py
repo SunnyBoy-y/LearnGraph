@@ -489,10 +489,16 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                                     self._merge_usage(usage)
                         elif event_type == "message_stop":
                             completed = True
+                            # Sort by the numeric content-block index so the
+                            # provider_position contract does not depend on dict
+                            # insertion order (aggregation keys are str(index)).
                             tool_calls = [
-                                item
-                                for item in tool_aggregates.values()
-                                if item.get("id") and item.get("function", {}).get("name")
+                                tool_aggregates[key]
+                                for key in sorted(tool_aggregates, key=int)
+                                if tool_aggregates[key].get("id")
+                                and tool_aggregates[key]
+                                .get("function", {})
+                                .get("name")
                             ]
                             if tool_calls:
                                 yield ProviderStreamEvent("tool_calls", tool_calls=tool_calls)
