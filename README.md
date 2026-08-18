@@ -214,7 +214,7 @@ docker compose up --build
 | 子应用 Preview | `http://127.0.0.1:18001` | 独立 origin，浏览器 iframe 按 capability token 加载 |
 | Health | `http://127.0.0.1:18000/api/v1/health` | |
 
-默认只绑定 `127.0.0.1` 且使用高位端口（18000/18001），避免与常见开发端口（5173/8000/8001/8080）撞车；这与你源码启动的监听行为一致（`npm run dev` 默认也只监听 127.0.0.1）。公网/局域网部署：
+默认只绑定 `127.0.0.1` 且使用高位端口（18000/18001）
 
 ```bash
 export LEARNGRAPH_LISTEN_HOST=0.0.0.0   # 等价于 npm run dev -- --lan
@@ -232,15 +232,17 @@ Compose 栈默认自带 **沙箱审批制出网（egress）**：`egress-proxy` �
 Agent 沙箱默认通过**独立的 sandboxd 控制面**运行：Docker socket 只挂给 sandboxd，LearnGraph 业务进程只消费其版本化、认证的 Sandbox API（不直接控制 Docker Engine，也不依赖宿主/容器同路径 bind）。Linux 启用覆盖文件：
 
 ```bash
-mkdir -p secrets && openssl rand -hex 32 > secrets/sandboxd-token
+mkdir -p secrets
+openssl rand -hex 32 > secrets/sandboxd-token
+openssl rand -hex 32 > secrets/sandboxd-admin-token   # Bootstrap 管理面（拉取+digest+冒烟）
 export LEARNGRAPH_DATA_DIR=/var/lib/learngraph
 export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
 docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
 ```
 
-覆盖模式下：`app` 无 Docker socket、无 same-path bind；`sandboxd` 独占 socket 并通过 `sandbox-control` 内部网络提供服务，不发布宿主端口；sandbox 使用独立 named volume 与 per-sandbox 内部 egress 网络；runner 镜像须为不可变 sha256 digest（通过 sandboxd Bootstrap 安装，或设置 `LEARNGRAPH_SANDBOX_IMAGE`）。若你此前手动建过 `learngraph-egress` 网络，请先删除（`docker network rm learngraph-egress`），由 Compose/daemon 统一管理。
+覆盖模式下：`app` 无 Docker socket、无 same-path bind；`sandboxd` 独占 socket 并通过 `sandbox-control` 内部网络提供服务，不发布宿主端口；sandbox 使用独立 named volume 与 per-sandbox 内部 egress 网络；runner 镜像须为不可变 sha256 digest——在页面「初始化沙箱」时由 sandboxd 拉取 prebuilt 镜像（`LEARNGRAPH_SANDBOX_PREBUILT_IMAGE`）→ 解析 RepoDigest → 离线冒烟（Python/Node）→ 记录为 active runtime，也可直接设置 `LEARNGRAPH_SANDBOX_IMAGE` 跳过 Bootstrap。若你此前手动建过 `learngraph-egress` 网络，请先删除（`docker network rm learngraph-egress`），由 Compose/daemon 统一管理。
 
-Windows / Docker Desktop 请继续用上面的 `npm run dev` 跑后端，让本机 Docker 提供沙箱（sandboxd 模式下需额外启动本地 sandboxd 进程，见 `sandboxd/` 与 `backend/.env.example`）；不要把 Compose 里的 named volume 路径传给 dockerd。本地开发同样可以启用 egress（与 Docker 部署同款代理）：
+Windows / Docker Desktop 请继续用上面的 `npm run dev` 跑后端，让本机 Docker 提供沙箱：dev 脚本会自动拉起本地 sandboxd 进程（token 与 state 生成在忽略的 `backend/data/.sandboxd/` 下），无需手动额外启动；不要把 Compose 里的 named volume 路径传给 dockerd。本地开发同样可以启用 egress（与 Docker 部署同款代理）：
 
 ```bash
 docker network create learngraph-egress
@@ -248,6 +250,22 @@ docker network create learngraph-egress
 LEARNGRAPH_SANDBOX_EGRESS_PROXY_URL=http://host.docker.internal:8888 \
   uv run python -m app.services.egress_proxy_main
 ```
+
+### 宿主机服务桥（Host Service Bridge，可选）
+
+容器内 `127.0.0.1` 是容器自己，整体 Docker 部署无法直接访问宿主机回环服务（Ollama、LM Studio、本地 HTTP MCP、本地 API）。**Host Service Bridge** 是运行在真实机器上的授权反向代理：只转发注册表里显式放行的服务（默认 DENY、目标默认仅 loopback、逐请求 Bearer token 认证），每次允许/拒绝都写 JSONL 审计；backend 的 Host Service Resolver 在容器内把 loopback 的 Provider / MCP 地址改写到 `{bridge}/services/<id>/...`，业务数据里始终保存逻辑地址，无需向宿主机开放任意端口。
+
+**宿主机一键启动**（真实机器上、仓库根目录，幂等可重复执行）：
+
+```bash
+node scripts/host-bridge.mjs
+```
+
+脚本自动完成三件事：① 生成/复用 `data/host-bridge/token`（Bearer token，已被 git 忽略）；② 在 `data/host-bridge/host-services/` 写入注册表模板（`ollama.json` / `lm-studio.json`，默认 `enabled: false`——服务就绪后改成 `true` 即放行）；③ 启动 bridge（默认端口 `34115`）。
+
+**容器侧零配置**：compose 已内置 `extra_hosts: host.docker.internal:host-gateway`，容器化部署自动推导 bridge 地址 `http://host.docker.internal:34115`，并默认把 `./data/host-bridge/token` 挂载为容器内凭据（backend 以 `X-LearnGraph-Host-Bridge-Token` 头发送）——直接 `docker compose up --build` 即可，无需额外环境变量；未启动 bridge 时后端自动跳过认证头，前端 Provider 管理页会显示实时状态与操作指引。
+
+自定义时通过环境变量覆盖：`LEARNGRAPH_HOST_BRIDGE_URL`（自定义端口/远程 bridge）、`LEARNGRAPH_HOST_BRIDGE_AUTO=false`（完全禁用桥接）、`LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE`（更换 token 挂载来源）。源码模式（`npm run dev`）默认不经过桥：loopback 地址直接解析，零影响。
 
 更完整的变量说明见仓库根目录 `.env.example` 和 `backend/.env.example`。
 
@@ -365,6 +383,7 @@ LearnGraph/
 | `npm run check:backend` | 仅执行后端检查 |
 | `npm run build:frontend` | 构建前端生产产物 |
 | `docker compose up --build` | 用容器启动 Web/API 与 Preview |
+| `node scripts/host-bridge.mjs` | 宿主机一键启动 Host Service Bridge（Docker 部署访问本机服务，可选） |
 
 `npm run dev` 会从 5173 开始自动选择第一个可用的前端端口，终端会显示实际地址。公共代码快照不包含内部开发文档、测试夹具或浏览器产物，因此 `npm run check` 不代表真实 E2E 或远程 Provider 验收已经完成。
 

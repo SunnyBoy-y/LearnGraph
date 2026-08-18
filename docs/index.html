@@ -448,7 +448,7 @@ npm.cmd run check</code></pre>
             <div><span>Image</span><strong>文生图 / 图生图 / 参考图编辑（gpt-image-2 · qwen-image-edit · qwen_image_search）</strong><small>图片模型独立 lane，拦截误作文本模型</small></div>
             <div><span>ASR</span><strong>DashScope 转录（实时 + 录音转写）</strong><small>qwen 行兜底路由 · input_audio 直连 · 异步录音识别；沙箱内音频走宿主侧 ASR 桥</small></div>
             <div><span>Storage</span><strong>Local filesystem · MinIO</strong><small>通过迁移流程切换</small></div>
-            <div><span>Sandbox</span><strong>Docker backend</strong><small>无 Docker 时明确 unavailable，不落回宿主执行</small></div>
+            <div><span>Sandbox</span><strong>sandboxd 控制面</strong><small>app 无 Docker 权限；sandboxd 独占 socket/named volume/内部网络，不可用时明确 unavailable</small></div>
           </div>
           <h3>能力快照与按供应商门控</h3>
           <p>
@@ -759,9 +759,12 @@ npm.cmd run check</code></pre>
           <p>
             沙箱是 <strong>Docker-only、默认断网、按「聊天会话 × 属主用户」隔离</strong>的代码与文件执行边界。
             宿主机永远不是 fallback：Docker、镜像 digest 或配置缺失时 probe 返回明确 unavailable，不会退化执行。
+            自 <strong>sandboxd 控制面</strong>（独立进程/服务）起，LearnGraph 业务进程不再直接控制 Docker Engine：
+            它只消费版本化、认证的 Sandbox API（create/exec/file/lifecycle），Docker socket、named volume 与
+            per-sandbox 内部 egress 网络均由 sandboxd 独占管理；app 生产镜像不再包含 Docker SDK。
             系统内有两条互相独立的执行路径——<code>sandbox-policy-v1</code> 固定任务（只能跑内置 runner 检查已上传文件）与
             <code>sandbox-agent-v1</code> Agent 工作区（模型写文件、跑 <code>.py</code>/<code>.js</code> 脚本）——共用同一张
-            <code>SandboxSession</code> 表与容器后端，但按 <code>policy_revision</code> 严格互斥。
+            <code>SandboxSession</code> 表与后端，但按 <code>policy_revision</code> 严格互斥。
           </p>
 
           <div class="sandbox-diagram">
@@ -769,14 +772,14 @@ npm.cmd run check</code></pre>
               <span class="diagram-label">LearnGraph host</span>
               <div class="host-service">SandboxAgentWorkspaceService<small>argv 策略 · 授权 · 配额 · 审计 · 计费桥（ASR）· Artifact</small></div>
               <div class="sandbox-boundary">
-                <span class="diagram-label">Docker boundary · network=none · read-only rootfs · uid 65532</span>
+                <span class="diagram-label">Sandboxd API（版本化 · bearer 认证 · ownership scope）→ Docker boundary · network=none · read-only rootfs · uid 65532</span>
                 <div class="container-box">
                   <strong>Unified Runner 镜像</strong>
-                  <span>Python 3.12 + Node + Chromium + ffmpeg · digest pin</span>
+                  <span>Python 3.12 + Node + Chromium + ffmpeg · digest pin（sandboxd Bootstrap 拉取+冒烟）</span>
                 </div>
                 <div class="workspace-box">
-                  <strong>/workspace bind mount</strong>
-                  <span>inputs / work / outputs · 用户×会话隔离</span>
+                  <strong>/workspace named volume</strong>
+                  <span>inputs / work / outputs · 每沙箱独立 volume · 用户×会话隔离</span>
                 </div>
               </div>
             </div>

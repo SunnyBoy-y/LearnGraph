@@ -347,8 +347,6 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
             "以及 thinking 模型的原生 think 参数（low/medium/high/max）。"
             "默认无需 API Key；若启用了 OLLAMA_API_KEY 可在此填写。"
             "地址始终填本机逻辑地址 http://127.0.0.1:11434/v1：整体 Docker "
-            "部署时由 Host Service Bridge 自动转发到宿主机（见 "
-            "docs/host-service-bridge.md），源码启动时直连。"
         ),
         requires_base_url=True,
         requires_secret=False,

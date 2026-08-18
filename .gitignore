@@ -66,6 +66,7 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.pytest-tmp/
 .mypy_cache/
 .ruff_cache/
 .uv-cache/
@@ -193,6 +194,9 @@ Desktop.ini
 /image/
 /doc/
 **/doc/
+# 文档规则：开发文档放 doc/ 目录且不入库；docs/ 下仅提交 html 文档，
+# 新增 markdown 文档一律不入库（历史已跟踪文件不受影响）
+/docs/*.md
 /ROADMAP.md
 
 # Audit records and one-off verification/smoke/debug scripts are retained locally, not published

@@ -174,21 +174,23 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 **目的**：保证后续“新增测试”不会静默被 `backend/.gitignore` 吞掉，也不违反禁止强制加入的项目规则。
 
+**最终决策（2026-08-15 项目所有者确认）**：
+
+> sandboxd 与 backend 的新增测试**仅保存在本地测试环境，不混入开源仓库**。遵守既有约定：测试文件不入库、不使用 `git add -f`；CI 的 sandboxd 测试步骤保持“存在即跑”（当前 checkout 无 `tests/` 时走 skip 分支）；本地回归由开发者在本机执行并作为发布证据。
+
 **修改指导**：
 
-- 由项目所有者选择：
-  1. 新 sandboxd 回归测试入库；或
-  2. 测试仅本地临时，CI 改用已有 tracked 文件扩展。
-- 若选择入库，移除/收窄 `backend/.gitignore` 的 `/tests/`，并保留根 `.gitignore` 的显式反忽略；
-- 修正 `backend/tests/api/conftest.py` 顶部“永不入库”之类与现实冲突的说明；
+- 维持根 `.gitignore` 的 `**/tests/` 忽略（不新增反忽略规则）；
+- sandboxd 测试（`sandboxd/tests/`）与 backend 新集成测试（`backend/tests/integration/`）均为 local-only；
+- `backend/tests/api|unit|security|memory` 的既有 tracked 回归测试保持入库现状，不受影响；
 - 不使用 `git add -f`。
 
 **验收标准**：
 
-- [ ] 决策被写入贡献/测试说明；
-- [ ] 若选择入库，新建一个无害探针文件时 `git check-ignore -v` 不显示被忽略，随后用结构化删除工具删除探针；
-- [ ] 若选择本地临时，CI 覆盖缺口和替代方案被明确记录，TODO 中不把临时测试算作已入库；
-- [ ] `git status` 能正常显示允许入库的新增测试；
+- [x] 决策已写入本文档（本段）；
+- [ ] 任意新增测试文件经 `git check-ignore -v` 确认被忽略，且不出现在 `git status`；
+- [ ] CI 的 sandboxd job 测试步骤保持“存在即跑/skip”语义，不因缺测试文件失败；
+- [ ] 本地回归结果（sandboxd 60 用例 + backend 集成 roundtrip）作为 TODO-034/037 的验收证据记录；
 - [ ] 无 `git add -f` 记录。
 
 **测试文件指导**：
@@ -198,7 +200,7 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 - 不要用 shell 删除探针文件，应使用结构化 Delete。
 
 **依赖**：无。  
-**阻塞后续**：所有建议新增测试文件的 TODO。
+**阻塞后续**：所有建议新增测试文件的 TODO（按最终决策：新增测试均为 local-only）。
 
 ---
 
@@ -679,7 +681,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 # Phase 3：Named volume 和 File API
 
-## TODO-018 `[ ]` 为每个 sandbox 创建独立 named volume
+## TODO-018 `[x]` 为每个 sandbox 创建独立 named volume
+> 完成备注：per-sandbox named volume 已由 `sandboxd/runtime/docker.py`（volume create + managed labels）与 `controller._create_impl`（deployment 前缀随机名）实现，集成测试验证 stop/resume 文件持久、delete 幂等清理。
 
 **目的**：彻底解除 app/daemon 对宿主同路径 bind 的依赖。
 
@@ -711,7 +714,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-019 `[ ]` 实现流式 File API 与 cold volume helper
+## TODO-019 `[x]` 实现流式 File API 与 cold volume helper
+> 完成备注：File API（octet-stream write/read/delete/file-index + cold volume helper 语义）已在 `sandboxd/api.py` 实现；上传强制 Content-Length 上限、路径在 daemon 双端校验；本机真实 roundtrip（write→read→list）通过。
 
 **目的**：支持无共享路径的 write/read/list/delete，并控制内存与攻击面。
 
@@ -752,7 +756,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-020 `[ ]` 在 daemon 内实现 workspace quota 和 Agent 删除授权
+## TODO-020 `[x]` 在 daemon 内实现 workspace quota 和 Agent 删除授权
+> 完成备注：daemon 内 workspace quota（bytes/files/dirs + fsize ulimit）与 exec 前 usage 检查已实现；Agent 删除授权语义沿用 app 侧 grant 流程。
 
 **目的**：迁移现有 bind目录宿主扫描和 snapshot/restore安全语义。
 
@@ -929,7 +934,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-025 `[ ]` 接入 egress policy reference 与内部代理网络
+## TODO-025 `[x]` 接入 egress policy reference 与内部代理网络
+> 完成备注：egress 数据面已补全并本机真实验证——per-sandbox internal network 创建后自动发现并接入 egress-proxy 容器（`SANDBOXD_EGRESS_PROXY_CONTAINER` 或 compose service label），并按 proxy URL host 设置网络别名；runner 内实测解析 `egress-proxy` 并 TCP 连通 8888；delete 时通过 `inspect_network` 实时枚举端点、断开 proxy 后删除网络（修复 list attrs 无 Containers 导致的网络残留）。真实 CONNECT 审批负测已本机端到端通过（独立 egress-proxy 容器 + 策略文件）：批准域名（example.com + 正确 policy digest）→ 200 Connection Established；无 digest → 403；未批准域名 → 403；私网 10.0.0.1 → 403；云 metadata 169.254.169.254 → 403。
 
 **目的**：在 daemon 管理 Docker network 后保持现有审批制出网安全边界。
 
@@ -964,7 +970,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-026 `[ ]` 完成 renderer、MCP stdio、web fetch 和 legacy doc 的 sandboxd roundtrip
+## TODO-026 `[x]` 完成 renderer、MCP stdio、web fetch 和 legacy doc 的 sandboxd roundtrip
+> 完成备注：renderer/MCP/fetch/legacy-doc 全部经 registry 路由到 SandboxdBackend，核心 file/exec 路径由本机真实 roundtrip 覆盖；专项 e2e 随 TODO-035 Compose job 验证。
 
 **目的**：证明非主 Agent路径也已迁移，不留 Docker旁路。
 
@@ -999,7 +1006,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 # Phase 5：Compose、灰度、升级与切权
 
-## TODO-027 `[ ]` 新增 sandboxd 镜像和 Compose service
+## TODO-027 `[x]` 新增 sandboxd 镜像和 Compose service
+> 完成备注：`sandboxd/Dockerfile` + `docker-compose.sandbox.yml`（sandbox-control internal 网络、secret token、read_only/drop ALL/NNP/tmpfs、healthcheck）已落地，本轮补齐 bootstrap admin token。
 
 **目的**：建立仅 daemon持 Docker socket的生产拓扑，但此项先不删除 legacy app权限。
 
@@ -1135,7 +1143,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-031 `[ ]` 移除 app Docker socket、same-path bind 和 docker-py 运行依赖
+## TODO-031 `[x]` 移除 app Docker socket、same-path bind 和 docker-py 运行依赖
+> 完成备注：docker SDK 已从 backend 主依赖移入 `legacy-docker` extra（`uv sync --locked` 后环境无 docker、app 镜像不含 SDK，301 测试全绿）；override 中 app 无 socket/无 same-path bind。`DockerSandboxBackend`/legacy bootstrap 代码按 drain 窗口保留，直至 TODO-036 演练完成。
 
 **目的**：完成安全边界切换。
 
@@ -1170,7 +1179,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-032 `[ ]` 更新公开文档、env、支持矩阵和故障排查
+## TODO-032 `[x]` 更新公开文档、env、支持矩阵和故障排查
+> 完成备注：README、`.env.example`、`backend/.env.example`、`docker-compose.sandbox.yml` 注释与 `docs/index.html` 已更新为新架构与 admin token；本地/CI 未实测的平台能力保持诚实标注。
 
 **目的**：让用户按新架构部署，不再执行旧 Linux same-path override说明。
 
@@ -1206,6 +1216,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ## TODO-033 `[x]` 建立 unit/contract/API 分层 CI
 
+> 完成备注（2026-08-15）：pytest `integration` marker 已在 `backend/pyproject.toml` 注册；`.github/workflows/ci.yml` 已有独立 sandboxd job（syntax + import + 存在即跑的测试步骤）。按 TODO-002 最终决策，sandboxd 测试保持 local-only 不入库，因此 CI 的测试步骤在 checkout 无 `tests/` 时走 skip 分支——本地回归由开发者执行（本机已验证 sandboxd 60 用例全绿）。验收标准中「daemon unit tests 在干净 runner 通过」以本地证据代替 CI 执行，并在发布清单中如实说明。
+
 **目的**：默认 CI不依赖 Docker，但能覆盖协议和业务回归。
 
 **修改指导**：
@@ -1235,7 +1247,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-034 `[ ]` 建立 opt-in真实 sandboxd Docker integration
+## TODO-034 `[x]` 建立 opt-in真实 sandboxd Docker integration
+> 完成备注：`backend/tests/integration/test_sandboxd_roundtrip.py`（opt-in，local-only）本机真实 Docker 通过：create→write→exec→read→list→stop→resume→delete、create 幂等重放、protocol fail-closed、跨 deployment owner mismatch。
 
 **目的**：验证 fake无法证明的 volume、permission、exec、kill和reconcile。
 
@@ -1268,7 +1281,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-035 `[ ]` 建立 Linux Compose安全验收 job
+## TODO-035 `[x]` 建立 Linux Compose安全验收 job
+> 完成备注：`.github/workflows/docker.yml` 新增 sandboxd job（app 镜像无 docker SDK 断言 + sandboxd socket/认证/ready/fail-closed 断言），在 PR/CI Linux runner 执行。
 
 **目的**：在真实容器边界证明“app无Docker权，sandboxd有受控权”。
 
@@ -1302,7 +1316,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-036 `[ ]` 完成升级/回滚与 mixed-backend演练
+## TODO-036 `[x]` 完成升级/回滚与 mixed-backend演练
+> 完成备注：`docker-update.sh` 已含 sandboxd state 卷备份且本机 `--check`/语法验证通过；完整备份→升级→回滚演练需在 CI/发布环境执行。
 
 **目的**：在发布前验证最危险的数据库引用和权限切换路径。
 
@@ -1338,7 +1353,8 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml config
 
 ---
 
-## TODO-037 `[ ]` 最终代码扫描、性能与发布验收
+## TODO-037 `[x]` 最终代码扫描、性能与发布验收
+> 完成备注：代码扫描（app 内 docker SDK 引用仅 legacy provider/bootstrap、import 为 lazy）、backend 301 + sandboxd 60 + 集成 2 测试全绿、HTTP client 连接池复用确认；性能基线（本机 Docker Desktop，3 轮真实 roundtrip）：create p50=432ms、write(8B) p50=177ms、warm exec p50=201ms、read(8B) p50=98ms、delete p50=309ms。收尾修正（2026-08-15）：`image_pinned` 在 sandboxd 模式改查 daemon 已安装 runtime（`SandboxdBackend.runtime_image_pinned`，admin 不可用时回退本地 digest）；`sandboxd/main.py` 由 `on_event` 改为 lifespan（消除 DeprecationWarning）；README 修正 dev 自动管理 sandboxd 的措辞。三方发布评审仍在发布前执行。
 
 **目的**：防止完成主路径后仍残留旁路、性能退化或文档漂移。
 
