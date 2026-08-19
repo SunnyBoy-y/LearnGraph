@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import httpx
 
@@ -47,6 +47,82 @@ def _safe_image_url(value: Any) -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return None
     return candidate[:2_000]
+
+
+# Query parameters that exist purely for campaign/click tracking. Two pages that
+# differ only in these share the same content, so they must collapse to one
+# deduplication key instead of surfacing as separate (duplicate) sources.
+_TRACKING_QUERY_PARAMS = frozenset(
+    {
+        "gclid",
+        "fbclid",
+        "dclid",
+        "msclkid",
+        "yclid",
+        "twclid",
+        "igshid",
+        "mc_cid",
+        "mc_eid",
+        "li_fat_id",
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "utm_id",
+        "utm_campaignid",
+        "utm_source_platform",
+    }
+)
+
+
+def normalize_result_url(value: str) -> str:
+    """Collapse URL variants that point at the same page into one key.
+
+    Case-folded scheme/host, default ports, trailing slashes, URL fragments and
+    known tracking parameters are dropped; remaining query pairs are sorted so
+    ``?a=1&b=2`` and ``?b=2&a=1`` match. Non-http(s) values fall back to the
+    exact string so the key is still deterministic.
+    """
+    parsed = urlparse(value)
+    scheme = (parsed.scheme or "").casefold()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return value.casefold().strip()
+    hostname = parsed.hostname.casefold().strip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port in {80, 443}:
+        port = None
+    authority = hostname if port is None else f"{hostname}:{port}"
+    path = (parsed.path or "/").rstrip("/") or "/"
+    kept: list[str] = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.casefold() in _TRACKING_QUERY_PARAMS:
+            continue
+        kept.append(f"{key}={item}")
+    query = "&".join(sorted(kept))
+    return urlunparse((scheme, authority, path, "", query, ""))
+
+
+def dedupe_search_results(results: list[SearchResult]) -> list[SearchResult]:
+    """Drop duplicate pages, keeping the first (highest-ranked) occurrence.
+
+    Search providers routinely return the same page twice — duplicated entries,
+    engine merges, or tracking-parameter variants. Deduplicating here (before
+    the list reaches the model and the source_list part) keeps citation indexes
+    consistent: the model only ever sees the unique list it is asked to cite.
+    """
+    seen: set[str] = set()
+    deduped: list[SearchResult] = []
+    for result in results:
+        key = normalize_result_url(result.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(result)
+    return deduped
 
 
 class SearXNGSearchProvider:
@@ -142,7 +218,7 @@ class SearXNGSearchProvider:
             )
             if len(results) >= max_results:
                 break
-        return results
+        return dedupe_search_results(results)
 
     def probe(self) -> dict[str, object]:
         results = self.search("LearnGraph provider capability check", 1)
@@ -290,7 +366,7 @@ class CloudSearchProvider:
             )
             if len(results) >= max_results:
                 break
-        return results
+        return dedupe_search_results(results)
 
     def probe(self) -> dict[str, object]:
         results = self.search("LearnGraph provider capability check", 1)

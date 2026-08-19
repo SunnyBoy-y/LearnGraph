@@ -17,6 +17,7 @@ from app.providers.remote.search import (
     SearchProviderError,
     SearchProviderResponseError,
     SearchProviderTimeout,
+    dedupe_search_results,
     domain_is_allowed,
     normalize_domain,
 )
@@ -182,7 +183,7 @@ class QwenResponsesToolProvider:
             )
             if len(results) >= max_results:
                 break
-        return results
+        return dedupe_search_results(results)
 
     def fetch(self, url: str) -> FetchedDocument:
         try:

@@ -25,6 +25,7 @@ from app.providers.remote.search import (
     SearchProviderError,
     SearchProviderResponseError,
     SearchProviderTimeout,
+    dedupe_search_results,
     domain_is_allowed,
     normalize_domain,
 )
@@ -331,7 +332,7 @@ class OllamaCloudSearchProvider:
             )
             if len(results) >= max_results:
                 break
-        return results
+        return dedupe_search_results(results)
 
     def probe(self) -> dict[str, object]:
         results = self.search("LearnGraph provider capability check", 1)

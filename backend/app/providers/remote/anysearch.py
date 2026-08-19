@@ -13,6 +13,7 @@ from app.providers.remote.search import (
     SearchProviderError,
     SearchProviderResponseError,
     SearchProviderTimeout,
+    dedupe_search_results,
     domain_is_allowed,
     normalize_domain,
 )
@@ -250,7 +251,7 @@ class AnySearchSearchProvider:
             fetched_at=fetched_at,
         )
         if structured_results is not None:
-            return structured_results
+            return dedupe_search_results(structured_results)
 
         text = self._result_text(result)
         # A future AnySearch server can return a JSON document inside its text
@@ -267,12 +268,14 @@ class AnySearchSearchProvider:
             fetched_at=fetched_at,
         )
         if parsed_inline is not None:
-            return parsed_inline
-        return self._markdown_results(
-            text,
-            max_results=requested_results,
-            permitted_domains=permitted_domains,
-            fetched_at=fetched_at,
+            return dedupe_search_results(parsed_inline)
+        return dedupe_search_results(
+            self._markdown_results(
+                text,
+                max_results=requested_results,
+                permitted_domains=permitted_domains,
+                fetched_at=fetched_at,
+            )
         )
 
     def probe(self) -> dict[str, object]:
