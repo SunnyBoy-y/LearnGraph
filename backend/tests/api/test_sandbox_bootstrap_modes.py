@@ -159,9 +159,9 @@ class TestAutoModeLocalBuildFallback:
 
     A failed prebuilt pull (image not pushed, private registry without login,
     wrong tag) must fall back to the local Docker build instead of stranding
-    the deployment uninitialized — even when the settings page persisted
-    source mode ``prebuilt``.  Only explicit ``prebuilt`` requests keep
-    failing closed.
+    the deployment uninitialized.  The deployment-level source config
+    (settings page) is authoritative: a persisted ``prebuilt`` source fails
+    closed and never degrades to a local build.
     """
 
     @staticmethod
@@ -191,36 +191,28 @@ class TestAutoModeLocalBuildFallback:
         assert job.image_digest == _FakeImage.id
         assert job.error_code is None
 
-    def test_auto_mode_falls_back_even_when_source_mode_is_prebuilt(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        """One-click init (auto) degrades even with a persisted prebuilt source.
+    def test_persisted_prebuilt_source_fails_closed(self, monkeypatch, tmp_path) -> None:
+        """Deployment-level ``prebuilt`` source must never degrade to a build.
 
-        The settings page may persist source mode ``prebuilt`` (the operator
-        prefers the registry image), but a failed pull must still degrade to
-        the local build instead of stranding the deployment uninitialized.
-        Only an explicit request mode ``prebuilt`` fails closed.
+        The settings page persisted source mode ``prebuilt``; even though the
+        one-click init request is "auto", the deployment source is
+        authoritative and a failed pull fails closed (no local-build
+        fallback).
         """
-        from app.services import sandbox_bootstrap as sb
         from app.services.sandbox_runtime import save_bootstrap_source
 
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
         monkeypatch.setattr(service, "_pull_prebuilt_image", self._failing_pull(service))
-        monkeypatch.setattr(service, "_sandbox_root", lambda: tmp_path)
-        (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
-        monkeypatch.setattr(service, "_smoke_test", lambda *args, **kwargs: None)
-        monkeypatch.setattr(sb, "save_runtime_config", lambda *args, **kwargs: None)
-        monkeypatch.setattr(service, "_docker_client", lambda: _FakeDockerClient())
-        settings = Settings(sandbox_enabled=True)
+        settings = Settings(sandbox_enabled=True, storage_root=tmp_path / "storage")
         save_bootstrap_source(
             settings, mode="prebuilt", prebuilt_image=ACR_REF, actor_id="u-test"
         )
-        job = BootstrapJob(id="u-fallback-persisted", actor_id="u-test", mode="auto")
+        job = BootstrapJob(id="u-persisted-prebuilt", actor_id="u-test", mode="auto")
         service._run_job(job, settings)  # noqa: SLF001 - unit-level verification
-        assert job.status == "succeeded"
-        assert any("[auto-fallback]" in line for line in job.log_lines)
-        assert job.error_code is None
+        assert job.status == "failed"
+        assert job.error_code == "prebuilt_pull_failed"
+        assert not any("[auto-fallback]" in line for line in job.log_lines)
 
     def test_explicit_prebuilt_mode_does_not_fallback(self, monkeypatch) -> None:
         service = SandboxBootstrapService()
@@ -232,6 +224,97 @@ class TestAutoModeLocalBuildFallback:
         assert job.status == "failed"
         assert job.error_code == "prebuilt_pull_failed"
         assert not any("[auto-fallback]" in line for line in job.log_lines)
+
+
+class TestDeploymentSourceAuthoritative:
+    """The persisted「沙箱镜像来源」deployment source governs initialization.
+
+    The one-click init posts no body (mode="auto"), which must defer to the
+    deployment-level source config instead of always degrading to a local
+    build or ignoring a forced "build" strategy.
+    """
+
+    LEGACY = {"sandbox_backend": "docker"}
+
+    def test_start_resolves_persisted_prebuilt_source(self, monkeypatch, tmp_path) -> None:
+        from app.services.sandbox_runtime import save_bootstrap_source
+
+        service = SandboxBootstrapService()
+        monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        monkeypatch.setattr(service, "_run_job", lambda job, s: None)
+        settings = Settings(
+            sandbox_enabled=True, storage_root=tmp_path / "storage", **self.LEGACY
+        )
+        save_bootstrap_source(
+            settings, mode="prebuilt", prebuilt_image=ACR_REF, actor_id="u-test"
+        )
+        result = service.start(settings, actor_id="u-test", mode="auto")
+        assert result["accepted"] is True
+        assert result["job"]["mode"] == "prebuilt"
+
+    def test_start_resolves_persisted_build_source(self, monkeypatch, tmp_path) -> None:
+        from app.services.sandbox_runtime import save_bootstrap_source
+
+        service = SandboxBootstrapService()
+        monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        monkeypatch.setattr(service, "_run_job", lambda job, s: None)
+        settings = Settings(
+            sandbox_enabled=True, storage_root=tmp_path / "storage", **self.LEGACY
+        )
+        save_bootstrap_source(
+            settings, mode="build", prebuilt_image=ACR_REF, actor_id="u-test"
+        )
+        result = service.start(settings, actor_id="u-test", mode="auto")
+        assert result["accepted"] is True
+        assert result["job"]["mode"] == "build"
+
+    def test_persisted_build_source_skips_prebuilt(self, monkeypatch, tmp_path) -> None:
+        """A persisted ``build`` source must ignore the prebuilt reference."""
+        from app.services import sandbox_bootstrap as sb
+        from app.services.sandbox_runtime import save_bootstrap_source
+
+        service = SandboxBootstrapService()
+        monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        monkeypatch.setattr(service, "_pull_prebuilt_image", self._unexpected_pull(service))
+        monkeypatch.setattr(service, "_sandbox_root", lambda: tmp_path)
+        (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        monkeypatch.setattr(service, "_smoke_test", lambda *args, **kwargs: None)
+        monkeypatch.setattr(sb, "save_runtime_config", lambda *args, **kwargs: None)
+        monkeypatch.setattr(service, "_docker_client", lambda: _FakeDockerClient())
+        settings = Settings(
+            sandbox_enabled=True, storage_root=tmp_path / "storage", **self.LEGACY
+        )
+        save_bootstrap_source(
+            settings, mode="build", prebuilt_image=ACR_REF, actor_id="u-test"
+        )
+        job = BootstrapJob(id="u-build-source", actor_id="u-test", mode="auto")
+        service._run_job(job, settings)  # noqa: SLF001 - unit-level verification
+        assert job.status == "succeeded"
+        assert job.image_digest == _FakeImage.id
+
+    @staticmethod
+    def _unexpected_pull(service: SandboxBootstrapService):
+        def _pull(job: BootstrapJob, settings: Settings, ref: str) -> str | None:
+            pytest.fail("persisted build source must not pull the prebuilt image")
+
+        return _pull
+
+    def test_sandboxd_rejects_persisted_build_source(self, tmp_path) -> None:
+        """sandboxd backend + persisted ``build`` source fails closed."""
+        from app.services.sandbox_runtime import save_bootstrap_source
+
+        service = SandboxBootstrapService()
+        settings = Settings(
+            sandbox_enabled=True,
+            sandbox_backend="sandboxd",
+            storage_root=tmp_path / "storage",
+        )
+        save_bootstrap_source(
+            settings, mode="build", prebuilt_image=ACR_REF, actor_id="u-test"
+        )
+        result = service.start(settings, actor_id="u-test", mode="auto")
+        assert result["accepted"] is False
+        assert result["error_code"] == "sandboxd_build_unsupported"
 
 
 class TestBootstrapStartHttpContract:

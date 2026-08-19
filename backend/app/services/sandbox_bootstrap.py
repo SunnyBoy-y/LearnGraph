@@ -737,11 +737,16 @@ class SandboxBootstrapService:
         daemon_detail: str | None = client_error
         daemon_reasons: list[str] = []
         runtimes: list[dict[str, Any]] = []
+        ready: dict[str, Any] | None = None
         admin_configured = client is not None
         if client is not None:
             try:
                 ready = client.get_ready()
-                daemon_reachable = bool(ready.get("ready"))
+                # A responding control plane is reachable even when it is not
+                # fully ready (e.g. no runtime image installed yet) — that gap
+                # is exactly what bootstrap fixes, so reachability must not be
+                # conflated with the daemon's ready flag.
+                daemon_reachable = True
                 docker_reachable = bool(ready.get("docker"))
                 daemon_reasons = [str(r) for r in (ready.get("reasons") or [])]
             except (SandboxdUnavailable, SandboxdProtocolError) as exc:
@@ -761,7 +766,13 @@ class SandboxBootstrapService:
             if record and image_ref_is_pinned(str(record.get("image_digest") or ""))
             else None
         )
-        image_ready = bool(record and record.get("smoke_status") == "passed")
+        record_ready = bool(record and record.get("smoke_status") == "passed")
+        # The daemon's health verdict owns "runtime environment" truth: a
+        # surviving store record is not enough — the image must still exist in
+        # Docker Engine. Deleting the sandbox environment while running (e.g.
+        # docker rmi) must flip the UI from 已就绪 back to 未就绪.
+        runtime_ok = bool(ready.get("runtime")) if ready is not None else False
+        image_ready = runtime_ok and record_ready
 
         try:
             _, effective_prebuilt = effective_bootstrap_source(settings)
@@ -770,7 +781,12 @@ class SandboxBootstrapService:
             prebuilt_ref = None
 
         remediation: list[str] = []
-        can_initialize = settings.sandbox_enabled and daemon_reachable and admin_configured
+        can_initialize = (
+            settings.sandbox_enabled
+            and daemon_reachable
+            and docker_reachable
+            and admin_configured
+        )
         if not settings.sandbox_enabled:
             remediation.append("部署已关闭沙箱（LEARNGRAPH_SANDBOX_ENABLED=false）")
             can_initialize = False
@@ -780,11 +796,18 @@ class SandboxBootstrapService:
                     "确认 sandboxd 控制面已启动且健康",
                     daemon_detail or "sandboxd 不可达",
                 ]
-                + daemon_reasons
             )
             can_initialize = False
         elif not admin_configured:
             remediation.append("sandboxd admin token 未配置，无法初始化沙箱运行环境")
+            can_initialize = False
+        elif not docker_reachable:
+            remediation.extend(
+                [
+                    "sandboxd 所在主机的 Docker 引擎不可达，请先启动 Docker 后重试",
+                ]
+                + daemon_reasons
+            )
             can_initialize = False
         elif image_ready:
             remediation.append("沙箱运行环境已就绪，可直接在会话中使用 Agent 文件与代码能力")
@@ -795,6 +818,7 @@ class SandboxBootstrapService:
                     "点击「初始化沙箱」让 sandboxd 拉取并冒烟检查预构建 Runner 镜像",
                     "sandboxd 模式只支持 prebuilt 镜像；本地构建仅在 docker backend 下可用",
                 ]
+                + daemon_reasons
             )
             if prebuilt_ref is None:
                 remediation.append("请先配置 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE")
@@ -934,9 +958,30 @@ class SandboxBootstrapService:
             "status": self._sandboxd_status(settings),
         }
 
+    @staticmethod
+    def _resolve_bootstrap_mode(settings: Settings, request_mode: str) -> str:
+        """Resolve the authoritative bootstrap strategy.
+
+        ``request_mode`` is the per-invocation selection. The deployment-level
+        source config (settings page「沙箱镜像来源」) is authoritative: the
+        one-click init posts no body so ``request_mode`` defaults to "auto",
+        which means "use the persisted deployment source". Only an explicit
+        request of "prebuilt"/"build" still overrides it. Invalid values pass
+        through unchanged so the caller reports them as usual.
+        """
+        if request_mode != "auto":
+            return request_mode
+        effective_mode, _ = effective_bootstrap_source(settings)
+        return effective_mode
+
     def start(
         self, settings: Settings, *, actor_id: str, mode: str = "auto"
     ) -> dict[str, Any]:
+        # The deployment-level「沙箱镜像来源」setting (settings page) is the
+        # authority for the strategy: the one-click init always sends "auto",
+        # which here means "follow the persisted deployment source". Only an
+        # explicit request mode ("prebuilt"/"build") overrides it.
+        mode = self._resolve_bootstrap_mode(settings, mode)
         if (settings.sandbox_backend or "").strip().casefold() == "sandboxd":
             return self._start_sandboxd(settings, actor_id=actor_id, mode=mode)
         if mode not in ("auto", "prebuilt", "build"):
@@ -1182,15 +1227,15 @@ class SandboxBootstrapService:
                 self._fail(job, "docker_unavailable", detail or "Docker Engine is unavailable")
                 return
 
-            # Resolve the prebuilt reference from the deployment source config:
-            # env LEARNGRAPH_SANDBOX_PREBUILT_IMAGE wins over the page-persisted
-            # reference; a forced build mode ignores it entirely.
-            effective_mode, effective_prebuilt = effective_bootstrap_source(settings)
-            prebuilt_candidate = (
-                effective_prebuilt
-                if job.mode != "build" and effective_mode != "build"
-                else None
-            )
+            # The deployment source config decides the strategy: env
+            # LEARNGRAPH_SANDBOX_PREBUILT_IMAGE wins over the page-persisted
+            # reference; a forced "build" source ignores it entirely. The
+            # authoritative mode is the one resolved by start() into
+            # job.mode; direct callers re-resolve "auto" against the
+            # persisted deployment source here.
+            mode = self._resolve_bootstrap_mode(settings, job.mode)
+            _, effective_prebuilt = effective_bootstrap_source(settings)
+            prebuilt_candidate = effective_prebuilt if mode != "build" else None
             try:
                 prebuilt_ref = (
                     _prebuilt_image_ref(prebuilt_candidate) if prebuilt_candidate else None
@@ -1198,7 +1243,7 @@ class SandboxBootstrapService:
             except ValueError as exc:
                 self._fail(job, "prebuilt_image_invalid", str(exc))
                 return
-            if job.mode == "prebuilt" and not prebuilt_ref:
+            if mode == "prebuilt" and not prebuilt_ref:
                 self._fail(
                     job,
                     "prebuilt_image_not_configured",
@@ -1213,16 +1258,12 @@ class SandboxBootstrapService:
                         job, settings, digest, source="prebuilt_pull", tag=prebuilt_ref
                     )
                     return
-                # Auto mode promises "pull the prebuilt image when one is
-                # configured, otherwise fall back to a local Docker build":
-                # an unreachable/missing registry image (not pushed yet,
-                # private without login, wrong tag) must not strand the
-                # deployment uninitialized.  The one-click init always sends
-                # auto, so a failed prebuilt pull degrades to the local build
-                # even when the settings page persisted ``prebuilt`` as the
-                # source mode; only an explicit request mode ``prebuilt``
-                # still fails closed.
-                if job.mode == "auto":
+                # Only "auto" promises "pull the prebuilt image when one is
+                # configured, otherwise fall back to a local Docker build".
+                # A persisted deployment source of "prebuilt" fails closed: a
+                # failed pull must not silently switch to a local build that
+                # the operator explicitly turned off.
+                if mode == "auto":
                     with self._lock:
                         job.status = "running"
                         job.phase = "pull_runner"

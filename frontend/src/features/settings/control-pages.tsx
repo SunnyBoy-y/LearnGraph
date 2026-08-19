@@ -566,10 +566,17 @@ export function SandboxAdministration() {
     queryFn: getSandboxBootstrapStatus,
     refetchInterval: (query) => {
       const job = query.state.data?.active_job;
-      return job && job.status === "running" ? 1500 : false;
+      return job && job.status === "running" ? 1500 : 15000;
     },
   });
-  const profiles = useQuery({ queryKey: ["sandbox-profiles"], queryFn: listSandboxProfiles });
+  const profiles = useQuery({
+    queryKey: ["sandbox-profiles"],
+    queryFn: listSandboxProfiles,
+    // Poll so runtime-environment changes (e.g. the runner image being
+    // deleted from Docker while running) flip the 可用/不可用 state without a
+    // manual refresh.
+    refetchInterval: 15000,
+  });
   const currentUser = useQuery({ queryKey: ["auth-me"], queryFn: getCurrentUser });
   const isAdmin = Boolean(currentUser.data?.is_system_admin);
   const bootstrapPolicy = useQuery({
