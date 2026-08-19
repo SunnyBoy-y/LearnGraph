@@ -126,6 +126,36 @@ function isAbort(error: unknown, signal?: AbortSignal): boolean {
   return signal?.aborted === true || (error instanceof DOMException && error.name === 'AbortError')
 }
 
+/**
+ * Retry policy for requests that are safe to replay.
+ *
+ * GET/HEAD are idempotent, so a transient 502/503/504 (typically the backend
+ * restarting under `uvicorn --reload`, or the Vite proxy briefly refusing the
+ * target) is retried with a short backoff. Mutating methods are never retried,
+ * and neither are 4xx responses (a 401 must run its session-expiry flow once).
+ */
+const RETRYABLE_METHODS = new Set(['GET', 'HEAD'])
+const RETRYABLE_STATUSES = new Set([502, 503, 504])
+const RETRY_BACKOFF_MS = [500, 1000, 2000]
+
+function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export class ApiClient {
   readonly baseUrl: string
   private readonly fetcher: typeof fetch
@@ -167,54 +197,69 @@ export class ApiClient {
       requestBody = body.value as BodyInit
     }
 
-    try {
-      const response = await this.fetcher(url, {
-        method,
-        headers,
-        body: requestBody,
-        signal: options.signal,
-      })
-      if (response.ok) return response
+    const retryable = RETRYABLE_METHODS.has(method)
+    let attempt = 0
+    for (;;) {
+      attempt += 1
+      const backoff = attempt <= RETRY_BACKOFF_MS.length ? RETRY_BACKOFF_MS[attempt - 1] : null
+      try {
+        const response = await this.fetcher(url, {
+          method,
+          headers,
+          body: requestBody,
+          signal: options.signal,
+        })
+        if (response.ok) return response
 
-      const responseBody = await readResponseBody(response)
-      const known = appError(responseBody)
-      const issues = validationIssues(responseBody)
-      if (response.status === 401 && options.auth !== false) {
-        // R-017: drop the failed account's private selection history (partitioned
-        // by user+workspace) while the auth store still resolves the partition.
-        clearSelectionExplanations()
-        await clearAuthenticatedClientState()
-        authStore.clear()
-        if (
-          typeof window !== 'undefined' &&
-          !window.location.pathname.startsWith('/auth/login')
-        ) {
-          window.location.replace('/auth/login?reason=session_expired')
+        if (retryable && backoff !== null && RETRYABLE_STATUSES.has(response.status)) {
+          await delayWithAbort(backoff, options.signal)
+          continue
         }
+
+        const responseBody = await readResponseBody(response)
+        const known = appError(responseBody)
+        const issues = validationIssues(responseBody)
+        if (response.status === 401 && options.auth !== false) {
+          // R-017: drop the failed account's private selection history (partitioned
+          // by user+workspace) while the auth store still resolves the partition.
+          clearSelectionExplanations()
+          await clearAuthenticatedClientState()
+          authStore.clear()
+          if (
+            typeof window !== 'undefined' &&
+            !window.location.pathname.startsWith('/auth/login')
+          ) {
+            window.location.replace('/auth/login?reason=session_expired')
+          }
+        }
+        throw new ApiError({
+          status: response.status,
+          code: known?.code ?? (issues ? 'validation_error' : 'http_error'),
+          message:
+            known?.message ??
+            issues?.[0]?.msg ??
+            (typeof responseBody === 'string' ? responseBody : response.statusText || `HTTP ${response.status}`),
+          details: known?.details ?? issues,
+          method,
+          url,
+          responseBody,
+        })
+      } catch (error) {
+        if (error instanceof ApiError || isAbort(error, options.signal)) throw error
+        if (retryable && backoff !== null) {
+          await delayWithAbort(backoff, options.signal)
+          continue
+        }
+        throw new ApiError({
+          status: 0,
+          code: 'network_error',
+          message: error instanceof Error ? error.message : 'Network request failed',
+          details: null,
+          method,
+          url,
+          cause: error,
+        })
       }
-      throw new ApiError({
-        status: response.status,
-        code: known?.code ?? (issues ? 'validation_error' : 'http_error'),
-        message:
-          known?.message ??
-          issues?.[0]?.msg ??
-          (typeof responseBody === 'string' ? responseBody : response.statusText || `HTTP ${response.status}`),
-        details: known?.details ?? issues,
-        method,
-        url,
-        responseBody,
-      })
-    } catch (error) {
-      if (error instanceof ApiError || isAbort(error, options.signal)) throw error
-      throw new ApiError({
-        status: 0,
-        code: 'network_error',
-        message: error instanceof Error ? error.message : 'Network request failed',
-        details: null,
-        method,
-        url,
-        cause: error,
-      })
     }
   }
 
