@@ -17,6 +17,7 @@ import type { Cell, Workbook, Worksheet } from "exceljs";
 
 import { Button } from "@/components/ui/button";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import { createSandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 
@@ -899,6 +900,16 @@ export function HtmlDocumentViewer({
   const [sourceText, setSourceText] = useState("");
   const [previewHtml, setPreviewHtml] = useState("");
   const [error, setError] = useState("");
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+
+  // Browser-sandbox runtime bridge: relays JS network requests (net.fetch)
+  // to the approval-free sandbox-net gateway. No bundle context here, so
+  // vfs.read is unavailable but networking works.
+  useEffect(() => {
+    if (!previewHtml) return;
+    const bridge = createSandboxRuntimeBridge(iframeRef.current, {});
+    return () => bridge.destroy();
+  }, [previewHtml]);
 
   useEffect(() => {
     let cancelled = false;
@@ -910,7 +921,7 @@ export function HtmlDocumentViewer({
       .then((text) => {
         if (cancelled) return;
         setSourceText(text);
-        setPreviewHtml(sandboxedHtmlPreviewDocument(text));
+        setPreviewHtml(sandboxedHtmlPreviewDocument(text, { runtimeShim: true }));
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -954,7 +965,7 @@ export function HtmlDocumentViewer({
           {filename}
         </span>
         <span className="text-[10px] text-muted-foreground">
-          内联脚本在隔离沙箱中运行；网络、存储与宿主页面访问已禁用
+          内联脚本在隔离沙箱中运行；网络已启用，宿主页面访问已禁用
         </span>
       </div>
       {error ? (
@@ -973,6 +984,7 @@ export function HtmlDocumentViewer({
       {mode === "preview" && previewHtml ? (
         <iframe
           className="min-h-[36rem] w-full flex-1 border-0 bg-white"
+          ref={iframeRef}
           referrerPolicy="no-referrer"
           sandbox="allow-scripts"
           srcDoc={previewHtml}

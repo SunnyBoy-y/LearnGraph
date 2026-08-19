@@ -24,6 +24,8 @@ import {
   trustedRendererEligible,
   trustedRendererReason,
 } from "@/lib/trusted-renderer";
+import { createSandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
+import type { SandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
 
 const supportedLanguages = new Set<BundledLanguage>([
   "css",
@@ -70,6 +72,8 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const subappLoadedRef = useRef(false);
   const subappChannelRef = useRef<SubappChannel | null>(null);
+  const runtimeIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const runtimeBridgeRef = useRef<SandboxRuntimeBridge | null>(null);
   const [subappFailed, setSubappFailed] = useState<string | null>(null);
   const [consentRequest, setConsentRequest] = useState<{
     eventId: string
@@ -131,6 +135,23 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
     return () => { cancelled = true; };
   }, [bundleId]);
 
+  // Browser-sandbox runtime bridge: relays vfs.read (multi-file) and
+  // net.fetch (approval-free networking) between the sandbox shim and the
+  // backend for every non-subapp preview (srcDoc or bundle URL).
+  const runtimePreviewActive = !subappTrigger && Boolean(previewHtml || bundlePreviewUrl);
+  useEffect(() => {
+    if (!runtimePreviewActive) return;
+    const bridge = createSandboxRuntimeBridge(runtimeIframeRef.current, {
+      bundleId: bundleId || null,
+      bundlePreviewUrl,
+    });
+    runtimeBridgeRef.current = bridge;
+    return () => {
+      bridge.destroy();
+      runtimeBridgeRef.current = null;
+    };
+  }, [runtimePreviewActive, bundleId, bundlePreviewUrl, subappTrigger]);
+
   const hasSubappContent = Boolean(previewHtml || bundlePreviewUrl || canRenderRemote);
 
   return (
@@ -173,15 +194,28 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
             </div>
           </div>
         )
+      ) : bundlePreviewUrl ? (
+        <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+          <iframe
+            allow=""
+            className="sandbox-artifact__preview"
+            ref={runtimeIframeRef}
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            src={bundlePreviewUrl}
+            title={`${title}多文件沙箱预览`}
+          />
+        </FullscreenPreview>
       ) : previewHtml ? (
         <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
           <iframe
             allow=""
             className="sandbox-artifact__preview"
             onLoad={(event) => postRendererUnlock(event.currentTarget, unlockMessage)}
+            ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
-            srcDoc={sandboxedHtmlPreviewDocument(previewHtml)}
+            srcDoc={sandboxedHtmlPreviewDocument(previewHtml, { runtimeShim: true })}
             title={`${title}动态沙箱预览`}
           />
         </FullscreenPreview>

@@ -15,7 +15,7 @@ assert.match(source, /DOMParser/);
 assert.match(source, /querySelectorAll\("meta\[http-equiv\]"\)/);
 assert.match(source, /content-security-policy/);
 assert.match(source, /connect-src 'none'/);
-assert.match(source, /iframe, object, embed, form, base, link/);
+assert.match(source, /iframe, object, embed, form, base/);
 assert.match(source, /@import/);
 assert.doesNotMatch(source, /html\.replace\([^\n]*Content-Security-Policy/i);
 
@@ -198,12 +198,17 @@ class DOMParser {
 
 globalThis.DOMParser = DOMParser;
 
-const jsSource = source
+const jsSource =
+  `const sandboxRuntimeShimInlineTag = () => '';\n` +
+  source
+  .replace(/^import .*from .*;?$/gm, "")
   .replace(/: string/g, "")
   .replace(/: HTMLElement/g, "")
   .replace(/: HTMLScriptElement/g, "")
   .replace(/export const /g, "const ")
   .replace(/export function /g, "function ")
+  .replace(/export interface [^{]*\{[^}]*\}\n?/g, "")
+  .replace(/: SandboxedHtmlPreviewOptions/g, "")
   .replace(/querySelectorAll<[^>]+>/g, "querySelectorAll");
 
 const moduleUrl = `data:text/javascript,${encodeURIComponent(
@@ -229,24 +234,35 @@ function countCsp(html) {
   const forged = `<html><head><!-- Content-Security-Policy --></head>
 <body><img src="https://evil.example/pixel.png"><iframe src="https://evil.example"></iframe>
 <link rel="stylesheet" href="https://evil.example/x.css">
+<link rel="icon" href="https://evil.example/favicon.ico">
 <script src="https://evil.example/x.js"></script>
-<style>@import url("https://evil.example/a.css"); body{background:url("https://evil.example/b.png")}</style>
+<style>@import url("https://evil.example/a.css"); @import url("local.css"); body{background:url("https://evil.example/b.png")}</style>
 </body></html>`;
   const out = sandboxedHtmlPreviewDocument(forged);
   assert.equal(countCsp(out), 1);
-  assert.doesNotMatch(out, /https:\/\/evil\.example/);
+  // Navigation / embedding / non-stylesheet links stay stripped.
   assert.doesNotMatch(out, /<iframe/i);
-  assert.doesNotMatch(out, /<link/i);
-  assert.doesNotMatch(out, /@import/i);
+  assert.doesNotMatch(out, /rel="icon"/i);
+  // Network static assets are allowed (approval-free networking decision):
+  // external scripts, images, stylesheets, @imports and CSS url() all survive.
+  assert.match(out, /src="https:\/\/evil\.example\/x\.js"/);
+  assert.match(out, /src="https:\/\/evil\.example\/pixel\.png"/);
+  assert.match(out, /rel="stylesheet" href="https:\/\/evil\.example\/x\.css"/);
+  assert.match(out, /@import url\("https:\/\/evil\.example\/a\.css"\)/);
+  assert.match(out, /url\("https:\/\/evil\.example\/b\.png"\)/);
+  // Local (non-network) @imports are still dropped.
+  assert.doesNotMatch(out, /@import url\("local\.css"\)/);
 }
 
 {
   const mixedCase = `<html><head><meta HTTP-EQUIV="content-security-policy" content="script-src *"></head>
-<body><a href="https://lan.example">x</a><img src="data:image/png;base64,aa"></body></html>`;
+<body><a href="https://lan.example">x</a><a href="javascript:alert(1)">y</a><img src="data:image/png;base64,aa"></body></html>`;
   const out = sandboxedHtmlPreviewDocument(mixedCase);
   assert.equal(countCsp(out), 1);
   assert.match(out, /src="data:image\/png;base64,aa"/);
-  assert.doesNotMatch(out, /href="https:\/\/lan\.example"/);
+  // Network anchors are kept (in-iframe navigation); dangerous schemes dropped.
+  assert.match(out, /href="https:\/\/lan\.example"/);
+  assert.doesNotMatch(out, /javascript:/);
 }
 
 {

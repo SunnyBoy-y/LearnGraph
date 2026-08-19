@@ -4,8 +4,10 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Query, status
+from fastapi.responses import StreamingResponse
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.providers.storage_factory import object_storage_provider
 from app.services.subapp_bundles import SubAppBundleService
 from app.core.errors import AppError
 from app.domain.schemas.subapps import (
@@ -91,6 +93,38 @@ def list_subapp_events(
         created_before=created_before,
         offset=offset,
         limit=limit,
+    )
+
+
+@router.get("/bundles/{bundle_id}/files/{path:path}")
+def read_bundle_file(
+    bundle_id: str,
+    path: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+):
+    """Read one bundle file through the main API (frontend sandbox VFS relay).
+
+    Authorized by the authenticated workspace+owner of the bundle; returns the
+    raw bytes with the bundle's MIME type so the host bridge can serve it into
+    the sandbox (blob URLs / vfs.read responses). No capability token needed —
+    this channel is session-scoped, not preview-scoped.
+    """
+    item, blob = SubAppBundleService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).read_file(bundle_id, path)
+    storage = object_storage_provider(db, context.workspace_id, settings)
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+    return StreamingResponse(
+        storage.iter_bytes(blob.object_key, offset=0, length=item.size_bytes),
+        media_type=item.mime_type,
+        headers=headers,
     )
 
 

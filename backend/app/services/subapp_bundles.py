@@ -114,7 +114,12 @@ def _validate_entry_html(data: bytes, *, entry_path: str, known_paths: set[str])
     except UnicodeDecodeError as exc:
         raise AppError(422, "subapp_bundle_entry_not_utf8", "Bundle entry HTML must be UTF-8") from exc
     folded = html.casefold()
-    forbidden = ("<base", "<iframe", "<frame", "<object", "<embed", "<form", "http://", "https://", "ws://", "wss://")
+    # Navigation / embedding / form / base markup is always rejected. External
+    # http(s) references are allowed: frontend-sandbox networking is
+    # approval-free (static assets load directly under the gateway CSP, JS
+    # network goes through the sandbox-net relay), so only structural markup
+    # that could navigate or embed is forbidden here.
+    forbidden = ("<base", "<iframe", "<frame", "<object", "<embed", "<form")
     found = [item for item in forbidden if item in folded]
     if found:
         raise AppError(
@@ -125,12 +130,13 @@ def _validate_entry_html(data: bytes, *, entry_path: str, known_paths: set[str])
         )
     # A quick, deterministic reference check catches the common Vite failure:
     # emitting an index.html that points at assets omitted from the publication.
+    # External http(s) references are skipped (they resolve over the network).
     import re
 
     missing: list[str] = []
     parent = PurePosixPath(entry_path).parent
     for raw in re.findall(r"(?:src|href)\s*=\s*[\"']([^\"'#?]+)", html, flags=re.IGNORECASE):
-        if raw.startswith(("data:", "blob:")):
+        if raw.startswith(("data:", "blob:")) or re.match(r"^(https?:)?//", raw, flags=re.IGNORECASE):
             continue
         candidate = str((parent / raw).as_posix())
         try:
@@ -539,6 +545,37 @@ class SubAppBundleService:
             },
         )
         return manifest.id
+
+    def read_file(self, bundle_id: str, path: str) -> tuple[SubAppBundleFile, ContentBlob]:
+        """Read one bundle file through the main API (host-bridge VFS channel).
+
+        Authorization is the authenticated workspace+owner of the bundle itself
+        (``_bundle``); no capability token is needed because the caller is the
+        host bridge acting on the user's own session. Used by the frontend
+        sandbox ``vfs.read`` relay for multi-file projects.
+        """
+        bundle = self._bundle(bundle_id)
+        if bundle.status != "published" or bundle.revoked_at is not None:
+            raise AppError(409, "subapp_bundle_revoked", "Bundle is no longer available")
+        normalized = _normalize_bundle_path(path)
+        item = self.db.scalar(
+            select(SubAppBundleFile).where(
+                SubAppBundleFile.bundle_id == bundle.id,
+                SubAppBundleFile.workspace_id == bundle.workspace_id,
+                SubAppBundleFile.path == normalized,
+            )
+        )
+        if item is None:
+            raise AppError(404, "subapp_bundle_asset_not_found", "Bundle file is not part of this bundle")
+        blob = self.db.scalar(
+            select(ContentBlob).where(
+                ContentBlob.workspace_id == bundle.workspace_id,
+                ContentBlob.sha256 == item.blob_sha256,
+            )
+        )
+        if blob is None:
+            raise AppError(404, "subapp_bundle_asset_not_found", "Bundle file bytes are unavailable")
+        return item, blob
 
     def mint_preview(self, bundle_id: str) -> dict[str, Any]:
         bundle = self._bundle(bundle_id)

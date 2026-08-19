@@ -12,6 +12,8 @@ import {
   subappSessionTrigger,
 } from "@/lib/subapp-bridge";
 import type { SubappChannel } from "@/lib/subapp-bridge";
+import { createSandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
+import type { SandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
 
 type MagicCardData = {
   card_instance_id?: string;
@@ -135,6 +137,8 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   const [agentStatus, setAgentStatus] = useState<'idle' | 'queued' | 'processing' | 'failed'>('idle');
   const [agentError, setAgentError] = useState<string | null>(null);
   const [bundlePreviewUrl, setBundlePreviewUrl] = useState<string | null>(null);
+  const runtimeIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const runtimeBridgeRef = useRef<SandboxRuntimeBridge | null>(null);
 
   useEffect(() => {
     if (!subappTrigger) return;
@@ -189,6 +193,23 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
       });
     return () => { cancelled = true; };
   }, [bundleId]);
+
+  // Browser-sandbox runtime bridge: relays vfs.read (multi-file) and
+  // net.fetch (approval-free networking) between the sandbox shim and the
+  // backend. Mounted for every non-subapp preview (srcDoc or bundle URL).
+  const runtimePreviewActive = !subappTrigger && Boolean(previewHtml || bundlePreviewUrl);
+  useEffect(() => {
+    if (!runtimePreviewActive) return;
+    const bridge = createSandboxRuntimeBridge(runtimeIframeRef.current, {
+      bundleId: bundleId || null,
+      bundlePreviewUrl,
+    });
+    runtimeBridgeRef.current = bridge;
+    return () => {
+      bridge.destroy();
+      runtimeBridgeRef.current = null;
+    };
+  }, [runtimePreviewActive, bundleId, bundlePreviewUrl, subappTrigger]);
 
   useEffect(() => {
     setFailed(false);
@@ -399,12 +420,45 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     );
   }
 
+  if (bundlePreviewUrl) {
+    // Multi-file bundle mode: the iframe loads the immutable bundle through
+    // the capability-gated preview gateway; relative-path resources resolve
+    // natively. The gateway injects the runtime shim, and the host bridge
+    // relays vfs.read / net.fetch for dynamic access.
+    return (
+      <section aria-label={title} className="magic-card">
+        <div className="magic-card__heading">
+          <Box className="size-4" />
+          <div>
+            <strong>{title}</strong>
+            <span>多文件沙箱（已启用）</span>
+          </div>
+          <Badge variant="secondary">bundle · 联网</Badge>
+        </div>
+        <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+          <iframe
+            allow=""
+            className="magic-card__frame"
+            ref={runtimeIframeRef}
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts"
+            src={bundlePreviewUrl}
+            style={{ height }}
+            title={`${title} 多文件沙箱`}
+          />
+        </FullscreenPreview>
+      </section>
+    );
+  }
+
   if (previewHtml) {
     // Dynamic preview: allow scripts inside an opaque-origin sandbox (no
     // allow-same-origin) so agent HTML/canvas/animation can run without
     // host-DOM access. The host owns the CSP; network, frames, and forms stay
-    // blocked even if the card ships its own policy.
-    const srcDoc = sandboxedHtmlPreviewDocument(previewHtml);
+    // blocked even if the card ships its own policy. The runtime shim is
+    // inlined so sandbox code can still reach multi-file VFS reads and the
+    // approval-free network relay through the host bridge.
+    const srcDoc = sandboxedHtmlPreviewDocument(previewHtml, { runtimeShim: true });
     return (
       <section aria-label={title} className="magic-card">
         <div className="magic-card__heading">
@@ -413,12 +467,13 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
             <strong>{title}</strong>
             <span>动态预览（脚本已启用）</span>
           </div>
-          <Badge variant="secondary">preview</Badge>
+          <Badge variant="secondary">preview · 联网</Badge>
         </div>
         <FullscreenPreview className="magic-card__frame-wrap" label={title}>
           <iframe
             allow=""
             className="magic-card__frame"
+            ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             srcDoc={srcDoc}

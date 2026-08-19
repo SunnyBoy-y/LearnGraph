@@ -23,12 +23,17 @@ try {
 
 const sourcePath = join(__dirname, "sandboxed-html-preview.ts");
 const source = readFileSync(sourcePath, "utf8");
-const jsSource = source
+const jsSource =
+  `const sandboxRuntimeShimInlineTag = () => '';\n` +
+  source
+  .replace(/^import .*from .*;?$/gm, "")
   .replace(/: string/g, "")
   .replace(/: HTMLElement/g, "")
   .replace(/: HTMLScriptElement/g, "")
   .replace(/export const /g, "const ")
   .replace(/export function /g, "function ")
+  .replace(/export interface [^{]*\{[^}]*\}\n?/g, "")
+  .replace(/: SandboxedHtmlPreviewOptions/g, "")
   .replace(/querySelectorAll<[^>]+>/g, "querySelectorAll")
   + "\n;({ SANDBOXED_HTML_PREVIEW_CSP, sandboxedHtmlPreviewDocument });";
 
@@ -63,6 +68,9 @@ assert.ok(cspMatch, "platform CSP meta must exist in generated HTML");
 assert.equal(cspMatch[1], api.csp, "CSP must be platform-owned, not attacker-supplied");
 assert.match(cspMatch[1], /connect-src 'none'/);
 assert.doesNotMatch(cspMatch[1], /connect-src https/);
+// Static network assets are allowed (approval-free networking), JS network
+// stays relay-only through connect-src 'none'.
+assert.match(cspMatch[1], /img-src[^;]*https:/);
 
 // Count CSP metas - must be exactly 1 (platform only).
 const cspCount = (api.maliciousHtml.match(/http-equiv=["']?Content-Security-Policy/gi) || []).length;

@@ -31,6 +31,7 @@ from app.api.routers import (
     research,
     sources,
     subapps,
+    sandbox_net,
     usage,
     workflow,
     sandbox,
@@ -55,6 +56,7 @@ for router in (
     research.router,
     sources.router,
     subapps.router,
+    sandbox_net.router,
     evidence.router,
     exercises.router,
     # Memory V2 static routes must be registered before V1 /memory/{memory_id}.

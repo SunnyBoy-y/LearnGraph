@@ -398,6 +398,13 @@ class Settings(BaseSettings):
     # in Provider 管理 -> 网页抓取 (``web_fetch.runtime`` setting). Defaults to
     # on so sandbox-isolated fetch is the secure primary path out of the box.
     sandbox_web_fetch_enabled: bool = True
+    # --- Frontend-sandbox networking (browser MagicCard / HTML preview) -------
+    # Approval-free by product decision (only backend sandboxes require egress
+    # approval). When enabled, JS-initiated network calls inside the browser
+    # sandbox are relayed by the host bridge to POST /api/v1/sandbox-net/proxy;
+    # the gateway still hard-guards every relay (public-only resolved addresses,
+    # no cookies/credentials, size/timeout caps, audit trail).
+    sandbox_net_enabled: bool = True
     # Hard bounds for a single web_fetch container job (independent of the
     # generic sandbox resource limits).
     sandbox_web_fetch_timeout_seconds: float = 30.0
