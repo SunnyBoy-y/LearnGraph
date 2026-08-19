@@ -186,6 +186,24 @@ class DockerRuntimeBackend:
             self._close(client)
         return RuntimeCapability(True)
 
+    def image_present(self, image_ref: str) -> bool:
+        """True when the immutable image reference still exists in Docker Engine.
+
+        Readiness and status reporting must not trust a persisted runtime record
+        alone: if the image is deleted while the daemon is running, every new
+        sandbox fails at create time. Presence is a cheap metadata lookup, so
+        it is safe to call on every health/status probe.
+        """
+        client = None
+        try:
+            client = self._client()
+            client.images.get(image_ref)
+            return True
+        except Exception:  # noqa: BLE001 - presence probe is best-effort
+            return False
+        finally:
+            self._close(client)
+
     def capacity(self) -> tuple[int, int]:
         client = self._client()
         try:

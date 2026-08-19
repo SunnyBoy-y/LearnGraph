@@ -263,9 +263,21 @@ class SandboxController:
             reasons.append(capability.reason or "docker runtime unavailable")
         if not store_ok:
             reasons.append("state store is not writable")
-        if not self._runtime_image_for("python-node") and not capability.available:
+        # A runtime image is required to create any sandbox (create() fails with
+        # runtime_unavailable otherwise), so readiness must not depend on Docker
+        # reachability alone: an engine that is up but has no image installed is
+        # NOT ready. This keeps the settings-page 可用/不可用 honest before the
+        # first bootstrap.
+        runtime_image = self._runtime_image_for("python-node")
+        if not runtime_image:
             runtime_ok = False
             reasons.append("no runtime image is configured or installed")
+        elif capability.available and not self.runtime.image_present(runtime_image):
+            # The store record survives but the actual image was deleted from
+            # Docker Engine (e.g. docker rmi while running) — treat that as not
+            # ready so the settings page stops reporting 已就绪/可用.
+            runtime_ok = False
+            reasons.append("runtime image is not present in Docker Engine")
         return HealthReady(
             ready=docker_ok and store_ok and runtime_ok,
             reasons=reasons,
