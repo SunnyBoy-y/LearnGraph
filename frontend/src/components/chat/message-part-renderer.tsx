@@ -427,11 +427,31 @@ function collectSourceItems(data: PartData, workspaceId: string): SourceItem[] {
   });
 }
 
+/** Display-only deduplication for the source list.
+
+Keeps the first occurrence of each (title, href) pair so the rendered list
+cannot carry duplicate children with identical React keys. This is display
+scoped on purpose: the citation lookup (``buildCitationLookup``) must keep the
+full original list so in-text citation numbers keep pointing at the right
+sources even when the backend returned the same page twice.
+ */
+function dedupeSourceItemsForDisplay(items: SourceItem[]): SourceItem[] {
+  const seen = new Set<string>();
+  const deduped: SourceItem[] = [];
+  for (const item of items) {
+    const key = `${item.title}\u0000${item.href}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
 function SourceListPart({ data }: { data: PartData }) {
   const { workspaceId } = useAuth();
   const navigate = useNavigate();
   const items = useMemo(
-    () => collectSourceItems(data, workspaceId),
+    () => dedupeSourceItemsForDisplay(collectSourceItems(data, workspaceId)),
     [data, workspaceId],
   );
 

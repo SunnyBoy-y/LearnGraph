@@ -3,7 +3,9 @@
  * dots, and sidebar sort order.
  *
  * Sort tiers (pinned groups first, then within each group):
- *   0. Recently touched by the user (opened / sent a message)
+ *   0. Recently active — real content activity (user sent a message, or the
+ *      model finished while the user was viewing). Merely opening a session
+ *      does NOT count, so the sidebar never reorders from navigation alone.
  *   1. Model finished while the user was elsewhere (black-dot / unread)
  *   2. Everything else by updated_at
  */
@@ -13,7 +15,7 @@ export type SessionActivity = {
   /** Model finished while this session was not the active view. */
   unreadCompleted: boolean;
   completedAt: number | null;
-  /** Last time the user opened or sent in this session (epoch ms). */
+  /** Last real content activity (user sent / model finished while viewing). */
   lastTouchedAt: number;
 };
 
@@ -96,8 +98,9 @@ export function markSessionRunning(sessionId: string, running: boolean): void {
 }
 
 /**
- * Model finished. If the user is still viewing this session, clear unread;
- * otherwise set the black-dot reminder and stamp completion time for sort.
+ * Model finished. If the user is still viewing this session, clear unread and
+ * bump recency (a reply landing IS real content activity); otherwise set the
+ * black-dot reminder and stamp completion time for sort.
  */
 export function markSessionGenerationFinished(
   sessionId: string,
@@ -124,18 +127,21 @@ export function markSessionGenerationFinished(
   });
 }
 
-/** User opened / focused a session — clear black dot and bump recency. */
-export function markSessionViewed(
-  sessionId: string,
-  at: number = Date.now(),
-): void {
+/**
+ * User opened / focused a session — clear the black dot and completion stamp.
+ *
+ * This intentionally does NOT bump `lastTouchedAt`: viewing alone must never
+ * reorder the sidebar (opening an old session would otherwise jump it to the
+ * top on every click). Only real content activity — a sent message or a model
+ * reply finishing — moves a session up.
+ */
+export function markSessionViewed(sessionId: string): void {
   if (!sessionId || sessionId === "new") return;
   const prev = read(sessionId);
   write(sessionId, {
     ...prev,
     unreadCompleted: false,
     completedAt: null,
-    lastTouchedAt: Math.max(prev.lastTouchedAt, at),
   });
 }
 
@@ -163,7 +169,8 @@ function toEpoch(value: string | number | null | undefined): number {
 
 /**
  * Sort tier within a pin group:
- * 0 = recently touched by user (and not waiting for unread completion)
+ * 0 = recently active (real content activity: sent message / reply finished
+ *     while viewing)
  * 1 = model finished while the user was elsewhere (black-dot)
  * 2 = everything else
  */

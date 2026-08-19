@@ -29,11 +29,11 @@ export const SourcesTrigger = ({
   ...props
 }: SourcesTriggerProps) => (
   <CollapsibleTrigger
-    className={cn("flex items-center gap-2", className)}
+    className={cn("group flex items-center gap-2", className)}
     {...props}
   >
     {children ?? <p className="font-medium">Used {count} sources</p>}
-    <ChevronDownIcon className="h-4 w-4" />
+    <ChevronDownIcon className="size-3 transition-transform duration-200 group-data-[state=closed]:-rotate-90" />
   </CollapsibleTrigger>
 );
 
