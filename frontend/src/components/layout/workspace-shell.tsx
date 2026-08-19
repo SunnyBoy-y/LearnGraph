@@ -34,6 +34,7 @@ import {
   Focus,
   Folder,
   FolderPlus,
+  GitBranch,
   GraduationCap,
   Home,
   ListChecks,
@@ -57,6 +58,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Split,
+  Target,
   Trash2,
   X,
 } from "lucide-react";
@@ -2788,6 +2790,112 @@ function statusIsHealthy(status: string) {
   return ["healthy", "healthy_local", "enabled"].includes(status);
 }
 
+/** Bound goal/graph/node info for the active chat session, bridged from the
+ *  chat page via the `learngraph:chat-header` window event. */
+type ChatHeaderInfo = {
+  goalBound?: boolean;
+  graphTitle?: string;
+  learningNodeActive?: boolean;
+  learningNodeLabel?: string;
+  modelConnected: boolean;
+};
+
+/** Shared body of the merged status + conversation-context menu. Both the
+ *  desktop dot trigger and the mobile page-tools menu render this so the two
+ *  former menus (系统状态 / 上下文) stay consistent across breakpoints. */
+function TopBarStatusMenuBody({
+  chatHeader,
+  contextActive,
+  isChat,
+  onClearLearningNode,
+  systemStatuses,
+  workspaceName,
+}: {
+  chatHeader?: ChatHeaderInfo;
+  contextActive: boolean;
+  isChat: boolean;
+  onClearLearningNode: () => void;
+  systemStatuses: [string, string][];
+  workspaceName: string;
+}) {
+  return (
+    <>
+      <DropdownMenuLabel>{workspaceName || "当前工作区"}</DropdownMenuLabel>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem disabled>
+        <Activity className="size-4" />
+        API 会话有效
+      </DropdownMenuItem>
+      {isChat ? (
+        <>
+          <DropdownMenuItem disabled>
+            <Bot className="size-4" />
+            {chatHeader?.modelConnected ? "模型已连接" : "模型不可用"}
+          </DropdownMenuItem>
+          {!chatHeader?.graphTitle ? (
+            <DropdownMenuItem disabled>
+              <Network className="size-4" />
+              未绑定图谱
+            </DropdownMenuItem>
+          ) : null}
+          {contextActive ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>本轮对话上下文</DropdownMenuLabel>
+              {chatHeader?.goalBound ? (
+                <div className="chat-context-menu__row">
+                  <Target className="size-3.5" />
+                  <span className="min-w-0 flex-1 truncate">已绑定目标</span>
+                </div>
+              ) : null}
+              {chatHeader?.graphTitle ? (
+                <div className="chat-context-menu__row" title={chatHeader.graphTitle}>
+                  <Network className="size-3.5" />
+                  <span className="min-w-0 flex-1 truncate">
+                    图谱 · {chatHeader.graphTitle}
+                  </span>
+                </div>
+              ) : null}
+              {chatHeader?.learningNodeActive ? (
+                <div className="chat-context-menu__row chat-context-menu__row--node">
+                  <GitBranch className="size-3.5" />
+                  <span
+                    className="min-w-0 flex-1 truncate"
+                    title={chatHeader.learningNodeLabel ?? "已选择学习节点"}
+                  >
+                    节点 · {chatHeader.learningNodeLabel ?? "已选择学习节点"}
+                  </span>
+                  <button
+                    aria-label="移除当前学习节点上下文"
+                    className="chat-context-menu__clear"
+                    onClick={onClearLearningNode}
+                    title="本轮后续消息不再绑定此节点"
+                    type="button"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </>
+      ) : systemStatuses.length ? (
+        systemStatuses.map(([key, value]) => (
+          <DropdownMenuItem disabled key={key}>
+            <CircleDot className="size-4" />
+            <span className="flex-1">{topbarStatusLabels[key] ?? key}</span>
+            <span className="text-xs text-muted-foreground">
+              {statusIsHealthy(value) ? "正常" : "不可用"}
+            </span>
+          </DropdownMenuItem>
+        ))
+      ) : (
+        <DropdownMenuItem disabled>正在读取运行状态…</DropdownMenuItem>
+      )}
+    </>
+  );
+}
+
 function TopBar({
   graphOpen,
   onOpenActivity,
@@ -2811,10 +2919,7 @@ function TopBar({
     staleTime: 30_000,
     enabled: !isChat,
   });
-  const [chatHeader, setChatHeader] = useState<{
-    graphTitle?: string;
-    modelConnected: boolean;
-  }>();
+  const [chatHeader, setChatHeader] = useState<ChatHeaderInfo>();
   useEffect(() => {
     // 信息密度固定为「舒适」，不再提供切换：清掉旧偏好与残留样式。
     delete document.documentElement.dataset.density;
@@ -2822,12 +2927,7 @@ function TopBar({
   }, []);
   useEffect(() => {
     const updateHeader = (event: Event) => {
-      const detail = (
-        event as CustomEvent<{
-          graphTitle?: string;
-          modelConnected: boolean;
-        }>
-      ).detail;
+      const detail = (event as CustomEvent<ChatHeaderInfo>).detail;
       if (detail) setChatHeader(detail);
     };
     window.addEventListener("learngraph:chat-header", updateHeader);
@@ -2838,6 +2938,19 @@ function TopBar({
   const systemHealthy = isChat
     ? Boolean(chatHeader?.modelConnected)
     : systemStatuses.length > 0 && systemStatuses.every(([, value]) => statusIsHealthy(value));
+  // Merged status+context trigger state: the green dot always shows system
+  // health; once a goal/graph/node is bound, the trigger grows the compact
+  // "上下文" pill and the dropdown shows both sections.
+  const contextActive =
+    isChat &&
+    Boolean(
+      chatHeader?.goalBound ||
+        chatHeader?.graphTitle ||
+        chatHeader?.learningNodeActive,
+    );
+  const clearLearningNode = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("learngraph:learning-node-clear"));
+  }, []);
   return (
     <header className="workspace-topbar">
       <div className="workspace-topbar__left">
@@ -2848,10 +2961,6 @@ function TopBar({
         ) : null}
       </div>
       <div className="workspace-topbar__actions">
-        {isChat ? (
-          // Compact secondary menu for bound goal/graph/node context.
-          <div className="topbar-context-slot" id="topbar-context-slot" />
-        ) : null}
         {onToggleGraph ? (
           <Button
             aria-expanded={graphOpen}
@@ -2865,48 +2974,6 @@ function TopBar({
           </Button>
         ) : null}
         <div className="hidden items-center gap-0.5 md:flex">
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button className="topbar-status" size="icon-sm" variant="ghost" aria-label="系统状态">
-                <span
-                  aria-hidden="true"
-                  className={cn("topbar-status__dot", systemHealthy && "is-healthy")}
-                />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-64">
-              <DropdownMenuLabel>{auth.workspaceName || "当前工作区"}</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem disabled>
-                <Activity className="size-4" />
-                API 会话有效
-              </DropdownMenuItem>
-              {isChat ? (
-                <>
-                  <DropdownMenuItem disabled>
-                    <Bot className="size-4" />
-                    {chatHeader?.modelConnected ? "模型已连接" : "模型不可用"}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem disabled>
-                    <Network className="size-4" />
-                    {chatHeader?.graphTitle ?? "未绑定图谱"}
-                  </DropdownMenuItem>
-                </>
-              ) : systemStatuses.length ? (
-                systemStatuses.map(([key, value]) => (
-                  <DropdownMenuItem disabled key={key}>
-                    <CircleDot className="size-4" />
-                    <span className="flex-1">{topbarStatusLabels[key] ?? key}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {statusIsHealthy(value) ? "正常" : "不可用"}
-                    </span>
-                  </DropdownMenuItem>
-                ))
-              ) : (
-                <DropdownMenuItem disabled>正在读取运行状态…</DropdownMenuItem>
-              )}
-            </DropdownMenuContent>
-          </DropdownMenu>
           {onToggleRail ? (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -2927,68 +2994,40 @@ function TopBar({
               </TooltipContent>
             </Tooltip>
           ) : null}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label="打开学习活动"
-                onClick={onOpenActivity}
-                size="icon-sm"
-                variant="ghost"
-              >
-                <CalendarDays className="size-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>学习活动</TooltipContent>
-          </Tooltip>
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
               aria-label="打开页面工具"
-              className="shrink-0 md:hidden"
+              className="topbar-status relative shrink-0"
               size="icon-sm"
+              title="系统状态、上下文与学习活动"
               variant="ghost"
             >
               <SlidersHorizontal className="size-4" />
+              <span
+                aria-hidden="true"
+                className={cn(
+                  "topbar-status__dot topbar-status__dot--badge",
+                  systemHealthy && "is-healthy",
+                )}
+              />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-64 md:hidden">
+          <DropdownMenuContent align="end" className="chat-context-menu w-64">
             <DropdownMenuItem onSelect={onOpenActivity}>
               <CalendarDays className="size-4" />
               学习活动
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuLabel>系统状态</DropdownMenuLabel>
-            <DropdownMenuItem disabled>
-              <Activity className="size-4" />
-              API 会话有效
-            </DropdownMenuItem>
-            {isChat ? (
-              <>
-                <DropdownMenuItem disabled>
-                  <Bot className="size-4" />
-                  {chatHeader?.modelConnected ? "模型已连接" : "模型不可用"}
-                </DropdownMenuItem>
-                <DropdownMenuItem disabled>
-                  <Network className="size-4" />
-                  <span className="truncate">
-                    {chatHeader?.graphTitle ?? "未绑定图谱"}
-                  </span>
-                </DropdownMenuItem>
-              </>
-            ) : systemStatuses.length ? (
-              systemStatuses.map(([key, value]) => (
-                <DropdownMenuItem disabled key={key}>
-                  <CircleDot className="size-4" />
-                  <span className="flex-1">{topbarStatusLabels[key] ?? key}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {statusIsHealthy(value) ? "正常" : "不可用"}
-                  </span>
-                </DropdownMenuItem>
-              ))
-            ) : (
-              <DropdownMenuItem disabled>正在读取运行状态…</DropdownMenuItem>
-            )}
+            <TopBarStatusMenuBody
+              chatHeader={chatHeader}
+              contextActive={contextActive}
+              isChat={isChat}
+              onClearLearningNode={clearLearningNode}
+              systemStatuses={systemStatuses}
+              workspaceName={auth.workspaceName}
+            />
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
