@@ -38,3 +38,34 @@ export interface FetchAuthorizationData {
   decision?: FetchAuthorizationDecision;
   authorization_status?: "approved" | "denied" | "pending";
 }
+
+/** Durable web-fetch approval record (fetch_authorization_requests row). */
+export interface FetchAuthorizationRequestView {
+  id: string;
+  workspace_id: string;
+  chat_session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  requested_url: string;
+  hostname: string;
+  status: string;
+  decision: FetchAuthorizationDecision | null;
+  requested_by: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FetchAuthorizationListResponse {
+  items: FetchAuthorizationRequestView[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+/** Current user's personal web-fetch whitelist (聊天内「以后都允许」). */
+export interface FetchUserPolicy {
+  allowed_domains: string[];
+  allow_without_confirmation: boolean;
+}

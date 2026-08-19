@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -61,6 +62,7 @@ class WebFetchRuntimeView(BaseModel):
 
 class FetchAuthorizationRequestView(ORMModel):
     id: str
+    workspace_id: str
     chat_session_id: str
     tool_call_id: str
     tool_name: str
@@ -68,3 +70,34 @@ class FetchAuthorizationRequestView(ORMModel):
     hostname: str
     status: str
     decision: str | None
+    requested_by: str
+    decided_by: str | None
+    decided_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class FetchAuthorizationListResponse(BaseModel):
+    items: list[FetchAuthorizationRequestView]
+    total: int
+    offset: int
+    limit: int
+
+
+class UserWebFetchPolicyView(BaseModel):
+    """The requesting user's own web-fetch whitelist (聊天内「以后都允许」)."""
+
+    allowed_domains: list[str]
+    allow_without_confirmation: bool
+
+
+class UserWebFetchPolicyUpdateRequest(BaseModel):
+    """Replace the requesting user's personal whitelist from the settings page.
+
+    Mirrors the decision-path write so the settings page can manage (e.g. remove)
+    domains that were added through 聊天内「以后都允许」 without granting any
+    workspace-level permission.
+    """
+
+    allowed_domains: list[str] = Field(default_factory=list)
+    allow_without_confirmation: bool = False

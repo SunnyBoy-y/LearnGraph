@@ -10,9 +10,13 @@ import {
   listEgressApprovals,
 } from "@/api/egress";
 import {
+  getFetchUserPolicy,
   getWebFetchSettings,
+  listFetchAuthorizations,
+  updateFetchUserPolicy,
   updateWebFetchSettings,
 } from "@/api/fetch-authorizations";
+import { listSandboxNetAudit } from "@/api/sandbox-net";
 import { UnifiedAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import {
   EmptyState,
@@ -347,6 +351,288 @@ function EgressApprovalQueue() {
   );
 }
 
+/** 我的个人白名单：聊天授权卡片「以后都允许」写入的域名（仅当前用户）。 */
+function PersonalFetchAllowlist() {
+  const queryClient = useQueryClient();
+  const { workspaceId = "" } = useParams();
+  const queryKey = [
+    ...workspaceResourcePrefix(workspaceId, "fetch-authorizations"),
+    "user-policy",
+  ];
+  const policy = useQuery({
+    queryKey,
+    queryFn: getFetchUserPolicy,
+    enabled: Boolean(workspaceId),
+  });
+  const update = useMutation({
+    mutationFn: updateFetchUserPolicy,
+    onSuccess: (next) => {
+      queryClient.setQueryData(queryKey, next);
+      toast.success("个人白名单已更新");
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  const domains = policy.data?.allowed_domains ?? [];
+  const remove = (domain: string) => {
+    if (!policy.data) return;
+    update.mutate({
+      ...policy.data,
+      allowed_domains: domains.filter((item) => item !== domain),
+    });
+  };
+  if (policy.isPending) return <LoadingState label="正在读取个人白名单…" />;
+  if (policy.isError) {
+    return (
+      <div className="flex items-center justify-between gap-3 text-sm text-destructive">
+        <span>{policy.error.message || "个人白名单读取失败"}</span>
+        <Button onClick={() => void policy.refetch()} size="sm" variant="outline">
+          重试
+        </Button>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <p className="text-xs leading-5 text-muted-foreground">
+        聊天授权卡片中选择「以后都允许」的域名写入这里，仅对当前用户生效；
+        网页抓取判定时与工作区白名单、统一白名单取并集。在此删除即从个人白名单移除。
+      </p>
+      {domains.length ? (
+        <div className="flex flex-wrap gap-2">
+          {domains.map((domain) => (
+            <Badge className="gap-1.5 py-1" key={domain} variant="secondary">
+              {domain}
+              <button
+                aria-label={`从个人白名单移除 ${domain}`}
+                className="text-muted-foreground hover:text-destructive"
+                disabled={update.isPending}
+                onClick={() => remove(domain)}
+                type="button"
+              >
+                ×
+              </button>
+            </Badge>
+          ))}
+        </div>
+      ) : (
+        <p className="rounded-lg border border-dashed px-3 py-4 text-center text-sm text-muted-foreground">
+          暂无个人白名单域名。在聊天授权卡片中选择「以后都允许」后，域名会出现在这里。
+        </p>
+      )}
+    </div>
+  );
+}
+
+const FETCH_STATUS_FILTERS: Array<{ value: string; label: string }> = [
+  { value: "", label: "全部" },
+  { value: "pending", label: "待审批" },
+  { value: "approved", label: "已允许" },
+  { value: "denied", label: "已拒绝" },
+];
+
+const FETCH_STATUS_LABELS: Record<string, string> = {
+  pending: "待审批",
+  approved: "已允许",
+  denied: "已拒绝",
+};
+
+function decisionLabel(decision: string | null): string | null {
+  if (decision === "allow_once") return "允许一次";
+  if (decision === "allow_always") return "已入个人白名单";
+  if (decision === "deny") return "已拒绝";
+  return null;
+}
+
+/** 网页抓取审批记录：聊天内授权卡片的持久化历史（fetch_authorization_requests）。 */
+function FetchApprovalHistory() {
+  const { workspaceId = "" } = useParams();
+  const [statusFilter, setStatusFilter] = useState("");
+  const queryPrefix = workspaceResourcePrefix(workspaceId, "fetch-authorizations");
+  const history = useQuery({
+    queryKey: [...queryPrefix, "history", statusFilter],
+    queryFn: () => listFetchAuthorizations({ status: statusFilter || undefined, limit: 100 }),
+    enabled: Boolean(workspaceId),
+  });
+  const items = history.data?.items ?? [];
+  return (
+    <Surface className="p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <SectionHeading
+          description="聊天内网页抓取授权卡片的审批记录，持久化存储；「以后都允许」同时写入个人白名单。"
+          title="网页抓取审批记录"
+        />
+        <div className="flex flex-wrap gap-1.5">
+          {FETCH_STATUS_FILTERS.map((option) => (
+            <Button
+              key={option.value}
+              className={statusFilter === option.value ? "bg-muted" : ""}
+              onClick={() => setStatusFilter(option.value)}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+      </div>
+      {history.isPending ? (
+        <LoadingState label="正在读取审批记录…" />
+      ) : history.isError ? (
+        <ErrorState message={history.error.message} onRetry={() => void history.refetch()} />
+      ) : items.length === 0 ? (
+        <EmptyState
+          description={
+            statusFilter
+              ? "该状态下暂无审批记录"
+              : "暂无审批记录。聊天内抓取需要授权时会生成记录并持久化保存"
+          }
+          title="没有审批记录"
+        />
+      ) : (
+        <ul className="mt-3 divide-y">
+          {items.map((request) => {
+            const decision = decisionLabel(request.decision);
+            return (
+              <li key={request.id} className="flex flex-col gap-2 py-3 first:pt-1 last:pb-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <code className="text-sm font-semibold">{request.hostname}</code>
+                  <StatePill
+                    label={FETCH_STATUS_LABELS[request.status] ?? request.status}
+                    status={request.status}
+                  />
+                  {request.decision === "allow_always" && (
+                    <Badge variant="outline">已入个人白名单</Badge>
+                  )}
+                </div>
+                {request.requested_url && request.requested_url !== request.hostname && (
+                  <p className="min-w-0 truncate text-xs text-muted-foreground">
+                    {request.requested_url}
+                  </p>
+                )}
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                  <span>请求者：{request.requested_by}</span>
+                  <span>创建：{formatTime(request.created_at)}</span>
+                  <span>
+                    决定：
+                    {request.decided_at
+                      ? `${decision ?? request.decision ?? "—"} · ${formatTime(request.decided_at)}`
+                      : "—"}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {history.data && history.data.total > items.length && (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <CircleAlert className="size-3.5" />
+          仅显示前 {items.length} 条（共 {history.data.total} 条）
+        </div>
+      )}
+      <div className="flex justify-end">
+        <Button
+          disabled={history.isFetching}
+          onClick={() => void history.refetch()}
+          size="sm"
+          variant="ghost"
+        >
+          <RefreshCcw className="size-4" />
+          刷新
+        </Button>
+      </div>
+    </Surface>
+  );
+}
+
+/** 前端沙箱联网审计：MagicCard / HTML 预览沙箱的免审批网络直连记录。 */
+function SandboxNetAuditHistory() {
+  const { workspaceId = "" } = useParams();
+  const queryPrefix = workspaceResourcePrefix(workspaceId, "sandbox-net-audit");
+  const audit = useQuery({
+    queryKey: [...queryPrefix, "history"],
+    queryFn: () => listSandboxNetAudit({ limit: 100 }),
+    enabled: Boolean(workspaceId),
+  });
+  const items = audit.data?.items ?? [];
+  return (
+    <Surface className="p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <SectionHeading
+          description="聊天内 MagicCard / HTML 预览沙箱发起的网络请求（免审批直连，仅记录目标与方法，不含查询参数与凭据）。"
+          title="前端沙箱联网记录"
+        />
+      </div>
+      {audit.isPending ? (
+        <LoadingState label="正在读取联网记录…" />
+      ) : audit.isError ? (
+        <ErrorState message={audit.error.message} onRetry={() => void audit.refetch()} />
+      ) : items.length === 0 ? (
+        <EmptyState
+          description="暂无联网记录。沙箱内代码发起 fetch 后会在这里留下只读记录。"
+          title="没有联网记录"
+        />
+      ) : (
+        <ul className="mt-3 divide-y">
+          {items.map((entry) => {
+            const details = entry.details ?? {};
+            const target = typeof details.target === "string" ? details.target : "—";
+            const method = typeof details.method === "string" ? details.method : "GET";
+            const status = typeof details.status === "number" ? details.status : null;
+            const size =
+              typeof details.size_bytes === "number" ? `${details.size_bytes} B` : null;
+            return (
+              <li key={entry.id} className="flex flex-col gap-1.5 py-3 first:pt-1 last:pb-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <code className="text-sm font-semibold">{method}</code>
+                  <code className="min-w-0 flex-1 truncate text-sm">{target}</code>
+                  <StatePill
+                    label={
+                      entry.outcome === "denied"
+                        ? "已拦截"
+                        : status != null
+                          ? status < 400
+                            ? "成功"
+                            : status < 500
+                              ? `错误 ${status}`
+                              : `失败 ${status}`
+                          : entry.outcome
+                      }
+                    status={
+                      entry.outcome === "denied" || (status != null && status >= 400)
+                        ? "danger"
+                        : "healthy"
+                    }
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                  <span>时间：{formatTime(entry.created_at)}</span>
+                  {size ? <span>大小：{size}</span> : null}
+                  {entry.outcome === "denied" && typeof details.reason === "string" ? (
+                    <span>原因：{details.reason}</span>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <div className="flex justify-end">
+        <Button
+          disabled={audit.isFetching}
+          onClick={() => void audit.refetch()}
+          size="sm"
+          variant="ghost"
+        >
+          <RefreshCcw className="size-4" />
+          刷新
+        </Button>
+      </div>
+    </Surface>
+  );
+}
+
 /**
  * 搜索与抓取：统一白名单（搜索 / 抓取 / 出站一层放行）+ 全放行开关 +
  * 网页抓取通道 + 出站审批。替代原「访问与审批」「Egress 审批」「搜索与研究」。
@@ -385,6 +671,15 @@ export function SearchFetchPage() {
           />
         </div>
         <UnifiedAllowlistEditor />
+        <div className="border-t pt-5">
+          <SectionHeading
+            description="聊天授权卡片中选择「以后都允许」写入的域名，仅对当前用户生效。"
+            title="我的个人白名单"
+          />
+          <div className="mt-3">
+            <PersonalFetchAllowlist />
+          </div>
+        </div>
       </Surface>
       <Surface className="space-y-5 p-5">
         <SectionHeading
@@ -394,6 +689,8 @@ export function SearchFetchPage() {
         <FetchChannelSettings />
       </Surface>
       <EgressApprovalQueue />
+      <FetchApprovalHistory />
+      <SandboxNetAuditHistory />
     </PageFrame>
   );
 }

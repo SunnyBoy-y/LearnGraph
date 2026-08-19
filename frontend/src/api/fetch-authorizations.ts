@@ -1,9 +1,38 @@
 import type {
   FetchAuthorizationDecision,
+  FetchAuthorizationListResponse,
+  FetchUserPolicy,
   WebFetchRuntimeSettings,
 } from "@/types/fetch-authorization";
 
 import { apiClient } from "./client";
+
+export function listFetchAuthorizations(options: {
+  status?: string;
+  offset?: number;
+  limit?: number;
+} = {}): Promise<FetchAuthorizationListResponse> {
+  const query: Record<string, string | number> = {};
+  if (options.status) query.status = options.status;
+  if (options.offset !== undefined) query.offset = options.offset;
+  if (options.limit !== undefined) query.limit = options.limit;
+  return apiClient.get<FetchAuthorizationListResponse>("/fetch-authorizations", {
+    query,
+  });
+}
+
+export function getFetchUserPolicy(): Promise<FetchUserPolicy> {
+  return apiClient.get<FetchUserPolicy>("/fetch-authorizations/user-policy");
+}
+
+export function updateFetchUserPolicy(
+  payload: FetchUserPolicy,
+): Promise<FetchUserPolicy> {
+  return apiClient.put<FetchUserPolicy, FetchUserPolicy>(
+    "/fetch-authorizations/user-policy",
+    payload,
+  );
+}
 
 export function decideFetchAuthorization(
   requestId: string,

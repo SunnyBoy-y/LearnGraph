@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.core.errors import AppError
@@ -16,7 +16,10 @@ from app.domain.models import (
 )
 from app.domain.schemas.fetch_authorization import (
     FetchAuthorizationDecisionRequest,
+    FetchAuthorizationListResponse,
     FetchAuthorizationRequestView,
+    UserWebFetchPolicyUpdateRequest,
+    UserWebFetchPolicyView,
     WebFetchRuntimeUpdateRequest,
     WebFetchRuntimeView,
 )
@@ -27,6 +30,141 @@ from app.services.web_fetch_runtime import (
 )
 
 router = APIRouter(prefix="/fetch-authorizations", tags=["fetch-authorizations"])
+
+
+def _to_view(row: FetchAuthorizationRequest) -> FetchAuthorizationRequestView:
+    """Map the ORM row to the API view (``actor_id`` surfaces as ``requested_by``)."""
+    return FetchAuthorizationRequestView(
+        id=row.id,
+        workspace_id=row.workspace_id,
+        chat_session_id=row.chat_session_id,
+        tool_call_id=row.tool_call_id,
+        tool_name=row.tool_name,
+        requested_url=row.requested_url,
+        hostname=row.hostname,
+        status=row.status,
+        decision=row.decision,
+        requested_by=row.actor_id,
+        decided_by=row.decided_by,
+        decided_at=row.decided_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get("", response_model=FetchAuthorizationListResponse)
+def list_fetch_authorizations(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    status: str | None = None,
+    offset: int = 0,
+    limit: int = 50,
+) -> FetchAuthorizationListResponse:
+    """List persisted web-fetch approval records for the workspace.
+
+    These are the durable ``fetch_authorization_requests`` rows behind the
+    聊天内网络审批卡片: every 允许一次 / 以后都允许 / 拒绝 decision is stored in
+    PostgreSQL, so the settings page can show the full history after a reload.
+    Ordinary members see only their own requests; workspace managers see the
+    whole queue. ``allow_always`` rows surface the personal whitelist entry
+    that the decision wrote into ``UserWebFetchPolicy``.
+    """
+    query = select(FetchAuthorizationRequest).where(
+        FetchAuthorizationRequest.workspace_id == context.workspace_id
+    )
+    if "workspace.manage" not in context.permissions:
+        query = query.where(
+            FetchAuthorizationRequest.actor_id == context.principal.user_id
+        )
+    if status:
+        query = query.where(FetchAuthorizationRequest.status == status)
+    total = db.scalar(
+        select(func.count()).select_from(query.subquery())
+    ) or 0
+    rows = db.scalars(
+        query.order_by(FetchAuthorizationRequest.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return FetchAuthorizationListResponse(
+        items=[_to_view(row) for row in rows],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
+
+
+@router.get("/user-policy", response_model=UserWebFetchPolicyView)
+def get_fetch_user_policy(
+    db: DB,
+    context: CurrentWorkspace,
+) -> UserWebFetchPolicyView:
+    """The current user's personal web-fetch whitelist (聊天内「以后都允许」).
+
+    Stored per (workspace, user) in ``user_web_fetch_policies``; the effective
+    fetch domains are the union of this personal list, the workspace
+    ``web_fetch.policy`` and the unified ``access.allowlist``.
+    """
+    policy = db.scalar(
+        select(UserWebFetchPolicy).where(
+            UserWebFetchPolicy.workspace_id == context.workspace_id,
+            UserWebFetchPolicy.user_id == context.principal.user_id,
+        )
+    )
+    return UserWebFetchPolicyView(
+        allowed_domains=list(policy.allowed_domains if policy else []),
+        allow_without_confirmation=bool(
+            policy.allow_without_confirmation if policy else False
+        ),
+    )
+
+
+@router.put("/user-policy", response_model=UserWebFetchPolicyView)
+def update_fetch_user_policy(
+    payload: UserWebFetchPolicyUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> UserWebFetchPolicyView:
+    """Replace the current user's personal whitelist from the settings page.
+
+    No ``workspace.manage`` gate — the list is user-scoped, mirroring the
+    decision-path write so the settings page can remove a「以后都允许」domain
+    without affecting other members.
+    """
+    policy = db.scalar(
+        select(UserWebFetchPolicy).where(
+            UserWebFetchPolicy.workspace_id == context.workspace_id,
+            UserWebFetchPolicy.user_id == context.principal.user_id,
+        )
+    )
+    domains = [item.strip().casefold() for item in payload.allowed_domains if isinstance(item, str)]
+    domains = list(dict.fromkeys(item for item in domains if item))
+    if policy is None:
+        policy = UserWebFetchPolicy(
+            workspace_id=context.workspace_id,
+            user_id=context.principal.user_id,
+            allowed_domains=domains,
+            allow_without_confirmation=payload.allow_without_confirmation,
+        )
+        db.add(policy)
+    else:
+        policy.allowed_domains = domains
+        policy.allow_without_confirmation = payload.allow_without_confirmation
+    AuditRepository(db, context.workspace_id).record(
+        actor_id=context.principal.user_id,
+        action="web_fetch.user_policy_updated",
+        resource_type="user_web_fetch_policy",
+        resource_id=context.principal.user_id,
+        outcome="updated",
+        details={"allowed_domains": domains},
+    )
+    db.commit()
+    db.refresh(policy)
+    return UserWebFetchPolicyView(
+        allowed_domains=list(policy.allowed_domains),
+        allow_without_confirmation=bool(policy.allow_without_confirmation),
+    )
 
 
 @router.get("/settings", response_model=WebFetchRuntimeView)
@@ -70,7 +208,7 @@ def decide_fetch_authorization(
     if pending is None:
         raise AppError(404, "fetch_authorization_not_found", "Fetch authorization request was not found")
     if pending.status != "pending":
-        return FetchAuthorizationRequestView.model_validate(pending)
+        return _to_view(pending)
     # Authority (design doc §6.3): only the requesting user, or a workspace
     # manager deciding on their behalf, may decide a pending request.
     if (
@@ -176,7 +314,7 @@ def decide_fetch_authorization(
     )
     db.commit()
     db.refresh(pending)
-    return FetchAuthorizationRequestView.model_validate(pending)
+    return _to_view(pending)
 
 
 @router.post("/{request_id}/resume")
