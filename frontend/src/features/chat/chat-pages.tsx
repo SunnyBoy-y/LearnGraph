@@ -37,9 +37,11 @@ import {
   MessageSquareQuote,
   Mic,
   Network,
+  Paperclip,
   Pencil,
   RefreshCcw,
   Search,
+  Send,
   Settings2,
   Sparkles,
   Square,
@@ -333,6 +335,33 @@ type ChatStatus = "ready" | "submitted" | "streaming" | "error";
 type GraphAction = NonNullable<MessageCreateRequest["graph_action"]>;
 type ImageSize = NonNullable<MessageCreateRequest["image_size"]>;
 
+/**
+ * A message queued while the assistant is still replying. It waits above the
+ * composer until the current generation finishes (auto-send), or until the user
+ * picks 打断并发送 to interrupt and send it right away.
+ */
+type PendingSendItem = {
+  id: string;
+  text: string;
+  /** Raw form attachments snapshotted at queue time (sent as-is). */
+  files: PromptInputMessage["files"];
+  /** Library files referenced via @ 资料库. */
+  pendingFiles: FileRecord[];
+  longPaste: string | null;
+  generationMode: GenerationMode;
+  imageSize: ImageSize;
+  queuedAt: number;
+};
+
+/** Draft overrides that let a queued item replay the exact composer state. */
+type PendingSendDraft = {
+  files?: PromptInputMessage["files"];
+  pendingFiles?: FileRecord[];
+  longPaste?: string | null;
+  generationMode?: GenerationMode;
+  imageSize?: ImageSize;
+};
+
 const IMAGE_EDIT_MIME_TYPES = new Set([
   "image/png",
   "image/jpeg",
@@ -410,6 +439,124 @@ function usePhoneLayout() {
     return () => query.removeEventListener("change", update);
   }, []);
   return isPhone;
+}
+
+/**
+ * Mouse drag-to-scroll for horizontally overflowing rows (e.g. the composer
+ * capability toolbar). Touch keeps its native swipe, and the handlers are
+ * inert when the row fits — so ordinary clicks on the row's buttons keep
+ * working. While an overflow exists the element gets `data-draggable="true"`
+ * (grab cursor affordance); during an active drag it gets `is-drag-scrolling`.
+ *
+ * Deliberately NOT using pointer capture: capture retargets the click derived
+ * from a tap to the capture element, breaking plain clicks on the row's
+ * buttons. Instead we track the drag with window-level listeners, which keeps
+ * taps on the button target and still lets the drag follow the cursor even
+ * when it drifts outside the row. The click that follows a real drag is
+ * suppressed via a flag consumed in capture phase (only a click matching the
+ * drag — release over the same button or inside the row — passes through it).
+ */
+function useHorizontalDragScroll<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const drag = useRef<{
+    pointerId: number;
+    startX: number;
+    startScrollLeft: number;
+  } | null>(null);
+  const suppressClick = useRef(false);
+  /** Clears the suppression flag shortly after a drag that produced no
+   *  derived click, so a later click on a toolbar button is not eaten. */
+  const resetSuppressTimer = useRef<number | null>(null);
+  const bound = useRef<{
+    move: (event: PointerEvent) => void;
+    up: (event: PointerEvent) => void;
+  } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const update = () => {
+      el.dataset.draggable =
+        el.scrollWidth > el.clientWidth + 1 ? "true" : "false";
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      if (bound.current) {
+        window.removeEventListener("pointermove", bound.current.move);
+        window.removeEventListener("pointerup", bound.current.up);
+        window.removeEventListener("pointercancel", bound.current.up);
+        bound.current = null;
+      }
+      if (resetSuppressTimer.current !== null) {
+        window.clearTimeout(resetSuppressTimer.current);
+        resetSuppressTimer.current = null;
+      }
+    };
+  }, []);
+
+  const stopDrag = useCallback(() => {
+    if (!bound.current) return;
+    window.removeEventListener("pointermove", bound.current.move);
+    window.removeEventListener("pointerup", bound.current.up);
+    window.removeEventListener("pointercancel", bound.current.up);
+    bound.current = null;
+    drag.current = null;
+    if (ref.current) ref.current.classList.remove("is-drag-scrolling");
+    // The derived click (if any) fires in the same task as pointerup and
+    // consumes the flag via onClickCapture; anything later must pass.
+    if (resetSuppressTimer.current !== null) {
+      window.clearTimeout(resetSuppressTimer.current);
+    }
+    resetSuppressTimer.current = window.setTimeout(() => {
+      suppressClick.current = false;
+      resetSuppressTimer.current = null;
+    }, 250);
+  }, []);
+
+  const onPointerDown = useCallback(
+    (event: React.PointerEvent<T>) => {
+      if (event.pointerType !== "mouse" || event.button !== 0) return;
+      const el = ref.current;
+      if (!el || el.scrollWidth <= el.clientWidth + 1) return;
+      suppressClick.current = false;
+      drag.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startScrollLeft: el.scrollLeft,
+      };
+      el.classList.add("is-drag-scrolling");
+      const move = (native: PointerEvent) => {
+        const state = drag.current;
+        const target = ref.current;
+        if (!state || !target || native.pointerId !== state.pointerId) return;
+        const dx = native.clientX - state.startX;
+        if (Math.abs(dx) > 4) suppressClick.current = true;
+        target.scrollLeft = state.startScrollLeft - dx;
+        if (native.cancelable) native.preventDefault();
+      };
+      const up = (native: PointerEvent) => {
+        if (native.pointerId !== drag.current?.pointerId) return;
+        stopDrag();
+      };
+      bound.current = { move, up };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    },
+    [stopDrag],
+  );
+
+  const onClickCapture = useCallback((event: React.MouseEvent<T>) => {
+    if (!suppressClick.current) return;
+    suppressClick.current = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, []);
+
+  return { ref, onPointerDown, onClickCapture };
 }
 
 function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
@@ -517,7 +664,7 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
   return (
     <>
       <div
-        className="mb-2 flex flex-col gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-950 shadow-sm dark:border-amber-800 dark:bg-amber-950/45 dark:text-amber-100 sm:flex-row sm:items-center"
+        className="mb-2 flex w-full flex-col gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-950 shadow-sm dark:border-amber-800 dark:bg-amber-950/45 dark:text-amber-100 sm:flex-row sm:items-center"
         role="alert"
       >
         <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-amber-200/70 dark:bg-amber-900">
@@ -1926,7 +2073,7 @@ function AssistantMessageInner({
       onFocus={() => setVersionsRequested(true)}
     >
       {versions.data && versions.data.length > 1 ? (
-        <div className="mb-2 flex items-center gap-1 text-[10px] text-muted-foreground">
+        <div className="chat-message-version-row mb-2 flex items-center gap-1 text-[10px] text-muted-foreground">
           版本：
           {versions.data.map((version) => (
             <Button
@@ -2277,96 +2424,6 @@ function FollowUpPrompts({
   );
 }
 
-function ConversationContextBar({
-  goalBound,
-  graphTitle,
-  learningNode,
-  onClearLearningNode,
-}: {
-  goalBound: boolean;
-  graphTitle?: string;
-  learningNode?: LearningNodeContext;
-  onClearLearningNode: () => void;
-}) {
-  if (!goalBound && !graphTitle && !learningNode) return null;
-
-  const itemCount =
-    (goalBound ? 1 : 0) + (graphTitle ? 1 : 0) + (learningNode ? 1 : 0);
-  const primaryLabel = learningNode
-    ? (learningNode.nodeLabel ?? "学习节点")
-    : graphTitle
-      ? graphTitle
-      : "已绑定目标";
-  const triggerTitle = learningNode
-    ? `节点 · ${learningNode.nodeLabel ?? "已选择学习节点"}`
-    : graphTitle
-      ? `图谱 · ${graphTitle}`
-      : "已绑定目标";
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          aria-label={`本轮对话上下文，共 ${itemCount} 项`}
-          className="chat-context-menu-trigger"
-          size="sm"
-          title={triggerTitle}
-          variant="ghost"
-        >
-          <span className="chat-context-menu-trigger__label">上下文</span>
-          <span className="chat-context-menu-trigger__value" title={primaryLabel}>
-            {primaryLabel}
-          </span>
-          {itemCount > 1 ? (
-            <span className="chat-context-menu-trigger__count">+{itemCount - 1}</span>
-          ) : null}
-          <ChevronDown aria-hidden="true" className="chat-context-menu-trigger__chevron" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="end"
-        className="chat-context-menu w-64"
-        sideOffset={6}
-      >
-        <DropdownMenuLabel>本轮对话上下文</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        {goalBound ? (
-          <div className="chat-context-menu__row">
-            <Target className="size-3.5" />
-            <span className="min-w-0 flex-1 truncate">已绑定目标</span>
-          </div>
-        ) : null}
-        {graphTitle ? (
-          <div className="chat-context-menu__row" title={graphTitle}>
-            <Network className="size-3.5" />
-            <span className="min-w-0 flex-1 truncate">图谱 · {graphTitle}</span>
-          </div>
-        ) : null}
-        {learningNode ? (
-          <div className="chat-context-menu__row chat-context-menu__row--node">
-            <GitBranch className="size-3.5" />
-            <span
-              className="min-w-0 flex-1 truncate"
-              title={learningNode.nodeLabel ?? "已选择学习节点"}
-            >
-              节点 · {learningNode.nodeLabel ?? "已选择学习节点"}
-            </span>
-            <button
-              aria-label="移除当前学习节点上下文"
-              className="chat-context-menu__clear"
-              onClick={onClearLearningNode}
-              title="本轮后续消息不再绑定此节点"
-              type="button"
-            >
-              <X aria-hidden="true" className="size-3" />
-            </button>
-          </div>
-        ) : null}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
 function ConversationQuickActions({
   agentActive,
   agentDisabled,
@@ -2412,9 +2469,13 @@ function ConversationQuickActions({
   searchActive: boolean;
   searchDisabled: boolean;
 }) {
+  const dragScroll = useHorizontalDragScroll<HTMLElement>();
   return (
-    <section aria-label="对话工作台功能" className="chat-workbench-toolbar">
-      <span className="chat-workbench-toolbar__label">本轮能力</span>
+    <section
+      aria-label="对话工作台功能"
+      className="chat-workbench-toolbar"
+      {...dragScroll}
+    >
       <div className="chat-workbench-toolbar__actions">
         <button
           aria-label="添加资料到本轮对话"
@@ -2537,13 +2598,8 @@ export function ChatCanvasPage() {
   const [topbarModelSlot, setTopbarModelSlot] = useState<HTMLElement | null>(
     null,
   );
-  // Bound goal/graph/node chips live in the page header, not above the composer.
-  const [topbarContextSlot, setTopbarContextSlot] = useState<HTMLElement | null>(
-    null,
-  );
   useEffect(() => {
     setTopbarModelSlot(document.getElementById("topbar-model-slot"));
-    setTopbarContextSlot(document.getElementById("topbar-context-slot"));
   }, []);
   const [localMessages, setLocalMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ChatStatus>("ready");
@@ -2589,6 +2645,14 @@ export function ChatCanvasPage() {
   );
   const [pendingFiles, setPendingFiles] = useState<FileRecord[]>([]);
   const [composerText, setComposerText] = useState("");
+  // 待发送队列：回复进行中提交的消息先进队列，生成结束后自动发出。
+  const [pendingSendQueue, setPendingSendQueue] = useState<PendingSendItem[]>([]);
+  const pendingSendQueueRef = useRef<PendingSendItem[]>([]);
+  const dispatchInFlightRef = useRef(false);
+  const autoDispatchBlockedRef = useRef(false);
+  const composerHasText = composerText.trim().length > 0;
+  const streamOrSubmitted = status === "streaming" || status === "submitted";
+  const queueOnClick = streamOrSubmitted && composerHasText;
   const [graphAction, setGraphAction] = useState<GraphAction>("none");
   // Settings load after mount; initial seed uses product defaults, then
   // the session restore effect below adopts the workspace default.
@@ -2682,6 +2746,9 @@ export function ChatCanvasPage() {
   const optimisticSessionId = useRef<string | null>(null);
   const retryExpectedVersionRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  /** 底部 Composer 整体（快捷栏 + 状态条 + 输入框）高度写入 --composer-height，
+      驱动正文动态安全区 / 底部淡出 / 悬浮按钮位置，禁止固定像素值。 */
+  const composerDockRef = useRef<HTMLDivElement | null>(null);
   const [composerExpanded, setComposerExpanded] = useState(false);
   const openFileDialogRef = useRef<() => void>(() => undefined);
   const pendingHandled = useRef(false);
@@ -2711,9 +2778,13 @@ export function ChatCanvasPage() {
 
   // Grow the composer with soft wraps (not only hard newlines), ChatGPT-style.
   // Cap height; once capped, allow overflow so the caret stays reachable.
+  // Width is fixed: the pill spans the shared content column
+  // (--chat-content-width), so the textarea simply fills the flex space.
   useLayoutEffect(() => {
     const el = composerTextareaRef.current;
     if (!el) return;
+
+    el.style.width = "100%";
 
     const syncHeight = () => {
       const maxHeight = 210;
@@ -2729,8 +2800,34 @@ export function ChatCanvasPage() {
 
     syncHeight();
     window.addEventListener("resize", syncHeight);
-    return () => window.removeEventListener("resize", syncHeight);
+    // Re-sync when the pill chrome changes (model chip, mode switches…).
+    const group = el.closest("[data-slot='input-group']");
+    let observer: ResizeObserver | undefined;
+    if (group && typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(syncHeight);
+      observer.observe(group);
+    }
+    return () => {
+      window.removeEventListener("resize", syncHeight);
+      observer?.disconnect();
+    };
   }, [composerText, composerInstanceKey]);
+
+  // 底部 Composer 高度变化时写入 --composer-height：正文动态安全区、底部
+  // 淡出区域与「回到底部」按钮统一依赖该变量，而不是各自的固定像素值。
+  useEffect(() => {
+    const element = composerDockRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      document.documentElement.style.setProperty(
+        "--composer-height",
+        `${entry.contentRect.height}px`,
+      );
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!selectionMenu) return;
@@ -4856,7 +4953,10 @@ export function ChatCanvasPage() {
             status !== "streaming" &&
             status !== "submitted" &&
             !closeSessionMutation.isPending,
+          goalBound: Boolean(currentSession?.goal_id),
           graphTitle,
+          learningNodeActive: Boolean(learningNode),
+          learningNodeLabel: learningNode?.nodeLabel,
           modelConnected: Boolean(activeGenerationProvider),
           sessionClosed: sessionIsClosed,
           sessionTitle: currentSession?.title ?? "新会话",
@@ -4868,6 +4968,7 @@ export function ChatCanvasPage() {
     closeSessionMutation.isPending,
     currentSession,
     graphTitle,
+    learningNode,
     sessionId,
     sessionIsClosed,
     status,
@@ -5855,18 +5956,57 @@ export function ChatCanvasPage() {
   const discardLongPaste = useCallback(() => setLongPaste(null), []);
 
   const submitPrompt = useCallback(
-    async (message: PromptInputMessage) => {
+    async (
+      message: PromptInputMessage,
+      _event?: unknown,
+      draft?: PendingSendDraft,
+    ) => {
+      const effectiveFiles = draft?.files ?? message.files;
+      const effectivePendingFiles = draft?.pendingFiles ?? pendingFiles;
+      const effectiveLongPaste =
+        draft?.longPaste === undefined ? longPaste : draft.longPaste;
+      const effectiveGenerationMode = draft?.generationMode ?? generationMode;
+      const effectiveImageSize = draft?.imageSize ?? imageSize;
+      // 回复进行中提交的新消息进入待发送队列：快照完整草稿（文本、附件、
+      // 资料库引用、大文本附件、模式与图片比例），当前生成结束后自动发出，
+      // 或由用户在队列控件上选择「打断并发送」立即发出。
+      const generatingNow =
+        activeStreamSessionId.current === sessionId ||
+        isSessionStreaming(sessionId);
+      const trimmedText = message.text.trim();
+      if (generatingNow && trimmedText) {
+        const queued: PendingSendItem = {
+          id: `pending-send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          text: trimmedText,
+          files: effectiveFiles,
+          pendingFiles: effectivePendingFiles,
+          longPaste: effectiveLongPaste,
+          generationMode: effectiveGenerationMode,
+          imageSize: effectiveImageSize,
+          queuedAt: Date.now(),
+        };
+        autoDispatchBlockedRef.current = false;
+        setPendingSendQueue((current) => [...current, queued]);
+        toast.message("已加入发送队列，当前回复结束后自动发送。");
+        // 与正常发送一致地清空草稿（文本与附件已移入队列条目）。
+        setPendingFiles([]);
+        setComposerText("");
+        setLongPaste(null);
+        setGenerationMode("text");
+        return true;
+      }
+      autoDispatchBlockedRef.current = false;
       try {
         // 大文本粘贴自动转成的附件：仅发送时上传入库（发送前不入库）。
         const longPasteParts: PromptInputMessage["files"] =
-          longPaste === null
+          effectiveLongPaste === null
             ? []
             : (() => {
                 const timestamp = new Date()
                   .toISOString()
                   .replaceAll(/[:.]/g, "-");
                 const filename = `chat-note-${timestamp}.md`;
-                const localFile = new File([longPaste], filename, {
+                const localFile = new File([effectiveLongPaste], filename, {
                   type: "text/markdown",
                 });
                 return [
@@ -5881,10 +6021,12 @@ export function ChatCanvasPage() {
                   },
                 ];
               })();
-        const files = [...message.files, ...longPasteParts];
+        const files = [...effectiveFiles, ...longPasteParts];
         const hasImageMention = /^\s*@绘图(?=\s|$)/u.test(message.text);
         const requestedGenerationMode: GenerationMode =
-          hasImageMention || generationMode === "image" ? "image" : "text";
+          hasImageMention || effectiveGenerationMode === "image"
+            ? "image"
+            : "text";
         if (
           requestedGenerationMode === "text" &&
           responseMode !== "agentic"
@@ -5900,7 +6042,7 @@ export function ChatCanvasPage() {
                   }).ok,
               )
               .map((part) => part.filename ?? "未命名附件"),
-            ...pendingFiles
+            ...effectivePendingFiles
               .filter(
                 (file) =>
                   !classifyNonAgentAttachment({
@@ -5943,7 +6085,7 @@ export function ChatCanvasPage() {
         }
         if (
           requestedGenerationMode === "image" &&
-          pendingFiles.some(
+          effectivePendingFiles.some(
             (file) => !IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase()),
           )
         ) {
@@ -5952,7 +6094,7 @@ export function ChatCanvasPage() {
         }
         if (
           requestedGenerationMode === "image" &&
-          (files.length > 0 || pendingFiles.length > 0) &&
+          (files.length > 0 || effectivePendingFiles.length > 0) &&
           !isImageEditModel(selectedImageModel)
         ) {
           toast.error("图生图和图片编辑仅支持支持参考图的绘图模型。");
@@ -5973,7 +6115,7 @@ export function ChatCanvasPage() {
         const preparedPendingFiles =
           requestedGenerationMode === "text"
             ? await Promise.all(
-                pendingFiles.map((file) =>
+                effectivePendingFiles.map((file) =>
                   prepareStoredFile(file, responseMode === "agentic"),
                 ),
               )
@@ -6058,7 +6200,7 @@ export function ChatCanvasPage() {
             attachmentFiles:
               requestedGenerationMode === "text" ? attachmentFiles : [],
             generationMode: requestedGenerationMode,
-            imageSize,
+            imageSize: effectiveImageSize,
             sourceFileIds,
             sandboxPreflighted:
               requestedGenerationMode === "text" && responseMode === "agentic",
@@ -6088,10 +6230,170 @@ export function ChatCanvasPage() {
       responseMode,
       selectedImageModel,
       send,
+      sessionId,
       storedAudioAsrAvailable,
       uploadAndIndex,
     ],
   );
+
+  // --- 待发送队列：打断 / 编辑 / 取消 / 自动发送 ---------------------------
+
+  const stopCurrentGeneration = useCallback(() => {
+    const messageId = activeMessageId.current;
+    const streamSessionId = activeStreamSessionId.current;
+    const cancellation =
+      messageId && streamSessionId
+        ? cancelSessionMessage(streamSessionId, messageId)
+            .catch((error: Error) => toast.error(error.message))
+            .then(() => undefined)
+        : Promise.resolve();
+    activeCancellationRef.current = cancellation;
+    void cancellation.finally(() => {
+      if (activeCancellationRef.current === cancellation)
+        activeCancellationRef.current = null;
+    });
+    // Only abort the currently viewed session's stream.
+    abortSessionStream(streamSessionId ?? sessionId);
+    abortRef.current?.abort();
+    markSessionRunning(streamSessionId ?? sessionId, false);
+    setStatus("submitted");
+  }, [sessionId]);
+
+  /** Wait until an aborted stream's finally block clears abortRef. */
+  const waitForAbortSettle = useCallback(async (timeoutMs = 5_000) => {
+    const controller = abortRef.current;
+    if (!controller) return;
+    const startedAt = Date.now();
+    await new Promise<void>((resolve) => {
+      const tick = () => {
+        if (
+          abortRef.current !== controller ||
+          Date.now() - startedAt > timeoutMs
+        ) {
+          resolve();
+          return;
+        }
+        window.setTimeout(tick, 25);
+      };
+      tick();
+    });
+  }, []);
+
+  /** Replay a queued item through the full composer pipeline (uploads etc.). */
+  const dispatchQueuedSend = useCallback(
+    async (item: PendingSendItem): Promise<boolean> => {
+      try {
+        const ok = await submitPrompt(
+          { text: item.text, files: item.files },
+          undefined,
+          {
+            pendingFiles: item.pendingFiles,
+            longPaste: item.longPaste,
+            generationMode: item.generationMode,
+            imageSize: item.imageSize,
+          },
+        );
+        if (!ok) {
+          // Validation failed (e.g. sandbox not ready): put the item back at
+          // the front and stop auto-dispatching so the user can decide.
+          setPendingSendQueue((current) => [item, ...current]);
+          autoDispatchBlockedRef.current = true;
+        } else {
+          autoDispatchBlockedRef.current = false;
+        }
+        return ok;
+      } catch {
+        setPendingSendQueue((current) => [item, ...current]);
+        autoDispatchBlockedRef.current = true;
+        return false;
+      }
+    },
+    [submitPrompt],
+  );
+
+  /** 打断当前回复并立即发送该队列条目。 */
+  const handleInterruptSend = useCallback(
+    async (item: PendingSendItem) => {
+      if (dispatchInFlightRef.current) return;
+      if (!pendingSendQueueRef.current.some((entry) => entry.id === item.id))
+        return;
+      autoDispatchBlockedRef.current = false;
+      dispatchInFlightRef.current = true;
+      setPendingSendQueue((current) =>
+        current.filter((entry) => entry.id !== item.id),
+      );
+      try {
+        const streamSessionId = activeStreamSessionId.current;
+        if (streamSessionId === sessionId || isSessionStreaming(sessionId)) {
+          stopCurrentGeneration();
+          await waitForAbortSettle();
+        }
+        await dispatchQueuedSend(item);
+      } finally {
+        dispatchInFlightRef.current = false;
+      }
+    },
+    [dispatchQueuedSend, sessionId, stopCurrentGeneration, waitForAbortSettle],
+  );
+
+  /** 重新编辑：把队列条目回填到输入框（保留资料库引用与大文本附件）。 */
+  const handleEditQueued = useCallback((item: PendingSendItem) => {
+    autoDispatchBlockedRef.current = false;
+    setPendingSendQueue((current) =>
+      current.filter((entry) => entry.id !== item.id),
+    );
+    setComposerText(item.text);
+    setPendingFiles(item.pendingFiles);
+    setLongPaste(item.longPaste);
+    setGenerationMode(item.generationMode);
+    setImageSize(item.imageSize);
+    if (item.files.length) {
+      toast.message("已回到输入框；该消息原先直接附加的文件需要重新选择。");
+    }
+    window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
+  }, []);
+
+  /** 取消发送：把队列条目丢弃。 */
+  const handleCancelQueued = useCallback((id: string) => {
+    setPendingSendQueue((current) =>
+      current.filter((entry) => entry.id !== id),
+    );
+  }, []);
+
+  // Keep a ref in sync so async dispatch paths read the freshest queue.
+  useEffect(() => {
+    pendingSendQueueRef.current = pendingSendQueue;
+  }, [pendingSendQueue]);
+
+  // 当前会话空闲时自动发送队列中的下一条消息。
+  useEffect(() => {
+    if (dispatchInFlightRef.current) return;
+    if (autoDispatchBlockedRef.current) return;
+    if (!pendingSendQueue.length) return;
+    if (sessionId === "new") return;
+    if (isSessionStreaming(sessionId)) return;
+    if (status !== "ready") return;
+    if (goalFlow.busy || closeSessionMutation.isPending || sessionIsClosed)
+      return;
+    const [next, ...rest] = pendingSendQueue;
+    dispatchInFlightRef.current = true;
+    setPendingSendQueue(rest);
+    void (async () => {
+      try {
+        await dispatchQueuedSend(next);
+      } finally {
+        dispatchInFlightRef.current = false;
+      }
+    })();
+  }, [
+    closeSessionMutation.isPending,
+    dispatchQueuedSend,
+    goalFlow.busy,
+    pendingSendQueue,
+    sessionId,
+    sessionIsClosed,
+    status,
+  ]);
 
   const reviewGraphChange = useMutation({
     mutationFn: ({
@@ -7739,6 +8041,14 @@ export function ChatCanvasPage() {
     );
     focusComposer();
   }, [focusComposer]);
+  // The merged topbar status+context menu dispatches this event to unbind the
+  // active learning node (the conversation context chip lives in the shell).
+  useEffect(() => {
+    const clearNode = () => clearSelectedLearningNode();
+    window.addEventListener("learngraph:learning-node-clear", clearNode);
+    return () =>
+      window.removeEventListener("learngraph:learning-node-clear", clearNode);
+  }, [clearSelectedLearningNode]);
   const toggleGoalMode = useCallback(() => {
     if (goalMode) {
       leaveGoalMode();
@@ -7849,7 +8159,7 @@ export function ChatCanvasPage() {
       />
       <Conversation className="min-h-0 flex-1">
         <ConversationContent
-          className="mx-auto w-full max-w-4xl gap-7 px-4 py-6 pb-36 sm:px-7 sm:py-7"
+          className="chat-messages-content mx-auto w-full max-w-4xl gap-7 px-4 py-6 sm:px-7 sm:py-7"
           onMouseUp={() => {
             const selected = readTextSelection();
             if (!selected) {
@@ -8170,7 +8480,7 @@ export function ChatCanvasPage() {
             </>
           )}
         </ConversationContent>
-        <ConversationScrollButton />
+        <ConversationScrollButton className="chat-scroll-to-bottom" />
       </Conversation>
 
       {selectionMenu ? (
@@ -8269,21 +8579,10 @@ export function ChatCanvasPage() {
         </div>
       ) : null}
 
-      <div className="chat-composer-dock relative z-10 mx-auto w-full max-w-4xl px-3 pb-3 pt-2.5 sm:px-4">
+      <div className="chat-composer-dock" ref={composerDockRef}>
         {responseMode === "agentic" ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
-        {topbarContextSlot
-          ? createPortal(
-              <ConversationContextBar
-                goalBound={Boolean(currentSession?.goal_id)}
-                graphTitle={graphTitle}
-                learningNode={learningNode}
-                onClearLearningNode={clearSelectedLearningNode}
-              />,
-              topbarContextSlot,
-            )
-          : null}
         <ConversationQuickActions
           agentActive={responseMode === "agentic"}
           agentDisabled={
@@ -8573,6 +8872,57 @@ export function ChatCanvasPage() {
                     <span className="chat-mention-menu__key">Enter</span>
                   ) : null}
                 </button>
+              );
+            })}
+          </div>
+        ) : null}
+        {pendingSendQueue.length ? (
+          <div aria-label="待发送队列" className="chat-send-queue" role="region">
+            {pendingSendQueue.map((item) => {
+              const attachmentCount =
+                item.files.length + item.pendingFiles.length;
+              return (
+                <div className="chat-send-queue__item" key={item.id}>
+                  <span className="chat-send-queue__badge">待发送</span>
+                  <span className="chat-send-queue__text" title={item.text}>
+                    {attachmentCount ? (
+                      <span className="chat-send-queue__files">
+                        <Paperclip className="size-3" />
+                        {attachmentCount}
+                      </span>
+                    ) : null}
+                    {item.text}
+                  </span>
+                  <span className="chat-send-queue__actions">
+                    <button
+                      aria-label="重新编辑"
+                      className="chat-send-queue__action"
+                      onClick={() => handleEditQueued(item)}
+                      title="重新编辑"
+                      type="button"
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                    <button
+                      aria-label="打断当前回复并发送"
+                      className="chat-send-queue__action chat-send-queue__action--send"
+                      onClick={() => void handleInterruptSend(item)}
+                      title="打断当前回复并立即发送"
+                      type="button"
+                    >
+                      <Send className="size-3.5" />
+                    </button>
+                    <button
+                      aria-label="取消发送"
+                      className="chat-send-queue__action"
+                      onClick={() => handleCancelQueued(item.id)}
+                      title="取消发送"
+                      type="button"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </span>
+                </div>
               );
             })}
           </div>
@@ -9108,13 +9458,17 @@ export function ChatCanvasPage() {
             </PromptInputButton>
             <PromptInputSubmit
               aria-label={
-                status === "streaming" || status === "submitted" || goalFlow.busy
-                  ? "停止生成"
-                  : "发送消息"
+                queueOnClick
+                  ? "发送消息（加入队列）"
+                  : streamOrSubmitted || goalFlow.busy
+                    ? "停止生成"
+                    : "发送消息"
               }
               className={cn(
                 "chat-composer__submit",
-                status === "streaming" && "chat-composer__submit--stop",
+                status === "streaming" &&
+                  !queueOnClick &&
+                  "chat-composer__submit--stop",
               )}
               disabled={
                 !activeGenerationProvider ||
@@ -9124,31 +9478,20 @@ export function ChatCanvasPage() {
                 goalFlow.busy ||
                 goalComposerLocked
               }
-              onStop={() => {
-                const messageId = activeMessageId.current;
-                const streamSessionId = activeStreamSessionId.current;
-                const cancellation =
-                  messageId && streamSessionId
-                    ? cancelSessionMessage(streamSessionId, messageId)
-                        .catch((error: Error) => toast.error(error.message))
-                        .then(() => undefined)
-                    : Promise.resolve();
-                activeCancellationRef.current = cancellation;
-                void cancellation.finally(() => {
-                  if (activeCancellationRef.current === cancellation)
-                    activeCancellationRef.current = null;
-                });
-                // Only abort the currently viewed session's stream.
-                abortSessionStream(streamSessionId ?? sessionId);
-                abortRef.current?.abort();
-                markSessionRunning(streamSessionId ?? sessionId, false);
-                setStatus("submitted");
-              }}
+              onStop={
+                streamOrSubmitted && !queueOnClick
+                  ? stopCurrentGeneration
+                  : undefined
+              }
               status={goalFlow.busy ? "submitted" : status}
             >
-              {status === "streaming" && !goalFlow.busy ? (
+              {goalFlow.busy ? (
+                <LoaderCircle className="size-3.5 animate-spin" />
+              ) : queueOnClick ? (
+                <ArrowUp className="size-4" />
+              ) : status === "streaming" ? (
                 <Square className="size-3.5" color="#111" fill="#111" strokeWidth={0} />
-              ) : status === "submitted" || goalFlow.busy ? (
+              ) : status === "submitted" ? (
                 <LoaderCircle className="size-3.5 animate-spin" />
               ) : (
                 <ArrowUp className="size-4" />
