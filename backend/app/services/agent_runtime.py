@@ -1394,6 +1394,9 @@ class AgentToolRuntime:
         Always available in Agent mode (independent of provider toggles). Pure
         observe: no data is written, no state is patched.
         """
+        from app.services.subapp_analyze import ANALYZE_TOOL_DEFINITION
+
+        SUBAPP_ANALYZE_TOOLS = [ANALYZE_TOOL_DEFINITION]
         return [
             {
                 "type": "function",
@@ -1466,7 +1469,8 @@ class AgentToolRuntime:
                         "additionalProperties": False,
                     },
                 },
-            }
+            },
+            *SUBAPP_ANALYZE_TOOLS,
         ]
 
     @staticmethod
@@ -3106,6 +3110,10 @@ class AgentToolRuntime:
                 )
             if name == "subapp_observe":
                 return self._execute_subapp_observe(arguments)
+            if name == "subapp_analyze_events":
+                from app.services.subapp_analyze import execute_analyze_events
+
+                return execute_analyze_events(self, arguments)
             if name == "subapp_patch_state":
                 return self._execute_subapp_patch_state(arguments)
             if name in {
