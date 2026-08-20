@@ -4313,16 +4313,26 @@ class ChatService:
         timeout_seconds = self.settings.agent_tool_timeout_seconds
         if not timeout_seconds or timeout_seconds <= 0:
             return None, None
+        if self.tool_worker_factory is None:
+            # P0-1: no isolated worker factory — refuse to run the SHARED
+            # runtime on the executor (a Session touched from two threads
+            # corrupts the SQLite write-gate ownership). Callers fall back to
+            # the serial inline path.
+            logger.warning(
+                "tool_worker_factory is None; skipping detached agent tool "
+                "submission for %r",
+                tool_call.get("function", {}).get("name"),
+            )
+            return None, None
         executor = _agent_tool_executor()
         future = executor.submit(
-            self.agent_tool_runtime.execute,
+            self._run_agent_tool_isolated,
             tool_call,
             allowed_domains=allowed_domains,
             chat_session_id=chat_session_id,
             assistant_message_id=assistant_message_id,
             assistant_version_id=assistant_version_id,
             source_message_id=source_message_id,
-            model_supports_image_input=self._agent_model_supports_image_input(),
             disclosed_tool_names=disclosed_tool_names,
         )
         return future, time.monotonic() + timeout_seconds
@@ -4399,14 +4409,14 @@ class ChatService:
         """
 
         if self.tool_worker_factory is None:
-            return self._execute_agent_tool(
-                tool_call,
-                allowed_domains,
-                chat_session_id,
-                assistant_message_id=assistant_message_id,
-                assistant_version_id=assistant_version_id,
-                source_message_id=source_message_id,
-                disclosed_tool_names=disclosed_tool_names,
+            # P0-1: unreachable in production — every call site (parallel
+            # prestart and the serial path) guards on the factory. Fail fast
+            # instead of falling back to the coordinator's SHARED runtime /
+            # Session on this worker thread: two threads using one Session
+            # corrupts the SQLite write-gate ownership (cross-thread release).
+            raise RuntimeError(
+                "tool_worker_factory is None: cannot execute agent tool on an "
+                "isolated worker Session"
             )
         from app.core.database import SessionLocal
 
@@ -4609,21 +4619,46 @@ class ChatService:
                             else timeout_seconds
                         )
                     else:
-                        executor = _agent_tool_executor()
-                        future = executor.submit(
-                            self.agent_tool_runtime.execute,
-                            tool_call,
-                            allowed_domains=allowed_domains,
-                            chat_session_id=chat_session_id,
-                            assistant_message_id=assistant_message_id,
-                            assistant_version_id=assistant_version_id,
-                            source_message_id=source_message_id,
-                            model_supports_image_input=self._agent_model_supports_image_input(),
-                            disclosed_tool_names=disclosed_tool_names,
-                        )
-                        wait_seconds = timeout_seconds
+                        if self.tool_worker_factory is None:
+                            # P0-1: no isolated worker factory (tests / legacy
+                            # construction). Execute INLINE on the coordinator
+                            # thread instead of submitting the shared runtime to
+                            # the executor — a shared Session touched from two
+                            # threads corrupts the SQLite write-gate ownership.
+                            logger.warning(
+                                "tool_worker_factory is None; executing agent "
+                                "tool %r inline on the coordinator thread",
+                                tool_call.get("function", {}).get("name"),
+                            )
+                            future = None
+                            wait_seconds = None
+                        else:
+                            executor = _agent_tool_executor()
+                            future = executor.submit(
+                                self._run_agent_tool_isolated,
+                                tool_call,
+                                allowed_domains=allowed_domains,
+                                chat_session_id=chat_session_id,
+                                assistant_message_id=assistant_message_id,
+                                assistant_version_id=assistant_version_id,
+                                source_message_id=source_message_id,
+                                disclosed_tool_names=disclosed_tool_names,
+                            )
+                            wait_seconds = timeout_seconds
                     try:
-                        result = future.result(timeout=wait_seconds)
+                        if future is not None:
+                            result = future.result(timeout=wait_seconds)
+                        else:
+                            result = self.agent_tool_runtime.execute(
+                                tool_call,
+                                allowed_domains=allowed_domains,
+                                chat_session_id=chat_session_id,
+                                assistant_message_id=assistant_message_id,
+                                assistant_version_id=assistant_version_id,
+                                source_message_id=source_message_id,
+                                model_supports_image_input=self._agent_model_supports_image_input(),
+                                disclosed_tool_names=disclosed_tool_names,
+                            )
                     except FutureTimeout:
                         future.cancel()
                         self._record_agent_run_event(
