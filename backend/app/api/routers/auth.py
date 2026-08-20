@@ -80,8 +80,6 @@ def login(payload: LoginRequest, request: Request, settings: AppSettings, db: DB
 @router.post("/auth/register", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest, request: Request, settings: AppSettings, db: DB) -> LoginResponse:
     """注册用户。输入注册资料，创建用户并返回初始认证会话。"""
-    if settings.desktop_single_user:
-        raise AppError(403, "registration_disabled", "桌面版为单用户模式，注册已禁用")
     _enforce_auth_rate_limit(request)
     user_agent, ip_address, device_id = _request_metadata(request)
     return AuthService(db, settings).register(

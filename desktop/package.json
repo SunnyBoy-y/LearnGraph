@@ -1,9 +1,0 @@
-{
-  "name": "learngraph-desktop",
-  "private": true,
-  "version": "0.1.0",
-  "description": "LearnGraph Windows desktop shell (Tauri 2 + Rust Supervisor + FastAPI sidecar)",
-  "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4"
-  }
-}
