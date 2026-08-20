@@ -119,8 +119,14 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
                             settings.domStorageEnabled = true
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                             settings.textZoom = 100
-                            settings.loadWithOverviewMode = true
+                            // 宽度定死为手机真实宽度：尊重 viewport meta（device-width），
+                            // 初始缩放强制 100%（1:1 不缩放），禁用双指/页面缩放，不缩略显示
                             settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = false
+                            this.setInitialScale(100)
+                            settings.setSupportZoom(false)
+                            settings.builtInZoomControls = false
+                            settings.displayZoomControls = false
                             overScrollMode = android.view.View.OVER_SCROLL_NEVER
 
                             // Cookie 保存（登录态跨重启保持）
