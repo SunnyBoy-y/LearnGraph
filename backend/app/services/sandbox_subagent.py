@@ -251,7 +251,7 @@ def _run_subagent(
             if job.status == "cancelled":
                 _finish_subagent(job, "cancelled", final_text)
                 return
-            if time.time() > deadline:
+            if time.time() >= deadline:
                 _finish_subagent(
                     job,
                     "timed_out",
