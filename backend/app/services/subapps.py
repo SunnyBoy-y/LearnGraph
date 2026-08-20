@@ -92,6 +92,15 @@ def _event_view(event: SubAppInteractionEvent) -> SubAppInteractionEventView:
         event_type=event.event_type,
         payload=payload,
         payload_sha256=event.payload_sha256 or "",
+        client_event_id=event.client_event_id,
+        sequence=event.sequence,
+        schema_version=event.schema_version,
+        occurred_at=event.occurred_at,
+        bundle_id=event.bundle_id,
+        component_id=event.component_id,
+        component_version=event.component_version,
+        source=event.source,
+        privacy_class=event.privacy_class,
         created_at=event.created_at,
     )
 

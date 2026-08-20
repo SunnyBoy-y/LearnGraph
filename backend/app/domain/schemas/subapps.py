@@ -49,6 +49,15 @@ class SubAppInteractionEventView(ORMModel):
     event_type: str
     payload: dict[str, Any]
     payload_sha256: str
+    client_event_id: str | None = None
+    sequence: int | None = None
+    schema_version: int = 1
+    occurred_at: datetime | None = None
+    bundle_id: str | None = None
+    component_id: str | None = None
+    component_version: str | None = None
+    source: str = "semantic"
+    privacy_class: str = "session"
     created_at: datetime
 
 

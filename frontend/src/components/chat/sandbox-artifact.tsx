@@ -76,7 +76,6 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const runtimeBridgeRef = useRef<SandboxRuntimeBridge | null>(null);
   const [subappFailed, setSubappFailed] = useState<string | null>(null);
   const [consentRequest, setConsentRequest] = useState<{
-    eventId: string
     pendingConsentId: string
     triggers: string[]
   } | null>(null);

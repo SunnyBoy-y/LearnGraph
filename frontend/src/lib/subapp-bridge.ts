@@ -33,7 +33,7 @@
 
 import { apiClient } from '@/api/client'
 import { downloadFile } from '@/api/files'
-import { postRendererState, postRendererUnlock } from '@/lib/trusted-renderer'
+import { postRendererAck, postRendererState, postRendererUnlock } from '@/lib/trusted-renderer'
 import {
   parseSubappMediaRefs,
   postRendererMedia,
@@ -50,6 +50,10 @@ const EVENT_TYPE_PATTERN = /^[a-z][a-z0-9_.-]{0,119}$/
 
 /** The trusted-renderer protocol discriminator for iframe→host events. */
 const COMPONENT_EVENT_TYPE = 'component.event'
+
+/** Bounded transient-failure retries for session event relays (host outbox). */
+const SUBAPP_RELAY_MAX_ATTEMPTS = 3
+const SUBAPP_RELAY_RETRY_DELAY_MS = 1500
 
 // --------------------------------------------------------------------------- //
 // T2.6 session channel tuning
@@ -132,7 +136,6 @@ export interface SubAppSessionRelay {
   onAccepted?: (accepted: { sessionId: string; nextToken: string }) => void
   /** Fired when the server asks for a one-time Agent consent decision. */
   onConsentRequired?: (info: {
-    eventId: string
     pendingConsentId: string
     triggers: string[]
   }) => void
@@ -140,6 +143,12 @@ export interface SubAppSessionRelay {
   onEventQueued?: (info: { eventId?: string | null; runId?: string | null }) => void
   /** Fired on a deterministic (4xx) rejection such as an invalid/stale token. */
   onRejected?: (error: unknown) => void
+  /** Fired for every relay outcome so the host can ACK the iframe (no fake success). */
+  onAck?: (ack: {
+    clientEventId: string
+    status: 'persisted' | 'rejected' | 'retrying'
+    errorCode?: string | null
+  }) => void
 }
 
 export interface SubAppBridge {
@@ -164,8 +173,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
  * Validate a `component.event` message and extract the business event to relay.
  * Returns `{ eventType, payload }` or null when the message is not a valid
  * subapp event. The business `event_type` lives on `payload.type` per the
- * interaction-contract event_schema (§9.4: `{ type, value }`); the whole
- * business event is forwarded as the session event `payload`.
+ * SDK protocol; `type` is routing metadata and is STRIPPED from the payload the
+ * backend validates against `event_schema`, so app-authored schemas never need
+ * to declare `type`. Client reliability fields (`client_event_id`,
+ * `schema_version`, `occurred_at`) stay in the forwarded payload.
  */
 function resolveComponentEvent(
   message: ComponentEventMessage,
@@ -175,7 +186,9 @@ function resolveComponentEvent(
   if (!payload) return null
   const eventType = typeof payload.type === 'string' ? payload.type : ''
   if (!EVENT_TYPE_PATTERN.test(eventType)) return null
-  return { eventType, payload }
+  const business = { ...payload }
+  delete business.type
+  return { eventType, payload: business }
 }
 
 /** True when the payload is not finite, size-bounded JSON suitable for the API. */
@@ -224,45 +237,67 @@ async function relayIngestEvent(
  * T2.6 session-scoped relay: present the host's current rotating token and POST
  * the business event to `POST /subapps/sessions/{id}/events`. A 202 rotates the
  * token; a deterministic 4xx (stale token, session not active, budget) surfaces
- * via `onRejected` while transient failures are swallowed.
+ * via `onRejected`, while transient failures are retried with bounded backoff
+ * (host outbox) and each outcome is ACKed back to the iframe via `onAck`.
  */
 async function relaySessionEvent(
   eventType: string,
   payload: Record<string, unknown>,
   session: SubAppSessionRelay,
 ): Promise<void> {
-  const token = session.getToken()
-  if (!token) return
-  try {
-    const accepted = await apiClient.post<
-      SubappEventAcceptedResponse,
-      { token: string; event_type: string; payload: Record<string, unknown> }
-    >(`/subapps/sessions/${session.sessionId}/events`, {
-      token,
-      event_type: eventType,
-      payload,
-    })
-    if (accepted?.next_token) {
-      session.onAccepted?.({ sessionId: session.sessionId, nextToken: accepted.next_token })
-    }
-    const agent = accepted?.agent
-    if (agent?.consent_required) {
-      session.onConsentRequired?.({
-        eventId: agent.pending_consent_id ?? '',
-        pendingConsentId: agent.pending_consent_id ?? '',
-        triggers: Array.isArray(agent.triggers) ? agent.triggers : [],
+  const clientEventId =
+    typeof payload.client_event_id === 'string' ? payload.client_event_id : ''
+
+  async function attempt(round: number): Promise<void> {
+    const token = session.getToken()
+    if (!token) return
+    try {
+      const accepted = await apiClient.post<
+        SubappEventAcceptedResponse,
+        { token: string; event_type: string; payload: Record<string, unknown> }
+      >(`/subapps/sessions/${session.sessionId}/events`, {
+        token,
+        event_type: eventType,
+        payload,
       })
-    } else if (agent?.triggered) {
-      session.onEventQueued?.({ eventId: agent.event_id, runId: agent.run_id })
-    }
-  } catch (error) {
-    const status = apiErrorStatus(error)
-    if (typeof status === 'number' && status >= 400 && status < 500) {
-      session.onRejected?.(error)
-    } else {
-      console.warn('[subapp-bridge] failed to relay session component.event', error)
+      if (accepted?.next_token) {
+        session.onAccepted?.({ sessionId: session.sessionId, nextToken: accepted.next_token })
+      }
+      const agent = accepted?.agent
+      if (agent?.consent_required) {
+        session.onConsentRequired?.({
+          pendingConsentId: agent.pending_consent_id ?? '',
+          triggers: [],
+        })
+      } else if (agent?.triggered) {
+        session.onEventQueued?.({})
+      }
+      session.onAck?.({ clientEventId, status: 'persisted' })
+    } catch (error) {
+      const status = apiErrorStatus(error)
+      if (typeof status === 'number' && status >= 400 && status < 500) {
+        session.onAck?.({ clientEventId, status: 'rejected', errorCode: String(status) })
+        session.onRejected?.(error)
+        return
+      }
+      if (round < SUBAPP_RELAY_MAX_ATTEMPTS) {
+        session.onAck?.({ clientEventId, status: 'retrying' })
+        await new Promise((resolve) =>
+          setTimeout(resolve, SUBAPP_RELAY_RETRY_DELAY_MS * 2 ** (round - 1)),
+        )
+        await attempt(round + 1)
+      } else {
+        session.onAck?.({
+          clientEventId,
+          status: 'rejected',
+          errorCode: 'relay_timeout',
+        })
+        console.warn('[subapp-bridge] component.event relay failed after retries', error)
+      }
     }
   }
+
+  await attempt(1)
 }
 
 async function relayComponentEvent(
@@ -490,7 +525,6 @@ export interface SubappChannelOptions {
   onStatePushed?: (version: number) => void
   /** Fired when the server asks for a one-time Agent consent decision. */
   onConsentRequired?: (info: {
-    eventId: string
     pendingConsentId: string
     triggers: string[]
   }) => void
@@ -735,6 +769,17 @@ export function createSubappChannel(options: SubappChannelOptions): SubappChanne
           currentToken = accepted.nextToken
           pollAttempts = 0
           startPolling()
+        },
+        onAck: (ack) => {
+          postRendererAck(options.getIframe(), {
+            version: '1',
+            event_type: 'component.event.ack',
+            payload: {
+              client_event_id: ack.clientEventId,
+              status: ack.status,
+              error_code: ack.errorCode ?? null,
+            },
+          })
         },
         onConsentRequired: options.onConsentRequired,
         onEventQueued: options.onEventQueued,

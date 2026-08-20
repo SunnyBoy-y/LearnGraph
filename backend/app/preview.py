@@ -134,6 +134,133 @@ RUNTIME_SHIM = r"""// LearnGraph sandbox runtime shim (opaque-origin iframe)
 RUNTIME_SHIM_SCRIPT_TAG = '<script src="/api/v1/subapps/runtime-shim.js"></script>'
 
 
+# --------------------------------------------------------------------------- //
+# Bidirectional subapp client SDK (opaque-origin iframe)
+# --------------------------------------------------------------------------- //
+# Injected as a same-origin script into every subapp_mode text/html bundle
+# response, right after the runtime shim. Installs `window.__lgSubapp` with
+# emit/track/submit/onState/onStatus/requestAnalysis; the app code never touches
+# tokens, postMessage envelopes, or the rotating-token protocol. Keep in sync
+# with frontend/src/lib/subapp-client-shim.ts (same protocol, different carrier).
+SUBAPP_CLIENT = r"""// LearnGraph bidirectional subapp client SDK (opaque-origin iframe)
+// iframe->parent: {event_type:'component.event', payload:{type, client_event_id, schema_version, occurred_at, ...}}
+// parent->iframe: renderer.unlock | renderer.state | component.event.ack | renderer.media
+(function () {
+  'use strict';
+  if (window.__lgSubapp) return;
+  var PENDING = {}, SEQ = 0, TOKEN = null, STATE = null, STATE_VERSION = 0;
+  var STATE_HANDLERS = [], STATUS_HANDLERS = [];
+  var TIMEOUT_MS = 60000;
+  function uuid() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+      var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+  function send(payload) {
+    try { parent.postMessage(payload, '*'); return true; } catch (e) { return false; }
+  }
+  function copyInto(dst, src) {
+    if (!src || typeof src !== 'object') return dst;
+    for (var k in src) {
+      if (Object.prototype.hasOwnProperty.call(src, k)) dst[k] = src[k];
+    }
+    return dst;
+  }
+  function emit(type, data) {
+    var payload = copyInto({}, data);
+    var clientEventId = uuid();
+    payload.type = type;
+    payload.client_event_id = clientEventId;
+    payload.schema_version = 1;
+    payload.occurred_at = new Date().toISOString();
+    var id = ++SEQ;
+    var p = new Promise(function (resolve, reject) {
+      PENDING[id] = { clientEventId: clientEventId, resolve: resolve, reject: reject };
+      setTimeout(function () {
+        if (PENDING[id]) { delete PENDING[id]; reject(new Error('learngraph subapp event timeout')); }
+      }, TIMEOUT_MS);
+    });
+    send({ event_type: 'component.event', payload: payload });
+    return p;
+  }
+  function notifyStatus(status, detail) {
+    for (var i = 0; i < STATUS_HANDLERS.length; i++) {
+      try { STATUS_HANDLERS[i](status, detail || null); } catch (e) {}
+    }
+  }
+  function onMessage(event) {
+    var data = event.data;
+    if (!data || typeof data !== 'object') return;
+    var et = data.event_type;
+    if (et === 'renderer.unlock') {
+      var up = data.payload || {};
+      TOKEN = typeof up.token === 'string' ? up.token : null;
+      notifyStatus('ready');
+      return;
+    }
+    if (et === 'renderer.state') {
+      var sp = data.payload || {};
+      if (typeof sp.version === 'number' && sp.version >= STATE_VERSION) {
+        STATE_VERSION = sp.version;
+        STATE = sp.state || {};
+        for (var i = 0; i < STATE_HANDLERS.length; i++) {
+          try { STATE_HANDLERS[i](STATE, STATE_VERSION); } catch (e) {}
+        }
+      }
+      return;
+    }
+    if (et === 'component.event.ack') {
+      var ap = data.payload || {};
+      var cid = ap.client_event_id;
+      for (var key in PENDING) {
+        var entry = PENDING[key];
+        if (entry && entry.clientEventId === cid) {
+          delete PENDING[key];
+          var err = new Error(ap.error_code || 'event rejected');
+          err.status = ap.status;
+          err.error_code = ap.error_code;
+          if (ap.status === 'persisted') { entry.resolve(ap); } else { entry.reject(err); }
+          notifyStatus(ap.status === 'persisted' ? 'persisted' : 'rejected', ap);
+        }
+      }
+      return;
+    }
+  }
+  window.addEventListener('message', onMessage);
+  window.__lgSubapp = {
+    emit: emit,
+    track: emit,
+    submit: emit,
+    onState: function (handler) {
+      STATE_HANDLERS.push(handler);
+      if (STATE) { try { handler(STATE, STATE_VERSION); } catch (e) {} }
+    },
+    onStatus: function (handler) { STATUS_HANDLERS.push(handler); },
+    ready: function () { return TOKEN !== null; },
+    requestAnalysis: function (purpose) {
+      return emit('analysis.requested', { purpose: typeof purpose === 'string' ? purpose : '' });
+    }
+  };
+})();
+"""
+
+SUBAPP_CLIENT_SCRIPT_TAG = '<script src="/api/v1/subapps/subapp-client.js"></script>'
+
+
+@router.get("/subapp-client.js", include_in_schema=False)
+def serve_subapp_client() -> Response:
+    """Same-origin bidirectional subapp client SDK for preview-origin iframes."""
+    return Response(
+        content=SUBAPP_CLIENT,
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/runtime-shim.js", include_in_schema=False)
 def serve_runtime_shim() -> Response:
     """Same-origin runtime shim for browser sandboxes served from the preview origin."""
@@ -147,21 +274,25 @@ def serve_runtime_shim() -> Response:
     )
 
 
-def _inject_runtime_shim(html: bytes) -> bytes:
-    """Insert the runtime-shim script tag into a bundle HTML response.
+def _inject_runtime_shim(html: bytes, *, subapp_mode: bool = False) -> bytes:
+    """Insert the runtime-shim (and subapp client when bidirectional) script
+    tags into a bundle HTML response.
 
-    Keeps ``script-src 'self'`` intact (the shim is same-origin), so the
-    injected script never broadens the bundle's own CSP.
+    Keeps ``script-src 'self'`` intact (both scripts are same-origin), so the
+    injected scripts never broaden the bundle's own CSP.
     """
     try:
         text = html.decode("utf-8")
     except UnicodeDecodeError:
         text = html.decode("utf-8", errors="replace")
     marker = "</head>"
+    tags = RUNTIME_SHIM_SCRIPT_TAG
+    if subapp_mode:
+        tags += SUBAPP_CLIENT_SCRIPT_TAG
     if marker in text:
-        text = text.replace(marker, RUNTIME_SHIM_SCRIPT_TAG + marker, 1)
+        text = text.replace(marker, tags + marker, 1)
     else:
-        text += RUNTIME_SHIM_SCRIPT_TAG
+        text += tags
     return text.encode("utf-8")
 
 
@@ -209,8 +340,12 @@ def serve_bundle_preview(
     }
     if item.mime_type == "text/html":
         # Inject the runtime shim so sandbox code can use window.__lg / fetch
-        # relay (multi-file VFS + approval-free networking via the host bridge).
-        payload = _inject_runtime_shim(b"".join(storage.iter_bytes(blob.object_key, offset=0, length=item.size_bytes)))
+        # relay (multi-file VFS + approval-free networking via the host bridge),
+        # plus the bidirectional subapp client SDK for subapp_mode bundles.
+        payload = _inject_runtime_shim(
+            b"".join(storage.iter_bytes(blob.object_key, offset=0, length=item.size_bytes)),
+            subapp_mode=bundle.component_manifest_id is not None,
+        )
         return Response(content=payload, media_type="text/html", headers=headers)
     return StreamingResponse(
         storage.iter_bytes(blob.object_key, offset=0, length=item.size_bytes),

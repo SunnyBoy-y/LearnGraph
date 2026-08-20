@@ -142,3 +142,21 @@ export function postRendererState(
     // a forward seam — never let a post failure break the artifact render.
   }
 }
+
+/**
+ * Post a `component.event.ack` message into the subapp iframe so the client SDK
+ * can resolve its pending `emit()` promise. `persisted` proves the event reached
+ * the backend; `rejected`/`retrying` keep the page honest (no fake "submitted").
+ * Same `targetOrigin '*'` and never-throw semantics as the other seams.
+ */
+export function postRendererAck(
+  iframe: HTMLIFrameElement | null,
+  message: Record<string, unknown> | null,
+): void {
+  if (!iframe || !message) return
+  try {
+    iframe.contentWindow?.postMessage(message, '*')
+  } catch {
+    // Inert opaque iframe / jsdom: no receiver; never break the artifact render.
+  }
+}
