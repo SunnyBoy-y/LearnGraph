@@ -10,7 +10,7 @@
 | `sandbox_file_range_out_of_bounds` (422) | start_line 超出文件行数 | 看返回的 `total_lines`，用 `end_line` 钳制（超出自动收尾） |
 | grep 搜不到某文件 | 该文件是 `sandbox_exec` 在容器内生成的，宿主存储没有 | 先 `sandbox_read_file`（有容器兜底）拉回宿主，或在脚本里直接搜 |
 | grep 返回 `skipped_large` | 文件 > 4 MiB | 用 `sandbox_exec` + `fs.grep_lines`（可设更大范围）或先 split 再搜 |
-| 删除报 `sandbox_auth_required` (403) | 单次授权尚未授予 | 这是预期流程：聊天 UI 会弹授权框，用户允许后重试一次即可；授权即用即失效，不会反复弹 |
+| 删除报 `sandbox_auth_required` (403) | 部署开启了审批模式（`LEARNGRAPH_SANDBOX_DELETE_APPROVAL_MODE=on`） | 预期流程：聊天 UI 弹授权框，用户允许后重试一次即可；默认部署（off）下 work/ 树内删除免审批不会触发 |
 | 删除报 `sandbox_path_blocked` (422) | 目标不在 `work/` 树 | 只能删工作区草稿；inputs/outputs 与宿主文件不可删 |
 | `sandbox_grep_invalid_pattern` (422) | 正则语法错误 | 修正正则；需要纯文本匹配时先 `re.escape` |
 | exec 输出被截断（`truncated=true`） | 超过 `sandbox_output_bytes` | 脚本 stdout 用结构化 JSON + 摘要/计数，不要打印大块原文 |

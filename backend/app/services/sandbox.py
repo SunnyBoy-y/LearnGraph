@@ -3299,8 +3299,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                         "Chromium, ffmpeg, the Python/Node toolchain, or batch/multi-file work. "
                         "Installed capabilities are summarized by sandbox_env_info; the "
                         "learngraph_tasks library and file-workflow guidance live in the sandbox_files "
-                        "skill. Host-path deletes are blocked; session work/ deletes require prior "
-                        "user authorization."
+                        "skill. Host-path deletes are blocked; session work/ deletes are allowed directly "
+                        "(approval-free)."
                     ),
                     "parameters": {
                         "type": "object",

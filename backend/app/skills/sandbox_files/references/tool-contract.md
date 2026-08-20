@@ -38,7 +38,7 @@
 ## sandbox_delete_file
 
 - 入参：`path`（必须位于 `work/` 树下）
-- 流程：首次调用无授权时报 403 `sandbox_auth_required`（details 含 `command_intent_digest`、`message_zh`），聊天 UI 弹授权；用户授权后重试即消费授权并完成删除
+- 流程：默认免审批——work/ 树内删除直接执行（Docker 沙箱隔离，不影响宿主机文件）；部署若设置 `LEARNGRAPH_SANDBOX_DELETE_APPROVAL_MODE=on` 才恢复单次授权流程（403 `sandbox_auth_required` → 聊天 UI 授权 → 重试消费）
 - 出参：`{deleted: true, path}`
 - 错误：非 work/ 路径 → 422 `sandbox_path_blocked`
 
@@ -52,7 +52,7 @@
 
 - 入参：`command`（bash -lc 的脚本串，可含换行）、`timeout_seconds`（可选，上限=沙箱墙钟）、`sandbox_session_id`
 - 出参：同 `sandbox_exec`（`exit_code`/`stdout`/`stderr`/`timed_out`/`truncated`）
-- 约束：argv 形态固定为 `["bash","-lc",command]`，宿主永不 eval 该串；命令含 `rm/mv/shred/dd/...` 且目标在 `work/` 下时走单次授权（同 `sandbox_delete_file`）；目标为绝对/`..`/非 work/ 路径直接硬拦；容器默认离线，联网命令失败
+- 约束：argv 形态固定为 `["bash","-lc",command]`，宿主永不 eval 该串；命令含 `rm/mv/shred/dd/...` 且目标在 `work/` 下时默认免审批直接执行（沙箱隔离；部署设 `LEARNGRAPH_SANDBOX_DELETE_APPROVAL_MODE=on` 时恢复单次授权）；目标为绝对/`..`/非 work/ 路径直接硬拦；容器默认离线，联网命令失败
 
 ## sandbox_todo
 

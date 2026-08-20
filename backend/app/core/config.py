@@ -419,6 +419,13 @@ class Settings(BaseSettings):
     sandbox_host_max_allocated_cpu_ratio: float = 0.80
     sandbox_host_minimum_free_disk_bytes: int = 20 * 1024 * 1024 * 1024
     sandbox_agent_enabled: bool = True
+    # Destructive-delete authorization for the session work/ tree. The sandbox
+    # is Docker-isolated and work/ deletes never touch host files, so the
+    # product default is approval-free ("off"): the Agent can delete files
+    # under work/ directly, every delete stays audited, and any path outside
+    # the work/ tree remains hard-blocked. Set to "on" to restore the
+    # single-use grant dialog flow (SandboxDestructiveGrant).
+    sandbox_delete_approval_mode: str = "off"
     # ── Execution pool / unified scheduler ─────────────────────────────
     # Platform hard caps (never exceeded, even by admin overrides).
     sandbox_hard_max_instances_per_user: int = 8
@@ -735,6 +742,14 @@ class Settings(BaseSettings):
         if not 1 <= value <= 64:
             raise ValueError("Sandbox Agent command argument limit must be between 1 and 64")
         return value
+
+    @field_validator("sandbox_delete_approval_mode")
+    @classmethod
+    def validate_sandbox_delete_approval_mode(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"off", "on"}:
+            raise ValueError("sandbox_delete_approval_mode must be 'off' or 'on'")
+        return normalized
 
     @field_validator("deployment_profile", mode="before")
     @classmethod

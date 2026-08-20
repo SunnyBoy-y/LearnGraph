@@ -831,7 +831,7 @@ npm.cmd run check</code></pre>
           <h3>一次 Agent 命令的执行管线</h3>
           <ol class="steps compact-steps">
             <li><span>01</span><div><strong>argv 策略</strong><p>解释器白名单（python/node），禁止 <code>-c/-m/-e/--eval/-p/-i</code> 内联代码；入口必须是工作区内相对 <code>.py</code>/<code>.js</code> 文件；cwd 只能是 <code>.</code>；参数数与单参字节受限。</p></div></li>
-            <li><span>02</span><div><strong>破坏性预授权</strong><p><code>rm / dd / mkfs / Remove-Item</code> 等命令按路径逐一核对会话级 Grant（仅 <code>work/</code> 子树，TTL 60s–24h）；缺失则 403 授权挑战经 SSE 弹窗回传。</p></div></li>
+            <li><span>02</span><div><strong>破坏性删除（默认免审批）</strong><p><code>rm / dd / mkfs / Remove-Item</code> 等命令仅允许 <code>work/</code> 子树（绝对 / <code>..</code> / 盘符路径直接硬拦）；默认 <code>LEARNGRAPH_SANDBOX_DELETE_APPROVAL_MODE=off</code> 直接放行并保留审计（沙箱隔离，不影响宿主机文件），设为 <code>on</code> 时恢复会话级单次 Grant（TTL 60s–24h），缺失则 403 授权挑战经 SSE 弹窗回传。</p></div></li>
             <li><span>03</span><div><strong>幂等与审计</strong><p><code>Idempotency-Key</code> 去重；持久化 <code>SandboxAgentCommand</code> 只存 argv 摘要与脱敏副本，stdout/stderr 落库前同样脱敏。</p></div></li>
             <li><span>04</span><div><strong>容量与容器</strong><p>进程锁 + 跨进程文件锁下校验用户/宿主容量，先提交 STARTING 占位再 <code>docker create</code>；失败回滚 COLD。</p></div></li>
             <li><span>05</span><div><strong>快照 → 执行 → 恢复</strong><p>执行前对工作区做 inode 级快照；100ms 粒度轮询超时与聚合配额；执行后凡未授权的删除一律从快照恢复并抛授权挑战——argv 拦不住的 <code>shutil.rmtree</code> 类软删除由此兜底。</p></div></li>

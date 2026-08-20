@@ -12,6 +12,7 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.errors import AppError
 from app.domain.models import CapabilityGrant, SandboxDestructiveGrant, new_id, utc_now
 from app.providers.remote.sandbox import (
@@ -437,6 +438,15 @@ class SandboxAuthorizationService:
         """Atomically consume only grants needed by this exact command."""
 
         now = utc_now()
+        if get_settings().sandbox_delete_approval_mode != "on":
+            # Approval-free mode (product default): the classifier already
+            # confined every path to the session work/ tree, and work/ deletes
+            # never touch host files, so no grant is required. Return the
+            # validated paths so the runtime keeps its destructive-path
+            # prefix guard (defense in depth) — deletion stays fully audited
+            # at the command/file level.
+            validated = [validate_agent_workspace_path(raw) for raw in paths]
+            return tuple(sorted(set(validated)))
         matches: dict[str, SandboxDestructiveGrant] = {}
         for raw_path in paths:
             path = validate_agent_workspace_path(raw_path)
@@ -529,11 +539,19 @@ class SandboxAuthorizationService:
             self.db.commit()
             raise AppError(422, "sandbox_command_blocked", intent["reason"])
         paths = list(intent.get("paths") or [])
-        missing = [
-            path
-            for path in paths
-            if not self.has_active_grant(chat_session_id=chat_session_id, path=path)
-        ]
+        if get_settings().sandbox_delete_approval_mode == "on":
+            # Approval mode: require a single-use grant whose path prefix
+            # covers every target path.
+            missing = [
+                path
+                for path in paths
+                if not self.has_active_grant(chat_session_id=chat_session_id, path=path)
+            ]
+        else:
+            # Approval-free mode (product default): destructive deletes are
+            # confined to the session work/ tree by the classifier, so they
+            # are allowed directly (audited at command/file level).
+            missing = []
         if missing:
             self.audit.record(
                 actor_id=self.actor_id,
