@@ -182,10 +182,14 @@ jobs:
           openssl rand -hex 32 > "$secrets_dir/admin-token"
           socket_gid=$(stat -c %g /var/run/docker.sock)
           docker network create sandbox-control-ci >/dev/null 2>&1 || true
+          # sandboxd persists its SQLite state under SANDBOXD_STATE_PATH; the
+          # container runs --read-only, so /tmp must be a writable tmpfs
+          # (production Compose mounts a volume for /var/lib/sandboxd).
           docker run -d --name sandboxd-ci \
             --network sandbox-control-ci \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "$socket_gid" \
+            --tmpfs /tmp \
             -e SANDBOXD_LISTEN_HOST=0.0.0.0 \
             -e SANDBOXD_PORT=8090 \
             -e SANDBOXD_TOKEN_FILE=/run/secrets/token \

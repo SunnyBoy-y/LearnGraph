@@ -1,20 +1,21 @@
-# Linux override: add the isolated sandboxd control plane.
+# Hardening override: reviewed file-based credentials + isolated control
+# network for the sandboxd control plane.
 #
-# sandboxd is the ONLY component that talks to Docker Engine: it mounts the
-# host Docker socket and manages sandbox containers, named volumes and
-# per-sandbox egress networks. The LearnGraph app never sees the socket and
-# never needs host/container same-path workspace bindings.
+# The MAIN docker-compose.yml already ships a self-contained sandboxd service
+# (host socket mount + self-bootstrapped tokens on the shared state volume),
+# so plain `docker compose up -d --build` gives you sandbox execution with
+# zero host setup — on Docker Desktop (Windows/macOS) and native Linux alike.
+# Use this override only when you want the hardened shape:
 #
 #   export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # optional host data path
 #   mkdir -p secrets && openssl rand -hex 32 > secrets/sandboxd-token
+#   openssl rand -hex 32 > secrets/sandboxd-admin-token
 #   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
 #
-# The sandboxd container must be able to talk to the Docker socket. If its
-# health check reports "Docker Engine is unavailable", pass the host GID:
-#   export DOCKER_GID=$(stat -c %g /var/run/docker.sock)
-#
-# Docker Desktop / Windows cannot use this socket override; keep using
-# `npm run dev` (which manages a local sandboxd process) for sandbox there.
+# In this shape the daemon reads reviewed tokens from compose secrets
+# (/run/secrets/…) and runs on the internal `sandbox-control` network only.
+# If its health check reports "Docker Engine is unavailable", pass the host
+# GID: export DOCKER_GID=$(stat -c %g /var/run/docker.sock)
 
 services:
   # LearnGraph app: consumes the sandboxd Sandbox API only.
@@ -39,7 +40,9 @@ services:
   # The only Docker control plane. No host ports are published; the daemon
   # listens on the internal `sandbox-control` network only.
   sandboxd:
-    image: ${LEARNGRAPH_IMAGE:-learngraph:local}
+    # Distinct image tag (do NOT share `learngraph:local` with the app
+    # services or the last build wins and the daemon runs the app image).
+    image: ${LEARNGRAPH_SANDBOXD_IMAGE:-learngraph-sandboxd:local}
     build:
       context: .
       dockerfile: sandboxd/Dockerfile

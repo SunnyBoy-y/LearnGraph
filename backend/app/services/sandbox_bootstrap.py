@@ -794,7 +794,10 @@ class SandboxBootstrapService:
             remediation.extend(
                 [
                     "确认 sandboxd 控制面已启动且健康",
-                    daemon_detail or "sandboxd 不可达",
+                    daemon_detail
+                    or f"sandboxd 不可达（当前地址 {settings.sandboxd_url or '(未配置)'}）",
+                    "容器化部署请核对互联地址：compose 栈内默认 http://sandboxd:8090，"
+                    "或显式设置 LEARNGRAPH_SANDBOXD_URL",
                 ]
             )
             can_initialize = False

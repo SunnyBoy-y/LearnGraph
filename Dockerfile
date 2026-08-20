@@ -3,6 +3,10 @@
 #
 # The sandbox runner (backend/sandbox/Dockerfile) stays a separate image.
 # This file packages the product UI and API for self-hosted Compose deploys.
+#
+# NOTE: the uv 镜像引用必须带 digest 锁定（tag 引用每次构建都会回源
+# ghcr.io 重新解析 tag，网络抖动会以 `Head .../manifests/0.12: EOF` 失败；
+# digest 引用优先命中 BuildKit 本地内容库，无需 registry 往返）。
 
 FROM node:22-bookworm-slim AS frontend
 
@@ -19,7 +23,7 @@ RUN npm run build
 
 FROM python:3.12-slim-bookworm AS backend
 
-COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /bin/uv
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \

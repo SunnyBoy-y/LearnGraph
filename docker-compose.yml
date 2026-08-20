@@ -20,8 +20,13 @@ name: learngraph
 # LEARNGRAPH_MASTER_KEY is unset, the entrypoint generates one and stores it
 # on the data volume so encrypted keys survive restarts.
 #
-# Sandbox containers need the host Docker Engine and a host-visible workspace
-# path. On Linux, add the sandbox override:
+# Sandbox is fully self-contained: the stack includes its own sandboxd
+# control plane (the only component that mounts the host Docker socket), so
+# `docker compose up --build` gives you sandbox execution out of the box on
+# Docker Desktop (Windows/macOS) and native Linux — no host Node or manual
+# daemon needed. The daemon self-bootstraps its auth tokens into the shared
+# `sandboxd-state` volume on first start. Operators who prefer reviewed
+# file-based credentials can keep the hardening override:
 #   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d
 #
 # Reviewed outbound egress (审批制出网) is fully wired: the egress-proxy
@@ -63,6 +68,11 @@ x-app-environment: &app-environment
   # (see backend Settings.effective_host_bridge_url). Set explicitly only to
   # override (custom port/host) or to point at a remote bridge.
   LEARNGRAPH_HOST_BRIDGE_URL: ${LEARNGRAPH_HOST_BRIDGE_URL:-}
+  # 宿主服务访问策略：auto（默认：容器化 profile 自动走 Host Service Bridge）|
+  # bridge（强制桥接）| direct（可信桌面直连：loopback URL 改写为
+  # host.docker.internal:同端口，无需 Bridge/token/注册/审计，仅建议 Windows/
+  # macOS Docker Desktop 个人可信环境；沙箱容器绝不继承）| off（关闭全部改写）。
+  LEARNGRAPH_HOST_ACCESS_MODE: ${LEARNGRAPH_HOST_ACCESS_MODE:-auto}
   LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:18000","http://localhost:18000"]}
   LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS: ${LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS:-true}
   LEARNGRAPH_SANDBOX_ENABLED: ${LEARNGRAPH_SANDBOX_ENABLED:-true}
@@ -71,6 +81,9 @@ x-app-environment: &app-environment
 
 services:
   app:
+    # Sole build source for the shared main image `learngraph:local`;
+    # preview/egress-proxy reference it by tag only (concurrent BuildKit
+    # exports of the same tag race and fail with "image already exists").
     image: ${LEARNGRAPH_IMAGE:-learngraph:local}
     build:
       context: .
@@ -94,9 +107,23 @@ services:
       # the backend simply skips the header — the providers page shows an
       # actionable hint instead of failing silently.
       LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE: /run/secrets/host-bridge-token
+      # sandboxd control plane（沙箱运行时控制面）的容器间互联：同栈 sandboxd
+      # 服务，app 经内部网络 http://sandboxd:8090 访问，凭据由 sandboxd 首启时
+      # 自举写入共享卷 sandboxd-state（app 只读挂载），宿主零配置、零 Node。
+      # docker-compose.sandbox.yml 加固形态会覆盖为 compose secrets 路径。
+      LEARNGRAPH_SANDBOX_BACKEND: sandboxd
+      LEARNGRAPH_SANDBOXD_URL: ${LEARNGRAPH_SANDBOXD_URL:-http://sandboxd:8090}
+      LEARNGRAPH_SANDBOXD_TOKEN_FILE: ${LEARNGRAPH_SANDBOXD_TOKEN_FILE:-/data/sandboxd/sandboxd-token}
+      LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE: ${LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE:-/data/sandboxd/sandboxd-admin-token}
+      LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
     volumes:
       - learngraph-data:/data
       - "${LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE:-./data/host-bridge/token}:/run/secrets/host-bridge-token:ro"
+      # sandboxd 自举凭据与状态（共享卷，只读；token 由 sandboxd 首启生成）。
+      - sandboxd-state:/data/sandboxd:ro
+    depends_on:
+      sandboxd:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -118,10 +145,11 @@ services:
         max-file: "3"
 
   preview:
+    # Shares the main image built by the `app` service (identical Dockerfile,
+    # different command). NO build section here — letting every service build
+    # the same `learngraph:local` tag makes BuildKit race on the export and
+    # fail with `image already exists`.
     image: ${LEARNGRAPH_IMAGE:-learngraph:local}
-    build:
-      context: .
-      dockerfile: Dockerfile
     command:
       [
         "python",
@@ -175,10 +203,9 @@ services:
     # join via the host Docker Engine) plus the default outbound network.
     # Reads reviewed policy files from the shared data volume; every
     # allow/deny decision is appended to the JSONL audit log.
+    # Shares the main image built by `app` (no build section, same reason as
+    # preview: concurrent exports of one tag would race in BuildKit).
     image: ${LEARNGRAPH_IMAGE:-learngraph:local}
-    build:
-      context: .
-      dockerfile: Dockerfile
     entrypoint: ["tini", "--", "python", "-m", "app.services.egress_proxy_main"]
     environment:
       LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
@@ -214,8 +241,66 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # sandboxd: the only component that talks to Docker Engine (mounts the host
+  # socket). It manages sandbox containers, named volumes and per-sandbox
+  # egress networks; the app never sees the socket. On first start the
+  # entrypoint self-bootstraps service + admin tokens into the shared
+  # `sandboxd-state` volume (idempotent — reviewed secrets mounted by
+  # docker-compose.sandbox.yml are respected and never overwritten), so
+  # `docker compose up` needs zero host-side setup and no Node runtime.
+  sandboxd:
+    # Distinct image tag: the app/preview/egress-proxy share the main image
+    # name, so sandboxd must NOT reuse `learngraph:local` or the last build
+    # wins and the daemon container would run the app image.
+    image: ${LEARNGRAPH_SANDBOXD_IMAGE:-learngraph-sandboxd:local}
+    build:
+      context: .
+      dockerfile: sandboxd/Dockerfile
+    environment:
+      SANDBOXD_LISTEN_HOST: "0.0.0.0"
+      SANDBOXD_PORT: "8090"
+      SANDBOXD_TOKEN_FILE: /data/sandboxd/sandboxd-token
+      SANDBOXD_ADMIN_TOKEN_FILE: /data/sandboxd/sandboxd-admin-token
+      SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
+      # Immutable runtime image digest for runners; empty keeps the daemon
+      # fail-closed until the settings page「沙箱一键初始化」pulls + pins +
+      # smokes the prebuilt image (LEARNGRAPH_SANDBOX_PREBUILT_IMAGE or the
+      # code-release default).
+      SANDBOXD_RUNTIME_IMAGE: ${LEARNGRAPH_SANDBOX_IMAGE:-}
+      SANDBOXD_EGRESS_ENABLED: "true"
+      SANDBOXD_EGRESS_PROXY_URL: http://egress-proxy:8888
+      SANDBOXD_EGRESS_PROXY_CONTAINER: egress-proxy
+      SANDBOXD_STATE_PATH: /data/sandboxd/state.db
+      SANDBOXD_SECCOMP_DIR: /app/sandbox-profiles
+      SANDBOXD_MAX_ACTIVE: "20"
+    volumes:
+      # Host Docker Engine socket (Docker Desktop WSL2 and native Linux alike).
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandboxd-state:/data/sandboxd
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/v1/health/live', timeout=4)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   learngraph-data:
+  # sandboxd state + self-bootstrapped tokens (shared read-only with app).
+  sandboxd-state:
 
 networks:
   # Internal bridge on the host Docker Engine: dynamic sandbox containers join
