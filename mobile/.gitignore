@@ -13,6 +13,12 @@ android/app/build/
 android/local.properties
 android/capacitor-cordova-android-plugins/build/
 
+# 原生版（mobile/native/）构建产物
+native/.gradle/
+native/build/
+native/app/build/
+native/local.properties
+
 # IDE
 .idea/
 .vscode/

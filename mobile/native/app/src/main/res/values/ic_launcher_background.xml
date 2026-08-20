@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 自适应图标背景：与网页版 favicon.svg 深底一致 -->
+    <color name="ic_launcher_background">#141716</color>
+</resources>
