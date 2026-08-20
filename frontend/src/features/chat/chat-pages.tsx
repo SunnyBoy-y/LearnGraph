@@ -8754,6 +8754,57 @@ export function ChatCanvasPage() {
             <em>点击跳过</em>
           </button>
         ) : null}
+        {pendingSendQueue.length ? (
+          <div aria-label="待发送队列" className="chat-send-queue" role="region">
+            {pendingSendQueue.map((item) => {
+              const attachmentCount =
+                item.files.length + item.pendingFiles.length;
+              return (
+                <div className="chat-send-queue__item" key={item.id}>
+                  <span className="chat-send-queue__badge">待发送</span>
+                  <span className="chat-send-queue__text" title={item.text}>
+                    {attachmentCount ? (
+                      <span className="chat-send-queue__files">
+                        <Paperclip className="size-3" />
+                        {attachmentCount}
+                      </span>
+                    ) : null}
+                    {item.text}
+                  </span>
+                  <span className="chat-send-queue__actions">
+                    <button
+                      aria-label="重新编辑"
+                      className="chat-send-queue__action"
+                      onClick={() => handleEditQueued(item)}
+                      title="重新编辑"
+                      type="button"
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                    <button
+                      aria-label="打断当前回复并发送"
+                      className="chat-send-queue__action chat-send-queue__action--send"
+                      onClick={() => void handleInterruptSend(item)}
+                      title="打断当前回复并立即发送"
+                      type="button"
+                    >
+                      <Send className="size-3.5" />
+                    </button>
+                    <button
+                      aria-label="取消发送"
+                      className="chat-send-queue__action"
+                      onClick={() => handleCancelQueued(item.id)}
+                      title="取消发送"
+                      type="button"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
         <ConversationQuickActions
           agentActive={responseMode === "agentic"}
           agentDisabled={
@@ -8872,57 +8923,6 @@ export function ChatCanvasPage() {
                     <span className="chat-mention-menu__key">Enter</span>
                   ) : null}
                 </button>
-              );
-            })}
-          </div>
-        ) : null}
-        {pendingSendQueue.length ? (
-          <div aria-label="待发送队列" className="chat-send-queue" role="region">
-            {pendingSendQueue.map((item) => {
-              const attachmentCount =
-                item.files.length + item.pendingFiles.length;
-              return (
-                <div className="chat-send-queue__item" key={item.id}>
-                  <span className="chat-send-queue__badge">待发送</span>
-                  <span className="chat-send-queue__text" title={item.text}>
-                    {attachmentCount ? (
-                      <span className="chat-send-queue__files">
-                        <Paperclip className="size-3" />
-                        {attachmentCount}
-                      </span>
-                    ) : null}
-                    {item.text}
-                  </span>
-                  <span className="chat-send-queue__actions">
-                    <button
-                      aria-label="重新编辑"
-                      className="chat-send-queue__action"
-                      onClick={() => handleEditQueued(item)}
-                      title="重新编辑"
-                      type="button"
-                    >
-                      <Pencil className="size-3.5" />
-                    </button>
-                    <button
-                      aria-label="打断当前回复并发送"
-                      className="chat-send-queue__action chat-send-queue__action--send"
-                      onClick={() => void handleInterruptSend(item)}
-                      title="打断当前回复并立即发送"
-                      type="button"
-                    >
-                      <Send className="size-3.5" />
-                    </button>
-                    <button
-                      aria-label="取消发送"
-                      className="chat-send-queue__action"
-                      onClick={() => handleCancelQueued(item.id)}
-                      title="取消发送"
-                      type="button"
-                    >
-                      <X className="size-3.5" />
-                    </button>
-                  </span>
-                </div>
               );
             })}
           </div>
@@ -9375,18 +9375,27 @@ export function ChatCanvasPage() {
                 >
                   <DropdownMenuRadioItem
                     disabled={thinkingRequired}
+                    onSelect={
+                      isPhoneLayout ? (event) => event.preventDefault() : undefined
+                    }
                     value="fast"
                   >
                     极速{thinkingRequired ? "（该模型仅支持思考）" : ""}
                   </DropdownMenuRadioItem>
                   <DropdownMenuRadioItem
                     disabled={!supportsThinkingMode}
+                    onSelect={
+                      isPhoneLayout ? (event) => event.preventDefault() : undefined
+                    }
                     value="thinking"
                   >
                     思考{supportsThinkingMode ? "" : "（模型未声明推理能力）"}
                   </DropdownMenuRadioItem>
                   <DropdownMenuRadioItem
                     disabled={!supportsAgentMode}
+                    onSelect={
+                      isPhoneLayout ? (event) => event.preventDefault() : undefined
+                    }
                     value="agentic"
                   >
                     智能体{supportsAgentMode ? "" : agentModeUnavailableLabel}

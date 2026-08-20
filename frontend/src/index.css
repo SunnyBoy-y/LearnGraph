@@ -5442,14 +5442,16 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   }
 }
 
-/* 3) 输入框聚焦展开动效：选中时平滑变高约一行 */
+/* 3) 输入框点击展开动效：聚焦或已有文字 → 变高约一行；
+      失焦且内容为空（:placeholder-shown）→ 恢复原状 */
 .chat-composer__textarea {
   transition:
     min-height 0.24s cubic-bezier(0.4, 0, 0.2, 1),
     padding 0.24s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }
 @media (max-width: 780px) {
-  .chat-composer__textarea:focus {
+  .chat-composer__textarea:focus,
+  .chat-composer__textarea:not(:placeholder-shown) {
     min-height: 78px !important; /* 52px + 约一行 26px */
   }
 }
