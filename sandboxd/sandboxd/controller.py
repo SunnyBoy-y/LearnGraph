@@ -197,7 +197,7 @@ class SandboxController:
         if runtime_kind not in RUNTIME_KINDS:
             raise SandboxdError("invalid_request", f"unsupported runtime kind: {runtime_kind}")
         try:
-            digest, labels = self.runtime.pull_and_resolve_digest(image_tag)
+            digest, labels = self.runtime.install_runtime(image_tag)
         except Exception as exc:  # noqa: BLE001 - map runtime failures to the protocol
             raise SandboxdError(
                 "runtime_unavailable",
@@ -272,7 +272,7 @@ class SandboxController:
         if not runtime_image:
             runtime_ok = False
             reasons.append("no runtime image is configured or installed")
-        elif capability.available and not self.runtime.image_present(runtime_image):
+        elif capability.available and not self.runtime.artifact_present(runtime_image):
             # The store record survives but the actual image was deleted from
             # Docker Engine (e.g. docker rmi while running) — treat that as not
             # ready so the settings page stops reporting 已就绪/可用.
@@ -387,8 +387,8 @@ class SandboxController:
             session_id=body.session_id,
             workspace_key=body.workspace_key,
             runtime_kind=body.runtime_kind,
-            image_ref=runtime_image,
-            volume_name=volume_name,
+            runtime_ref=runtime_image,
+            workspace_ref=volume_name,
             deployment_id=self.config.deployment_id,
             memory_bytes=body.memory_bytes,
             memory_swap_bytes=body.memory_swap_bytes,
@@ -411,7 +411,7 @@ class SandboxController:
             runtime_kind=body.runtime_kind,
             state="RUNNING",
             volume_name=volume_name,
-            container_id=handle.container_id,
+            container_id=handle.runtime_instance_id,
             image_digest=runtime_image,
             runner_abi=DEFAULT_RUNNER_ABI,
             policy_digest=policy_digest,
@@ -479,6 +479,8 @@ class SandboxController:
             last_used_at=record.last_used_at,
             policy_digest=record.policy_digest,
             workspace_key=record.workspace_key,
+            runtime_digest=record.image_digest,
+            runtime_backend=record.runtime_backend,
         )
 
     def get(self, sandbox_id: str, scope: str, fence: int | None = None) -> SandboxView:
@@ -498,8 +500,8 @@ class SandboxController:
                 session_id=record.session_id,
                 workspace_key=record.workspace_key,
                 runtime_kind=record.runtime_kind,
-                image_ref=record.image_digest,
-                volume_name=record.volume_name,
+                runtime_ref=record.image_digest,
+                workspace_ref=record.volume_name,
                 deployment_id=self.config.deployment_id,
                 memory_bytes=int(record.limits.get("memory_bytes") or 512 * 1024 * 1024),
                 memory_swap_bytes=int(record.limits.get("memory_swap_bytes") or 512 * 1024 * 1024),
@@ -520,7 +522,7 @@ class SandboxController:
             handle = self._ensure_runtime(record)
             now = _utc_now().isoformat(timespec="seconds")
             self.store.update_sandbox(
-                sandbox_id, state="RUNNING", container_id=handle.container_id, last_used_at=now
+                sandbox_id, state="RUNNING", container_id=handle.runtime_instance_id, last_used_at=now
             )
             return self._view(self.store.get_sandbox(sandbox_id))
 

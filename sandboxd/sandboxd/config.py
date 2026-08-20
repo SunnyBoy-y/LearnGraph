@@ -8,9 +8,13 @@ from pathlib import Path
 
 # Protocol / runner ABI negotiation bounds (see protocol.py).
 PROTOCOL_MIN = "1.0"
-PROTOCOL_MAX = "1.0"
+PROTOCOL_MAX = "1.1"
 RUNNER_ABI_MIN = "1"
 RUNNER_ABI_MAX = "1"
+
+# Runtime adapters this daemon can assemble. ``docker`` is the legacy
+# implementation; ``wsl_oci`` is the desktop/WSL OCI runtime.
+RUNTIME_BACKENDS = frozenset({"docker", "wsl_oci"})
 
 
 class SandboxdConfigError(RuntimeError):
@@ -54,6 +58,7 @@ class SandboxdConfig:
     state_path: str
     deployment_id: str
     docker_host: str | None
+    runtime_backend: str
     runtime_image: str | None
     egress_network_enabled: bool
     egress_proxy_url: str | None
@@ -86,6 +91,12 @@ class SandboxdConfig:
                 "SANDBOXD_RUNTIME_IMAGE must be an immutable sha256 digest reference"
             )
 
+        runtime_backend = (os.environ.get("SANDBOXD_RUNTIME_BACKEND") or "docker").strip().casefold()
+        if runtime_backend not in RUNTIME_BACKENDS:
+            raise SandboxdConfigError(
+                f"SANDBOXD_RUNTIME_BACKEND must be one of {sorted(RUNTIME_BACKENDS)}, got {runtime_backend!r}"
+            )
+
         egress_network_enabled = os.environ.get("SANDBOXD_EGRESS_ENABLED", "true").strip().casefold() != "false"
         egress_proxy_url = (os.environ.get("SANDBOXD_EGRESS_PROXY_URL") or "").strip() or None
         if egress_network_enabled and not egress_proxy_url:
@@ -102,6 +113,7 @@ class SandboxdConfig:
             state_path=state_path,
             deployment_id=deployment_id,
             docker_host=(os.environ.get("SANDBOXD_DOCKER_HOST") or "").strip() or None,
+            runtime_backend=runtime_backend,
             runtime_image=runtime_image,
             egress_network_enabled=egress_network_enabled,
             egress_proxy_url=egress_proxy_url,

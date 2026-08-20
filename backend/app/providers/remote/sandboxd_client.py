@@ -319,8 +319,10 @@ class SandboxdClient:
     # --- bootstrap / admin control plane ------------------------------------
 
     def install_runtime(self, runtime_kind: str, image_tag: str) -> dict[str, Any]:
-        """Ask the daemon to pull + pin + smoke a prebuilt runner image.
+        """Ask the daemon to install + pin + smoke a prebuilt runner.
 
+        ``image_tag`` is the runtime source (registry tag/digest/bundle ref);
+        sent as the neutral ``runtime_source`` field on protocol v1.1.
         Requires the separate admin token; raises ``SandboxdUnavailable`` when
         the admin control plane is not configured on this client.
         """
@@ -331,7 +333,7 @@ class SandboxdClient:
         response = self._request(
             "POST",
             "/v1/bootstrap/jobs",
-            json_body={"runtime_kind": runtime_kind, "image_tag": image_tag},
+            json_body={"runtime_kind": runtime_kind, "runtime_source": image_tag},
             admin=True,
         )
         return response.json()

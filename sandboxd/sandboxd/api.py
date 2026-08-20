@@ -364,7 +364,9 @@ class SandboxAPI:
         @router.post("/bootstrap/jobs", dependencies=[Depends(self.admin_auth)])
         def create_bootstrap_job(body: BootstrapJobRequest, request: Request) -> dict:
             try:
-                return self.controller.install_runtime(body.runtime_kind, body.image_tag)
+                return self.controller.install_runtime(
+                    body.runtime_kind, body.runtime_source or body.image_tag or ""
+                )
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
 

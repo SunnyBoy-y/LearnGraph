@@ -44,6 +44,9 @@ class SandboxRecord:
     updated_at: str
     last_used_at: str
     fence_generation: int = 0
+    # Runtime adapter that owns this sandbox (docker | wsl_oci). Defaults to
+    # docker for records created before the neutralization migration.
+    runtime_backend: str = "docker"
 
     @property
     def limits(self) -> dict[str, Any]:
@@ -99,7 +102,8 @@ class SandboxdStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_used_at TEXT NOT NULL,
-                    fence_generation INTEGER NOT NULL DEFAULT 0
+                    fence_generation INTEGER NOT NULL DEFAULT 0,
+                    runtime_backend TEXT NOT NULL DEFAULT 'docker'
                 );
                 CREATE INDEX IF NOT EXISTS ix_sandboxes_owner
                     ON sandboxes (deployment_id, owner_scope, state);
@@ -150,6 +154,18 @@ class SandboxdStore:
                 );
                 """
             )
+            # Schema migration (v1 -> v2): runtime_backend column + meta table.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sandboxes)")}
+            if "runtime_backend" not in columns:
+                conn.execute(
+                    "ALTER TABLE sandboxes ADD COLUMN runtime_backend TEXT NOT NULL DEFAULT 'docker'"
+                )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -176,8 +192,8 @@ class SandboxdStore:
                     state, volume_name, container_id, image_digest, runner_abi,
                     policy_digest, egress_network, limits_json, ttl_seconds,
                     expires_at, created_at, updated_at, last_used_at,
-                    fence_generation
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    fence_generation, runtime_backend
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.sandbox_id, record.deployment_id, record.owner_scope,
@@ -188,6 +204,7 @@ class SandboxdStore:
                     record.egress_network, record.limits_json, record.ttl_seconds,
                     record.expires_at, record.created_at, record.updated_at,
                     record.last_used_at, record.fence_generation,
+                    record.runtime_backend,
                 ),
             )
 
@@ -270,6 +287,7 @@ class SandboxdStore:
             updated_at=row["updated_at"],
             last_used_at=row["last_used_at"],
             fence_generation=int(row["fence_generation"] or 0),
+            runtime_backend=str(row["runtime_backend"] or "docker"),
         )
 
     # --- idempotency -------------------------------------------------------

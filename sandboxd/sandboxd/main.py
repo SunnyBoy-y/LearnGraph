@@ -21,6 +21,32 @@ from sandboxd.store import SandboxdStore
 logger = logging.getLogger("sandboxd.main")
 
 
+def _default_runtime(config: SandboxdConfig) -> RuntimeBackendPort:
+    """Assemble the runtime adapter selected by ``runtime_backend``.
+
+    ``docker`` is the legacy implementation. ``wsl_oci`` is the desktop/WSL
+    OCI runtime (imported lazily so a deployment that never uses it does not
+    need its dependencies installed).
+    """
+    if config.runtime_backend == "wsl_oci":
+        try:
+            from sandboxd.runtime.oci import OciRuntimeBackend
+        except ImportError as exc:  # pragma: no cover - deployment misconfiguration
+            raise SandboxdConfigError(
+                "wsl_oci runtime selected but sandboxd.runtime.oci is unavailable"
+            ) from exc
+        return OciRuntimeBackend(config)
+    return DockerRuntimeBackend(
+        deployment_id=config.deployment_id,
+        docker_host=config.docker_host,
+        runtime_image=config.runtime_image,
+        egress_proxy_url=config.egress_proxy_url,
+        egress_proxy_container=config.egress_proxy_container,
+        seccomp_dir=config.seccomp_dir,
+        workspace_uid=config.workspace_uid,
+    )
+
+
 def create_app(
     config: SandboxdConfig,
     store: SandboxdStore | None = None,
@@ -30,21 +56,13 @@ def create_app(
 ) -> FastAPI:
     """Build the ASGI application.
 
-    ``runtime`` may be injected (tests use a fake); the default is the Docker
-    runtime adapter bound to this deployment.
+    ``runtime`` may be injected (tests use a fake); the default follows
+    ``config.runtime_backend`` (docker | wsl_oci).
     """
     if store is None:
         store = SandboxdStore(config.state_path)
     if runtime is None:
-        runtime = DockerRuntimeBackend(
-            deployment_id=config.deployment_id,
-            docker_host=config.docker_host,
-            runtime_image=config.runtime_image,
-            egress_proxy_url=config.egress_proxy_url,
-            egress_proxy_container=config.egress_proxy_container,
-            seccomp_dir=config.seccomp_dir,
-            workspace_uid=config.workspace_uid,
-        )
+        runtime = _default_runtime(config)
     controller = SandboxController(config, store, runtime)
     api = SandboxAPI(
         controller,

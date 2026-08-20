@@ -37,7 +37,10 @@ class EgressRef(BaseModel):
 
 class BootstrapJobRequest(BaseModel):
     runtime_kind: Literal["python-node", "python-node-browser"] = "python-node"
-    image_tag: str = Field(min_length=1, max_length=500)
+    # Runtime-neutral source (registry tag, digest, or bundle ref). Preferred
+    # over the legacy ``image_tag`` (v1.0 compat, kept for old clients).
+    runtime_source: str | None = Field(default=None, min_length=1, max_length=500)
+    image_tag: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class CreateSandboxRequest(BaseModel):
@@ -67,6 +70,9 @@ class SandboxView(BaseModel):
     last_used_at: str
     policy_digest: str | None = None
     workspace_key: str | None = None
+    # v1.1 neutral aliases (mirror the legacy fields above).
+    runtime_digest: str | None = None
+    runtime_backend: str | None = None
 
 
 class FixedExecRequest(BaseModel):
@@ -169,6 +175,8 @@ class HealthReady(BaseModel):
     store: bool = False
     runtime: bool = False
     reconcile: str = "not_run"
+    # v1.1 neutral runtime identity.
+    runtime_backend: str | None = None
 
 
 class Capacity(BaseModel):
@@ -180,6 +188,8 @@ class Capacity(BaseModel):
     observed_memory_bytes: int = 0
     observed_cpu_percent: float = 0.0
     active_containers: int = 0
+    # v1.1 neutral alias.
+    active_sandboxes: int = 0
 
 
 # Stable error codes (contract). Client maps them onto its own exceptions.
@@ -205,8 +215,7 @@ ERROR_CODES = frozenset(
         "capacity_exceeded",
         "runtime_unavailable",
         "docker_unavailable",
-        "idempotency_conflict",
-        "invalid_request",
+        "idempotency_conflict",        "invalid_request",
         "kernel_not_found",
     }
 )

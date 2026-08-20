@@ -186,8 +186,8 @@ class DockerRuntimeBackend:
             self._close(client)
         return RuntimeCapability(True)
 
-    def image_present(self, image_ref: str) -> bool:
-        """True when the immutable image reference still exists in Docker Engine.
+    def artifact_present(self, runtime_digest: str) -> bool:
+        """True when the immutable runtime image still exists in Docker Engine.
 
         Readiness and status reporting must not trust a persisted runtime record
         alone: if the image is deleted while the daemon is running, every new
@@ -197,7 +197,7 @@ class DockerRuntimeBackend:
         client = None
         try:
             client = self._client()
-            client.images.get(image_ref)
+            client.images.get(runtime_digest)
             return True
         except Exception:  # noqa: BLE001 - presence probe is best-effort
             return False
@@ -259,7 +259,7 @@ class DockerRuntimeBackend:
                 "com.learngraph.sandbox_id": spec.sandbox_id,
                 "com.learngraph.session_id": spec.session_id,
                 "com.learngraph.runtime_kind": spec.runtime_kind,
-                "com.learngraph.volume_name": spec.volume_name,
+                "com.learngraph.volume_name": spec.workspace_ref,
                 "com.learngraph.workspace_limit_bytes": str(spec.disk_bytes),
                 "com.learngraph.policy_digest": spec.policy_digest or "",
                 "com.learngraph.egress_network": spec.egress_network or "",
@@ -346,25 +346,25 @@ class DockerRuntimeBackend:
         return spec.egress_network
 
     def create(self, spec: RuntimeCreateSpec) -> RuntimeHandle:
-        if not image_ref_is_pinned(spec.image_ref):
+        if not image_ref_is_pinned(spec.runtime_ref):
             raise DockerRuntimeUnavailable("runtime image must be an immutable sha256 digest")
         client = self._client()
         container = None
         try:
             from docker.types import Mount, Ulimit
 
-            client.images.get(spec.image_ref)
+            client.images.get(spec.runtime_ref)
             try:
-                volume = client.volumes.get(spec.volume_name)
+                volume = client.volumes.get(spec.workspace_ref)
                 if volume.labels.get("com.learngraph.managed") != "true":
                     raise DockerRuntimeUnavailable(
-                        f"volume {spec.volume_name} exists but is not managed by this deployment"
+                        f"volume {spec.workspace_ref} exists but is not managed by this deployment"
                     )
             except DockerRuntimeUnavailable:
                 raise
             except Exception:
                 client.volumes.create(
-                    spec.volume_name,
+                    spec.workspace_ref,
                     labels={
                         "com.learngraph.managed": "true",
                         "com.learngraph.deployment_id": self.deployment_id,
@@ -389,7 +389,7 @@ class DockerRuntimeBackend:
 
             shm_size = CODE_SHM_SIZE if spec.runtime_kind == CODE_RUNTIME_KIND else BROWSER_SHM_SIZE
             container = client.containers.create(
-                spec.image_ref,
+                spec.runtime_ref,
                 command=["sleep", "infinity"],
                 detach=True,
                 name=f"lg-sb-{spec.sandbox_id}",
@@ -418,7 +418,7 @@ class DockerRuntimeBackend:
                 mounts=[
                     Mount(
                         target=WORKSPACE_MOUNT,
-                        source=spec.volume_name,
+                        source=spec.workspace_ref,
                         type="volume",
                         read_only=False,
                     )
@@ -440,10 +440,10 @@ class DockerRuntimeBackend:
             self._close(client)
 
     def _container(self, client: Any, handle: RuntimeHandle):
-        if not handle.container_id:
+        if not handle.runtime_instance_id:
             raise DockerRuntimeError("sandbox runtime has no container reference")
         try:
-            container = client.containers.get(handle.container_id)
+            container = client.containers.get(handle.runtime_instance_id)
         except Exception as exc:
             raise DockerRuntimeError("sandbox runtime container is missing") from exc
         if container.labels.get("com.learngraph.managed") != "true" or container.labels.get(
@@ -456,15 +456,17 @@ class DockerRuntimeBackend:
 
     # --- bootstrap ---------------------------------------------------------
 
-    def pull_and_resolve_digest(self, image_tag: str) -> tuple[str, dict[str, str]]:
-        """Pull a tag and resolve an immutable ``sha256:...`` RepoDigest.
+    def install_runtime(self, source: str) -> tuple[str, dict[str, str]]:
+        """Install a runtime from an opaque source (registry tag or digest).
 
-        Returns ``(digest, image_labels)``. Tags that resolve to multiple
-        repositories are rejected (the deployment pins one registry).
+        Docker implementation: pull the tag and resolve an immutable
+        ``sha256:...`` RepoDigest. Returns ``(runtime_digest, labels)``. Tags
+        that resolve to multiple repositories are rejected (the deployment
+        pins one registry).
         """
-        tag = (image_tag or "").strip()
+        tag = (source or "").strip()
         if not tag:
-            raise DockerRuntimeError("bootstrap image tag must not be empty")
+            raise DockerRuntimeError("bootstrap runtime source must not be empty")
         if "@sha256:" in tag or tag.startswith("sha256:"):
             # Already an immutable reference; verify presence without pulling.
             digest_ref = tag
@@ -506,7 +508,7 @@ class DockerRuntimeBackend:
         return digest_ref, labels
 
     def smoke_test(
-        self, image_ref: str, runtime_kind: str, *, timeout_seconds: int = 120
+        self, runtime_digest: str, runtime_kind: str, *, timeout_seconds: int = 120
     ) -> tuple[bool, str]:
         """Run a bounded offline smoke of a pinned runner image.
 
@@ -516,6 +518,7 @@ class DockerRuntimeBackend:
         The container is always removed in ``finally``; a crash leaves no
         managed smoke container behind.
         """
+        image_ref = runtime_digest
         if not image_ref_is_pinned(image_ref):
             return False, "image is not an immutable sha256 digest"
         client = self._client()
@@ -632,10 +635,10 @@ class DockerRuntimeBackend:
         finally:
             self._close(client)
 
-    def resume(self, sandbox_id: str, container_id: str | None) -> RuntimeHandle:
+    def resume(self, sandbox_id: str, runtime_instance_id: str | None) -> RuntimeHandle:
         client = self._client()
         try:
-            container = self._container(client, RuntimeHandle(sandbox_id, container_id))
+            container = self._container(client, RuntimeHandle(sandbox_id, runtime_instance_id))
             if container.status != "running":
                 container.start()
             return RuntimeHandle(sandbox_id, container.id)

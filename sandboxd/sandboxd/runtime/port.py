@@ -1,8 +1,12 @@
 """Runtime adapter contract for sandboxd.
 
-The controller only speaks this port; Docker is one implementation. The spec
+The controller only speaks this port; Docker is one implementation (the spec
 is daemon-internal — callers can never express privileged/host-mount/host-
-network options.
+network options). The vocabulary is runtime-neutral: a runtime is installed
+from an opaque ``source`` and pinned by an immutable ``runtime_digest``; a
+sandbox instance is addressed by ``runtime_instance_id`` and its workspace by
+``workspace_ref``. Docker-specific terms (image/volume/container) only live
+inside concrete adapters.
 """
 
 from __future__ import annotations
@@ -17,8 +21,8 @@ class RuntimeCreateSpec:
     session_id: str
     workspace_key: str
     runtime_kind: str
-    image_ref: str
-    volume_name: str
+    runtime_ref: str
+    workspace_ref: str
     deployment_id: str
     memory_bytes: int
     memory_swap_bytes: int
@@ -34,7 +38,7 @@ class RuntimeCreateSpec:
 @dataclass(frozen=True, slots=True)
 class RuntimeHandle:
     sandbox_id: str
-    container_id: str | None
+    runtime_instance_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,15 +64,15 @@ class RuntimeFileEntry:
 
 
 class RuntimeBackendPort(Protocol):
-    """Minimal daemon-internal runtime contract."""
+    """Minimal daemon-internal runtime contract (runtime-neutral)."""
 
     def probe(self) -> RuntimeCapability: ...
     def capacity(self) -> tuple[int, int]: ...
-    def pull_and_resolve_digest(self, image_tag: str) -> tuple[str, dict[str, str]]: ...
-    def image_present(self, image_ref: str) -> bool: ...
-    def smoke_test(self, image_ref: str, runtime_kind: str, *, timeout_seconds: int = 120) -> tuple[bool, str]: ...
+    def install_runtime(self, source: str) -> tuple[str, dict[str, str]]: ...
+    def artifact_present(self, runtime_digest: str) -> bool: ...
+    def smoke_test(self, runtime_digest: str, runtime_kind: str, *, timeout_seconds: int = 120) -> tuple[bool, str]: ...
     def create(self, spec: RuntimeCreateSpec) -> RuntimeHandle: ...
-    def resume(self, sandbox_id: str, container_id: str | None) -> RuntimeHandle: ...
+    def resume(self, sandbox_id: str, runtime_instance_id: str | None) -> RuntimeHandle: ...
     def stop(self, handle: RuntimeHandle) -> None: ...
     def delete(self, handle: RuntimeHandle) -> None: ...
     def write_file(self, handle: RuntimeHandle, path: str, data: bytes, *, mode: int = 0o644) -> None: ...
