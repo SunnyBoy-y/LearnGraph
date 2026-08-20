@@ -932,11 +932,24 @@ class DockerRuntimeBackend:
         return timed_out, truncated, exec_id, pid, stdout, stderr
 
     @staticmethod
+    def _sock_read(sock, size: int) -> bytes:
+        """Read up to ``size`` bytes from a docker exec stream socket.
+
+        docker-py >=7.2 returns ``socket.SocketIO`` (file-like; ``read`` only)
+        from ``exec_start(socket=True)``, while older versions return a raw
+        socket (``recv`` only). Normalize both so output streaming is
+        version-independent.
+        """
+        if hasattr(sock, "recv"):
+            return sock.recv(size)
+        return sock.read(size)
+
+    @staticmethod
     def _read_frame(socket) -> tuple[int, bytes] | None:
         header = bytearray()
         while len(header) < 8:
             try:
-                chunk = socket.recv(8 - len(header))
+                chunk = DockerRuntimeBackend._sock_read(socket, 8 - len(header))
             except Exception:  # noqa: BLE001
                 return None
             if not chunk:
@@ -949,7 +962,7 @@ class DockerRuntimeBackend:
         payload = bytearray()
         while len(payload) < length:
             try:
-                chunk = socket.recv(length - len(payload))
+                chunk = DockerRuntimeBackend._sock_read(socket, length - len(payload))
             except Exception:  # noqa: BLE001
                 return None
             if not chunk:
