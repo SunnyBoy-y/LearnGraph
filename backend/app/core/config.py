@@ -219,8 +219,8 @@ class Settings(BaseSettings):
     sandboxd_deployment_id: str = "default"
     sandboxd_connect_timeout_seconds: float = 3.0
     sandboxd_request_timeout_seconds: float = 190.0
-    sandboxd_protocol_min: str = "1.0"
-    sandboxd_protocol_max: str = "1.0"
+    sandboxd_protocol_min: str = "1.1"
+    sandboxd_protocol_max: str = "1.1"
     # Optional immutable runtime image override for CI/offline deployments.
     # When empty, runtime resolution uses the digest persisted by Bootstrap.
     sandbox_image: str | None = None
