@@ -1166,7 +1166,7 @@ body.is-resizing .workspace-resizer {
 .chat-plus-menu { min-width: 236px; max-height: min(470px, calc(100vh - 120px)); overflow-y: auto; }
 .chat-plus-menu [data-slot='dropdown-menu-item'] { gap: 9px; }
 .chat-context-bar { display: flex; min-width: 0; max-width: 100%; align-items: center; gap: 7px; margin: 0 0 7px; overflow-x: auto; padding: 0 4px; scrollbar-width: none; overscroll-behavior-x: contain; }
-.chat-workbench-toolbar { display: flex; min-width: 0; align-items: center; gap: 7px; margin: 0 0 7px; overflow-x: auto; padding: 0 4px; scrollbar-width: none; }
+.chat-workbench-toolbar { display: flex; min-width: 0; max-width: 100%; align-items: center; gap: 7px; margin: 0 0 7px; overflow-x: auto; padding: 0 4px; scrollbar-width: none; overscroll-behavior-x: contain; }
 .chat-context-bar::-webkit-scrollbar, .chat-workbench-toolbar::-webkit-scrollbar { display: none; }
 /* Draggable rows (mouse): grab cursor only when content overflows, grabbing
    while dragging. `data-draggable` is set by useHorizontalDragScroll. */
