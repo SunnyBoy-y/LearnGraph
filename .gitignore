@@ -223,3 +223,9 @@ backend/sandbox/.spec-test.json
 
 # Docker 自托管备份产物（含主密钥，等同敏感数据）— 由 scripts/docker-update.sh 生成
 /backups/
+
+# LearnGraph Desktop (Tauri) — 构建产物不入库；占位启动页除外
+/desktop/src-tauri/target/
+/desktop/frontend-dist/*
+!/desktop/frontend-dist/index.html
+/desktop/src-tauri/gen/
