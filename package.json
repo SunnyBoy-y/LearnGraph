@@ -15,6 +15,9 @@
     "check:frontend": "node ./scripts/check.mjs --skip-backend",
     "check:backend": "node ./scripts/check.mjs --skip-frontend",
     "lint:frontend": "npm --prefix frontend run lint",
-    "build:frontend": "npm --prefix frontend run build"
+    "build:frontend": "npm --prefix frontend run build",
+    "docker": "node ./scripts/compose.mjs",
+    "docker:up": "node ./scripts/compose.mjs up -d --build",
+    "docker:down": "node ./scripts/compose.mjs down"
   }
 }

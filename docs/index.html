@@ -79,6 +79,7 @@
               <p>运行与数据</p>
               <a href="#sandbox">沙箱</a>
               <a href="#sandbox-egress">沙箱联网与审批</a>
+              <a href="#host-access">宿主服务访问</a>
               <a href="#memory">记忆系统</a>
               <a href="#artifacts">产物与分享</a>
               <a href="#atomic-tools">原子工具</a>
@@ -946,9 +947,67 @@ npm.cmd run check</code></pre>
           <div class="source-ref">来源：<code>backend/app/services/sandbox_egress_proxy.py</code> · <code>backend/app/services/sandbox_network_policy.py</code> · <code>backend/app/services/egress_approvals.py</code> · <code>backend/app/services/external_acquisition.py</code> · <code>backend/app/services/session_workspace.py</code> · <code>backend/app/providers/sandbox_fetch_pool.py</code> · <code>backend/app/services/sandbox_bootstrap.py</code></div>
         </section>
 
-        <section id="memory" class="doc-section doc-section-accent" data-title="记忆系统">
+        <section id="host-access" class="doc-section" data-title="宿主服务访问">
           <div class="section-heading">
             <span class="section-index">13B</span>
+            <div>
+              <p class="overline">Host service access</p>
+              <h2>宿主服务访问：Bridge 默认，可信桌面可直连</h2>
+            </div>
+          </div>
+          <p>
+            整体 Docker 部署后，容器内 <code>127.0.0.1</code> 是容器自己，Provider/MCP 配置里保存的
+            <code>http://127.0.0.1:11434</code>（Ollama）这类逻辑地址无法直达真机。LearnGraph 不做
+            <code>if docker: host.docker.internal</code> 补丁，而是由<strong>Host Service Resolver</strong>在装配点
+            （<code>backend/app/providers/factory.py</code> 的 effective_base_url 与探测路径）按部署形态统一改写，
+            业务层与数据库始终保存逻辑地址。改写策略由 <code>LEARNGRAPH_HOST_ACCESS_MODE</code> 决定：
+            <code>auto</code>（默认）｜ <code>bridge</code> ｜ <code>direct</code> ｜ <code>off</code>。
+          </p>
+          <div class="plain-grid">
+            <div><strong>Host Service Bridge（默认）</strong><p>真机常驻授权反向代理（<code>node scripts/host-bridge.mjs</code>，端口 34115）：只转发注册表显式放行的服务（默认 DENY、目标默认仅 loopback、逐请求 Bearer token），每次允许/拒绝写 JSONL 审计。Resolver 把 loopback 地址改写为 <code>{bridge}/services/{id}/...</code>；compose 已内置 <code>extra_hosts: host.docker.internal:host-gateway</code> 并挂载 token 文件，容器侧零配置。</p></div>
+            <div><strong>Trusted Desktop Direct（opt-in）</strong><p><code>LEARNGRAPH_HOST_ACCESS_MODE=direct</code>：容器内 loopback 的 Provider/MCP 地址改写为 <code>host.docker.internal:同端口</code>（端口/路径/query 原样保留），Docker Desktop 把该别名转发到真机同端口。无注册、无 token、无审计——主应用可触达宿主全部本地 TCP 端口，仅建议 Windows/macOS Docker Desktop 个人可信环境；非容器（源码安装）自动回退为不改写。</p></div>
+            <div><strong>off / 源码模式</strong><p><code>off</code> 关闭全部宿主改写（loopback 保持字面量）；源码模式（<code>npm run dev</code>，personal_desktop）默认直连、零影响。MCP 适配器在 direct 模式下把 <code>host.docker.internal</code> 加入明文 HTTP 白名单（allow_private_hosts），并跳过 bridge token 头。</p></div>
+          </div>
+          <h3>改写规则（host_service_resolver）</h3>
+          <table>
+            <thead><tr><th>条件</th><th>结果</th></tr></thead>
+            <tbody>
+              <tr><td><code>host_access_mode="direct"</code> 且 host 为 loopback</td><td>→ <code>http://host.docker.internal:同端口/路径?query</code></td></tr>
+              <tr><td><code>host_access_mode="off"</code></td><td>URL 原样返回</td></tr>
+              <tr><td>bridge 模式且 host 为 loopback</td><td>→ <code>{bridge}/services/{id}/{path}?query</code>（ollama 与 ollama_embedding 共用注册 id <code>ollama</code>）</td></tr>
+              <tr><td>非 loopback（远端 API）</td><td>永不改写</td></tr>
+              <tr><td>personal_desktop / 未配置 bridge 地址</td><td>URL 原样返回（源码直连）</td></tr>
+            </tbody>
+          </table>
+          <div class="code-block">
+            <div class="code-header">
+              <span>direct 模式启用（仓库根目录 .env）</span>
+              <button type="button" data-copy-code>复制</button>
+            </div>
+            <pre><code>LEARNGRAPH_HOST_ACCESS_MODE=direct
+docker compose up -d --build</code></pre>
+          </div>
+          <h3>状态与提示</h3>
+          <p>
+            <code>GET /api/v1/providers/host-bridge/status</code> 返回 <code>host_access_mode</code>、
+            <code>bridge_reachable</code>（bridge 可达性）、<code>host_gateway_reachable</code>（direct 模式下
+            <code>host.docker.internal</code> 是否可解析）、<code>bridge_token_ready</code> 与现成的中文 guidance；
+            Provider 管理页按模式展示：bridge 未运行 → 提示启动 <code>node scripts/host-bridge.mjs</code> 并重启容器；
+            direct 网关不可达 → 提示核对 <code>extra_hosts: host.docker.internal:host-gateway</code>。
+          </p>
+          <div class="callout callout-warning">
+            <span class="callout-icon">!</span>
+            <div>
+              <strong>沙箱容器绝不继承直连能力</strong>
+              <p>direct 只在主应用 Resolver 装配点生效；动态沙箱、插件与不可信执行容器内的 <code>localhost</code> 永远只表示容器自己。原生 Linux 下 <code>host-gateway</code> 只到 Docker 网桥，宿主服务需监听网关可达接口（可能扩大局域网暴露面），否则请继续使用 bridge。</p>
+            </div>
+          </div>
+          <div class="source-ref">来源：<code>backend/app/core/config.py</code>（HostAccessMode）· <code>backend/app/providers/host_service_resolver.py</code> · <code>backend/app/services/host_service_bridge.py</code> · <code>backend/app/services/management.py</code>（host_bridge_status）· <code>docker-compose.yml</code> · <code>frontend/src/features/settings/provider-pages.tsx</code></div>
+        </section>
+
+        <section id="memory" class="doc-section doc-section-accent" data-title="记忆系统">
+          <div class="section-heading">
+            <span class="section-index">13C</span>
             <div><p class="overline">Atomic memory</p><h2>记忆系统：原子记忆</h2></div>
           </div>
           <p>
@@ -968,7 +1027,7 @@ npm.cmd run check</code></pre>
 
         <section id="artifacts" class="doc-section" data-title="产物与分享">
           <div class="section-heading">
-            <span class="section-index">13C</span>
+            <span class="section-index">13D</span>
             <div><p class="overline">Artifact gateway</p><h2>产物与分享：不可变版本、分享令牌与卡片索引</h2></div>
           </div>
           <p>

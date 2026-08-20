@@ -204,9 +204,21 @@ LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN=https://my-tunnel.example.com:23351
 
 适合想先跑起来、或不想在本机装 Node / Python 的自托管体验。镜像同时包含前端生产构建和 FastAPI。生产形态是**单入口**：浏览器访问一个地址即可拿到页面和同源 `/api/v1`（前端是构建产物，由 API 进程托管——源码里的 5173 是 Vite 开发服务器，生产不存在该组件）。
 
+首次启动会**自动生成仓库根目录 `.env`**（模板来自 `.env.example`，全部为注释掉的默认值；文件已存在时绝不会覆盖你的配置）。
+
+**想让原生命令 `docker compose up -d --build` 也自动创建 `.env`**（不经过任何额外入口）——装一次 shell 级 hook 即可（Git Bash 与 PowerShell 任选其一）：
+
 ```bash
-docker compose up --build
+# Git Bash（写入 ~/.bashrc）
+bash scripts/install-docker-env-hook.sh
+
+# 或 Windows PowerShell（写入 $PROFILE）
+powershell -ExecutionPolicy Bypass -File scripts/install-docker-env-hook.ps1
 ```
+
+装完后直接执行 `docker compose up -d --build`：仅当仓库根目录 `.env` 缺失时才自动从 `.env.example` 生成（幂等，绝不覆盖你的配置），且只对 LearnGraph 项目生效（不干扰其它 compose 项目）。卸载用 `bash scripts/install-docker-env-hook.sh --uninstall` 或 `...ps1 -Uninstall`。
+
+不使用 hook 时，Compose 本身**不会**自动创建 `.env`（缺失时静默使用 `docker-compose.yml` 内置默认值）；需要自定义配置时手动 `copy .env.example .env` 后编辑。仓库也提供跨平台 npm 入口作为备选：`npm run docker:up`（等价 `docker compose up -d --build`，同样幂等确保 `.env` 就绪）。
 
 | 服务 | 默认地址 | 说明 |
 | --- | --- | --- |
@@ -229,7 +241,15 @@ docker compose up --build
 
 Compose 栈默认自带 **沙箱审批制出网（egress）**：`egress-proxy` 服务是沙箱唯一的外网出口，动态沙箱容器加入内部网络 `learngraph-egress`，每个 CONNECT 都按工作区策略 digest 重新授权（私网/环回/云元数据地址始终拒绝），审计记录写到数据卷 `egress-audit.jsonl`。无需额外部署代理或手动建网。
 
-Agent 沙箱默认通过**独立的 sandboxd 控制面**运行：Docker socket 只挂给 sandboxd，LearnGraph 业务进程只消费其版本化、认证的 Sandbox API（不直接控制 Docker Engine，也不依赖宿主/容器同路径 bind）。Linux 启用覆盖文件：
+Agent 沙箱默认通过**内置的 sandboxd 控制面**运行：Docker socket 只挂给 sandboxd，LearnGraph 业务进程只消费其版本化、认证的 Sandbox API（不直接控制 Docker Engine，也不依赖宿主/容器同路径 bind）。**主 compose 已自带 sandboxd**，`docker compose up -d --build` 一步到位即含沙箱能力，宿主无需 Node 环境、无需手工生成凭据：
+
+```bash
+docker compose up -d --build
+```
+
+`sandboxd` 容器首启时把 service/admin token 自举写入共享卷 `sandboxd-state`（幂等；app 容器只读挂载同一卷），并通过挂载的宿主 Docker socket 管理沙箱：拉取 prebuilt 镜像 → 解析 RepoDigest → 离线冒烟（Python/Node）→ 记录为 active runtime。runner 镜像须为不可变 sha256 digest——在页面「初始化沙箱」时由 sandboxd 完成（`LEARNGRAPH_SANDBOX_PREBUILT_IMAGE` 或代码版本默认），也可直接设置 `LEARNGRAPH_SANDBOX_IMAGE` 跳过 Bootstrap。若你此前手动建过 `learngraph-egress` 网络，请先删除（`docker network rm learngraph-egress`），由 Compose/daemon 统一管理。
+
+需要**加固形态**（人工评审的 secrets 文件凭据 + `sandbox-control` internal 网络，仅 Linux）时可叠加 override：
 
 ```bash
 mkdir -p secrets
@@ -240,9 +260,7 @@ export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
 docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
 ```
 
-覆盖模式下：`app` 无 Docker socket、无 same-path bind；`sandboxd` 独占 socket 并通过 `sandbox-control` 内部网络提供服务，不发布宿主端口；sandbox 使用独立 named volume 与 per-sandbox 内部 egress 网络；runner 镜像须为不可变 sha256 digest——在页面「初始化沙箱」时由 sandboxd 拉取 prebuilt 镜像（`LEARNGRAPH_SANDBOX_PREBUILT_IMAGE`）→ 解析 RepoDigest → 离线冒烟（Python/Node）→ 记录为 active runtime，也可直接设置 `LEARNGRAPH_SANDBOX_IMAGE` 跳过 Bootstrap。若你此前手动建过 `learngraph-egress` 网络，请先删除（`docker network rm learngraph-egress`），由 Compose/daemon 统一管理。
-
-Windows / Docker Desktop 请继续用上面的 `npm run dev` 跑后端，让本机 Docker 提供沙箱：dev 脚本会自动拉起本地 sandboxd 进程（token 与 state 生成在忽略的 `backend/data/.sandboxd/` 下），无需手动额外启动；不要把 Compose 里的 named volume 路径传给 dockerd。本地开发同样可以启用 egress（与 Docker 部署同款代理）：
+源码模式（`npm run dev`，Windows 本地开发）请继续用 dev 脚本：它自动拉起本地 sandboxd 进程（token 与 state 生成在忽略的 `backend/data/.sandboxd/` 下），无需手动额外启动。本地开发同样可以启用 egress（与 Docker 部署同款代理）：
 
 ```bash
 docker network create learngraph-egress
@@ -266,6 +284,8 @@ node scripts/host-bridge.mjs
 **容器侧零配置**：compose 已内置 `extra_hosts: host.docker.internal:host-gateway`，容器化部署自动推导 bridge 地址 `http://host.docker.internal:34115`，并默认把 `./data/host-bridge/token` 挂载为容器内凭据（backend 以 `X-LearnGraph-Host-Bridge-Token` 头发送）——直接 `docker compose up --build` 即可，无需额外环境变量；未启动 bridge 时后端自动跳过认证头，前端 Provider 管理页会显示实时状态与操作指引。
 
 自定义时通过环境变量覆盖：`LEARNGRAPH_HOST_BRIDGE_URL`（自定义端口/远程 bridge）、`LEARNGRAPH_HOST_BRIDGE_AUTO=false`（完全禁用桥接）、`LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE`（更换 token 挂载来源）。源码模式（`npm run dev`）默认不经过桥：loopback 地址直接解析，零影响。
+
+**可信桌面直连（可选，Windows/macOS Docker Desktop 个人环境）**：如果不想维护 bridge 注册表/token，可设置 `LEARNGRAPH_HOST_ACCESS_MODE=direct`（在 `.env` 中）。此时 Host Service Resolver 把容器内 loopback 的 Provider / MCP 地址改写成 `host.docker.internal:同端口`（端口、路径、query 原样保留），Docker Desktop 会把该别名转发到真实机器同端口——Ollama、LM Studio、本地 HTTP MCP 无需注册、无需 token、无需启动 bridge 即可直连。代价：**失去服务白名单与审计边界**（主应用容器可访问宿主机全部本地 TCP 端口），仅建议单用户可信电脑使用；原生 Linux 下 `host-gateway` 只到 Docker 网桥，宿主服务需监听网关可达接口。`LEARNGRAPH_HOST_ACCESS_MODE` 取值：`auto`（默认，容器化 profile 走 bridge）、`bridge`、`direct`、`off`。**沙箱容器绝不继承直连能力**——沙箱内的 `localhost` 始终只表示沙箱自己。
 
 更完整的变量说明见仓库根目录 `.env.example` 和 `backend/.env.example`。
 
@@ -382,7 +402,10 @@ LearnGraph/
 | `npm run check:frontend` | 仅执行前端检查 |
 | `npm run check:backend` | 仅执行后端检查 |
 | `npm run build:frontend` | 构建前端生产产物 |
-| `docker compose up --build` | 用容器启动 Web/API 与 Preview |
+| `npm run docker:up` | compose 一键启动（自动生成根目录 .env，等价 `docker compose up -d --build`） |
+| `npm run docker -- <args>` | 任意 compose 子命令透传（如 `npm run docker -- down` / `logs -f app`） |
+| `bash scripts/install-docker-env-hook.sh` | 装 shell hook：之后原样 `docker compose up` 即自动生成 .env（PowerShell 用 `install-docker-env-hook.ps1`） |
+| `docker compose up --build` | 用容器启动 Web/API 与 Preview（原生命令，不会自动创建 .env） |
 | `node scripts/host-bridge.mjs` | 宿主机一键启动 Host Service Bridge（Docker 部署访问本机服务，可选） |
 
 `npm run dev` 会从 5173 开始自动选择第一个可用的前端端口，终端会显示实际地址。公共代码快照不包含内部开发文档、测试夹具或浏览器产物，因此 `npm run check` 不代表真实 E2E 或远程 Provider 验收已经完成。
