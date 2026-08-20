@@ -121,6 +121,21 @@ def _remote_fetch_configured(db: Session, workspace_id: str) -> bool:
     )
 
 
+def _sandbox_runtime_image_available(settings: Settings) -> bool:
+    """Whether the sandbox runner image is available for web fetch.
+
+    Under the sandboxd backend the daemon owns the active runtime image
+    (``state.db`` runtime_records), so a missing app-side
+    ``sandbox-runtime.json`` does not mean the runner is unavailable. The
+    legacy in-process docker backend still requires a locally resolved image.
+    """
+    if settings.sandbox_backend == "sandboxd":
+        return True
+    from app.services.sandbox_runtime import resolve_sandbox_image
+
+    return bool(resolve_sandbox_image(settings))
+
+
 def web_fetch_runtime_status(
     db: Session,
     workspace_id: str,
@@ -133,7 +148,6 @@ def web_fetch_runtime_status(
         _sandbox_fetch_available,
         resolve_fetch_channel,
     )
-    from app.services.sandbox_runtime import resolve_sandbox_image
 
     sandbox_enabled = bool(runtime["sandbox_enabled"])
     global_gate = bool(settings.sandbox_web_fetch_enabled)
@@ -146,7 +160,7 @@ def web_fetch_runtime_status(
         from app.providers.factory import _web_fetch_policy_domains
 
         allowlist_count = len(_web_fetch_policy_domains(db, workspace_id))
-    image_available = bool(resolve_sandbox_image(settings))
+    image_available = _sandbox_runtime_image_available(settings)
     sandbox_effective = bool(
         sandbox_enabled
         and global_gate

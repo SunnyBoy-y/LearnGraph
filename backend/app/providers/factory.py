@@ -1433,32 +1433,59 @@ def deep_research_provider_for_workspace(
     )
 
 
+def _sandbox_fetch_unavailable_reason(
+    db: Session, workspace_id: str, settings: Settings
+) -> str | None:
+    """Why the sandbox-isolated fetch lane cannot run, or ``None`` when usable.
+
+    The runtime image check is relaxed under the sandboxd backend: the daemon
+    owns its active runtime (``state.db`` runtime_records), so a missing
+    app-side ``sandbox-runtime.json`` does NOT mean the runner is unavailable —
+    an actually missing runtime surfaces as a clear backend error at fetch
+    time. The legacy in-process docker backend still requires a locally
+    resolved image.
+    """
+    if not (settings.sandbox_web_fetch_enabled and settings.sandbox_egress_enabled):
+        return (
+            "sandbox web fetch is disabled by deployment configuration "
+            "(sandbox_web_fetch_enabled / sandbox_egress_enabled)"
+        )
+    if not _web_fetch_policy_domains(db, workspace_id) and not access_allow_all(
+        db, workspace_id
+    ):
+        return (
+            "workspace has no web fetch allowlist "
+            "(web_fetch.policy / access.allowlist)"
+        )
+    if settings.sandbox_backend != "sandboxd":
+        from app.services.sandbox_runtime import resolve_sandbox_image
+
+        if not resolve_sandbox_image(settings):
+            return "sandbox runtime image is not resolved"
+    return None
+
+
 def _sandbox_fetch_available(
     db: Session, workspace_id: str, settings: Settings
 ) -> bool:
     """Whether the sandbox-isolated fetch lane can run for this workspace.
 
-    Requires the global env gate, egress, a non-empty unified allowlist (or
-    allow-all mode) and a resolved sandbox runtime image — exactly the
-    conditions that previously selected ``SandboxFetchProvider`` as the
-    hard-coded primary path.
+    Requires the global env gate, egress, and a non-empty unified allowlist
+    (or allow-all mode) — exactly the conditions that previously selected
+    ``SandboxFetchProvider`` as the hard-coded primary path.
     """
-    if not (settings.sandbox_web_fetch_enabled and settings.sandbox_egress_enabled):
-        return False
-    if not _web_fetch_policy_domains(db, workspace_id) and not access_allow_all(
-        db, workspace_id
-    ):
-        return False
-    from app.services.sandbox_runtime import resolve_sandbox_image
-
-    return bool(resolve_sandbox_image(settings))
+    return _sandbox_fetch_unavailable_reason(db, workspace_id, settings) is None
 
 
 def _sandbox_fetch_provider(
     db: Session, workspace_id: str, settings: Settings
 ) -> FetchProviderPort | None:
     if not _sandbox_fetch_available(db, workspace_id, settings):
-        return None
+        return UnavailableFetchProvider(
+            "sandbox_web_fetch",
+            _sandbox_fetch_unavailable_reason(db, workspace_id, settings)
+            or "sandbox web fetch is unavailable",
+        )
     return SandboxFetchProvider(
         provider_id="sandbox_web_fetch",
         settings=settings,

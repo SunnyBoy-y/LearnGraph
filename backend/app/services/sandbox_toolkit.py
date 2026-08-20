@@ -565,6 +565,15 @@ class SandboxToolkitMixin:
         from app.providers.factory import fetch_provider_for_workspace
 
         provider = fetch_provider_for_workspace(self.db, self.workspace_id, self.settings)
+        if provider is None:
+            # Defensive: every channel returned nothing usable. The sandbox
+            # lane normally carries a precise reason; this guard keeps the
+            # tool diagnosable even if the channel priority list is custom.
+            raise AppError(
+                503,
+                "fetch_provider_unavailable",
+                "没有可用的网页抓取通道：请检查 Provider 管理 → 网页抓取（沙箱通道需启用 egress 与域名白名单/allow-all，或配置 remote/hosted 抓取 Provider）",
+            )
         try:
             require_public_http_url(raw_url, domains)
         except UnsafeFetchURL as exc:

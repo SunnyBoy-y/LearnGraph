@@ -36,6 +36,7 @@ ALLOWED_WEB_FETCH_CONTENT_TYPES = frozenset({
     "application/xhtml+xml",
     "text/plain",
     "text/markdown",
+    "application/json",
 })
 WEB_FETCH_USER_AGENT = "LearnGraphSandboxFetch/1.0 (+https://learngraph.local)"
 MCP_SERVER_EXECUTABLES = frozenset({"python", "python3", "node", "nodejs"})
@@ -199,7 +200,12 @@ def _fetch_headers() -> dict[str, str]:
 
 
 def _response_content_type(response: httpx.Response) -> str:
-    return response.headers.get("content-type", "").split(";", 1)[0].casefold().strip()
+    value = response.headers.get("content-type", "").split(";", 1)[0].casefold().strip()
+    # Normalize structured JSON variants (application/vnd.github+json etc.)
+    # to the plain JSON lane so API endpoints are fetchable as text.
+    if value.endswith("+json"):
+        return "application/json"
+    return value
 
 
 def _read_response_body(response: httpx.Response, max_bytes: int) -> bytes:
@@ -337,7 +343,7 @@ def web_fetch(
         raise WebFetchError("web fetch did not receive a response")
     text = body.decode(response.encoding or "utf-8", errors="replace")
     render_reason = None
-    if content_type in {"text/plain", "text/markdown"}:
+    if content_type in {"text/plain", "text/markdown", "application/json"}:
         markdown = text.strip()
         title = ""
     else:
@@ -346,7 +352,7 @@ def web_fetch(
     markdown = markdown.strip()
     extracted_by = "trafilatura"
     render_failed = None
-    if render and content_type not in {"text/plain", "text/markdown"}:
+    if render and content_type not in {"text/plain", "text/markdown", "application/json"}:
         if _should_render(text, markdown):
             render_reason = (
                 "empty"
