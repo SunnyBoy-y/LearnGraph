@@ -157,6 +157,16 @@ fun WebAppScreen(
                             CookieManager.getInstance().setAcceptCookie(true)
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
+                            // 原生 JS bridge：网页版登出/会话失效时（authStore.clear()）
+                            // 调用 LearnGraphNative.clearAuth() 清空 DataStore，
+                            // 防止旧 token 被 syncLoginState 重新注入（注入死循环）
+                            addJavascriptInterface(
+                                NativeAuthBridge {
+                                    scope.launch { app.authStore.clearAuth() }
+                                },
+                                "LearnGraphNative",
+                            )
+
                             webViewClient = object : WebViewClient() {
                                 private var loadFailed = false
 
@@ -201,21 +211,29 @@ fun WebAppScreen(
 
                                 /**
                                  * 登录态同步（免登录核心）：
-                                 *  - 网页版未登录（localStorage 无 token）→ 注入原生 token + reload（自愈）
+                                 *  - 网页版未登录（localStorage 无 token）且原生 DataStore 有 token
+                                 *    → 注入原生 token + reload（自愈）
                                  *  - 网页版已登录且 token 与原生一致 → 无事
-                                 *  - 网页版 token 不同（用户在网页版内重新登录）→ 回写 DataStore，持续免登录
+                                 *  - 网页版 token 与原生不同（首次登录/网页版内重登/换账号）
+                                 *    → 回写 DataStore（token + workspace），持续免登录
                                  *  reload 后再次 onPageFinished：token 已一致 → 停止，无循环。
+                                 * 说明：前端 auth-store 登录时会把 token 双写 sessionStorage +
+                                 * localStorage（见 frontend/src/api/auth-store.ts），这里从
+                                 * localStorage 读取即为网页真实登录态；登出时前端会通过
+                                 * LearnGraphNative.clearAuth() 通知本端清空 DataStore，
+                                 * 避免旧 token 被重新注入。
                                  */
                                 private fun syncLoginState(view: WebView) {
-                                    val token = authState.token
-                                    if (token.isNullOrBlank()) return
+                                    val nativeToken = authState.token
                                     val js = buildString {
                                         append("(function(){")
                                         append("var cur=localStorage.getItem('learngraph.access_token')||'';")
+                                        append("var curWs=localStorage.getItem('learngraph.workspace_id')||'';")
                                         append("var want='")
-                                        append(escapeJs(token))
+                                        append(escapeJs(nativeToken.orEmpty()))
                                         append("';")
                                         append("if(!cur){")
+                                        append("if(!want){return 'none';}")
                                         append("localStorage.setItem('learngraph.access_token',want);")
                                         append("localStorage.setItem('learngraph.workspace_id','")
                                         append(escapeJs(authState.workspaceId.orEmpty()))
@@ -225,7 +243,7 @@ fun WebAppScreen(
                                         append("');")
                                         append("return 'injected';")
                                         append("}")
-                                        append("if(cur!==want){return 'token:'+cur;}")
+                                        append("if(cur!==want){return 'token:'+cur+'|ws:'+curWs;}")
                                         append("return 'ok';")
                                         append("})()")
                                     }
@@ -234,9 +252,15 @@ fun WebAppScreen(
                                         when {
                                             trimmed == "injected" -> view.post { view.reload() }
                                             trimmed.startsWith("token:") -> {
-                                                val newToken = trimmed.removePrefix("token:")
+                                                val payload = trimmed.removePrefix("token:")
+                                                val sep = payload.indexOf("|ws:")
+                                                val newToken = if (sep >= 0) payload.substring(0, sep) else payload
+                                                val newWs = if (sep >= 0) payload.substring(sep + 4).takeIf { it.isNotBlank() } else null
                                                 if (newToken.isNotBlank()) {
-                                                    scope.launch { app.authStore.updateToken(newToken) }
+                                                    scope.launch {
+                                                        app.authStore.updateToken(newToken)
+                                                        if (newWs != null) app.authStore.updateWorkspace(newWs)
+                                                    }
                                                 }
                                             }
                                         }
@@ -328,6 +352,14 @@ private fun requestNotifPermissionIfNeeded(ctx: Context) {
         ) {
             ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2001)
         }
+    }
+}
+
+/** 网页 → 原生 JS bridge（Android 4.2+ 需要 @JavascriptInterface 才暴露） */
+private class NativeAuthBridge(private val onClearAuth: () -> Unit) {
+    @android.webkit.JavascriptInterface
+    fun clearAuth() {
+        onClearAuth()
     }
 }
 

@@ -81,6 +81,11 @@ class AuthStore(private val context: Context) {
         context.dataStore.edit { it[Keys.TOKEN] = token }
     }
 
+    /** 网页版内切换/重登工作区后，把 workspaceId 回写同步 */
+    suspend fun updateWorkspace(workspaceId: String) {
+        context.dataStore.edit { it[Keys.WORKSPACE_ID] = workspaceId }
+    }
+
     /** 记忆账号密码（自动重登用；应用私有存储） */
     suspend fun saveCredentials(username: String, password: String) {
         context.dataStore.edit {
