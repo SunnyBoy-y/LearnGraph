@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
@@ -98,8 +99,12 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
                     .height(2.dp),
             ) {}
 
-            // 全屏网页
-            Box(modifier = Modifier.fillMaxSize()) {
+            // 全屏网页（imePadding：键盘弹出时 WebView 整体抬升，输入框不被键盘遮挡）
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .imePadding(),
+            ) {
                 AndroidView(
                     factory = { ctx ->
                         WebView(ctx).apply {
