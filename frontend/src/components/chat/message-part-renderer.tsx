@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentPro
 import { useNavigate } from "react-router-dom";
 import {
   Check,
+  ChevronDown,
   Download,
   ExternalLink,
   Eye,
@@ -47,6 +48,12 @@ import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
 import { FilePreviewCanvas } from "@/components/resources/file-preview";
 import { downloadFile } from "@/api/files";
 import { apiClient } from "@/api/client";
+import {
+  cancelAgentTask,
+  getAgentTask,
+  retryAgentTask,
+  type AgentTask,
+} from "@/api/agent-tasks";
 import { confirmSkillDeletion } from "@/api/extensions";
 import { approveResearch } from "@/api/research";
 import { decideFetchAuthorization, resumeFetchAuthorization } from "@/api/fetch-authorizations";
@@ -237,6 +244,238 @@ function SandboxStatusPart({
         <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-amber-800 dark:text-amber-200">
           {data.stderr_summary}
         </pre>
+      ) : null}
+    </div>
+  );
+}
+
+const AGENT_ROLE_LABELS: Record<string, string> = {
+  generic: "子代理",
+  scout: "调研",
+  architect: "设计",
+  implementer: "实现",
+  reviewer: "验证",
+  artifact: "产物",
+};
+
+const AGENT_STATUS_LABELS: Record<string, { label: string; className: string }> = {
+  queued: { label: "等待调度", className: "bg-sky-100 text-sky-900 dark:bg-sky-950/60 dark:text-sky-200" },
+  running: { label: "正在处理", className: "bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200" },
+  finalizing: { label: "整理交付物", className: "bg-violet-100 text-violet-900 dark:bg-violet-950/60 dark:text-violet-200" },
+  succeeded: { label: "已交付", className: "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200" },
+  partial: { label: "部分完成", className: "bg-orange-100 text-orange-900 dark:bg-orange-950/60 dark:text-orange-200" },
+  failed: { label: "执行失败", className: "bg-red-100 text-red-900 dark:bg-red-950/60 dark:text-red-200" },
+  timed_out: { label: "已超时", className: "bg-red-100 text-red-900 dark:bg-red-950/60 dark:text-red-200" },
+  cancelled: { label: "已取消", className: "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300" },
+  interrupted: { label: "已中断", className: "bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300" },
+};
+
+const AGENT_TERMINAL_STATUSES = new Set([
+  "succeeded",
+  "partial",
+  "failed",
+  "timed_out",
+  "cancelled",
+  "interrupted",
+]);
+
+function formatAgentDuration(startedAt?: string, finishedAt?: string): string | null {
+  if (!startedAt) return null;
+  const start = new Date(startedAt).getTime();
+  if (Number.isNaN(start)) return null;
+  const end = finishedAt ? new Date(finishedAt).getTime() : Date.now();
+  const seconds = Math.max(0, Math.round((end - start) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+}
+
+/** Sub-agent task card (L1): status badge, title, role, duration, deliverables
+ *  summary and inline retry/cancel actions. Live status is refreshed from the
+ *  durable task REST endpoint while the task is not terminal. */
+function SubagentTaskPart({
+  data,
+  status,
+}: {
+  data: Record<string, unknown> | undefined;
+  status?: string;
+}) {
+  const taskId =
+    typeof data?.task_id === "string" && data.task_id ? data.task_id : "";
+  const title =
+    typeof data?.title === "string" && data.title ? data.title : "子代理任务";
+  const roleKey =
+    typeof data?.role_key === "string" && data.role_key ? data.role_key : "generic";
+  const phaseInitial =
+    typeof data?.status === "string" && data.status
+      ? data.status.toLowerCase()
+      : typeof data?.phase === "string"
+        ? data.phase.toLowerCase()
+        : (status ?? "").toLowerCase();
+  const [live, setLive] = useState<AgentTask | null>(null);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const phase = live ? live.status.toLowerCase() : phaseInitial;
+  const terminal = AGENT_TERMINAL_STATUSES.has(phase);
+
+  useEffect(() => {
+    if (!taskId || terminal) return;
+    let disposed = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      try {
+        const task = await getAgentTask(taskId);
+        if (disposed) return;
+        setLive(task);
+        if (!AGENT_TERMINAL_STATUSES.has(task.status.toLowerCase())) {
+          timer = window.setTimeout(tick, 3000);
+        }
+      } catch {
+        if (!disposed) timer = window.setTimeout(tick, 5000);
+      }
+    };
+    timer = window.setTimeout(tick, 1200);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [taskId, terminal]);
+
+  const statusMeta = AGENT_STATUS_LABELS[phase] ?? {
+    label: phase || "未知状态",
+    className: "bg-muted text-muted-foreground",
+  };
+  const roleLabel = AGENT_ROLE_LABELS[roleKey] ?? roleKey;
+  const duration = formatAgentDuration(
+    live?.started_at ??
+      (typeof data?.started_at === "string" ? data.started_at : undefined),
+    live?.finished_at ??
+      (typeof data?.finished_at === "string" ? data.finished_at : undefined),
+  );
+  const latestAttempt = live?.attempts?.[live.attempts.length - 1];
+  const errorClass =
+    typeof data?.error_class === "string" ? data.error_class : latestAttempt?.error_class;
+  const errorMessage =
+    typeof data?.error_message === "string" ? data.error_message : latestAttempt?.error_message;
+  const deliverables = live?.deliverables ??
+    (data?.deliverables && typeof data.deliverables === "object"
+      ? (data.deliverables as Record<string, unknown>)
+      : undefined);
+  const artifactCount = Array.isArray(deliverables?.artifacts)
+    ? deliverables.artifacts.length
+    : 0;
+  const progress =
+    typeof data?.progress_summary === "string" ? data.progress_summary : undefined;
+  const reason =
+    typeof data?.status_reason === "string" ? data.status_reason : (live?.status_reason ?? undefined);
+
+  const handleCancel = async () => {
+    if (!taskId || busy) return;
+    setBusy(true);
+    try {
+      const task = await cancelAgentTask(taskId);
+      setLive(task);
+      setToast("正在取消…");
+    } catch {
+      setToast("取消失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    if (!taskId || busy) return;
+    setBusy(true);
+    try {
+      const task = await retryAgentTask(taskId, { scope: "same", note: "前端重试" });
+      setLive(task);
+      setOpen(false);
+      setToast("已重新排队");
+    } catch {
+      setToast("重试失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border bg-card/60 px-3 py-2 text-xs text-card-foreground">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 text-left"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-label={`${title} 子代理任务`}
+      >
+        <span
+          className={`shrink-0 rounded-md px-1.5 py-0.5 font-medium ${statusMeta.className}`}
+        >
+          {statusMeta.label}
+        </span>
+        <span className="truncate font-medium">{title}</span>
+        <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+          {roleLabel}
+        </span>
+        {duration ? (
+          <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+            {duration}
+          </span>
+        ) : null}
+        <ChevronDown
+          className={cn("size-3 shrink-0 text-muted-foreground", open && "rotate-180")}
+        />
+      </button>
+      {open ? (
+        <div className="mt-2 space-y-1.5 border-t pt-2">
+          {progress ? (
+            <p className="leading-5 text-muted-foreground">{progress}</p>
+          ) : null}
+          {reason ? (
+            <p className="leading-5 text-muted-foreground">原因：{reason}</p>
+          ) : null}
+          {errorMessage ? (
+            <p className="leading-5 text-amber-800 dark:text-amber-200">
+              失败：{errorMessage}
+              {errorClass ? `（${errorClass}）` : ""}
+            </p>
+          ) : null}
+          {deliverables && typeof deliverables.summary === "string" ? (
+            <p className="leading-5 text-muted-foreground">
+              交付：{deliverables.summary}
+              {artifactCount > 0 ? ` · ${artifactCount} 个文件` : ""}
+            </p>
+          ) : null}
+          {latestAttempt && latestAttempt.rounds !== undefined ? (
+            <p className="text-[10px] text-muted-foreground">
+              轮次 {latestAttempt.rounds} · 工具调用 {latestAttempt.tool_calls ?? 0}
+              {typeof latestAttempt.cost_usd === "number"
+                ? ` · $${latestAttempt.cost_usd.toFixed(4)}`
+                : ""}
+            </p>
+          ) : null}
+          {!terminal ? (
+            <div className="flex items-center gap-2 pt-1">
+              <Button size="sm" variant="outline" disabled={busy} onClick={handleRetry}>
+                重试
+              </Button>
+              <Button size="sm" variant="ghost" disabled={busy} onClick={handleCancel}>
+                取消
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 pt-1">
+              {phase === "partial" || phase === "failed" || phase === "timed_out" ? (
+                <Button size="sm" variant="outline" disabled={busy} onClick={handleRetry}>
+                  重试
+                </Button>
+              ) : null}
+            </div>
+          )}
+          {toast ? <p className="text-[10px] text-muted-foreground">{toast}</p> : null}
+        </div>
       ) : null}
     </div>
   );
@@ -2104,6 +2343,8 @@ export function MessagePartRenderer({
       );
     case "sandbox_status":
       return <SandboxStatusPart data={part.data} status={part.status} />;
+    case "subagent_task":
+      return <SubagentTaskPart data={part.data} status={part.status} />;
     case "image":
       return <ImagePart data={part.data} status={part.status} />;
     case "attachment":

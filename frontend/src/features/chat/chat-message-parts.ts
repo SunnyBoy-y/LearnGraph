@@ -12,6 +12,7 @@ export const CHAIN_PART_TYPES = new Set<MessagePart["type"]>([
   "tool_call",
   "graph_context",
   "sandbox_status",
+  "subagent_task",
   "skill_trigger",
   "graph_progress",
 ]);
@@ -116,7 +117,24 @@ export function isGraphUpdateProposalPart(part: MessagePart): boolean {
  * so this is a defensive copy — no grouping.
  */
 export function orderChainParts(parts: MessagePart[]): MessagePart[] {
-  return [...parts];
+  // Sub-agent task snapshots: multiple status polls for the same task produce
+  // several parts; keep only the newest snapshot per task_id (stream order).
+  const seenTaskIds = new Set<string>();
+  const deduped: MessagePart[] = [];
+  for (const part of parts) {
+    if (part.type === "subagent_task") {
+      const taskId =
+        typeof part.data?.task_id === "string" && part.data.task_id
+          ? part.data.task_id
+          : "";
+      if (taskId) {
+        if (seenTaskIds.has(taskId)) continue;
+        seenTaskIds.add(taskId);
+      }
+    }
+    deduped.push(part);
+  }
+  return deduped;
 }
 
 export function isReasoningTextPart(part: MessagePart): boolean {
@@ -455,6 +473,36 @@ export function currentActivityLabel(
 ): string | null {
   if (status !== "streaming") return null;
   const ordered = orderedMessageParts(parts);
+
+  // Sub-agent aggregate (L0): prefer "已委派 N 项 · M 处理中" over raw tool rows
+  // and the sandbox_subagent_status polling tool names.
+  const subagentParts = ordered.filter((part) => part.type === "subagent_task");
+  if (subagentParts.length > 0) {
+    const byTask = new Map<string, MessagePart>();
+    for (const part of subagentParts) {
+      const taskId =
+        typeof part.data?.task_id === "string" && part.data.task_id
+          ? part.data.task_id
+          : part.id;
+      byTask.set(taskId, part);
+    }
+    const tasks = [...byTask.values()];
+    const terminal = new Set([
+      "succeeded",
+      "partial",
+      "failed",
+      "timed_out",
+      "cancelled",
+      "interrupted",
+    ]);
+    const running = tasks.filter((part) => {
+      const phase = String(part.data?.status ?? part.data?.phase ?? "").toLowerCase();
+      return !terminal.has(phase);
+    }).length;
+    const total = tasks.length;
+    if (running > 0) return `已委派 ${total} 项 · ${running} 项处理中`;
+    return `已委派 ${total} 项 · 全部完成`;
+  }
 
   const activeTool = [...ordered]
     .reverse()

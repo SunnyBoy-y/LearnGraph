@@ -21,6 +21,7 @@ export type MessagePartType =
   | 'subapp_artifact'
   | 'subapp_event'
   | 'sandbox_status'
+  | 'subagent_task'
   | 'skill_trigger'
   | 'component'
   | 'magic_card'
@@ -41,6 +42,30 @@ export interface MessagePart {
   content_delta?: string
   sequence?: number
   data?: UnknownRecord
+}
+
+/** Sub-agent lifecycle data embedded in a subagent_task message part. */
+export interface SubagentTaskPartData {
+  task_id: string
+  plan_id?: string
+  title: string
+  role_key: string
+  /** Real sub-agent status (QUEUED/RUNNING/FINALIZING/SUCCEEDED/PARTIAL/FAILED/TIMED_OUT/CANCELLED/INTERRUPTED). */
+  status: string
+  status_reason?: string | null
+  progress_summary?: string
+  rounds?: number
+  started_at?: string
+  updated_at?: string
+  finished_at?: string
+  deliverables?: {
+    summary?: string
+    artifact_count?: number
+    files?: Array<{ path: string; file_id?: string }>
+  }
+  error?: { error_class?: string; error_message?: string; retryable?: boolean }
+  parent_disposition?: 'pending' | 'adopting' | 'adopted' | 'rejected' | 'adjusted'
+  attempt?: number
 }
 
 export interface SessionCreateRequest {
