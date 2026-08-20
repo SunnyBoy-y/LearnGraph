@@ -18,7 +18,6 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -103,15 +102,14 @@ fun WebAppScreen(
         fileCallback = null
     }
 
-    val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
-
-    // 系统返回键：优先 WebView 后退，无历史时交由系统（退出应用）
+    // 系统返回键：优先 WebView 后退，无历史时退出应用。
+    // ⚠️ 禁止在回调里调用 onBackPressedDispatcher.onBackPressed()：会重新
+    // 触发本 BackHandler 回调造成无限递归（StackOverflowError 闪退，实机复现）。
     BackHandler {
         val wv = webViewRef.value
         if (wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else {
-            backDispatcher?.onBackPressed()
+            wv.goBack()        } else {
+            (context as? Activity)?.finish()
         }
     }
 
