@@ -4,7 +4,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -40,9 +39,8 @@ fun AppNav() {
         app.api.deviceId = authState.deviceId
     }
 
-    val start = remember(authState.baseUrl) {
-        if (authState.baseUrl.isBlank()) Routes.CONNECT else Routes.WEBAPP
-    }
+    // 启动路由：始终从连接页开始（地址自动预填），用户点击「连接并继续」才进入网页
+    val start = Routes.CONNECT
     val navController = rememberNavController()
 
     NavHost(navController = navController, startDestination = start) {
