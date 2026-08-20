@@ -155,15 +155,41 @@ fun WebAppScreen(
                             CookieManager.getInstance().setAcceptCookie(true)
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
-                            // 原生 JS bridge：网页版登出/会话失效时（authStore.clear()）
-                            // 调用 LearnGraphNative.clearAuth() 清空 DataStore，
-                            // 防止旧 token 被 syncLoginState 重新注入（注入死循环）
+                            // 原生 JS bridge：
+                            //  - clearAuth：网页登出/会话失效时清空 DataStore（防注入死循环）
+                            //  - download：网页真实 URL 下载走原生 OkHttp（自动附 Bearer/进度/管理页）
+                            //  - saveBase64：网页纯前端生成的 blob 下载（导出 md/svg/ics 等）
                             addJavascriptInterface(
-                                NativeAuthBridge {
-                                    scope.launch {
-                                        runCatching { app.authStore.clearAuth() }
-                                    }
-                                },
+                                NativeBridge(
+                                    onClearAuth = {
+                                        scope.launch { runCatching { app.authStore.clearAuth() } }
+                                    },
+                                    onDownload = { url, fileName ->
+                                        val appCtx = ctx.applicationContext
+                                        val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) {
+                                            authState.token
+                                        } else {
+                                            null
+                                        }
+                                        scope.launch {
+                                            runCatching {
+                                                DownloadStore.enqueue(
+                                                    appCtx,
+                                                    url,
+                                                    authToken = token,
+                                                    fileNameOverride = fileName,
+                                                )
+                                            }
+                                        }
+                                    },
+                                    onSaveBase64 = { dataUrl, fileName ->
+                                        scope.launch {
+                                            runCatching {
+                                                DownloadStore.saveBase64(ctx.applicationContext, dataUrl, fileName)
+                                            }
+                                        }
+                                    },
+                                ),
                                 "LearnGraphNative",
                             )
 
@@ -414,10 +440,24 @@ private fun requestNotifPermissionIfNeeded(ctx: Context) {
 }
 
 /** 网页 → 原生 JS bridge（Android 4.2+ 需要 @JavascriptInterface 才暴露） */
-private class NativeAuthBridge(private val onClearAuth: () -> Unit) {
+private class NativeBridge(
+    private val onClearAuth: () -> Unit,
+    private val onDownload: (url: String, fileName: String?) -> Unit,
+    private val onSaveBase64: (dataUrl: String, fileName: String?) -> Unit,
+) {
     @android.webkit.JavascriptInterface
     fun clearAuth() {
         onClearAuth()
+    }
+
+    @android.webkit.JavascriptInterface
+    fun download(url: String, fileName: String?) {
+        onDownload(url, fileName)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun saveBase64(dataUrl: String, fileName: String?) {
+        onSaveBase64(dataUrl, fileName)
     }
 }
 

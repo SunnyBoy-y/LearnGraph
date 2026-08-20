@@ -85,10 +85,14 @@ object DownloadStore {
         mimeType: String? = null,
         userAgent: String? = null,
         authToken: String? = null,
+        fileNameOverride: String? = null,
     ): String {
         val ctx = context.applicationContext
         appContext = ctx
-        val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val fileName = sanitizeFileName(
+            fileNameOverride?.takeIf { it.isNotBlank() }
+                ?: URLUtil.guessFileName(url, contentDisposition, mimeType),
+        )
         val id = UUID.randomUUID().toString()
         _tasks.update { listOf(
             DownloadTask(
@@ -172,6 +176,50 @@ object DownloadStore {
         jobs[id]?.cancel()
     }
 
+    /**
+     * 网页端纯前端生成的 blob（导出 md/svg/ics/zip 等，无真实 URL）经 JS
+     * bridge 传回 base64 落盘。dataUrl 形如 data:<mime>;base64,<payload>。
+     */
+    fun saveBase64(context: Context, dataUrl: String, fileName: String?) {
+        val ctx = context.applicationContext
+        appContext = ctx
+        val name = sanitizeFileName(fileName?.takeIf { it.isNotBlank() } ?: "download.bin")
+        val comma = dataUrl.indexOf(',')
+        val meta = if (comma >= 0) dataUrl.substring(0, comma) else ""
+        val mime = meta.removePrefix("data:").substringBefore(';').ifBlank { null }
+        val id = UUID.randomUUID().toString()
+        _tasks.update { listOf(
+            DownloadTask(id = id, url = "data:", fileName = name, mimeType = mime, status = DownloadStatus.DOWNLOADING),
+        ) + it }
+        ensureChannel(ctx)
+        scope.launch {
+            try {
+                val dir = downloadDir(ctx)
+                val target = uniqueFile(dir, name)
+                val payload = if (comma >= 0) dataUrl.substring(comma + 1) else dataUrl
+                val bytes = android.util.Base64.decode(payload, android.util.Base64.DEFAULT)
+                target.outputStream().use { it.write(bytes) }
+                updateTask(id) {
+                    it.copy(
+                        downloadedBytes = bytes.size.toLong(),
+                        totalBytes = bytes.size.toLong(),
+                        status = DownloadStatus.COMPLETED,
+                        localPath = target.absolutePath,
+                    )
+                }
+                notifyDone(ctx, task(id), success = true)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                updateTask(id) { it.copy(status = DownloadStatus.CANCELLED) }
+                notifyDone(ctx, task(id), success = false)
+            } catch (e: Exception) {
+                updateTask(id) { it.copy(status = DownloadStatus.FAILED, error = e.message) }
+                notifyDone(ctx, task(id), success = false)
+            } finally {
+                jobs.remove(id)
+            }
+        }
+    }
+
     fun retry(id: String) {
         val t = _tasks.value.firstOrNull { it.id == id } ?: return
         _tasks.update { list -> list.filterNot { it.id == id } }
@@ -218,6 +266,12 @@ object DownloadStore {
 
     private fun downloadDir(ctx: Context): File =
         File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir, "downloads").apply { mkdirs() }
+
+    /** 文件名清洗：去掉路径分隔符与非法字符，防止下载文件逃出下载目录 */
+    private fun sanitizeFileName(name: String): String {
+        val cleaned = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+        return cleaned.ifBlank { "download" }
+    }
 
     private fun uniqueFile(dir: File, fileName: String): File {
         if (!File(dir, fileName).exists()) return File(dir, fileName)
