@@ -1,5 +1,6 @@
 package com.learngraph.mobile.ui.connect
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -28,9 +29,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.unit.dp
 import com.learngraph.mobile.LearnGraphApp
 import com.learngraph.mobile.R
@@ -50,7 +53,8 @@ fun normalizeBaseUrl(input: String): String {
  */
 @Composable
 fun ConnectScreen(onConnected: () -> Unit) {
-    val app = LocalContext.current.applicationContext as LearnGraphApp
+    val context = LocalContext.current
+    val app = context.applicationContext as LearnGraphApp
     val scope = rememberCoroutineScope()
     val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
 
@@ -71,9 +75,22 @@ fun ConnectScreen(onConnected: () -> Unit) {
             .padding(horizontal = 28.dp),
     ) {
         Spacer(Modifier.height(48.dp))
-        // App 图标（与桌面图标一致）
+        // App 图标（与桌面图标一致）。
+        // ⚠️ 不能用 painterResource(R.mipmap.ic_launcher)：API 26+ 该资源是
+        // adaptive-icon XML，painterResource 不支持（启动即崩 IllegalArgumentException）。
+        // 先渲染成 Bitmap 再显示。
+        val launcherBitmap = remember {
+            val d = ContextCompat.getDrawable(context, R.mipmap.ic_launcher)
+            val w = (d?.intrinsicWidth ?: 192).coerceAtLeast(1)
+            val h = (d?.intrinsicHeight ?: 192).coerceAtLeast(1)
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bmp)
+            d?.setBounds(0, 0, w, h)
+            d?.draw(canvas)
+            bmp.asImageBitmap()
+        }
         Image(
-            painter = painterResource(R.mipmap.ic_launcher),
+            bitmap = launcherBitmap,
             contentDescription = "LearnGraph 图标",
             modifier = Modifier
                 .size(88.dp)
