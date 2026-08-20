@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.core.config import Settings
+from app.core.config import DEFAULT_SANDBOX_PREBUILT_IMAGE, Settings
 from app.providers.remote.sandbox import image_ref_is_pinned
 
 _lock = threading.RLock()
@@ -138,14 +138,21 @@ def effective_bootstrap_source(settings: Settings) -> tuple[str, str | None]:
     variable ``LEARNGRAPH_SANDBOX_PREBUILT_IMAGE`` overrides the persisted
     image reference when present (backwards compatible with env-only
     deployments). A ``build`` mode still ignores any prebuilt reference.
+
+    When neither an explicit env var nor a persisted settings-page reference
+    is present, the code release default (DEFAULT_SANDBOX_PREBUILT_IMAGE)
+    applies so open-source deployments follow the shipped runner on code
+    upgrade without editing .env.
     """
 
     source = load_bootstrap_source(settings)
     mode = source.mode if source is not None else "auto"
     prebuilt = source.prebuilt_image if source is not None else None
-    env_ref = (settings.effective_sandbox_prebuilt_image or "").strip()
-    if env_ref:
-        prebuilt = env_ref
+    explicit_env = (settings.sandbox_prebuilt_image or "").strip()
+    if explicit_env:
+        prebuilt = explicit_env
+    elif mode != "build" and not prebuilt:
+        prebuilt = DEFAULT_SANDBOX_PREBUILT_IMAGE
     return mode, prebuilt
 
 

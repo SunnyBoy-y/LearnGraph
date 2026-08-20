@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.core.config import DEFAULT_SANDBOX_PREBUILT_IMAGE
 from app.core.database import SessionLocal
 from app.domain.models import User
 
@@ -50,7 +51,8 @@ class TestBootstrapSourceGet:
         assert body["mode"] == "auto"
         assert body["effective_mode"] == "auto"
         assert body["persisted"] is False
-        assert body["prebuilt_image"] is None
+        # 无 env/页面配置时，effective 回退到代码 release 默认 runner。
+        assert body["prebuilt_image"] == DEFAULT_SANDBOX_PREBUILT_IMAGE
 
 
 class TestBootstrapSourceUpdate:
@@ -76,6 +78,7 @@ class TestBootstrapSourceUpdate:
         assert body["mode"] == "prebuilt"
         assert body["effective_mode"] == "prebuilt"
         assert body["persisted"] is True
+        # 页面持久化的地址是 effective 权威，不被代码 release 默认覆盖。
         assert body["prebuilt_image"] == ACR_REF
 
         # 再读：持久化生效
@@ -94,6 +97,7 @@ class TestBootstrapSourceUpdate:
         assert resp.status_code == 200
         body = resp.json()
         assert body["effective_mode"] == "build"
+        # build 模式忽略任何预构建引用（包括代码 release 默认）。
         assert body["prebuilt_image"] is None
 
     def test_prebuilt_mode_requires_ref(self, client, register_user, auth_headers) -> None:

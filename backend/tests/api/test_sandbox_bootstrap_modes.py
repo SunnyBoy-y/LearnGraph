@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from app.core.config import Settings
+from app.core.config import DEFAULT_SANDBOX_PREBUILT_IMAGE, Settings
 from app.domain.schemas.sandbox import SandboxBootstrapStartRequest
 from app.services.sandbox_bootstrap import (
     BootstrapJob,
@@ -93,17 +93,21 @@ class TestBootstrapStartModeSelection:
     # deterministic; the sandboxd routing has its own tests below.
     LEGACY = {"sandbox_backend": "docker"}
 
-    def test_prebuilt_mode_rejected_without_configuration(self, monkeypatch) -> None:
+    def test_prebuilt_mode_uses_release_default_without_configuration(self, monkeypatch) -> None:
+        """Explicit ``prebuilt`` mode with no persisted/env ref uses the code
+        release default runner (open-source deployments never configure)."""
         service = SandboxBootstrapService()
         monkeypatch.setattr(service, "_probe_docker", lambda: (True, None))
+        # Do not let the worker thread actually touch Docker.
+        monkeypatch.setattr(service, "_run_job", lambda job, s: None)
         # tests/api/conftest.py disables the sandbox by default; the bootstrap
         # gate tests opt back in explicitly. Explicit None also beats a local
         # .env LEARNGRAPH_SANDBOX_PREBUILT_IMAGE (init args > env > dotenv).
         settings = Settings(sandbox_enabled=True, sandbox_prebuilt_image=None, **self.LEGACY)  # sandbox_prebuilt_image defaults to None
         result = service.start(settings, actor_id="u-test", mode="prebuilt")
-        assert result["accepted"] is False
-        assert result["error_code"] == "prebuilt_image_not_configured"
-        assert "LEARNGRAPH_SANDBOX_PREBUILT_IMAGE" in result["error_message"]
+        assert result["accepted"] is True
+        assert result["joined_existing"] is False
+        assert result["job"]["mode"] == "prebuilt"
 
     def test_build_mode_accepted_without_configuration(self, monkeypatch) -> None:
         service = SandboxBootstrapService()
@@ -147,11 +151,12 @@ class TestBootstrapStartModeSelection:
         assert status["prebuilt_image_configured"] is True
         assert status["prebuilt_image_ref"] == ACR_REF.split("@")[0]
 
-    def test_status_reports_missing_prebuilt(self) -> None:
+    def test_status_reports_release_default_prebuilt(self) -> None:
+        """No persisted/env ref still reports the code release default runner."""
         service = SandboxBootstrapService()
         status = service.status(Settings(sandbox_prebuilt_image=None))
-        assert status["prebuilt_image_configured"] is False
-        assert status["prebuilt_image_ref"] is None
+        assert status["prebuilt_image_configured"] is True
+        assert status["prebuilt_image_ref"] == DEFAULT_SANDBOX_PREBUILT_IMAGE.split("@")[0]
 
 
 class TestAutoModeLocalBuildFallback:
