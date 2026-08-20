@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useEffect } from "react";
 import {
   ArrowRight,
   KeyRound,
@@ -9,6 +9,7 @@ import {
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
 import { apiClient } from "@/api/client";
+import { fetchDeploymentProfile } from "@/api/deployment";
 import { KnowledgeGraph } from "@/components/graph/knowledge-graph";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -32,6 +33,7 @@ export function LoginPage() {
   const [password, setPassword] = useState("");
   const [passwordConfirmation, setPasswordConfirmation] = useState("");
   const [registerMode, setRegisterMode] = useState(false);
+  const [registrationEnabled, setRegistrationEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(() =>
     searchParams.get("reason") === "session_expired"
@@ -46,6 +48,20 @@ export function LoginPage() {
     }
     return `/w/${workspaceId}`;
   }
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchDeploymentProfile()
+      .then((profile) => {
+        if (!cancelled) setRegistrationEnabled(profile.registration_enabled);
+      })
+      .catch(() => {
+        // 保持默认（显示注册入口）；端点不可达时登录页本身也无法工作。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function submitLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -281,20 +297,22 @@ export function LoginPage() {
                 试用 Demo
               </Button>
             )}
-            <Button
-              className="auth-demo"
-              disabled={busy}
-              onClick={() => {
-                setRegisterMode(true);
-                setError("");
-                setPassword("");
-                setPasswordConfirmation("");
-              }}
-              type="button"
-              variant="outline"
-            >
-              创建新账号
-            </Button>
+            {registrationEnabled && (
+              <Button
+                className="auth-demo"
+                disabled={busy}
+                onClick={() => {
+                  setRegisterMode(true);
+                  setError("");
+                  setPassword("");
+                  setPasswordConfirmation("");
+                }}
+                type="button"
+                variant="outline"
+              >
+                创建新账号
+              </Button>
+            )}
             <p className="login-footnote">本地优先 · API {apiClient.baseUrl}</p>
           </form>
         )}

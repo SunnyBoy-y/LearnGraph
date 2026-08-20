@@ -9,6 +9,7 @@ from app.api.routers import (
     chat,
     components,
     dashboard,
+    deployment,
     document_learning,
     fetch_authorizations,
     egress_approvals,
@@ -42,6 +43,7 @@ api_router = APIRouter(prefix="/api/v1")
 
 for router in (
     health.router,
+    deployment.router,
     artifact_gateway.router,
     auth.router,
     dashboard.router,
