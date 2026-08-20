@@ -3548,7 +3548,23 @@ body.is-resizing .workspace-resizer {
     justify-self: end;
     background: transparent;
   }
-  .resource-file-table tbody td:nth-child(1) button { width: 100%; }
+  /* 文件单元格：flex 让勾选框与文件名同行；勾选框（role=checkbox 的 button）
+     不被 width:100% 拉伸成长条（修复窄屏勾选框显示异常） */
+  .resource-file-table tbody td:nth-child(1) {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .resource-file-table tbody td:nth-child(1) button[role='checkbox'] {
+    flex: none;
+    width: 1rem;
+    height: 1rem;
+  }
+  .resource-file-table tbody td:nth-child(1) > button:not([role='checkbox']) {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+  }
   .resource-file-table tbody td:nth-child(1) span { max-width: none; }
 }
 
