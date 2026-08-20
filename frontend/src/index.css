@@ -5464,3 +5464,21 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     width: min(var(--chat-content-width), calc(100% - 24px));
   }
 }
+
+/* ===========================================================================
+   APK 窄屏：侧边栏会话 ID（中间截断 + 长按复制，见 MiddleEllipsis 组件）
+   =========================================================================== */
+.sidebar-session__id {
+  display: none;
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 9.5px;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+  color: color-mix(in srgb, var(--muted-foreground) 78%, transparent);
+}
+@media (max-width: 780px) {
+  .sidebar-session__id {
+    display: block;
+  }
+}

@@ -70,6 +70,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ActivityHeatmap } from "@/components/shared/activity-heatmap";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
+import { MiddleEllipsis } from "@/components/shared/middle-ellipsis";
 import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
@@ -2205,7 +2206,13 @@ function SessionProjects({
                   title="模型回复已完成"
                 />
               ) : null}
-              <span className="min-w-0 flex-1 truncate">{session.title}</span>
+              <span className="sidebar-session__title-block min-w-0 flex-1">
+                <span className="block min-w-0 truncate">{session.title}</span>
+                <MiddleEllipsis
+                  text={session.id}
+                  className="sidebar-session__id block max-w-full truncate"
+                />
+              </span>
               {hasChildren ? (
                 <small className="sidebar-session__child-count">
                   {children.length}
