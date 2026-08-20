@@ -5383,3 +5383,84 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   .lg-roadmap-calendar__meta { display: none; }
 }
 
+/* ===========================================================================
+   APK 内嵌窄屏优化（v0.7.0）
+   适用：APK WebView 手机窄屏（360–430dp）。桌面不受影响（规则以
+   max-width: 780px 限定，或为全局增强且对桌面同样友好）。
+   =========================================================================== */
+
+/* 1) 左上 / 右上角按钮：圆润白色背景包裹底色（胶囊白底 + 轻阴影） */
+@media (max-width: 780px) {
+  .workspace-topbar__left button,
+  .workspace-topbar__actions button {
+    width: 34px;
+    height: 34px;
+    flex: none;
+    border-radius: 999px !important;
+    background: rgba(255, 255, 255, 0.94) !important;
+    box-shadow:
+      0 1px 3px rgba(15, 20, 35, 0.1),
+      0 0 0 1px rgba(15, 20, 35, 0.05) !important;
+    color: #333 !important;
+  }
+  .workspace-topbar__left button:hover,
+  .workspace-topbar__actions button:hover,
+  .workspace-topbar__left button:focus-visible,
+  .workspace-topbar__actions button:focus-visible {
+    background: #ffffff !important;
+    box-shadow:
+      0 2px 6px rgba(15, 20, 35, 0.14),
+      0 0 0 1px rgba(15, 20, 35, 0.07) !important;
+  }
+  .dark .workspace-topbar__left button,
+  .dark .workspace-topbar__actions button {
+    background: rgba(255, 255, 255, 0.92) !important;
+    color: #222 !important;
+  }
+}
+
+/* 2) 底部画布突出：输入条更圆润、阴影更强，窄屏下更醒目 */
+@media (max-width: 780px) {
+  .chat-composer [data-slot='input-group'] {
+    border-radius: 20px !important;
+    box-shadow:
+      0 1px 0 color-mix(in srgb, #fff 70%, transparent) inset,
+      0 10px 32px rgba(15, 20, 35, 0.16),
+      0 0 0 1px rgba(15, 20, 35, 0.05) !important;
+  }
+  .chat-composer [data-slot='input-group']:focus-within {
+    box-shadow:
+      0 1px 0 color-mix(in srgb, #fff 80%, transparent) inset,
+      0 14px 38px rgba(15, 20, 35, 0.2),
+      0 0 0 1.5px color-mix(in srgb, var(--border) 70%, var(--foreground)) !important;
+  }
+  .dark .chat-composer [data-slot='input-group'] {
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.06) inset,
+      0 10px 32px rgba(0, 0, 0, 0.32),
+      0 0 0 1px rgba(255, 255, 255, 0.1) !important;
+  }
+}
+
+/* 3) 输入框聚焦展开动效：选中时平滑变高约一行 */
+.chat-composer__textarea {
+  transition:
+    min-height 0.24s cubic-bezier(0.4, 0, 0.2, 1),
+    padding 0.24s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+@media (max-width: 780px) {
+  .chat-composer__textarea:focus {
+    min-height: 78px !important; /* 52px + 约一行 26px */
+  }
+}
+
+/* 4) 文字与两旁的间距缩小到二分之一（48px → 24px，每边 24px → 12px） */
+@media (max-width: 780px) {
+  .chat-canvas-page .is-user,
+  .chat-message-version-row,
+  .chat-composer-dock,
+  .chat-follow-up-prompts,
+  .is-assistant [data-message-content] {
+    width: min(var(--chat-content-width), calc(100% - 24px));
+  }
+}
