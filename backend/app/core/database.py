@@ -153,6 +153,11 @@ _sqlite_metrics: dict[str, float] = {
     "gate_wait_ms": 0.0,
     "write_ms": 0.0,
     "locked_retries": 0.0,
+    # P0-2/P0-3 observability: a 30s gate acquire timeout (leak or long
+    # window) and a release attempted by a thread that does not own the gate
+    # (cross-thread Session use). Both must stay ~0 in healthy operation.
+    "gate_timeouts": 0.0,
+    "release_failures": 0.0,
 }
 _METRICS_LOCK = threading.Lock()
 
@@ -191,14 +196,24 @@ def record_sqlite_locked_retry() -> None:
     _sqlite_metrics_bump("locked_retries", 1.0)
 
 
-def _sqlite_acquire_gate(conn: Any) -> None:
+def _sqlite_acquire_gate(conn: Any) -> bool:
+    """Block for the single-writer gate; True on success, False on timeout.
+
+    On timeout the caller proceeds ungated — SQLite's own busy_timeout still
+    bounds the write — and MUST NOT record the connection as owning the gate:
+    a later commit would otherwise attempt a release from a thread that never
+    acquired it (``RuntimeError``), leaving the gate's ownership bookkeeping
+    corrupted (P0-2).
+    """
     if _SQLITE_WRITE_LOCK.acquire(timeout=_SQLITE_WRITE_GATE_TIMEOUT_SECONDS):
-        return
+        return True
+    _sqlite_metrics_bump("gate_timeouts", 1.0)
     logger.error(
         "SQLite write gate not acquired within %.0fs (leaked?); "
         "proceeding ungated for this statement",
         _SQLITE_WRITE_GATE_TIMEOUT_SECONDS,
     )
+    return False
 
 
 def _sqlite_release_gate(conn: Any) -> None:
@@ -206,7 +221,6 @@ def _sqlite_release_gate(conn: Any) -> None:
     if marker is None:
         return
     held_ms = (time.monotonic() - marker) * 1000.0
-    _sqlite_metrics_bump("write_ms", held_ms)
     # W2 enforcement: a write transaction held this long means a session kept
     # dirty ORM state across a slow operation (typically an LLM call) — exactly
     # the pattern that starves concurrent streams. Loudly flag it so the
@@ -226,8 +240,17 @@ def _sqlite_release_gate(conn: Any) -> None:
             pass
     try:
         _SQLITE_WRITE_LOCK.release()
-    except RuntimeError:  # pragma: no cover - defensive (wrong-thread release)
+    except RuntimeError:
+        # P0-3: count it, not just log it — a nonzero release_failures trend
+        # means a cross-thread Session handoff is back (the ownership marker
+        # was set by a different thread than the one committing here).
+        _sqlite_metrics_bump("release_failures", 1.0)
         logger.error("SQLite write gate release failed (not owned by this thread)")
+    # P0-3 lock-order fix: bump metrics only AFTER releasing the gate so this
+    # path never holds GATE while taking METRICS (the acquire path takes
+    # METRICS before GATE; holding them in reverse order is a deadlock hazard).
+    # Release is non-blocking, so moving the bump after it loses no accuracy.
+    _sqlite_metrics_bump("write_ms", held_ms)
 
 
 def _sqlite_before_cursor_execute(
@@ -245,7 +268,12 @@ def _sqlite_before_cursor_execute(
     # Fair queue probe: a non-blocking attempt makes contention observable.
     if not _SQLITE_WRITE_LOCK.acquire(blocking=False):
         _sqlite_metrics_bump("gate_contentions", 1.0)
-        _sqlite_acquire_gate(conn)
+        if not _sqlite_acquire_gate(conn):
+            # Timed out (leaked gate / long window): proceed ungated, but do
+            # NOT mark this connection as owning the gate — a later commit
+            # would try to release a lock this thread never acquired and
+            # corrupt the gate's ownership bookkeeping (P0-2).
+            return
     conn.info[_WRITE_GATE_MARKER] = time.monotonic()
     # Mirror onto the pool record so the checkin/invalidate safety nets can
     # release a stranded hold even if the commit/rollback event path failed.

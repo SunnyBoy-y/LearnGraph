@@ -1047,11 +1047,14 @@ async def wal_checkpoint_scheduler(
                 metrics = await asyncio.to_thread(snapshot_sqlite_metrics)
                 logger.info(
                     "SQLite metrics: write_gate_contentions=%s gate_wait_ms=%s "
-                    "write_ms=%s locked_retries=%s wal_bytes=%s",
+                    "write_ms=%s locked_retries=%s gate_timeouts=%s "
+                    "release_failures=%s wal_bytes=%s",
                     int(metrics.get("gate_contentions") or 0),
                     int(metrics.get("gate_wait_ms") or 0),
                     int(metrics.get("write_ms") or 0),
                     int(metrics.get("locked_retries") or 0),
+                    int(metrics.get("gate_timeouts") or 0),
+                    int(metrics.get("release_failures") or 0),
                     int(metrics.get("wal_bytes") or 0),
                 )
             except Exception:
