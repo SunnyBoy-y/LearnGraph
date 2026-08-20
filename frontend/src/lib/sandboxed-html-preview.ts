@@ -1,4 +1,5 @@
 import { sandboxRuntimeShimInlineTag } from "./sandbox-runtime-shim";
+import { subappClientInlineTag } from "./subapp-client-shim";
 
 export const SANDBOXED_HTML_PREVIEW_CSP = [
   "default-src 'none'",
@@ -41,6 +42,12 @@ export interface SandboxedHtmlPreviewOptions {
    * iframe directly — `connect-src 'none'` is unchanged.
    */
   runtimeShim?: boolean
+  /**
+   * Inject the bidirectional subapp client SDK (`window.__lgSubapp`) for
+   * subapp_mode srcDoc previews. Must be paired with runtimeShim on the bundle
+   * path; on the gateway path the SDK is a same-origin static file instead.
+   */
+  subappClient?: boolean
 }
 
 /** Build an opaque-origin srcDoc whose executable policy is owned by the host. */
@@ -104,5 +111,6 @@ export function sandboxedHtmlPreviewDocument(
   });
 
   const shimTag = options.runtimeShim ? sandboxRuntimeShimInlineTag() : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${SANDBOXED_HTML_PREVIEW_CSP}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${shimTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
+  const clientTag = options.subappClient ? subappClientInlineTag() : "";
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${SANDBOXED_HTML_PREVIEW_CSP}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${shimTag}${clientTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
 }

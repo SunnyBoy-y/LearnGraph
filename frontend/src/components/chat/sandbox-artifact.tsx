@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Box, FileCode2, ShieldAlert, ShieldCheck } from "lucide-react";
+import { BarChart3, Box, FileCode2, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { BundledLanguage } from "shiki";
 
 import {
@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { apiClient } from "@/api/client";
+import { streamSessionMessage } from "@/api/sessions";
 import {
   createSubappChannel,
   subappFailureText,
@@ -81,6 +82,30 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   } | null>(null);
   const [agentStatus, setAgentStatus] = useState<'idle' | 'queued' | 'processing' | 'failed'>('idle');
   const [agentError, setAgentError] = useState<string | null>(null);
+  const [analysisSending, setAnalysisSending] = useState(false);
+
+  /** Built-in data-analysis entry: send a structured message to the Agent. */
+  const sendAnalysisRequest = async () => {
+    if (!chatSessionId || analysisSending) return
+    setAnalysisSending(true)
+    try {
+      const content =
+        `分析双向交互子应用「${title}」的数据（bundle_id: ${bundleId}）\n` +
+        `目的：汇总我的作答与交互行为，找出反复出错、卡顿或停留最久的环节，并给出定制化指导。`
+      for await (const _event of streamSessionMessage(chatSessionId, {
+        content,
+        agent_mode: true,
+        message_kind: 'normal',
+        search_route: 'disabled',
+      })) {
+        // 消费 SSE 流；消息与结果由后端持久化并展示在聊天中。
+      }
+    } catch {
+      // 发送失败由聊天流 UI 呈现；这里不阻断 artifact 渲染。
+    } finally {
+      setAnalysisSending(false)
+    }
+  };
 
   useEffect(() => {
     if (!subappTrigger) return;
@@ -179,7 +204,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
               ref={iframeRef}
               referrerPolicy="no-referrer"
               sandbox="allow-scripts"
-              srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
+              srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml, { subappClient: true }) : undefined}
               src={!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined)) : undefined}
               title={`${title}子应用`}
             />
@@ -291,6 +316,21 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           <ShieldCheck className="size-3.5" />
           AI 正在处理子应用事件…
         </p>
+      ) : null}
+
+      {subappTrigger ? (
+        <div className="sandbox-artifact__analysis">
+          <Button
+            size="sm"
+            type="button"
+            variant="outline"
+            disabled={analysisSending || !chatSessionId}
+            onClick={() => void sendAnalysisRequest()}
+          >
+            <BarChart3 className="size-3.5" />
+            {analysisSending ? '分析请求发送中…' : '数据分析'}
+          </Button>
+        </div>
       ) : null}
 
       {subappTrigger && agentStatus === 'failed' ? (

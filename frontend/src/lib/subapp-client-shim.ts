@@ -116,3 +116,8 @@ export const SUBAPP_CLIENT = `// LearnGraph bidirectional subapp client SDK (opa
   };
 })();
 `
+
+/** Build an inline <script> element tag carrying the bidirectional subapp client SDK. */
+export function subappClientInlineTag(): string {
+  return `<script>${SUBAPP_CLIENT}</script>`;
+}

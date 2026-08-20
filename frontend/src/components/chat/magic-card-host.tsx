@@ -130,7 +130,6 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   const subappChannelRef = useRef<SubappChannel | null>(null);
   const [subappFailed, setSubappFailed] = useState<string | null>(null);
   const [consentRequest, setConsentRequest] = useState<{
-    eventId: string
     pendingConsentId: string
     triggers: string[]
   } | null>(null);
