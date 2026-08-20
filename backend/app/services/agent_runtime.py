@@ -2994,6 +2994,19 @@ class AgentToolRuntime:
         model_supports_image_input: bool = False,
         disclosed_tool_names: set[str] | None = None,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        # P1: never carry a write transaction across the tool-call boundary.
+        # A prior tool (or an inline coordinator call) that wrote without
+        # committing would hold the single SQLite write gate through this
+        # call's network I/O and starve every other writer. Commit pending
+        # work first; an empty transaction is a no-op.
+        if self.extensions is not None and getattr(self.extensions, "db", None) is not None:
+            try:
+                self.extensions.db.commit()
+            except Exception:
+                try:
+                    self.extensions.db.rollback()
+                except Exception:
+                    pass
         function = tool_call.get("function")
         if not isinstance(function, dict):
             return self._failure("invalid_tool_call", "Tool call is malformed")
@@ -8019,6 +8032,10 @@ class AgentToolRuntime:
             commit=False,
         )
         images.mark_running(task)
+        # P1: persist the created/running task BEFORE the long provider
+        # stream. Holding the write gate across image generation (seconds to
+        # minutes of remote I/O) starves every other writer.
+        self.extensions.db.commit()
         final_event = None
         usage: dict[str, Any] = {}
         try:
