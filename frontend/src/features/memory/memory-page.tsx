@@ -54,6 +54,7 @@ import {
   updateMemory,
 } from '@/api'
 import { authStore } from '@/api/auth-store'
+import { ApiError } from '@/api/client'
 import {
   identityQueryKey,
   workspaceQueryKey,
@@ -145,6 +146,19 @@ function memoryBody(markdown: string | null): string {
   if (lines[0]?.startsWith('# ')) lines.shift()
   while (lines[0] === '') lines.shift()
   return lines.join('\n').trimEnd()
+}
+
+/**
+ * 从自然语言输入推导记忆标题：取首个非空行，去掉常见 Markdown 标记，
+ * 截断到 240 字符以内（服务端标题上限）。仅用于无模型降级保存路径。
+ */
+function memoryTitleFromText(text: string): string {
+  const firstLine = text
+    .split('\n')
+    .map((line) => line.trim())
+    .find(Boolean)
+  const cleaned = (firstLine ?? text).replace(/[#>*`\[\]()]/g, '').trim()
+  return cleaned.slice(0, 240) || '用户记忆'
 }
 
 function formatTime(value: string | null): string {
@@ -277,7 +291,12 @@ export function MemoryPage() {
       }
       await refreshMemory()
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error) => {
+      // 未配置记忆模型时 quickAdd 会降级为直接创建普通记忆并给出中文提示，
+      // 这里不再重复弹出英文错误。
+      if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') return
+      toast.error(error.message)
+    },
   })
   const regenerateProfile = useMutation({
     mutationFn: refreshMemoryProfile,
@@ -319,19 +338,39 @@ export function MemoryPage() {
 
   const recoverableCount = deletedMemories.filter((item) => item.restore_available).length
   const zoneBusy = remove.isPending || update.isPending || restoreRevision.isPending
-  const quickAdd = (
+  // “添加或更新”优先走自然语言意图（LLM 原子化整理）。当工作区未配置记忆
+  // 提取/摘要模型时，后端会返回 memory_profile_model_unconfigured —— 此时降级
+  // 为直接创建一条普通记忆，保证输入框在无模型状态也能发送并立即在摘要与
+  // 记忆列表中生效（原子快照模式会逐条列出，配置模型后可一键整理为原子）。
+  const quickAdd = async (
     content: string,
     selectedText?: string,
     selectedAtomIds?: string[],
-  ) =>
-    editProfile
-      .mutateAsync({
+  ) => {
+    try {
+      await editProfile.mutateAsync({
         text: content,
         selected_text: selectedText,
         selected_atom_ids: selectedAtomIds,
         timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
       })
-      .then(() => undefined)
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') {
+        toast.info('未配置记忆提取/摘要模型，已按普通记忆直接保存；配置模型后可自动原子化整理')
+        await create.mutateAsync({
+          title: memoryTitleFromText(content),
+          content,
+          zone: 'topics',
+          namespace: 'workspace',
+          scope_type: 'workspace',
+          record_kind: 'semantic_memory',
+          source: 'user_confirmed',
+        })
+        return
+      }
+      throw error
+    }
+  }
 
   return (
     <PageFrame>
