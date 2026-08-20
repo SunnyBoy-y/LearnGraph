@@ -10,6 +10,8 @@ import android.net.Uri
 import android.os.Build
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -17,6 +19,8 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -42,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -82,6 +87,21 @@ fun WebAppScreen(
     val downloadTasks by DownloadStore.tasks.collectAsState()
     val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
     val scope = rememberCoroutineScope()
+
+    // 文件选择器（网页版「添加资料」按钮 → input[type=file] → 系统文件管理器）
+    var fileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+    val fileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        fileCallback?.onReceiveValue(uri?.let { arrayOf(it) })
+        fileCallback = null
+    }
+    val multiFileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        fileCallback?.onReceiveValue(uris.toTypedArray())
+        fileCallback = null
+    }
 
     val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
 
@@ -236,6 +256,29 @@ fun WebAppScreen(
                                     userAgent = userAgent,
                                     authToken = token,
                                 )
+                            }
+
+                            // 文件选择：网页版「添加资料」→ input[type=file] → 系统文件管理器
+                            webChromeClient = object : WebChromeClient() {
+                                override fun onShowFileChooser(
+                                    webView: WebView,
+                                    filePathCallback: ValueCallback<Array<Uri>>,
+                                    fileChooserParams: FileChooserParams,
+                                ): Boolean {
+                                    // 取消上一次未消费的回调，避免 WebView 卡住
+                                    fileCallback?.onReceiveValue(null)
+                                    fileCallback = filePathCallback
+                                    val mimeTypes = fileChooserParams.acceptTypes
+                                        .filter { it.isNotBlank() }
+                                        .toTypedArray()
+                                        .ifEmpty { arrayOf("*/*") }
+                                    if (fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                                        multiFileLauncher.launch(mimeTypes)
+                                    } else {
+                                        fileLauncher.launch(mimeTypes)
+                                    }
+                                    return true
+                                }
                             }
 
                             webViewRef.value = this
