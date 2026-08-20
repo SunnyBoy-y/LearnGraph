@@ -6,9 +6,22 @@ its own model provider; it only shares the workspace's durable sandbox files
 (which is the point of a sandbox sub-agent).  Results are stored in an
 in-process registry and polled with ``sandbox_subagent_status``.
 
-v1 scope: tools are a statically filtered subset of the sandbox tool set
-(no host-side authorization cards), rounds and wall time are capped, and the
-final answer is returned as plain text.
+v1.1 (P0 semantics): the status machine now distinguishes real success from
+budget-exhausted / empty / timed-out / cancelled outcomes:
+
+- ``completed`` — a non-empty final answer was produced without exhausting the
+  round budget (the only status that means "delivered").
+- ``partial``   — the round or tool-call budget ran out but the sub-agent may
+  have left usable files/text behind; the parent should inspect the workspace.
+- ``failed``    — an unexpected exception, or an empty final answer.
+- ``timed_out`` — the wall-clock deadline expired.
+- ``cancelled`` — a cancellation request was honoured.
+
+``write_set`` (optional) restricts file mutations to declared path prefixes;
+``max_tool_calls`` (optional) caps tool execution; both keep a sub-agent from
+silently writing outside its lane.  ``sandbox_session_id`` is now injected into
+every tool call so the sub-agent is pinned to the parent's declared session
+instead of letting ``_resolve_session`` pick another one.
 """
 
 from __future__ import annotations
@@ -45,6 +58,21 @@ DEFAULT_SUBAGENT_TOOLS = frozenset(
     }
 )
 
+# File-mutating tools whose argument carries a workspace-relative path.  Only
+# these are statically checked against ``write_set``; shell/exec/patch stay
+# governed by the sandbox boundary itself.
+_WRITE_TOOL_PATH_ARG = {
+    "sandbox_write_file": "path",
+    "sandbox_append_file": "path",
+    "sandbox_edit_file": "path",
+    "sandbox_delete_file": "path",
+}
+
+# Terminal statuses kept by the bounded registry.
+_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "partial", "timed_out"}
+)
+
 _SUBAGENT_SYSTEM_PROMPT = (
     "你是 LearnGraph 沙箱内的子代理（sub-agent），在一个隔离的离线沙箱工作区中"
     "执行被委派的任务。规则：\n"
@@ -53,6 +81,7 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "重活交给 sandbox_exec 或 sandbox_bash。\n"
     "3. 完成后用纯文本输出最终结果（包含关键文件路径、结论、数据摘要）。\n"
     "4. 不要输出思考过程，只输出任务结果。\n"
+    "5. 如果预算或轮数即将耗尽，仍然输出当前进度与已写入文件路径，不要留空。\n"
 )
 
 
@@ -67,15 +96,19 @@ class SubagentSpec:
     max_rounds: int
     max_seconds: int
     sandbox_session_id: str | None = None
+    write_set: tuple[str, ...] | None = None
+    max_tool_calls: int | None = None
 
 
 @dataclass(slots=True)
 class SubagentJob:
     spec: SubagentSpec
-    status: str = "queued"  # queued | running | completed | failed | cancelled
+    status: str = "queued"  # queued | running | completed | failed | cancelled | partial | timed_out
     error_class: str | None = None
     error_message: str | None = None
     rounds: int = 0
+    tool_calls: int = 0
+    duration_ms: int = 0
     result: str | None = None
     started_at: float | None = None
     finished_at: float | None = None
@@ -103,6 +136,63 @@ def _extract_tool_call(call: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     return call_id, name, arguments
 
 
+def _inject_session_id(arguments: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+    """Pin a sub-agent tool call to the declared sandbox session."""
+    if not session_id:
+        return arguments
+    existing = arguments.get("sandbox_session_id")
+    if isinstance(existing, str) and existing and existing not in {
+        "", "new", "auto", "none", "null", "default", "create", "latest", "current",
+    }:
+        return arguments
+    return {**arguments, "sandbox_session_id": session_id}
+
+
+def _normalize_prefix(prefix: str) -> str:
+    return prefix.replace("\\", "/").strip("/")
+
+
+def _write_allowed(spec: SubagentSpec, name: str, arguments: dict[str, Any]) -> bool:
+    """Static write-set check for path-carrying file tools.
+
+    Returns True for non-file tools (shell/exec/patch remain governed by the
+    sandbox boundary).  When ``write_set`` is unset nothing is restricted
+    (backwards-compatible; the v2 executor defaults to the task directory).
+    """
+    if not spec.write_set:
+        return True
+    arg_name = _WRITE_TOOL_PATH_ARG.get(name)
+    if arg_name is None:
+        return True
+    path = arguments.get(arg_name)
+    if not isinstance(path, str) or not path.strip():
+        return False
+    cleaned = path.replace("\\", "/").lstrip("./")
+    prefixes = tuple(_normalize_prefix(p) for p in spec.write_set)
+    return any(
+        cleaned == prefix or cleaned.startswith(prefix + "/")
+        for prefix in prefixes
+    )
+
+
+def _finish_subagent(
+    job: SubagentJob,
+    status: str,
+    final_text: str,
+    *,
+    error_class: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    job.status = status
+    job.error_class = error_class
+    job.error_message = error_message
+    job.result = (final_text or "").strip()[:16_000]
+    if job.finished_at is None:
+        job.finished_at = time.time()
+    if job.started_at is not None:
+        job.duration_ms = int((job.finished_at - job.started_at) * 1000)
+
+
 def _run_subagent(
     spec: SubagentSpec,
     job: SubagentJob,
@@ -123,6 +213,7 @@ def _run_subagent(
     job.started_at = time.time()
     deadline = job.started_at + spec.max_seconds
     db: Any = None
+    final_text = ""
     try:
         if sandbox_service is None or provider is None:
             db = SessionLocal()
@@ -155,12 +246,20 @@ def _run_subagent(
             ProviderChatMessage(role="system", content=system_content),
             ProviderChatMessage(role="user", content=spec.prompt),
         ]
-        final_text = ""
+        tool_calls_total = 0
         for _round in range(1, spec.max_rounds + 1):
             if job.status == "cancelled":
+                _finish_subagent(job, "cancelled", final_text)
                 return
             if time.time() > deadline:
-                raise TimeoutError(f"sub-agent exceeded its {spec.max_seconds}s wall-time budget")
+                _finish_subagent(
+                    job,
+                    "timed_out",
+                    final_text or "（子代理超时，未能给出最终答案）",
+                    error_class="TimeoutError",
+                    error_message=f"sub-agent exceeded its {spec.max_seconds}s wall-time budget",
+                )
+                return
             job.rounds = _round
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
@@ -174,7 +273,28 @@ def _run_subagent(
             text = "".join(text_parts)
             if not tool_calls:
                 final_text = text
+                if not final_text.strip():
+                    _finish_subagent(
+                        job,
+                        "failed",
+                        "",
+                        error_class="EmptyResult",
+                        error_message="sub-agent returned an empty final answer",
+                    )
+                    return
                 break
+            if (
+                spec.max_tool_calls is not None
+                and tool_calls_total + len(tool_calls) > spec.max_tool_calls
+            ):
+                _finish_subagent(
+                    job,
+                    "partial",
+                    final_text or "（子代理达到工具调用上限，未能给出最终答案）",
+                    error_class="MaxToolCallsExhausted",
+                    error_message=f"sub-agent exceeded its {spec.max_tool_calls}-call tool budget",
+                )
+                return
             messages.append(
                 ProviderChatMessage(
                     role="assistant",
@@ -187,21 +307,35 @@ def _run_subagent(
                 if name not in allowed:
                     result_text = '{"error": "tool not allowed in sub-agent"}'
                 else:
-                    try:
-                        outcome = sandbox.execute_agent_tool(
-                            name,
-                            arguments,
-                            chat_session_id=spec.chat_session_id,
-                            agent_authorized=True,
-                        )
+                    arguments = _inject_session_id(arguments, spec.sandbox_session_id)
+                    if not _write_allowed(spec, name, arguments):
                         result_text = json.dumps(
-                            outcome, ensure_ascii=False, default=str
-                        )
-                    except Exception as exc:  # noqa: BLE001 - surfaced to the model
-                        result_text = json.dumps(
-                            {"error": type(exc).__name__, "message": str(exc)[:500]},
+                            {
+                                "error": "write_not_allowed",
+                                "message": (
+                                    "write path is outside the declared write_set; "
+                                    "only these prefixes are writable: "
+                                    + (", ".join(spec.write_set) if spec.write_set else "")
+                                ),
+                            },
                             ensure_ascii=False,
                         )
+                    else:
+                        try:
+                            outcome = sandbox.execute_agent_tool(
+                                name,
+                                arguments,
+                                chat_session_id=spec.chat_session_id,
+                                agent_authorized=True,
+                            )
+                            result_text = json.dumps(
+                                outcome, ensure_ascii=False, default=str
+                            )
+                        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+                            result_text = json.dumps(
+                                {"error": type(exc).__name__, "message": str(exc)[:500]},
+                                ensure_ascii=False,
+                            )
                 if len(result_text) > 8_000:
                     result_text = result_text[:8_000] + "\n...[truncated]"
                 messages.append(
@@ -211,19 +345,31 @@ def _run_subagent(
                         content=result_text,
                     )
                 )
+                tool_calls_total += 1
+                job.tool_calls = tool_calls_total
         else:
-            final_text = final_text or (
-                "（子代理达到最大轮数，未能给出最终答案）"
+            # Round budget exhausted: never report success.
+            _finish_subagent(
+                job,
+                "partial",
+                final_text or "（子代理达到最大轮数，未能给出最终答案）",
+                error_class="MaxRoundsExhausted",
+                error_message=f"sub-agent reached its {spec.max_rounds}-round cap",
             )
-        if job.status == "cancelled":
             return
-        job.result = (final_text or "").strip()[:16_000]
-        job.status = "completed"
+        if job.status == "cancelled":
+            _finish_subagent(job, "cancelled", final_text)
+            return
+        _finish_subagent(job, "completed", final_text)
     except Exception as exc:  # noqa: BLE001 - registry reports the failure
         logger.exception("sandbox sub-agent %s failed", spec.subagent_id)
-        job.status = "failed"
-        job.error_class = type(exc).__name__
-        job.error_message = str(exc)[:500]
+        _finish_subagent(
+            job,
+            "failed",
+            final_text,
+            error_class=type(exc).__name__,
+            error_message=str(exc)[:500],
+        )
     finally:
         job.finished_at = time.time()
         if db is not None:
@@ -249,6 +395,15 @@ class SubagentRegistry:
         self._jobs: dict[str, SubagentJob] = {}
         self._jobs_lock = threading.RLock()
 
+    def _active_for_chat(self, chat_session_id: str) -> int:
+        with self._jobs_lock:
+            return sum(
+                1
+                for job in self._jobs.values()
+                if job.spec.chat_session_id == chat_session_id
+                and job.status in {"queued", "running"}
+            )
+
     def start(
         self,
         spec: SubagentSpec,
@@ -256,18 +411,33 @@ class SubagentRegistry:
         provider: Any = None,
         sandbox_service: Any = None,
     ) -> SubagentJob:
+        from app.core.config import get_settings
+
+        limit = get_settings().sandbox_subagent_max_concurrent_chat
+        if limit and limit > 0:
+            active = self._active_for_chat(spec.chat_session_id)
+            if active >= limit:
+                from app.core.errors import AppError
+
+                raise AppError(
+                    503,
+                    "sandbox_subagent_capacity",
+                    f"Chat already has {active} active sub-agents (limit {limit})",
+                )
         with self._jobs_lock:
             if len(self._jobs) >= self._MAX_JOBS:
-                # Evict the oldest finished job to keep the registry bounded.
+                # Evict the OLDEST finished jobs first to keep the registry
+                # bounded (ascending order = oldest finished_at first).
                 finished = sorted(
                     (
                         (job.finished_at or 0, job_id)
                         for job_id, job in self._jobs.items()
-                        if job.status in {"completed", "failed", "cancelled"}
+                        if job.status in _TERMINAL_STATUSES
                     ),
-                    reverse=True,
+                    reverse=False,
                 )
-                for _finished_at, job_id in finished[: len(finished) - (self._MAX_JOBS - 1)]:
+                excess = len(finished) - (self._MAX_JOBS - 1)
+                for _finished_at, job_id in finished[: excess]:
                     self._jobs.pop(job_id, None)
             job = SubagentJob(spec=spec)
             self._jobs[spec.subagent_id] = job

@@ -483,6 +483,10 @@ class Settings(BaseSettings):
     sandbox_subagent_enabled: bool = True
     sandbox_subagent_max_rounds: int = 6
     sandbox_subagent_max_seconds: int = 300
+    # Per-chat cap on concurrently active sub-agents (queued + running).
+    # 0 disables the cap. v1.1 transition: enforced in SubagentRegistry; the
+    # unified scheduler replaces this with a four-level quota in v2.
+    sandbox_subagent_max_concurrent_chat: int = 3
     # Host-side network tools for the sandbox (search/fetch). The sandbox
     # container itself stays offline; requests go through the reviewed
     # authorization pipeline on the host.

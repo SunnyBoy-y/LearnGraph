@@ -3966,7 +3966,22 @@ class ChatService:
             status = str(summary.get("status") or (data.get("phase") if isinstance(data, dict) else None) or "completed")
             if part_type != "sandbox_status":
                 part_type = "sandbox_status"
-            normalized_status = status if status in {"completed", "failed", "streaming", "pending"} else "completed"
+            # Sub-agent lifecycle statuses must survive normalization. The outer
+            # MessagePart state only has 4 values, so queued/running map to
+            # streaming and budget/error outcomes map to completed/failed, while
+            # the real status stays in data.status for the frontend part
+            # renderer (partial/timed_out/cancelled are NOT collapsed to
+            # completed, fixing the old "max rounds yet completed" lie).
+            if part_type == "sandbox_status" and isinstance(data, dict) and data.get("subagent_id"):
+                real = status.lower()
+                if real == "failed":
+                    normalized_status = "failed"
+                elif real in {"completed", "partial", "timed_out", "cancelled"}:
+                    normalized_status = "completed"
+                else:  # queued / running / queued…
+                    normalized_status = "streaming"
+            else:
+                normalized_status = status if status in {"completed", "failed", "streaming", "pending"} else "completed"
             if isinstance(data, dict):
                 candidates.append((part_type, normalized_status, data))
 

@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -207,15 +208,26 @@ def _initialize_workspace(
             try:
                 os.chown(directory, settings.sandbox_workspace_uid, -1)
                 os.chmod(directory, 0o750)
-            except OSError:
-                logger.warning(
-                    "Unable to apply sandbox workspace uid and permissions",
+                # Setgid so later sub-directories inherit the group, preventing
+                # cross-identity writers from losing traversal on nested paths
+                # (sub-agent lanes, outputs/, inputs/).
+                mode = os.stat(directory).st_mode
+                if not (mode & stat.S_ISGID):
+                    os.chmod(directory, mode | stat.S_ISGID)
+            except OSError as exc:
+                logger.error(
+                    "Failed to apply sandbox workspace uid and permissions",
                     extra={
                         "workspace_path": str(directory),
                         "sandbox_workspace_uid": settings.sandbox_workspace_uid,
                     },
                     exc_info=True,
                 )
+                raise AppError(
+                    500,
+                    "sandbox_workspace_permission_invalid",
+                    f"Unable to secure sandbox workspace directory {directory}",
+                ) from exc
     return relative
 
 
@@ -3789,9 +3801,12 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     "description": (
                         "Spawn a nested sandbox sub-agent: it runs its own agent loop in the "
                         "background with a restricted offline tool subset (file tools, bash, exec, "
-                        "todo, patch, git) and returns a subagent_id. Poll with sandbox_subagent_status "
-                        "until status is completed, then read its result text. Use it to parallelize "
-                        "independent research/implementation work inside the same workspace."
+                        "todo, patch, git) and returns a subagent_id. Poll with sandbox_subagent_status. "
+                        "Status outcomes: completed (final answer delivered), partial (round/tool budget "
+                        "ran out but files may exist - inspect the workspace), failed, timed_out, "
+                        "cancelled. Pass write_set (writable path prefixes) to keep the sub-agent out of "
+                        "shared directories; file writes outside write_set are rejected. Use it to "
+                        "parallelize independent research/implementation work inside the same workspace."
                     ),
                     "parameters": {
                         "type": "object",
@@ -3799,6 +3814,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                             "prompt": {"type": "string", "description": "Self-contained task description for the sub-agent."},
                             "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional sandbox tool-name subset; defaults to the offline tool set."},
                             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Tool round cap (default 6)."},
+                            "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Optional cap on total tool executions."},
+                            "write_set": {"type": "array", "items": {"type": "string"}, "description": "Optional writable workspace path prefixes, e.g. [\"work/subagents/task_a\"]. File writes outside these prefixes are rejected."},
                             "sandbox_session_id": session_property,
                         },
                         "required": ["prompt"],
@@ -3810,7 +3827,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_subagent_status",
-                    "description": "Poll the status and final result of a sandbox_subagent job (status: queued/running/completed/failed/cancelled).",
+                    "description": "Poll the status and final result of a sandbox_subagent job (status: completed/partial/failed/timed_out/cancelled/queued/running). Only completed means a final answer was delivered; partial means the budget ran out but the sub-agent may have left files behind.",
                     "parameters": {
                         "type": "object",
                         "properties": {

@@ -619,6 +619,8 @@ class SandboxToolkitMixin:
             max_rounds=min(payload.max_rounds, self.settings.sandbox_subagent_max_rounds),
             max_seconds=self.settings.sandbox_subagent_max_seconds,
             sandbox_session_id=payload.sandbox_session_id,
+            write_set=tuple(payload.write_set) if payload.write_set else None,
+            max_tool_calls=payload.max_tool_calls,
         )
         SubagentRegistry.instance().start(spec)
         return {
@@ -653,14 +655,26 @@ class SandboxToolkitMixin:
             "subagent_id": job.spec.subagent_id,
             "status": job.status,
             "error_class": job.error_class,
+            "error_message": job.error_message,
             "rounds": job.rounds,
+            "tool_calls": job.tool_calls,
+            "duration_ms": job.duration_ms,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "result": job.result,
+            "result_complete": job.status == "completed",
             "summary": {
-                "type": "sandbox_status",
+                "type": "subagent_task",
                 "status": job.status,
-                "data": {"phase": job.status.lower(), "subagent_id": job.spec.subagent_id},
+                "data": {
+                    "phase": job.status,
+                    "subagent_id": job.spec.subagent_id,
+                    "title": "子代理任务",
+                    "role_key": "generic",
+                    "rounds": job.rounds,
+                    "error_class": job.error_class,
+                    "error_message": job.error_message,
+                },
             },
         }
 

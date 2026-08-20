@@ -629,6 +629,16 @@ class SandboxAgentSubagentRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16_384)
     tools: list[str] | None = Field(default=None, max_length=16)
     max_rounds: int = Field(default=6, ge=1, le=12)
+    max_tool_calls: int | None = Field(default=None, ge=1, le=200)
+    write_set: list[str] | None = Field(
+        default=None,
+        max_length=32,
+        description=(
+            "Writable workspace path prefixes (e.g. ['work/subagents/task_a']). "
+            "File writes outside these prefixes are rejected with write_not_allowed. "
+            "Unset keeps the legacy unrestricted behavior."
+        ),
+    )
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
