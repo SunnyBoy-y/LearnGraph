@@ -3,6 +3,7 @@ import {
   ArrowRight,
   KeyRound,
   LockKeyhole,
+  Network,
   Sparkles,
   UserRound,
 } from "lucide-react";
@@ -141,7 +142,9 @@ export function LoginPage() {
       </div>
       <section className="auth-modal" aria-labelledby="auth-title">
         <div className="auth-brand">
-          <span className="brand__mark">L</span>
+          <span className="brand__mark">
+            <Network aria-hidden="true" />
+          </span>
           <strong>LearnGraph</strong>
         </div>
         {registerMode ? (

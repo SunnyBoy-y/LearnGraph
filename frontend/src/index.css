@@ -299,7 +299,8 @@ h1, h2, h3, p { margin-top: 0; }
 .entry-brand { display: flex; align-items: center; gap: 16px; }
 .entry-brand h1 { font-size: clamp(36px, 4vw, 50px); letter-spacing: -.055em; margin: 0; line-height: .95; }
 .entry-brand p { margin: 8px 0 0; color: #6b706d; font-size: 18px; }
-.brand__mark { display: inline-grid; place-items: center; width: 36px; height: 36px; border-radius: 11px; background: #111; color: #fff; font-weight: 760; font-size: 18px; flex: none; }
+.brand__mark { display: inline-grid; place-items: center; width: 36px; height: 36px; border-radius: 11px; background: linear-gradient(145deg, #8981e8 0 55%, #78cfbc 55% 100%); color: #fff; box-shadow: 0 5px 14px rgba(91, 82, 174, .14); flex: none; }
+.brand__mark svg { width: 18px; height: 18px; }
 .login-form { width: min(100%, 560px); margin: 60px auto 70px; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: var(--lg-green-dark); text-transform: uppercase; letter-spacing: .08em; font-size: 12px; font-weight: 700; }
 .eyebrow svg { width: 15px; }
@@ -3836,6 +3837,7 @@ html[data-color-mode='mono'] {
   --chart-5: oklch(.78 0 0);
 }
 html[data-color-mode='mono'] .sidebar-brand__mark,
+html[data-color-mode='mono'] .brand__mark,
 html[data-color-mode='mono'] .graph-workbench-split .graph-library__spine,
 html[data-color-mode='mono'] .graph-workbench-split .graph-library__book:not(.is-active) .graph-library__spine,
 html[data-color-mode='mono'] .project-bookshelf__spine {
@@ -4256,7 +4258,6 @@ html.dark[data-color-mode='mono'] {
   color: var(--foreground);
 }
 .dark .new-session,
-.dark .brand__mark,
 .dark .graph-workbench-form button,
 .dark .graph-workbench-copy__intro > span { background: var(--primary) !important; color: var(--primary-foreground) !important; }
 .dark .sidebar-collapse { background: var(--card); border-color: var(--border); color: var(--muted-foreground); }
@@ -5484,19 +5485,13 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 }
 
 /* ===========================================================================
-   APK 窄屏：侧边栏会话 ID（中间截断 + 长按复制，见 MiddleEllipsis 组件）
+   手机窄屏：消息内消息 ID 中间截断（MiddleEllipsis，长按复制完整 ID）
    =========================================================================== */
-.sidebar-session__id {
-  display: none;
-  margin-top: 2px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 9.5px;
-  line-height: 1.35;
-  letter-spacing: 0.01em;
-  color: color-mix(in srgb, var(--muted-foreground) 78%, transparent);
+.chat-message-id {
+  display: block;
 }
 @media (max-width: 780px) {
-  .sidebar-session__id {
-    display: block;
+  .chat-message-id {
+    max-width: min(56vw, 15rem);
   }
 }

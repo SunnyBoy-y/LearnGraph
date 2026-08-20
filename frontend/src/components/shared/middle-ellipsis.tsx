@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 /**
- * 中间截断 + 长按复制的文本（手机窄屏会话 ID 用）：
+ * 中间截断 + 长按复制的文本（手机窄屏 ID 用）：
  *  - 一行放不下时保留头尾、中间省略（…）
  *  - 长按 / 右键复制完整文本
  *  - user-select: none 防止与系统长按选择冲突
@@ -10,9 +10,11 @@ import { toast } from "sonner";
 export function MiddleEllipsis({
   text,
   className,
+  copyToast = "会话 ID 已复制",
 }: {
   text: string;
   className?: string;
+  copyToast?: string;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [display, setDisplay] = useState(text);
@@ -71,7 +73,7 @@ export function MiddleEllipsis({
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text);
-      toast.success("会话 ID 已复制");
+      toast.success(copyToast);
     } catch {
       toast.error("复制失败");
     }

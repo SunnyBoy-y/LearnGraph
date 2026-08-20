@@ -1,5 +1,11 @@
 import { useState, type FormEvent } from "react";
-import { ArrowRight, KeyRound, LoaderCircle, ShieldCheck } from "lucide-react";
+import {
+  ArrowRight,
+  KeyRound,
+  LoaderCircle,
+  Network,
+  ShieldCheck,
+} from "lucide-react";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import { KnowledgeGraph } from "@/components/graph/knowledge-graph";
@@ -72,7 +78,9 @@ export function ChangePasswordPage() {
       </div>
       <section className="auth-modal" aria-labelledby="auth-title">
         <div className="auth-brand">
-          <span className="brand__mark">L</span>
+          <span className="brand__mark">
+            <Network aria-hidden="true" />
+          </span>
           <strong>LearnGraph</strong>
         </div>
         <form onSubmit={submitPasswordChange}>

@@ -163,6 +163,7 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
+import { MiddleEllipsis } from "@/components/shared/middle-ellipsis";
 import {
   groupAnswerParts,
   QuestionSetPager,
@@ -2196,7 +2197,12 @@ function AssistantMessageInner({
         </MessageAction>
         {sessionId ? (
           <Badge className="ml-1 font-mono text-[10px]" variant="secondary">
-            {message.id} · v{shown.version}
+            <MiddleEllipsis
+              className="chat-message-id"
+              copyToast="消息 ID 已复制"
+              text={message.id}
+            />
+            {" · "}v{shown.version}
           </Badge>
         ) : null}
       </MessageActions>
@@ -9176,6 +9182,17 @@ export function ChatCanvasPage() {
                  generationMode === "image"
                    ? `绘图 · ${selectedImageModel?.id ?? "未选择"}`
                    : `${responseModeLabel} · ${activeModelProvider?.display_name ?? "模型"} / ${selectedModel?.id ?? "未选择"}`;
+               // Phone top bar is tight: show only the two-character mode word
+               // (极速/思考/智能, or 绘图 for image mode) instead of the full
+               // label + arrow.
+               const phoneModelTriggerLabel =
+                 generationMode === "image"
+                   ? "绘图"
+                   : responseMode === "fast"
+                     ? "极速"
+                     : responseMode === "thinking"
+                       ? "思考"
+                       : "智能";
                const thinkingChoices = thinkingModes.length ? (
                  <DropdownMenuRadioGroup
                    onValueChange={(value) => setThinkingMode(value as ThinkingMode)}
@@ -9262,8 +9279,7 @@ export function ChatCanvasPage() {
                     type="button"
                     variant="outline"
                   >
-                    <span>{modelTriggerLabel}</span>
-                    <ChevronDown className="size-3.5" />
+                    <span>{phoneModelTriggerLabel}</span>
                   </Button>
                 ) : (
                   <PromptInputButton
