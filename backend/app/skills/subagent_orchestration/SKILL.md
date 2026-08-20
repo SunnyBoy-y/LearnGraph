@@ -1,83 +1,84 @@
 ---
 name: subagent-orchestration
-description: 沙箱子代理的编排与调用（sandbox_subagent / sandbox_subagent_status）——何时委派、如何写子代理任务、如何轮询结果。
+description: 沙箱子代理的编排与调用（sandbox_subagent / _status / _wait / _cancel / _retry）——何时委派、收益门、Context Pack、写集、结构化交付与主代理接管。
 ---
 
-# 子代理编排（subagent-orchestration）
+# 子代理编排 v2（subagent-orchestration）
 
 ## When to use
 
-- 有一批**相互独立**的工作（多文件调研、多个候选方案实现、分头清洗/生成），可以并行执行。
-- 任务**很长或很绕**，会挤占主对话上下文：把完整上下文隔离进子代理，只回收最终结果。
-- 需要"隔离执行"：子代理有独立消息历史与受限工具集，不会污染主链的决策。
-- 主代理要先做别的（写文档、等用户输入），子代理在后台跑。
+先过**收益门**，全部满足才开子代理：
 
-## 何时不要用
+- 至少 2 个当前可独立执行的节点；
+- 预计关键路径缩短 ≥ 25%；
+- 拆分/等待/汇总/复核成本 ≤ 子任务总工作量 20%；
+- 每个子任务预计 30~180 秒，有单一可验收交付物；
+- 写集互斥或使用独立目录；
+- 主代理仍保留预算做验收与收尾。
 
-- **简单任务**：几步就能做完的，直接自己做（子代理有启动开销 + LLM 成本）。
-- **需要交互**：子代理不能弹授权卡片（sandbox_fetch / sandbox_search_web / sandbox_git_clone / 嵌套子代理不在默认工具集内）——需要联网/授权的工作留在主链。
-- **需要共享状态**：子代理的工作区与主代理是同一个沙箱会话，但**消息上下文完全隔离**；依赖主链临时结论的工作不要委派。
-- **结果必须立等可用**：子代理是后台线程 + 轮询，不是同步返回。
+适合并行：多模块只读调研、独立候选方案、独立目录实现、不同测试面。
+适合流水线（有依赖时）：调研 → 主代理冻结设计 → 多模块实现 → 验证 → 主代理收尾。
+**不应委派**：少于约 3~4 次工具调用、需要联网/授权/用户交互、多个步骤频繁改同一文件、结果立等可用。
 
-## 正确调用姿势
+## 调用姿势
 
-### 1. 写自包含的 prompt（关键！）
+### 1. 写自包含 Context Pack
 
-子代理看不到你的对话历史，prompt 必须包含：
-
-```text
-目标：<一句话要完成什么>
-输入：<明确的工作区路径，如 work/repos/a/，用 sandbox_list_files 确认>
-约束：<不允许做什么，如"不要删除 inputs/ 文件"、"只改 work/ 下文件">
-输出契约：<最终回答必须包含什么，如"列出修改的文件路径 + 关键结论 + 遗留问题">
-完成标准：<什么算完成，如"测试通过/文件已生成">
-```
-
-### 2. 选择工具子集（可选 `tools`）
-
-默认子集 = 文件工具 + bash + exec + todo + apply_patch + git（离线）。仅在子代理只需只读调研时传更小的子集：
-
-```json
-{"tools": ["sandbox_list_files", "sandbox_grep", "sandbox_read_file", "sandbox_bash"]}
-```
-
-### 3. 轮询（不要死等）
-
-`sandbox_subagent` 返回 `subagent_id` 后立即轮询 `sandbox_subagent_status`：
+子代理看不到主对话历史，prompt 必须自包含：
 
 ```text
-1. 提交后先做你自己的其他工作（写文件、整理思路）。
-2. 再查状态：queued → running → completed / failed / cancelled。
-3. completed 后取 result 文本（≤16k）；failed 时看 error_class/error_message 决定重试还是降级。
-4. 不要在一个回合里连续轮询多次——每次轮询是一轮工具调用，有模型成本。
+目标：<一句话>
+为什么：<在父计划中的作用>
+输入：<明确路径/文件/快照，用 sandbox_list_files 确认>
+约束：<禁止项、兼容性、安全边界>
+写集：<允许写的路径前缀；写集外写入会被拒绝 write_not_allowed>
+接口契约：<DOM ID / schema / 类型 / 命名>
+输出契约：<交付 JSON：summary / artifacts[] / evidence[] / acceptance[] / risks / unresolved>
+完成标准：<什么算完成>
+失败协议：<预算耗尽时输出当前进度与已写文件，不假成功>
 ```
+
+### 2. 等待优先于轮询
+
+- `sandbox_subagent_wait(subagent_ids, mode=all|any, timeout_ms, after_event_seq)`；
+- 服务端按片返回，超时给 `retry_after_ms`，按它再次调用；
+- **禁止**在一个回合内连续多次 `sandbox_subagent_status` 轮询；
+- 等待期间主代理应继续做不冲突的工作（写文档、冻结接口、准备合并框架）。
+
+### 3. 状态语义（只有 completed 才是成功）
+
+| 状态 | 含义 |
+|---|---|
+| completed | 有非空最终答案且交付契约通过 |
+| partial | 轮数/工具数/token/费用预算耗尽，可能有可用文件——检查产物 |
+| failed | 异常或空结果（empty_result） |
+| timed_out | 墙钟超限 |
+| cancelled | 已确认取消（取消中是 running + cancel_requested） |
 
 ### 4. 失败处理
 
-- `failed` + `TimeoutError`：子代理超时（墙钟 300s / max_rounds），缩小任务范围或拆小重试。
-- `failed` + 其他：把 error_message 带回主链，判断是 prompt 不清晰还是工具问题。
-- 结果不满意：在结果上继续迭代（不要无脑重跑整个子代理）。
+- 瞬时 Provider/容量错误：`sandbox_subagent_retry(scope=same)` 一次；
+- 范围过大/预算耗尽：`sandbox_subagent_retry(scope=scoped, prompt_override=更窄的prompt)` 一次；
+- 已有大部分产物、剩余工作量小、写集冲突、权限异常、重复失败：**主代理接管**，不整任务重跑；
+- 结果不满意：在结果上迭代，不无脑重跑。
 
-## 组合路线
+### 5. 写集与目录
 
-```text
-并行调研: subagent(prompt=调研A) + subagent(prompt=调研B) + subagent(prompt=调研C)
-          → 各自轮询 → 汇总三份 result 成主链结论
-拆分实现: 先写主设计 → 每个模块一个 subagent(输出契约: 文件路径+实现说明)
-          → 主代理用 sandbox_apply_patch / sandbox_edit_file 复核合并
-跟踪: subagent 提交前先 sandbox_todo add 任务 → 完成后 todo done
-验证: subagent 产物用 sandbox_grep / sandbox_exec 复核
-```
+- 派发时声明 `write_set`；文件类工具越界写入直接拒绝；
+- 未声明时默认只允许 `work/subagents/<task_id>/` 车道；
+- 每个子代理只写自己的目录，主代理按 manifest 合并，避免并行覆盖。
 
-## 限制（务必遵守）
+### 6. 交付说明（强制）
 
-- 子代理**不能**触发用户授权（fetch/search/clone 不在默认工具集）；需要联网/授权的工作留在主链。
-- 注册表是进程内的：应用重启后子代理结果丢失，`sandbox_subagent_status` 返回 not_found。
-- `max_rounds`（默认 6，上限 12）与墙钟（默认 300s）是硬上限；任务写小写明确。
-- 子代理与主代理共用同一沙箱工作区，注意文件命名冲突（用不同 work/ 子目录隔离）。
-- 一个子代理的最终结果只回传纯文本；需要产物文件时让子代理写到工作区，主代理再读。
+子代理最终回复必须带 JSON 交付块；`partial` 时也要输出进度与已写文件路径。主代理合并前用 `sandbox_read_file` / `sandbox_grep` 确定性复核，不采信"我说完成了"。
+
+## 限制
+
+- 子代理不能联网、不能弹用户授权、不能嵌套创建子代理；
+- 任务持久化在数据库（sandbox_agent_tasks / sandbox_agent_events），重启不丢；
+- 并发受 chat/user/workspace 配额约束；排队中任务自动开始，无需重提。
 
 ## 详细说明
 
-- 工具输入输出契约见 `references/tool-contract.md`
-- 子代理运行器实现与限制见 `references/runner.md`
+- 工具契约见 `references/tool-contract.md`
+- 执行器与调度说明见 `references/runner.md`

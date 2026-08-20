@@ -408,6 +408,11 @@ class SandboxJobView(BaseModel):
     deadline_at: datetime | None = None
     error_class: str | None = None
     error_message: str | None = None
+    task_id: str | None = None
+    title: str | None = None
+    role_key: str | None = None
+    deliverables_summary: dict[str, Any] | None = None
+    result_summary: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -623,28 +628,91 @@ class SandboxAgentFetchRequest(BaseModel):
 
 
 class SandboxAgentSubagentRequest(BaseModel):
-    """Spawn a nested sandbox sub-agent with a restricted tool subset."""
+    """Spawn a durable sandbox sub-agent task (v2: unified scheduler)."""
 
     chat_session_id: str = Field(min_length=1, max_length=36)
     prompt: str = Field(min_length=1, max_length=16_384)
+    title: str = Field(default="", max_length=200)
+    role_key: str = Field(default="generic", max_length=40)
     tools: list[str] | None = Field(default=None, max_length=16)
+    skills: list[str] | None = Field(default=None, max_length=8)
     max_rounds: int = Field(default=6, ge=1, le=12)
+    max_seconds: int | None = Field(default=None, ge=30, le=900)
     max_tool_calls: int | None = Field(default=None, ge=1, le=200)
+    max_tokens: int | None = Field(default=None, ge=1000, le=200_000)
+    max_cost_usd: float | None = Field(default=None, ge=0.0, le=10.0)
     write_set: list[str] | None = Field(
         default=None,
         max_length=32,
         description=(
             "Writable workspace path prefixes (e.g. ['work/subagents/task_a']). "
             "File writes outside these prefixes are rejected with write_not_allowed. "
-            "Unset keeps the legacy unrestricted behavior."
+            "Unset defaults to the task lane work/subagents/<task_id>/."
         ),
     )
+    output_contract: dict[str, Any] | None = Field(default=None)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
 class SandboxAgentSubagentStatusRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
     subagent_id: str = Field(min_length=1, max_length=64)
+    after_event_seq: int | None = Field(default=None, ge=0)
+
+
+class SandboxAgentSubagentWaitRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    subagent_ids: list[str] = Field(min_length=1, max_length=8)
+    mode: Literal["any", "all"] = "all"
+    timeout_ms: int = Field(default=30_000, ge=1000, le=60_000)
+    after_event_seq: int | None = Field(default=None, ge=0)
+
+
+class SandboxAgentSubagentCancelRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    subagent_id: str = Field(min_length=1, max_length=64)
+
+
+class SandboxAgentSubagentRetryRequest(BaseModel):
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    subagent_id: str = Field(min_length=1, max_length=64)
+    scope: Literal["same", "scoped"] = "same"
+    note: str = Field(default="", max_length=500)
+    prompt_override: str | None = Field(default=None, max_length=16_384)
+
+
+class SandboxAgentTaskEventView(BaseModel):
+    seq: int
+    event_type: str
+    payload: dict[str, Any] = {}
+    created_at: datetime | None = None
+
+
+class SandboxAgentTaskView(BaseModel):
+    """Public view of a durable sub-agent task (panel snapshot)."""
+
+    id: str
+    task_id: str
+    plan_id: str | None = None
+    chat_session_id: str
+    title: str
+    role_key: str
+    status: str
+    status_reason: str | None = None
+    spec_json: dict[str, Any] = {}
+    latest_job_id: str | None = None
+    attempts: list[dict[str, Any]] = []
+    deliverables: dict[str, Any] | None = None
+    result_text: str | None = None
+    event_seq: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SandboxAgentTaskListResponse(BaseModel):
+    tasks: list[SandboxAgentTaskView]
 
 
 class SandboxAgentSkillListRequest(BaseModel):

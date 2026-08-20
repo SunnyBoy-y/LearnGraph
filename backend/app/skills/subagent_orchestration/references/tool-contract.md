@@ -1,28 +1,36 @@
-# sandbox_subagent / sandbox_subagent_status 工具契约
+# sandbox_subagent 系列工具契约 v2
 
 ## sandbox_subagent
 
-启动一个后台沙箱子代理（嵌套 agent 循环），立即返回 `subagent_id`。
+启动一个持久化沙箱子代理任务（v2 走统一调度器），立即返回 `subagent_id`。
 
 ### 入参
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `prompt` | string | ✅ | 自包含任务描述（子代理看不到主对话历史） |
+| `prompt` | string | ✅ | 自包含 Context Pack（子代理看不到主对话历史），≤16k |
+| `title` | string | 否 | 可读任务名（UI 展示），默认"子代理任务" |
+| `role_key` | string | 否 | `generic`（默认）/ scout / architect / implementer / reviewer / artifact |
 | `tools` | array\<string\> | 否 | 工具名子集；缺省用离线默认集 |
+| `skills` | array\<string\> | 否 | 预激活 Skill key 列表（≤8） |
 | `max_rounds` | int 1-12 | 否 | 工具循环轮数上限（默认 6） |
-| `sandbox_session_id` | string | 否 | 沙箱会话标识（透传） |
-
-### 默认工具集（离线）
-
-`sandbox_env_info`、`sandbox_list_files`、`sandbox_grep`、`sandbox_read_file`、`sandbox_write_file`、`sandbox_append_file`、`sandbox_edit_file`、`sandbox_delete_file`、`sandbox_exec`、`sandbox_bash`、`sandbox_todo`、`sandbox_apply_patch`、`sandbox_git`、`sandbox_skill_list`、`sandbox_skill_read`
+| `max_seconds` | int 30-900 | 否 | 墙钟上限（默认配置 300） |
+| `max_tool_calls` | int 1-200 | 否 | 工具调用总数上限 |
+| `max_tokens` | int | 否 | token 预算（默认配置 60k） |
+| `max_cost_usd` | float | 否 | 费用预算（默认配置 $0.15） |
+| `write_set` | array\<string\> | 否 | 允许写路径前缀；缺省=任务车道 `work/subagents/<task_id>/` |
+| `output_contract` | object | 否 | 交付契约自定义字段 |
+| `sandbox_session_id` | string | 否 | 绑定沙箱会话（注入到每个工具调用） |
 
 ### 出参
 
 ```json
 {
   "subagent_id": "sa_<uuid>",
-  "status": "queued"
+  "task_id": "sa_<uuid>",
+  "job_id": "<job id>",
+  "status": "queued",
+  "sandbox_session_id": "..."
 }
 ```
 
@@ -30,34 +38,92 @@
 
 ### 入参
 
-| 参数 | 类型 | 必填 |
-|---|---|---|
-| `subagent_id` | string | ✅ |
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `subagent_id` | string | ✅ | |
+| `after_event_seq` | int | 否 | 只返回此 seq 之后的事件（增量） |
 
 ### 出参
 
 ```json
 {
-  "subagent_id": "sa_<uuid>",
-  "status": "queued | running | completed | failed | cancelled",
-  "rounds": 3,
+  "subagent_id": "sa_...",
+  "task_id": "sa_...",
+  "title": "视觉样式",
+  "role_key": "implementer",
+  "status": "queued|running|finalizing|succeeded|partial|failed|timed_out|cancelled|interrupted",
+  "status_reason": null,
   "error_class": null,
   "error_message": null,
-  "result": "最终答案纯文本（≤16k；仅 completed 时有值）",
-  "started_at": 1720000000.0,
-  "finished_at": 1720000100.0
+  "rounds": 3,
+  "tool_calls": 12,
+  "result": "最终答案文本（≤16k）",
+  "deliverables": {"summary": "...", "artifacts": [...], "evidence": [...], "acceptance": [...]},
+  "event_seq": 9,
+  "events": [{"seq": 8, "event_type": "progress", "payload": {...}}],
+  "latest_job_id": "..."
 }
 ```
 
-### 状态机
+未知/过期 id：HTTP 404（`sandbox_subagent_not_found`）。
 
-- `queued` → `running` → `completed` / `failed` / `cancelled`
-- 未知 id（注册表进程内，重启即失）：返回 `{"status": "not_found"}`
-- `failed` 常见 `error_class`：`TimeoutError`（墙钟超限）、`RuntimeError`（provider/工具异常）
+## sandbox_subagent_wait
 
-### 执行语义
+等待一个或多个子代理任务达到终态或超时。
 
-- 每轮：provider `stream_chat` 收文本与 `tool_calls` → 有 tool_call 则执行并回填 tool 结果，继续下一轮；无 tool_call 则取 final text 结束。
-- 工具执行结果 JSON 截断至 8k 回填；最终结果截断至 16k。
-- 墙钟上限 = 配置 `sandbox_subagent_max_seconds`（默认 300s）；`max_rounds` 用尽时返回提示文本而非失败。
-- 子代理工具调用带 `agent_authorized=True`，但默认工具集不含 fetch/search/git_clone/subagent，因此**不会触发授权卡片**。
+### 入参
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `subagent_ids` | array\<string\> | ✅ | 1..8 个任务 |
+| `mode` | `any` \| `all` | 否 | `all`（默认）等全部；`any` 首个变化即返回 |
+| `timeout_ms` | int 1000-60000 | 否 | 本次等待上限（默认 30000；服务端按片执行） |
+| `after_event_seq` | int | 否 | 增量事件游标 |
+
+### 出参
+
+```json
+{
+  "tasks": [<status 快照>...],
+  "retry_after_ms": 0,
+  "timed_out": false
+}
+```
+
+未达终态时 `timed_out: true` + `retry_after_ms`（建议模型按此间隔再次调用，不要连续轮询）。
+
+## sandbox_subagent_cancel
+
+请求取消（协作文：任务确认退出后才进入 `cancelled`；取消中可能仍显示 `running`）。
+
+### 入参：`subagent_id`
+
+### 出参：任务快照（当前状态）
+
+## sandbox_subagent_retry
+
+同一任务新建 attempt 重新排队（旧 attempt 保留在历史）。
+
+### 入参
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `subagent_id` | string | ✅ | |
+| `scope` | `same` \| `scoped` | 否 | `same` 沿用原 spec；`scoped` 允许缩小 prompt |
+| `prompt_override` | string | 否 | `scoped` 时的新 prompt |
+| `note` | string | 否 | 重试原因（进事件审计） |
+
+### 出参：任务快照
+
+## 状态机
+
+```text
+queued → running → finalizing → succeeded
+                       ├→ partial   （预算/交付契约不满足，可能有产物）
+                       ├→ failed    （异常/空结果）
+                       ├→ timed_out （墙钟）
+                       └→ cancelled （确认取消）
+interrupted：进程/租约丢失后恢复判定（重启场景）
+```
+
+只有 `succeeded` 表示交付成功；`partial` 时必须检查 `deliverables` 与工作区文件。

@@ -584,15 +584,15 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
     OfficialSkillSpec(
         key="subagent-orchestration",
         display_name="子代理编排",
-        version="1.0.0",
+        version="2.0.0",
         dir_name="subagent_orchestration",
         description=(
-            "沙箱子代理的编排与调用（sandbox_subagent / sandbox_subagent_status）："
-            "何时委派、如何写自包含子代理任务、选择工具子集、轮询与失败处理。"
+            "沙箱子代理编排 v2（sandbox_subagent / _status / _wait / _cancel / _retry）："
+            "收益门、Context Pack、写集、结构化交付与主代理接管协议。"
         ),
         grant_reason="official_skill_auto_enable",
         category="agent",
-        capability_ids=("agent.subagent", "agent.delegation"),
+        capability_ids=("agent.subagent", "agent.delegation", "agent.takeover"),
         keywords=(
             "子代理",
             "subagent",
@@ -600,11 +600,19 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "委派",
             "delegation",
             "sandbox_subagent",
-            "sandbox_subagent_status",
+            "sandbox_subagent_wait",
+            "sandbox_subagent_cancel",
+            "sandbox_subagent_retry",
             "后台任务",
         ),
         requires_runtime="sandbox",
-        required_tools=("sandbox_subagent", "sandbox_subagent_status"),
+        required_tools=(
+            "sandbox_subagent",
+            "sandbox_subagent_status",
+            "sandbox_subagent_wait",
+            "sandbox_subagent_cancel",
+            "sandbox_subagent_retry",
+        ),
     ),
 )
 

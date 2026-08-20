@@ -1,49 +1,61 @@
-# 子代理运行器实现说明
+# 子代理运行器实现说明（v2）
 
 ## 位置与结构
 
-- 运行器：`backend/app/services/sandbox_subagent.py`
-  - `SubagentSpec`：不可变任务描述（id / workspace / actor / chat / prompt / tools / max_rounds / max_seconds / sandbox_session_id）
-  - `SubagentJob`：任务状态（status / rounds / error_class / error_message / result / 时间戳）
-  - `SubagentRegistry`：进程内注册表（RLock 保护，上限 64 个 job，满员时淘汰最旧的已完成 job）；`start()` 起守护线程，`get()` / `cancel()` 查询与取消
-  - `_run_subagent()`：嵌套循环主体（每轮 provider 调用 + 工具执行 + 结果回填）
-- 工具实现：`backend/app/services/sandbox_toolkit.py` → `toolkit_subagent()` / `toolkit_subagent_status()`
-- 接线：`backend/app/services/sandbox.py` `execute_agent_tool` 分发 + `agent_tool_definitions()` 注册（每类 agent 会话都会暴露这两个工具）
+- **执行器**：`backend/app/services/sandbox_agent_executor.py`
+  - `execute_subagent_job(settings, job, task, *, emit_event, provider, sandbox_service)`：一次执行的完整循环，返回 `SubagentRunOutcome`（status / event_type / summary / deliverables / attempt_record / error）。
+  - `finalize_deliverables(result_text, *, default_output_root, file_exists)`：FINALIZING 机器校验交付契约。
+- **调度**：`backend/app/services/sandbox_scheduler.py`
+  - `SandboxSchedulerService._execute_job` 新增 `kind=="subagent"` 分支 → `_execute_subagent`；
+  - `_execute_subagent`：四层配额（chat/user/workspace）→ 置 RUNNING → 调执行器 → 更新 task（status/deliverables/attempts）→ 写终态事件 → `_finish(job, ...)`；
+  - `append_agent_event(db, task, event_type, payload)`：写 `sandbox_agent_events`（(task_id, seq) 幂等）并推进 `task.event_seq`。
+- **持久化**：`backend/app/domain/models.py`
+  - `SandboxAgentTask`：任务身份 + 冻结 spec_json + 最新状态 + deliverables_json + attempts_json 历史；
+  - `SandboxAgentEvent`：生命周期事件流（UI/SSE/审计）。
+- **提交**：`backend/app/services/sandbox_toolkit.py`
+  - `toolkit_subagent`：建 task → `SandboxSchedulerService.submit_job(kind="subagent")` → 事件 created/queued；
+  - `toolkit_subagent_status/_wait/_cancel/_retry`：查 task + job，返回快照/事件。
+- **兼容**：`backend/app/services/sandbox_subagent.py` 保留 v1 进程内 Registry 仅供旧任务查询兜底（不再新增 v1 任务）。
 
-## 嵌套循环语义
+## 执行语义
 
 ```
-messages = [system(人设+可用工具), user(prompt)]
+任务契约（job.payload_json）:
+  {task_id, task_title, role_key, prompt, tools, write_set, budget, sandbox_session_id}
+
 for round in 1..max_rounds:
-    校验取消 / 墙钟（> max_seconds 抛 TimeoutError）
+    检查 cancelled → CANCELLED；检查 deadline → TIMED_OUT
     events = provider.stream_chat(messages, tools=definitions)
-    攒 text_delta → text；攒 tool_calls
-    无 tool_call → final = text，结束
+    累计 last_usage token；按 pricing_catalog 折算成本
+    emit progress / tool_call 事件
+    无 tool_call：
+      空文本 → FAILED(EmptyResult)
+      非空 → 正常结束
     有 tool_call：
-      append assistant(带 tool_calls)
-      逐个执行 execute_agent_tool(name, args, agent_authorized=True)（仅限 allowed 集）
-      异常 → {"error": class, "message"} JSON 回填
-      结果 → JSON（≤8k 截断）作为 role=tool 消息
-job.result = final（≤16k）；status = completed
+      max_tool_calls 超限 → PARTIAL(MaxToolCallsExhausted)
+      逐个执行（allowed 集过滤 → session 注入 → 写集校验 → execute_agent_tool）
+      token/cost 超限 → PARTIAL(BudgetExhausted)
+轮数耗尽 → PARTIAL(MaxRoundsExhausted)
+FINALIZING:
+  finalize_deliverables(result_text, ...) → 契约完整且产物存在 → SUCCEEDED
+  否则 → PARTIAL(HandoffIncomplete)
 ```
 
-## 关键约束（实现强制）
+## 关键约束
 
-1. **允许集过滤**：`allowed` = 调用方 `tools` 子集或 `DEFAULT_SUBAGENT_TOOLS`（离线默认集）。定义层只注入 allowed 内的工具 schema；执行层再次校验，不在 allowed 的工具直接回 `{"error": "tool not allowed in sub-agent"}` 且**不执行**。
-2. **无授权拦截**：默认工具集排除 `sandbox_fetch` / `sandbox_search_web` / `sandbox_git_clone` / `sandbox_subagent`，子代理永远不会触发宿主侧授权卡片。
-3. **取消**：`cancel()` 置 `cancelled`；循环每轮起点检查该标记直接返回，成功路径也不会覆盖为 `completed`。
-4. **资源上限**：`max_rounds`（1-12，默认 6）、墙钟（默认 300s）、工具结果 8k、最终结果 16k、注册表 64 job。
-5. **隔离**：每个子代理独立 `SessionLocal` + 独立 `model_provider_for_workspace`（生产路径）；单元测试可注入 fake provider / fake sandbox。
+1. **写集**：文件类工具（write/append/edit/delete）在 `execute_agent_tool` 前做前缀校验，越界返回 `write_not_allowed` 且不执行；未声明 write_set 时默认只允许 `work/subagents/<task_id>/` 车道。
+2. **取消**：`SandboxSchedulerService.cancel_job` 置 `cancel_requested`；执行器每轮起点检查 → CANCELLED。阻塞中的 provider 流不可硬中断（协作式取消，adapter 能力受限时等待流返回）。
+3. **预算**：rounds / wall clock / tool calls / tokens / USD cost 五维；token 优先取 `provider.last_usage`，缺失时按字符估算；成本按 `pricing_catalog.PRICING_CATALOG` 匹配（无价格条目时仅按 token 上限）。
+4. **配额**：`_subagent_quota_exceeded` 检查 chat/user/workspace 三级活动数（QUEUED+STARTING+RUNNING），超限 requeue（5s 后重试），不失败调用方。
+5. **重试**：`toolkit_subagent_retry` 用新 idempotency key 提交新 job，attempts_json 追加历史。
+6. **交付**：模型输出末尾 JSON 块 → 机器解析 + 结构校验 + 产物存在性尽力校验（sandbox 不可用时跳过并标记），`handoff_parse=false` 时交付不完整 → PARTIAL。
 
-## 生产依赖
+## 事件类型
 
-- 配置：`sandbox_subagent_enabled`、`sandbox_subagent_max_seconds`、`sandbox_subagent_max_rounds`（`app/core/config.py`）
-- provider：`model_provider_for_workspace(db, workspace_id, settings)` 返回工作区绑定的模型提供者（LLM 调用走工作区供应商配置）
-- 数据库：运行器正常路径需要可用的 `SessionLocal`；子代理工具执行复用 `SandboxAgentWorkspaceService`（独立会话）
+`created` `queued` `started` `progress` `tool_call` `finalizing` `succeeded` `partial` `failed` `timed_out` `cancelled` `retry_scheduled`（预留 `checkpoint` `takeover_required` `claimed_by_parent` `delivered` 供 P3 使用）。
 
-## 已知限制
+## 生产依赖与限制
 
-- 注册表**进程内**：应用重启后 job 全部丢失，`sandbox_subagent_status` 对旧 id 返回 not_found。
-- 后台线程"并行"是进程内线程级并行，非跨进程调度；多子代理共享同一 model provider 限流。
-- 最终结果仅纯文本；需要结构产物时由子代理写入工作区，主代理再读取。
-- Linux 容器内 cell 超时用 `signal.alarm`；无 SIGALRM 平台（Windows）上 kernel cell 超时退化为 daemon 墙钟。
+- 单进程部署（uvicorn workers=1）：事件 seq 由 `task.event_seq + 1` 分配，进程内安全；多 worker 需改 DB 序列。
+- wait 工具在 chat 主循环内联分片执行（≤5s/片），不占单 worker Agent 工具执行器；模型按 `retry_after_ms` 再次调用。
+- 进程崩溃后：QUEUED 任务由调度器 tick 继续；RUNNING 任务心跳超时后需恢复逻辑标记 `interrupted`（P3）。

@@ -3841,6 +3841,57 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             {
                 "type": "function",
                 "function": {
+                    "name": "sandbox_subagent_wait",
+                    "description": "Wait for one or more sub-agent tasks to reach a terminal state (completed/partial/failed/timed_out/cancelled) or a timeout. mode=all waits for every task; mode=any returns as soon as one changes. Pass after_event_seq from a previous status/wait call to get incremental events. Prefer this over repeated sandbox_subagent_status polling.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subagent_ids": {"type": "array", "items": {"type": "string"}, "description": "subagent_id values returned by sandbox_subagent."},
+                            "mode": {"type": "string", "enum": ["any", "all"], "description": "any: return on first change; all: wait for every task (default all)."},
+                            "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 60000, "description": "Max wait in ms (default 30000)."},
+                            "after_event_seq": {"type": "integer", "minimum": 0, "description": "Return only events after this seq."},
+                        },
+                        "required": ["subagent_ids"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_subagent_cancel",
+                    "description": "Request cancellation of a running/queued sub-agent task. The task only reports cancelled after the worker confirms; while cancelling the snapshot may still show running.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subagent_id": {"type": "string", "description": "The subagent_id returned by sandbox_subagent."},
+                        },
+                        "required": ["subagent_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_subagent_retry",
+                    "description": "Re-queue a sub-agent task as a new attempt (new job). scope=same keeps the original spec; scope=scoped lets you pass a narrower prompt_override (e.g. after partial/timeout). Old attempts stay in history.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subagent_id": {"type": "string", "description": "The subagent_id returned by sandbox_subagent."},
+                            "scope": {"type": "string", "enum": ["same", "scoped"], "description": "same keeps original spec; scoped allows prompt_override."},
+                            "prompt_override": {"type": "string", "description": "New narrower prompt for scope=scoped retries."},
+                            "note": {"type": "string", "description": "Optional reason for the retry."},
+                        },
+                        "required": ["subagent_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "sandbox_skill_list",
                     "description": "List the official LearnGraph skills (key, category, description) available for sandbox workflows.",
                     "parameters": {
@@ -4190,7 +4241,16 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             if name == "sandbox_subagent":
                 return self.toolkit_subagent(SandboxAgentSubagentRequest.model_validate(payload))
             if name == "sandbox_subagent_status":
-                return self.toolkit_subagent_status(payload)
+                return self.toolkit_subagent_status(SandboxAgentSubagentStatusRequest.model_validate(payload))
+            if name == "sandbox_subagent_wait":
+                from app.domain.schemas.sandbox import SandboxAgentSubagentWaitRequest
+                return self.toolkit_subagent_wait(SandboxAgentSubagentWaitRequest.model_validate(payload))
+            if name == "sandbox_subagent_cancel":
+                from app.domain.schemas.sandbox import SandboxAgentSubagentCancelRequest
+                return self.toolkit_subagent_cancel(SandboxAgentSubagentCancelRequest.model_validate(payload))
+            if name == "sandbox_subagent_retry":
+                from app.domain.schemas.sandbox import SandboxAgentSubagentRetryRequest
+                return self.toolkit_subagent_retry(SandboxAgentSubagentRetryRequest.model_validate(payload))
             if name == "sandbox_skill_list":
                 return self.toolkit_skill_list(SandboxAgentSkillListRequest.model_validate(payload))
             if name == "sandbox_skill_read":

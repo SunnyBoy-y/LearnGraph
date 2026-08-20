@@ -18,6 +18,11 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileView,
     SandboxAgentFileWriteRequest,
     SandboxAgentFileAppendRequest,
+    SandboxAgentSubagentCancelRequest,
+    SandboxAgentSubagentRetryRequest,
+    SandboxAgentTaskEventView,
+    SandboxAgentTaskListResponse,
+    SandboxAgentTaskView,
     SandboxAgentFileEditRequest,
     SandboxAgentEnvironmentRequest,
     SandboxAgentImagePublishRequest,
@@ -457,6 +462,189 @@ def get_sandbox_job(
     return SandboxJobView.model_validate(job)
 
 
+def _agent_task_view(task: Any) -> SandboxAgentTaskView:
+    return SandboxAgentTaskView(
+        id=task.id,
+        task_id=task.task_id,
+        plan_id=task.plan_id,
+        chat_session_id=task.chat_session_id,
+        title=task.title,
+        role_key=task.role_key,
+        status=task.status,
+        status_reason=task.status_reason,
+        spec_json=task.spec_json or {},
+        latest_job_id=task.latest_job_id,
+        attempts=task.attempts_json or [],
+        deliverables=task.deliverables_json,
+        result_text=task.result_text,
+        event_seq=task.event_seq,
+        started_at=task.started_at,
+        finished_at=task.finished_at,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+@router.get("/agent-tasks", response_model=SandboxAgentTaskListResponse)
+def list_agent_tasks(
+    chat_session_id: str | None = Query(default=None),
+    plan_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: DB = None,
+    context: CurrentWorkspace = None,
+    settings: AppSettings = None,
+) -> SandboxAgentTaskListResponse:
+    """List durable sub-agent tasks for the current workspace (panel snapshot)."""
+    require_agent_sandbox_permission(context)
+    from sqlalchemy import select
+
+    from app.domain.models import SandboxAgentTask
+
+    conditions = [
+        SandboxAgentTask.workspace_id == context.workspace_id,
+        SandboxAgentTask.owner_user_id == context.principal.user_id,
+    ]
+    if chat_session_id:
+        conditions.append(SandboxAgentTask.chat_session_id == chat_session_id)
+    if plan_id:
+        conditions.append(SandboxAgentTask.plan_id == plan_id)
+    if status:
+        conditions.append(SandboxAgentTask.status == status.upper())
+    rows = db.scalars(
+        select(SandboxAgentTask)
+        .where(*conditions)
+        .order_by(SandboxAgentTask.created_at.desc())
+        .limit(limit)
+    ).all()
+    return SandboxAgentTaskListResponse(tasks=[_agent_task_view(t) for t in rows])
+
+
+@router.get("/agent-tasks/{task_id}", response_model=SandboxAgentTaskView)
+def get_agent_task(
+    task_id: str,
+    db: DB = None,
+    context: CurrentWorkspace = None,
+    settings: AppSettings = None,
+) -> SandboxAgentTaskView:
+    """Single durable sub-agent task detail."""
+    require_agent_sandbox_permission(context)
+    from sqlalchemy import select
+
+    from app.domain.models import SandboxAgentTask
+
+    task = db.scalar(
+        select(SandboxAgentTask).where(
+            SandboxAgentTask.workspace_id == context.workspace_id,
+            SandboxAgentTask.owner_user_id == context.principal.user_id,
+            SandboxAgentTask.task_id == task_id,
+        )
+    )
+    if task is None:
+        raise AppError(404, "sandbox_agent_task_not_found", "Sub-agent task was not found")
+    return _agent_task_view(task)
+
+
+@router.get("/agent-tasks/{task_id}/events", response_model=list[SandboxAgentTaskEventView])
+def list_agent_task_events(
+    task_id: str,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: DB = None,
+    context: CurrentWorkspace = None,
+    settings: AppSettings = None,
+) -> list[SandboxAgentTaskEventView]:
+    """Incremental lifecycle events for a sub-agent task (idempotent replay)."""
+    require_agent_sandbox_permission(context)
+    from sqlalchemy import select
+
+    from app.domain.models import SandboxAgentEvent, SandboxAgentTask
+
+    task = db.scalar(
+        select(SandboxAgentTask).where(
+            SandboxAgentTask.workspace_id == context.workspace_id,
+            SandboxAgentTask.owner_user_id == context.principal.user_id,
+            SandboxAgentTask.task_id == task_id,
+        )
+    )
+    if task is None:
+        raise AppError(404, "sandbox_agent_task_not_found", "Sub-agent task was not found")
+    rows = db.scalars(
+        select(SandboxAgentEvent)
+        .where(SandboxAgentEvent.task_id == task.id, SandboxAgentEvent.seq > after_seq)
+        .order_by(SandboxAgentEvent.seq.asc())
+        .limit(limit)
+    ).all()
+    return [
+        SandboxAgentTaskEventView(
+            seq=e.seq, event_type=e.event_type, payload=e.payload or {}, created_at=e.created_at
+        )
+        for e in rows
+    ]
+
+
+@router.post("/agent-tasks/{task_id}/cancel", response_model=SandboxAgentTaskView)
+def cancel_agent_task(
+    task_id: str,
+    db: DB = None,
+    context: CurrentWorkspace = None,
+    settings: AppSettings = None,
+) -> SandboxAgentTaskView:
+    """Request cancellation of a queued/running sub-agent task."""
+    require_agent_sandbox_permission(context)
+    service = SandboxAgentWorkspaceService(db, context.workspace_id, context.principal.user_id, settings)
+    snapshot = service.toolkit_subagent_cancel(
+        SandboxAgentSubagentCancelRequest(chat_session_id="", subagent_id=task_id)
+    )
+    from app.domain.models import SandboxAgentTask
+
+    task = db.scalar(
+        select_sandbox_task(db, context, task_id)
+    )
+    return _agent_task_view(task)
+
+
+@router.post("/agent-tasks/{task_id}/retry", response_model=SandboxAgentTaskView)
+def retry_agent_task(
+    task_id: str,
+    payload: SandboxAgentSubagentRetryRequest,
+    db: DB = None,
+    context: CurrentWorkspace = None,
+    settings: AppSettings = None,
+) -> SandboxAgentTaskView:
+    """Re-queue a sub-agent task as a new attempt."""
+    require_agent_sandbox_permission(context)
+    service = SandboxAgentWorkspaceService(db, context.workspace_id, context.principal.user_id, settings)
+    snapshot = service.toolkit_subagent_retry(
+        SandboxAgentSubagentRetryRequest(
+            chat_session_id=payload.chat_session_id or "",
+            subagent_id=task_id,
+            scope=payload.scope,
+            note=payload.note,
+            prompt_override=payload.prompt_override,
+        )
+    )
+    from app.domain.models import SandboxAgentTask
+
+    task = db.scalar(select_sandbox_task(db, context, task_id))
+    return _agent_task_view(task)
+
+
+def select_sandbox_task(db, context, task_id: str):
+    from sqlalchemy import select
+
+    from app.domain.models import SandboxAgentTask
+
+    return (
+        select(SandboxAgentTask)
+        .where(
+            SandboxAgentTask.workspace_id == context.workspace_id,
+            SandboxAgentTask.owner_user_id == context.principal.user_id,
+            SandboxAgentTask.task_id == task_id,
+        )
+    )
+
+
 @router.get("/jobs/{job_id}/stream")
 async def stream_sandbox_job(
     job_id: str,
@@ -479,15 +667,18 @@ async def stream_sandbox_job(
     from app.core.database import SessionLocal
     from app.services.sandbox_scheduler import SandboxSchedulerService
 
-    TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
+    TERMINAL = {"SUCCEEDED", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "EXPIRED", "INTERRUPTED"}
     _JOB_SSE_TYPES = {
         "QUEUED": "queued",
         "STARTING": "starting",
         "RUNNING": "running",
         "SUCCEEDED": "succeeded",
+        "PARTIAL": "partial",
         "FAILED": "failed",
+        "TIMED_OUT": "timed_out",
         "CANCELLED": "cancelled",
         "EXPIRED": "expired",
+        "INTERRUPTED": "interrupted",
     }
 
     def _load_job():

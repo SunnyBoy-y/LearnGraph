@@ -3964,7 +3964,7 @@ class ChatService:
             part_type = str(summary.get("type") or "sandbox_status")
             data = summary.get("data") if isinstance(summary.get("data"), dict) else summary
             status = str(summary.get("status") or (data.get("phase") if isinstance(data, dict) else None) or "completed")
-            if part_type != "sandbox_status":
+            if part_type not in {"sandbox_status", "subagent_task"}:
                 part_type = "sandbox_status"
             # Sub-agent lifecycle statuses must survive normalization. The outer
             # MessagePart state only has 4 values, so queued/running map to
@@ -3972,13 +3972,15 @@ class ChatService:
             # the real status stays in data.status for the frontend part
             # renderer (partial/timed_out/cancelled are NOT collapsed to
             # completed, fixing the old "max rounds yet completed" lie).
-            if part_type == "sandbox_status" and isinstance(data, dict) and data.get("subagent_id"):
+            if part_type == "subagent_task" or (
+                part_type == "sandbox_status" and isinstance(data, dict) and data.get("subagent_id")
+            ):
                 real = status.lower()
                 if real == "failed":
                     normalized_status = "failed"
                 elif real in {"completed", "partial", "timed_out", "cancelled"}:
                     normalized_status = "completed"
-                else:  # queued / running / queued…
+                else:  # queued / running / …
                     normalized_status = "streaming"
             else:
                 normalized_status = status if status in {"completed", "failed", "streaming", "pending"} else "completed"
@@ -4073,7 +4075,7 @@ class ChatService:
                 content = f"触发了 Skill · {data.get('skill_name') or data.get('skill_key')}"
             elif part_type == "sandbox_artifact":
                 content = str(data.get("title") or data.get("path") or "沙箱产物")
-            elif part_type == "sandbox_status":
+            elif part_type in {"sandbox_status", "subagent_task"}:
                 content = str(data.get("message_zh") or data.get("phase") or "沙箱执行")
             elif part_type == "fetch_authorization":
                 content = str(data.get("message_zh") or "网页抓取需要授权")
@@ -4609,6 +4611,42 @@ class ChatService:
         arbitrary network endpoint.  Search results are returned only through
         the already scoped SearchProvider and are recorded as source parts.
         """
+
+        # ── sandbox_subagent_wait: inline sliced wait (never occupies the
+        #    single-worker agent tool executor). Each slice is at most 5s on the
+        #    coordinator; the toolkit returns retry_after_ms so the model calls
+        #    again instead of busy-polling. Waiting blocks only this chat's SSE
+        #    stream, never other chats' tool execution. ──
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        if function.get("name") == "sandbox_subagent_wait":
+            raw = function.get("arguments")
+            try:
+                wait_args = json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+            except json.JSONDecodeError:
+                wait_args = {}
+            if isinstance(wait_args, dict):
+                try:
+                    max_slice = max(1000, min(int(wait_args.get("timeout_ms") or 30000), 5000))
+                except (TypeError, ValueError):
+                    max_slice = 5000
+                wait_args["timeout_ms"] = max_slice
+                patched_call = dict(tool_call)
+                patched_call["function"] = {
+                    **function,
+                    "arguments": json.dumps(wait_args, ensure_ascii=False),
+                }
+                runtime = self.agent_tool_runtime
+                if runtime is not None:
+                    return runtime.execute(
+                        patched_call,
+                        allowed_domains=allowed_domains,
+                        chat_session_id=chat_session_id,
+                        assistant_message_id=assistant_message_id,
+                        assistant_version_id=assistant_version_id,
+                        source_message_id=source_message_id,
+                        model_supports_image_input=self._agent_model_supports_image_input(),
+                        disclosed_tool_names=disclosed_tool_names or set(),
+                    )
 
         if self.agent_tool_runtime is not None:
             if not chat_session_id:

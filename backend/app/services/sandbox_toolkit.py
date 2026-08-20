@@ -601,82 +601,297 @@ class SandboxToolkitMixin:
             },
         }
 
-    # ── sandbox_subagent ─────────────────────────────────────────────────────
+    # ── sandbox_subagent (v2: durable tasks via the unified scheduler) ───────
+
+    def _load_agent_task(self, subagent_id: str):
+        """Load a durable sub-agent task scoped to this workspace."""
+        from app.domain.models import SandboxAgentTask
+
+        if not isinstance(subagent_id, str) or not subagent_id:
+            raise AppError(422, "invalid_tool_arguments", "sandbox_subagent_* requires a subagent_id")
+        task = self.db.scalar(
+            select(SandboxAgentTask).where(
+                SandboxAgentTask.workspace_id == self.workspace_id,
+                SandboxAgentTask.task_id == subagent_id,
+            )
+        )
+        return task
+
+    def _agent_task_snapshot(self, task: Any, *, include_events: bool = False, after_seq: int | None = None) -> dict[str, Any]:
+        from app.domain.models import SandboxAgentEvent
+
+        latest = (task.attempts_json or [])[-1] if (task.attempts_json or []) else {}
+        result: dict[str, Any] = {
+            "subagent_id": task.task_id,
+            "task_id": task.task_id,
+            "title": task.title,
+            "role_key": task.role_key,
+            "status": task.status.lower(),
+            "status_reason": task.status_reason,
+            "error_class": latest.get("error_class"),
+            "error_message": latest.get("error_message"),
+            "rounds": latest.get("rounds", 0),
+            "tool_calls": latest.get("tool_calls", 0),
+            "result": task.result_text,
+            "deliverables": task.deliverables_json,
+            "event_seq": task.event_seq,
+            "latest_job_id": task.latest_job_id,
+        }
+        if include_events and after_seq is not None:
+            rows = self.db.scalars(
+                select(SandboxAgentEvent)
+                .where(
+                    SandboxAgentEvent.task_id == task.id,
+                    SandboxAgentEvent.seq > after_seq,
+                )
+                .order_by(SandboxAgentEvent.seq.asc())
+                .limit(20)
+            ).all()
+            result["events"] = [
+                {"seq": e.seq, "event_type": e.event_type, "payload": e.payload or {}}
+                for e in rows
+            ]
+        result["summary"] = {
+            "type": "subagent_task",
+            "status": task.status.lower(),
+            "data": {
+                "phase": task.status.lower(),
+                "status": task.status.lower(),
+                "task_id": task.task_id,
+                "title": task.title,
+                "role_key": task.role_key,
+                "status_reason": task.status_reason,
+                "chat_session_id": task.chat_session_id,
+            },
+        }
+        return result
+
+    def _subagent_budget_payload(self, payload: Any) -> dict[str, Any]:
+        return {
+            "max_rounds": min(payload.max_rounds, self.settings.sandbox_subagent_max_rounds),
+            "max_seconds": payload.max_seconds or self.settings.sandbox_subagent_max_seconds,
+            "max_tool_calls": payload.max_tool_calls,
+            "max_tokens": payload.max_tokens or self.settings.sandbox_subagent_default_max_tokens,
+            "max_cost_usd": (
+                payload.max_cost_usd
+                if payload.max_cost_usd is not None
+                else self.settings.sandbox_subagent_default_max_cost_usd
+            ),
+        }
 
     def toolkit_subagent(self, payload: SandboxAgentSubagentRequest) -> dict[str, Any]:
         if not self.settings.sandbox_subagent_enabled:
             raise AppError(503, "sandbox_subagent_disabled", "Sandbox sub-agents are disabled by configuration")
-        from app.services.sandbox_subagent import SubagentRegistry, SubagentSpec
+        from app.domain.models import SandboxAgentTask
+        from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
-        subagent_id = new_id()[:20]
-        spec = SubagentSpec(
-            subagent_id=subagent_id,
+        title = payload.title or "子代理任务"
+        task = SandboxAgentTask(
             workspace_id=self.workspace_id,
-            actor_id=self.actor_id,
+            owner_user_id=self.actor_id,
+            task_id=f"sa_{new_id()[:16]}",
             chat_session_id=payload.chat_session_id,
-            prompt=payload.prompt,
-            tools=payload.tools,
-            max_rounds=min(payload.max_rounds, self.settings.sandbox_subagent_max_rounds),
-            max_seconds=self.settings.sandbox_subagent_max_seconds,
             sandbox_session_id=payload.sandbox_session_id,
-            write_set=tuple(payload.write_set) if payload.write_set else None,
-            max_tool_calls=payload.max_tool_calls,
+            title=title,
+            role_key=payload.role_key or "generic",
+            status="QUEUED",
+            spec_json={
+                "objective": payload.prompt,
+                "input_snapshot": None,
+                "constraints": [],
+                "read_set": [],
+                "write_set": payload.write_set or [],
+                "tool_profile": payload.tools or [],
+                "skill_profile": payload.skills or [],
+                "budget": self._subagent_budget_payload(payload),
+                "output_contract": payload.output_contract or {},
+            },
         )
-        SubagentRegistry.instance().start(spec)
+        self.db.add(task)
+        self.db.commit()
+        self.db.refresh(task)
+        scheduler = SandboxSchedulerService(self.db, self.settings)
+        job = scheduler.submit_job(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            chat_session_id=payload.chat_session_id,
+            kind="subagent",
+            payload={
+                "task_id": task.id,
+                "task_title": title,
+                "role_key": task.role_key,
+                "prompt": payload.prompt,
+                "tools": payload.tools,
+                "write_set": payload.write_set,
+                "budget": self._subagent_budget_payload(payload),
+                "sandbox_session_id": payload.sandbox_session_id,
+            },
+            idempotency_key=f"subagent:{task.id}:v1",
+            deadline_seconds=self.settings.sandbox_subagent_queue_deadline_seconds,
+        )
+        task.latest_job_id = job.id
+        append_agent_event(
+            self.db,
+            task,
+            "created",
+            {
+                "task_id": task.task_id,
+                "title": title,
+                "role_key": task.role_key,
+                "chat_session_id": task.chat_session_id,
+            },
+        )
+        append_agent_event(self.db, task, "queued", {"job_id": job.id})
+        self.db.commit()
         return {
-            "subagent_id": subagent_id,
+            "subagent_id": task.task_id,
+            "task_id": task.task_id,
+            "job_id": job.id,
             "status": "queued",
             "sandbox_session_id": payload.sandbox_session_id,
             "summary": {
-                "type": "sandbox_status",
+                "type": "subagent_task",
                 "status": "queued",
                 "data": {
                     "phase": "queued",
-                    "subagent_id": subagent_id,
+                    "task_id": task.task_id,
+                    "title": title,
+                    "role_key": task.role_key,
                     "chat_session_id": payload.chat_session_id,
+                    "message_zh": "子代理任务已排队，资源可用后自动开始。",
                 },
             },
         }
 
-    def toolkit_subagent_status(self, payload: Any) -> dict[str, Any]:
+    def toolkit_subagent_status(self, payload: SandboxAgentSubagentStatusRequest) -> dict[str, Any]:
         from app.services.sandbox_subagent import SubagentRegistry
 
-        subagent_id = (
-            payload.get("subagent_id")
-            if isinstance(payload, dict)
-            else getattr(payload, "subagent_id", None)
-        )
-        if not isinstance(subagent_id, str) or not subagent_id:
-            raise AppError(422, "invalid_tool_arguments", "sandbox_subagent_status requires a subagent_id")
-        job = SubagentRegistry.instance().get(subagent_id)
-        if job is None:
-            raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
-        return {
-            "subagent_id": job.spec.subagent_id,
-            "status": job.status,
-            "error_class": job.error_class,
-            "error_message": job.error_message,
-            "rounds": job.rounds,
-            "tool_calls": job.tool_calls,
-            "duration_ms": job.duration_ms,
-            "started_at": job.started_at,
-            "finished_at": job.finished_at,
-            "result": job.result,
-            "result_complete": job.status == "completed",
-            "summary": {
-                "type": "subagent_task",
+        task = self._load_agent_task(payload.subagent_id)
+        if task is None:
+            # v1 in-process registry compatibility path (legacy tasks only).
+            job = SubagentRegistry.instance().get(payload.subagent_id)
+            if job is None:
+                raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
+            return {
+                "subagent_id": job.spec.subagent_id,
                 "status": job.status,
-                "data": {
-                    "phase": job.status,
-                    "subagent_id": job.spec.subagent_id,
-                    "title": "子代理任务",
-                    "role_key": "generic",
-                    "rounds": job.rounds,
-                    "error_class": job.error_class,
-                    "error_message": job.error_message,
+                "error_class": job.error_class,
+                "error_message": job.error_message,
+                "rounds": job.rounds,
+                "tool_calls": job.tool_calls,
+                "result": job.result,
+                "result_complete": job.status == "completed",
+                "summary": {
+                    "type": "subagent_task",
+                    "status": job.status,
+                    "data": {
+                        "phase": job.status,
+                        "task_id": job.spec.subagent_id,
+                        "title": "子代理任务",
+                        "role_key": "generic",
+                    },
                 },
+            }
+        return self._agent_task_snapshot(
+            task, include_events=True, after_seq=payload.after_event_seq
+        )
+
+    def toolkit_subagent_wait(self, payload: SandboxAgentSubagentWaitRequest) -> dict[str, Any]:
+        """Synchronous bounded wait (fallback path; chat.py uses the async branch).
+
+        Returns task snapshots plus ``retry_after_ms`` — never busy-polls the
+        model, never blocks beyond ``timeout_ms``.
+        """
+        terminal = {"SUCCEEDED", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"}
+        deadline = time.monotonic() + (payload.timeout_ms / 1000)
+        while True:
+            tasks = []
+            for sid in payload.subagent_ids:
+                task = self._load_agent_task(sid)
+                if task is not None:
+                    tasks.append(task)
+            done = [t for t in tasks if t.status in terminal]
+            changed = [t for t in tasks if t.event_seq > (payload.after_event_seq or 0)]
+            if payload.mode == "any":
+                if done or changed:
+                    return {
+                        "tasks": [self._agent_task_snapshot(t) for t in tasks],
+                        "retry_after_ms": 0,
+                    }
+            else:  # all
+                if len(tasks) == len(payload.subagent_ids) and len(done) == len(tasks):
+                    return {
+                        "tasks": [self._agent_task_snapshot(t) for t in tasks],
+                        "retry_after_ms": 0,
+                    }
+            if time.monotonic() >= deadline:
+                return {
+                    "tasks": [self._agent_task_snapshot(t) for t in tasks],
+                    "retry_after_ms": 2500,
+                    "timed_out": True,
+                }
+            time.sleep(0.4)
+
+    def toolkit_subagent_cancel(self, payload: SandboxAgentSubagentCancelRequest) -> dict[str, Any]:
+        from app.services.sandbox_scheduler import SandboxSchedulerService
+
+        task = self._load_agent_task(payload.subagent_id)
+        if task is None:
+            raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
+        if task.latest_job_id:
+            scheduler = SandboxSchedulerService(self.db, self.settings)
+            try:
+                job = scheduler.get_job(
+                    task.latest_job_id,
+                    workspace_id=self.workspace_id,
+                    owner_user_id=self.actor_id,
+                )
+                scheduler.cancel_job(job)
+            except AppError:
+                pass  # job already gone; the task snapshot carries the outcome
+        return self._agent_task_snapshot(task)
+
+    def toolkit_subagent_retry(self, payload: SandboxAgentSubagentRetryRequest) -> dict[str, Any]:
+        from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
+
+        task = self._load_agent_task(payload.subagent_id)
+        if task is None:
+            raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
+        spec = task.spec_json or {}
+        budget = spec.get("budget") or {}
+        prompt = payload.prompt_override or spec.get("objective") or ""
+        attempt_no = len(task.attempts_json or []) + 2
+        scheduler = SandboxSchedulerService(self.db, self.settings)
+        job = scheduler.submit_job(
+            workspace_id=self.workspace_id,
+            owner_user_id=self.actor_id,
+            chat_session_id=task.chat_session_id,
+            kind="subagent",
+            payload={
+                "task_id": task.id,
+                "task_title": task.title,
+                "role_key": task.role_key,
+                "prompt": prompt,
+                "tools": spec.get("tool_profile"),
+                "write_set": spec.get("write_set"),
+                "budget": budget,
+                "sandbox_session_id": task.sandbox_session_id,
             },
-        }
+            idempotency_key=f"subagent:{task.id}:v{attempt_no}",
+            deadline_seconds=self.settings.sandbox_subagent_queue_deadline_seconds,
+        )
+        task.latest_job_id = job.id
+        task.status = "QUEUED"
+        task.status_reason = None
+        append_agent_event(
+            self.db,
+            task,
+            "retry_scheduled",
+            {"attempt": attempt_no, "scope": payload.scope, "note": payload.note[:200]},
+        )
+        self.db.commit()
+        return self._agent_task_snapshot(task)
+
 
     # ── sandbox_skill_list / sandbox_skill_read ──────────────────────────────
 
