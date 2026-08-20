@@ -193,8 +193,10 @@ def _egress_policy_digest() -> str:
 def _fetch_headers() -> dict[str, str]:
     # Only benign request headers; the egress policy digest is NOT sent to the
     # origin — it rides the proxy's CONNECT headers instead (see web_fetch).
+    # application/json is included so JSON API endpoints (GitHub et al.) do
+    # not reject the request with 415 on their strict Accept negotiation.
     return {
-        "Accept": "text/html,application/xhtml+xml,text/plain,text/markdown",
+        "Accept": "text/html,application/xhtml+xml,text/plain,text/markdown,application/json",
         "User-Agent": WEB_FETCH_USER_AGENT,
     }
 

@@ -907,28 +907,48 @@ class DockerRuntimeBackend:
             except Exception:  # noqa: BLE001
                 pid = None
             frames: list[tuple[int, bytes]] = []
+            process_done = threading.Event()
 
             def _read_all() -> None:
                 while True:
                     frame = self._read_frame(socket)
                     if frame is None:
-                        return
+                        # docker-py>=7.2's SocketIO returns empty reads while
+                        # the exec is still producing output (non-blocking), so
+                        # an empty read is NOT an EOF by itself. Only stop when
+                        # the process has actually finished (polled by the main
+                        # thread) AND the stream is drained.
+                        if process_done.is_set():
+                            return
+                        time.sleep(0.02)
+                        continue
                     frames.append(frame)
 
             reader = threading.Thread(target=_read_all, daemon=True)
             reader.start()
-            reader.join(timeout=max(0.1, deadline - time.monotonic()))
-            if reader.is_alive():
-                timed_out = True
-            else:
-                for stream_type, payload in frames:
-                    if stream_type == 1:
-                        stdout.extend(payload)
-                    elif stream_type == 2:
-                        stderr.extend(payload)
-                    if len(stdout) + len(stderr) > output_limit:
-                        truncated = True
-                        break
+            # Wait for the process to finish (poll exec_inspect), not for the
+            # stream: the SocketIO can sit empty while output is still coming,
+            # and waiting on the reader alone would either truncate output or
+            # falsely report a timeout.
+            while time.monotonic() < deadline:
+                try:
+                    inspect = client.api.exec_inspect(exec_id)
+                except Exception:  # noqa: BLE001
+                    inspect = {}
+                if not inspect.get("Running", True):
+                    break
+                time.sleep(0.05)
+            timed_out = time.monotonic() >= deadline
+            process_done.set()
+            reader.join(timeout=2.0)
+            for stream_type, payload in frames:
+                if stream_type == 1:
+                    stdout.extend(payload)
+                elif stream_type == 2:
+                    stderr.extend(payload)
+                if len(stdout) + len(stderr) > output_limit:
+                    truncated = True
+                    break
         except Exception as exc:  # noqa: BLE001
             raise DockerRuntimeError(f"failed to stream exec output: {type(exc).__name__}") from exc
         finally:
