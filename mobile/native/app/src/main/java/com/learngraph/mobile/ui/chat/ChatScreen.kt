@@ -56,6 +56,7 @@ import com.learngraph.mobile.web.EmbeddedBrowserActivity
 fun ChatScreen(
     vm: ChatViewModel,
     onBack: () -> Unit,
+    onOpenWeb: () -> Unit,
 ) {
     val messages by vm.messages.collectAsState()
     val loading by vm.loading.collectAsState()
@@ -66,9 +67,8 @@ fun ChatScreen(
     val app = context.applicationContext as LearnGraphApp
     var input by rememberSaveable { mutableStateOf("") }
 
-    val openWeb = {
-        EmbeddedBrowserActivity.open(context, app.api.baseUrl)
-    }
+    // 内嵌浏览器打开外链
+    val openExternal = { url: String -> EmbeddedBrowserActivity.open(context, url) }
 
     // 新消息/流式更新时自动滚到底部
     LaunchedEffect(messages.size, sending) {
@@ -88,8 +88,8 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    TextButton(onClick = openWeb) {
-                        Text("网页版", style = MaterialTheme.typography.labelLarge)
+                    TextButton(onClick = onOpenWeb) {
+                        Text("全部功能", style = MaterialTheme.typography.labelLarge)
                     }
                 },
                 modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars),
@@ -171,8 +171,8 @@ fun ChatScreen(
                             MessageBubble(
                                 message = msg,
                                 baseUrl = app.api.baseUrl,
-                                onLinkClick = { url -> EmbeddedBrowserActivity.open(context, url) },
-                                onOpenWeb = openWeb,
+                                onLinkClick = openExternal,
+                                onOpenWeb = onOpenWeb,
                                 onRetry = if (msg.status == "failed") {
                                     { vm.retry(msg.id) }
                                 } else {

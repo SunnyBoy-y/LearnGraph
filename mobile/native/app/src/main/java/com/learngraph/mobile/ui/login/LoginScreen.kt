@@ -33,9 +33,10 @@ import java.util.UUID
 
 /**
  * 登录页：账号密码认证，成功后写入 AuthStore 并进入会话列表。
+ * 未注册账号可跳转注册页（服务器开启注册时）。
  */
 @Composable
-fun LoginScreen(onLoggedIn: () -> Unit) {
+fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
     val app = LocalContext.current.applicationContext as LearnGraphApp
     val scope = rememberCoroutineScope()
 
@@ -134,6 +135,14 @@ fun LoginScreen(onLoggedIn: () -> Unit) {
             } else {
                 Text("登录")
             }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        androidx.compose.material3.TextButton(
+            onClick = onRegister,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("没有账号？注册新账号")
         }
     }
 }

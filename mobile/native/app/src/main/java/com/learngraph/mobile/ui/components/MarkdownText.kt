@@ -39,11 +39,12 @@ fun MarkdownText(
     markdown: String,
     onLinkClick: (String) -> Unit,
     modifier: Modifier = Modifier,
+    baseColor: androidx.compose.ui.graphics.Color? = null,
 ) {
     val blocks = remember(markdown) { splitBlocks(markdown) }
     val codeBg = MaterialTheme.colorScheme.surfaceVariant
     val codeColor = MaterialTheme.colorScheme.onSurfaceVariant
-    val titleColor = MaterialTheme.colorScheme.onSurface
+    val titleColor = baseColor ?: MaterialTheme.colorScheme.onSurface
 
     Column(modifier = modifier) {
         blocks.forEach { block ->
@@ -61,7 +62,7 @@ fun MarkdownText(
                     )
                     Spacer(Modifier.height(6.dp))
                 }
-                is Block.Line -> renderLine(block, onLinkClick, titleColor)
+                is Block.Line -> renderLine(block, onLinkClick, titleColor, baseColor)
             }
         }
     }
@@ -120,7 +121,12 @@ private fun splitBlocks(markdown: String): List<Block> {
 }
 
 @Composable
-private fun renderLine(block: Block.Line, onLinkClick: (String) -> Unit, titleColor: androidx.compose.ui.graphics.Color) {
+private fun renderLine(
+    block: Block.Line,
+    onLinkClick: (String) -> Unit,
+    titleColor: androidx.compose.ui.graphics.Color,
+    baseColor: androidx.compose.ui.graphics.Color? = null,
+) {
     if (block.text.isBlank()) {
         Spacer(Modifier.height(4.dp))
         return
@@ -137,11 +143,12 @@ private fun renderLine(block: Block.Line, onLinkClick: (String) -> Unit, titleCo
         LineKind.TABLE -> MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
         LineKind.NORMAL -> MaterialTheme.typography.bodyMedium
     }
+    val textColor = baseColor ?: style.color
     val linkColor = MaterialTheme.colorScheme.primary
-    val annotated = remember(block.text) { buildInline(block.text, style.toSpanStyle(), linkColor, onLinkClick) }
+    val annotated = remember(block.text) { buildInline(block.text, style.toSpanStyle().copy(color = textColor), linkColor, onLinkClick) }
     Text(
         text = annotated,
-        style = style,
+        style = style.copy(color = textColor),
         modifier = Modifier.padding(top = if (block.kind == LineKind.H1 || block.kind == LineKind.H2) 4.dp else 0.dp),
     )
 }

@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -25,6 +26,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -34,6 +37,8 @@ import androidx.compose.ui.unit.dp
 import com.learngraph.mobile.data.Message
 import com.learngraph.mobile.data.MessagePart
 import com.learngraph.mobile.ui.components.MarkdownText
+import com.learngraph.mobile.ui.theme.BrandBlue
+import com.learngraph.mobile.ui.theme.BrandViolet
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
@@ -57,39 +62,66 @@ fun MessageBubble(
     modifier: Modifier = Modifier,
 ) {
     val isUser = message.role == "user"
-    val bubbleColor = if (isUser) {
-        MaterialTheme.colorScheme.primaryContainer
-    } else {
-        MaterialTheme.colorScheme.surfaceVariant
-    }
     val shape = RoundedCornerShape(
-        topStart = if (isUser) 16.dp else 4.dp,
-        topEnd = if (isUser) 4.dp else 16.dp,
-        bottomStart = 16.dp,
-        bottomEnd = 16.dp,
+        topStart = if (isUser) 18.dp else 4.dp,
+        topEnd = if (isUser) 4.dp else 18.dp,
+        bottomStart = 18.dp,
+        bottomEnd = 18.dp,
     )
 
-    Column(
+    Row(
         modifier = modifier.fillMaxWidth(),
-        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start,
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
+        verticalAlignment = Alignment.Top,
     ) {
+        // AI 头像（LG 渐变徽标）；用户消息不带头像
+        if (!isUser) {
+            Box(
+                modifier = Modifier
+                    .padding(top = 2.dp)
+                    .size(26.dp)
+                    .clip(CircleShape)
+                    .background(Brush.linearGradient(listOf(BrandBlue, BrandViolet))),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "LG",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+        }
+
         Box(
             modifier = Modifier
-                .fillMaxWidth(if (isUser) 0.85f else 0.95f)
+                .fillMaxWidth(if (isUser) 0.82f else 0.9f)
                 .clip(shape)
-                .background(bubbleColor)
+                .background(
+                    if (isUser) {
+                        Brush.linearGradient(listOf(BrandBlue, BrandViolet))
+                    } else {
+                        Brush.linearGradient(listOf(MaterialTheme.colorScheme.surface, MaterialTheme.colorScheme.surfaceVariant))
+                    },
+                )
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         ) {
             Column {
                 if (message.parts.isEmpty()) {
                     if (message.content.isNotBlank()) {
-                        Text(message.content, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            message.content,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (isUser) Color.White else MaterialTheme.colorScheme.onSurface,
+                        )
                     }
                 } else {
                     message.parts.forEach { part ->
                         PartView(
                             part = part,
                             baseUrl = baseUrl,
+                            isUser = isUser,
                             onLinkClick = onLinkClick,
                             onOpenWeb = onOpenWeb,
                         )
@@ -110,14 +142,15 @@ fun MessageBubble(
                 }
             }
         }
-        Spacer(Modifier.height(8.dp))
     }
+    Spacer(Modifier.height(8.dp))
 }
 
 @Composable
 private fun PartView(
     part: MessagePart,
     baseUrl: String,
+    isUser: Boolean,
     onLinkClick: (String) -> Unit,
     onOpenWeb: () -> Unit,
 ) {
@@ -125,11 +158,23 @@ private fun PartView(
         "text" -> {
             val content = part.content ?: ""
             if (content.isNotBlank()) {
-                MarkdownText(content, onLinkClick = onLinkClick)
+                MarkdownText(
+                    content,
+                    onLinkClick = onLinkClick,
+                    baseColor = if (isUser) Color.White else null,
+                )
+                // 流式光标：正在生成的文本尾部显示输入光标
+                if (part.status == "streaming") {
+                    Text(
+                        text = "▍",
+                        color = if (isUser) Color.White else MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
         }
         "reasoning_summary", "reasoning_content" -> ReasoningCard(part)
-        "tool_call", "agent_step" -> ToolStepRow(part)
+        "tool_call", "agent_step" -> ToolStepRow(part, isUser)
         "source_list" -> SourceListCard(part, onLinkClick)
         "attachment", "selection_quote", "document_selection" -> QuoteCard(part)
         "image" -> ImagePart(part, baseUrl)
@@ -190,7 +235,7 @@ private fun ReasoningCard(part: MessagePart) {
 }
 
 @Composable
-private fun ToolStepRow(part: MessagePart) {
+private fun ToolStepRow(part: MessagePart, isUser: Boolean = false) {
     val data = part.data
     val toolName = data?.get("name")?.jsonPrimitive?.contentOrNull
         ?: data?.get("tool_name")?.jsonPrimitive?.contentOrNull
@@ -201,6 +246,7 @@ private fun ToolStepRow(part: MessagePart) {
         "streaming", "pending" -> "…"
         else -> "·"
     }
+    val fg = if (isUser) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(
             text = icon,
@@ -208,7 +254,7 @@ private fun ToolStepRow(part: MessagePart) {
             color = when (status) {
                 "failed" -> MaterialTheme.colorScheme.error
                 "completed" -> MaterialTheme.colorScheme.primary
-                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                else -> fg
             },
         )
         Spacer(Modifier.width(6.dp))
@@ -216,7 +262,7 @@ private fun ToolStepRow(part: MessagePart) {
             text = toolName ?: (data?.get("tool")?.jsonPrimitive?.contentOrNull ?: part.type),
             style = MaterialTheme.typography.labelMedium,
             fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = fg,
             maxLines = 1,
         )
     }
