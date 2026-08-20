@@ -487,6 +487,25 @@ class Settings(BaseSettings):
     # 0 disables the cap. v1.1 transition: enforced in SubagentRegistry; the
     # unified scheduler replaces this with a four-level quota in v2.
     sandbox_subagent_max_concurrent_chat: int = 3
+
+    # ── Sub-agent v2 (durable tasks via the unified scheduler) ───────────
+    sandbox_subagent_queue_deadline_seconds: int = 900
+    sandbox_subagent_max_concurrent_user: int = 3
+    sandbox_subagent_max_concurrent_workspace: int = 4
+    sandbox_subagent_max_concurrent_chat: int = 3
+    sandbox_subagent_default_parallel: int = 2
+    sandbox_subagent_max_parallel: int = 4
+    sandbox_subagent_max_auto_retries: int = 1
+    sandbox_subagent_reserved_parent_ratio: float = 0.2
+    sandbox_subagent_events_enabled: bool = True
+    sandbox_subagent_wait_max_ms: int = 60_000
+    # Budget fallbacks when the pricing catalog has no entry for the model:
+    # max tokens (input+output) per sub-agent run and a USD cost cap.
+    sandbox_subagent_default_max_tokens: int = 60_000
+    sandbox_subagent_default_max_cost_usd: float = 0.15
+    # Sandbox workspace UID/GID pairing for cross-identity writer safety.
+    sandbox_workspace_gid: int | None = None
+    sandbox_workspace_umask: int = 0o027
     # Host-side network tools for the sandbox (search/fetch). The sandbox
     # container itself stays offline; requests go through the reviewed
     # authorization pipeline on the host.

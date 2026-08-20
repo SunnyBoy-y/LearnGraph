@@ -2017,6 +2017,70 @@ class SandboxJob(Base, TimestampMixin, WorkspaceScopedMixin):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class SandboxAgentTask(Base, TimestampMixin, WorkspaceScopedMixin):
+    """A durable sub-agent task: identity, frozen spec, latest status and the
+    structured deliverables produced by the most recent attempt.
+
+    One task row owns multiple executions; each execution is a
+    ``SandboxJob(kind="subagent")`` referenced by ``latest_job_id`` and the
+    ``attempts_json`` history. ``id`` is the stable ``subagent_id`` handed back
+    to the parent agent.
+    """
+
+    __tablename__ = "sandbox_agent_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "owner_user_id", "task_id", name="uq_sandbox_agent_task_taskid"
+        ),
+        Index("ix_sandbox_agent_tasks_chat", "chat_session_id"),
+        Index("ix_sandbox_agent_tasks_plan", "plan_id"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    task_id: Mapped[str] = mapped_column(String(64), index=True)
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    parent_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    chat_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    sandbox_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    role_key: Mapped[str] = mapped_column(String(40), default="generic")
+    status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)
+    status_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    spec_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    latest_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    attempts_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    deliverables_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_seq: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SandboxAgentEvent(Base, WorkspaceScopedMixin):
+    """Append-only lifecycle events for a sub-agent task.
+
+    Events carry a per-task monotonic ``seq`` (idempotent replay key) and drive
+    the chat SSE stream, the frontend panel and audit. ``(task_id, seq)`` is
+    unique so replays never duplicate.
+    """
+
+    __tablename__ = "sandbox_agent_events"
+    __table_args__ = (
+        UniqueConstraint("task_id", "seq", name="uq_sandbox_agent_event_seq"),
+        Index("ix_sandbox_agent_events_type", "event_type"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("sandbox_agent_tasks.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer)
+    event_type: Mapped[str] = mapped_column(String(48), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class SandboxReservation(Base, TimestampMixin, WorkspaceScopedMixin):
     """An atomic capacity reservation on a user instance for a job.
 

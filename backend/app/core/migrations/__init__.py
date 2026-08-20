@@ -239,6 +239,14 @@ def _subapp_analytics_dimensions(connection: Connection) -> None:
         )
 
 
+def _sandbox_agent_tables(connection: Connection) -> None:
+    """v1.5.0: durable sub-agent task identity and lifecycle event stream."""
+    from app.domain.models import SandboxAgentEvent, SandboxAgentTask
+
+    SandboxAgentTask.__table__.create(bind=connection, checkfirst=True)
+    SandboxAgentEvent.__table__.create(bind=connection, checkfirst=True)
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -277,6 +285,11 @@ MIGRATIONS = (
         "v1.4.0",
         "Subapp analytics dimensions, session analytics snapshot, analysis-request ledger",
         _subapp_analytics_dimensions,
+    ),
+    SchemaMigration(
+        "v1.5.0",
+        "Durable sub-agent tasks and lifecycle events",
+        _sandbox_agent_tables,
     ),
 )
 

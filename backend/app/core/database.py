@@ -572,8 +572,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via _apply_migration) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.4.0"
-CURRENT_SCHEMA_DESCRIPTION = "Subapp analytics dimensions, session analytics snapshot, analysis-request ledger"
+CURRENT_SCHEMA_REVISION = "v1.5.0"
+CURRENT_SCHEMA_DESCRIPTION = "Durable sub-agent tasks and lifecycle events"
 
 
 def _compute_schema_checksum() -> str:

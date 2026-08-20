@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.domain.models import (
+    SandboxAgentEvent,
+    SandboxAgentTask,
     SandboxInstance,
     SandboxJob,
     SandboxReservation,
@@ -53,6 +55,21 @@ SCHEDULE_BATCH = 8
 # scheduler tick; each worker uses its own DB session.
 _SCHEDULER_EXECUTOR_LOCK = threading.Lock()
 _SCHEDULER_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def append_agent_event(db: Session, task: SandboxAgentTask, event_type: str, payload: dict[str, Any]) -> None:
+    """Persist one lifecycle event with an idempotent per-task seq."""
+    seq = (task.event_seq or 0) + 1
+    db.add(
+        SandboxAgentEvent(
+            workspace_id=task.workspace_id,
+            task_id=task.id,
+            seq=seq,
+            event_type=event_type,
+            payload=payload,
+        )
+    )
+    task.event_seq = seq
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -574,6 +591,9 @@ class SandboxSchedulerService:
         if job.kind == "agent_command":
             self._execute_agent_command(job)
             return
+        if job.kind == "subagent":
+            self._execute_subagent(job)
+            return
         if job.kind == "fixed_task":
             # Fixed-task (file parsing) submissions keep their existing
             # synchronous path for now; they are not routed through the queue
@@ -587,6 +607,95 @@ class SandboxSchedulerService:
             )
             return
         raise AppError(422, "sandbox_job_kind_unsupported", f"Unsupported job kind: {job.kind}")
+
+    def _subagent_active_count(
+        self, *, workspace_id: str | None = None, owner_user_id: str | None = None, chat_session_id: str | None = None
+    ) -> int:
+        conditions = [SandboxJob.kind == "subagent", SandboxJob.status.in_(("QUEUED", "STARTING", "RUNNING"))]
+        if workspace_id is not None:
+            conditions.append(SandboxJob.workspace_id == workspace_id)
+        if owner_user_id is not None:
+            conditions.append(SandboxJob.owner_user_id == owner_user_id)
+        if chat_session_id is not None:
+            conditions.append(SandboxJob.chat_session_id == chat_session_id)
+        return int(self.db.scalar(select(func.count(SandboxJob.id)).where(*conditions)) or 0)
+
+    def _subagent_quota_exceeded(self, job: SandboxJob) -> str | None:
+        """Four-level sub-agent lane quota (chat/user/workspace/plan-adjacent)."""
+        settings = self.settings
+        if (
+            settings.sandbox_subagent_max_concurrent_chat > 0
+            and self._subagent_active_count(chat_session_id=job.chat_session_id) >= settings.sandbox_subagent_max_concurrent_chat
+        ):
+            return "subagent_chat_quota"
+        if (
+            settings.sandbox_subagent_max_concurrent_user > 0
+            and self._subagent_active_count(owner_user_id=job.owner_user_id) >= settings.sandbox_subagent_max_concurrent_user
+        ):
+            return "subagent_user_quota"
+        if (
+            settings.sandbox_subagent_max_concurrent_workspace > 0
+            and self._subagent_active_count(workspace_id=job.workspace_id) >= settings.sandbox_subagent_max_concurrent_workspace
+        ):
+            return "subagent_workspace_quota"
+        return None
+
+    def _execute_subagent(self, job: SandboxJob) -> None:
+        """Run one claimed sub-agent job through the durable executor."""
+        from app.services.sandbox_agent_executor import execute_subagent_job
+
+        payload = job.payload_json or {}
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            self._finish(job, "FAILED", "invalid_job", "subagent payload missing task_id")
+            return
+        task = self.db.get(SandboxAgentTask, task_id)
+        if task is None or task.workspace_id != job.workspace_id:
+            self._finish(job, "FAILED", "invalid_job", "subagent task not found")
+            return
+        quota_reason = self._subagent_quota_exceeded(job)
+        if quota_reason:
+            job.status = "QUEUED"
+            job.reason = quota_reason
+            job.available_at = utc_now() + timedelta(seconds=5)
+            self.db.commit()
+            return
+        job.status = "RUNNING"
+        job.started_at = utc_now()
+        task.status = "RUNNING"
+        task.latest_job_id = job.id
+        task.started_at = utc_now()
+        self.db.commit()
+
+        def _emit(event_type: str, event_payload: dict[str, Any]) -> None:
+            try:
+                append_agent_event(self.db, task, event_type, event_payload)
+                self.db.commit()
+            except Exception:  # noqa: BLE001 - event persistence must not kill the run
+                self.db.rollback()
+                logger.exception("failed to persist sub-agent event %s", event_type)
+
+        outcome = execute_subagent_job(
+            self.settings, job, task, emit_event=_emit
+        )
+        task.status = outcome.status
+        task.status_reason = outcome.error_class
+        task.deliverables_json = outcome.deliverables
+        task.result_text = (outcome.summary or "")[:16_000]
+        record = dict(outcome.attempt_record)
+        record.update(
+            {
+                "status": outcome.status,
+                "error_class": outcome.error_class,
+                "error_message": outcome.error_message,
+            }
+        )
+        attempts = list(task.attempts_json or [])
+        attempts.append(record)
+        task.attempts_json = attempts
+        task.finished_at = utc_now()
+        self.db.commit()
+        self._finish(job, outcome.status, outcome.error_class, outcome.error_message)
 
     def _execute_agent_command(self, job: SandboxJob) -> None:
         from app.domain.schemas.sandbox import SandboxAgentCommandRequest
