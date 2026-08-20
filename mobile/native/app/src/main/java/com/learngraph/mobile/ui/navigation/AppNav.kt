@@ -12,11 +12,13 @@ import androidx.navigation.compose.rememberNavController
 import com.learngraph.mobile.LearnGraphApp
 import com.learngraph.mobile.data.AuthStore
 import com.learngraph.mobile.ui.connect.ConnectScreen
+import com.learngraph.mobile.ui.downloads.DownloadsScreen
 import com.learngraph.mobile.ui.web.WebAppScreen
 
 object Routes {
     const val CONNECT = "connect"
     const val WEBAPP = "webapp"
+    const val DOWNLOADS = "downloads"
 }
 
 /**
@@ -52,7 +54,12 @@ fun AppNav() {
             )
         }
         composable(Routes.WEBAPP) {
-            WebAppScreen()
+            WebAppScreen(
+                onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) },
+            )
+        }
+        composable(Routes.DOWNLOADS) {
+            DownloadsScreen(onBack = { navController.popBackStack() })
         }
     }
 }

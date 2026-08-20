@@ -1,8 +1,13 @@
 package com.learngraph.mobile.ui.web
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
@@ -10,49 +15,67 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.learngraph.mobile.LearnGraphApp
 import com.learngraph.mobile.data.AuthStore
+import com.learngraph.mobile.data.DownloadStatus
+import com.learngraph.mobile.data.DownloadStore
 import com.learngraph.mobile.web.EmbeddedBrowserActivity
 
 /**
- * 纯网页模式（v0.7.0）：
- *  - 无原生控件：没有底栏、没有顶栏按钮；顶部仅一层很薄的白色（状态栏区域白底 + 2dp 白条）
- *  - 全屏 WebView 承载网页版（窄屏优化由前端 CSS 负责）
- *  - Cookie 保存：CookieManager 持久化，登录态跨重启保持
- *  - 登录态注入：localStorage（learngraph.*）写入后 reload 一次，免二次登录
+ * 纯网页模式（v0.8.0）：
+ *  - 无原生控件：没有底栏、没有顶栏按钮；顶部仅一层很薄的白色
+ *  - 全屏 WebView 承载网页版；Cookie 保存（登录态跨重启保持）
+ *  - 内置下载器：网页下载链接由 DownloadStore 接管（进度/通知/打开/管理），
+ *    右下角悬浮入口（仅存在下载任务时显示）进入下载管理页
+ *  - 登录态注入：localStorage（learngraph.*）写入后 reload 一次
  *  - 系统返回键：WebView 可后退则后退，否则退出
- *  - 外链（非本服务器 host）→ 内嵌浏览器
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WebAppScreen() {
+fun WebAppScreen(onOpenDownloads: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as LearnGraphApp
     val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
 
     val webViewRef = remember { mutableStateOf<WebView?>(null) }
+    val downloadTasks by DownloadStore.tasks.collectAsState()
+    val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
 
-    // 在可组合上下文中捕获返回派发器，供 BackHandler lambda 使用
-    val backDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
+    val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
 
     // 系统返回键：优先 WebView 后退，无历史时交由系统（退出应用）
     BackHandler {
@@ -64,82 +87,138 @@ fun WebAppScreen() {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // 很薄的白色顶栏：状态栏区域白底 + 2dp 白条（无任何按钮/控件）
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color.White)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .height(2.dp),
-        ) {}
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // 很薄的白色顶栏：状态栏区域白底 + 2dp 白条（无任何按钮/控件）
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .height(2.dp),
+            ) {}
 
-        // 全屏网页
-        Box(modifier = Modifier.fillMaxSize()) {
-            AndroidView(
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                        )
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        settings.textZoom = 100
-                        settings.loadWithOverviewMode = true
-                        settings.useWideViewPort = true
-                        overScrollMode = android.view.View.OVER_SCROLL_NEVER
+            // 全屏网页
+            Box(modifier = Modifier.fillMaxSize()) {
+                AndroidView(
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            )
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            settings.textZoom = 100
+                            settings.loadWithOverviewMode = true
+                            settings.useWideViewPort = true
+                            overScrollMode = android.view.View.OVER_SCROLL_NEVER
 
-                        // Cookie 保存（登录态跨重启保持）
-                        CookieManager.getInstance().setAcceptCookie(true)
-                        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            // Cookie 保存（登录态跨重启保持）
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
-                        webViewClient = object : WebViewClient() {
-                            private var injected = false
+                            webViewClient = object : WebViewClient() {
+                                private var injected = false
 
-                            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                                val url = request.url
-                                val scheme = url.scheme?.lowercase()
-                                if (scheme == "http" || scheme == "https") {
-                                    // 非本服务器主机 → 内嵌浏览器（不离开应用）
-                                    if (!isSameServer(url, app.api.baseUrl)) {
-                                        EmbeddedBrowserActivity.open(ctx, url.toString())
-                                        return true
+                                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                                    val url = request.url
+                                    val scheme = url.scheme?.lowercase()
+                                    if (scheme == "http" || scheme == "https") {
+                                        // 非本服务器主机 → 内嵌浏览器（不离开应用）
+                                        if (!isSameServer(url, app.api.baseUrl)) {
+                                            EmbeddedBrowserActivity.open(ctx, url.toString())
+                                            return true
+                                        }
+                                        return false
                                     }
                                     return false
                                 }
-                                return false
-                            }
 
-                            override fun onPageFinished(view: WebView, url: String?) {
-                                super.onPageFinished(view, url)
-                                // 登录态注入（仅一次）：网页版 localStorage 键与 auth-store 对齐
-                                if (!injected && !authState.token.isNullOrBlank()) {
-                                    injected = true
-                                    val js = buildString {
-                                        append("localStorage.setItem('learngraph.access_token', '")
-                                        append(escapeJs(authState.token.orEmpty()))
-                                        append("');")
-                                        append("localStorage.setItem('learngraph.workspace_id', '")
-                                        append(escapeJs(authState.workspaceId.orEmpty()))
-                                        append("');")
-                                        append("localStorage.setItem('learngraph.device_id', '")
-                                        append(escapeJs(authState.deviceId))
-                                        append("');")
+                                override fun onPageFinished(view: WebView, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    // 登录态注入（仅一次）：网页版 localStorage 键与 auth-store 对齐
+                                    if (!injected && !authState.token.isNullOrBlank()) {
+                                        injected = true
+                                        val js = buildString {
+                                            append("localStorage.setItem('learngraph.access_token', '")
+                                            append(escapeJs(authState.token.orEmpty()))
+                                            append("');")
+                                            append("localStorage.setItem('learngraph.workspace_id', '")
+                                            append(escapeJs(authState.workspaceId.orEmpty()))
+                                            append("');")
+                                            append("localStorage.setItem('learngraph.device_id', '")
+                                            append(escapeJs(authState.deviceId))
+                                            append("');")
+                                        }
+                                        view.evaluateJavascript(js, null)
+                                        // 注入后 reload 一次让 SPA 启动时读到登录态
+                                        view.post { view.reload() }
                                     }
-                                    view.evaluateJavascript(js, null)
-                                    // 注入后 reload 一次让 SPA 启动时读到登录态
-                                    view.post { view.reload() }
                                 }
                             }
+
+                            // 内置下载器：拦截网页下载
+                            setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                                requestNotifPermissionIfNeeded(ctx)
+                                val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) authState.token else null
+                                DownloadStore.enqueue(
+                                    context = ctx,
+                                    url = url,
+                                    contentDisposition = contentDisposition,
+                                    mimeType = mimeType,
+                                    userAgent = userAgent,
+                                    authToken = token,
+                                )
+                            }
+
+                            webViewRef.value = this
+                            loadUrl(app.api.baseUrl)
                         }
-                        webViewRef.value = this
-                        loadUrl(app.api.baseUrl)
-                    }
-                },
-                update = { },
-            )
+                    },
+                    update = { },
+                )
+            }
+        }
+
+        // 右下角悬浮下载入口（仅存在下载任务时显示，不破坏纯网页体验）
+        if (downloadTasks.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .navigationBarsPadding()
+                    .padding(16.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Color(0xEFFFFFFF))
+                    .clickable(onClick = onOpenDownloads)
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "↓",
+                    fontSize = 16.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (activeDownloads > 0) "$activeDownloads 个下载中" else "下载",
+                    fontSize = 13.sp,
+                    color = Color(0xFF2A2E35),
+                )
+            }
+        }
+    }
+}
+
+private fun requestNotifPermissionIfNeeded(ctx: Context) {
+    if (Build.VERSION.SDK_INT >= 33) {
+        val activity = ctx as? Activity ?: return
+        if (
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2001)
         }
     }
 }

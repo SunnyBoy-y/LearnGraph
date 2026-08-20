@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 内置下载器文件（应用专属外部存储） -->
+    <external-files-path name="downloads" path="Downloads/" />
+    <files-path name="internal_downloads" path="downloads/" />
+</paths>
