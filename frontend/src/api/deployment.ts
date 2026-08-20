@@ -10,7 +10,7 @@ export interface DeploymentProfile {
 
 /** Public deployment capability flags (no auth required, safe for the login page). */
 export function fetchDeploymentProfile(): Promise<DeploymentProfile> {
-  return apiClient.get<DeploymentProfile>("/api/v1/deployment/profile", {
+  return apiClient.get<DeploymentProfile>("/deployment/profile", {
     auth: false,
   });
 }
