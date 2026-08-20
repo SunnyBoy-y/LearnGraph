@@ -1,42 +1,53 @@
 # -*- mode: python ; coding: utf-8 -*-
-# LearnGraph Windows sidecar — PyInstaller onedir 打包蓝图（Phase 1，尚未实际构建）
+# LearnGraph Windows sidecar — PyInstaller onedir 打包
 #
-# 说明：
-#   - 这是打包蓝图，实际构建需在冻结的 Python 3.11/3.12 venv 中完成（本机 3.14
-#     仅用于开发验证）；依赖以 backend/uv.lock 为准。
-#   - 产物：dist/LearnGraph-Service/LearnGraph-Service.exe，同目录含
-#     frontend-dist/ 与 licenses/。同一入口 --role api|preview 分派两个进程。
-#   - 按需调整 hiddenimports（uvicorn 动态导入、providers 延迟加载等）。
-#   - 构建命令（在 backend 内）：
-#       python -m PyInstaller desktop/spec/learngraph-service.spec --noconfirm
+# 产物：dist/LearnGraph-Service/LearnGraph-Service.exe，同目录含 frontend-dist/。
+# 同一入口 --role api|preview 分派两个进程；用户机器无需 Python/Node。
+# 构建命令（在仓库根或 backend 内）：
+#   backend/.venv/Scripts/python.exe -m PyInstaller desktop/spec/learngraph-service.spec --noconfirm
+
+import PyInstaller.utils.hooks
 
 from pathlib import Path
 
-ROOT = Path(SPECPATH).resolve().parents[1]           # backend/
-FRONTEND_DIST = ROOT.parent / "frontend" / "dist"    # 生产由 LEARNGRAPH_FRONTEND_DIST 指定
+SPEC_DIR = Path(SPECPATH).resolve()                # <repo>/desktop/spec
+ROOT = SPEC_DIR.parents[1] / "backend"             # parents: [0]=desktop, [1]=repo
+FRONTEND_DIST = SPEC_DIR.parents[1] / "frontend" / "dist"
+
+# uvicorn loads "app.main:app" / "app.preview:preview_app" by string; the
+# static import chain from those modules is then tracked by PyInstaller.
+# Collect the whole app package to cover lazy/dynamic imports (providers,
+# skills, routers) without guessing.
+app_modules = PyInstaller.utils.hooks.collect_submodules("app")
+
+hiddenimports = [
+    "app.main",
+    "app.preview",
+    "uvicorn.logging",
+    "uvicorn.loops.auto",
+    "uvicorn.protocols.http.auto",
+    "uvicorn.protocols.websockets.auto",
+    "uvicorn.lifespan.on",
+    # keyring picks its Windows backend dynamically.
+    "keyring.backends.Windows",
+    *app_modules,
+]
 
 a = Analysis(
-    [str(ROOT.parent / "desktop" / "service_entry.py")],  # 后续提供 --role 入口模块
+    [str(ROOT.parent / "desktop" / "service_entry.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=[
-        # 按路径读取的资源必须显式打包
+        # Path-read resources must be packaged explicitly.
         (str(ROOT / "app" / "skills"), "app/skills"),
         (str(ROOT / "sandbox"), "sandbox"),
         (str(FRONTEND_DIST), "frontend-dist"),
     ],
-    hiddenimports=[
-        "uvicorn.logging",
-        "uvicorn.loops.auto",
-        "uvicorn.protocols.http.auto",
-        "uvicorn.protocols.websockets.auto",
-        "uvicorn.lifespan.on",
-        # TODO: 冻结后端完整依赖后，按 pylint/collect_submodules 结果补全
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "IPython", "notebook"],
+    excludes=["tkinter", "matplotlib", "IPython", "notebook", "jupyter"],
     noarchive=False,
 )
 

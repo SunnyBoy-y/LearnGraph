@@ -201,6 +201,7 @@ fn spawn_sidecar(
         }
         let mut c = Command::new(&exe);
         c.arg("--role").arg(spec.role);
+        c.arg("--port").arg(port.to_string());
         c
     } else {
         // Dev mode: venv/system python + uvicorn, backend repo as cwd.

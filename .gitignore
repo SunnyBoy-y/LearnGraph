@@ -229,3 +229,6 @@ backend/sandbox/.spec-test.json
 /desktop/frontend-dist/*
 !/desktop/frontend-dist/index.html
 /desktop/src-tauri/gen/
+# PyInstaller sidecar 打包产物
+/desktop/dist/
+/desktop/build/
