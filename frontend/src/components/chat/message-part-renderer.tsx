@@ -460,7 +460,7 @@ function SourceListPart({ data }: { data: PartData }) {
     <Sources className="message-sources" defaultOpen={false}>
       <SourcesTrigger count={items.length}>
         <>
-          <p className="font-medium">引用了 {items.length} 个来源</p>
+          <span className="font-medium">引用了 {items.length} 个来源</span>
         </>
       </SourcesTrigger>
       <SourcesContent>

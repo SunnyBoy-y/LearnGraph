@@ -335,6 +335,19 @@ export interface SessionContextUsage {
   context_window_tokens: number
   compaction_ratio: number
   message_count: number
+  /** 已被最新压缩摘要覆盖（按摘要计 token）的早期消息数；0 表示尚未压缩。 */
+  compacted_message_count?: number
+}
+
+/** 主动压缩上下文的结果；skipped=true 表示未执行压缩（reason 说明原因）。 */
+export interface CompactContextResult {
+  skipped: boolean
+  reason: string | null
+  kind: string | null
+  source_message_count: number
+  estimated_tokens_before: number
+  estimated_tokens_after: number
+  summary_preview: string
 }
 
 export interface MessagePartStreamEvent {

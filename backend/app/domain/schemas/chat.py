@@ -563,7 +563,10 @@ class SessionContextUsageView(BaseModel):
 
     ``estimated_tokens`` is a lower bound over the visible timeline; the
     authoritative compaction decision still happens inside the next stream
-    request (see ``ChatService.context_usage``).
+    request (see ``ChatService.context_usage``). When the newest compaction
+    summary covers a contiguous prefix of the timeline, the estimate counts
+    the summary text plus only the uncovered messages, so a manual or
+    automatic compaction is reflected immediately.
     """
 
     session_id: str
@@ -575,6 +578,24 @@ class SessionContextUsageView(BaseModel):
     context_window_tokens: int
     compaction_ratio: float
     message_count: int
+    compacted_message_count: int = 0
+
+
+class CompactContextResultView(BaseModel):
+    """Result of a manual context compaction request.
+
+    ``skipped=True`` with ``reason`` means compaction was declined
+    (``context_too_small`` / ``nothing_to_compact``); otherwise the summary
+    record was persisted and the next prompt build will use it.
+    """
+
+    skipped: bool
+    reason: str | None = None
+    kind: str | None = None
+    source_message_count: int = 0
+    estimated_tokens_before: int
+    estimated_tokens_after: int
+    summary_preview: str = ""
 
 
 class BranchRequest(BaseModel):

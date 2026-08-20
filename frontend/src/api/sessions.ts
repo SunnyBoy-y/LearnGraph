@@ -1,5 +1,6 @@
 import type {
   BranchSessionRequest,
+  CompactContextResult,
   ConceptBranchCreateRequest,
   DictationCleanupRequest,
   DictationCleanupResult,
@@ -178,6 +179,22 @@ export function getSessionContextUsage(
 ): Promise<SessionContextUsage> {
   return apiClient.get<SessionContextUsage>(
     `/sessions/${encodeURIComponent(sessionId)}/context-usage`,
+    {
+      query: {
+        provider_id: options.provider_id,
+        model_id: options.model_id,
+        agent_mode: options.agent_mode ? 'true' : undefined,
+      },
+    },
+  )
+}
+
+export function compactSessionContext(
+  sessionId: string,
+  options: { provider_id?: string; model_id?: string; agent_mode?: boolean } = {},
+): Promise<CompactContextResult> {
+  return apiClient.post<CompactContextResult>(
+    `/sessions/${encodeURIComponent(sessionId)}/compact`,
     {
       query: {
         provider_id: options.provider_id,

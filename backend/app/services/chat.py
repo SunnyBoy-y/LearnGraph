@@ -168,9 +168,14 @@ MAX_PROVIDER_STREAM_ATTEMPTS = 256
 # Stream event persistence is batched while a generation is running: SQLite
 # stays a single writer, so committing every delta serializes token delivery
 # behind fsync/lock acquisition. Initial/terminal/checkpoint events still flush
-# immediately; ordinary deltas flush on count or wall-clock cadence.
-STREAM_EVENT_BATCH_COUNT = 64
-STREAM_EVENT_BATCH_SECONDS = 0.5
+# immediately; ordinary deltas flush on count or wall-clock cadence. The 1s
+# cadence halves the per-stream commit frequency vs the old 0.5s, which
+# proportionally reduces write-lock contention between concurrent streams (the
+# in-process write gate serializes commits, so fewer, larger commits are
+# strictly better here). Crash-replay gap grows from 0.5s to 1s, which the
+# recovery path already absorbs.
+STREAM_EVENT_BATCH_COUNT = 128
+STREAM_EVENT_BATCH_SECONDS = 1.0
 STREAM_REPLAY_BATCH_SIZE = 500
 STREAM_EVENT_IMMEDIATE_TYPES = frozenset({
     "answer.started",
@@ -2121,6 +2126,78 @@ class ChatService:
             ratio = default
         return min(1.0, max(0.1, ratio))
 
+    def _partition_recent_older(
+        self,
+        history: list[Message],
+        input_budget: int,
+    ) -> tuple[list[Message], list[Message], int]:
+        """Split history into a budget-bounded recent window and an older prefix.
+
+        Mirrors the historic compaction partition used by ``_build_model_prompt``:
+        keep as many trailing messages as fit in 30% of the input budget, then
+        fall back to a third of the timeline when even the windowed scan yields
+        nothing to compact. Returns (recent, older, recent_tokens).
+        """
+        recent_budget = int(input_budget * 0.3)
+        recent: list[Message] = []
+        recent_tokens = 0
+        for item in reversed(history):
+            cost = self._estimate_tokens(item.content)
+            if recent and recent_tokens + cost > recent_budget:
+                break
+            recent.append(item)
+            recent_tokens += cost
+        recent.reverse()
+        recent_ids = {item.id for item in recent}
+        older = [item for item in history if item.id not in recent_ids]
+        if not older and len(history) > 2:
+            keep_count = max(2, len(history) // 3)
+            recent = history[-keep_count:]
+            recent_ids = {item.id for item in recent}
+            older = [item for item in history if item.id not in recent_ids]
+            recent_tokens = sum(
+                self._estimate_tokens(item.content) for item in recent
+            )
+        return recent, older, recent_tokens
+
+    def _record_context_summary(
+        self,
+        session_id: str,
+        *,
+        older: list[Message],
+        summary_text: str,
+        summary_kind: str,
+        recent_tokens: int,
+        before_tokens: int,
+    ) -> ContextSummary:
+        """Persist a compaction summary record (shared auto/manual paths)."""
+        source_hash = self._hash(
+            "\n".join(f"{item.id}:{item.content}" for item in older)
+        )
+        version = (
+            self.db.scalar(
+                select(func.max(ContextSummary.version)).where(
+                    ContextSummary.workspace_id == self.workspace_id,
+                    ContextSummary.session_id == session_id,
+                )
+            )
+            or 0
+        ) + 1
+        summary = ContextSummary(
+            workspace_id=self.workspace_id,
+            session_id=session_id,
+            version=version,
+            kind=summary_kind,
+            source_message_ids=[item.id for item in older],
+            source_hash=source_hash,
+            summary=summary_text,
+            estimated_tokens_before=before_tokens,
+            estimated_tokens_after=self._estimate_tokens(summary_text) + recent_tokens,
+        )
+        self.db.add(summary)
+        self.db.flush()
+        return summary
+
     def _preflight_model_call(
         self,
         prompt: str,
@@ -2289,38 +2366,18 @@ class ChatService:
                 f"{style_instructions}\n\n会话历史：\n{full_with_context}\n\n当前用户消息：\n{current_content}",
                 None,
             )
-        recent_budget = int(input_budget * 0.3)
-        recent: list[Message] = []
-        recent_tokens = 0
-        for item in reversed(history):
-            cost = self._estimate_tokens(item.content)
-            if recent and recent_tokens + cost > recent_budget:
-                break
-            recent.append(item)
-            recent_tokens += cost
-        recent.reverse()
-        recent_ids = {item.id for item in recent}
-        older = [item for item in history if item.id not in recent_ids]
-        if not older and len(history) > 2:
-            keep_count = max(2, len(history) // 3)
-            recent = history[-keep_count:]
-            recent_ids = {item.id for item in recent}
-            older = [item for item in history if item.id not in recent_ids]
-            recent_tokens = sum(
-                self._estimate_tokens(item.content) for item in recent
-            )
-        summary_text, summary_kind = self._compose_context_summary_text(session_id, older)
-        source_hash = self._hash("\n".join(f"{item.id}:{item.content}" for item in older))
-        version = (self.db.scalar(select(func.max(ContextSummary.version)).where(ContextSummary.workspace_id == self.workspace_id, ContextSummary.session_id == session_id)) or 0) + 1
-        summary = ContextSummary(
-            workspace_id=self.workspace_id, session_id=session_id, version=version,
-            kind=summary_kind,
-            source_message_ids=[item.id for item in older], source_hash=source_hash,
-            summary=summary_text, estimated_tokens_before=self._estimate_tokens(full_with_context),
-            estimated_tokens_after=self._estimate_tokens(summary_text) + recent_tokens,
+        recent, older, recent_tokens = self._partition_recent_older(
+            history, input_budget
         )
-        self.db.add(summary)
-        self.db.flush()
+        summary_text, summary_kind = self._compose_context_summary_text(session_id, older)
+        summary = self._record_context_summary(
+            session_id,
+            older=older,
+            summary_text=summary_text,
+            summary_kind=summary_kind,
+            recent_tokens=recent_tokens,
+            before_tokens=self._estimate_tokens(full_with_context),
+        )
         recent_text = "\n\n".join(f"[{item.role} message_id={item.id}]\n{item.content}" for item in recent)
         prompt = f"较早会话结构摘要：\n{summary_text}\n\n最近完整消息：\n{recent_text}\n\n当前用户消息：\n{current_content}"
         body = f"{authorized_context}\n\n{prompt}" if authorized_context else prompt
@@ -2816,31 +2873,14 @@ class ChatService:
             summary_text, summary_kind = self._compose_context_summary_text(
                 session_id, older
             )
-            source_hash = self._hash(
-                "\n".join(f"{item.id}:{item.content}" for item in older)
+            summary = self._record_context_summary(
+                session_id,
+                older=older,
+                summary_text=summary_text,
+                summary_kind=summary_kind,
+                recent_tokens=used,
+                before_tokens=self._estimate_tokens(serialized),
             )
-            version = (
-                self.db.scalar(
-                    select(func.max(ContextSummary.version)).where(
-                        ContextSummary.workspace_id == self.workspace_id,
-                        ContextSummary.session_id == session_id,
-                    )
-                )
-                or 0
-            ) + 1
-            summary = ContextSummary(
-                workspace_id=self.workspace_id,
-                session_id=session_id,
-                version=version,
-                kind=summary_kind,
-                source_message_ids=[item.id for item in older],
-                source_hash=source_hash,
-                summary=summary_text,
-                estimated_tokens_before=self._estimate_tokens(serialized),
-                estimated_tokens_after=self._estimate_tokens(summary_text) + used,
-            )
-            self.db.add(summary)
-            self.db.flush()
             prefix = messages[: len(messages) - len(history) - 1]
             return [
                 *prefix,
@@ -8685,6 +8725,50 @@ class ChatService:
             compact_part["sequence"] = part.get("sequence")
         return compact_part
 
+    def _effective_context_estimate(
+        self,
+        session_id: str,
+        history: list[Message],
+    ) -> tuple[int, int]:
+        """Summary-aware context estimate: (estimated_tokens, compacted_count).
+
+        When the newest compaction summary (manual or automatic) covers a
+        contiguous prefix of the timeline, the estimate counts the summary text
+        plus only the uncovered messages, so a successful compaction is
+        reflected immediately. Without a usable summary it degrades to the raw
+        timeline estimate with ``compacted_count == 0``.
+        """
+        lines = [
+            f"[{item.role} message_id={item.id}]\n{item.content}" for item in history
+        ]
+        estimated = self._estimate_tokens("\n\n".join(lines)) if lines else 0
+        compacted_count = 0
+        latest = self.db.scalar(
+            select(ContextSummary)
+            .where(
+                ContextSummary.workspace_id == self.workspace_id,
+                ContextSummary.session_id == session_id,
+            )
+            .order_by(ContextSummary.version.desc())
+            .limit(1)
+        )
+        if latest is not None and latest.source_message_ids:
+            covered = set(latest.source_message_ids)
+            ids = [item.id for item in history]
+            if covered.issubset(ids):
+                prefix_len = 0
+                for message_id in ids:
+                    if message_id not in covered:
+                        break
+                    prefix_len += 1
+                if prefix_len == len(covered):
+                    compacted_count = prefix_len
+                    uncovered = history[prefix_len:]
+                    estimated = self._estimate_tokens(latest.summary) + sum(
+                        self._estimate_tokens(item.content) for item in uncovered
+                    )
+        return estimated, compacted_count
+
     def context_usage(self, session_id: str, *, agent_mode: bool = False) -> dict[str, Any]:
         """Approximate context usage for the visible session timeline.
 
@@ -8693,13 +8777,17 @@ class ChatService:
         Per-request additions (authorized context, memory injection, style
         instructions) are unknown ahead of the next message, so the estimate
         is a lower bound intended for display, not billing.
+
+        When the newest compaction summary (manual or automatic) covers a
+        contiguous prefix of the timeline, the estimate counts the summary text
+        plus only the uncovered messages, so a successful compaction is
+        reflected immediately in the UI ring.
         """
 
         history = self._session_timeline(session_id)
-        lines = [
-            f"[{item.role} message_id={item.id}]\n{item.content}" for item in history
-        ]
-        estimated = self._estimate_tokens("\n\n".join(lines)) if lines else 0
+        estimated, compacted_count = self._effective_context_estimate(
+            session_id, history
+        )
         input_budget = self._input_token_budget()
         ratio = self._context_compaction_ratio(agent_mode)
         threshold = max(1, int(input_budget * ratio))
@@ -8715,6 +8803,61 @@ class ChatService:
             ),
             "compaction_ratio": ratio,
             "message_count": len(history),
+            "compacted_message_count": compacted_count,
+        }
+
+    def compact_context(self, session_id: str, *, agent_mode: bool = False) -> dict[str, Any]:
+        """Manually compact the session context into a durable summary.
+
+        Mirrors the automatic compaction path in ``_build_model_prompt``:
+        older messages are reduced to a summary record (model-backed when a
+        background rolling summary is available, otherwise mechanical) that
+        the next prompt build uses instead of the raw history. Returns a
+        skipped result instead of raising when compaction would be pointless.
+        """
+        history = self._session_timeline(session_id)
+        estimated, compacted_count = self._effective_context_estimate(
+            session_id, history
+        )
+        input_budget = self._input_token_budget()
+        ratio = self._context_compaction_ratio(agent_mode)
+        threshold = max(1, int(input_budget * ratio))
+        skipped = {
+            "skipped": True,
+            "reason": "context_too_small",
+            "kind": None,
+            "source_message_count": 0,
+            "estimated_tokens_before": estimated,
+            "estimated_tokens_after": estimated,
+            "summary_preview": "",
+        }
+        if estimated < int(threshold * 0.5):
+            return skipped
+        recent, older, recent_tokens = self._partition_recent_older(
+            history, input_budget
+        )
+        if not older:
+            return {**skipped, "reason": "nothing_to_compact"}
+        summary_text, summary_kind = self._compose_context_summary_text(
+            session_id, older
+        )
+        summary = self._record_context_summary(
+            session_id,
+            older=older,
+            summary_text=summary_text,
+            summary_kind=summary_kind,
+            recent_tokens=recent_tokens,
+            before_tokens=estimated,
+        )
+        self.db.commit()
+        return {
+            "skipped": False,
+            "reason": None,
+            "kind": summary.kind,
+            "source_message_count": len(older),
+            "estimated_tokens_before": summary.estimated_tokens_before,
+            "estimated_tokens_after": summary.estimated_tokens_after,
+            "summary_preview": summary_text[:240],
         }
 
     def _session_timeline(
@@ -9258,6 +9401,9 @@ class ChatService:
         except OperationalError as exc:
             if not _is_sqlite_locked_error(exc):
                 raise
+            from app.core.database import record_sqlite_locked_retry
+
+            record_sqlite_locked_retry()
             self._recover_pending_events()
             return
         self._pending_event_snapshots.clear()
@@ -9329,6 +9475,9 @@ class ChatService:
             except OperationalError as exc:
                 if not _is_sqlite_locked_error(exc):
                     raise
+                from app.core.database import record_sqlite_locked_retry
+
+                record_sqlite_locked_retry()
                 last_error = exc
                 if attempt >= 4:
                     # Nothing was persisted by this recovery; drop the
@@ -9405,7 +9554,18 @@ class ChatService:
             }
         )
         try:
-            self.stream_events.add(
+            # Defer the flush to the batch commit. ScopedRepository.add would
+            # db.flush() per event, and every flush is a write statement inside
+            # a transaction that holds SQLite's single write lock until commit
+            # — with N concurrent streams that means N×flush-rate lock
+            # acquisitions all contending with each other. Appending via
+            # db.add keeps the INSERTs pending so a whole batch (up to
+            # STREAM_EVENT_BATCH_COUNT events plus the checkpoint writes) lands
+            # in ONE write transaction at the commit in
+            # _commit_pending_stream_events. Row identity is preserved: the id
+            # and created_at are pre-generated, and workspace_id is set
+            # explicitly here, so nothing depends on the repository's scoping.
+            self.db.add(
                 MessageStreamEvent(
                     id=envelope_record.id,
                     workspace_id=self.workspace_id,
@@ -9425,10 +9585,24 @@ class ChatService:
                 self._commit_pending_stream_events()
         except OperationalError as exc:
             from app.core.database import _is_sqlite_locked_error
+            from app.core.database import record_sqlite_locked_retry
 
             if not _is_sqlite_locked_error(exc):
                 raise
-            self._recover_pending_events()
+            record_sqlite_locked_retry()
+            # With deferred flush the lock can only surface in the flush/commit
+            # path (``_maybe_flush_events`` → ``_commit_pending_stream_events``),
+            # which already ran ``_recover_pending_events`` and exhausted its
+            # retry budget before raising. Re-running recovery here would double
+            # the retry window (and could outlive a long-held lock, silently
+            # swallowing the error). Roll back so the session stays usable, then
+            # propagate; ``_append_event_locked_retry`` callers retry with fresh
+            # event ids from their own loop.
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            raise
         return self._event_envelope(envelope_record)
 
     def _append_event_locked_retry(
@@ -9463,6 +9637,9 @@ class ChatService:
                 except OperationalError as exc:
                     if not _is_sqlite_locked_error(exc):
                         raise
+                    from app.core.database import record_sqlite_locked_retry
+
+                    record_sqlite_locked_retry()
                     last_error = exc
                     try:
                         self.db.rollback()

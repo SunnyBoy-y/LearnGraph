@@ -49,6 +49,7 @@ from app.domain.schemas.chat import (
     SessionActivitySummaryRequest,
     SessionAutoTitleRequest,
     SessionContextUsageView,
+    CompactContextResultView,
     SessionCreateRequest,
     SessionFileView,
     SessionView,
@@ -219,50 +220,58 @@ def _detached_message_stream(
     """
 
     def produce():
-        with session_factory() as worker_db:
-            workspace = worker_db.get(Workspace, context.workspace_id)
-            if workspace is None:
-                raise AppError(
-                    404,
-                    "workspace_not_found",
-                    "The workspace no longer exists",
+        # Count this generation as an active stream so non-urgent scheduler
+        # sweeps and the WAL TRUNCATE checkpoint defer while it runs (P3-S1).
+        from app.core.database import enter_active_stream, exit_active_stream
+
+        enter_active_stream()
+        try:
+            with session_factory() as worker_db:
+                workspace = worker_db.get(Workspace, context.workspace_id)
+                if workspace is None:
+                    raise AppError(
+                        404,
+                        "workspace_not_found",
+                        "The workspace no longer exists",
+                    )
+                worker_context = WorkspaceContext(
+                    principal=context.principal,
+                    workspace=workspace,
+                    permissions=context.permissions,
                 )
-            worker_context = WorkspaceContext(
-                principal=context.principal,
-                workspace=workspace,
-                permissions=context.permissions,
-            )
-            if payload.generation_mode == "image":
-                worker_service = ImageChatService(
-                    worker_db,
-                    worker_context.workspace_id,
-                    worker_context.principal.user_id,
-                    settings,
-                    image_provider_for_workspace(
+                if payload.generation_mode == "image":
+                    worker_service = ImageChatService(
                         worker_db,
                         worker_context.workspace_id,
+                        worker_context.principal.user_id,
+                        settings,
+                        image_provider_for_workspace(
+                            worker_db,
+                            worker_context.workspace_id,
+                            settings,
+                            model_id=payload.model_id,
+                            provider_id=payload.provider_id,
+                        ),
+                    )
+                else:
+                    worker_service = service(
+                        worker_db,
+                        worker_context,
                         settings,
                         model_id=payload.model_id,
                         provider_id=payload.provider_id,
-                    ),
+                        thinking_mode=payload.thinking_mode,
+                        search_route=payload.search_route,
+                        agent_mode=payload.agent_mode,
+                    )
+                yield from worker_service.create_stream(
+                    session_id,
+                    payload,
+                    idempotency_key=idempotency_key,
+                    last_event_id=last_event_id,
                 )
-            else:
-                worker_service = service(
-                    worker_db,
-                    worker_context,
-                    settings,
-                    model_id=payload.model_id,
-                    provider_id=payload.provider_id,
-                    thinking_mode=payload.thinking_mode,
-                    search_route=payload.search_route,
-                    agent_mode=payload.agent_mode,
-                )
-            yield from worker_service.create_stream(
-                session_id,
-                payload,
-                idempotency_key=idempotency_key,
-                last_event_id=last_event_id,
-            )
+        finally:
+            exit_active_stream()
 
     return _detached_sse_transport(
         produce,
@@ -281,33 +290,41 @@ def _detached_retry_stream(
     session_factory: sessionmaker,
 ):
     def produce():
-        with session_factory() as worker_db:
-            workspace = worker_db.get(Workspace, context.workspace_id)
-            if workspace is None:
-                raise AppError(
-                    404,
-                    "workspace_not_found",
-                    "The workspace no longer exists",
+        # Retry streams are full generations too — count them as active so
+        # background sweeps defer (P3-S1).
+        from app.core.database import enter_active_stream, exit_active_stream
+
+        enter_active_stream()
+        try:
+            with session_factory() as worker_db:
+                workspace = worker_db.get(Workspace, context.workspace_id)
+                if workspace is None:
+                    raise AppError(
+                        404,
+                        "workspace_not_found",
+                        "The workspace no longer exists",
+                    )
+                worker_context = WorkspaceContext(
+                    principal=context.principal,
+                    workspace=workspace,
+                    permissions=context.permissions,
                 )
-            worker_context = WorkspaceContext(
-                principal=context.principal,
-                workspace=workspace,
-                permissions=context.permissions,
-            )
-            worker_service = service(
-                worker_db,
-                worker_context,
-                settings,
-                model_id=payload.model_id,
-                provider_id=payload.provider_id,
-                thinking_mode=payload.thinking_mode,
-                search_route=payload.search_route,
-            )
-            yield from worker_service.retry_message(
-                session_id,
-                message_id,
-                payload,
-            )
+                worker_service = service(
+                    worker_db,
+                    worker_context,
+                    settings,
+                    model_id=payload.model_id,
+                    provider_id=payload.provider_id,
+                    thinking_mode=payload.thinking_mode,
+                    search_route=payload.search_route,
+                )
+                yield from worker_service.retry_message(
+                    session_id,
+                    message_id,
+                    payload,
+                )
+        finally:
+            exit_active_stream()
 
     return _detached_sse_transport(
         produce,
@@ -1140,6 +1157,35 @@ def get_session_context_usage(
             model_id=model_id,
             provider_id=provider_id,
         ).context_usage(session_id, agent_mode=agent_mode)
+    )
+
+
+@router.post("/{session_id}/compact", response_model=CompactContextResultView)
+def compact_session_context(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    model_id: Annotated[str | None, Query(min_length=1, max_length=160)] = None,
+    provider_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    agent_mode: bool = False,
+) -> CompactContextResultView:
+    """Manually compact the session context into a durable summary.
+
+    Mirrors the automatic compaction path: older messages are reduced to a
+    summary record that the next prompt build uses instead of the raw
+    history. Returns a ``skipped`` result (with reason) when the context is
+    still small or there is nothing to compact.
+    """
+    require_session_access(session_id, "write", db, context)
+    return CompactContextResultView.model_validate(
+        service(
+            db,
+            context,
+            settings,
+            model_id=model_id,
+            provider_id=provider_id,
+        ).compact_context(session_id, agent_mode=agent_mode)
     )
 
 

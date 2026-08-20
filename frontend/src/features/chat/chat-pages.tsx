@@ -8583,62 +8583,6 @@ export function ChatCanvasPage() {
         {responseMode === "agentic" ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
-        <ConversationQuickActions
-          agentActive={responseMode === "agentic"}
-          agentDisabled={
-            sessionIsClosed || goalFlow.busy || !supportsAgentMode
-          }
-          attachDisabled={sessionIsClosed || goalFlow.busy}
-          deepResearchDisabled={
-            sessionIsClosed ||
-            goalMode ||
-            goalFlow.busy ||
-            !supportsAgentMode ||
-            !hasDeepResearchProvider
-          }
-          goalActive={goalMode}
-          goalDisabled={goalFlow.busy || (!goalMode && sessionIsClosed)}
-          graphActive={graphAction !== "none"}
-          graphDisabled={
-            sessionIsClosed ||
-            goalMode ||
-            goalFlow.busy ||
-            !graphCommandAvailable
-          }
-          imageActive={generationMode === "image"}
-          imageDisabled={
-            sessionIsClosed ||
-            goalMode ||
-            goalFlow.busy ||
-            !activeImageProvider ||
-            !selectedImageModel
-          }
-          onAgent={toggleAgentMode}
-          onAttach={openAttachmentPicker}
-          onDeepResearch={startDeepResearch}
-          onGoal={toggleGoalMode}
-          onGraph={setGraphProposal}
-          onImage={toggleImageMode}
-          onPractice={() => activateComposerCommand("practice")}
-          onSearch={toggleNetworkSearch}
-          practiceDisabled={
-            sessionIsClosed || goalMode || goalFlow.busy || !activeModelProvider
-          }
-          searchActive={searchRoute !== "disabled"}
-          searchDisabled={
-            sessionIsClosed ||
-            goalFlow.busy ||
-            !canUseNetworkSearch
-          }
-        />
-        <SandboxAuthDialog
-          onClose={() => setSandboxAuthRequest(null)}
-          onGranted={() => {
-            void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
-          }}
-          request={sandboxAuthRequest}
-        />
-
       {longPaste ? (
           <div className="mb-2 flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 shadow-sm dark:border-amber-900 dark:bg-amber-950/45 dark:text-amber-100">
             <FilePlus2 className="size-4" />
@@ -8688,7 +8632,7 @@ export function ChatCanvasPage() {
           </div>
         ) : null}
         {!providers.isPending && !activeModelProvider ? (
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/35 dark:text-amber-100">
+          <div className="mb-2 flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/35 dark:text-amber-100">
             <span>没有可用的真实模型 Provider，发送已暂停。</span>
             <Button
               onClick={() => navigate(`/w/${workspaceId}/settings/providers`)}
@@ -8810,6 +8754,62 @@ export function ChatCanvasPage() {
             <em>点击跳过</em>
           </button>
         ) : null}
+        <ConversationQuickActions
+          agentActive={responseMode === "agentic"}
+          agentDisabled={
+            sessionIsClosed || goalFlow.busy || !supportsAgentMode
+          }
+          attachDisabled={sessionIsClosed || goalFlow.busy}
+          deepResearchDisabled={
+            sessionIsClosed ||
+            goalMode ||
+            goalFlow.busy ||
+            !supportsAgentMode ||
+            !hasDeepResearchProvider
+          }
+          goalActive={goalMode}
+          goalDisabled={goalFlow.busy || (!goalMode && sessionIsClosed)}
+          graphActive={graphAction !== "none"}
+          graphDisabled={
+            sessionIsClosed ||
+            goalMode ||
+            goalFlow.busy ||
+            !graphCommandAvailable
+          }
+          imageActive={generationMode === "image"}
+          imageDisabled={
+            sessionIsClosed ||
+            goalMode ||
+            goalFlow.busy ||
+            !activeImageProvider ||
+            !selectedImageModel
+          }
+          onAgent={toggleAgentMode}
+          onAttach={openAttachmentPicker}
+          onDeepResearch={startDeepResearch}
+          onGoal={toggleGoalMode}
+          onGraph={setGraphProposal}
+          onImage={toggleImageMode}
+          onPractice={() => activateComposerCommand("practice")}
+          onSearch={toggleNetworkSearch}
+          practiceDisabled={
+            sessionIsClosed || goalMode || goalFlow.busy || !activeModelProvider
+          }
+          searchActive={searchRoute !== "disabled"}
+          searchDisabled={
+            sessionIsClosed ||
+            goalFlow.busy ||
+            !canUseNetworkSearch
+          }
+        />
+        <SandboxAuthDialog
+          onClose={() => setSandboxAuthRequest(null)}
+          onGranted={() => {
+            void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
+          }}
+          request={sandboxAuthRequest}
+        />
+
         <div className="chat-composer-anchor">
         {showMentionMenu ? (
           <div
@@ -9154,7 +9154,12 @@ export function ChatCanvasPage() {
             generationMode === "text" &&
             sessionId !== "new" &&
             contextUsage.data ? (
-              <ContextUsageRing usage={contextUsage.data} />
+              <ContextUsageRing
+                usage={contextUsage.data}
+                sessionId={sessionId}
+                agentMode={responseMode === "agentic"}
+                onCompacted={() => void contextUsage.refetch()}
+              />
             ) : null}
              {(() => {
                const modelTriggerDisabled =
