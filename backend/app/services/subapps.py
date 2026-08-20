@@ -421,13 +421,61 @@ class SubAppService:
                 "Current session capability token is missing, stale, or invalid",
             )
 
-        payload_json, payload_sha256 = _payload_json_and_hash(payload.payload)
+        # System fields (SDK envelope): `type` is already stripped by the host
+        # bridge; `client_event_id` / `sequence` / `schema_version` /
+        # `occurred_at` are SDK reliability metadata that the backend maps to
+        # dedicated columns. They are separated from the BUSINESS payload before
+        # schema validation and persistence, so app-authored event_schemas never
+        # need to declare them (and stay closed under additionalProperties:false).
+        SYSTEM_EVENT_FIELDS = frozenset(
+            {"client_event_id", "sequence", "schema_version", "occurred_at"}
+        )
+        business_payload = {
+            key: value
+            for key, value in payload.payload.items()
+            if key not in SYSTEM_EVENT_FIELDS
+        }
+        payload_json, payload_sha256 = _payload_json_and_hash(business_payload)
         _validate_against_schema(
-            payload.payload,
+            business_payload,
             session.event_schema,
             error_code="subapp_event_schema_rejected",
             label="Event payload",
         )
+
+        # Idempotency: the client SDK stamps every event with client_event_id.
+        # A replayed delivery (ack lost, client retried with the rotated token)
+        # returns the already-persisted event without double-counting, without a
+        # second event row, and without re-triggering the Agent.
+        client_event_id = payload.payload.get("client_event_id")
+        existing: SubAppInteractionEvent | None = None
+        if isinstance(client_event_id, str) and client_event_id:
+            existing = self.db.scalar(
+                select(SubAppInteractionEvent).where(
+                    SubAppInteractionEvent.workspace_id == self.workspace_id,
+                    SubAppInteractionEvent.session_id == session.id,
+                    SubAppInteractionEvent.client_event_id == client_event_id,
+                )
+            )
+
+        # Rotate the capability token: the presented token is spent immediately
+        # and a fresh one is issued so old-token replays cannot succeed. Even an
+        # idempotent hit consumes the presented token (protocol consistency).
+        next_token = secrets.token_urlsafe(32)
+        next_hash = _token_sha256(next_token)
+        next_prefix = next_token[:8]
+
+        if existing is not None:
+            session.current_token_hash = next_hash
+            session.current_token_prefix = next_prefix
+            self.db.commit()
+            return SubAppSessionEventAcceptedView(
+                session_id=session.id,
+                event=_event_view(existing),
+                next_token=next_token,
+                next_token_prefix=next_prefix,
+                agent={"triggered": False, "idempotent": True},
+            )
 
         event_count = self.db.scalar(
             select(func.count())
@@ -445,11 +493,15 @@ class SubAppService:
                 {"max": MAX_SUBAPP_EVENTS_PER_SESSION},
             )
 
-        # Rotate the capability token: the presented token is spent immediately
-        # and a fresh one is issued so old-token replays cannot succeed.
-        next_token = secrets.token_urlsafe(32)
-        next_hash = _token_sha256(next_token)
-        next_prefix = next_token[:8]
+        occurred_at: datetime | None = None
+        raw_occurred = payload.payload.get("occurred_at")
+        if isinstance(raw_occurred, str) and raw_occurred:
+            try:
+                occurred_at = datetime.fromisoformat(raw_occurred.replace("Z", "+00:00"))
+            except ValueError:
+                occurred_at = None
+        sequence = payload.payload.get("sequence")
+        schema_version = payload.payload.get("schema_version")
         event = SubAppInteractionEvent(
             workspace_id=self.workspace_id,
             session_id=session.id,
@@ -459,6 +511,16 @@ class SubAppService:
             event_type=payload.event_type,
             payload_json=payload_json,
             payload_sha256=payload_sha256,
+            client_event_id=client_event_id if isinstance(client_event_id, str) else None,
+            sequence=sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else None,
+            schema_version=schema_version if isinstance(schema_version, int) else 1,
+            occurred_at=occurred_at,
+            bundle_id=getattr(session, "bundle_id", None),
+            component_id=getattr(session, "component_id", None),
+            component_version=None,
+            delivery_attempt=1,
+            source="semantic",
+            privacy_class="session",
         )
         self.db.add(event)
         session.current_token_hash = next_hash
@@ -477,6 +539,7 @@ class SubAppService:
         )
         self.db.commit()
         self.db.refresh(event)
+        self._append_event_log(event)
         from app.services.subapp_event_agent import (
             maybe_enqueue_subapp_event_agent,
         )
@@ -495,6 +558,41 @@ class SubAppService:
             next_token_prefix=next_prefix,
             agent=agent_info,
         )
+
+    def _append_event_log(self, event: SubAppInteractionEvent) -> None:
+        """Best-effort JSONL analytics copy (DB stays the source of truth)."""
+        try:
+            from app.services.subapp_event_log import SubAppEventLogWriter
+
+            SubAppEventLogWriter().append(
+                workspace_id=self.workspace_id,
+                event={
+                    "id": event.id,
+                    "workspace_id": event.workspace_id,
+                    "session_id": event.session_id,
+                    "actor_id": event.actor_id,
+                    "chat_session_id": event.chat_session_id,
+                    "artifact_version_id": event.artifact_version_id,
+                    "event_type": event.event_type,
+                    "payload_sha256": event.payload_sha256,
+                    "client_event_id": event.client_event_id,
+                    "sequence": event.sequence,
+                    "schema_version": event.schema_version,
+                    "bundle_id": event.bundle_id,
+                    "component_id": event.component_id,
+                    "component_version": event.component_version,
+                    "source": event.source,
+                    "privacy_class": event.privacy_class,
+                    "occurred_at": event.occurred_at.isoformat()
+                    if event.occurred_at
+                    else None,
+                    "created_at": event.created_at.isoformat()
+                    if event.created_at
+                    else None,
+                },
+            )
+        except Exception:  # noqa: BLE001 — logging must never break ingest
+            return
 
     def list_states(
         self,
