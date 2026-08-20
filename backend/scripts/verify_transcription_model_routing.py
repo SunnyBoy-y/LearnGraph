@@ -63,11 +63,25 @@ def database_with(capabilities: dict, *, functional_model: str | None = None):
         engine.dispose()
 
 
+def _settings_stub() -> SimpleNamespace:
+    """Settings stub sufficient for ``_resolve_provider_base_url`` unit runs.
+
+    The stub URLs in this script are remote (non-loopback), so the host-access
+    strategy always passes them through unchanged; the fields only need to
+    exist for attribute access.
+    """
+    return SimpleNamespace(
+        effective_host_bridge_url=None,
+        deployment_profile="personal_desktop",
+        effective_host_access_mode="off",
+    )
+
+
 def resolve(db: Session, purpose: str, model_id: str | None = None):
     return transcription_provider_for_workspace(
         db,
         WORKSPACE_ID,
-        SimpleNamespace(),
+        _settings_stub(),
         provider_id=PROVIDER_ID if model_id is not None else None,
         model_id=model_id,
         purpose=purpose,
@@ -122,10 +136,10 @@ def verify_functional_default_is_stored_only() -> None:
         functional_model="qwen3-asr-flash",
     ) as db:
         stored = transcription_provider_for_workspace(
-            db, WORKSPACE_ID, SimpleNamespace(), purpose="stored"
+            db, WORKSPACE_ID, _settings_stub(), purpose="stored"
         )
         realtime = transcription_provider_for_workspace(
-            db, WORKSPACE_ID, SimpleNamespace(), purpose="realtime"
+            db, WORKSPACE_ID, _settings_stub(), purpose="realtime"
         )
         assert stored is not None and stored.model_id == "qwen3-asr-flash"
         assert realtime is not None and realtime.model_id == "paraformer-realtime-v2"
