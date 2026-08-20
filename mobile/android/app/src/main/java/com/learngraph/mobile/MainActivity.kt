@@ -5,16 +5,30 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Message
 import android.view.Gravity
 import android.view.View
+import android.webkit.ConsoleMessage
+import android.webkit.GeolocationPermissions
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
+import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Switch
@@ -40,6 +54,10 @@ class MainActivity : BridgeActivity() {
         const val KEY_NOTIFY = "notify_enabled"
         const val KEY_VIBRATE = "vibrate_enabled"
         const val KEY_INTERVAL = "poll_interval_seconds"
+        /** Capacitor Preferences 默认存储组（store.ts 通过 @capacitor/preferences 写入） */
+        const val CAPACITOR_PREFS = "CapacitorStorage"
+        /** 服务器地址键（store.ts K.baseUrl） */
+        const val KEY_BASE_URL = "lg.baseUrl"
         /** 本机助手页（连接配置/返回入口） */
         const val LOCAL_HOME = "https://localhost/index.html?from=webapp"
 
@@ -59,6 +77,7 @@ class MainActivity : BridgeActivity() {
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         webViewRef = bridge.getWebView()
         tuneWebView()
+        installExternalLinkGuard()
         installControlPill()
         maybeRequestNotificationPermission()
         syncNotificationService()
@@ -86,6 +105,179 @@ class MainActivity : BridgeActivity() {
             wv.settings.textZoom = 100
             wv.overScrollMode = View.OVER_SCROLL_NEVER
         }
+    }
+
+    // ------------------------------------------------------------------ //
+    // 外跳拦截：外部 http(s) 一律内嵌浏览器打开，绝不跳系统浏览器（仿 ChatGPT）
+    // ------------------------------------------------------------------ //
+
+    private fun installExternalLinkGuard() {
+        val wv = bridge.getWebView() ?: return
+        wv.post {
+            val baseClient = wv.webViewClient
+            val baseChrome = wv.webChromeClient
+
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    val url = request.url
+                    if (url.scheme == "http" || url.scheme == "https") {
+                        if (isSameServer(url)) return false // 属于配置的服务器：留在主 WebView
+                        EmbeddedBrowserActivity.open(this@MainActivity, url.toString())
+                        return true
+                    }
+                    return baseClient?.shouldOverrideUrlLoading(view, request) ?: false
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun shouldOverrideUrlLoading(view: WebView, url: String?): Boolean {
+                    val u = url ?: return false
+                    val uri = Uri.parse(u)
+                    if (uri.scheme == "http" || uri.scheme == "https") {
+                        if (isSameServer(uri)) return false
+                        EmbeddedBrowserActivity.open(this@MainActivity, u)
+                        return true
+                    }
+                    return baseClient?.shouldOverrideUrlLoading(view, u) ?: false
+                }
+
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
+                    baseClient?.shouldInterceptRequest(view, request) ?: super.shouldInterceptRequest(view, request)
+
+                override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                    baseClient?.onPageStarted(view, url, favicon) ?: super.onPageStarted(view, url, favicon)
+                }
+
+                override fun onPageFinished(view: WebView, url: String?) {
+                    baseClient?.onPageFinished(view, url) ?: super.onPageFinished(view, url)
+                }
+
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                    baseClient?.onReceivedError(view, request, error) ?: super.onReceivedError(view, request, error)
+                }
+
+                override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
+                    baseClient?.onReceivedHttpError(view, request, errorResponse) ?: super.onReceivedHttpError(view, request, errorResponse)
+                }
+
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean =
+                    baseClient?.onRenderProcessGone(view, detail) ?: super.onRenderProcessGone(view, detail)
+            }
+
+            wv.webChromeClient = object : WebChromeClient() {
+                // target="_blank" / window.open → 用临时 WebView 接住弹窗请求并捕获 URL，转内嵌浏览器
+                override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
+                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: run {
+                        return baseChrome?.onCreateWindow(view, isDialog, isUserGesture, resultMsg) ?: false
+                    }
+                    val temp = WebView(this@MainActivity)
+                    temp.webViewClient = object : WebViewClient() {
+                        private var captured = false
+
+                        private fun capture(url: String) {
+                            if (captured) return
+                            captured = true
+                            if (url.startsWith("http://") || url.startsWith("https://")) {
+                                EmbeddedBrowserActivity.open(this@MainActivity, url)
+                            }
+                            temp.post {
+                                try {
+                                    (temp.parent as? android.view.ViewGroup)?.removeView(temp)
+                                    temp.destroy()
+                                } catch (_: Exception) {
+                                    // 忽略清理期异常
+                                }
+                            }
+                        }
+
+                        override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
+                            capture(request.url.toString())
+                            return true
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun shouldOverrideUrlLoading(v: WebView, url: String?): Boolean {
+                            capture(url ?: "")
+                            return true
+                        }
+
+                        override fun onPageStarted(v: WebView, url: String?, favicon: Bitmap?) {
+                            capture(url ?: "")
+                        }
+                    }
+                    // 挂到视图树（1×1 不可见）确保弹窗加载被驱动，捕获后立即拆除
+                    addContentView(temp, FrameLayout.LayoutParams(1, 1))
+                    temp.visibility = View.GONE
+                    transport.setWebView(temp)
+                    resultMsg.sendToTarget()
+                    return true
+                }
+
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    baseChrome?.onProgressChanged(view, newProgress) ?: super.onProgressChanged(view, newProgress)
+                }
+
+                override fun onJsAlert(view: WebView, url: String, message: String, result: JsResult): Boolean =
+                    baseChrome?.onJsAlert(view, url, message, result) ?: super.onJsAlert(view, url, message, result)
+
+                override fun onJsConfirm(view: WebView, url: String, message: String, result: JsResult): Boolean =
+                    baseChrome?.onJsConfirm(view, url, message, result) ?: super.onJsConfirm(view, url, message, result)
+
+                override fun onJsPrompt(view: WebView, url: String, message: String, defaultValue: String, result: JsPromptResult): Boolean =
+                    baseChrome?.onJsPrompt(view, url, message, defaultValue, result) ?: super.onJsPrompt(view, url, message, defaultValue, result)
+
+                override fun onPermissionRequest(request: PermissionRequest) {
+                    baseChrome?.onPermissionRequest(request) ?: super.onPermissionRequest(request)
+                }
+
+                override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
+                    baseChrome?.onGeolocationPermissionsShowPrompt(origin, callback) ?: super.onGeolocationPermissionsShowPrompt(origin, callback)
+                }
+
+                @Suppress("DEPRECATION")
+                override fun onShowFileChooser(
+                    webView: WebView,
+                    filePathCallback: ValueCallback<Array<Uri>>,
+                    fileChooserParams: WebChromeClient.FileChooserParams,
+                ): Boolean =
+                    baseChrome?.onShowFileChooser(webView, filePathCallback, fileChooserParams) ?: super.onShowFileChooser(webView, filePathCallback, fileChooserParams)
+
+                override fun onShowCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
+                    baseChrome?.onShowCustomView(view, callback) ?: super.onShowCustomView(view, callback)
+                }
+
+                override fun onHideCustomView() {
+                    baseChrome?.onHideCustomView() ?: super.onHideCustomView()
+                }
+
+                override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean =
+                    baseChrome?.onConsoleMessage(consoleMessage) ?: super.onConsoleMessage(consoleMessage)
+            }
+        }
+    }
+
+    /** 读取用户配置的服务器地址（store.ts 通过 Capacitor Preferences 写入 CapacitorStorage） */
+    private fun configuredServer(): Pair<String, Int>? {
+        val base = getSharedPreferences(CAPACITOR_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_BASE_URL, "")?.trim().orEmpty()
+        if (base.isBlank()) return null
+        val uri = Uri.parse(base)
+        val host = uri.host?.lowercase() ?: return null
+        return host to effectivePort(uri)
+    }
+
+    private fun effectivePort(uri: Uri): Int {
+        val p = uri.port
+        if (p != -1) return p
+        return if (uri.scheme == "https") 443 else 80
+    }
+
+    /** http(s) 链接是否属于已配置服务器（留在主 WebView 内导航），否则进内嵌浏览器 */
+    private fun isSameServer(url: Uri): Boolean {
+        val scheme = url.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") return false
+        val server = configuredServer() ?: return false
+        val host = url.host?.lowercase() ?: return false
+        return host == server.first && effectivePort(url) == server.second
     }
 
     private fun currentRemoteUrl(): String? {

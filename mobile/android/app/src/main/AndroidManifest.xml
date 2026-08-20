@@ -27,6 +27,13 @@
 
         </activity>
 
+        <!-- 内嵌浏览器：外部链接一律在应用内打开（仿 ChatGPT），不跳系统浏览器 -->
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation"
+            android:name=".EmbeddedBrowserActivity"
+            android:exported="false"
+            android:theme="@style/AppTheme.NoActionBar" />
+
         <!-- 后台轮询新回复 → 系统通知 + 震动（见 NotificationService.kt） -->
         <service
             android:name=".NotificationService"
