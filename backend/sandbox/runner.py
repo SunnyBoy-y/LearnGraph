@@ -297,14 +297,15 @@ def web_fetch(
             raise WebFetchError("web fetch requires the sandbox egress proxy")
         if not policy_digest:
             raise WebFetchError("web fetch requires the egress policy digest")
-        # httpx does not echo request headers on CONNECT; the approved policy
-        # digest must ride the proxy's own headers so the multi-tenant proxy can
-        # resolve the per-workspace policy. The proxy URL is backend-injected via
-        # HTTPS_PROXY; no direct socket is ever opened.
+        # httpx does not send custom headers on CONNECT, so the policy digest
+        # rides the standard Proxy-Authorization: Basic channel instead
+        # (username = digest) — the same channel web_render.js uses. The proxy
+        # URL is backend-injected via HTTPS_PROXY; no direct socket is ever
+        # opened.
         transport = httpx.HTTPTransport(
             proxy=httpx.Proxy(
                 proxy_url,
-                headers={"X-LearnGraph-Policy-Digest": policy_digest},
+                auth=(policy_digest, ""),
             )
         )
     current_url = spec.url

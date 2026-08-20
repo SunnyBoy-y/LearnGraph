@@ -758,7 +758,7 @@ class DockerRuntimeBackend:
                     privileged=False,
                     tty=False,
                 )
-                client.api.exec_start(kill_exec)
+                client.api.exec_start(self._exec_id(kill_exec))
             except Exception:  # noqa: BLE001 - best-effort process termination
                 logger.debug(
                     "process-group %s signal %s failed for pid %s",
@@ -789,11 +789,16 @@ class DockerRuntimeBackend:
         # Wrap argv in setsid so the command becomes its own process-group
         # leader (PID == PGID). On timeout/truncate/cancel we can then target
         # exactly that process group instead of the whole container.
+        # ``-w`` is required: when the exec process is itself a process-group
+        # leader (docker exec), plain ``setsid`` forks and exits immediately
+        # with 0, so docker would report exit 0 for every command — the real
+        # program runs in the child and its exit code is lost. ``-w`` makes
+        # setsid wait for the child and propagate its exit code.
         deadline = started + max(1, timeout_seconds)
         timed_out, truncated, exec_id, pid, stdout, stderr = self._exec_and_stream(
             client,
             container,
-            ("setsid",) + tuple(argv),
+            ("setsid", "-w") + tuple(argv),
             workdir=workdir,
             environment=environment,
             timeout_seconds=timeout_seconds,
@@ -837,11 +842,12 @@ class DockerRuntimeBackend:
                 self._terminate_process_group(client, container, pid)
                 exit_code = -1
             else:
-                try:
-                    inspect = client.api.exec_inspect(exec_id)
-                    exit_code = inspect.get("ExitCode")
-                except Exception:  # noqa: BLE001
-                    exit_code = None
+                # The output stream can EOF early when the docker-py socket
+                # layer reports empty reads (SocketIO), while the exec process
+                # is still running — at that point exec_inspect still reports
+                # ExitCode=0. Never trust a code read right after streaming:
+                # poll until the exec actually finished (Running=False).
+                exit_code = self._wait_for_exec_exit(client, exec_id)
         finally:
             if execution_id:
                 self._untrack_exec(execution_id)
@@ -870,14 +876,16 @@ class DockerRuntimeBackend:
         """Start one exec, stream its output with a bounded reader, and return
         ``(timed_out, truncated, exec_id, pid, stdout, stderr)``."""
         try:
-            exec_id = client.api.exec_create(
-                container.id,
-                list(argv),
-                user=RUNNER_UID,
-                workdir=workdir,
-                environment=environment,
-                privileged=False,
-                tty=False,
+            exec_id = self._exec_id(
+                client.api.exec_create(
+                    container.id,
+                    list(argv),
+                    user=RUNNER_UID,
+                    workdir=workdir,
+                    environment=environment,
+                    privileged=False,
+                    tty=False,
+                )
             )
         except Exception as exc:
             raise DockerRuntimeError(f"failed to create exec: {type(exc).__name__}") from exc
@@ -970,6 +978,47 @@ class DockerRuntimeBackend:
             payload.extend(chunk)
         return stream_type, bytes(payload)
 
+    @staticmethod
+    def _exec_id(created: Any) -> str:
+        """Normalize ``exec_create`` return values across docker-py versions.
+
+        docker-py >=7.2 returns ``{"Id": "..."}`` (dict) while older versions
+        return a plain string; ``exec_start``/``exec_inspect`` must receive the
+        actual id or they silently no-op (empty stream, Running stuck True,
+        exit code always 0).
+        """
+        if isinstance(created, dict):
+            value = created.get("Id") or created.get("id")
+            if value:
+                return str(value)
+        return str(created)
+
+    def _wait_for_exec_exit(
+        self, client: Any, exec_id: str, timeout: float = 15.0
+    ) -> int | None:
+        """Poll ``exec_inspect`` until the exec finishes, then return its real
+        exit code.
+
+        docker-py's ``exec_start(socket=True)`` stream can EOF before the
+        process exits (empty SocketIO reads), so an ``exec_inspect`` right
+        after streaming may observe a still-running exec whose ``ExitCode`` is
+        ``0`` regardless of the real outcome. Polling ``Running`` avoids
+        misreporting every failed exec as a successful exit-0.
+        """
+        deadline = time.monotonic() + max(0.1, timeout)
+        last_code: int | None = None
+        while time.monotonic() < deadline:
+            try:
+                inspect = client.api.exec_inspect(exec_id)
+            except Exception:  # noqa: BLE001
+                return None
+            running = bool(inspect.get("Running", True))
+            last_code = inspect.get("ExitCode")
+            if not running:
+                return last_code
+            time.sleep(0.1)
+        return last_code
+
     def _ensure_running(self, client: Any, handle: RuntimeHandle):
         container = self._container(client, handle)
         if container.status != "running":
@@ -1051,14 +1100,16 @@ class DockerRuntimeBackend:
             server_script = f"{WORKSPACE_MOUNT}/{kernel_dir}/kernel_server.py"
             self.write_file(handle, f"{kernel_dir}/kernel_server.py", KERNEL_SERVER_SOURCE.encode("utf-8"), mode=0o644)
             self.write_file(handle, f"{kernel_dir}/kernel_client.py", KERNEL_CLIENT_SOURCE.encode("utf-8"), mode=0o644)
-            exec_id = client.api.exec_create(
-                container.id,
-                ["python", server_script, kernel_id, port_file, workspace_relative or "."],
-                user=RUNNER_UID,
-                workdir=WORKSPACE_MOUNT,
-                environment={"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "XDG_CACHE_HOME": "/tmp/.cache"},
-                privileged=False,
-                tty=False,
+            exec_id = self._exec_id(
+                client.api.exec_create(
+                    container.id,
+                    ["python", server_script, kernel_id, port_file, workspace_relative or "."],
+                    user=RUNNER_UID,
+                    workdir=WORKSPACE_MOUNT,
+                    environment={"HOME": "/tmp", "XDG_CONFIG_HOME": "/tmp/.config", "XDG_CACHE_HOME": "/tmp/.cache"},
+                    privileged=False,
+                    tty=False,
+                )
             )
             client.api.exec_start(exec_id, detach=True)
             # Wait for the port file (bounded poll); the server writes it after
