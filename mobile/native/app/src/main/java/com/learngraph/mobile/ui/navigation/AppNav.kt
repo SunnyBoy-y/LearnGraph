@@ -56,6 +56,9 @@ fun AppNav() {
         composable(Routes.WEBAPP) {
             WebAppScreen(
                 onOpenDownloads = { navController.navigate(Routes.DOWNLOADS) },
+                onLoadFailed = {
+                    navController.navigate(Routes.CONNECT) { popUpTo(0) { inclusive = true } }
+                },
             )
         }
         composable(Routes.DOWNLOADS) {

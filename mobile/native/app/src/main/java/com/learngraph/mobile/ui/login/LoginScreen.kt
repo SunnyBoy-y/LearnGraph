@@ -1,6 +1,7 @@
 package com.learngraph.mobile.ui.login
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -8,24 +9,30 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.learngraph.mobile.LearnGraphApp
+import com.learngraph.mobile.data.AuthStore
 import com.learngraph.mobile.data.LoginResponse
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -39,11 +46,24 @@ import java.util.UUID
 fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
     val app = LocalContext.current.applicationContext as LearnGraphApp
     val scope = rememberCoroutineScope()
+    val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
 
     var username by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
+    var rememberMe by rememberSaveable { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+
+    // 自动填充已记忆的账号密码（记忆前用户已同意过一次）
+    LaunchedEffect(authState.savedUsername, authState.savedPassword) {
+        if (authState.savedUsername.isNotBlank()) {
+            username = authState.savedUsername
+            rememberMe = true
+        }
+        if (authState.savedPassword.isNotBlank() && password.isBlank()) {
+            password = authState.savedPassword
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -78,7 +98,27 @@ fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = KeyboardType.Password),
         )
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(4.dp))
+
+        // 记忆前询问：勾选「记住密码」才保存到本机，下次自动填充
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(
+                checked = rememberMe,
+                onCheckedChange = { rememberMe = it },
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "记住密码（下次自动填充，仅保存在本机）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
 
         if (error != null) {
             Text(
@@ -118,6 +158,12 @@ fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
                                 sessionId = login.sessionId,
                                 deviceId = deviceId,
                             )
+                            // 记忆前已询问（勾选）：同意才保存，取消勾选则清除
+                            if (rememberMe) {
+                                app.authStore.saveCredentials(username, password)
+                            } else {
+                                app.authStore.clearCredentials()
+                            }
                             onLoggedIn()
                         }
                     } catch (e: Exception) {

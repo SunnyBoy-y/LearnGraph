@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -69,7 +70,10 @@ import kotlinx.coroutines.launch
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WebAppScreen(onOpenDownloads: () -> Unit) {
+fun WebAppScreen(
+    onOpenDownloads: () -> Unit,
+    onLoadFailed: () -> Unit,
+) {
     val context = LocalContext.current
     val app = context.applicationContext as LearnGraphApp
     val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
@@ -134,6 +138,8 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                             webViewClient = object : WebViewClient() {
+                                private var loadFailed = false
+
                                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                                     val url = request.url
                                     val scheme = url.scheme?.lowercase()
@@ -153,6 +159,24 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
                                     syncLoginState(view)
                                     // Cookie 强制写盘：登录态持久化（重启免登录）
                                     CookieManager.getInstance().flush()
+                                }
+
+                                override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                                    super.onPageStarted(view, url, favicon)
+                                    loadFailed = false
+                                }
+
+                                // 网页加载失败（服务器不可达/网络异常）→ 自动调回连接页
+                                override fun onReceivedError(
+                                    view: WebView,
+                                    request: WebResourceRequest,
+                                    error: WebResourceError,
+                                ) {
+                                    super.onReceivedError(view, request, error)
+                                    if (request.isForMainFrame && !loadFailed) {
+                                        loadFailed = true
+                                        onLoadFailed()
+                                    }
                                 }
 
                                 /**

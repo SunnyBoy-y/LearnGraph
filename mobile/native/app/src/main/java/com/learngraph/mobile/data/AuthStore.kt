@@ -24,6 +24,8 @@ class AuthStore(private val context: Context) {
         val DISPLAY_NAME = stringPreferencesKey("lg.displayName")
         val SESSION_ID = stringPreferencesKey("lg.sessionId")
         val DEVICE_ID = stringPreferencesKey("lg.deviceId")
+        val SAVED_USERNAME = stringPreferencesKey("lg.savedUsername")
+        val SAVED_PASSWORD = stringPreferencesKey("lg.savedPassword")
     }
 
     data class AuthState(
@@ -34,6 +36,8 @@ class AuthStore(private val context: Context) {
         val displayName: String? = null,
         val sessionId: String? = null,
         val deviceId: String = "",
+        val savedUsername: String = "",
+        val savedPassword: String = "",
     )
 
     val state: Flow<AuthState> = context.dataStore.data.map { p ->
@@ -45,6 +49,8 @@ class AuthStore(private val context: Context) {
             displayName = p[Keys.DISPLAY_NAME],
             sessionId = p[Keys.SESSION_ID],
             deviceId = p[Keys.DEVICE_ID] ?: "",
+            savedUsername = p[Keys.SAVED_USERNAME] ?: "",
+            savedPassword = p[Keys.SAVED_PASSWORD] ?: "",
         )
     }
 
@@ -73,6 +79,21 @@ class AuthStore(private val context: Context) {
     /** 网页版内重新登录后，把新 token 回写同步（持续免登录关键） */
     suspend fun updateToken(token: String) {
         context.dataStore.edit { it[Keys.TOKEN] = token }
+    }
+
+    /** 记忆账号密码（自动重登用；应用私有存储） */
+    suspend fun saveCredentials(username: String, password: String) {
+        context.dataStore.edit {
+            it[Keys.SAVED_USERNAME] = username
+            it[Keys.SAVED_PASSWORD] = password
+        }
+    }
+
+    suspend fun clearCredentials() {
+        context.dataStore.edit {
+            it.remove(Keys.SAVED_USERNAME)
+            it.remove(Keys.SAVED_PASSWORD)
+        }
     }
 
     suspend fun clearAuth() {
