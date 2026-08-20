@@ -1,52 +1,29 @@
 import { useState } from 'react'
-import { CHANNEL_PRESETS, isNativePlatform, normalizeBaseUrl, useAppStore } from '../store'
-import type { ChannelProfile } from '../store'
+import { isNativePlatform, normalizeBaseUrl, useAppStore } from '../store'
 import { useToastStore } from '../store'
 
-type Tab = Exclude<ChannelProfile, 'custom'> | 'custom'
-
-const TABS: Array<{ id: Tab; label: string }> = [
-  { id: 'docker', label: 'Docker 服务器' },
-  { id: 'custom', label: '自定义' },
-]
-
+/**
+ * 连接配置（单一通道）：Docker 服务器默认 18000。
+ * 产品概念已取消「桌面版」渠道——APK 只连 Docker 部署的服务，网页版内含全部功能。
+ */
 export default function ConnectScreen() {
-  const { baseUrl, profile, setConnection } = useAppStore()
+  const { baseUrl, setConnection } = useAppStore()
   const showToast = useToastStore((s) => s.showToast)
 
-  const initialTab: Tab = profile === 'custom' ? 'custom' : (profile as Tab)
-  const [tab, setTab] = useState<Tab>(initialTab)
   const [address, setAddress] = useState(baseUrl || '')
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null)
 
   const native = isNativePlatform()
 
-  const placeholder = (() => {
-    if (tab === 'docker') return 'http://192.168.1.100:18000'
-    return 'https://example.com:18000'
-  })()
-
-  const presetAddress = (): string => {
-    if (tab === 'docker') return `http://192.168.1.100:${CHANNEL_PRESETS.docker.port}`
-    return address
-  }
-
-  const ensureAddress = (): string => {
-    if (tab === 'custom') return address
-    // 预设渠道：地址为空时先自动填入示例地址（可编辑），真机不允许空地址
-    return address || presetAddress()
-  }
-
   const handleTest = async () => {
     if (native && !normalizeBaseUrl(address)) {
-      showToast('error', '真机上必须填写服务器地址')
+      showToast('error', '请填写服务器地址')
       return
     }
     setTesting(true)
     setTestResult(null)
-    const value = ensureAddress()
-    const result = await setConnection(value, tab === 'custom' ? 'custom' : tab)
+    const result = await setConnection(address)
     setTesting(false)
     if (result.ok) {
       const info = result.info
@@ -61,11 +38,10 @@ export default function ConnectScreen() {
 
   const handleContinue = async () => {
     if (native && !normalizeBaseUrl(address)) {
-      showToast('error', '真机上必须填写服务器地址')
+      showToast('error', '请填写服务器地址')
       return
     }
-    const value = ensureAddress()
-    const result = await setConnection(value, tab === 'custom' ? 'custom' : tab)
+    const result = await setConnection(address)
     if (result.ok) {
       useAppStore.setState({ screen: 'webview' })
     } else {
@@ -78,45 +54,25 @@ export default function ConnectScreen() {
       <div className="connect-hero">
         <div className="connect-logo">LG</div>
         <h1>LearnGraph</h1>
-        <p className="dim">手机端 · 连接你的电脑服务 · 共享历史记录</p>
+        <p className="dim">手机端 · 连接你的服务器 · 共享历史记录</p>
       </div>
 
       <div className="connect-card">
-        <div className="tabs">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              className={`tab ${tab === t.id ? 'active' : ''}`}
-              onClick={() => {
-                setTab(t.id)
-                setTestResult(null)
-                // 切到预设渠道且地址为空时，自动填入示例地址方便修改
-                if (t.id !== 'custom' && !address) {
-                  setAddress(`http://192.168.1.100:${CHANNEL_PRESETS[t.id].port}`)
-                }
-              }}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-
         <div className="field">
           <label className="field-label">服务器地址</label>
           <input
             className="input"
             value={address}
             onChange={(e) => setAddress(e.target.value)}
-            placeholder={placeholder}
+            placeholder="http://192.168.1.100:18000"
             inputMode="url"
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
           />
-          {tab !== 'custom' && !address ? (
-            <p className="field-hint">{CHANNEL_PRESETS[tab].hint}</p>
-          ) : null}
+          <p className="field-hint">
+            Docker 服务入口（默认端口 18000，含网页版全部功能）
+          </p>
           {!native && !address ? (
             <p className="field-hint dim">浏览器开发态可留空（走 Vite 代理到本机 18000）</p>
           ) : null}

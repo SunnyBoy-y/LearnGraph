@@ -9,19 +9,9 @@ import { createUuid, storageGet, storageRemove, storageSet } from './storage'
 import type { DeploymentProfile, Session } from './types'
 
 export type Screen = 'connect' | 'webview' | 'login' | 'home' | 'chat'
-export type ChannelProfile = 'docker' | 'custom'
-
-export const CHANNEL_PRESETS: Record<Exclude<ChannelProfile, 'custom'>, { label: string; port: number; hint: string }> = {
-  docker: {
-    label: 'Docker 服务器',
-    port: 18000,
-    hint: 'docker compose 部署的服务入口（LEARNGRAPH_PORT 默认 18000）',
-  },
-}
 
 const K = {
   baseUrl: 'lg.baseUrl',
-  profile: 'lg.profile',
   token: 'lg.token',
   workspaceId: 'lg.workspaceId',
   username: 'lg.username',
@@ -66,7 +56,6 @@ interface AppState {
   screen: Screen
 
   baseUrl: string
-  profile: ChannelProfile
   profileInfo: DeploymentProfile | null
   connectionError: string | null
 
@@ -86,7 +75,7 @@ interface AppState {
   activeSession: Session | null
 
   hydrate: () => Promise<void>
-  setConnection: (baseUrl: string, profile: ChannelProfile) => Promise<{ ok: boolean; error?: string; info?: DeploymentProfile | null }>
+  setConnection: (baseUrl: string) => Promise<{ ok: boolean; error?: string; info?: DeploymentProfile | null }>
   login: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
   loadSessions: () => Promise<void>
@@ -126,7 +115,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   screen: 'connect',
 
   baseUrl: '',
-  profile: 'docker',
   profileInfo: null,
   connectionError: null,
 
@@ -146,10 +134,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeSession: null,
 
   async hydrate() {
-    const [baseUrl, profileRaw, token, workspaceId, username, displayName, sessionId, expiresAt, deviceId] =
+    const [baseUrl, token, workspaceId, username, displayName, sessionId, expiresAt, deviceId] =
       await Promise.all([
         storageGet(K.baseUrl),
-        storageGet(K.profile),
         storageGet(K.token),
         storageGet(K.workspaceId),
         storageGet(K.username),
@@ -161,13 +148,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const devId = deviceId || createUuid()
     if (!deviceId) await storageSet(K.deviceId, devId)
 
-    // 旧版本可能持久化了 'desktop' 渠道（Win 桌面版已下线），归一化为 docker
-    const storedProfile = profileRaw as ChannelProfile | 'desktop' | null
-    const normalizedProfile: ChannelProfile = storedProfile === 'desktop' ? 'docker' : storedProfile || 'docker'
-
     const next = {
       baseUrl: baseUrl ?? '',
-      profile: normalizedProfile,
       token: token || null,
       workspaceId: workspaceId || null,
       username: username || null,
@@ -181,14 +163,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       ...next,
       hydrated: true,
-      screen: next.token && next.baseUrl ? 'home' : next.baseUrl ? 'login' : 'connect',
+      // 包裹器流程：有服务器地址 → 直接进入网页版（登录在网页版内完成）
+      screen: next.baseUrl ? 'webview' : 'connect',
     })
     if (next.token && next.baseUrl) {
       void get().loadSessions()
     }
   },
 
-  async setConnection(baseUrl, profile) {
+  async setConnection(baseUrl) {
     const normalized = normalizeBaseUrl(baseUrl)
     set({ connectionError: null })
     try {
@@ -199,9 +182,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         configureApi({ baseUrl: normalized })
       }
       const info = await api.deploymentProfile()
-      set({ baseUrl: normalized, profile, profileInfo: info })
+      set({ baseUrl: normalized, profileInfo: info })
       await storageSet(K.baseUrl, normalized)
-      await storageSet(K.profile, profile)
       return { ok: true, info }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -255,7 +237,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       displayName: null,
       sessionId: null,
       expiresAt: null,
-      screen: get().baseUrl ? 'login' : 'connect',
+      screen: get().baseUrl ? 'webview' : 'connect',
       sessions: [],
       activeSessionId: null,
       activeSession: null,
