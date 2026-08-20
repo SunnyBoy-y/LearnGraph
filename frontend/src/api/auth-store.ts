@@ -51,27 +51,56 @@ function createDeviceId(): string {
   return createUuid()
 }
 
+/**
+ * 读取优先级：sessionStorage（当前标签页的会话覆盖，保留多标签隔离）
+ * → localStorage（持久化层：桌面浏览器重启、手机 WebView 注入/重启免登录）
+ * → 内存兜底。
+ */
 function read(key: string, fallback: string | null): string | null {
   const storage = browserStorage()
-  if (!storage) return fallback
-
-  try {
-    return storage.getItem(key) ?? fallback
-  } catch {
-    return fallback
+  if (storage) {
+    try {
+      const value = storage.getItem(key)
+      if (value !== null) return value
+    } catch {
+      // Fall through to the persistent layer below.
+    }
   }
+  const persistent = persistentStorage()
+  if (persistent) {
+    try {
+      return persistent.getItem(key) ?? fallback
+    } catch {
+      return fallback
+    }
+  }
+  return fallback
 }
 
+/**
+ * 双写 sessionStorage + localStorage：当前会话立即生效，同时持久化供
+ * 下次启动（桌面浏览器重启 / 手机 App 重启）恢复登录态。原生 WebView 的
+ * syncLoginState 正是从 localStorage 读取并回写 DataStore。
+ */
 function write(key: string, value: string | null): void {
   const storage = browserStorage()
-  if (!storage) return
-
-  try {
-    if (value === null) storage.removeItem(key)
-    else storage.setItem(key, value)
-  } catch {
-    // Private browsing and storage policies can reject writes. The in-memory
-    // state remains usable for the current page lifetime.
+  if (storage) {
+    try {
+      if (value === null) storage.removeItem(key)
+      else storage.setItem(key, value)
+    } catch {
+      // Private browsing and storage policies can reject writes. The in-memory
+      // state remains usable for the current page lifetime.
+    }
+  }
+  const persistent = persistentStorage()
+  if (persistent) {
+    try {
+      if (value === null) persistent.removeItem(key)
+      else persistent.setItem(key, value)
+    } catch {
+      // Non-fatal: the session-layer copy above keeps the tab usable.
+    }
   }
 }
 
@@ -83,6 +112,25 @@ function readBoolean(key: string, fallback: boolean | null): boolean | null {
 
 function writeBoolean(key: string, value: boolean | null): void {
   write(key, value === null ? null : String(value))
+}
+
+/**
+ * 通知原生端（手机 App WebView）清除 DataStore 登录态。登出/会话失效后
+ * 必须同步清掉原生持久层，否则 syncLoginState 会在下次页面加载时把旧 token
+ * 重新注入（注入死循环）。桌面浏览器无该 bridge，静默忽略。
+ */
+function notifyNativeAuthCleared(): void {
+  try {
+    if (typeof window === 'undefined') return
+    const bridge = (
+      window as unknown as {
+        LearnGraphNative?: { clearAuth?: () => void }
+      }
+    ).LearnGraphNative
+    bridge?.clearAuth?.()
+  } catch {
+    // Bridge 异常不影响前端登出流程。
+  }
 }
 
 export const authStore = {
@@ -199,5 +247,6 @@ export const authStore = {
     write(DISPLAY_NAME_KEY, null)
     write(SESSION_ID_KEY, null)
     writeBoolean(MUST_CHANGE_PASSWORD_KEY, null)
+    notifyNativeAuthCleared()
   },
 }
