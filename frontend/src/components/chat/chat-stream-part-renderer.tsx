@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import { downloadFile } from "@/api/files";
 import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
+import { downloadViaNative } from "@/lib/native-download";
 import {
   Dialog,
   DialogClose,
@@ -370,6 +371,14 @@ function ChatImagePart({ part }: { part: MessagePart }) {
   }`;
   const handleDownload = useCallback(async () => {
     if (!source) return;
+    // 移动端 WebView：真实 URL 交给原生下载器
+    if (
+      !source.startsWith("blob:") &&
+      !source.startsWith("data:") &&
+      downloadViaNative(source, downloadName)
+    ) {
+      return;
+    }
     try {
       let href = source;
       let revoke = false;

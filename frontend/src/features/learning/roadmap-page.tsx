@@ -30,6 +30,7 @@ import {
   YAxis,
 } from "recharts";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { saveBlobViaNative } from "@/lib/native-download";
 import { toast } from "sonner";
 
 import {
@@ -730,16 +731,20 @@ export function RoadmapPlannerPage() {
       );
     });
     lines.push("END:VCALENDAR");
-    const url = URL.createObjectURL(
-      new Blob([lines.join("\r\n")], {
-        type: "text/calendar;charset=utf-8",
-      }),
-    );
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `roadmap-${data.goal_id}.ics`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    const blob = new Blob([lines.join("\r\n")], {
+      type: "text/calendar;charset=utf-8",
+    });
+    const name = `roadmap-${data.goal_id}.ics`;
+    // 移动端 WebView：纯前端生成的 blob 交给原生 base64 通道
+    void saveBlobViaNative(blob, name).then((handled) => {
+      if (handled) return;
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    });
   };
 
   const monthCells = (() => {

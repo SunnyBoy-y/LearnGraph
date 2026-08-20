@@ -14,6 +14,7 @@ import {
   FilePreviewCanvas,
 } from "@/components/resources/file-preview";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
+import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -105,6 +106,15 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
     if (!fileId || downloading) return;
     setDownloading(true);
     try {
+      // 移动端 WebView：真实 URL 交给原生下载器
+      if (
+        downloadViaNative(
+          toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(fileId)}/content`),
+          title,
+        )
+      ) {
+        return;
+      }
       const blob = await downloadFile(fileId);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");

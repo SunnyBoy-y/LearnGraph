@@ -43,6 +43,7 @@ import {
 } from "@/components/ui/select";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { saveBlobViaNative } from "@/lib/native-download";
 import type {
   AnswerResult,
   Evidence,
@@ -58,14 +59,17 @@ import { questionTypeLabel } from "./exercise-labels";
 export { RoadmapPlannerPage as RoadmapPage } from "./roadmap-page";
 
 function downloadJson(name: string, value: unknown) {
-  const url = URL.createObjectURL(
-    new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }),
-  );
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  // 移动端 WebView：纯前端生成的 blob 交给原生 base64 通道
+  void saveBlobViaNative(blob, name).then((handled) => {
+    if (handled) return;
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  });
 }
 
 function EvidenceRow({

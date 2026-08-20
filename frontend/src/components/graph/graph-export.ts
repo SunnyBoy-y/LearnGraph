@@ -9,6 +9,8 @@
  * taints).
  */
 
+import { saveBlobViaNative } from "@/lib/native-download";
+
 export type GraphExportNode = {
   id: string;
   x: number;
@@ -367,7 +369,9 @@ export function sanitizeFilename(value: string): string {
   return cleaned || "学习图谱";
 }
 
-function triggerDownload(blob: Blob, filename: string): void {
+async function triggerDownload(blob: Blob, filename: string): Promise<void> {
+  // 移动端 WebView：纯前端生成的 blob 交给原生 base64 通道
+  if (await saveBlobViaNative(blob, filename)) return;
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -381,7 +385,7 @@ function triggerDownload(blob: Blob, filename: string): void {
 /** Download the SVG document as a .svg file. */
 export function downloadSvgFile(svg: string, filename: string): void {
   const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
-  triggerDownload(blob, filename);
+  void triggerDownload(blob, filename);
 }
 
 /** Rasterize the SVG at 2x and download as a .png file. */
@@ -419,8 +423,7 @@ export async function downloadPngFile(svg: string, filename: string): Promise<vo
         "image/png",
       );
     });
-    triggerDownload(png, filename);
+    await triggerDownload(png, filename);
   } finally {
     URL.revokeObjectURL(url);
-  }
-}
+  }}

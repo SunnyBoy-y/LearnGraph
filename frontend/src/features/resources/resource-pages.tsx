@@ -53,6 +53,7 @@ import { SourceAssociationDialog } from "@/components/resources/source-associati
 import { SourceDetailDialog } from "@/components/resources/source-detail-dialog";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
+import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import {
   ErrorState,
   LoadingState,
@@ -233,6 +234,15 @@ export function SourcesPage() {
   });
   const download = useMutation({
     mutationFn: async (file: FileRecord) => {
+      // 移动端 WebView：真实 URL 交给原生下载器
+      if (
+        downloadViaNative(
+          toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.id)}/content`),
+          file.original_name || "download",
+        )
+      ) {
+        return;
+      }
       const blob = await downloadFile(file.id);
       const url = URL.createObjectURL(blob);
       try {

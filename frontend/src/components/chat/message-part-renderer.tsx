@@ -86,6 +86,7 @@ import {
 } from "@/lib/document-citations";
 import { decodeUrlForDisplay } from "@/lib/url-display";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
+import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
 import type { FetchAuthorizationData, FetchAuthorizationDecision } from "@/types/fetch-authorization";
@@ -1196,6 +1197,17 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
     if (downloading) return;
     setDownloading(true);
     try {
+      // 移动端 WebView：真实 URL 交给原生下载器（OkHttp 自动附 Bearer，
+      // 走原生进度/管理页）。桌面浏览器回退原 blob 下载。
+      if (
+        fileId &&
+        downloadViaNative(
+          toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(fileId)}/content`),
+          filename,
+        )
+      ) {
+        return;
+      }
       const blob = fileId ? await downloadFile(fileId) : undefined;
       const url = blob ? URL.createObjectURL(blob) : href;
       if (!url) return;

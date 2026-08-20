@@ -64,6 +64,7 @@ import {
   updateGraphNode,
 } from "@/api";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { saveBlobViaNative } from "@/lib/native-download";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { GraphReviewDialog } from "@/components/graph/graph-review-dialog";
 import {
@@ -137,16 +138,19 @@ import type {
 import type { DeleteImpact } from "@/types/workflow";
 
 function downloadJsonFile(name: string, value: unknown) {
-  const url = URL.createObjectURL(
-    new Blob([JSON.stringify(value, null, 2)], {
-      type: "application/json;charset=utf-8",
-    }),
-  );
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  const blob = new Blob([JSON.stringify(value, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  // 移动端 WebView：纯前端生成的 blob 交给原生 base64 通道
+  void saveBlobViaNative(blob, name).then((handled) => {
+    if (handled) return;
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  });
 }
 
 type GoalShelfEntry = {

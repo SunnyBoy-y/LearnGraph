@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/dialog";
 import { documentHref } from "@/lib/document-citations";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
+import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import type { SessionFile } from "@/types/files";
 
 const ORIGIN_LABELS: Record<string, string> = {
@@ -246,6 +247,15 @@ export function SessionFilesList({
                           className="size-6"
                           onClick={(event) => {
                             event.stopPropagation();
+                            if (
+                              file.file_id &&
+                              downloadViaNative(
+                                toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.file_id)}/content`),
+                                file.filename,
+                              )
+                            ) {
+                              return;
+                            }
                             void downloadFile(file.file_id!).then((blob) => {
                               const url = URL.createObjectURL(blob);
                               const anchor = document.createElement("a");
@@ -414,6 +424,15 @@ function SessionFilePreviewDialog({
                   {file.file_id ? (
                     <Button
                       onClick={() => {
+                        if (
+                          file.file_id &&
+                          downloadViaNative(
+                            toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.file_id)}/content`),
+                            filename,
+                          )
+                        ) {
+                          return;
+                        }
                         void downloadFile(file.file_id!).then((next) => {
                           const url = URL.createObjectURL(next);
                           const anchor = document.createElement("a");

@@ -55,6 +55,7 @@ import {
 } from '@/api'
 import { authStore } from '@/api/auth-store'
 import { ApiError } from '@/api/client'
+import { saveBlobViaNative } from '@/lib/native-download'
 import {
   identityQueryKey,
   workspaceQueryKey,
@@ -179,14 +180,19 @@ function profileUpdatedHint(latest: string | null): string | null {
 }
 
 function downloadBlob(blob: Blob): void {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = `learngraph-memory-${new Date().toISOString().slice(0, 10)}.zip`
-  document.body.append(anchor)
-  anchor.click()
-  anchor.remove()
-  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  const name = `learngraph-memory-${new Date().toISOString().slice(0, 10)}.zip`
+  // 移动端 WebView：纯 blob（后端导出 zip）交给原生 base64 通道
+  void saveBlobViaNative(blob, name).then((handled) => {
+    if (handled) return
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = name
+    document.body.append(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  })
 }
 
 export function MemoryPage() {

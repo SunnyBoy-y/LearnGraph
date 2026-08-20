@@ -145,6 +145,7 @@ import {
   readChatThinkingChainDefault,
 } from "@/lib/workspace-settings";
 import type { ResponseMode } from "@/lib/session-composer-prefs";
+import { downloadViaNative, saveBlobViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { cn } from "@/lib/utils";
 import { DatabaseConfigurationSheet } from "@/features/settings/database-configuration-sheet";
 import type { AuditEvent } from "@/types/audit";
@@ -679,10 +680,16 @@ export function MigrationPage() {
     mutationFn: downloadFullBackup,
     onError: (error) => toast.error(error.message),
     onSuccess: (blob) => {
+      const name = `learngraph-full-backup-${authStore.getWorkspaceId() ?? "workspace"}.zip`;
+      // 移动端 WebView：备份是 GET 真实 URL，交给原生下载器（流式不占内存）
+      if (downloadViaNative(toAbsoluteApiUrl("/api/v1/migrations/backup"), name)) {
+        toast.success("全盘业务数据备份已生成");
+        return;
+      }
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `learngraph-full-backup-${authStore.getWorkspaceId() ?? "workspace"}.zip`;
+      anchor.download = name;
       anchor.click();
       URL.revokeObjectURL(url);
       toast.success("全盘业务数据备份已生成");
@@ -1507,12 +1514,17 @@ export function AuditPage() {
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: "application/json",
     });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `learngraph-audit-${new Date().toISOString().slice(0, 10)}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    const name = `learngraph-audit-${new Date().toISOString().slice(0, 10)}.json`;
+    // 移动端 WebView：纯前端生成的 blob 交给原生 base64 通道
+    void saveBlobViaNative(blob, name).then((handled) => {
+      if (handled) return;
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    });
   }
 
   function toggleGroup(key: string) {

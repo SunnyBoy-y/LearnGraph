@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { CircleAlert, Download, LoaderCircle, X } from "lucide-react";
 
 import { downloadFile } from "@/api/files";
+import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import {
   Dialog,
   DialogClose,
@@ -133,6 +134,19 @@ export function SandboxImageArtifact({
 
   const download = () => {
     if (!source) return;
+    // 移动端 WebView：优先真实 URL 交给原生下载器
+    if (
+      fileId &&
+      downloadViaNative(
+        toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(fileId)}/content`),
+        title,
+      )
+    ) {
+      return;
+    }
+    if (!source.startsWith("blob:") && downloadViaNative(source, title)) {
+      return;
+    }
     const anchor = document.createElement("a");
     anchor.href = source;
     anchor.download = title;
@@ -222,6 +236,9 @@ export function SandboxImageStrip({ parts }: { parts: MessagePart[] }) {
 
   const downloadLightbox = () => {
     if (!lightbox) return;
+    if (!lightbox.source.startsWith("blob:") && downloadViaNative(lightbox.source, lightbox.title)) {
+      return;
+    }
     const anchor = document.createElement("a");
     anchor.href = lightbox.source;
     anchor.download = lightbox.title;

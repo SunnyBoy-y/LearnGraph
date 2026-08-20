@@ -82,6 +82,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { saveBlobViaNative } from "@/lib/native-download";
 import {
   Command,
   CommandEmpty,
@@ -595,12 +596,17 @@ function OverviewSection({
       [`\uFEFF${rows.map((row) => row.map(escape).join(",")).join("\n")}`],
       { type: "text/csv;charset=utf-8" },
     );
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `learngraph-bill-${new Date().toISOString().slice(0, 10)}.csv`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    const name = `learngraph-bill-${new Date().toISOString().slice(0, 10)}.csv`;
+    // 移动端 WebView：纯前端生成的 blob 交给原生 base64 通道
+    void saveBlobViaNative(blob, name).then((handled) => {
+      if (handled) return;
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    });
   }
 
       const chartTooltipStyle = {
