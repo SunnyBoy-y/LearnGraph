@@ -14,6 +14,11 @@ time (``ProviderService._discover``).
 Rewrite rules (fail-open by design — a missing bridge simply leaves the URL
 unchanged so source-mode installs are never affected):
 
+* ``host_access_mode == "direct"`` (trusted desktop direct) -> loopback URLs
+  are rewritten to ``http://host.docker.internal:<same-port>``, preserving
+  path/query. Docker Desktop forwards that alias to the real machine's
+  loopback; no service registry, token or audit (single-user trusted mode).
+* ``host_access_mode == "off"`` -> URL unchanged.
 * No ``host_bridge_url`` configured  -> URL unchanged (source mode, direct).
 * ``deployment_profile == personal_desktop`` -> URL unchanged (single-user
   source install; localhost is the real machine).
@@ -29,11 +34,16 @@ registry id the operator reviews on the host (e.g. ``ollama``).
 
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlunsplit, urlsplit
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1"})
 
 PERSONAL_DESKTOP_PROFILE = "personal_desktop"
+
+# Docker Desktop host gateway alias: inside a container it reaches the real
+# machine's loopback (Windows/macOS Desktop). Compose additionally wires
+# ``extra_hosts: host.docker.internal:host-gateway`` for native Linux.
+HOST_DOCKER_HOST = "host.docker.internal"
 
 # Header the backend sends to the Host Service Bridge for authentication.
 # Kept separate from Authorization so provider/MCP target credentials
@@ -80,6 +90,26 @@ def is_loopback_url(url: str) -> bool:
     return host in LOOPBACK_HOSTS
 
 
+def rewrite_loopback_to_host_docker(base_url: str) -> str:
+    """Trusted-desktop direct: rewrite a loopback URL to the Docker gateway.
+
+    ``http://127.0.0.1:PORT/path`` -> ``http://host.docker.internal:PORT/path``
+    (port, path and query preserved; literal loopback hosts only). Remote
+    endpoints are never touched. On native Linux the ``host-gateway`` alias
+    only reaches the Docker bridge, so host services must bind an interface
+    reachable from it — see doc/host-service-bridge.md.
+    """
+    if not is_loopback_url(base_url):
+        return base_url
+    parsed = urlsplit((base_url or "").strip())
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return base_url
+    netloc = f"{HOST_DOCKER_HOST}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 def service_id_for_provider(provider_type: str) -> str:
     """Map a provider type to its host-service registry id.
 
@@ -99,13 +129,21 @@ def resolve_host_service_url(
     base_url: str,
     host_bridge_url: str | None,
     deployment_profile: str,
+    host_access_mode: str | None = None,
 ) -> str:
-    """Rewrite a loopback provider URL through the Host Service Bridge.
+    """Rewrite a loopback provider URL per the host-access strategy.
 
-    See module docstring for the exact rules. The return value is always a
+    ``host_access_mode`` is the *effective* strategy (``"direct"`` |
+    ``"bridge"`` | ``"off"``, see ``Settings.effective_host_access_mode``);
+    ``None`` keeps the legacy bridge-only behavior for older callers. See
+    module docstring for the exact rules. The return value is always a
     usable URL; callers normalize it afterwards (e.g.
     ``normalize_ollama_api_base_url``).
     """
+    if host_access_mode == "direct":
+        return rewrite_loopback_to_host_docker(base_url)
+    if host_access_mode == "off":
+        return base_url
     if not host_bridge_url:
         return base_url
     if deployment_profile == PERSONAL_DESKTOP_PROFILE:
@@ -128,13 +166,18 @@ def resolve_loopback_url(
     base_url: str,
     host_bridge_url: str | None,
     deployment_profile: str,
+    host_access_mode: str | None = None,
 ) -> str:
-    """Rewrite any loopback URL (MCP endpoints, local APIs) through the bridge.
+    """Rewrite any loopback URL (MCP endpoints, local APIs) per host-access strategy.
 
     Same rules as :func:`resolve_host_service_url` but with an explicit
     registry service id, used by non-provider callers such as the MCP adapter
     wiring (``app.services.mcp_skills``).
     """
+    if host_access_mode == "direct":
+        return rewrite_loopback_to_host_docker(base_url)
+    if host_access_mode == "off":
+        return base_url
     if not host_bridge_url:
         return base_url
     if deployment_profile == PERSONAL_DESKTOP_PROFILE:

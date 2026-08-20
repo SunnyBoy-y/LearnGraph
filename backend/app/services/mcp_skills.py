@@ -65,6 +65,7 @@ from app.providers.ports.mcp import (
 )
 from app.providers.host_service_resolver import (
     HOST_BRIDGE_TOKEN_HEADER,
+    HOST_DOCKER_HOST,
     is_loopback_url,
     read_bridge_token,
     resolve_loopback_url,
@@ -3699,14 +3700,26 @@ class MCPAndSkillService:
             return UnavailableStdioMCPAdapter()
         if not server.endpoint_url:
             raise MCPTransportUnavailable("MCP HTTP endpoint is not configured")
-        # Host Service Bridge: a containerized deployment keeps the logical
-        # loopback MCP endpoint in the row and reaches the real machine through
-        # the host-side bridge (/services/mcp-<server_key>/...). The bridge
-        # host is explicitly trusted for plaintext HTTP - it is the authorized,
-        # audited path to host loopback services.
+        # Host-service access: a containerized deployment keeps the logical
+        # loopback MCP endpoint in the row and reaches the real machine either
+        # through the Host Service Bridge (/services/mcp-<server_key>/...) or,
+        # in trusted-desktop direct mode, through the Docker Desktop gateway
+        # alias host.docker.internal:<same-port>. Both hosts are explicitly
+        # trusted for plaintext HTTP - the bridge is the authorized, audited
+        # path; the gateway alias is the opted-in single-user shortcut.
         bridge_url = self.settings.effective_host_bridge_url
+        host_access_mode = self.settings.effective_host_access_mode
         allow_private_hosts: frozenset[str] = frozenset()
-        if (
+        if host_access_mode == "direct" and is_loopback_url(server.endpoint_url):
+            server.endpoint_url = resolve_loopback_url(
+                service_id=f"mcp-{sanitize_service_id(server.server_key)}",
+                base_url=server.endpoint_url,
+                host_bridge_url=None,
+                deployment_profile=self.settings.deployment_profile,
+                host_access_mode="direct",
+            )
+            allow_private_hosts = frozenset({HOST_DOCKER_HOST})
+        elif (
             bridge_url
             and self.settings.deployment_profile != "personal_desktop"
             and is_loopback_url(server.endpoint_url)

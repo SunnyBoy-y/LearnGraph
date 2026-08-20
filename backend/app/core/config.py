@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
@@ -9,6 +10,64 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEPLOYMENT_PROFILES = frozenset({"personal_desktop", "self_hosted_team", "cloud_saas"})
+
+
+class HostAccessMode(str, Enum):
+    """Host-service access strategy for the whole-app container deployment.
+
+    ``127.0.0.1`` inside a container is the container itself, so provider/MCP
+    loopback URLs must be rewritten to reach real-machine services. This enum
+    selects the strategy:
+
+    * ``auto`` (default): containerized profiles (``self_hosted_team`` /
+      ``cloud_saas``) rewrite through the Host Service Bridge
+      (``host.docker.internal:34115``); source installs keep direct loopback.
+    * ``bridge``: force bridge rewriting (same rules as ``auto``, explicit).
+    * ``direct``: trusted-desktop direct host access — loopback URLs are
+      rewritten to ``host.docker.internal:<same-port>`` (Docker Desktop
+      forwards that alias to the real machine's loopback). No service
+      registry, token or audit; single-user trusted machines only. Sandbox
+      containers never inherit this.
+    * ``off``: disable all host-service rewriting (loopback URLs stay literal).
+    """
+
+    auto = "auto"
+    bridge = "bridge"
+    direct = "direct"
+    off = "off"
+
+
+def running_in_container() -> bool:
+    """True when this process runs inside a container (compose deployment).
+
+    Source installs (``npm run dev``) run directly on the real machine and
+    have no ``/.dockerenv``, so they keep the loopback default. Inside the
+    app container the loopback is the container itself, so the sandboxd URL
+    must go through the compose ``extra_hosts`` gateway alias instead.
+    """
+    try:
+        return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+    except OSError:  # pragma: no cover - defensive
+        return False
+
+
+def default_sandboxd_url() -> str:
+    """Resolve the sandboxd control-plane URL when no explicit one is set.
+
+    Mirrors ``Settings.effective_host_bridge_url`` (the Host Service Bridge
+    auto-derive): an explicit ``LEARNGRAPH_SANDBOXD_URL`` wins; otherwise a
+    containerized backend reaches a sandboxd that runs on the real machine
+    (Windows/Docker Desktop dev, host-launched daemon) through the
+    ``host.docker.internal:host-gateway`` alias already wired by
+    ``docker-compose.yml`` — the container→host interconnect that keeps
+    「沙箱一键初始化」working under a containerized LearnGraph. A source
+    install talks to its local daemon on loopback. The compose stack pins
+    ``http://sandboxd:8090`` for its in-stack sandboxd service (the hardening
+    override keeps the same URL).
+    """
+    if running_in_container():
+        return "http://host.docker.internal:8090"
+    return "http://127.0.0.1:8090"
 
 # Release-default prebuilt sandbox runner image. Bump this constant with every
 # release: deployments that do NOT set LEARNGRAPH_SANDBOX_PREBUILT_IMAGE pick up
@@ -34,6 +93,11 @@ class Settings(BaseSettings):
     # managed TLS termination / reverse proxy in front.
     deployment_profile: str = "personal_desktop"
 
+    # Host-service access strategy for whole-app Docker (see HostAccessMode).
+    # auto = compose default (bridge); direct = trusted desktop direct host
+    # access without the Host Service Bridge; off = no rewriting at all.
+    host_access_mode: HostAccessMode = HostAccessMode.auto
+
     # Host Service Bridge endpoint (host-side daemon, see
     # doc/host-service-bridge.md). When set on a containerized deployment
     # (self_hosted_team/cloud_saas), the Host Service Resolver rewrites
@@ -57,6 +121,12 @@ class Settings(BaseSettings):
     # to skip auth).
     host_bridge_token_file: Path | None = None
 
+    def _raw_host_access_mode(self) -> HostAccessMode:
+        mode = self.host_access_mode
+        if not isinstance(mode, HostAccessMode):
+            mode = HostAccessMode(mode)
+        return mode
+
     @property
     def effective_host_bridge_url(self) -> str | None:
         """Resolve the bridge endpoint for the active deployment shape.
@@ -64,29 +134,74 @@ class Settings(BaseSettings):
         Priority: explicit ``host_bridge_url`` > auto-derived
         ``http://host.docker.internal:34115`` on containerized profiles (when
         ``host_bridge_auto``) > None (source installs keep direct loopback).
+        ``direct``/``off`` modes short-circuit to None — no bridge in play.
         """
+        if self._raw_host_access_mode() in (HostAccessMode.direct, HostAccessMode.off):
+            return None
         if self.host_bridge_url:
             return self.host_bridge_url
         if self.host_bridge_auto and self.deployment_profile != "personal_desktop":
             return "http://host.docker.internal:34115"
         return None
 
+    @property
+    def effective_host_access_mode(self) -> str:
+        """Resolve the effective host-access strategy.
+
+        Returns one of ``"direct"`` | ``"bridge"`` | ``"off"``. ``direct``
+        only applies inside a container — on a source install the local
+        loopback is already the real machine, so rewriting would break it.
+        """
+        raw = self._raw_host_access_mode()
+        if raw is HostAccessMode.direct:
+            return "direct" if running_in_container() else "off"
+        if raw is HostAccessMode.off:
+            return "off"
+        # auto | bridge
+        return "bridge" if self.effective_host_bridge_url else "off"
+
     env: str = "development"
     database_url: str = "sqlite:///./data/learngraph.db"
     # SQLite write-lock busy wait (milliseconds). Feeds both the pysqlite
-    # ``timeout`` and the per-connection PRAGMA busy_timeout. 10s bounds
-    # interactive-request stalls when a background sweep owns the single write
-    # lock, while staying well above the old 5s budget that lost races to
-    # multi-second chat/memory commits; the retry helpers and the B1-7 sweep
-    # mutex absorb the residual contention.
-    sqlite_busy_timeout_ms: int = 10_000
+    # ``timeout`` and the per-connection PRAGMA busy_timeout. 2s is a fast-fail
+    # budget: normal multi-stream contention resolves in well under a second
+    # (WAL single-writer windows are bounded by the 1s stream flush cadence),
+    # so a 10s wait only ever amplified pathological long-window stalls into
+    # multi-second token freezes. When a lock is genuinely held longer (a
+    # background sweep that kept a dirty session across a model call), the
+    # retry helpers fail fast and retry with backoff instead of blocking 10s.
+    sqlite_busy_timeout_ms: int = 2_000
+    # SQLite connection-pool tuning. Each active agent stream holds one
+    # connection for the whole generation; the SQLAlchemy default (5 + 10
+    # overflow) could be exhausted by 5 concurrent streams plus scheduler
+    # sweeps, blocking pool checkout for up to 30s. Raise the ceiling and
+    # shorten the checkout wait so streams never stall on pool checkout.
+    sqlite_pool_size: int = 10
+    sqlite_pool_max_overflow: int = 20
+    sqlite_pool_timeout_seconds: int = 10
     # Period (seconds) of the background SQLite WAL checkpoint maintenance
     # loop. A multi-MB WAL makes the next autocheckpoint write many MB back
     # into the main file while holding the single SQLite write lock, which can
     # starve concurrent chat streams with ``database is locked``. Keeping the
     # WAL small (TRUNCATE checkpoint every interval, skipped when busy) keeps
-    # autocheckpoint cheap. 0 disables the loop.
-    wal_checkpoint_interval_seconds: int = 30
+    # autocheckpoint cheap. 60s halves the checkpoint frequency vs 30s so the
+    # maintenance writer collides less often with active streams. 0 disables
+    # the loop.
+    wal_checkpoint_interval_seconds: int = 60
+    # P3-S1: while any agent SSE stream is generating, non-urgent scheduler
+    # sweeps defer to the next tick so the single SQLite writer serves
+    # interactive traffic first. This caps how many consecutive ticks a sweep
+    # may skip before it runs anyway (a long multi-session study session must
+    # not starve mastery/retention/cleanup work forever).
+    sqlite_sweep_defer_max_skips: int = 3
+    # P4-L1: stream-event retention. ``message_stream_events`` is an
+    # append-only transport/replay projection; terminal messages older than
+    # ``stream_event_retention_days`` get their events purged by a periodic
+    # maintenance sweep (the message/part rows remain the fact source). 0
+    # disables purging. The sweep also defers while agent streams are active.
+    stream_event_retention_enabled: bool = True
+    stream_event_retention_days: int = 90
+    stream_event_retention_interval_seconds: int = 3600
     storage_root: Path = Path("./data/storage")
     memory_root: Path = Path("./data/memory")
     # Production SPA directory served by the API process. Empty keeps the
@@ -595,7 +710,7 @@ class Settings(BaseSettings):
         # daemon yet.
         if self.sandbox_backend == "sandboxd":
             if not (self.sandboxd_url or "").strip():
-                self.sandboxd_url = "http://127.0.0.1:8090"
+                self.sandboxd_url = default_sandboxd_url()
             if not (self.sandboxd_token_file or "").strip():
                 self.sandboxd_token_file = "./data/.sandboxd/sandboxd-token"
         return self

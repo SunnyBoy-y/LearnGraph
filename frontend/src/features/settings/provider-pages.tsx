@@ -428,9 +428,33 @@ function fuzzyMatchesModelId(text: string, query: string): boolean {
 }
 
 function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
-  // 仅当：容器化部署启用了 bridge 地址，且工作区配置了依赖 bridge 的本地
-  // loopback provider（Ollama 等）时才提示；源码模式或无关 provider 不打扰。
-  if (!status?.host_bridge_url || !status.has_local_loopback_providers) return null;
+  // 仅当工作区配置了依赖宿主服务的本地 loopback provider（Ollama 等）时提示；
+  // 容器化部署按宿主访问策略分别展示：bridge（安全桥接）或 direct（可信桌面
+  // 直连）；源码模式或无关 provider 不打扰。
+  if (!status?.has_local_loopback_providers) return null;
+  if (status.host_access_mode === "direct") {
+    const ready = status.host_gateway_reachable === true;
+    const title = ready
+      ? "可信桌面直连已启用：本机模型服务可正常使用"
+      : "可信桌面直连已启用，但宿主机网关不可达";
+    return (
+      <div
+        className={
+          ready
+            ? "mx-5 mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800"
+            : "mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"
+        }
+      >
+        <p className="font-medium">{title}</p>
+        <p className="mt-1 whitespace-pre-line text-xs leading-relaxed">
+          {ready
+            ? "本机服务（Ollama、LM Studio、本地 HTTP MCP 等）经 host.docker.internal:同端口 直接访问，无需启动 Host Service Bridge。"
+            : status.guidance}
+        </p>
+      </div>
+    );
+  }
+  if (!status.host_bridge_url) return null;
   const ready = status.bridge_reachable === true && status.bridge_token_ready;
   const title = ready
     ? "宿主机 Host Service Bridge 已就绪"

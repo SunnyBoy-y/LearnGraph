@@ -908,12 +908,16 @@ class SecretStoreStatusView(BaseModel):
 
 
 class HostBridgeStatusView(BaseModel):
-    """Frontend guidance for the Host Service Bridge (whole-app Docker)."""
+    """Frontend guidance for host-service access (whole-app Docker)."""
 
     deployment_profile: str
+    # Effective host-access strategy: "bridge" | "direct" | "off".
+    host_access_mode: str
     host_bridge_url: str | None
     auto_derived: bool
     bridge_reachable: bool | None
+    # Direct mode: Docker gateway alias resolvable inside the container.
+    host_gateway_reachable: bool | None
     bridge_token_ready: bool
     has_local_loopback_providers: bool
     guidance: str

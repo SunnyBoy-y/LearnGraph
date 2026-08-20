@@ -31,6 +31,7 @@ from app.providers.catalog import (
 )
 from app.providers.host_service_resolver import (
     HOST_BRIDGE_TOKEN_HEADER,
+    is_loopback_url,
     read_bridge_token,
     resolve_host_service_url,
 )
@@ -42,6 +43,32 @@ from app.providers.ports.memory import MemoryProviderPort
 from app.providers.ports.research import DeepResearchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.ports.transcription import TranscriptionProviderPort
+
+
+def _resolve_provider_base_url(
+    settings: Settings,
+    provider_type: str,
+    base_url: str | None,
+) -> str | None:
+    """Apply the Host Service Resolver to ANY user-configured provider base URL.
+
+    Loopback URLs are rewritten per the host-access strategy (Host Service
+    Bridge / trusted-desktop direct) so real-machine services stay reachable
+    from inside the whole-app Docker deployment — covering model, embedding,
+    image, transcription, search (SearXNG), fetch (Crawl4AI/Firecrawl), deep
+    research and memory lanes alike. Non-loopback remote URLs, fixed-origin
+    providers and source installs (``npm run dev`` / personal_desktop) pass
+    through unchanged: zero impact outside Docker.
+    """
+    if not base_url:
+        return base_url
+    return resolve_host_service_url(
+        provider_type=provider_type,
+        base_url=base_url,
+        host_bridge_url=settings.effective_host_bridge_url,
+        deployment_profile=settings.deployment_profile,
+        host_access_mode=settings.effective_host_access_mode,
+    )
 from app.providers.remote.transcription import (
     DashScopeAsyncTranscriptionProvider,
     OpenAICompatibleTranscriptionProvider,
@@ -402,40 +429,49 @@ def model_provider_for_workspace(
                 provider_id=provider.id,
                 model_id=resolved_model_id,
             )
+        # Host Service Resolver: a containerized deployment keeps the logical
+        # loopback URL in the provider row and rewrites it per the host-access
+        # strategy (bridge / trusted-desktop direct) so real-machine services
+        # stay reachable from inside Docker. Applies to EVERY provider type
+        # with a user-configured base_url (Ollama, OpenAI-compatible local
+        # gateways like Sub2API, local MCP-style APIs, ...); non-loopback
+        # remote URLs and fixed-origin providers pass through unchanged.
+        resolved_base_url = (
+            resolve_host_service_url(
+                provider_type=provider.provider_type,
+                base_url=provider.base_url,
+                host_bridge_url=settings.effective_host_bridge_url,
+                deployment_profile=settings.deployment_profile,
+                host_access_mode=settings.effective_host_access_mode,
+            )
+            if provider.base_url
+            else None
+        )
         if provider.provider_type == "codex_chatgpt":
             # The Codex backend is the only origin these OAuth tokens are
             # accepted by, so the row's URL never redirects the credential.
             effective_base_url = CODEX_BASE_URL
         elif provider.provider_type == "openai_responses":
-            effective_base_url = normalize_openai_api_base_url(provider.base_url)
+            effective_base_url = normalize_openai_api_base_url(resolved_base_url)
         elif provider.provider_type == "github_copilot":
             effective_base_url = "https://api.githubcopilot.com"
         elif provider.provider_type == "anthropic_messages":
-            effective_base_url = normalize_anthropic_api_base_url(provider.base_url)
+            effective_base_url = normalize_anthropic_api_base_url(resolved_base_url)
         elif is_ollama_provider_type(provider.provider_type) or provider.provider_type == "ollama_cloud":
-            # Host Service Resolver: a containerized deployment keeps the
-            # logical 127.0.0.1 URL in the provider row and rewrites it through
-            # the host-side bridge so real-machine Ollama stays reachable from
-            # inside Docker (source installs pass through unchanged).
-            effective_base_url = normalize_ollama_api_base_url(
-                resolve_host_service_url(
-                    provider_type=provider.provider_type,
-                    base_url=provider.base_url,
-                    host_bridge_url=settings.effective_host_bridge_url,
-                    deployment_profile=settings.deployment_profile,
-                )
-            )
+            effective_base_url = normalize_ollama_api_base_url(resolved_base_url)
         else:
-            effective_base_url = provider.base_url
+            effective_base_url = resolved_base_url
         extra_headers = _extra_headers_from_capabilities(capabilities)
         # Authenticate the outbound bridge hop when a loopback provider URL
         # was rewritten to the Host Service Bridge (token file is mounted by
         # compose; missing token simply means the bridge will deny — the
-        # frontend surfaces that with an actionable hint).
+        # frontend surfaces that with an actionable hint). Direct mode has no
+        # bridge URL, so no token is sent.
         if (
             effective_base_url
             and settings.effective_host_bridge_url
-            and is_ollama_provider_type(provider.provider_type)
+            and provider.base_url
+            and is_loopback_url(provider.base_url)
         ):
             bridge_token = read_bridge_token(settings.host_bridge_token_file)
             if bridge_token:
@@ -739,7 +775,7 @@ def image_provider_for_workspace(
         return OpenAIImagesProvider(
             provider_id=provider.id,
             model_id=resolved_model_id,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             output_format=output_format,
             timeout_seconds=timeout_seconds,
@@ -825,9 +861,11 @@ def vision_provider_for_workspace(
         )
 
     if provider.provider_type == "openai_responses_vision":
-        effective_base_url = normalize_openai_api_base_url(provider.base_url)
+        effective_base_url = normalize_openai_api_base_url(
+            _resolve_provider_base_url(settings, provider.provider_type, provider.base_url)
+        )
     else:
-        effective_base_url = provider.base_url
+        effective_base_url = _resolve_provider_base_url(settings, provider.provider_type, provider.base_url)
     extra_headers = _extra_headers_from_capabilities(capabilities)
     common = {
         "provider_id": provider.id,
@@ -950,7 +988,7 @@ def _qwen_vision_companion_for_workspace(
             provider_id=provider.id,
             provider_type="qwen",
             model_id=resolved_model_id,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             context_window_tokens=int(
                 effective.get("context_limit_tokens")
@@ -1080,7 +1118,7 @@ def search_provider_for_workspace(
         try:
             return SearXNGSearchProvider(
                 provider_id=provider.id,
-                base_url=provider.base_url,
+                base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
                 api_key=api_key,
                 allow_private_bridge_urls=settings.allow_private_bridge_urls,
             )
@@ -1092,7 +1130,7 @@ def search_provider_for_workspace(
         try:
             return AnySearchSearchProvider(
                 provider_id=provider.id,
-                base_url=provider.base_url,
+                base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
                 api_key=api_key,
             )
         except ValueError as exc:
@@ -1101,7 +1139,7 @@ def search_provider_for_workspace(
         try:
             return OllamaCloudSearchProvider(
                 provider_id=provider.id,
-                base_url=provider.base_url,
+                base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
                 api_key=api_key,
             )
         except ValueError as exc:
@@ -1110,7 +1148,7 @@ def search_provider_for_workspace(
         return CloudSearchProvider(
             provider_id=provider.id,
             provider_type=provider.provider_type,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             allow_private_bridge_urls=settings.allow_private_bridge_urls,
         )
@@ -1236,13 +1274,13 @@ def transcription_provider_for_workspace(
             return DashScopeAsyncTranscriptionProvider(
                 provider_id=provider.id,
                 model_id=resolved_model,
-                base_url=provider.base_url,
+                base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
                 api_key=api_key,
             )
         return OpenAICompatibleTranscriptionProvider(
             provider_id=provider.id,
             model_id=resolved_model,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             timeout_seconds=float(capabilities.get("transcription_timeout_seconds") or 180),
         )
@@ -1295,14 +1333,14 @@ def embedding_provider_for_workspace(
         return OllamaEmbeddingProvider(
             provider_id=provider.id,
             model_id=resolved_model,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             extra_headers=extra_headers,
         )
     return OpenAICompatibleEmbeddingProvider(
         provider_id=provider.id,
         model_id=resolved_model,
-        base_url=provider.base_url,
+        base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
         api_key=api_key,
         extra_headers=extra_headers,
     )
@@ -1382,14 +1420,14 @@ def deep_research_provider_for_workspace(
         ).strip()
         return adapter(
             provider_id=provider.id,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             model=model or default_model,
             declared_capabilities=capabilities,
         )
     return HTTPDeepResearchProvider(
         provider_id=provider.id,
-        base_url=provider.base_url,
+        base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
         api_key=api_key,
         declared_capabilities=provider.capabilities,
     )
@@ -1481,7 +1519,7 @@ def _remote_fetch_provider(
         try:
             return FirecrawlFetchProvider(
                 provider_id=provider.id,
-                base_url=provider.base_url,
+                base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
                 api_key=api_key,
                 allow_private_bridge_urls=settings.allow_private_bridge_urls,
             )
@@ -1493,7 +1531,7 @@ def _remote_fetch_provider(
     try:
         return Crawl4AIHTTPFetchProvider(
             provider_id=provider.id,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             allow_private_bridge_urls=settings.allow_private_bridge_urls,
         )
@@ -1635,7 +1673,7 @@ def _qwen_companion_for_workspace(
         kwargs: dict[str, Any] = dict(
             provider_id=provider.id,
             model_id=model_id,
-            base_url=provider.base_url,
+            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
             api_key=api_key,
             extra_headers=_extra_headers_from_capabilities(capabilities),
         )
@@ -1681,7 +1719,9 @@ def _rest_image_search_provider_for_workspace(
                 continue
             if not api_key:
                 continue
-        base_url = provider.base_url or spec.default_base_url
+        base_url = _resolve_provider_base_url(
+            settings, provider.provider_type, provider.base_url or spec.default_base_url
+        )
         if not base_url:
             continue
         return ImageSearchProvider(
@@ -1777,7 +1817,7 @@ def memory_provider_for_workspace(
         )
     return Mem0PlatformAdapter(
         provider_id=provider.id,
-        base_url=provider.base_url,
+        base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
         api_key=api_key,
         workspace_entity=mem0_entity_id(
             tenant_id=workspace.tenant_id,

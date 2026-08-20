@@ -227,13 +227,42 @@ def _tcp_reachable(url: str, *, timeout_seconds: float = 2.0) -> bool:
         return False
 
 
+def _host_gateway_reachable() -> bool:
+    """Direct-mode probe: the Docker gateway alias resolves inside the container.
+
+    Docker Desktop injects ``host.docker.internal``; compose additionally
+    wires ``extra_hosts: host.docker.internal:host-gateway`` for native Linux.
+    Resolution succeeding is the practical signal that direct rewrites can
+    reach the real machine (Windows/macOS Desktop) or at least the gateway.
+    """
+    import socket as _socket
+
+    try:
+        _socket.gethostbyname("host.docker.internal")
+        return True
+    except OSError:
+        return False
+
+
 def _host_bridge_guidance(
     *,
+    host_access_mode: str,
     effective: str | None,
     reachable: bool | None,
     token_ready: bool,
+    host_gateway_reachable: bool | None,
 ) -> str:
-    """Compose the frontend hint for the Host Service Bridge state."""
+    """Compose the frontend hint for the host-service access state."""
+    if host_access_mode == "direct":
+        if host_gateway_reachable is False:
+            return (
+                "可信桌面直连已启用，但容器内无法解析 host.docker.internal。"
+                "请确认 compose 已配置 extra_hosts: host.docker.internal:host-gateway。"
+            )
+        return (
+            "可信桌面直连已启用：本机服务（Ollama、LM Studio、本地 HTTP MCP 等）"
+            "经 host.docker.internal:同端口 直接访问，无需 Host Service Bridge。"
+        )
     if not effective:
         return ""
     if reachable is False:
@@ -641,20 +670,25 @@ class ProviderService:
             }
 
     def host_bridge_status(self) -> dict:
-        """Frontend guidance for the Host Service Bridge (whole-app Docker).
+        """Frontend guidance for the host-service access state (whole-app Docker).
 
-        Reports whether the bridge endpoint is in effect, reachable from the
-        container (TCP probe), whether the bearer token file is mounted, and
+        Reports the effective host-access strategy (``bridge`` / ``direct`` /
+        ``off``), bridge endpoint reachability and token mount state, or the
+        Docker gateway alias reachability for trusted-desktop direct mode, and
         whether this workspace configures loopback local providers (Ollama)
-        that depend on the bridge. Guidance is a ready-to-show Chinese hint
+        that depend on host access. Guidance is a ready-to-show Chinese hint
         with the exact host-side commands.
         """
         from app.providers.host_service_resolver import is_loopback_url, read_bridge_token
 
+        host_access_mode = self.settings.effective_host_access_mode
         effective = self.settings.effective_host_bridge_url
         auto_derived = bool(effective) and not self.settings.host_bridge_url
         bridge_reachable: bool | None = None
-        if effective:
+        host_gateway_reachable: bool | None = None
+        if host_access_mode == "direct":
+            host_gateway_reachable = _host_gateway_reachable()
+        elif effective:
             bridge_reachable = _tcp_reachable(effective, timeout_seconds=2.0)
         token_ready = read_bridge_token(self.settings.host_bridge_token_file) is not None
         local_loopback = [
@@ -665,15 +699,19 @@ class ProviderService:
             and is_loopback_url(p.base_url)
         ]
         guidance = _host_bridge_guidance(
+            host_access_mode=host_access_mode,
             effective=effective,
             reachable=bridge_reachable,
             token_ready=token_ready,
+            host_gateway_reachable=host_gateway_reachable,
         )
         return {
             "deployment_profile": self.settings.deployment_profile,
+            "host_access_mode": host_access_mode,
             "host_bridge_url": effective,
             "auto_derived": auto_derived,
             "bridge_reachable": bridge_reachable,
+            "host_gateway_reachable": host_gateway_reachable,
             "bridge_token_ready": token_ready,
             "has_local_loopback_providers": bool(local_loopback),
             "guidance": guidance,
@@ -3189,27 +3227,34 @@ class ProviderService:
             (provider.capabilities or {}).get("extra_headers")
         )
         try:
+            # Host Service Resolver: rewrite loopback base URLs per the
+            # host-access strategy (bridge / trusted-desktop direct) for EVERY
+            # provider type; non-loopback URLs pass through unchanged. Bridge
+            # mode additionally carries the bearer token on loopback probes.
+            from app.providers.host_service_resolver import (
+                HOST_BRIDGE_TOKEN_HEADER,
+                is_loopback_url,
+                read_bridge_token,
+                resolve_host_service_url,
+            )
+
+            probe_headers = dict(extra_headers or {})
+            resolved_base_url = resolve_host_service_url(
+                provider_type=provider.provider_type,
+                base_url=provider.base_url,
+                host_bridge_url=self.settings.effective_host_bridge_url,
+                deployment_profile=self.settings.deployment_profile,
+                host_access_mode=self.settings.effective_host_access_mode,
+            )
+            if self.settings.effective_host_bridge_url and is_loopback_url(provider.base_url):
+                bridge_token = read_bridge_token(self.settings.host_bridge_token_file)
+                if bridge_token:
+                    probe_headers[HOST_BRIDGE_TOKEN_HEADER] = bridge_token
             if provider.provider_type in {"ollama", "ollama_embedding"}:
                 from app.providers.remote.ollama import discover_ollama_models
 
-                from app.providers.host_service_resolver import (
-                    HOST_BRIDGE_TOKEN_HEADER,
-                    read_bridge_token,
-                    resolve_host_service_url,
-                )
-
-                probe_headers = dict(extra_headers or {})
-                if self.settings.effective_host_bridge_url:
-                    bridge_token = read_bridge_token(self.settings.host_bridge_token_file)
-                    if bridge_token:
-                        probe_headers[HOST_BRIDGE_TOKEN_HEADER] = bridge_token
                 return discover_ollama_models(
-                    base_url=resolve_host_service_url(
-                        provider_type=provider.provider_type,
-                        base_url=provider.base_url,
-                        host_bridge_url=self.settings.effective_host_bridge_url,
-                        deployment_profile=self.settings.deployment_profile,
-                    ),
+                    base_url=resolved_base_url,
                     api_key=self._optional_secret(provider.id),
                     extra_headers=probe_headers,
                 )
@@ -3232,14 +3277,14 @@ class ProviderService:
                 from app.providers.remote.anthropic import discover_anthropic_models
 
                 return discover_anthropic_models(
-                    base_url=provider.base_url,
+                    base_url=resolved_base_url,
                     api_key=api_key,
-                    extra_headers=extra_headers,
+                    extra_headers=probe_headers,
                 )
             return discover_remote_models(
-                base_url=provider.base_url,
+                base_url=resolved_base_url,
                 api_key=api_key,
-                extra_headers=extra_headers,
+                extra_headers=probe_headers,
             )
         except ProviderInvalidUrlError as exc:
             # User-facing configuration mistakes (missing http(s):// protocol,

@@ -462,9 +462,13 @@ export interface SecretStoreStatus {
 
 export interface HostBridgeStatus {
   deployment_profile: string;
+  /** 宿主访问策略："bridge"（安全桥接）| "direct"（可信桌面直连）| "off" */
+  host_access_mode: "bridge" | "direct" | "off" | string;
   host_bridge_url: string | null;
   auto_derived: boolean;
   bridge_reachable: boolean | null;
+  /** direct 模式：容器内能否解析 host.docker.internal */
+  host_gateway_reachable: boolean | null;
   bridge_token_ready: boolean;
   has_local_loopback_providers: boolean;
   guidance: string;
