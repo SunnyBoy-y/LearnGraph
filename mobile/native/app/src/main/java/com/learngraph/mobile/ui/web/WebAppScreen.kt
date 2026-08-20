@@ -162,7 +162,9 @@ fun WebAppScreen(
                             // 防止旧 token 被 syncLoginState 重新注入（注入死循环）
                             addJavascriptInterface(
                                 NativeAuthBridge {
-                                    scope.launch { app.authStore.clearAuth() }
+                                    scope.launch {
+                                        runCatching { app.authStore.clearAuth() }
+                                    }
                                 },
                                 "LearnGraphNative",
                             )
@@ -186,9 +188,17 @@ fun WebAppScreen(
 
                                 override fun onPageFinished(view: WebView, url: String?) {
                                     super.onPageFinished(view, url)
-                                    syncLoginState(view)
+                                    try {
+                                        syncLoginState(view)
+                                    } catch (_: Exception) {
+                                        // JS 桥/注入异常不打断页面加载
+                                    }
                                     // Cookie 强制写盘：登录态持久化（重启免登录）
-                                    CookieManager.getInstance().flush()
+                                    try {
+                                        CookieManager.getInstance().flush()
+                                    } catch (_: Exception) {
+                                        // flush 失败不影响页面
+                                    }
                                 }
 
                                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
@@ -207,6 +217,38 @@ fun WebAppScreen(
                                         loadFailed = true
                                         onLoadFailed()
                                     }
+                                }
+
+                                /**
+                                 * WebView renderer 进程崩溃接管（API 26+，Android 8+）。
+                                 *
+                                 * renderer（渲染/JS 进程）是独立进程，内存不足或渲染错误时可能
+                                 * 被杀。默认行为是连带杀掉整个应用 → 表现为「进网页时闪退」。
+                                 * 返回 true 表示应用自行处理：记录日志并在原 URL 上重新加载
+                                 * （reload 会重新拉起 renderer 进程）。Android 6/7 为单进程
+                                 * WebView，无此回调，崩溃只能靠减少内存压力规避。
+                                 */
+                                @android.annotation.SuppressLint("WebViewClientOnRenderProcessGone")
+                                override fun onRenderProcessGone(
+                                    view: WebView,
+                                    detail: android.webkit.RenderProcessGoneDetail,
+                                ): Boolean {
+                                    try {
+                                        android.util.Log.e(
+                                            "LearnGraphWeb",
+                                            "WebView renderer 崩溃：crash=${detail.didCrash()} 已接管恢复",
+                                        )
+                                    } catch (_: Exception) {
+                                    }
+                                    val target = view.url ?: app.api.baseUrl
+                                    view.post {
+                                        try {
+                                            view.loadUrl(target)
+                                        } catch (_: Exception) {
+                                            onLoadFailed()
+                                        }
+                                    }
+                                    return true
                                 }
 
                                 /**
@@ -247,23 +289,29 @@ fun WebAppScreen(
                                         append("return 'ok';")
                                         append("})()")
                                     }
-                                    view.evaluateJavascript(js) { result ->
-                                        val trimmed = result?.trim()?.trim('"') ?: return@evaluateJavascript
-                                        when {
-                                            trimmed == "injected" -> view.post { view.reload() }
-                                            trimmed.startsWith("token:") -> {
-                                                val payload = trimmed.removePrefix("token:")
-                                                val sep = payload.indexOf("|ws:")
-                                                val newToken = if (sep >= 0) payload.substring(0, sep) else payload
-                                                val newWs = if (sep >= 0) payload.substring(sep + 4).takeIf { it.isNotBlank() } else null
-                                                if (newToken.isNotBlank()) {
-                                                    scope.launch {
-                                                        app.authStore.updateToken(newToken)
-                                                        if (newWs != null) app.authStore.updateWorkspace(newWs)
+                                    try {
+                                        view.evaluateJavascript(js) { result ->
+                                            val trimmed = result?.trim()?.trim('"') ?: return@evaluateJavascript
+                                            when {
+                                                trimmed == "injected" -> view.post { view.reload() }
+                                                trimmed.startsWith("token:") -> {
+                                                    val payload = trimmed.removePrefix("token:")
+                                                    val sep = payload.indexOf("|ws:")
+                                                    val newToken = if (sep >= 0) payload.substring(0, sep) else payload
+                                                    val newWs = if (sep >= 0) payload.substring(sep + 4).takeIf { it.isNotBlank() } else null
+                                                    if (newToken.isNotBlank()) {
+                                                        scope.launch {
+                                                            runCatching {
+                                                                app.authStore.updateToken(newToken)
+                                                                if (newWs != null) app.authStore.updateWorkspace(newWs)
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
+                                    } catch (_: Exception) {
+                                        // WebView 已销毁/状态异常时静默跳过同步
                                     }
                                 }
                             }
@@ -310,6 +358,18 @@ fun WebAppScreen(
                         }
                     },
                     update = { },
+                    // 页面离开组合时销毁 WebView，避免每次进出网页累积内存
+                    // （WebView 不销毁会持续占用内存，最终 OOM 触发 renderer 崩溃）
+                    onRelease = { wv ->
+                        webViewRef.value = null
+                        try {
+                            wv.stopLoading()
+                            wv.removeAllViews()
+                            wv.destroy()
+                        } catch (_: Exception) {
+                            // destroy 失败静默
+                        }
+                    },
                 )
             }
         }

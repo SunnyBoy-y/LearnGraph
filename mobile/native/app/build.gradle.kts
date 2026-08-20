@@ -13,8 +13,8 @@ android {
         applicationId = "com.learngraph.mobile"
         minSdk = 23
         targetSdk = 35
-        versionCode = 18
-        versionName = "0.10.6"
+        versionCode = 19
+        versionName = "0.10.7"
     }
 
     buildTypes {
