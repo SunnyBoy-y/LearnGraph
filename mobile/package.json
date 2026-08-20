@@ -1,0 +1,34 @@
+{
+  "name": "learngraph-mobile",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "LearnGraph 手机端 APK：瘦客户端，连电脑服务（Docker 服务器），账号密码认证，共享电脑历史记录",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
+    "preview": "vite preview",
+    "cap:sync": "cap sync android",
+    "cap:add:android": "cap add android",
+    "cap:open:android": "cap open android",
+    "apk:debug": "cd android && ./gradlew assembleDebug",
+    "apk:release": "cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/preferences": "^7.0.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zustand": "^5.0.5"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.0.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5"
+  }
+}

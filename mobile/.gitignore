@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+
+# 构建产物 APK 不入库（体积大，按需本地构建）
+*.apk
+
+# Capacitor / Android 构建产物（android/ 原生壳本身入库，只忽略生成物）
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/capacitor-cordova-android-plugins/build/
+
+# IDE
+.idea/
+.vscode/
+*.suo
+*.user

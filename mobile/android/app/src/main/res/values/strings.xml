@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">LearnGraph</string>
+    <string name="title_activity_main">LearnGraph</string>
+    <string name="package_name">com.learngraph.mobile</string>
+    <string name="custom_url_scheme">com.learngraph.mobile</string>
+</resources>
