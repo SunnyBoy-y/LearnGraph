@@ -70,6 +70,11 @@ class AuthStore(private val context: Context) {
         }
     }
 
+    /** 网页版内重新登录后，把新 token 回写同步（持续免登录关键） */
+    suspend fun updateToken(token: String) {
+        context.dataStore.edit { it[Keys.TOKEN] = token }
+    }
+
     suspend fun clearAuth() {
         context.dataStore.edit {
             it.remove(Keys.TOKEN)

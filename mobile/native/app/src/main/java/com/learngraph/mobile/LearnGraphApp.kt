@@ -23,5 +23,7 @@ class LearnGraphApp : Application() {
                 explicitNulls = false
             },
         )
+        // 提前开启 Cookie 接受（任何 WebView 创建前），配合 flush() 实现登录态持久化
+        android.webkit.CookieManager.getInstance().setAcceptCookie(true)
     }
 }

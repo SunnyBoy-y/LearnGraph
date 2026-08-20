@@ -40,6 +40,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,6 +56,7 @@ import com.learngraph.mobile.data.AuthStore
 import com.learngraph.mobile.data.DownloadStatus
 import com.learngraph.mobile.data.DownloadStore
 import com.learngraph.mobile.web.EmbeddedBrowserActivity
+import kotlinx.coroutines.launch
 
 /**
  * 纯网页模式（v0.8.0）：
@@ -75,6 +77,7 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
     val webViewRef = remember { mutableStateOf<WebView?>(null) }
     val downloadTasks by DownloadStore.tasks.collectAsState()
     val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
+    val scope = rememberCoroutineScope()
 
     val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
 
@@ -125,8 +128,6 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
                             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                             webViewClient = object : WebViewClient() {
-                                private var injected = false
-
                                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                                     val url = request.url
                                     val scheme = url.scheme?.lowercase()
@@ -143,23 +144,52 @@ fun WebAppScreen(onOpenDownloads: () -> Unit) {
 
                                 override fun onPageFinished(view: WebView, url: String?) {
                                     super.onPageFinished(view, url)
-                                    // 登录态注入（仅一次）：网页版 localStorage 键与 auth-store 对齐
-                                    if (!injected && !authState.token.isNullOrBlank()) {
-                                        injected = true
-                                        val js = buildString {
-                                            append("localStorage.setItem('learngraph.access_token', '")
-                                            append(escapeJs(authState.token.orEmpty()))
-                                            append("');")
-                                            append("localStorage.setItem('learngraph.workspace_id', '")
-                                            append(escapeJs(authState.workspaceId.orEmpty()))
-                                            append("');")
-                                            append("localStorage.setItem('learngraph.device_id', '")
-                                            append(escapeJs(authState.deviceId))
-                                            append("');")
+                                    syncLoginState(view)
+                                    // Cookie 强制写盘：登录态持久化（重启免登录）
+                                    CookieManager.getInstance().flush()
+                                }
+
+                                /**
+                                 * 登录态同步（免登录核心）：
+                                 *  - 网页版未登录（localStorage 无 token）→ 注入原生 token + reload（自愈）
+                                 *  - 网页版已登录且 token 与原生一致 → 无事
+                                 *  - 网页版 token 不同（用户在网页版内重新登录）→ 回写 DataStore，持续免登录
+                                 *  reload 后再次 onPageFinished：token 已一致 → 停止，无循环。
+                                 */
+                                private fun syncLoginState(view: WebView) {
+                                    val token = authState.token
+                                    if (token.isNullOrBlank()) return
+                                    val js = buildString {
+                                        append("(function(){")
+                                        append("var cur=localStorage.getItem('learngraph.access_token')||'';")
+                                        append("var want='")
+                                        append(escapeJs(token))
+                                        append("';")
+                                        append("if(!cur){")
+                                        append("localStorage.setItem('learngraph.access_token',want);")
+                                        append("localStorage.setItem('learngraph.workspace_id','")
+                                        append(escapeJs(authState.workspaceId.orEmpty()))
+                                        append("');")
+                                        append("localStorage.setItem('learngraph.device_id','")
+                                        append(escapeJs(authState.deviceId))
+                                        append("');")
+                                        append("return 'injected';")
+                                        append("}")
+                                        append("if(cur!==want){return 'token:'+cur;}")
+                                        append("return 'ok';")
+                                        append("})()")
+                                    }
+                                    view.evaluateJavascript(js) { result ->
+                                        val trimmed = result?.trim()?.trim('"') ?: return@evaluateJavascript
+                                        when {
+                                            trimmed == "injected" -> view.post { view.reload() }
+                                            trimmed.startsWith("token:") -> {
+                                                val newToken = trimmed.removePrefix("token:")
+                                                if (newToken.isNotBlank()) {
+                                                    scope.launch { app.authStore.updateToken(newToken) }
+                                                }
+                                            }
                                         }
-                                        view.evaluateJavascript(js, null)
-                                        // 注入后 reload 一次让 SPA 启动时读到登录态
-                                        view.post { view.reload() }
                                     }
                                 }
                             }

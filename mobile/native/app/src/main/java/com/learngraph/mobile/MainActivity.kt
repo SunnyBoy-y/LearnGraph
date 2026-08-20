@@ -47,6 +47,8 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         ReplyNotifier.setForeground(false)
+        // 后台前强制 Cookie 写盘（重启免登录）
+        android.webkit.CookieManager.getInstance().flush()
     }
 
     private fun requestNotifPermissionIfNeeded() {
