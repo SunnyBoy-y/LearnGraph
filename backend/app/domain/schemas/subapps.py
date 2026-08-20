@@ -95,6 +95,7 @@ class SubAppSessionView(ORMModel):
     created_at: datetime
     updated_at: datetime
     agent_triggers: list[dict[str, Any]] = Field(default_factory=list)
+    analytics: dict[str, Any] | None = None
     agent_status: str = "idle"
     agent_job_id: str | None = None
     agent_error: str | None = None

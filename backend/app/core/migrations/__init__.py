@@ -192,6 +192,53 @@ def _sandbox_toolkit_tables(connection: Connection) -> None:
     SandboxKernel.__table__.create(bind=connection, checkfirst=True)
 
 
+def _subapp_analytics_dimensions(connection: Connection) -> None:
+    """Additive subapp analytics: event dimensions, session analytics snapshot,
+    idempotency key, and the analysis-request ledger.
+
+    All columns are nullable/defaulted so existing rows are untouched; the
+    unique ``(session_id, client_event_id)`` index only constrains rows that
+    carry a client id (SQLite treats NULLs as distinct).
+    """
+    from app.domain.models import SubAppAnalysisRequest
+
+    SubAppAnalysisRequest.__table__.create(bind=connection, checkfirst=True)
+
+    event_columns = {
+        column["name"] for column in inspect(connection).get_columns("subapp_interaction_events")
+    }
+    for column, ddl in (
+        ("client_event_id", "ALTER TABLE subapp_interaction_events ADD COLUMN client_event_id VARCHAR(64)"),
+        ("sequence", "ALTER TABLE subapp_interaction_events ADD COLUMN sequence INTEGER"),
+        ("schema_version", "ALTER TABLE subapp_interaction_events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"),
+        ("occurred_at", "ALTER TABLE subapp_interaction_events ADD COLUMN occurred_at DATETIME"),
+        ("bundle_id", "ALTER TABLE subapp_interaction_events ADD COLUMN bundle_id VARCHAR(36)"),
+        ("component_id", "ALTER TABLE subapp_interaction_events ADD COLUMN component_id VARCHAR(120)"),
+        ("component_version", "ALTER TABLE subapp_interaction_events ADD COLUMN component_version VARCHAR(40)"),
+        ("delivery_attempt", "ALTER TABLE subapp_interaction_events ADD COLUMN delivery_attempt INTEGER NOT NULL DEFAULT 1"),
+        ("source", "ALTER TABLE subapp_interaction_events ADD COLUMN source VARCHAR(24) NOT NULL DEFAULT 'semantic'"),
+        ("privacy_class", "ALTER TABLE subapp_interaction_events ADD COLUMN privacy_class VARCHAR(24) NOT NULL DEFAULT 'session'"),
+        ("analysis_status", "ALTER TABLE subapp_interaction_events ADD COLUMN analysis_status VARCHAR(24) NOT NULL DEFAULT 'none'"),
+    ):
+        if column not in event_columns:
+            connection.exec_driver_sql(ddl)
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS uq_subapp_interaction_events_session_client "
+        "ON subapp_interaction_events (session_id, client_event_id)"
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_subapp_interaction_events_bundle "
+        "ON subapp_interaction_events (bundle_id)"
+    )
+    session_columns = {
+        column["name"] for column in inspect(connection).get_columns("subapp_sessions")
+    }
+    if "analytics" not in session_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE subapp_sessions ADD COLUMN analytics JSON"
+        )
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -225,6 +272,11 @@ MIGRATIONS = (
         "v1.3.0",
         "Sandbox toolkit: sandbox_todos and sandbox_kernels tables",
         _sandbox_toolkit_tables,
+    ),
+    SchemaMigration(
+        "v1.4.0",
+        "Subapp analytics dimensions, session analytics snapshot, analysis-request ledger",
+        _subapp_analytics_dimensions,
     ),
 )
 

@@ -35,6 +35,7 @@ from app.services.session_workspace import SessionWorkspaceService
 MAX_BUNDLE_FILES = 256
 MAX_BUNDLE_FILE_BYTES = 8 * 1024 * 1024
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+MAX_CONTRACT_FILE_BYTES = 128 * 1024
 VALIDATION_TTL_SECONDS = 900
 PREVIEW_GRANT_TTL_SECONDS = 300
 
@@ -283,6 +284,84 @@ class SubAppBundleService:
             "report": validation.report,
         }
 
+    def validate_interaction_contract(
+        self,
+        *,
+        chat_session_id: str,
+        path: str,
+    ) -> dict[str, Any]:
+        """Load and validate a ``learngraph.subapp.json`` contract from the
+        sandbox workspace, returning a stable checksum the publish step reuses.
+
+        Unlike inline tool arguments, file-backed contracts survive JSON
+        escaping and truncation failures; errors carry the JSON Pointer of the
+        offending field.
+        """
+        from app.services.components import _interaction_contract_guard
+
+        contract = self._load_contract_from_workspace(chat_session_id, path)
+        try:
+            _interaction_contract_guard(contract)
+        except AppError as exc:
+            raise AppError(
+                422,
+                "subapp_interaction_contract_invalid",
+                f"Invalid interaction contract: {exc.message}",
+                exc.details,
+            ) from exc
+        checksum = _sha256(_canonical_json(contract))
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="subapp.contract_validated",
+            resource_type="subapp_bundle_contract",
+            resource_id=path,
+            details={"checksum": checksum, "path": path},
+        )
+        self.db.commit()
+        return {
+            "status": "passed",
+            "path": path,
+            "contract_checksum": checksum,
+            "agent_triggers": [
+                item.get("event_type")
+                for item in (contract.get("agent_triggers") or [])
+                if isinstance(item, dict)
+            ],
+            "analytics_enabled": bool(
+                isinstance(contract.get("analytics"), dict)
+                and contract.get("analytics", {}).get("enabled", True)
+            ),
+        }
+
+    def _load_contract_from_workspace(self, chat_session_id: str, path: str) -> dict[str, Any]:
+        from app.services.components import _interaction_contract_guard
+
+        normalized = _normalize_bundle_path(path)
+        data = self.workspace_files.materialize_bytes(chat_session_id, normalized)
+        if len(data) > MAX_CONTRACT_FILE_BYTES:
+            raise AppError(
+                422,
+                "subapp_interaction_contract_too_large",
+                "Interaction contract file exceeds the size limit",
+            )
+        try:
+            contract = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AppError(
+                422,
+                "subapp_interaction_contract_invalid_json",
+                "Interaction contract file is not valid JSON",
+                {"path": normalized, "error": str(exc)},
+            ) from exc
+        if not isinstance(contract, dict):
+            raise AppError(
+                422,
+                "subapp_interaction_contract_invalid",
+                "Interaction contract must be a JSON object",
+            )
+        _interaction_contract_guard(contract)
+        return contract
+
     def publish(
         self,
         *,
@@ -292,6 +371,7 @@ class SubAppBundleService:
         title: str,
         preferred_height: int | None = None,
         interaction_contract: dict[str, Any] | None = None,
+        contract_path: str | None = None,
     ) -> dict[str, Any]:
         validation = self.db.scalar(
             select(SubAppBundleValidation).where(
@@ -307,6 +387,16 @@ class SubAppBundleService:
             raise AppError(409, "subapp_bundle_validation_unusable", "Bundle validation is failed, expired, or already published")
         if sandbox_session_id and validation.sandbox_session_id and sandbox_session_id != validation.sandbox_session_id:
             raise AppError(409, "subapp_bundle_validation_session_mismatch", "Validation belongs to a different sandbox session")
+        if contract_path is not None:
+            if interaction_contract is not None:
+                raise AppError(
+                    409,
+                    "subapp_bundle_contract_conflict",
+                    "Pass either interaction_contract or contract_path, not both",
+                )
+            interaction_contract = self._load_contract_from_workspace(
+                chat_session_id, contract_path
+            )
         bundle = SubAppBundle(
             workspace_id=self.workspace_id,
             owner_user_id=self.actor_id,
@@ -335,8 +425,9 @@ class SubAppBundleService:
             )
         validation.consumed_at = utc_now()
         component_manifest_id: str | None = None
+        contract_smoke: dict[str, Any] | None = None
         if interaction_contract is not None:
-            component_manifest_id = self._create_interactive_manifest(
+            component_manifest_id, contract_smoke = self._create_interactive_manifest(
                 bundle=bundle,
                 interaction_contract=interaction_contract,
                 chat_session_id=chat_session_id,
@@ -351,6 +442,7 @@ class SubAppBundleService:
                 "validation_id": validation.id,
                 "manifest_sha256": bundle.manifest_sha256,
                 "subapp_mode": component_manifest_id is not None,
+                "contract_smoke": contract_smoke,
             },
         )
         self.db.commit()
@@ -362,6 +454,7 @@ class SubAppBundleService:
             "status": bundle.status,
             "subapp_mode": component_manifest_id is not None,
             "artifact_version_id": component_manifest_id,
+            "contract_smoke": contract_smoke,
             "part": {
                 "type": "subapp_artifact",
                 "status": "completed",
@@ -375,6 +468,7 @@ class SubAppBundleService:
                     "validation_status": "passed",
                     "subapp_mode": component_manifest_id is not None,
                     "artifact_version_id": component_manifest_id,
+                    "contract_smoke": contract_smoke,
                 },
             },
         }
@@ -396,7 +490,7 @@ class SubAppBundleService:
         publisher of this chat session's sandbox output, but still owns a minimal
         internal ``PluginRecord`` so the manifest foreign key is satisfied.
         Contract validation reuses the same closed-schema guards as component
-        registration.
+        registration. Returns ``(manifest_id, smoke_report)``.
         """
         from app.services.components import _interaction_contract_guard
 
@@ -434,6 +528,23 @@ class SubAppBundleService:
                 "Interaction contract contains an invalid JSON Schema",
                 {"validation_error": type(exc).__name__},
             ) from None
+
+        # Protocol smoke check: prove the event contract is instantiable so the
+        # host can persist at least one event against it. Skipped (not failed)
+        # when the schema cannot be heuristically synthesized.
+        smoke: dict[str, Any] = {"status": "skipped"}
+        try:
+            from app.services.components import build_minimal_schema_instance
+
+            sample, ok = build_minimal_schema_instance(event_schema)
+            if ok:
+                validator_for(event_schema)(event_schema).validate(sample)
+                smoke = {"status": "passed", "sample_payload": sample}
+        except Exception as exc:  # noqa: BLE001 — smoke must never block publish
+            smoke = {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         from app.domain.schemas.components import COMPONENT_ID_PATTERN
         import re
@@ -542,9 +653,10 @@ class SubAppBundleService:
                 "bundle_id": bundle.id,
                 "component_id": component_id,
                 "chat_session_id": chat_session_id,
+                "smoke": smoke,
             },
         )
-        return manifest.id
+        return manifest.id, smoke
 
     def read_file(self, bundle_id: str, path: str) -> tuple[SubAppBundleFile, ContentBlob]:
         """Read one bundle file through the main API (host-bridge VFS channel).

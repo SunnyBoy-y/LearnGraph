@@ -445,6 +445,9 @@ class SubAppSession(Base, TimestampMixin, WorkspaceScopedMixin):
     )
     last_processed_event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     agent_consent: Mapped[str] = mapped_column(String(16), default="ask")
+    # Analytics policy snapshot (from the publish contract); drives the generic
+    # behavior-capture and analysis entry behavior for this session.
+    analytics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class SubAppState(Base, WorkspaceScopedMixin):
@@ -518,6 +521,35 @@ class SubAppAgentConsentRequest(Base, TimestampMixin, WorkspaceScopedMixin):
     decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SubAppAnalysisRequest(Base, TimestampMixin, WorkspaceScopedMixin):
+    """One user-initiated "analyze this subapp" request and its outcome.
+
+    Tracks idempotency and audit for the built-in analysis entry; the actual
+    analysis is produced by an Agent turn whose result message is linked via
+    ``result_message_id``.
+    """
+
+    __tablename__ = "subapp_analysis_requests"
+    __table_args__ = (
+        Index(
+            "ix_subapp_analysis_requests_workspace_bundle",
+            "workspace_id",
+            "bundle_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    chat_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    bundle_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    component_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    scope: Mapped[str] = mapped_column(String(16), default="current")  # current|session|all
+    purpose: Mapped[str] = mapped_column(String(1000), default="")
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Message(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -1429,6 +1461,12 @@ class SubAppInteractionEvent(Base, TimestampMixin, WorkspaceScopedMixin):
             "workspace_id",
             "session_id",
         ),
+        Index(
+            "uq_subapp_interaction_events_session_client",
+            "session_id",
+            "client_event_id",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -1440,6 +1478,20 @@ class SubAppInteractionEvent(Base, TimestampMixin, WorkspaceScopedMixin):
     event_type: Mapped[str] = mapped_column(String(120))
     payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # --- Client-side reliability & analytics dimensions (P1) ---
+    client_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    bundle_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    component_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    component_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    delivery_attempt: Mapped[int] = mapped_column(Integer, default=1)
+    source: Mapped[str] = mapped_column(String(24), default="semantic")
+    privacy_class: Mapped[str] = mapped_column(String(24), default="session")
+    analysis_status: Mapped[str] = mapped_column(String(24), default="none")
 
 
 class MemoryRecord(Base, TimestampMixin, WorkspaceScopedMixin):

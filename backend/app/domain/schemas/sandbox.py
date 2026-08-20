@@ -490,6 +490,13 @@ class SandboxWebAppPublishRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     preferred_height: int | None = Field(default=None, ge=160, le=900)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+    interaction_contract: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional bidirectional contract: {event_schema, state_schema, "
+            "agent_triggers?, analytics?}. Omit for a static preview bundle."
+        ),
+    )
 
 
 class SandboxWebAppPublishView(BaseModel):

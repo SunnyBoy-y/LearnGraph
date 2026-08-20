@@ -4422,6 +4422,17 @@ class AgentToolRuntime:
         if time_to is not None:
             filters.append(SubAppInteractionEvent.created_at <= time_to)
 
+        # --- surface the session's current state_version so subapp_patch_state's
+        # expected_version CAS flow is actually executable (the docs require
+        # reading it first via subapp_observe). ---
+        session_state_version: int | None = None
+        if session_id:
+            from app.domain.models import SubAppSession
+
+            session_row = db.get(SubAppSession, session_id)
+            if session_row is not None:
+                session_state_version = session_row.state_version
+
         # --- aggregates via SQL (bounded output) ---
         total_count = int(
             db.scalar(
@@ -4476,6 +4487,7 @@ class AgentToolRuntime:
                     },
                     "limit": limit,
                 },
+                "session_state_version": session_state_version,
                 "total_events": total_count,
                 "events_by_type": count_by_type,
                 "recent_events": recent_events,
@@ -6849,7 +6861,14 @@ class AgentToolRuntime:
         try:
             value = json.loads(raw_arguments)
         except json.JSONDecodeError as exc:
-            raise AppError(422, "invalid_tool_arguments", "Tool arguments are not valid JSON") from exc
+            raise AppError(
+                422,
+                "invalid_tool_arguments",
+                "Tool arguments are not valid JSON. For sandbox_publish_web_app, "
+                "do not inline a large interaction_contract — write it to "
+                "learngraph.subapp.json, run sandbox_validate_interaction_contract, "
+                "and pass contract_path instead",
+            ) from exc
         if not isinstance(value, dict):
             raise AppError(422, "invalid_tool_arguments", "Tool arguments must be a JSON object")
         return value

@@ -75,6 +75,53 @@ class ComponentSignatureDeclaration(BaseModel):
     signature_base64: str = Field(min_length=16, max_length=16_384)
 
 
+SUBAPP_TRIGGER_EVENT_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
+
+
+class SubAppAgentTrigger(BaseModel):
+    """One explicit event-type → Agent turn trigger for a bidirectional subapp."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: str = Field(min_length=1, max_length=120)
+    mode: Literal["explicit"] = "explicit"
+
+    @field_validator("event_type")
+    @classmethod
+    def validate_event_type(cls, value: str) -> str:
+        normalized = value.strip()
+        if not SUBAPP_TRIGGER_EVENT_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                "agent_triggers.event_type must be a bounded lowercase event identifier"
+            )
+        return normalized
+
+
+class SubAppAnalytics(BaseModel):
+    """Optional analytics collection policy for a bidirectional subapp."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    track: list[str] = Field(default_factory=list, max_length=64)
+    summary_events: list[str] = Field(default_factory=list, max_length=16)
+    privacy: Literal["session", "workspace", "none"] = "session"
+
+    @field_validator("track", "summary_events")
+    @classmethod
+    def validate_event_names(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in values:
+            candidate = item.strip()
+            if not SUBAPP_TRIGGER_EVENT_PATTERN.fullmatch(candidate):
+                raise ValueError(
+                    "analytics event names must be bounded lowercase event identifiers"
+                )
+            if candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+
 class ComponentInteractionContract(BaseModel):
     """Schemas for the isolated subapp event and server-authored state channels."""
 
@@ -82,6 +129,8 @@ class ComponentInteractionContract(BaseModel):
 
     event_schema: dict[str, Any]
     state_schema: dict[str, Any]
+    agent_triggers: list[SubAppAgentTrigger] = Field(default_factory=list, max_length=16)
+    analytics: SubAppAnalytics | None = None
 
 
 class ComponentManifestImportRequest(BaseModel):

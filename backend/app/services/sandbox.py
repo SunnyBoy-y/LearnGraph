@@ -3399,6 +3399,36 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             {
                 "type": "function",
                 "function": {
+                    "name": "sandbox_validate_interaction_contract",
+                    "description": (
+                        "Validate a bidirectional subapp interaction contract stored as a JSON file "
+                        "in the sandbox workspace (convention: lerarngraph.subapp.json). The contract "
+                        "shape is {event_schema, state_schema, agent_triggers?, analytics?}. "
+                        "Prefer this over inlining the contract into sandbox_publish_web_app: it "
+                        "returns precise JSON Pointer errors and a stable checksum, and it cannot be "
+                        "truncated by tool-argument JSON escaping. event_schema/state_schema must be "
+                        "closed object schemas (top-level additionalProperties:false, depth<=16, "
+                        "nodes<=1000, <=64KiB) without executable content, external $ref, or "
+                        "caller-supplied patterns; event_schema must NOT include a 'type' field "
+                        "(the host routes event type separately)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative path to the contract JSON file, e.g. work/app/learngraph.subapp.json",
+                            },
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "sandbox_publish_web_app",
                     "description": (
                         "Publish a validated multi-file teaching app as a durable interactive subapp. "
@@ -3415,23 +3445,90 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                         "properties": {
                             "validation_id": {"type": "string"},
                             "title": {"type": "string"},
+                            "contract_path": {
+                                "type": "string",
+                                "description": (
+                                    "Optional workspace-relative path to a validated "
+                                    "lerarngraph.subapp.json contract (run "
+                                    "sandbox_validate_interaction_contract first). "
+                                    "Pass either contract_path or interaction_contract, "
+                                    "never both."
+                                ),
+                            },
                             "preferred_height": {"type": "integer", "minimum": 160, "maximum": 900},
                             "interaction_contract": {
                                 "type": "object",
                                 "description": (
                                     "Optional bidirectional contract. Shape: "
-                                    "{event_schema: <JSON Schema>, state_schema: <JSON Schema>}. "
+                                    "{event_schema: <JSON Schema>, state_schema: <JSON Schema>, "
+                                    "agent_triggers: [{event_type, mode: 'explicit'}], "
+                                    "analytics: {enabled, track, summary_events, privacy}}. "
                                     "event_schema describes user actions emitted by the app (e.g. "
-                                    "{question_id, selected}); state_schema describes the complete "
-                                    "state you write via subapp_patch_state (e.g. {view, answers}). "
-                                    "Both schemas must be closed object schemas (top-level "
-                                    "additionalProperties:false) and must not declare executable "
-                                    "content, callbacks, or caller-supplied patterns."
+                                    "{question_id, selected}) — do NOT include a 'type' field, the "
+                                    "host routes the event type separately. state_schema describes "
+                                    "the complete state you write via subapp_patch_state (e.g. "
+                                    "{view, answers}). agent_triggers lists the explicit event "
+                                    "types that may invoke the Agent (only 'explicit' mode, never "
+                                    "high-frequency telemetry). analytics.enabled turns on generic "
+                                    "behavior capture; track lists semantic event names to capture "
+                                    "in full, summary_events lists high-frequency events to "
+                                    "aggregate, privacy is session|workspace|none. Both schemas "
+                                    "must be closed object schemas (top-level additionalProperties:"
+                                    "false, depth<=16, nodes<=1000, <=64KiB) and must not declare "
+                                    "executable content, callbacks, external $ref, or "
+                                    "caller-supplied patterns."
                                 ),
                                 "properties": {
                                     "event_schema": {"type": "object"},
                                     "state_schema": {"type": "object"},
+                                    "agent_triggers": {
+                                        "type": "array",
+                                        "maxItems": 16,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "event_type": {
+                                                    "type": "string",
+                                                    "pattern": "^[a-z][a-z0-9_.-]{0,119}$",
+                                                },
+                                                "mode": {
+                                                    "type": "string",
+                                                    "enum": ["explicit"],
+                                                },
+                                            },
+                                            "required": ["event_type"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                    "analytics": {
+                                        "type": "object",
+                                        "properties": {
+                                            "enabled": {"type": "boolean"},
+                                            "track": {
+                                                "type": "array",
+                                                "maxItems": 64,
+                                                "items": {
+                                                    "type": "string",
+                                                    "pattern": "^[a-z][a-z0-9_.-]{0,119}$",
+                                                },
+                                            },
+                                            "summary_events": {
+                                                "type": "array",
+                                                "maxItems": 16,
+                                                "items": {
+                                                    "type": "string",
+                                                    "pattern": "^[a-z][a-z0-9_.-]{0,119}$",
+                                                },
+                                            },
+                                            "privacy": {
+                                                "type": "string",
+                                                "enum": ["session", "workspace", "none"],
+                                            },
+                                        },
+                                        "additionalProperties": False,
+                                    },
                                 },
+                                "required": ["event_schema", "state_schema"],
                                 "additionalProperties": False,
                             },
                             "sandbox_session_id": session_property,
@@ -4005,6 +4102,15 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                         },
                     },
                 }
+            if name == "sandbox_validate_interaction_contract":
+                from app.services.subapp_bundles import SubAppBundleService
+
+                return SubAppBundleService(
+                    self.db, self.workspace_id, self.actor_id, self.settings
+                ).validate_interaction_contract(
+                    chat_session_id=chat_session_id,
+                    path=str(payload.get("path") or ""),
+                )
             if name == "sandbox_validate_web_app":
                 from app.services.subapp_bundles import SubAppBundleService
 
@@ -4028,6 +4134,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     title=str(payload.get("title") or "交互式教学应用"),
                     preferred_height=payload.get("preferred_height") if isinstance(payload.get("preferred_height"), int) else None,
                     interaction_contract=payload.get("interaction_contract") if isinstance(payload.get("interaction_contract"), dict) else None,
+                    contract_path=payload.get("contract_path") if isinstance(payload.get("contract_path"), str) else None,
                 )
             if name == "sandbox_video_info":
                 return self.video_info(SandboxAgentVideoInfoRequest.model_validate(payload))

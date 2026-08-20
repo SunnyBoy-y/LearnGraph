@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from typing import Any
 
 from jsonschema import ValidationError
@@ -64,6 +65,9 @@ MAX_SCHEMA_BYTES = 64 * 1024
 MAX_INSTANCE_BYTES = 64 * 1024
 MAX_SCHEMA_DEPTH = 16
 MAX_SCHEMA_NODES = 1_000
+MAX_CONTRACT_TRIGGERS = 16
+MAX_CONTRACT_ANALYTIC_EVENTS = 64
+_SUBAPP_EVENT_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
 FORBIDDEN_CONTENT_MARKERS = (
     "<script",
     "</script",
@@ -197,6 +201,68 @@ def _schema_guard(schema: dict[str, Any], *, label: str) -> None:
         ) from exc
 
 
+def build_minimal_schema_instance(schema: dict[str, Any]) -> tuple[Any, bool]:
+    """Heuristically construct a minimal instance satisfying a closed object schema.
+
+    Used by the publish smoke check to prove the event contract is instantiable
+    (the host must be able to persist at least one event against it). Returns
+    ``(instance, ok)``; ``ok=False`` when a required field cannot be synthesized
+    (e.g. ``oneOf``/``anyOf`` without a resolvable branch), in which case the
+    caller should mark the smoke check as skipped rather than failed.
+    """
+
+    def build(value: Any, required_ok: bool) -> tuple[Any, bool]:
+        if not isinstance(value, dict):
+            return None, False
+        if "const" in value:
+            return value["const"], True
+        enum = value.get("enum")
+        if isinstance(enum, list) and enum:
+            return enum[0], True
+        stype = value.get("type")
+        if stype in ("string",):
+            return "x", True
+        if stype in ("integer", "number"):
+            return 0, True
+        if stype == "boolean":
+            return False, True
+        if stype == "null":
+            return None, True
+        if stype == "array":
+            items = value.get("items")
+            if isinstance(items, dict):
+                item, _ = build(items, required_ok=False)
+                return [item], True
+            return [], True
+        if stype == "object":
+            props = value.get("properties")
+            if not isinstance(props, dict):
+                return {}, True
+            result: dict[str, Any] = {}
+            required = set(value.get("required") or [])
+            for key, sub in props.items():
+                if key not in required and not required_ok:
+                    continue
+                sub_val, ok = build(sub, required_ok=False)
+                if not ok and key in required:
+                    return None, False
+                if ok:
+                    result[key] = sub_val
+            return result, True
+        for comb_key in ("oneOf", "anyOf", "allOf"):
+            combos = value.get(comb_key)
+            if isinstance(combos, list) and combos:
+                for combo in combos:
+                    if isinstance(combo, dict):
+                        sub_val, ok = build(combo, required_ok=False)
+                        if ok:
+                            return sub_val, True
+                return None, False
+        return None, False
+
+    return build(schema, required_ok=True)
+
+
 def _interaction_contract_guard(
     interaction_contract: dict[str, Any] | None,
     *,
@@ -214,6 +280,96 @@ def _interaction_contract_guard(
         interaction_contract["state_schema"],
         label=f"{label}.state_schema",
     )
+    # Explicit agent triggers: only bounded lowercase event identifiers, only
+    # the "explicit" mode (never auto-trigger on high-frequency telemetry), and
+    # no duplicate event types.
+    triggers = interaction_contract.get("agent_triggers") or []
+    if not isinstance(triggers, list):
+        raise AppError(
+            422,
+            "component_contract_invalid",
+            f"{label}.agent_triggers must be an array",
+        )
+    if len(triggers) > MAX_CONTRACT_TRIGGERS:
+        raise AppError(
+            422,
+            "component_contract_invalid",
+            f"{label}.agent_triggers exceeds the {MAX_CONTRACT_TRIGGERS}-entry limit",
+        )
+    seen: set[str] = set()
+    for trigger in triggers:
+        if not isinstance(trigger, dict) or "event_type" not in trigger:
+            raise AppError(
+                422,
+                "component_contract_invalid",
+                f"{label}.agent_triggers entries must declare event_type",
+            )
+        event_type = trigger.get("event_type")
+        if not isinstance(event_type, str) or not _SUBAPP_EVENT_NAME.fullmatch(
+            event_type.strip()
+        ):
+            raise AppError(
+                422,
+                "component_contract_invalid",
+                f"{label}.agent_triggers.event_type must be a bounded lowercase event identifier",
+            )
+        mode = trigger.get("mode", "explicit")
+        if mode != "explicit":
+            raise AppError(
+                422,
+                "component_contract_invalid",
+                f"{label}.agent_triggers.mode must be 'explicit'",
+            )
+        key = event_type.strip()
+        if key in seen:
+            raise AppError(
+                422,
+                "component_contract_invalid",
+                f"{label}.agent_triggers duplicates event_type {key}",
+            )
+        seen.add(key)
+    # Analytics policy: bounded event-name lists and a privacy whitelist.
+    analytics = interaction_contract.get("analytics")
+    if analytics is not None:
+        if not isinstance(analytics, dict):
+            raise AppError(
+                422,
+                "component_contract_invalid",
+                f"{label}.analytics must be an object",
+            )
+        privacy = analytics.get("privacy", "session")
+        if privacy not in {"session", "workspace", "none"}:
+            raise AppError(
+                422,
+                "component_contract_invalid",
+                f"{label}.analytics.privacy must be session, workspace, or none",
+            )
+        for field_name in ("track", "summary_events"):
+            names = analytics.get(field_name) or []
+            if not isinstance(names, list):
+                raise AppError(
+                    422,
+                    "component_contract_invalid",
+                    f"{label}.analytics.{field_name} must be an array",
+                )
+            if len(names) > MAX_CONTRACT_ANALYTIC_EVENTS:
+                raise AppError(
+                    422,
+                    "component_contract_invalid",
+                    f"{label}.analytics.{field_name} exceeds the limit",
+                )
+            for name in names:
+                if not isinstance(name, str) or not _SUBAPP_EVENT_NAME.fullmatch(
+                    name.strip()
+                ):
+                    raise AppError(
+                        422,
+                        "component_contract_invalid",
+                        f"{label}.analytics.{field_name} entries must be bounded lowercase event identifiers",
+                    )
+    # Normalize defaults so downstream consumers always see stable shapes.
+    interaction_contract.setdefault("agent_triggers", [])
+    interaction_contract.setdefault("analytics", None)
 
 
 def _assert_no_executable_content(value: Any, *, path: str = "$") -> None:

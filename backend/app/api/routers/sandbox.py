@@ -842,6 +842,7 @@ def publish_web_app(
         sandbox_session_id=payload.sandbox_session_id,
         title=payload.title,
         preferred_height=payload.preferred_height,
+        interaction_contract=payload.interaction_contract,
     )
     return SandboxWebAppPublishView.model_validate(result)
 
