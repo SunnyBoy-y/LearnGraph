@@ -22,6 +22,7 @@ from app.core.scheduler import (
     mcp_runner_cleanup_scheduler,
     sandbox_cleanup_scheduler,
     sandbox_execution_scheduler,
+    stream_events_retention_scheduler,
     wal_checkpoint_scheduler,
 )
 from app.services.durable_queue import (
@@ -80,6 +81,8 @@ async def lifespan(_: FastAPI):
     wal_task: asyncio.Task[None] | None = None
     sandbox_exec_stop: asyncio.Event | None = None
     sandbox_exec_task: asyncio.Task[None] | None = None
+    stream_events_retention_stop: asyncio.Event | None = None
+    stream_events_retention_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
         scheduler_stop = asyncio.Event()
         scheduler_task = asyncio.create_task(mastery_scheduler(scheduler_stop))
@@ -104,6 +107,11 @@ async def lifespan(_: FastAPI):
     if settings.wal_checkpoint_interval_seconds > 0:
         wal_stop = asyncio.Event()
         wal_task = asyncio.create_task(wal_checkpoint_scheduler(wal_stop))
+    if settings.stream_event_retention_enabled:
+        stream_events_retention_stop = asyncio.Event()
+        stream_events_retention_task = asyncio.create_task(
+            stream_events_retention_scheduler(stream_events_retention_stop)
+        )
     try:
         yield
     finally:
@@ -134,6 +142,12 @@ async def lifespan(_: FastAPI):
         if wal_stop is not None and wal_task is not None:
             wal_stop.set()
             await wal_task
+        if (
+            stream_events_retention_stop is not None
+            and stream_events_retention_task is not None
+        ):
+            stream_events_retention_stop.set()
+            await stream_events_retention_task
 
 
 class SecurityHeadersMiddleware:

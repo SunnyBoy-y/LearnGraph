@@ -5,18 +5,23 @@ import logging
 import os
 import shutil
 import stat
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
+from app.core.database import active_stream_count
 from app.core.database import commit_with_locked_retry
+from app.core.database import snapshot_sqlite_metrics
 from app.core.process_lock import acquire_advisory_lock, release_advisory_lock
 from app.domain.models import (
     MemoryProfileSnapshot,
+    Message,
+    MessageStreamEvent,
     SandboxAgentCommand,
     SandboxSession,
     Workspace,
@@ -39,6 +44,39 @@ _SANDBOX_COMMAND_SNAPSHOT_PREFIX = ".learngraph-command-snapshot-"
 # few times so transient locks (e.g. antivirus scanners) do not fail the sweep.
 _WIN_RM_RETRIES = 5
 _WIN_RM_RETRY_DELAY_SECONDS = 0.2
+
+# P3-S1: consecutive-defer counters per sweep name. When agent streams are
+# active a sweep defers up to ``sqlite_sweep_defer_max_skips`` ticks, then runs
+# anyway so long-running interactive sessions cannot starve maintenance work.
+_SWEEP_DEFER_LOCK = threading.Lock()
+_SWEEP_DEFER_COUNTERS: dict[str, int] = {}
+
+
+def _should_defer_sweep(name: str) -> bool:
+    """True when the named non-urgent sweep should skip this round.
+
+    Deferral happens only while at least one agent stream is generating, and
+    is bounded by ``sqlite_sweep_defer_max_skips`` consecutive skips. The
+    counter resets whenever the sweep actually runs (caller must call
+    ``_note_sweep_ran(name)`` after running).
+    """
+    if active_stream_count() <= 0:
+        with _SWEEP_DEFER_LOCK:
+            _SWEEP_DEFER_COUNTERS.pop(name, None)
+        return False
+    max_skips = max(0, get_settings().sqlite_sweep_defer_max_skips)
+    with _SWEEP_DEFER_LOCK:
+        skips = _SWEEP_DEFER_COUNTERS.get(name, 0)
+        if skips >= max_skips:
+            _SWEEP_DEFER_COUNTERS[name] = 0
+            return False
+        _SWEEP_DEFER_COUNTERS[name] = skips + 1
+        return True
+
+
+def _note_sweep_ran(name: str) -> None:
+    with _SWEEP_DEFER_LOCK:
+        _SWEEP_DEFER_COUNTERS.pop(name, None)
 
 
 def _force_rmtree(path: Path) -> None:
@@ -151,6 +189,10 @@ def run_mastery_ticks(
     now: datetime | None = None,
     execute: bool = True,
 ) -> list[MasterySchedulerTickView]:
+    # P3-S1: defer to the next tick while agent streams are generating so the
+    # single SQLite writer serves interactive traffic first.
+    if _should_defer_sweep("sweep.mastery"):
+        return []
     # B1-7: cross-process mutex so multiple workers do not all run the sweep.
     with SessionLocal() as lock_db:
         lock_token = acquire_advisory_lock(lock_db, "sweep.mastery", ttl_seconds=600)
@@ -176,6 +218,7 @@ def run_mastery_ticks(
                     "Mastery scheduler tick failed for workspace %s",
                     workspace_id,
                 )
+        _note_sweep_ran("sweep.mastery")
         return results
     finally:
         with SessionLocal() as lock_db:
@@ -244,6 +287,16 @@ def run_workspace_memory_retention(
 
 
 def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int]:
+    # P3-S1: defer while agent streams are generating.
+    if _should_defer_sweep("sweep.retention"):
+        return {
+            "content_keys_destroyed": 0,
+            "journal_entries_removed": 0,
+            "reviewed": 0,
+            "lapsed": 0,
+            "zones_reviewed": 0,
+            "zones_changed": 0,
+        }
     with SessionLocal() as db:
         workspace_ids = list(db.scalars(select(Workspace.id)))
     totals = {
@@ -262,6 +315,7 @@ def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int
             continue
         for key in totals:
             totals[key] += result[key]
+    _note_sweep_ran("sweep.retention")
     return totals
 
 
@@ -306,6 +360,16 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
     (MemoryDrafts) and rolling LLM context summaries (ContextSummary
     kind='model'). Each is gated by its own workspace enhancement settings.
     """
+
+    # P3-S1: defer while agent streams are generating.
+    if _should_defer_sweep("sweep.extraction"):
+        return {
+            "sessions_processed": 0,
+            "drafts_created": 0,
+            "auto_committed": 0,
+            "sessions_summarized": 0,
+            "profiles_rewritten": 0,
+        }
 
     from app.services.memory_enhancement import (
         run_workspace_extraction_sweep,
@@ -412,6 +476,7 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
             continue
         for key in totals:
             totals[key] += result.get(key, 0)
+    _note_sweep_ran("sweep.extraction")
     return totals
 
 
@@ -450,6 +515,15 @@ async def memory_extraction_scheduler(
 
 
 def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
+    # P3-S1: defer while agent streams are generating.
+    if _should_defer_sweep("sweep.sandbox_cleanup"):
+        return {
+            "cooled": 0,
+            "cleaned": 0,
+            "recovered": 0,
+            "cleanup_blocked": 0,
+            "snapshots_cleaned": 0,
+        }
     settings = get_settings()
     current = now or utc_now()
     totals = {
@@ -639,6 +713,7 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
                 session.cleanup_error_class = type(exc).__name__
                 totals["cleanup_blocked"] += 1
             db.commit()
+    _note_sweep_ran("sweep.sandbox_cleanup")
     return totals
 
 
@@ -878,6 +953,10 @@ def run_mcp_runner_cleanup_sweep(*, now: datetime | None = None) -> dict[str, in
 
     from app.domain.extension_models import MCPRunnerSession
 
+    # P3-S1: defer while agent streams are generating.
+    if _should_defer_sweep("sweep.mcp_runner_cleanup"):
+        return {"terminated": 0, "deleted": 0, "skipped": 0}
+
     settings = get_settings()
     current = now or utc_now()
     totals = {"terminated": 0, "deleted": 0, "skipped": 0}
@@ -904,6 +983,7 @@ def run_mcp_runner_cleanup_sweep(*, now: datetime | None = None) -> dict[str, in
                 totals["skipped"] += 1
             session.status = "terminated"
         db.commit()
+    _note_sweep_ran("sweep.mcp_runner_cleanup")
     return totals
 
 
@@ -951,11 +1031,117 @@ async def wal_checkpoint_scheduler(
     )
     if interval <= 0:
         return
+    metrics_ticks = 0
     while not stop.is_set():
         try:
             await asyncio.to_thread(run_wal_checkpoint)
         except Exception:
             logger.debug("WAL checkpoint round skipped", exc_info=True)
+        # P4-L2: periodically surface SQLite contention/throughput so lock
+        # storms and commit pressure stay observable without an external
+        # metrics backend. ~once per minute.
+        metrics_ticks += 1
+        if metrics_ticks >= max(1, round(60 / interval)):
+            metrics_ticks = 0
+            try:
+                metrics = await asyncio.to_thread(snapshot_sqlite_metrics)
+                logger.info(
+                    "SQLite metrics: write_gate_contentions=%s gate_wait_ms=%s "
+                    "write_ms=%s locked_retries=%s wal_bytes=%s",
+                    int(metrics.get("gate_contentions") or 0),
+                    int(metrics.get("gate_wait_ms") or 0),
+                    int(metrics.get("write_ms") or 0),
+                    int(metrics.get("locked_retries") or 0),
+                    int(metrics.get("wal_bytes") or 0),
+                )
+            except Exception:
+                logger.debug("SQLite metrics snapshot failed", exc_info=True)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+def run_stream_events_retention(*, now: datetime | None = None) -> int:
+    """Purge stream events of long-terminal messages (P4-L1).
+
+    ``message_stream_events`` is an append-only transport/replay projection;
+    the authoritative rows are ``messages``/``message_parts``. Events belonging
+    to messages that reached a terminal status (completed/failed/cancelled)
+    older than ``stream_event_retention_days`` are deleted so the table cannot
+    grow without bound. In-flight streams (pending/streaming/interrupted) are
+    never touched. Deferred while agent streams are generating, and fenced by
+    the advisory lock so multiple processes cannot purge concurrently. Returns
+    the number of deleted rows.
+    """
+
+    settings = get_settings()
+    if not settings.stream_event_retention_enabled:
+        return 0
+    retention_days = settings.stream_event_retention_days
+    if retention_days <= 0:
+        return 0
+    if _should_defer_sweep("sweep.stream_events_retention"):
+        return 0
+    cutoff = utc_now() - timedelta(days=retention_days)
+    with SessionLocal() as lock_db:
+        lock_token = acquire_advisory_lock(
+            lock_db, "sweep.stream_events_retention", ttl_seconds=600
+        )
+    if lock_token is None:
+        return 0
+    try:
+        with SessionLocal() as db:
+            terminal_message_ids = select(Message.id).where(
+                Message.status.in_(("completed", "failed", "cancelled")),
+                Message.updated_at < cutoff,
+            )
+            result = db.execute(
+                delete(MessageStreamEvent).where(
+                    MessageStreamEvent.message_id.in_(terminal_message_ids),
+                    MessageStreamEvent.created_at < cutoff,
+                )
+            )
+            deleted = int(result.rowcount or 0)
+            db.commit()
+        if deleted:
+            logger.info(
+                "Stream-event retention purged %s rows (older than %s days)",
+                deleted,
+                retention_days,
+            )
+        _note_sweep_ran("sweep.stream_events_retention")
+        return deleted
+    except Exception:
+        logger.exception("Stream-event retention sweep failed")
+        return 0
+    finally:
+        try:
+            with SessionLocal() as lock_db:
+                release_advisory_lock(
+                    lock_db, "sweep.stream_events_retention", lock_token
+                )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+async def stream_events_retention_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    """Periodically purge old terminal-message stream events (P4-L1)."""
+
+    interval = max(
+        300,
+        interval_seconds
+        if interval_seconds is not None
+        else get_settings().stream_event_retention_interval_seconds,
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_stream_events_retention)
+        except Exception:
+            logger.exception("Stream-event retention wake-up failed")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

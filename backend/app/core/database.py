@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 from collections.abc import Callable
 from collections.abc import Generator
@@ -23,9 +24,11 @@ class Base(DeclarativeBase):
 settings = get_settings()
 logger = logging.getLogger(__name__)
 # Busy timeout for the single SQLite write lock, sourced from settings
-# (LEARNGRAPH_SQLITE_BUSY_TIMEOUT_MS). Default 10s: bounds interactive-request
-# stalls while staying above the old 5s budget; the retry helpers and the
-# B1-7 sweep mutex absorb the residual contention.
+# (LEARNGRAPH_SQLITE_BUSY_TIMEOUT_MS). Default 2s acts as a fast-fail budget:
+# normal multi-stream contention resolves in well under a second, so a write
+# that is still locked after 2s means a pathological long-window owner and
+# should fail fast into the retry helpers (exponential backoff) instead of
+# blocking the stream for 10s.
 SQLITE_BUSY_TIMEOUT_MS = settings.sqlite_busy_timeout_ms
 SQLITE_BUSY_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1_000
 
@@ -44,6 +47,22 @@ engine = create_engine(
     }
     if is_sqlite
     else {},
+    **(
+        # Each active agent stream holds one connection for the whole SSE
+        # generation, so the SQLAlchemy default pool (5 + 10 overflow) can be
+        # exhausted by concurrent streams plus scheduler sweeps and block pool
+        # checkout for up to 30s. Raise the ceiling, shorten the checkout wait,
+        # and pre-ping so a stale pooled connection fails fast instead of
+        # stalling a request.
+        {
+            "pool_size": settings.sqlite_pool_size,
+            "max_overflow": settings.sqlite_pool_max_overflow,
+            "pool_timeout": settings.sqlite_pool_timeout_seconds,
+            "pool_pre_ping": True,
+        }
+        if is_sqlite
+        else {}
+    ),
 )
 
 
@@ -81,6 +100,251 @@ def _configure_sqlite_connection(dbapi_connection: Any, _: Any) -> None:
 if is_sqlite:
     event.listen(engine, "connect", _configure_sqlite_connection)
 
+
+# ── SQLite single-writer gate (P2-W1) ─────────────────────────────────────
+#
+# SQLite allows exactly one writer at a time. Without a gate, concurrent
+# writers (N agent streams + scheduler sweeps) collide inside SQLite and fall
+# into random busy-waits (up to sqlite_busy_timeout_ms) followed by
+# "database is locked" recovery storms. The process-global lock below turns
+# that into a bounded, fair in-process queue: the lock is held from the FIRST
+# write statement of a transaction until its commit/rollback, so a competing
+# writer waits on the gate (typically milliseconds) instead of inside SQLite.
+# Reads are never gated (WAL readers do not block writers). The engine-level
+# events cover every session, including the ad-hoc sessionmakers used by
+# stream workers, graph-proposal workers and scheduler sweeps. Non-SQLite
+# engines skip the gate entirely.
+_SQLITE_WRITE_LOCK: threading.RLock = threading.RLock()
+# A write that cannot get the gate within this window means the gate leaked
+# (connection died mid-transaction). Log loudly and proceed ungated — SQLite's
+# own busy_timeout still bounds the write — rather than wedging every writer.
+_SQLITE_WRITE_GATE_TIMEOUT_SECONDS = 30.0
+_WRITE_GATE_MARKER = "_lg_sqlite_write_gate"
+_SQLITE_WRITE_STMT_PREFIXES = (
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "REPLACE",
+    "UPSERT",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "VACUUM",
+    "REINDEX",
+)
+# First characters shared by every write prefix above: I/U/D/R/C/A/V. The
+# hot path (every SELECT/PRAGMA/BEGIN) short-circuits on this cheap set
+# membership before paying for the full prefix match — the gate event must
+# stay negligible on read-heavy traffic.
+_WRITE_STMT_FIRST_CHARS = frozenset("IUDCRAV")
+
+
+def _is_write_statement(statement: str) -> bool:
+    stripped = statement.lstrip()
+    if not stripped or stripped[0] not in _WRITE_STMT_FIRST_CHARS:
+        return False
+    return stripped[:16].upper().startswith(_SQLITE_WRITE_STMT_PREFIXES)
+
+
+# Module-level diagnostics (P4-L2). Updated under _METRICS_LOCK so concurrent
+# stream threads cannot corrupt the counters; purely observational.
+_sqlite_metrics: dict[str, float] = {
+    "gate_contentions": 0.0,
+    "gate_wait_ms": 0.0,
+    "write_ms": 0.0,
+    "locked_retries": 0.0,
+}
+_METRICS_LOCK = threading.Lock()
+
+
+def _sqlite_metrics_bump(key: str, delta: float) -> None:
+    with _METRICS_LOCK:
+        _sqlite_metrics[key] = _sqlite_metrics.get(key, 0.0) + delta
+
+
+def snapshot_sqlite_metrics() -> dict[str, Any]:
+    """Snapshot the SQLite contention/throughput counters plus WAL size.
+
+    Consumed by the periodic maintenance loop so an operator can see commit
+    pressure (``write_ms`` / ``gate_wait_ms`` growth) and lock-retry storms
+    (``locked_retries``) without adding an external metrics dependency.
+    """
+    with _METRICS_LOCK:
+        out: dict[str, Any] = dict(_sqlite_metrics)
+    try:
+        if is_sqlite and database_url.database and database_url.database != ":memory:":
+            wal_path = Path(str(database_url.database) + "-wal")
+            out["wal_bytes"] = float(wal_path.stat().st_size) if wal_path.exists() else 0.0
+    except OSError:  # pragma: no cover - defensive
+        out["wal_bytes"] = -1.0
+    return out
+
+
+def reset_sqlite_metrics() -> None:
+    with _METRICS_LOCK:
+        for key in _sqlite_metrics:
+            _sqlite_metrics[key] = 0.0
+
+
+def record_sqlite_locked_retry() -> None:
+    """Count one SQLite write-lock retry (used by the retry helpers)."""
+    _sqlite_metrics_bump("locked_retries", 1.0)
+
+
+def _sqlite_acquire_gate(conn: Any) -> None:
+    if _SQLITE_WRITE_LOCK.acquire(timeout=_SQLITE_WRITE_GATE_TIMEOUT_SECONDS):
+        return
+    logger.error(
+        "SQLite write gate not acquired within %.0fs (leaked?); "
+        "proceeding ungated for this statement",
+        _SQLITE_WRITE_GATE_TIMEOUT_SECONDS,
+    )
+
+
+def _sqlite_release_gate(conn: Any) -> None:
+    marker = conn.info.pop(_WRITE_GATE_MARKER, None)
+    if marker is None:
+        return
+    held_ms = (time.monotonic() - marker) * 1000.0
+    _sqlite_metrics_bump("write_ms", held_ms)
+    # W2 enforcement: a write transaction held this long means a session kept
+    # dirty ORM state across a slow operation (typically an LLM call) — exactly
+    # the pattern that starves concurrent streams. Loudly flag it so the
+    # offending path gets fixed rather than silently degrading everyone.
+    if held_ms > 10_000:
+        logger.warning(
+            "SQLite write transaction held %.0f ms (long window; another writer "
+            "may have been starved). Audit the caller for writes kept open "
+            "across a slow model/provider call.",
+            held_ms,
+        )
+    record = getattr(conn, "_connection_record", None)
+    if record is not None:
+        try:
+            record.info.pop(_WRITE_GATE_MARKER, None)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        _SQLITE_WRITE_LOCK.release()
+    except RuntimeError:  # pragma: no cover - defensive (wrong-thread release)
+        logger.error("SQLite write gate release failed (not owned by this thread)")
+
+
+def _sqlite_before_cursor_execute(
+    conn: Any,
+    cursor: Any,
+    statement: str,
+    parameters: Any,
+    context: Any,
+    executemany: bool,
+) -> None:
+    if not _is_write_statement(statement):
+        return
+    if conn.info.get(_WRITE_GATE_MARKER):
+        return  # this connection already owns the gate for its transaction
+    # Fair queue probe: a non-blocking attempt makes contention observable.
+    if not _SQLITE_WRITE_LOCK.acquire(blocking=False):
+        _sqlite_metrics_bump("gate_contentions", 1.0)
+        _sqlite_acquire_gate(conn)
+    conn.info[_WRITE_GATE_MARKER] = time.monotonic()
+    # Mirror onto the pool record so the checkin/invalidate safety nets can
+    # release a stranded hold even if the commit/rollback event path failed.
+    record = getattr(conn, "_connection_record", None)
+    if record is not None:
+        try:
+            record.info[_WRITE_GATE_MARKER] = True
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+def _sqlite_on_commit(conn: Any) -> None:
+    # Engine-level ``commit`` fires immediately BEFORE the DBAPI commit
+    # executes. Releasing here is deliberately early by a sub-millisecond
+    # window (the DBAPI commit is the very next statement this thread runs);
+    # a writer that grabs the gate in that window simply waits on SQLite's
+    # busy handler for the commit to land — bounded and negligible. There is
+    # no engine-level after-commit event in SQLAlchemy 2.x (that lives on
+    # Session), and Session events cannot reliably map back to the connection
+    # that held the gate.
+    _sqlite_release_gate(conn)
+
+
+def _sqlite_on_rollback(conn: Any) -> None:
+    _sqlite_release_gate(conn)
+
+
+def _sqlite_pool_safety_release(dbapi_conn: Any, connection_record: Any) -> None:
+    """Pool-side safety net: release a gate hold stranded on a connection
+    record (connection returned/invalidated without a commit/rollback event —
+    practically unreachable, but the gate must never wedge the process)."""
+    try:
+        if connection_record.info.pop(_WRITE_GATE_MARKER, None) is not None:
+            try:
+                _SQLITE_WRITE_LOCK.release()
+            except RuntimeError:  # pragma: no cover - defensive
+                pass
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def install_sqlite_write_gate(target_engine: Any) -> None:
+    """Attach the single-writer gate events to ``target_engine``.
+
+    Called once for the application engine at import; unit tests may call it on
+    a throwaway engine to exercise the gate against a real SQLite file. The
+    gate itself (``_SQLITE_WRITE_LOCK``) is process-global, which is correct:
+    the deployment is a single uvicorn process, and all sessions — including
+    ad-hoc sessionmakers — share the one SQLite write lock.
+
+    Registered events, in hot-path cost order:
+    * ``before_cursor_execute`` — every statement; a first-character
+      short-circuit makes the read path a single set membership check.
+    * ``commit`` / ``rollback`` — once per transaction; releases the gate.
+    * pool ``checkin`` / ``invalidate`` — once per connection return/invalid;
+      safety net that releases a stranded hold even if a statement ran outside
+      a transaction (no commit/rollback event fired).
+    """
+    event.listen(target_engine, "before_cursor_execute", _sqlite_before_cursor_execute)
+    event.listen(target_engine, "commit", _sqlite_on_commit)
+    event.listen(target_engine, "rollback", _sqlite_on_rollback)
+    # checkin/invalidate are Pool events (not Engine dispatch), so they must be
+    # registered on the pool object.
+    event.listen(target_engine.pool, "checkin", _sqlite_pool_safety_release)
+    event.listen(target_engine.pool, "invalidate", _sqlite_pool_safety_release)
+
+
+if is_sqlite:
+    install_sqlite_write_gate(engine)
+
+
+# ── Active-stream counter (P3-S1/C3b) ─────────────────────────────────────
+#
+# The number of agent SSE generations currently running in this process.
+# Non-urgent scheduler sweeps and the WAL TRUNCATE checkpoint defer while any
+# stream is active so the single SQLite writer serves interactive traffic
+# first. Counter lives here (not in chat.py) to keep scheduler/database free
+# of circular imports.
+_ACTIVE_STREAMS_LOCK = threading.Lock()
+_active_stream_count = 0
+
+
+def enter_active_stream() -> None:
+    global _active_stream_count
+    with _ACTIVE_STREAMS_LOCK:
+        _active_stream_count += 1
+
+
+def exit_active_stream() -> None:
+    global _active_stream_count
+    with _ACTIVE_STREAMS_LOCK:
+        _active_stream_count = max(0, _active_stream_count - 1)
+
+
+def active_stream_count() -> int:
+    with _ACTIVE_STREAMS_LOCK:
+        return _active_stream_count
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -107,6 +371,13 @@ def run_wal_checkpoint(*, truncate: bool = True) -> dict[str, Any]:
 
     if not is_sqlite:
         return {"ok": False, "skipped": True, "reason": "not_sqlite"}
+    # C3b: while any agent stream is generating, TRUNCATE would copy many WAL
+    # frames back into the main file while holding the single write lock and
+    # stall token delivery. PASSIVE checkpoints only the frames no writer is
+    # using (never blocks, never holds the lock long); TRUNCATE is reserved for
+    # idle moments.
+    if active_stream_count() > 0:
+        truncate = False
     try:
         with engine.connect() as conn:
             mode = "TRUNCATE" if truncate else "PASSIVE"
@@ -157,6 +428,7 @@ def retry_sqlite_locked(
             if not _is_sqlite_locked_error(exc):
                 raise
             last_error = exc
+            record_sqlite_locked_retry()
             try:
                 db.rollback()
             except Exception:  # pragma: no cover - defensive
@@ -197,6 +469,7 @@ def commit_with_locked_retry(
         except OperationalError as exc:
             if not _is_sqlite_locked_error(exc):
                 raise
+            record_sqlite_locked_retry()
             try:
                 db.rollback()
             except Exception:  # pragma: no cover - defensive
@@ -292,18 +565,29 @@ def _verify_schema_revisions() -> None:
     """Verify the database schema revision matches the code's expected revision.
 
     On a fresh database the initial revision is inserted automatically.  On an
-    existing database the revision must match, otherwise the application refuses
-    to start so the operator knows a migration is needed.
+    existing database the expected revision must already be applied (a row with
+    ``revision == CURRENT_SCHEMA_REVISION`` exists), otherwise the application
+    warns so the operator knows a migration is needed.
+
+    Checking for the expected row directly (instead of taking the latest
+    ``applied_at`` row) is deliberate: batch initialization inserts every
+    migration row in one transaction, so several revisions share an identical
+    timestamp and ``ORDER BY applied_at DESC LIMIT 1`` would return an
+    arbitrary one of them, producing a spurious warning on a fully migrated
+    database.
     """
     from app.domain.migration_models import SchemaRevision
 
     with SessionLocal() as session:
-        row = (
+        expected = (
             session.query(SchemaRevision)
-            .order_by(SchemaRevision.applied_at.desc())
+            .filter(SchemaRevision.revision == CURRENT_SCHEMA_REVISION)
             .first()
         )
-        if row is None:
+        if expected is not None:
+            return
+        any_row = session.query(SchemaRevision).first()
+        if any_row is None:
             # Fresh database — insert the initial revision.
             info = SchemaRevision(
                 revision=CURRENT_SCHEMA_REVISION,
@@ -319,11 +603,19 @@ def _verify_schema_revisions() -> None:
                 CURRENT_SCHEMA_REVISION,
                 CURRENT_SCHEMA_DESCRIPTION,
             )
-        elif row.revision != CURRENT_SCHEMA_REVISION:
+        else:
+            latest = (
+                session.query(SchemaRevision)
+                .order_by(
+                    SchemaRevision.applied_at.desc(),
+                    SchemaRevision.revision.desc(),
+                )
+                .first()
+            )
             logger.warning(
                 "Database schema revision is %s but code expects %s (%s). "
                 "Run the required migration before starting the application.",
-                row.revision,
+                latest.revision if latest is not None else "<empty>",
                 CURRENT_SCHEMA_REVISION,
                 CURRENT_SCHEMA_DESCRIPTION,
             )
@@ -369,10 +661,20 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
         END
         """
     )
+    # B1-9-opt: the update trigger must NOT fire on intermediate streaming
+    # content flushes. The stream commits message.content every ~0.5s while
+    # status stays 'streaming'; the old unconditional DELETE rewrote the FTS
+    # index on every flush (pure write amplification, ~2 FTS DELETEs/sec per
+    # active stream). Skip when BOTH old and new status are 'streaming' —
+    # finalization (streaming→completed/failed/cancelled), post-completion
+    # edits, and role/session moves still sync the projection. DROP+CREATE
+    # (instead of IF NOT EXISTS) upgrades existing databases to the new shape.
+    connection.exec_driver_sql("DROP TRIGGER IF EXISTS session_messages_fts_update")
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS session_messages_fts_update
         AFTER UPDATE OF content, status, role, session_id, workspace_id ON messages
+        WHEN old.status <> 'streaming' OR new.status <> 'streaming'
         BEGIN
           DELETE FROM session_messages_fts WHERE message_id = old.id;
           INSERT INTO session_messages_fts(
@@ -399,14 +701,23 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
         END
         """
     )
+    # B1-9: update only the title-derived columns of the session's existing FTS
+    # rows instead of deleting and re-inserting the whole session (write
+    # amplification on every auto-title change). The WHEN clause additionally
+    # skips no-op updates (SQLite fires AFTER UPDATE even when the values did
+    # not change), so repeated auto-title writes to the same title do not
+    # rewrite every FTS row of a long session.
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS session_messages_fts_session_update"
+    )
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS session_messages_fts_session_update
         AFTER UPDATE OF title, goal_id, graph_id ON chat_sessions
+        WHEN old.title IS NOT new.title
+          OR old.goal_id IS NOT new.goal_id
+          OR old.graph_id IS NOT new.graph_id
         BEGIN
-          -- B1-9: update only the title-derived columns of the session's
-          -- existing FTS rows instead of deleting and re-inserting the whole
-          -- session (write amplification on every auto-title change).
           UPDATE session_messages_fts
              SET title = new.title,
                  search_terms = coalesce(new.title, '') || ' ' ||
