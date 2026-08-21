@@ -619,20 +619,26 @@ export function SelectionExplanationPanel({
                   };
                 }
                 if (type === "answer.started") {
+                  // 后端 SSE envelope 把边界字段放在 payload 里（顶层只提升
+                  // part/status/provider_trace），需从 payload 读取。
+                  const answerPayload =
+                    typeof data.payload === "object" && data.payload !== null
+                      ? (data.payload as Record<string, unknown>)
+                      : {};
                   return {
                     ...message,
                     finalAnswerStarted: {
                       finalPartId:
-                        typeof data.final_part_id === "string"
-                          ? data.final_part_id
+                        typeof answerPayload.final_part_id === "string"
+                          ? answerPayload.final_part_id
                           : undefined,
                       boundarySequence:
-                        typeof data.boundary_sequence === "number"
-                          ? data.boundary_sequence
+                        typeof answerPayload.boundary_sequence === "number"
+                          ? answerPayload.boundary_sequence
                           : undefined,
                       thinkingDurationMs:
-                        typeof data.thinking_duration_ms === "number"
-                          ? data.thinking_duration_ms
+                        typeof answerPayload.thinking_duration_ms === "number"
+                          ? answerPayload.thinking_duration_ms
                           : undefined,
                     },
                   };

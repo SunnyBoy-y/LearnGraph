@@ -1268,24 +1268,38 @@ function applyStreamUpdates(
             : part,
         ),
       };
-    if (eventType === "answer.started")
+    if (eventType === "answer.started") {
+      // 后端 SSE envelope 把 final_part_id / boundary_sequence /
+      // thinking_duration_ms 放在 payload 里（顶层只提升 part/status/
+      // provider_trace）。从 payload 读取，并兼容顶层直读的旧事件源。
+      const payload =
+        typeof data.payload === "object" && data.payload !== null
+          ? (data.payload as Record<string, unknown>)
+          : {};
       return {
         ...current,
         finalAnswerStarted: {
           finalPartId:
-            typeof data.final_part_id === "string"
-              ? data.final_part_id
-              : undefined,
+            typeof payload.final_part_id === "string"
+              ? payload.final_part_id
+              : typeof data.final_part_id === "string"
+                ? data.final_part_id
+                : undefined,
           boundarySequence:
-            typeof data.boundary_sequence === "number"
-              ? data.boundary_sequence
-              : undefined,
+            typeof payload.boundary_sequence === "number"
+              ? payload.boundary_sequence
+              : typeof data.boundary_sequence === "number"
+                ? data.boundary_sequence
+                : undefined,
           thinkingDurationMs:
-            typeof data.thinking_duration_ms === "number"
-              ? data.thinking_duration_ms
-              : undefined,
+            typeof payload.thinking_duration_ms === "number"
+              ? payload.thinking_duration_ms
+              : typeof data.thinking_duration_ms === "number"
+                ? data.thinking_duration_ms
+                : undefined,
         },
       };
+    }
     if (isMessagePart(data.part))
       return {
         ...current,
