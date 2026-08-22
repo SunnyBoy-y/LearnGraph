@@ -756,6 +756,12 @@ class ProviderUpdateRequest(BaseModel):
     default_realtime_transcription_model_id: str | None = Field(
         default=None, min_length=1, max_length=160
     )
+    # ASR/转写通道「已测试支持」标注：tested = 已实测验证的模式，untested =
+    # 代码路径已实现但未经真实网关验收的模式。模式枚举：realtime_ws /
+    # http_segments / async_file / openai_multipart。仅供展示与验收追踪，
+    # 不参与模型解析与路由决策。
+    tested_modes: list[str] | None = Field(default=None, max_length=8)
+    untested_modes: list[str] | None = Field(default=None, max_length=8)
     default_vision_model_id: str | None = Field(
         default=None, min_length=1, max_length=160
     )

@@ -715,6 +715,25 @@ export function ProvidersPage() {
     },
     onError: (error) => toast.error(error.message),
   });
+  // ASR/转写通道「已测试支持模式」标注保存（tested_modes / untested_modes）。
+  const updateTestedModes = useMutation({
+    mutationFn: ({
+      id,
+      enabled,
+      tested_modes,
+      untested_modes,
+    }: {
+      id: string;
+      enabled: boolean;
+      tested_modes: string[];
+      untested_modes: string[];
+    }) => updateProvider(id, { enabled, tested_modes, untested_modes }),
+    onSuccess: () => {
+      toast.success("转写通道测试标注已更新");
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const updateEndpoint = useMutation({
     mutationFn: ({ id, baseUrl }: { id: string; baseUrl: string }) =>
       updateProvider(id, { base_url: baseUrl.trim() || null }),
@@ -1156,7 +1175,8 @@ export function ProvidersPage() {
                     </td>
                     <td className="px-5 py-4">
                       {isTranscriptionProvider ? (
-                        <div className="grid min-w-64 gap-3">
+                        <>
+                          <div className="grid min-w-64 gap-3">
                           <div className="grid gap-1">
                             <Label className="text-[10px] text-muted-foreground">
                               文件转写模型（上传音频 / HTTP）
@@ -1277,6 +1297,18 @@ export function ProvidersPage() {
                             ) : null}
                           </div>
                         </div>
+                        <AsrTestedModesBadge
+                          capabilities={provider.capabilities}
+                          onSave={(tested, untested) =>
+                            updateTestedModes.mutate({
+                              id: provider.id,
+                              enabled: provider.enabled,
+                              tested_modes: tested,
+                              untested_modes: untested,
+                            })
+                          }
+                        />
+                        </>
                       ) : hasConfigurableDefaultModel &&
                       (providerModels?.models.length ?? 0) > 0 ? (
                         <SearchableModelSelect
@@ -5063,5 +5095,107 @@ function ModelOverrideDialog({
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+
+// ---- ASR/转写通道「已测试支持模式」标注 ----
+// 各语音 ASR 接口协议不同（实时 WS / 分段上传 / 异步文件 / OpenAI 兼容），
+// 必须按 (Provider × 模型 × 通道) 三元组人工标注真实网关的验收状态。
+
+const ASR_TESTED_MODES = [
+  "realtime_ws",
+  "http_segments",
+  "async_file",
+  "openai_multipart",
+] as const;
+
+const ASR_TESTED_MODE_LABELS: Record<string, string> = {
+  realtime_ws: "实时 WS 流式",
+  http_segments: "分段上传",
+  async_file: "异步文件识别",
+  openai_multipart: "OpenAI 兼容接口",
+};
+
+function asrModeLabel(mode: string): string {
+  return ASR_TESTED_MODE_LABELS[mode] ?? mode;
+}
+
+function readAsrModes(
+  capabilities: Record<string, unknown> | undefined,
+): { tested: string[]; untested: string[] } {
+  const cap = capabilities ?? {};
+  const asStrings = (value: unknown) =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+      : [];
+  return {
+    tested: asStrings(cap.tested_modes),
+    untested: asStrings(cap.untested_modes),
+  };
+}
+
+function AsrTestedModesBadge({
+  capabilities,
+  onSave,
+}: {
+  capabilities: Record<string, unknown> | undefined;
+  onSave: (tested: string[], untested: string[]) => void;
+}) {
+  const { tested, untested } = readAsrModes(capabilities);
+  const cycle = (mode: string) => {
+    const nextTested = new Set(tested);
+    const nextUntested = new Set(untested);
+    if (nextTested.has(mode)) {
+      nextTested.delete(mode);
+      nextUntested.add(mode);
+    } else if (nextUntested.has(mode)) {
+      nextUntested.delete(mode);
+    } else {
+      nextTested.add(mode);
+    }
+    onSave([...nextTested], [...nextUntested]);
+  };
+  return (
+    <div className="grid gap-1">
+      <span className="text-[10px] text-muted-foreground">
+        已测试支持的模式（点击循环：未标注 → 已验证 → 未验证）
+      </span>
+      <div className="flex flex-wrap items-center gap-1">
+        {ASR_TESTED_MODES.map((mode) => {
+          const isTested = tested.includes(mode);
+          const isUntested = untested.includes(mode);
+          const label = isTested ? "✅" : isUntested ? "⚠️" : "○";
+          return (
+            <button
+              key={mode}
+              type="button"
+              title={
+                isTested
+                  ? "已验证：点击改为未验证"
+                  : isUntested
+                    ? "未验证：点击清除标注"
+                    : "未标注：点击标记为已验证"
+              }
+              className={`rounded-full border px-2 py-0.5 font-mono text-[10px] transition-colors ${
+                isTested
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600"
+                  : isUntested
+                    ? "border-amber-500/40 bg-amber-500/10 text-amber-600"
+                    : "border-border text-muted-foreground hover:bg-accent"
+              }`}
+              onClick={() => cycle(mode)}
+            >
+              {label} {asrModeLabel(mode)}
+            </button>
+          );
+        })}
+      </div>
+      {!tested.length && !untested.length ? (
+        <span className="text-[10px] text-muted-foreground/70">
+          尚未标注测试状态；各语音 ASR 接口协议不同，请按真实网关验收后标注。
+        </span>
+      ) : null}
+    </div>
   );
 }

@@ -52,6 +52,10 @@ export interface ProviderUpdateRequest {
   default_image_generation_model_id?: string | null;
   default_transcription_model_id?: string | null;
   default_realtime_transcription_model_id?: string | null;
+  /** ASR/转写通道「已测试支持」标注：tested = 已实测验证，untested = 代码已实现未实测。
+   *  模式枚举：realtime_ws / http_segments / async_file / openai_multipart。 */
+  tested_modes?: string[] | null;
+  untested_modes?: string[] | null;
   default_vision_model_id?: string | null;
   /** Custom HTTP headers for proxy / relay stations. Credentials are never accepted here. */
   extra_headers?: Record<string, string> | null;

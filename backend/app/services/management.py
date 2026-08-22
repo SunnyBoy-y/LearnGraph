@@ -937,6 +937,10 @@ class ProviderService:
             capabilities["default_realtime_transcription_model_id"] = (
                 payload.default_realtime_transcription_model_id
             )
+        if payload.tested_modes is not None:
+            capabilities["tested_modes"] = payload.tested_modes
+        if payload.untested_modes is not None:
+            capabilities["untested_modes"] = payload.untested_modes
         if payload.default_vision_model_id is not None:
             capabilities["default_vision_model_id"] = payload.default_vision_model_id
             # Vision companions also expose default_model so discovery UIs and
@@ -967,6 +971,8 @@ class ProviderService:
                     "default_realtime_transcription_model_id": capabilities.get(
                         "default_realtime_transcription_model_id"
                     ),
+                    "tested_modes": capabilities.get("tested_modes"),
+                    "untested_modes": capabilities.get("untested_modes"),
                     "default_vision_model_id": capabilities.get(
                         "default_vision_model_id"
                     ),
