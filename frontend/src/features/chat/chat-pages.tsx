@@ -107,15 +107,11 @@ import {
   transcribeDictationSegment,
 } from "@/api";
 import { hashFileSha256 } from "@/lib/file-hash";
+import { providerDictationSupported } from "@/lib/provider-dictation";
 import {
-  providerDictationSupported,
-  startProviderDictation,
-} from "@/lib/provider-dictation";
-import type { ProviderDictationHandle } from "@/lib/provider-dictation";
-import {
-  realtimeDictationSupported,
-  startRealtimeDictation,
-} from "@/lib/realtime-dictation";
+  startDictationOrchestrator,
+  type DictationOrchestratorHandle,
+} from "@/lib/dictation-orchestrator";
 import {
   classifyNonAgentAttachment,
   isAudioNameOrMime,
@@ -2841,7 +2837,7 @@ export function ChatCanvasPage() {
   const [dictationFinalizing, setDictationFinalizing] = useState<
     null | "transcribing" | "polishing"
   >(null);
-  const providerDictationRef = useRef<ProviderDictationHandle | null>(null);
+  const providerDictationRef = useRef<DictationOrchestratorHandle | null>(null);
   const registerFileDialog = useCallback((openFileDialog: () => void) => {
     openFileDialogRef.current = openFileDialog;
   }, []);
@@ -7114,73 +7110,67 @@ export function ChatCanvasPage() {
         if (dictationCleanupSessionRef.current === session)
           finishDictationSession(session);
       };
-      const beginSegmentedDictation = () => {
-        if (!storedAudioTranscriptionProvider) {
-          handleFatal("尚未配置文件/分段转写模型");
-          return Promise.resolve();
-        }
-        return startProviderDictation({
-          transcribe: async (segment) =>
-            (
-              await transcribeDictationSegment(segment, {
-                provider_id: storedAudioTranscriptionProvider.id,
-                model_id: providerAsrModelId(
-                  storedAudioTranscriptionProvider,
-                  "stored",
-                ),
-              })
-            ).text,
-          onSegmentText: (text) => {
-            if (dictationCleanupSessionRef.current !== session) return;
-            appendFinalText(text);
-            dictationEngine.apply(session);
-          },
-          onFatal: handleFatal,
-        })
-          .then((handle) => {
-            providerDictationRef.current = handle;
-            setIsListening(true);
-          })
-          .catch(() => {
-            if (dictationCleanupSessionRef.current === session)
-              dictationCleanupSessionRef.current = null;
-            toast.error("未获得麦克风权限");
-          });
-      };
-      if (asrRealtimeConfigured && realtimeDictationSupported()) {
-        startRealtimeDictation({
-          providerId: realtimeAudioTranscriptionProvider!.id,
-          modelId: realtimeAudioTranscriptionModel,
-          onPartial: (text) => {
-            if (dictationCleanupSessionRef.current !== session) return;
-            session.interim = text;
-            dictationEngine.apply(session);
-          },
-          onFinal: (text) => {
-            if (dictationCleanupSessionRef.current !== session) return;
-            session.interim = "";
-            appendFinalText(text);
-            dictationEngine.apply(session);
-          },
-          onFatal: handleFatal,
-        })
-          .then((handle) => {
-            providerDictationRef.current = handle;
-            setIsListening(true);
-          })
-          .catch((error: Error & { code?: string }) => {
-            // 后端判定当前模型并非 realtime 时,退回分段上传路径。
-            if (error.code === "realtime_model_required") {
-              void beginSegmentedDictation();
-              return;
-            }
-            if (dictationCleanupSessionRef.current === session)
-              dictationCleanupSessionRef.current = null;
-            toast.error(error.message || "无法启动实时语音转写");
-          });
+      // 双通道自动降级：realtime WS 失败/超时自动切换分段上传（编排层处理），
+      // 已定稿文本按 onFinal 语义保留；两个通道都未配置时提前提示。
+      if (!asrRealtimeConfigured && !storedAudioTranscriptionProvider) {
+        handleFatal("尚未配置文件/分段转写模型");
         return;
       }
-      void beginSegmentedDictation();
+      const transcribeSegment = async (segment: Blob) => {
+        if (!storedAudioTranscriptionProvider)
+          throw new Error("尚未配置文件/分段转写模型");
+        return (
+          await transcribeDictationSegment(segment, {
+            provider_id: storedAudioTranscriptionProvider.id,
+            model_id: providerAsrModelId(
+              storedAudioTranscriptionProvider,
+              "stored",
+            ),
+          })
+        ).text;
+      };
+      startDictationOrchestrator({
+        realtime: asrRealtimeConfigured
+          ? {
+              providerId: realtimeAudioTranscriptionProvider!.id,
+              modelId: realtimeAudioTranscriptionModel,
+            }
+          : undefined,
+        transcribeSegment,
+        onPartial: (text) => {
+          if (dictationCleanupSessionRef.current !== session) return;
+          session.interim = text;
+          dictationEngine.apply(session);
+        },
+        onFinal: (text) => {
+          if (dictationCleanupSessionRef.current !== session) return;
+          session.interim = "";
+          appendFinalText(text);
+          dictationEngine.apply(session);
+        },
+        onDegrade: (message) => {
+          if (dictationCleanupSessionRef.current !== session) return;
+          toast.message(message, {
+            description: "已定稿文本会保留，可直接继续说话。",
+          });
+          session.interim = "";
+          dictationEngine.apply(session);
+        },
+        onFatal: (message) => handleFatal(message),
+      })
+        .then((handle) => {
+          providerDictationRef.current = handle;
+          setIsListening(true);
+        })
+        .catch((error: unknown) => {
+          if (dictationCleanupSessionRef.current === session)
+            dictationCleanupSessionRef.current = null;
+          toast.error(
+            error instanceof Error && error.message
+              ? error.message
+              : "无法启动语音转写",
+          );
+        });
       return;
     }
 
