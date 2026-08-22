@@ -279,7 +279,7 @@ export function TrajectoryRail({
         </div>
       ) : (
         <ul className="grid gap-1.5 p-2">
-          {messages.data.items.map((message) => (
+          {(messages.data?.items ?? []).map((message) => (
             <TrajectoryRow
               key={message.id}
               message={message}
