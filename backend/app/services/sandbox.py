@@ -1659,10 +1659,17 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
     def _ensure_chat_dir(
         self, backend, handle: SandboxSessionHandle, chat_session_id: str
     ) -> None:
-        """Best-effort create the chat workspace dir inside the shared instance."""
+        """Best-effort create the chat workspace dirs inside the shared instance.
+
+        Mirrors the host-side ``_initialize_workspace`` layout (inputs/ work/
+        outputs/) so agent scripts can save directly into ``outputs/`` without a
+        manual mkdir. Binary generators (python-pptx, openpyxl, zipfile) fail
+        with FileNotFoundError when the target directory is missing.
+        """
         try:
             prefix = self._container_prefix(chat_session_id)
-            backend.write_agent_file(handle, f"{prefix}/.keep", b"")
+            for subdir in ("inputs", "work", "outputs"):
+                backend.write_agent_file(handle, f"{prefix}/{subdir}/.keep", b"")
         except (SandboxBackendUnavailable, SandboxBackendError):
             pass
 
@@ -3621,19 +3628,22 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "function": {
                     "name": "sandbox_publish_file",
                     "description": (
-                        "Promote a UTF-8 workspace file into session outputs/, register it in the "
-                        "unified file zone, and return a downloadable sandbox_artifact for the chat UI."
+                        "Publish ANY workspace file - including binary deliverables such as "
+                        "PPTX, ZIP, PDF, XLSX or DOCX - into session outputs/, register it in the "
+                        "unified file zone, and return a downloadable sandbox_artifact for the chat UI. "
+                        "Usually pass only path and let the backend read the file from the workspace "
+                        "or container; content is only for small UTF-8 text files."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Relative workspace path to publish (copied under outputs/).",
+                                "description": "Relative workspace path to publish (copied under outputs/). Binary files are fine; you do not need to read them first.",
                             },
                             "content": {
                                 "type": "string",
-                                "description": "Optional UTF-8 content; when omitted the path must already exist in the session workspace store.",
+                                "description": "Optional inline UTF-8 text. Omit for binary or already-existing files - the backend reads the file from the workspace/container.",
                             },
                             "title": {"type": "string"},
                             "sandbox_session_id": session_property,
