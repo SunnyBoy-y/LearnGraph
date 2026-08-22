@@ -119,6 +119,7 @@ const KnowledgeGraph = lazy(() =>
 );
 import { NodeExploreChain } from "@/components/graph/node-explore";
 import { SessionFilesList } from "@/features/chat/session-files-list";
+import { TrajectoryRail } from "@/features/trajectory/TrajectoryRail";
 import { SessionShareDialog } from "@/features/chat/session-share-dialog";
 import {
   archiveProject,
@@ -166,6 +167,7 @@ import {
   setSessionComposerPrefs,
 } from "@/lib/session-composer-prefs";
 import { readChatDefaultResponseMode } from "@/lib/workspace-settings";
+import { isTrajectoryEnabled } from "@/lib/workspace-settings";
 import type { Session } from "@/types/sessions";
 import type { Graph, GraphNode, GraphSummary } from "@/types/graphs";
 import type { DeleteImpact } from "@/types/workflow";
@@ -3317,7 +3319,9 @@ function ChatGraphRail({
   sessionId?: string;
   workspaceId: string;
 }) {
-  const [view, setView] = useState<"learning" | "capability" | "files">("learning");
+  const [view, setView] = useState<
+    "learning" | "capability" | "files" | "trajectory"
+  >("learning");
   const [boundOverride, setBoundOverride] = useState<{
     graphId: string;
     graphTitle: string;
@@ -3333,6 +3337,18 @@ function ChatGraphRail({
       : undefined);
 
   useEffect(() => setBoundOverride(undefined), [project?.id, project?.graphId]);
+
+  const settings = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "settings"),
+    queryFn: listSettings,
+    staleTime: 30_000,
+  });
+  const trajectoryEnabled = isTrajectoryEnabled(settings.data);
+
+  // 开关关闭后若仍停在「轨迹」视图，回落到默认视图。
+  useEffect(() => {
+    if (!trajectoryEnabled && view === "trajectory") setView("learning");
+  }, [trajectoryEnabled, view]);
 
   const bindGraph = (graph: GraphSummary) => {
     if (!project) {
@@ -3398,8 +3414,21 @@ function ChatGraphRail({
         >
           会话文件
         </Button>
+        {trajectoryEnabled ? (
+          <Button
+            aria-selected={view === "trajectory"}
+            onClick={() => setView("trajectory")}
+            role="tab"
+            size="xs"
+            variant="ghost"
+          >
+            轨迹
+          </Button>
+        ) : null}
       </div>
-      {view === "files" ? (
+      {view === "trajectory" ? (
+        <TrajectoryRail sessionId={sessionId} workspaceId={workspaceId} />
+      ) : view === "files" ? (
         <SessionFilesList
           sessionId={sessionId}
           workspaceId={workspaceId}
