@@ -63,6 +63,9 @@ x-app-environment: &app-environment
   LEARNGRAPH_MEMORY_ROOT: /data/memory
   LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: /data/sandbox-workspaces
   LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
+  # SSRF 公网校验的 fake-ip 容忍网段（逗号分隔 CIDR，默认空=严格公网校验）。
+  # Clash 类本地代理 fake-ip 模式下（198.18.0.0/15）抓取被误拦时按需配置。
+  LEARNGRAPH_SSRF_FAKE_IP_RANGES: ${LEARNGRAPH_SSRF_FAKE_IP_RANGES:-}
   LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:18001}
   LEARNGRAPH_SUBAPP_PREVIEW_PORT: "8001"
   # Host Service Bridge endpoint on the real machine. Leave EMPTY (default):
@@ -214,6 +217,8 @@ services:
       LEARNGRAPH_SANDBOX_EGRESS_PROXY_HOST: "0.0.0.0"
       LEARNGRAPH_SANDBOX_EGRESS_PROXY_PORT: "8888"
       LEARNGRAPH_EGRESS_PROXY_AUDIT_LOG: /data/egress-audit.jsonl
+      # CONNECT 时地址重分类同样需要 fake-ip 容忍（与 app 一致的配置来源）。
+      LEARNGRAPH_SSRF_FAKE_IP_RANGES: ${LEARNGRAPH_SSRF_FAKE_IP_RANGES:-}
     volumes:
       - learngraph-data:/data
     networks:

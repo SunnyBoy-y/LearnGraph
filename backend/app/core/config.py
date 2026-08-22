@@ -643,6 +643,16 @@ class Settings(BaseSettings):
     # internet-exposed deployments MUST explicitly set this to false to keep
     # the private-address SSRF guard closed.
     allow_private_bridge_urls: bool = True
+    # Comma-separated CIDR ranges that the SSRF public-address classifier must
+    # treat as trusted fake-IP space, e.g. "198.18.0.0/15" for a Clash-style
+    # local proxy running in fake-ip mode (the resolver answers every hostname
+    # with a synthetic 198.18.x.x address that Python classifies as private).
+    # Addresses inside these ranges pass the public-only checks in both the
+    # fetch gate and the sandbox egress proxy, matching how the local TUN
+    # proxy maps them to real destinations. Empty (default) keeps the strict
+    # classifier — set it only on trusted single-user machines behind such a
+    # proxy; the ranges must never include real private networks.
+    ssrf_fake_ip_ranges: str = ""
 
     @property
     def resolved_sandbox_workspace_root(self) -> Path:

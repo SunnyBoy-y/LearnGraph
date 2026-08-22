@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 import httpx
 from requests import exceptions as requests_exceptions
 
+from app.core.config import get_settings
 from app.providers.remote.search import domain_is_allowed, normalize_domain
 
 
@@ -32,6 +33,36 @@ class FetchedDocument:
     content: str
     content_type: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _configured_fake_ip_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Parse ``ssrf_fake_ip_ranges`` (comma-separated CIDRs) once per call.
+
+    Fake-IP is the synthetic address space a local TUN proxy (Clash-style,
+    fake-ip mode) answers DNS queries with — every hostname resolves to a
+    reserved-range address that Python's ``ipaddress`` classifies as private.
+    Real connections to those addresses are transparently mapped by the proxy,
+    so the SSRF classifier must be allowed to treat them as public, otherwise
+    web fetch is blocked before any request is made. This is strictly
+    opt-in via config; an empty value keeps the default strict classifier.
+    """
+    raw = get_settings().ssrf_fake_ip_ranges
+    if not raw:
+        return []
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(candidate, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _is_fake_ip_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return any(address in network for network in _configured_fake_ip_networks())
 
 
 def _resolve_public_host(hostname: str) -> str:
@@ -58,12 +89,15 @@ def _resolve_public_host(hostname: str) -> str:
         except OSError as exc:
             raise UnsafeFetchURL("The source host could not be resolved safely") from exc
     if not addresses or any(
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
+        (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        )
+        and not _is_fake_ip_address(address)
         for address in addresses
     ):
         raise UnsafeFetchURL(
