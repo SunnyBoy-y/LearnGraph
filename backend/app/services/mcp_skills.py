@@ -1778,6 +1778,13 @@ class MCPAndSkillService:
                 body = instructions[:8_000]
                 if len(instructions) > 8_000:
                     body = f"{body}\n…(truncated)"
+                # 命中即用：把技能引用的 references/*.md 随 SKILL.md 一起内联，
+                # 消除 lg_skill_read 的三级跳（SKILL.md -> references/*.md）。
+                # 仅在剩余预算内追加，且只对官方技能生效，避免 token 膨胀。
+                refs_budget = max(0, total_budget - used_budget - len(body))
+                refs = self._inline_skill_references(skill, refs_budget)
+                if refs:
+                    body = f"{body}\n\n{refs}"
                 used_budget += len(body)
                 sections.append(
                     f"### Skill: {category_tag}{skill.name} (`{skill.skill_key}`)\n"
@@ -1829,6 +1836,43 @@ class MCPAndSkillService:
                 "`lg_capability_search` to find it, then `lg_skill_read` to "
                 "load its SKILL.md before applying it."
             )
+        return "\n\n".join(parts)
+
+    def _inline_skill_references(self, skill: SkillRecord, max_chars: int) -> str:
+        """Return bounded references/*.md text for a skill to inline into the prompt.
+
+        Only official skills expose a controlled references/ tree through the
+        shipped package files. Non-official skills are skipped (their references
+        remain load-on-demand via lg_skill_read). The returned block is capped at
+        ``max_chars`` so a large reference cannot monopolize the context budget.
+        """
+
+        if max_chars <= 0:
+            return ""
+        if not is_official_skill_record(skill):
+            return ""
+        try:
+            from app.services.skill_package import (
+                official_skill_package_files,
+                official_skill_spec,
+            )
+            spec = official_skill_spec(skill.skill_key)
+            files = official_skill_package_files(spec)
+        except AppError:
+            return ""
+        parts: list[str] = []
+        used = 0
+        for path in sorted(files):
+            if not path.startswith("references/") or not path.endswith(".md"):
+                continue
+            text = files[path].decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            chunk = f"### 参考文件 {path}\n{text}"
+            if used + len(chunk) > max_chars:
+                break
+            parts.append(chunk)
+            used += len(chunk)
         return "\n\n".join(parts)
 
     @staticmethod
@@ -4652,13 +4696,32 @@ class MCPAndSkillService:
                     .order_by(GraphNode.label, GraphNode.id)
                 )
             )
+            match_mode = "all"
             if query:
-                nodes = [
-                    node
-                    for node in nodes
-                    if query in node.label.casefold()
-                    or query in node.description.casefold()
-                ]
+                # 分词后逐 token 做 OR 子串匹配。旧实现把整串 query（含空格）
+                # 当连续子串匹配，导致 "哈希 散列 HashMap 冲突" 这类多词查询
+                # 永远命中不了 "哈希表与散列" 节点（实测 matched_count=0 后被迫
+                # 二次全量读取）。token 化 + 零匹配兜底一次返回可用结果。
+                tokens = [t for t in re.split(r"[\s,，、/;；:：|]+", query) if t]
+                if tokens:
+                    matched = [
+                        node
+                        for node in nodes
+                        if any(
+                            t in node.label.casefold()
+                            or (
+                                node.description
+                                and t in node.description.casefold()
+                            )
+                            for t in tokens
+                        )
+                    ]
+                    if matched:
+                        nodes = matched
+                        match_mode = "tokenized"
+                    else:
+                        # 零匹配时兜底返回全量节点，避免 agent 再读一次全量图。
+                        match_mode = "fallback_all"
             edge_rows = list(
                 self.db.scalars(
                     select(GraphEdge)
@@ -4696,6 +4759,7 @@ class MCPAndSkillService:
                 ],
                 "query": query or None,
                 "matched_count": len(nodes),
+                "match_mode": match_mode,
                 "nodes_truncated": len(nodes) > limit,
                 "edges_truncated": edges_truncated,
             }
