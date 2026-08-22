@@ -101,6 +101,7 @@ import {
   streamSessionMessage,
   undoGraphChangeSet,
   updateSession,
+  updateSetting,
   uploadFile,
   listAudioTranscriptions,
   transcribeAudioFile,
@@ -297,11 +298,13 @@ import {
   readChatDefaultResponseMode,
   readChatFeatureModelSetting,
   readChatThinkingChainDefault,
+  CHAT_ASR_HOTWORDS_SETTING_KEY,
   CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
   CHAT_DICTATION_CLEANUP_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
 } from "@/lib/workspace-settings";
+import type { AsrHotword } from "@/lib/workspace-settings";
 import { ContextUsageRing } from "@/components/chat/context-usage-ring";
 import { shouldShowSuggestedPromptError } from "@/lib/suggested-prompts";
 import {
@@ -965,6 +968,36 @@ const DICTATION_CLEANUP_MAX_CHUNK_CHARS = 1_800;
 // 只携带已整理文本的尾部作为只读语境,token 消耗随语音长度线性增长。
 const DICTATION_CLEANUP_CONTEXT_CHARS = 80;
 const DICTATION_CLEANUP_MAX_FAILURES = 2;
+
+// 听写文本 → 热词候选：按标点/空白分词，过滤单字、纯数字与常见语气词。
+const ASR_HOTWORD_STOPWORDS = new Set([
+  "这个", "那个", "然后", "就是", "一个", "我们", "你们", "他们", "可以",
+  "还有", "所以", "但是", "因为", "如果", "没有", "什么", "怎么", "为什么",
+  "非常", "比较", "应该", "可能", "需要", "现在", "这样", "那样", "其实",
+  "真的", "特别", "一般", "主要", "其他", "一些", "这些", "那些", "之后",
+  "之前", "时候", "地方", "东西", "问题", "事情", "方式", "方法", "结果",
+  "原因", "情况", "过程", "阶段", "部分", "内容", "方面", "里面", "上面",
+  "下面", "前面", "后面", "比如", "例如",
+]);
+
+/** 从听写文本提取可加入热词表的候选词（去重、过滤、上限 10 个）。 */
+function extractHotwordCandidates(
+  text: string,
+  existing: AsrHotword[],
+): string[] {
+  const seen = new Set(existing.map((item) => item.text));
+  const candidates = new Set<string>();
+  // oxlint-disable-next-line no-useless-escape -- 字符类内 [ 需转义（TS1127），oxlint 误报
+  for (const part of text.split(/[\s,，。;；、.!！?？:："“”‘’()（）\[\]【】/\\-]+/)) {
+    const word = part.trim();
+    if (word.length < 2 || word.length > 24) continue;
+    if (/^\d+$/.test(word)) continue;
+    if (ASR_HOTWORD_STOPWORDS.has(word)) continue;
+    if (seen.has(word)) continue;
+    candidates.add(word);
+  }
+  return [...candidates].slice(0, 10);
+}
 
 function dictationCleanupActive(session: DictationCleanupSession): boolean {
   return session.cleanupEnabled && !session.degraded;
@@ -4412,6 +4445,36 @@ export function ChatCanvasPage() {
         : asrLanguage === "en-US"
           ? "语音 · 英文"
           : `语音 · ${asrLanguage}`;
+  const saveAsrHotwords = useMutation({
+    mutationFn: (hotwords: AsrHotword[]) =>
+      updateSetting(CHAT_ASR_HOTWORDS_SETTING_KEY, hotwords),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(
+        workspaceQueryKey(workspaceId, "settings"),
+        (current) => [
+          ...(current ?? []).filter((item) => item.key !== setting.key),
+          setting,
+        ],
+      );
+      toast.success("ASR 热词表已更新");
+    },
+  });
+  const saveDictatedHotwords = useCallback(() => {
+    const session = dictationCleanupSessionRef.current;
+    const text = [session?.pending, session?.cleaned].filter(Boolean).join(" ");
+    const candidates = extractHotwordCandidates(text, asrHotwords);
+    if (!candidates.length) {
+      toast.message("本次听写没有新的可存热词", {
+        description: "热词用于提升术语/人名/代码标识符的识别率",
+      });
+      return;
+    }
+    saveAsrHotwords.mutate([
+      ...asrHotwords,
+      ...candidates.map((text) => ({ text })),
+    ]);
+  }, [asrHotwords, saveAsrHotwords]);
   const canPrepareSuggestedPrompts = Boolean(
     !goalMode &&
       settings.isSuccess &&
@@ -8933,6 +8996,30 @@ export function ChatCanvasPage() {
           >
             {asrLanguageLabel}
           </span>
+        ) : null}
+        {(isListening || dictationFinalizing) &&
+        (dictationCleanupSessionRef.current?.pending ||
+          dictationCleanupSessionRef.current?.cleaned) ? (
+          <button
+            className="chat-dictation-polish"
+            onClick={saveDictatedHotwords}
+            title="把本次听写文本中的关键词加入热词表（paraformer-realtime-v2 生效）"
+            type="button"
+          >
+            <span>存入热词表</span>
+            <em>
+              新增{" "}
+              {extractHotwordCandidates(
+                [
+                  dictationCleanupSessionRef.current?.pending,
+                  dictationCleanupSessionRef.current?.cleaned,
+                ]
+                  .filter(Boolean)
+                  .join(" "),
+                asrHotwords,
+              ).length}
+            </em>
+          </button>
         ) : null}
         {dictationFinalizing ? (
           <button
