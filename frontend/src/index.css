@@ -5522,7 +5522,7 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   white-space: nowrap;
 }
 .message-stream-stats__item + .message-stream-stats__item::before {
-  content: " b7";
+  content: "\b7";
   margin-right: 8px;
   color: color-mix(in srgb, var(--muted-foreground) 55%, transparent);
 }
