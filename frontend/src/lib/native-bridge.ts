@@ -31,8 +31,6 @@ interface LearnGraphNativeBridge {
   getInboxImageDataUrl?: (id: string) => string
   takePhoto?: () => void
   consumeShortcutAction?: () => string
-  /** 后台任务投递成功标记：完成后台生成后（切到后台）推送完成通知 */
-  notifyOnUpdate?: (sessionId: string) => void
   // A 类触觉 / 提示音 / 朗读
   haptic?: (intensity: number) => void
   replyHaptic?: () => void
@@ -121,26 +119,12 @@ export function takePhoto(callback: PhotoCallback): void {
 export type NativeShortcutAction =
   | 'new-chat'
   | 'note'
-  | 'tasks'
   | `open-session:${string}`
 
 /** 读取并消费一次待执行的快捷动作；无则返回 null */
 export function consumeShortcutAction(): NativeShortcutAction | null {
   const action = nativeBridge()?.consumeShortcutAction?.()
   return action && action.length > 0 ? (action as NativeShortcutAction) : null
-}
-
-// ------------------------------------------------------------------ //
-// 后台任务完成通知
-// ------------------------------------------------------------------ //
-
-/**
- * 标记「此会话的后台生成完成后要推送通知」（仅 APK）：
- * 网页版把消息投递到 /messages/async 成功后调用，原生轮询遇到该会话
- * 变化时只等 App 切到后台再通知，避免前台轮询把变化基线吃掉。
- */
-export function notifyOnUpdate(sessionId: string): void {
-  nativeBridge()?.notifyOnUpdate?.(sessionId)
 }
 
 // ------------------------------------------------------------------ //

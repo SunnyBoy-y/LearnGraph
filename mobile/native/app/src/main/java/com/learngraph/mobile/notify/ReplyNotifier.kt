@@ -67,47 +67,14 @@ object ReplyNotifier {
     @Serializable
     private data class SessionUpdate(val id: String, val title: String? = null, val updated_at: String? = null)
 
+    private data class ReplyItem(val sessionId: String, val title: String, val preview: String)
+    private data class LatestAssistant(val id: String, val status: String, val preview: String)
+
     fun setForeground(fg: Boolean, context: Context? = null) {
         appInForeground = fg
         if (!fg && context != null) {
-            // 后台化立即轮询一次：让刚投递的后台任务完成后尽快通知
+            // 后台化立即轮询一次：让刚投递的消息尽快完成并通知
             scope.launch { poll(context.applicationContext, null) }
-        }
-    }
-
-    /**
-     * 网页版投递后台任务成功 → 标记该会话「生成完成后推送通知」。
-     *
-     * 立即抓一次该会话当前 updated_at 作为基线（投递时刻），之后轮询里
-     * updated_at 相对基线变化即视为任务完成。这样即使任务在第一次轮询
-     * 之前就跑完（首轮轮询见到的已是最终 updated_at），也不会漏通知。
-     * 标记持久化在 prefs，App 进程被杀后由 AlarmManager 拉起轮询仍有效。
-     */
-    fun markTaskSession(context: Context, sessionId: String) {
-        if (sessionId.isBlank()) return
-        val ctx = context.applicationContext
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        scope.launch {
-            try {
-                val auth = withContext(Dispatchers.IO) { readAuth(ctx) }
-                val baseline = if (auth.token.isNullOrBlank() || auth.baseUrl.isBlank()) {
-                    ""
-                } else {
-                    withContext(Dispatchers.IO) {
-                        fetchSessions(auth.baseUrl, auth.token, auth.workspaceId, auth.deviceId)
-                            ?.firstOrNull { it.id == sessionId }
-                            ?.updated_at
-                            .orEmpty()
-                    }
-                }
-                prefs.edit()
-                    .putString("task-pending:$sessionId", "1")
-                    .putString("task-baseline:$sessionId", baseline)
-                    .apply()
-            } catch (_: Exception) {
-                // 网络异常时仅保留标记，走 seen 基线兜底
-                prefs.edit().putString("task-pending:$sessionId", "1").apply()
-            }
         }
     }
 
@@ -153,11 +120,13 @@ object ReplyNotifier {
                 val auth = withContext(Dispatchers.IO) { readAuth(context) }
                 if (auth.token.isNullOrBlank() || auth.baseUrl.isBlank()) return@launch
 
-                // 会话新回复（现有逻辑）
-                val sessions = withContext(Dispatchers.IO) {
-                    fetchSessions(auth.baseUrl, auth.token, auth.workspaceId, auth.deviceId)
+                // 回复完成才通知 + 聚合摘要
+                val replies = withContext(Dispatchers.IO) {
+                    computeReplies(context, auth)
                 }
-                if (sessions != null) process(context, sessions)
+                if (replies != null && replies.isNotEmpty() && !appInForeground) {
+                    showNotification(context, replies)
+                }
 
                 // B1：后台 agent 任务完成 → 摘要通知
                 val agentTasks = withContext(Dispatchers.IO) {
@@ -352,80 +321,97 @@ object ReplyNotifier {
     // 基线对比 + 通知
     // ------------------------------------------------------------------ //
 
-    private fun process(context: Context, sessions: List<SessionUpdate>) {
+    /**
+     * 计算「回复完成且未读」的会话列表（IO 线程）。
+     *
+     * 判定：会话 updated_at 相对基线有变化 → 拉最新 assistant 消息 →
+     * status == "completed" 且尚未通知过该消息才纳入通知；streaming/pending
+     * 不通知也不推进基线（等完成后下轮再判）。
+     */
+    private fun computeReplies(context: Context, auth: AuthStore.AuthState): List<ReplyItem>? {
+        val token = auth.token ?: return null
+        if (auth.baseUrl.isBlank()) return null
+        val sessions = fetchSessions(auth.baseUrl, token, auth.workspaceId, auth.deviceId)
+            ?: return null
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val changes = mutableListOf<SessionUpdate>() // 有更新的会话
-
-        // 待通知的后台任务会话（网页版 / 快捷回复投递 async 后标记）
-        val taskSessions = prefs.all.keys
-            .filter { it.startsWith("task-pending:") }
-            .mapNotNull { it.removePrefix("task-pending:").takeIf { id -> id.isNotBlank() } }
-            .toSet()
+        val out = mutableListOf<ReplyItem>()
 
         for (s in sessions) {
             val updated = s.updated_at ?: continue
-            val key = "seen:${s.id}"
+            val seenKey = "seen:" + s.id
+            val seenUpdated = prefs.getString(seenKey, null)
+            if (seenUpdated == updated) continue // 无变化
 
-            // 后台任务会话：用「投递时刻基线」判定完成，前台绝不吞变化
-            if (s.id in taskSessions) {
-                val baseline = prefs.getString("task-baseline:${s.id}", null)
-                if (!baseline.isNullOrEmpty()) {
-                    if (updated == baseline) continue // 尚无变化，继续等
-                    if (appInForeground) continue // 任务在前台完成：不更新基线，切后台后首轮通知
-                    // 后台且已变化 → 任务完成，通知并清标记（写 seen/notified 防重复）
-                    prefs.edit()
-                        .putString(key, updated)
-                        .putString("notified:${s.id}", updated)
-                        .remove("task-pending:${s.id}")
-                        .remove("task-baseline:${s.id}")
-                        .apply()
-                    changes.add(s)
-                    continue
-                }
-                // 基线缺失（标记瞬间网络失败）：回退 seen 逻辑但前台不吞变化
-                val seen = prefs.getString(key, null)
-                if (seen == null) {
-                    prefs.edit().putString(key, updated).apply()
-                    continue
-                }
-                if (seen == updated) continue
-                if (appInForeground) continue
-                prefs.edit()
-                    .putString(key, updated)
-                    .putString("notified:${s.id}", updated)
-                    .remove("task-pending:${s.id}")
-                    .apply()
-                changes.add(s)
+            val assistant = fetchLatestAssistant(auth, s.id) ?: continue
+            val status = assistant.status
+
+            // 未完成：不通知，不推进基线（等完成后下轮再判）
+            if (status == "streaming" || status == "pending") continue
+
+            // 终态：先推进 updated_at 基线，避免反复拉取
+            prefs.edit().putString(seenKey, updated).apply()
+            if (status != "completed") continue // failed/interrupted 不通知
+
+            // 首次见到该 assistant：建立基线，不通知
+            val assistantKey = "seen-assistant:" + s.id
+            val seenAssistant = prefs.getString(assistantKey, null)
+            if (seenAssistant == null) {
+                prefs.edit().putString(assistantKey, assistant.id).apply()
                 continue
             }
+            if (seenAssistant == assistant.id) continue // 已通知过
 
-            val seen = prefs.getString(key, null)
-            if (seen == null) {
-                // 首次见到：建立基线，不通知
-                prefs.edit().putString(key, updated).apply()
-                continue
-            }
-            if (seen == updated) continue
-            // 有新动态：更新基线
-            prefs.edit().putString(key, updated).apply()
-            if (!appInForeground) {
-                val notified = prefs.getString("notified:${s.id}", null)
-                if (notified != updated) {
-                    prefs.edit().putString("notified:${s.id}", updated).apply()
-                    changes.add(s)
-                }
-            }
+            prefs.edit().putString(assistantKey, assistant.id).apply()
+            out.add(ReplyItem(s.id, s.title ?: "会话", assistant.preview))
         }
+        return out
+    }
 
-        if (changes.isNotEmpty() && !appInForeground) {
-            showNotification(context, changes)
+    /** 拉某会话最新一条 assistant 消息的 id/status/首句摘要 */
+    private fun fetchLatestAssistant(auth: AuthStore.AuthState, sessionId: String): LatestAssistant? {
+        val token = auth.token ?: return null
+        val url = auth.baseUrl.trimEnd('/') + "/api/v1/sessions/" + sessionId + "/messages?limit=5"
+        val request = Request.Builder().url(url)
+            .header("Authorization", "Bearer " + token)
+            .apply {
+                auth.workspaceId?.let { header("X-Workspace-ID", it) }
+                if (auth.deviceId.isNotBlank()) header("X-Device-ID", auth.deviceId)
+            }
+            .build()
+        val resp = try {
+            http.newCall(request).execute()
+        } catch (_: Exception) {
+            return null
+        }
+        return try {
+            if (resp.code != 200) return null
+            val root = json.parseToJsonElement(resp.body?.string() ?: return null) as? JsonObject ?: return null
+            val items = root["items"] as? JsonArray ?: return null
+            for (i in items.lastIndex downTo 0) {
+                val obj = items[i] as? JsonObject ?: continue
+                if (obj["role"]?.jsonPrimitive?.contentOrNull != "assistant") continue
+                val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: continue
+                val status = obj["status"]?.jsonPrimitive?.contentOrNull ?: "completed"
+                val content = obj["content"]?.jsonPrimitive?.contentOrNull ?: ""
+                return LatestAssistant(id, status, previewOf(content))
+            }
+            null
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { resp.close() }
         }
     }
 
-    private fun showNotification(context: Context, changes: List<SessionUpdate>) {
+    /** 回复首句摘要：去空白 + 截断 */
+    private fun previewOf(content: String): String {
+        val cleaned = content.replace(Regex("\\s+"), " ").trim()
+        return cleaned.take(80)
+    }
+
+    private fun showNotification(context: Context, changes: List<ReplyItem>) {
         if (!canNotify(context)) return
 
-        // 点击通知 → 打开 App（网页版）
         val launchIntent = Intent(context, com.learngraph.mobile.MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         val pi = PendingIntent.getActivity(
@@ -435,65 +421,61 @@ object ReplyNotifier {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+        val first = changes.first()
         val builder = NotificationCompat.Builder(context, CH_REPLIES)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle(if (changes.size == 1) "有新回复" else "${changes.size} 个会话有新回复")
-            .setContentText(changes.first().title ?: "会话")
+            .setContentText(first.preview.ifBlank { first.title })
             .setContentIntent(pi)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
 
         if (changes.size > 1) {
             val inbox = NotificationCompat.InboxStyle()
-            changes.forEach { s -> inbox.addLine(s.title ?: "会话") }
+            changes.forEach { r -> inbox.addLine(r.preview.ifBlank { r.title }) }
             inbox.setBigContentTitle("${changes.size} 个会话有新回复")
             builder.setStyle(inbox)
         }
 
-        // 快捷操作：打开会话 / 快速回复
-        val single = changes.firstOrNull()
-        if (single != null) {
-            val openIntent = Intent(context, com.learngraph.mobile.MainActivity::class.java)
-                .setAction("com.learngraph.mobile.OPEN_SESSION")
-                .putExtra("session_id", single.id)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            val openPi = PendingIntent.getActivity(
-                context,
-                single.id.hashCode(),
-                openIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-            builder.addAction(
-                NotificationCompat.Action.Builder(
-                    android.R.drawable.ic_menu_agenda,
-                    "打开会话",
-                    openPi,
-                ).build(),
-            )
+        // 快捷操作：打开会话 / 快速回复（取第一条）
+        val openIntent = Intent(context, com.learngraph.mobile.MainActivity::class.java)
+            .setAction("com.learngraph.mobile.OPEN_SESSION")
+            .putExtra("session_id", first.sessionId)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val openPi = PendingIntent.getActivity(
+            context,
+            first.sessionId.hashCode(),
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        builder.addAction(
+            NotificationCompat.Action.Builder(
+                android.R.drawable.ic_menu_agenda,
+                "打开会话",
+                openPi,
+            ).build(),
+        )
 
-            // 快速回复（RemoteInput → QuickReplyReceiver → 异步发消息）
-            val replyKey = "quick_reply"
-            val remoteInput = androidx.core.app.RemoteInput.Builder(replyKey)
-                .setLabel("回复")
-                .build()
-            val replyIntent = Intent(context, com.learngraph.mobile.notify.QuickReplyReceiver::class.java)
-                .putExtra("session_id", single.id)
-            val replyPi = PendingIntent.getBroadcast(
-                context,
-                single.id.hashCode() xor 0x5F,
-                replyIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        val remoteInput = androidx.core.app.RemoteInput.Builder("quick_reply")
+            .setLabel("回复")
+            .build()
+        val replyIntent = Intent(context, com.learngraph.mobile.notify.QuickReplyReceiver::class.java)
+            .putExtra("session_id", first.sessionId)
+        val replyPi = PendingIntent.getBroadcast(
+            context,
+            first.sessionId.hashCode() xor 0x5F,
+            replyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        builder.addAction(
+            NotificationCompat.Action.Builder(
+                android.R.drawable.ic_menu_send,
+                "回复",
+                replyPi,
             )
-            builder.addAction(
-                NotificationCompat.Action.Builder(
-                    android.R.drawable.ic_menu_send,
-                    "回复",
-                    replyPi,
-                )
-                    .addRemoteInput(remoteInput)
-                    .build(),
-            )
-        }
+                .addRemoteInput(remoteInput)
+                .build(),
+        )
 
         try {
             NotificationManagerCompat.from(context).notify(NOTIF_REPLY, builder.build())

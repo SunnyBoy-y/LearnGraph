@@ -35,7 +35,6 @@ import {
   ImageIcon,
   LoaderCircle,
   Camera,
-  History,
   MessageSquareQuote,
   Mic,
   Network,
@@ -164,11 +163,9 @@ import {
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
-import { apiClient } from "@/api/client";
 import {
   isNativeApp,
   takePhoto,
-  notifyOnUpdate,
   startReplyVibration,
   stopReplyVibration,
   stepHaptic,
@@ -8184,50 +8181,7 @@ export function ChatCanvasPage() {
       }
     });
   }, [focusComposer]);
-  // 后台任务投递（仅 APK）：内容发到服务器后台生成，完成后系统通知
-  const [asyncSubmitting, setAsyncSubmitting] = useState(false);
-  const submitBackgroundTask = useCallback(async () => {
-    const text = composerText.trim();
-    if (!text) {
-      toast.error("先输入任务内容再投递");
-      return;
-    }
-    setAsyncSubmitting(true);
-    try {
-      await apiClient.post(`/sessions/${sessionId}/messages/async`, {
-        content: text,
-        generation_mode: "text",
-        file_ids: pendingFiles.map((f) => f.id),
-        provider_id: activeModelProvider?.id,
-        model_id: selectedModel?.id,
-        thinking_mode: effectiveThinkingMode,
-        agent_mode: responseMode === "agentic",
-        search_route:
-          responseMode === "agentic" && !hasAuthorizedAgentSearchProvider && searchRoute !== "model_native"
-            ? "disabled"
-            : searchRoute === "auto" || searchRoute === "external" || searchRoute === "local"
-              ? hasAuthorizedAgentSearchProvider
-                ? searchRoute
-                : "disabled"
-              : searchRoute,
-        web_search:
-          searchRoute !== "disabled" &&
-          (searchRoute === "model_native" || hasAuthorizedAgentSearchProvider),
-      });
-      setComposerText("");
-      // 标记原生轮询：该会话后台生成完成后推送通知（避免前台轮询把变化基线吃掉）
-      notifyOnUpdate(sessionId);
-      toast.success("任务已投递到后台运行，完成后会推送通知");
-    } catch (error) {
-      toast.error(
-        error instanceof ApiError
-          ? `后台任务投递失败：${error.message}`
-          : "后台任务投递失败（服务器可能不支持异步接口）",
-      );
-    } finally {
-      setAsyncSubmitting(false);
-    }
-  }, [composerText, responseMode, sessionId, pendingFiles, activeModelProvider, selectedModel, effectiveThinkingMode, searchRoute, hasAuthorizedAgentSearchProvider]);
+
 
   // 离线草稿（断网 reload / 刷新后恢复当前会话未发送输入）
   useEffect(() => {

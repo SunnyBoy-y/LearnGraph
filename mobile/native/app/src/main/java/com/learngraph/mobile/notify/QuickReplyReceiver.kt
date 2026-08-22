@@ -53,10 +53,10 @@ class QuickReplyReceiver : BroadcastReceiver() {
                     submitReply(auth, sessionId, text)
                 }
                 if (ok) {
-                    // 统一后台任务语义：回复生成完成后推送「有新回复」通知
-                    ReplyNotifier.markTaskSession(context.applicationContext, sessionId)
+                    toast(context, "回复已发送")
+                } else {
+                    toast(context, "回复发送失败")
                 }
-                toast(context, if (ok) "回复已发送" else "回复发送失败")
             } catch (_: Exception) {
                 toast(context, "回复发送失败")
             } finally {

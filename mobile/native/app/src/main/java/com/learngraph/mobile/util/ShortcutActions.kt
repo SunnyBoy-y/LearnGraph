@@ -7,10 +7,9 @@ import android.content.SharedPreferences
 /**
  * 长按图标快捷方式（App Shortcuts）。
  *
- * MainActivity.onCreate 注册 4 个动态快捷方式：
+ * MainActivity.onCreate 注册 3 个动态快捷方式：
  *  - new-chat：新对话
  *  - note：记笔记（快捷动作，网页版引导到记忆页）
- *  - tasks：投递后台任务（网页版引导到任务页）
  *  - connect：切换服务器（回连接页）
  *
  * 点击快捷方式 → MainActivity 收到 intent（extra: lg.shortcut）→ 把动作写入
@@ -25,7 +24,6 @@ object ShortcutActions {
 
     const val ACTION_NEW_CHAT = "new-chat"
     const val ACTION_NOTE = "note"
-    const val ACTION_TASKS = "tasks"
     const val ACTION_CONNECT = "connect"
 
     /** 注册动态快捷方式（MainActivity.onCreate 调用，幂等） */
@@ -54,7 +52,6 @@ object ShortcutActions {
             manager.dynamicShortcuts = listOf(
                 shortcut(ACTION_NEW_CHAT, "新对话", "开始新的对话"),
                 shortcut(ACTION_NOTE, "记笔记", "快速记录一条记忆"),
-                shortcut(ACTION_TASKS, "投递任务", "后台跑一个长任务"),
                 shortcut(ACTION_CONNECT, "切换服务器", "连接其他 LearnGraph 服务器"),
             )
         }

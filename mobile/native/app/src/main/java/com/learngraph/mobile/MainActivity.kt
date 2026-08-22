@@ -164,7 +164,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onPause() {
         super.onPause()
-        // 传 context：后台化立即轮询一次（刚投递的后台任务完成后尽快通知）
+        // 传 context：后台化立即轮询一次（有新回复时尽快通知）
         ReplyNotifier.setForeground(false, this)
         // 后台前强制 Cookie 写盘（重启免登录）
         android.webkit.CookieManager.getInstance().flush()

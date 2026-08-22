@@ -255,12 +255,6 @@ fun WebAppScreen(
                                     onShortcutAction = {
                                         com.learngraph.mobile.util.ShortcutActions.consume(ctx.applicationContext)
                                     },
-                                    onNotifyTaskUpdate = { sessionId ->
-                                        com.learngraph.mobile.notify.ReplyNotifier.markTaskSession(
-                                            ctx.applicationContext,
-                                            sessionId,
-                                        )
-                                    },
                                 ),
                                 "LearnGraphNative",
                             )
@@ -533,7 +527,6 @@ private class NativeBridge(
     private val onGetInboxImageDataUrl: (id: String) -> String?,
     private val onTakePhoto: () -> Unit,
     private val onShortcutAction: () -> String?,
-    private val onNotifyTaskUpdate: (sessionId: String) -> Unit,
 ) {
     @android.webkit.JavascriptInterface
     fun clearAuth() {
@@ -577,12 +570,6 @@ private class NativeBridge(
     /** 读取待消费的快捷动作（如 "new-chat"），消费后返回空字符串 */
     @android.webkit.JavascriptInterface
     fun consumeShortcutAction(): String = onShortcutAction() ?: ""
-
-    /** 网页版投递后台任务成功 → 标记该会话完成生成后推送通知 */
-    @android.webkit.JavascriptInterface
-    fun notifyOnUpdate(sessionId: String) {
-        if (sessionId.isNotBlank()) onNotifyTaskUpdate(sessionId)
-    }
 
     // ------------------------------------------------------------------ //
     // A 类触觉 / 提示音：网页版在渲染关键时刻触发
