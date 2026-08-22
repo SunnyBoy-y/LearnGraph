@@ -483,6 +483,21 @@ def model_provider_for_workspace(
             capabilities,
             resolved_model_id,
         )
+        if is_deepseek:
+            # DeepSeek 官方直连（api.deepseek.com）：reasoning_effort 档位语义
+            # 直通，区别于 DashScope 托管模型（qwen_catalog 对 DeepSeek 记为
+            # high/max only）。旧逻辑把 low/medium/high 统一压成 high，导致
+            # thinking_mode=low 时实际按 high 推理（实测教学轮思考 217s）。此处
+            # 覆盖 per-model 快照，让 low/medium 档真正生效。注意：若官方 API
+            # 拒绝 low/medium，请在 Provider 能力页调回，或让调用方用
+            # thinking_mode=off（模型 thinking_required=false 支持直关）。
+            effective_model_capabilities["thinking_mapping"] = {
+                "off": None,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "max",
+            }
         context_window_tokens = int(
             effective_model_capabilities.get("context_window_tokens") or 256_000
         )

@@ -366,6 +366,11 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                         ),
                     }
                 )
+        if converted:
+            # Cache-breakpoint the trailing tool so the whole tool-definition
+            # block is eligible for Anthropic prompt caching (system already
+            # carries one breakpoint; this adds a second, independent one).
+            converted[-1]["cache_control"] = {"type": "ephemeral"}
         return converted or None
 
     def _stream_answer(self, prompt: str) -> Iterable[str]:

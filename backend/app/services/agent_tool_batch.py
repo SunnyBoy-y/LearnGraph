@@ -65,6 +65,14 @@ PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
         "get_current_time",
         "search_web",
         "search_images",
+        # 只读且无 DB 写入的工具，可在隔离 Session 上并发执行，消除教学轮的
+        # 串行往返。canvas_get_render_contract 是纯函数（无副作用）；
+        # lg_goal_read 只做 select（_load_session_goal / _goal_tool_summary）。
+        # 注意：lg_graph_read（builtin.graph.read）会写 ExtensionInvocation 与
+        # audit 记录（invoke_builtin_tool 内有两次 commit），存在 DB 写入，故
+        # 保持串行，避免 SQLite 写门闸的跨线程并发冲突。
+        "canvas_get_render_contract",
+        "lg_goal_read",
     }
 )
 
