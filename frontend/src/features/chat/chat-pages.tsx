@@ -2500,6 +2500,7 @@ function ConversationQuickActions({
   practiceDisabled,
   searchActive,
   searchDisabled,
+  onPhoto,
 }: {
   agentActive: boolean;
   agentDisabled: boolean;
@@ -2522,6 +2523,8 @@ function ConversationQuickActions({
   practiceDisabled: boolean;
   searchActive: boolean;
   searchDisabled: boolean;
+  /** 仅 APK：现场拍照并作为附件（与「资料」同层按钮） */
+  onPhoto?: () => void;
 }) {
   const dragScroll = useHorizontalDragScroll<HTMLElement>();
   return (
@@ -2542,6 +2545,19 @@ function ConversationQuickActions({
           <FilePlus2 aria-hidden="true" />
           资料
         </button>
+        {isNativeApp() && onPhoto ? (
+          <button
+            aria-label="现场拍照并作为附件"
+            className="chat-workbench-toolbar__action"
+            disabled={attachDisabled}
+            onClick={onPhoto}
+            title="打开系统相机拍照，照片将作为附件加入本轮对话"
+            type="button"
+          >
+            <Camera aria-hidden="true" />
+            拍照
+          </button>
+        ) : null}
         <button
           aria-pressed={goalActive}
           className="chat-workbench-toolbar__action"
@@ -8971,6 +8987,7 @@ export function ChatCanvasPage() {
             sessionIsClosed || goalFlow.busy || !supportsAgentMode
           }
           attachDisabled={sessionIsClosed || goalFlow.busy}
+          onPhoto={handleNativePhoto}
           deepResearchDisabled={
             sessionIsClosed ||
             goalMode ||
@@ -9085,50 +9102,6 @@ export function ChatCanvasPage() {
                 </button>
               );
             })}
-          </div>
-        ) : null}
-        {isNativeApp() ? (
-          <div
-            className="mb-2 flex items-center gap-2"
-            role="group"
-            aria-label="手机增强功能"
-          >
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  aria-label="拍照或选择图片"
-                  size="xs"
-                  title="从相册选择或现场拍照后作为附件"
-                  type="button"
-                  variant="outline"
-                >
-                  <Camera className="size-3.5" />
-                  拍照
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="w-44">
-                <DropdownMenuItem onClick={openAttachmentPicker}>
-                  <ImageIcon className="mr-2 size-4" />
-                  从相册选择
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={handleNativePhoto}>
-                  <Camera className="mr-2 size-4" />
-                  现场拍照
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <Button
-              aria-label="投递后台任务"
-              disabled={asyncSubmitting || !composerText.trim()}
-              onClick={() => void submitBackgroundTask()}
-              size="xs"
-              title="把当前内容发到服务器后台运行，完成后推送通知"
-              type="button"
-              variant="outline"
-            >
-              <History className="size-3.5" />
-              {asyncSubmitting ? "投递中…" : "后台任务"}
-            </Button>
           </div>
         ) : null}
         <PromptInput
