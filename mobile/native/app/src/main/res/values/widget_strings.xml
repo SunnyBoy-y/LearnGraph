@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="widget_description">LearnGraph 桌面入口，点击打开你的学习空间</string>
+    <string name="widget_hint">点击打开你的学习空间</string>
+</resources>

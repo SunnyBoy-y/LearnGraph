@@ -87,7 +87,7 @@ fun SettingsScreen(onLogout: () -> Unit) {
                 elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    SettingRow("版本", "v0.6.0 原生版")
+                    SettingRow("版本", "v0.13.0 原生版")
                     Spacer(Modifier.height(10.dp))
                     SettingRow("说明", "原生壳 + 内嵌网页版全套功能")
                 }

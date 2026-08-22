@@ -17,6 +17,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { authErrorMessage, SESSION_EXPIRED_MESSAGE } from "./auth-messages";
+import { ConnectQrCode } from "@/features/mobile/ConnectQrCode";
+import { isNativeApp } from "@/lib/native-bridge";
 import {
   PASSWORD_RULE_SUMMARY,
   passwordRuleViolations,
@@ -147,6 +149,11 @@ export function LoginPage() {
           </span>
           <strong>LearnGraph</strong>
         </div>
+        {!isNativeApp() ? (
+          <div className="mb-4 flex justify-center border-b pb-4">
+            <ConnectQrCode size={140} />
+          </div>
+        ) : null}
         {registerMode ? (
           <form onSubmit={submitRegister}>
             <div className="eyebrow">

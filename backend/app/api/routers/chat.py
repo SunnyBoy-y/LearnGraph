@@ -1330,6 +1330,93 @@ def stream_message(
     )
 
 
+@router.post("/{session_id}/messages/async")
+def async_message(
+    session_id: str,
+    payload: MessageCreateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    ] = None,
+) -> dict:
+    """投递消息到后台生成（手机「异步任务」/ 通知快捷回复用）。
+
+    与 /messages/stream 共用同一套幂等 + 独立 worker 的生成链路
+    （_detached_message_stream），但调用方不订阅 SSE：事件照常落库，
+    生成在后台线程跑完。客户端通过 GET /sessions/{id}（updated_at）
+    或 /sessions/{id}/messages 轮询结果。
+
+    依赖约束与 stream 一致（provider 可用性、agent_mode 前置校验），
+    因此先做 preflight，再起后台线程消费 detached 流到完成。
+    """
+    require_session_access(session_id, "write", db, context)
+    if payload.generation_mode == "image":
+        stream_service = ImageChatService(
+            db,
+            context.workspace_id,
+            context.principal.user_id,
+            settings,
+            image_provider_for_workspace(
+                db,
+                context.workspace_id,
+                settings,
+                model_id=payload.model_id,
+                provider_id=payload.provider_id,
+            ),
+        )
+    else:
+        stream_service = service(
+            db,
+            context,
+            settings,
+            model_id=payload.model_id,
+            provider_id=payload.provider_id,
+            thinking_mode=payload.thinking_mode,
+            search_route=payload.search_route,
+            agent_mode=False,
+        )
+    stream_service.preflight_create_stream(
+        session_id,
+        payload,
+        idempotency_key=idempotency_key,
+        last_event_id=None,
+    )
+
+    events = _detached_message_stream(
+        context=context,
+        settings=settings,
+        session_id=session_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+        last_event_id=None,
+        session_factory=sessionmaker(
+            bind=db.get_bind(),
+            autoflush=False,
+            expire_on_commit=False,
+        ),
+    )
+
+    def drain() -> None:
+        # 消费 detached 流到完成：events() 会启动 worker 线程并持续
+        # 持久化事件；这里只是让生成器跑完（含错误上报）。
+        try:
+            for _ in events:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=drain,
+        name=f"learngraph-async-{session_id[:8]}",
+        daemon=True,
+    ).start()
+
+    return {"status": "queued", "session_id": session_id}
+
+
 @router.get(
     "/{session_id}/messages/{message_id}/events",
     response_model=list[SSEEventEnvelope],

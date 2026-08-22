@@ -93,6 +93,8 @@ import {
 import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { SettingsModal } from "@/components/layout/settings-modal";
+import { NativeActions } from "@/features/mobile/NativeActions";
+import { ShareInboxPanel } from "@/features/mobile/ShareInboxPanel";
 // F1-2/P0-1: the selection-explanation panel pulls the whole chat renderer
 // (streamdown/hast/parse5/mermaid/d3 subtree) into the first-screen entry
 // chunk, which rolldown mis-orders at module eval (TDZ crash). Load it lazily.
@@ -4864,6 +4866,8 @@ export function WorkspaceShell() {
           </div>
         </SheetContent>
       </Sheet>
+      <ShareInboxPanel />
+      <NativeActions />
     </div>
   );
 }

@@ -24,9 +24,11 @@ object Routes {
  * 极简纯网页外壳导航：
  *  - 未配置服务器 → 连接页（填地址，记住）
  *  - 已配置 → 直接全屏网页版（无原生底栏/控件，顶栏为很薄的白色）
+ *
+ * startAtConnect=true 时强制从连接页开始（「切换服务器」快捷方式使用）。
  */
 @Composable
-fun AppNav() {
+fun AppNav(startAtConnect: Boolean = false) {
     val context = LocalContext.current
     val app = context.applicationContext as LearnGraphApp
 
@@ -39,7 +41,7 @@ fun AppNav() {
         app.api.deviceId = authState.deviceId
     }
 
-    // 启动路由：始终从连接页开始（地址自动预填），用户点击「连接并继续」才进入网页
+    // 启动路由：切换服务器快捷方式 → 连接页；否则始终从连接页开始（地址自动预填）
     val start = Routes.CONNECT
     val navController = rememberNavController()
 

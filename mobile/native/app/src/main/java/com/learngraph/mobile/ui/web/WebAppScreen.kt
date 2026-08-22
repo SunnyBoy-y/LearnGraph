@@ -34,12 +34,14 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,7 +62,7 @@ import com.learngraph.mobile.LearnGraphApp
 import com.learngraph.mobile.data.AuthStore
 import com.learngraph.mobile.data.DownloadStatus
 import com.learngraph.mobile.data.DownloadStore
-import com.learngraph.mobile.web.EmbeddedBrowserActivity
+import com.learngraph.mobile.util.PhotoCapture
 import kotlinx.coroutines.launch
 
 /**
@@ -86,6 +88,23 @@ fun WebAppScreen(
     val downloadTasks by DownloadStore.tasks.collectAsState()
     val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
     val scope = rememberCoroutineScope()
+
+    // 断网检测：离线时显示横幅，网络恢复后自动 reload 网页版
+    var offline by remember { mutableStateOf(false) }
+    val networkMonitor = remember {
+        ConnectivityMonitor(
+            webViewProvider = { webViewRef.value },
+            onOffline = { offline = true },
+            onOnline = { wv ->
+                offline = false
+                wv?.reload()
+            },
+        )
+    }
+    DisposableEffect(Unit) {
+        networkMonitor.register(context)
+        onDispose { networkMonitor.unregister(context) }
+    }
 
     // 文件选择器（网页版「添加资料」按钮 → input[type=file] → 系统文件管理器）
     var fileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
@@ -130,6 +149,23 @@ fun WebAppScreen(
                     .fillMaxSize()
                     .imePadding(),
             ) {
+                // 断网横幅（网络恢复后自动消失并 reload）
+                if (offline) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .align(Alignment.TopCenter)
+                            .background(Color(0xFFB3261E))
+                            .statusBarsPadding()
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = "网络已断开，正在等待恢复…",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                        )
+                    }
+                }
                 AndroidView(
                     factory = { ctx ->
                         WebView(ctx).apply {
@@ -161,6 +197,7 @@ fun WebAppScreen(
                             //  - saveBase64：网页纯前端生成的 blob 下载（导出 md/svg/ics 等）
                             addJavascriptInterface(
                                 NativeBridge(
+                                    context = ctx,
                                     onClearAuth = {
                                         scope.launch { runCatching { app.authStore.clearAuth() } }
                                     },
@@ -178,6 +215,8 @@ fun WebAppScreen(
                                                     url,
                                                     authToken = token,
                                                     fileNameOverride = fileName,
+                                                    workspaceId = authState.workspaceId,
+                                                    deviceId = authState.deviceId,
                                                 )
                                             }
                                         }
@@ -188,6 +227,39 @@ fun WebAppScreen(
                                                 DownloadStore.saveBase64(ctx.applicationContext, dataUrl, fileName)
                                             }
                                         }
+                                    },
+                                    onGetInbox = {
+                                        com.learngraph.mobile.data.ShareInbox
+                                            .encode(com.learngraph.mobile.data.ShareInbox.list(ctx.applicationContext))
+                                    },
+                                    onClearInboxItem = { id ->
+                                        scope.launch {
+                                            runCatching {
+                                                com.learngraph.mobile.data.ShareInbox.remove(ctx.applicationContext, id)
+                                            }
+                                        }
+                                    },
+                                    onClearInbox = {
+                                        scope.launch {
+                                            runCatching {
+                                                com.learngraph.mobile.data.ShareInbox.clear(ctx.applicationContext)
+                                            }
+                                        }
+                                    },
+                                    onGetInboxImageDataUrl = { id ->
+                                        com.learngraph.mobile.data.ShareInbox.imageDataUrl(ctx.applicationContext, id)
+                                    },
+                                    onTakePhoto = {
+                                        com.learngraph.mobile.util.PhotoCapture.launch(ctx)
+                                    },
+                                    onShortcutAction = {
+                                        com.learngraph.mobile.util.ShortcutActions.consume(ctx.applicationContext)
+                                    },
+                                    onNotifyTaskUpdate = { sessionId ->
+                                        com.learngraph.mobile.notify.ReplyNotifier.markTaskSession(
+                                            ctx.applicationContext,
+                                            sessionId,
+                                        )
                                     },
                                 ),
                                 "LearnGraphNative",
@@ -200,9 +272,9 @@ fun WebAppScreen(
                                     val url = request.url
                                     val scheme = url.scheme?.lowercase()
                                     if (scheme == "http" || scheme == "https") {
-                                        // 非本服务器主机 → 内嵌浏览器（不离开应用）
+                                        // 非本服务器主机（外链）→ 跳系统浏览器，防闪退
                                         if (!isSameServer(url, app.api.baseUrl)) {
-                                            EmbeddedBrowserActivity.open(ctx, url.toString())
+                                            openInSystemBrowser(ctx, url.toString())
                                             return true
                                         }
                                         return false
@@ -351,6 +423,8 @@ fun WebAppScreen(
                                     mimeType = mimeType,
                                     userAgent = userAgent,
                                     authToken = token,
+                                    workspaceId = authState.workspaceId,
+                                    deviceId = authState.deviceId,
                                 )
                             }
 
@@ -361,6 +435,12 @@ fun WebAppScreen(
                                     filePathCallback: ValueCallback<Array<Uri>>,
                                     fileChooserParams: FileChooserParams,
                                 ): Boolean {
+                                    // 网页 input[type=file][capture] → 直接走系统相机（拍照即问）
+                                    if (fileChooserParams.isCaptureEnabled) {
+                                        PhotoCapture.setWebView(webView)
+                                        PhotoCapture.launch(ctx)
+                                        return true
+                                    }
                                     // 取消上一次未消费的回调，避免 WebView 卡住
                                     fileCallback?.onReceiveValue(null)
                                     fileCallback = filePathCallback
@@ -378,6 +458,7 @@ fun WebAppScreen(
                             }
 
                             webViewRef.value = this
+                            PhotoCapture.setWebView(this)
                             loadUrl(app.api.baseUrl)
                         }
                     },
@@ -386,6 +467,7 @@ fun WebAppScreen(
                     // （WebView 不销毁会持续占用内存，最终 OOM 触发 renderer 崩溃）
                     onRelease = { wv ->
                         webViewRef.value = null
+                        PhotoCapture.setWebView(null)
                         try {
                             wv.stopLoading()
                             wv.removeAllViews()
@@ -441,9 +523,17 @@ private fun requestNotifPermissionIfNeeded(ctx: Context) {
 
 /** 网页 → 原生 JS bridge（Android 4.2+ 需要 @JavascriptInterface 才暴露） */
 private class NativeBridge(
+    private val context: Context,
     private val onClearAuth: () -> Unit,
     private val onDownload: (url: String, fileName: String?) -> Unit,
     private val onSaveBase64: (dataUrl: String, fileName: String?) -> Unit,
+    private val onGetInbox: () -> String,
+    private val onClearInboxItem: (id: String) -> Unit,
+    private val onClearInbox: () -> Unit,
+    private val onGetInboxImageDataUrl: (id: String) -> String?,
+    private val onTakePhoto: () -> Unit,
+    private val onShortcutAction: () -> String?,
+    private val onNotifyTaskUpdate: (sessionId: String) -> Unit,
 ) {
     @android.webkit.JavascriptInterface
     fun clearAuth() {
@@ -459,6 +549,92 @@ private class NativeBridge(
     fun saveBase64(dataUrl: String, fileName: String?) {
         onSaveBase64(dataUrl, fileName)
     }
+
+    /** 返回分享收件箱 JSON 数组（[{id,kind,text,imagePath,mime,source,created_at}]） */
+    @android.webkit.JavascriptInterface
+    fun getInboxItems(): String = onGetInbox()
+
+    @android.webkit.JavascriptInterface
+    fun clearInboxItem(id: String) {
+        onClearInboxItem(id)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun clearInbox() {
+        onClearInbox()
+    }
+
+    /** 收件箱图片转 base64 data URL（无则返回空字符串） */
+    @android.webkit.JavascriptInterface
+    fun getInboxImageDataUrl(id: String): String = onGetInboxImageDataUrl(id) ?: ""
+
+    /** 打开系统相机拍照（结果经 window.__lgPhotoCallback 回调网页版） */
+    @android.webkit.JavascriptInterface
+    fun takePhoto() {
+        onTakePhoto()
+    }
+
+    /** 读取待消费的快捷动作（如 "new-chat"），消费后返回空字符串 */
+    @android.webkit.JavascriptInterface
+    fun consumeShortcutAction(): String = onShortcutAction() ?: ""
+
+    /** 网页版投递后台任务成功 → 标记该会话完成生成后推送通知 */
+    @android.webkit.JavascriptInterface
+    fun notifyOnUpdate(sessionId: String) {
+        if (sessionId.isNotBlank()) onNotifyTaskUpdate(sessionId)
+    }
+
+    // ------------------------------------------------------------------ //
+    // A 类触觉 / 提示音：网页版在渲染关键时刻触发
+    // ------------------------------------------------------------------ //
+
+    /** 触觉反馈（轻微震动）：intensity 0/1/2 */
+    @android.webkit.JavascriptInterface
+    fun haptic(intensity: Int) {
+        com.learngraph.mobile.util.Haptics.haptic(context, intensity)
+    }
+
+    /** 最终回复到达轻震（思维链结束后第一帧正文） */
+    @android.webkit.JavascriptInterface
+    fun replyHaptic() {
+        com.learngraph.mobile.util.Haptics.replyHaptic(context)
+    }
+
+    /** 开始最终回答渲染期「答答答」持续震动 */
+    @android.webkit.JavascriptInterface
+    fun startReplyVibration() {
+        com.learngraph.mobile.util.Haptics.startReplyVibration(context)
+    }
+
+    /** 结束回答渲染期持续震动 */
+    @android.webkit.JavascriptInterface
+    fun stopReplyVibration() {
+        com.learngraph.mobile.util.Haptics.stopReplyVibration(context)
+    }
+
+    /** agent 工具/步骤完成弱震 */
+    @android.webkit.JavascriptInterface
+    fun stepHaptic() {
+        com.learngraph.mobile.util.Haptics.stepHaptic(context)
+    }
+
+    /** 目标/掌握度达成庆祝（短-长-短） */
+    @android.webkit.JavascriptInterface
+    fun celebration() {
+        com.learngraph.mobile.util.Haptics.celebration(context)
+    }
+
+    /** 提示音（可选，默认关） */
+    @android.webkit.JavascriptInterface
+    fun chime() {
+        com.learngraph.mobile.util.Haptics.chime()
+    }
+
+    /** 朗读文本（B4 耳机自动朗读 / 手动播报） */
+    @android.webkit.JavascriptInterface
+    fun speak(text: String) {
+        com.learngraph.mobile.util.TtsSynth.speak(context, text)
+    }
 }
 
 private fun isSameServer(url: Uri, baseUrl: String): Boolean {
@@ -472,3 +648,63 @@ private fun isSameServer(url: Uri, baseUrl: String): Boolean {
 
 private fun escapeJs(s: String): String =
     s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+
+/**
+ * 网络状态监测（断线重连）：
+ *  - 离线 → onOffline（显示横幅）
+ *  - 恢复在线 → onOnline（自动 reload 网页版）
+ * 仅关注传输层连通性（Wi-Fi/蜂窝），与「服务器可达性」解耦——
+ * 服务器不可达仍由 WebView 的 onReceivedError 处理（跳连接页）。
+ * 所有回调统一 post 到主线程；注册后首次 onAvailable（当前已有网络）不触发 reload。
+ */
+private class ConnectivityMonitor(
+    private val webViewProvider: () -> WebView?,
+    private val onOffline: () -> Unit,
+    private val onOnline: (webView: WebView?) -> Unit,
+) {
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    @Volatile
+    private var registered = false
+
+    private val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+        override fun onLost(network: android.net.Network) {
+            mainHandler.post { if (registered) onOffline() }
+        }
+
+        override fun onAvailable(network: android.net.Network) {
+            // 注册本身会立即触发一次 onAvailable：仅当之后真的断开又恢复才 reload
+            if (!registered) return
+            mainHandler.post { if (registered) onOnline(webViewProvider()) }
+        }
+    }
+
+    fun register(context: Context) {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        registered = true
+        runCatching {
+            cm.registerDefaultNetworkCallback(callback)
+        }
+    }
+
+    fun unregister(context: Context) {
+        registered = false
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        runCatching { cm.unregisterNetworkCallback(callback) }
+    }
+}
+
+
+/** 外链跳系统浏览器：异常兜底，绝不闪退 */
+private fun openInSystemBrowser(context: Context, url: String) {
+    try {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    } catch (e: android.content.ActivityNotFoundException) {
+        android.widget.Toast.makeText(
+            context, "没有可打开该链接的浏览器", android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    } catch (_: Exception) {
+        // 其他异常静默，不闪退
+    }
+}

@@ -34,6 +34,8 @@ import {
   LayoutDashboard,
   ImageIcon,
   LoaderCircle,
+  Camera,
+  History,
   MessageSquareQuote,
   Mic,
   Network,
@@ -162,6 +164,17 @@ import {
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
+import { apiClient } from "@/api/client";
+import {
+  isNativeApp,
+  takePhoto,
+  notifyOnUpdate,
+  startReplyVibration,
+  stopReplyVibration,
+  stepHaptic,
+  celebration,
+  chime as nativeChime,
+} from "@/lib/native-bridge";
 import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
 import { MiddleEllipsis } from "@/components/shared/middle-ellipsis";
 import {
@@ -1479,6 +1492,29 @@ function streamRenderMinIntervalMs(parts: MessagePart[] | undefined): number {
     if (ms > maxMs) maxMs = ms;
   }
   return maxMs;
+}
+
+async function copySelectionText(text: string): Promise<void> {
+  const content = text || "";
+  if (!content) return;
+  try {
+    await navigator.clipboard.writeText(content);
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = content;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch {
+      toast.error("复制失败");
+      return;
+    }
+  }
+  toast.success("已复制");
 }
 
 function readTextSelection(): TextSelectionMenu | null {
@@ -5535,6 +5571,50 @@ export function ChatCanvasPage() {
               const data = streamData(event.data);
               recordStreamDelta(assistant.id, deltaTextOf(data));
               const type = streamEventType(data);
+              if (type === "answer.started") {
+                // A1：思维链结束、最终回复正文开始 → 渲染期间持续「答答答」震动
+                startReplyVibration();
+              }
+              {
+                const streamPart = data.part as { type?: string; status?: string } | undefined;
+                const isChainDone =
+                  streamPart &&
+                  (streamPart.type === "agent_step" || streamPart.type === "tool_call") &&
+                  streamPart.status === "completed";
+                if (isChainDone) {
+                  // A2：agent 工具/步骤完成 → 弱震（节流约 900ms）
+                  const lastStep = Number((window as { __lgLastStepHaptic?: number }).__lgLastStepHaptic ?? 0);
+                  if (Date.now() - lastStep > 900) {
+                    (window as { __lgLastStepHaptic?: number }).__lgLastStepHaptic = Date.now();
+                    (window as { __lgHadAgentStep?: boolean }).__lgHadAgentStep = true;
+                    stepHaptic();
+                  }
+                }
+              }
+              if (
+                type === "message.completed" ||
+                type === "message.failed" ||
+                type === "message.cancelled"
+              ) {
+                // 渲染结束/失败/取消 → 停止「答答答」震动
+                stopReplyVibration();
+              }
+              if (type === "message.completed") {
+                // A3：本轮有 agent 活动且最终完成 → 庆祝震动（短-长-短）
+                if ((window as { __lgHadAgentStep?: boolean }).__lgHadAgentStep) {
+                  (window as { __lgHadAgentStep?: boolean }).__lgHadAgentStep = false;
+                  celebration();
+                }
+                // A4：可选完成提示音（默认关）
+                try {
+                  if (window.localStorage.getItem("lg:haptics:chime") === "1") {
+                    nativeChime();
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+
               if (
                 typeof data.message_id === "string" &&
                 !persistedAssistantId
@@ -8079,6 +8159,105 @@ export function ChatCanvasPage() {
   const openAttachmentPicker = useCallback(() => {
     openFileDialogRef.current();
   }, []);
+  // 原生拍照即问（仅 APK）：相机照片 → 上传 → 加入待发送附件
+  const handleNativePhoto = useCallback(() => {
+    takePhoto(async (dataUrl) => {
+      if (!dataUrl) {
+        toast.error("拍照失败或已取消");
+        return;
+      }
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        const file = new File([blob], `photo-${Date.now()}.jpg`, {
+          type: "image/jpeg",
+        });
+        const record = await uploadFile(file);
+        setPendingFiles((current) =>
+          current.some((item) => item.id === record.id)
+            ? current
+            : [...current, record],
+        );
+        toast.success("照片已添加为附件");
+        focusComposer();
+      } catch {
+        toast.error("照片处理失败");
+      }
+    });
+  }, [focusComposer]);
+  // 后台任务投递（仅 APK）：内容发到服务器后台生成，完成后系统通知
+  const [asyncSubmitting, setAsyncSubmitting] = useState(false);
+  const submitBackgroundTask = useCallback(async () => {
+    const text = composerText.trim();
+    if (!text) {
+      toast.error("先输入任务内容再投递");
+      return;
+    }
+    setAsyncSubmitting(true);
+    try {
+      await apiClient.post(`/sessions/${sessionId}/messages/async`, {
+        content: text,
+        generation_mode: "text",
+        file_ids: pendingFiles.map((f) => f.id),
+        provider_id: activeModelProvider?.id,
+        model_id: selectedModel?.id,
+        thinking_mode: effectiveThinkingMode,
+        agent_mode: responseMode === "agentic",
+        search_route:
+          responseMode === "agentic" && !hasAuthorizedAgentSearchProvider && searchRoute !== "model_native"
+            ? "disabled"
+            : searchRoute === "auto" || searchRoute === "external" || searchRoute === "local"
+              ? hasAuthorizedAgentSearchProvider
+                ? searchRoute
+                : "disabled"
+              : searchRoute,
+        web_search:
+          searchRoute !== "disabled" &&
+          (searchRoute === "model_native" || hasAuthorizedAgentSearchProvider),
+      });
+      setComposerText("");
+      // 标记原生轮询：该会话后台生成完成后推送通知（避免前台轮询把变化基线吃掉）
+      notifyOnUpdate(sessionId);
+      toast.success("任务已投递到后台运行，完成后会推送通知");
+    } catch (error) {
+      toast.error(
+        error instanceof ApiError
+          ? `后台任务投递失败：${error.message}`
+          : "后台任务投递失败（服务器可能不支持异步接口）",
+      );
+    } finally {
+      setAsyncSubmitting(false);
+    }
+  }, [composerText, responseMode, sessionId, pendingFiles, activeModelProvider, selectedModel, effectiveThinkingMode, searchRoute, hasAuthorizedAgentSearchProvider]);
+
+  // 离线草稿（断网 reload / 刷新后恢复当前会话未发送输入）
+  useEffect(() => {
+    if (!sessionId || !workspaceId) return;
+    try {
+      const saved = window.localStorage.getItem(
+        `lg:composer-draft:${workspaceId}:${sessionId}`,
+      );
+      if (saved) setComposerText(saved);
+    } catch {
+      // localStorage 不可用（隐私模式等）静默
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, workspaceId]);
+  useEffect(() => {
+    if (!sessionId || !workspaceId) return;
+    const timer = window.setTimeout(() => {
+      try {
+        const key = `lg:composer-draft:${workspaceId}:${sessionId}`;
+        if (composerText.trim()) {
+          window.localStorage.setItem(key, composerText);
+        } else {
+          window.localStorage.removeItem(key);
+        }
+      } catch {
+        // ignore
+      }
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [composerText, sessionId, workspaceId]);
   const selectComposerMenuCommand = useCallback(
     (command: ComposerCommandId) => {
       if (command === "goal") {
@@ -8514,6 +8693,15 @@ export function ChatCanvasPage() {
             “{selectionMenu.selected_text}”
           </span>
           <Button
+            aria-label="复制划词文本"
+            onClick={() => void copySelectionText(selectionMenu.selected_text)}
+            size="xs"
+            variant="ghost"
+          >
+            <Copy className="size-3.5" />
+            复制
+          </Button>
+          <Button
             onClick={() => {
               const quote = `> ${selectionMenu.selected_text.replaceAll("\n", "\n> ")}\n\n`;
               setComposerText((current) => `${current}${current ? "\n\n" : ""}${quote}`);
@@ -8945,6 +9133,50 @@ export function ChatCanvasPage() {
                 </button>
               );
             })}
+          </div>
+        ) : null}
+        {isNativeApp() ? (
+          <div
+            className="mb-2 flex items-center gap-2"
+            role="group"
+            aria-label="手机增强功能"
+          >
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="拍照或选择图片"
+                  size="xs"
+                  title="从相册选择或现场拍照后作为附件"
+                  type="button"
+                  variant="outline"
+                >
+                  <Camera className="size-3.5" />
+                  拍照
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-44">
+                <DropdownMenuItem onClick={openAttachmentPicker}>
+                  <ImageIcon className="mr-2 size-4" />
+                  从相册选择
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleNativePhoto}>
+                  <Camera className="mr-2 size-4" />
+                  现场拍照
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button
+              aria-label="投递后台任务"
+              disabled={asyncSubmitting || !composerText.trim()}
+              onClick={() => void submitBackgroundTask()}
+              size="xs"
+              title="把当前内容发到服务器后台运行，完成后推送通知"
+              type="button"
+              variant="outline"
+            >
+              <History className="size-3.5" />
+              {asyncSubmitting ? "投递中…" : "后台任务"}
+            </Button>
           </div>
         ) : null}
         <PromptInput

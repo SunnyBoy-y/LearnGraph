@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
 
     <application
         android:name=".LearnGraphApp"
@@ -29,6 +33,38 @@
             </intent-filter>
         </activity>
 
+        <!-- 分享投喂接收器（Share Target）：任意 App 分享文本/图片 → 收件箱 -->
+        <activity
+            android:name=".ShareReceiverActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@style/Theme.LearnGraph.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- 二维码扫码（连接页 → 扫描服务器地址） -->
+        <activity
+            android:name=".QrScanActivity"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.LearnGraph" />
+
         <!-- 内嵌浏览器 / 网页版兜底（外部链接或网页版全功能） -->
         <activity
             android:name=".web.EmbeddedBrowserActivity"
@@ -49,6 +85,24 @@
         <receiver
             android:name=".notify.ReplyAlarmReceiver"
             android:exported="false" />
+        <receiver
+            android:name=".notify.QuickReplyReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".notify.TtsReadbackReceiver"
+            android:exported="false" />
+
+        <!-- 桌面小组件 -->
+        <receiver
+            android:name=".LearnGraphWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/appwidget_info" />
+        </receiver>
         <receiver
             android:name=".notify.ReplyBootReceiver"
             android:exported="true">

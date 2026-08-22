@@ -39,6 +39,8 @@ data class DownloadTask(
     val contentDisposition: String? = null,
     val userAgent: String? = null,
     val authToken: String? = null,
+    val workspaceId: String? = null,
+    val deviceId: String = "",
     val totalBytes: Long? = null,
     val downloadedBytes: Long = 0,
     val status: DownloadStatus = DownloadStatus.DOWNLOADING,
@@ -86,6 +88,8 @@ object DownloadStore {
         userAgent: String? = null,
         authToken: String? = null,
         fileNameOverride: String? = null,
+        workspaceId: String? = null,
+        deviceId: String = "",
     ): String {
         val ctx = context.applicationContext
         appContext = ctx
@@ -103,6 +107,8 @@ object DownloadStore {
                 contentDisposition = contentDisposition,
                 userAgent = userAgent,
                 authToken = authToken,
+                workspaceId = workspaceId,
+                deviceId = deviceId,
             ),
         ) + it }
         ensureChannel(ctx)
@@ -115,6 +121,10 @@ object DownloadStore {
                     .header("User-Agent", userAgent ?: "LearnGraph-Android")
                     .apply {
                         if (!authToken.isNullOrBlank()) header("Authorization", "Bearer $authToken")
+                        // 后端工作区资源强制要求 X-Workspace-ID（缺失即 422）；
+                        // 同源 API 文件/备份下载必须带上，否则必然失败。
+                        if (!workspaceId.isNullOrBlank()) header("X-Workspace-ID", workspaceId)
+                        if (deviceId.isNotBlank()) header("X-Device-ID", deviceId)
                     }
                     .build()
                 val response = http.newCall(request).execute()
@@ -224,7 +234,16 @@ object DownloadStore {
         val t = _tasks.value.firstOrNull { it.id == id } ?: return
         _tasks.update { list -> list.filterNot { it.id == id } }
         val ctx = appContext ?: return
-        enqueue(ctx, t.url, t.contentDisposition, t.mimeType, t.userAgent, t.authToken)
+        enqueue(
+            ctx,
+            t.url,
+            t.contentDisposition,
+            t.mimeType,
+            t.userAgent,
+            t.authToken,
+            workspaceId = t.workspaceId,
+            deviceId = t.deviceId,
+        )
     }
 
     fun remove(id: String) {
