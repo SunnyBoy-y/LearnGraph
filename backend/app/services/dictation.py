@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -128,10 +129,27 @@ def dashscope_realtime_ws_url(base_url: str | None) -> str | None:
     return f"wss://{parsed.netloc}/api-ws/v1/inference"
 
 
-def build_realtime_run_task(model_id: str, sample_rate: int) -> tuple[str, str]:
-    """Build the DashScope ``run-task`` frame; returns (task_id, JSON text)."""
+def build_realtime_run_task(
+    model_id: str,
+    sample_rate: int,
+    language: str | None = None,
+    hotwords: list[str] | None = None,
+) -> tuple[str, str]:
+    """Build the DashScope ``run-task`` frame; returns (task_id, JSON text).
+
+    ``language`` (BCP-47, e.g. zh-CN / en-US) is passed through to the model
+    when explicitly requested. ``hotwords`` is injected into ``parameters``
+    for models that natively support vocabulary boosting (paraformer-realtime
+    family); models that ignore unknown parameters are unaffected, and the
+    exact key name for other families is verified per real gateway before use.
+    """
 
     task_id = uuid4().hex
+    parameters: dict[str, Any] = {"format": "pcm", "sample_rate": sample_rate}
+    if language and language != "auto":
+        parameters["language"] = language
+    if hotwords:
+        parameters["hotwords"] = hotwords
     message = {
         "header": {
             "action": "run-task",
@@ -143,7 +161,7 @@ def build_realtime_run_task(model_id: str, sample_rate: int) -> tuple[str, str]:
             "task": "asr",
             "function": "recognition",
             "model": model_id,
-            "parameters": {"format": "pcm", "sample_rate": sample_rate},
+            "parameters": parameters,
             "input": {},
         },
     }

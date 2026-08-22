@@ -21,6 +21,10 @@ export type RealtimeDictationHandle = {
 export type RealtimeDictationOptions = {
   providerId: string;
   modelId: string;
+  /** 显式语言（BCP-47，如 zh-CN / en-US）；"auto" 或缺省时由模型自动检测。 */
+  language?: string;
+  /** 热词表（术语/人名/代码标识符），透传给支持热词的 ASR 模型。 */
+  hotwords?: string[];
   /** 未定稿的当前句(整句替换,不追加)。 */
   onPartial: (text: string) => void;
   /** 一句定稿(按顺序追加)。 */
@@ -140,6 +144,11 @@ export async function startRealtimeDictation(
           provider_id: options.providerId,
           model_id: options.modelId,
           sample_rate: TARGET_SAMPLE_RATE,
+          language:
+            options.language && options.language !== "auto"
+              ? options.language
+              : undefined,
+          hotwords: options.hotwords?.length ? options.hotwords : undefined,
         }),
       );
     };

@@ -768,7 +768,16 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
         )
         return
 
-    task_id, run_task = build_realtime_run_task(adapter.model_id, sample_rate)
+    language = str(start.get("language") or "").strip() or None
+    hotwords_raw = start.get("hotwords")
+    hotwords = (
+        [str(item).strip() for item in hotwords_raw if str(item).strip()]
+        if isinstance(hotwords_raw, list)
+        else None
+    )
+    task_id, run_task = build_realtime_run_task(
+        adapter.model_id, sample_rate, language=language, hotwords=hotwords
+    )
     finish_sent = False
     try:
         await upstream.send(run_task)

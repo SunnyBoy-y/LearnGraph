@@ -37,7 +37,16 @@ const MAX_REALTIME_FAILURES = 2;
 
 export type DictationOrchestratorOptions = {
   /** realtime 通道配置；缺省时（或浏览器不支持 WS 实时）直接走分段通道。 */
-  realtime?: { providerId: string; modelId: string };
+  realtime?: {
+    providerId: string;
+    modelId: string;
+    /** 显式语言（BCP-47，如 zh-CN / en-US）；"auto" 或缺省由模型自动检测。 */
+    language?: string;
+    /** 热词表文本列表，透传给支持热词的 ASR 模型。 */
+    hotwords?: string[];
+  };
+  /** 分段通道本机 VAD 自适应基线开关（默认开启）。 */
+  adaptiveVad?: boolean;
   /** 分段通道转写函数（由调用方绑定 stored provider）。 */
   transcribeSegment: (segment: Blob) => Promise<string>;
   /** 未定稿的当前句（仅 realtime 通道产生，逐字刷新）。 */
@@ -94,6 +103,7 @@ export function startDictationOrchestrator(
   const startSegmented = () =>
     startProviderDictation({
       transcribe: options.transcribeSegment,
+      adaptiveVad: options.adaptiveVad,
       onSegmentText: (text) => {
         if (stopped || aborted) return;
         options.onFinal(text);
@@ -116,6 +126,8 @@ export function startDictationOrchestrator(
     return startRealtimeDictation({
       providerId: realtime.providerId,
       modelId: realtime.modelId,
+      language: realtime.language,
+      hotwords: realtime.hotwords,
       onPartial: (text) => {
         if (stopped || aborted) return;
         options.onPartial(text);
