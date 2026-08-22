@@ -15,8 +15,14 @@ import {
   formatTokenCount,
   formatTokensPerSecond,
   lookupStreamStats,
+  useShowCacheHit,
   useShowStreamStats,
 } from "@/features/chat/stream-stats";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { UnknownRecord } from "@/types/common";
 
 const STREAMING_TICK_MS = 250;
@@ -43,6 +49,7 @@ export function StreamStatsBadge({
   providerTrace,
 }: StreamStatsBadgeProps) {
   const [enabled] = useShowStreamStats();
+  const [showCacheHit] = useShowCacheHit();
   const [, setTick] = useState(0);
 
   const streaming = status === "streaming" || status === "submitted";
@@ -74,9 +81,11 @@ export function StreamStatsBadge({
     if (!stats || !stats.firstDeltaAt) {
       const waiting = stats ? now - stats.startedAt : undefined;
       return (
-        <span className="message-stream-stats" role="status" aria-live="polite">
-          {waiting !== undefined ? `等待首字… ${formatMilliseconds(waiting)}` : "等待首字…"}
-        </span>
+        <div className="message-stream-stats" role="status" aria-live="polite">
+          <span className="message-stream-stats__item">
+            {waiting !== undefined ? `等待首字… ${formatMilliseconds(waiting)}` : "等待首字…"}
+          </span>
+        </div>
       );
     }
     ttftMs = stats.firstDeltaAt - stats.startedAt;
@@ -108,6 +117,32 @@ export function StreamStatsBadge({
     totalTokens = estimateStreamTokens(stats);
   }
 
+  // Cache-hit share of billed prompt input (terminal only: the cache fields
+  // ride provider_trace, present on the completed event and persisted rows,
+  // never mid-stream). Mirrors the usage-page formula: cachedRead over the
+  // full input_tokens total, which already includes cache reads and writes.
+  let cacheHitPercent: number | undefined;
+  let cachedReadTokens: number | undefined;
+  let cachedWriteTokens: number | undefined;
+  let inputTokensTotal: number | undefined;
+  if (!streaming && showCacheHit) {
+    inputTokensTotal = numericTraceValue(providerTrace, "input_tokens");
+    cachedReadTokens = numericTraceValue(providerTrace, "cached_input_tokens");
+    cachedWriteTokens = numericTraceValue(
+      providerTrace,
+      "cache_creation_input_tokens",
+    );
+    const hasCacheActivity = (cachedReadTokens ?? 0) > 0 || (cachedWriteTokens ?? 0) > 0;
+    if (
+      inputTokensTotal !== undefined &&
+      inputTokensTotal > 0 &&
+      hasCacheActivity &&
+      cachedReadTokens !== undefined
+    ) {
+      cacheHitPercent = Math.round((cachedReadTokens / inputTokensTotal) * 100);
+    }
+  }
+
   const segments = [
     ttftMs !== undefined ? `首字 ${formatMilliseconds(ttftMs)}` : null,
     tokensPerSecond !== undefined
@@ -116,11 +151,38 @@ export function StreamStatsBadge({
     totalTokens !== undefined ? `共 ${formatTokenCount(totalTokens)}` : null,
   ].filter((segment): segment is string => segment !== null);
 
-  if (!segments.length) return null;
+  const cacheBadge =
+    cacheHitPercent !== undefined ? (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="message-stream-stats__badge" tabIndex={0}>
+            缓存命中 {cacheHitPercent}%
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          <p className="text-xs font-medium">Prompt 缓存命中</p>
+          <p className="mt-1 text-xs leading-5">
+            缓存读 {formatTokenCount(cachedReadTokens ?? 0)} · 缓存写{" "}
+            {formatTokenCount(cachedWriteTokens ?? 0)} · 总输入{" "}
+            {formatTokenCount(inputTokensTotal ?? 0)}
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            命中率 = 缓存读 / 总输入
+          </p>
+        </TooltipContent>
+      </Tooltip>
+    ) : null;
+
+  if (!segments.length && !cacheBadge) return null;
 
   return (
-    <span className="message-stream-stats" role="status" aria-live="polite">
-      {segments.join(" · ")}
-    </span>
+    <div className="message-stream-stats" role="status" aria-live="polite">
+      {segments.map((segment) => (
+        <span className="message-stream-stats__item" key={segment}>
+          {segment}
+        </span>
+      ))}
+      {cacheBadge}
+    </div>
   );
 }

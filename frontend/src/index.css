@@ -1154,10 +1154,11 @@ body.is-resizing .workspace-resizer {
 .chat-graph-rail .react-flow__minimap { display: none; }
 .chat-canvas-page { overflow: hidden; background: #fcfcfc; }
 .dark .chat-canvas-page { background: var(--background); }
-/* 用户消息气泡：整行收窄到输入框同一内容轴，气泡 ml-auto 右缘与输入框右缘对齐。 */
+/* 用户消息气泡：从右往左占 60% 宽度，右缘贴聊天容器右缘。 */
 .chat-canvas-page .is-user {
-  width: min(var(--chat-content-width), calc(100% - 48px));
-  margin-inline: auto;
+  width: 60%;
+  margin-left: auto;
+  margin-right: 0;
 }
 /* 重试回答的版本号行：最左缘与输入框左缘对齐。 */
 .chat-message-version-row {
@@ -5475,7 +5476,6 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 
 /* 4) 文字与两旁的间距缩小到二分之一（48px → 24px，每边 24px → 12px） */
 @media (max-width: 780px) {
-  .chat-canvas-page .is-user,
   .chat-message-version-row,
   .chat-composer-dock,
   .chat-follow-up-prompts,
@@ -5495,6 +5495,62 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     max-width: min(56vw, 15rem);
   }
 }
+
+
+/* ===========================================================================
+   Message stream stats bar (first-token / token speed / cache hit).
+   Shares --chat-content-width with the message body so its left edge aligns
+   with the text; tabular-nums + fixed min-height prevent horizontal jitter
+   while the numbers update during streaming.
+   =========================================================================== */
+.message-stream-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  width: min(var(--chat-content-width), calc(100% - 48px));
+  margin-inline: auto;
+  min-height: 20px;
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.message-stream-stats__item {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+.message-stream-stats__item + .message-stream-stats__item::before {
+  content: " b7";
+  margin-right: 8px;
+  color: color-mix(in srgb, var(--muted-foreground) 55%, transparent);
+}
+.message-stream-stats__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid color-mix(in srgb, #16a34a 26%, var(--border));
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: #15803d;
+  background: color-mix(in srgb, #16a34a 8%, var(--background));
+}
+.dark .message-stream-stats__badge {
+  color: #4ade80;
+  border-color: color-mix(in srgb, #4ade80 26%, var(--border));
+  background: color-mix(in srgb, #4ade80 8%, var(--background));
+}
+.message-stream-stats__badge:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent);
+  outline-offset: 1px;
+}
+@media (max-width: 780px) {
+  .message-stream-stats {
+    width: min(var(--chat-content-width), calc(100% - 24px));
+  }
+}
+
 /* ===========================================================================
    Public session share viewer (read-only snapshot page)
    =========================================================================== */
@@ -5692,3 +5748,6 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   border-radius: 10px;
   padding: 8px 11px;
   color: var(--muted-foreground, #71717a);
+  font-size: 12px;
+  line-height: 1.5;
+}

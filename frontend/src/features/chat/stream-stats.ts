@@ -28,6 +28,7 @@ export interface StreamStats {
 }
 
 const STREAM_STATS_KEY = "learngraph.showStreamStats";
+const CACHE_HIT_KEY = "learngraph.showCacheHit";
 const STREAM_STATS_MAX_ENTRIES = 200;
 
 const registry = new Map<string, StreamStats>();
@@ -123,6 +124,34 @@ export function useShowStreamStats(): [boolean, (next?: boolean) => void] {
       const value = next === undefined ? !current : next;
       try {
         localStorage.setItem(STREAM_STATS_KEY, value ? "1" : "0");
+      } catch {
+        // localStorage unavailable (private mode): keep the in-memory state.
+      }
+      return value;
+    });
+  }, []);
+  return [enabled, setOrToggle];
+}
+
+/**
+ * Persisted UI toggle for the cache-hit readout; default off.
+ *
+ * Mirrors {@link useShowStreamStats}: the badge shows the cache-hit segment
+ * only while this is enabled. Stored per-device in localStorage.
+ */
+export function useShowCacheHit(): [boolean, (next?: boolean) => void] {
+  const [enabled, setEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(CACHE_HIT_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setOrToggle = useCallback((next?: boolean) => {
+    setEnabled((current) => {
+      const value = next === undefined ? !current : next;
+      try {
+        localStorage.setItem(CACHE_HIT_KEY, value ? "1" : "0");
       } catch {
         // localStorage unavailable (private mode): keep the in-memory state.
       }

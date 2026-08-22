@@ -36,6 +36,7 @@ import {
   Upload,
   UserRound,
   X,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -69,7 +70,7 @@ import {
 } from "@/api";
 import { authStore } from "@/api/auth-store";
 import { useAuth } from "@/features/auth/auth-context-value";
-import { useShowStreamStats } from "@/features/chat/stream-stats";
+import { useShowCacheHit, useShowStreamStats } from "@/features/chat/stream-stats";
 import {
   ErrorState,
   LoadingState,
@@ -2270,6 +2271,7 @@ export function WorkspaceSettingsPage() {
   );
   // 流式指标开关是设备本地偏好（localStorage），随本设备即时生效。
   const [showStreamStats, setShowStreamStats] = useShowStreamStats();
+  const [showCacheHit, setShowCacheHit] = useShowCacheHit();
   const save = useMutation({
     mutationFn: (value: unknown) => updateSetting("ui.preferences", value),
     onError: (error) => toast.error(error.message),
@@ -2827,6 +2829,22 @@ export function WorkspaceSettingsPage() {
               aria-label="显示流式指标"
               checked={showStreamStats}
               onCheckedChange={setShowStreamStats}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
+            <div className="flex min-w-0 items-center gap-3">
+              <Zap className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">显示缓存命中</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  回答完成时在流式指标中显示缓存命中率（缓存读 / 输入 Token）；默认关闭，保存在本设备
+                </p>
+              </div>
+            </div>
+            <Switch
+              aria-label="显示缓存命中"
+              checked={showCacheHit}
+              onCheckedChange={setShowCacheHit}
             />
           </div>
           <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
