@@ -306,11 +306,21 @@ export function MemoryPage() {
   })
   const regenerateProfile = useMutation({
     mutationFn: refreshMemoryProfile,
-    onSuccess: async () => {
-      toast.success('记忆摘要已整篇重写')
+    onSuccess: async (result) => {
+      // 未配置提取/摘要模型时后端返回原子快照（200），此时不是“整篇重写”，
+      // 只提示保持快照模式，配置模型后可一键生成正式摘要。
+      if (result.status === 'atomic_snapshot') {
+        toast.info('未配置记忆摘要模型，当前保持原子快照；配置后可生成正式摘要')
+      } else {
+        toast.success('记忆摘要已整篇重写')
+      }
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error) => {
+      // 兜底静默未配置模型码，避免弹出英文错误；页面会显示原子快照提示。
+      if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') return
+      toast.error(error.message)
+    },
   })
   const migrateAtoms = useMutation({
     mutationFn: () => migrateLegacyMemoryAtoms(20),
@@ -323,7 +333,13 @@ export function MemoryPage() {
         await regenerateProfile.mutateAsync()
       }
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') {
+        toast.info('未配置记忆提取模型，旧记忆整理暂不可用；配置模型后可迁移为原子记忆')
+        return
+      }
+      toast.error(error.message)
+    },
   })
 
   if (memories.isPending || profile.isPending || deleted.isPending || sessions.isPending) {

@@ -794,6 +794,12 @@ class MemoryProfileService:
             and not force
         ):
             return self._profile_view(current)
+        provider_id, model_id = self._model_selection()
+        if not provider_id or not model_id:
+            # 未配置记忆提取/摘要模型：与 get_profile 一致降级为无模型的
+            # 原子快照视图，而不是抛出 memory_profile_model_unconfigured，
+            # 保证刷新入口在未配置状态下也不报英文错误、仍能看到全部原子。
+            return self._atomic_snapshot_view()
         prompt = (
             "你是 LearnGraph 的长期记忆摘要整理器。仅依据 ATOMS JSON 写一篇完整的"
             "中文用户记忆摘要。使用第二人称“你”。摘要是高层综合，不必包含所有原子。\n"
