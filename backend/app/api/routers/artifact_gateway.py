@@ -58,6 +58,12 @@ _CARD_SHARE_SHELL = """<!doctype html>
     padding: 24px; text-align: center; color: #52525b; }}
   .info p {{ margin: 6px 0; }}
   footer {{ text-align: center; color: #a1a1aa; font-size: 12px; padding: 16px; }}
+  .fullscreen-btn {{ position: fixed; right: 16px; bottom: 16px; z-index: 10;
+    border: 1px solid #d4d4d8; border-radius: 999px; background: rgba(255,255,255,.96);
+    padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+    box-shadow: 0 8px 24px rgba(0,0,0,.14); color: #18181b; }}
+  .fullscreen-btn:hover {{ background: #fff; }}
+  iframe:fullscreen {{ height: 100vh; border-radius: 0; }}
 </style>
 </head>
 <body>
@@ -65,6 +71,18 @@ _CARD_SHARE_SHELL = """<!doctype html>
 <footer>由 LearnGraph 生成 · 只读分享 · 不包含原始会话内容</footer>
 </body>
 </html>"""
+
+# Fullscreen affordance injected before the footer (kept outside the .format()
+# template so the JavaScript braces never clash with str.format placeholders).
+_SHARE_FULLSCREEN = """<button class="fullscreen-btn" onclick="enterFullscreen()" type="button">&#x26F6; 全屏</button>
+<script>
+function enterFullscreen() {
+  var frame = document.querySelector('iframe');
+  if (!frame) { return; }
+  if (frame.requestFullscreen) { frame.requestFullscreen(); }
+  else if (frame.webkitRequestFullscreen) { frame.webkitRequestFullscreen(); }
+}
+</script>"""
 
 
 def service(db, context, settings):
@@ -346,6 +364,7 @@ def card_share_viewer(raw_token: str, db: DB):
             ),
         )
     page = _CARD_SHARE_SHELL.format(body=body)
+    page = page.replace("</footer>", _SHARE_FULLSCREEN + "</footer>")
     return HTMLResponse(content=page, media_type="text/html; charset=utf-8")
 
 

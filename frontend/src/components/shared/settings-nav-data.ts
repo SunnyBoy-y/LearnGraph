@@ -6,7 +6,6 @@ import {
   Database,
   Globe,
   Info,
-  Package,
   Palette,
   ShieldCheck,
   SlidersHorizontal,
@@ -33,7 +32,6 @@ export const settingsNav: SettingsNavItem[] = [
   { label: "账户与访问", icon: UsersRound, path: "settings/access" },
   { label: "权限审计", icon: ShieldCheck, path: "settings/audit" },
   { label: "存储迁移", icon: Database, path: "settings/storage/migrations" },
-  { label: "产物与分享", icon: Package, path: "settings/artifacts" },
   { label: "关于", icon: Info, path: "settings/about" },
 ];
 

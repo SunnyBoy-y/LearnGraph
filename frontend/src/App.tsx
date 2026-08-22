@@ -152,7 +152,8 @@ function AppRoutes() {
         <Route element={<PersonalizationPage />} path="settings/personalization" />
         <Route element={<AccessManagementPage />} path="settings/access" />
         <Route element={<AboutPage />} path="settings/about" />
-        <Route element={<ArtifactsPage />} path="settings/artifacts" />
+        <Route element={<ArtifactsPage />} path="artifacts" />
+        <Route element={<Navigate replace to="../artifacts" />} path="settings/artifacts" />
       </Route>
       <Route element={<NotFound />} path="*" />
       <Route element={<SessionShareViewPage />} path="/share/:token" />

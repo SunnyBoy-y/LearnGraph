@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -106,6 +106,10 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   const [sortOrder, setSortOrder] = useState<string>("updated_at");
   const [previewCard, setPreviewCard] = useState<ArtifactCard | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ArtifactCard | null>(null);
+  // Progressive reveal: render cards in batches and grow on scroll so a large
+  // card library stays responsive (lazy pagination without server round-trips).
+  const [visibleCount, setVisibleCount] = useState(24);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
 
   const params = useMemo(
     () => ({
@@ -145,6 +149,24 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
       toast.error("该卡片未关联会话");
     }
   };
+
+  // Grow the visible window as the sentinel scrolls into view.
+  useEffect(() => {
+    const total = cards.data?.length ?? 0;
+    if (visibleCount >= total) return;
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisibleCount((count) => Math.min(count + 24, total));
+        }
+      },
+      { rootMargin: "320px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [cards.data?.length, visibleCount]);
 
   return (
     <div className="grid gap-4">
@@ -229,7 +251,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
           </div>
         ) : (
           <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {cards.data?.map((card) => (
+            {cards.data?.slice(0, visibleCount).map((card) => (
               <div
                 className="group flex flex-col rounded-xl border bg-background p-3 transition-colors hover:border-primary/40"
                 key={card.id}
@@ -287,6 +309,14 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                 </div>
               </div>
             ))}
+            {cards.data && visibleCount < cards.data.length ? (
+              <div
+                ref={sentinelRef}
+                className="flex items-center justify-center rounded-xl border border-dashed py-6 text-xs text-muted-foreground"
+              >
+                继续滚动加载更多…
+              </div>
+            ) : null}
           </div>
         )}
       </Surface>

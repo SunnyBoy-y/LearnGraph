@@ -45,6 +45,7 @@ import {
   MoreHorizontal,
   Network,
   PanelLeftClose,
+  Package,
   Pencil,
   Pin,
   Play,
@@ -203,6 +204,7 @@ const primaryNav: NavItem[] = [
     aliases: ["/roadmap"],
   },
   { label: "资料", icon: Files, path: "sources" },
+  { label: "产物", icon: Package, path: "artifacts", aliases: ["/artifacts"] },
 ];
 
 const primaryMoreNav: NavItem[] = [
