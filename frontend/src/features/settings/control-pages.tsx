@@ -1,8 +1,10 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Boxes,
+  Check,
   CircleAlert,
+  Copy,
   FileCog,
   PackageCheck,
   Play,
@@ -10,6 +12,12 @@ import {
   ServerCog,
 } from "lucide-react";
 import { toast } from "sonner";
+
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 import {
   addMembership,
@@ -434,42 +442,149 @@ export function AccessManagementPage() {
             description="可单独下线其他登录设备；当前会话通过退出登录处理。已下线的会话不再显示。"
             title="会话安全"
           />
-          <div className="mt-4 space-y-2">
+          <div className="mt-4 grid gap-3 xl:grid-cols-2">
             {activeSessions.map((session) => (
-              <div
-                className="flex flex-col gap-3 rounded-xl border bg-card/30 p-3 sm:flex-row sm:items-center"
+              <AuthSessionRow
                 key={session.id}
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="font-mono text-xs">{session.id.slice(0, 12)}</p>
-                    <StatePill
-                      status={session.current ? "approved" : "active"}
-                      label={session.current ? "当前会话" : "有效"}
-                    />
-                  </div>
-                  <p className="mt-1 truncate text-xs text-muted-foreground">
-                    {session.user_agent || "未提供 User-Agent"} · 最近活动 {formatDate(session.last_seen_at)}
-                  </p>
-                </div>
-                <Button
-                  disabled={session.current || revokeSession.isPending}
-                  onClick={() => revokeSession.mutate(session.id)}
-                  size="xs"
-                  variant="outline"
-                >
-                  下线
-                </Button>
-              </div>
+                onRevoke={() => revokeSession.mutate(session.id)}
+                revoking={revokeSession.isPending}
+                session={session}
+              />
             ))}
             {!activeSessions.length ? (
-              <p className="py-5 text-sm text-muted-foreground">当前没有有效登录会话。</p>
+              <p className="py-5 text-sm text-muted-foreground xl:col-span-2">
+                当前没有有效登录会话。
+              </p>
             ) : null}
           </div>
         </Surface>
       </div>
 
     </PageFrame>
+  );
+}
+
+function AuthSessionRow({
+  session,
+  onRevoke,
+  revoking,
+}: {
+  session: {
+    id: string;
+    current: boolean;
+    user_agent?: string | null;
+    last_seen_at?: string | null;
+  };
+  onRevoke: () => void;
+  revoking: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  const pressTimer = useRef<number | null>(null);
+  const isTouch =
+    typeof window !== "undefined" && window.matchMedia("(hover: none)").matches;
+
+  const copyText = async () => {
+    const lines = [
+      `会话 ID: ${session.id}`,
+      `设备: ${session.user_agent || "未提供 User-Agent"}`,
+      `最近活动: ${formatDate(session.last_seen_at)}`,
+      session.current ? "当前会话" : "有效会话",
+    ];
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setCopied(true);
+      toast.success("会话信息已复制");
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      toast.error("无法复制会话信息");
+    }
+  };
+
+  const startLongPress = () => {
+    if (!isTouch) return;
+    pressTimer.current = window.setTimeout(() => {
+      void copyText();
+      navigator.vibrate?.(40);
+    }, 500);
+  };
+  const clearLongPress = () => {
+    if (pressTimer.current !== null) {
+      window.clearTimeout(pressTimer.current);
+      pressTimer.current = null;
+    }
+  };
+
+  return (
+    <div
+      className="flex flex-col gap-3 rounded-xl border bg-card/30 p-3 sm:flex-row sm:items-center"
+      onPointerCancel={clearLongPress}
+      onPointerDown={startLongPress}
+      onPointerLeave={clearLongPress}
+      onPointerUp={clearLongPress}
+      onContextMenu={(event) => {
+        if (isTouch) event.preventDefault();
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="max-w-[16rem] cursor-default truncate font-mono text-xs">
+                {session.id}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="font-mono text-[10px]">
+              {session.id}
+            </TooltipContent>
+          </Tooltip>
+          <StatePill
+            status={session.current ? "approved" : "active"}
+            label={session.current ? "当前会话" : "有效"}
+          />
+        </div>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <p className="mt-1 cursor-default truncate text-xs text-muted-foreground">
+              {session.user_agent || "未提供 User-Agent"} · 最近活动{" "}
+              {formatDate(session.last_seen_at)}
+            </p>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-sm">
+            <p className="text-[11px] leading-5">
+              {session.user_agent || "未提供 User-Agent"} · 最近活动{" "}
+              {formatDate(session.last_seen_at)}
+            </p>
+          </TooltipContent>
+        </Tooltip>
+      </div>
+      <div className="flex items-center gap-1">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              aria-label="复制会话信息"
+              className="text-muted-foreground"
+              onClick={() => void copyText()}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>{copied ? "已复制" : "复制信息（触屏长按也可复制）"}</p>
+          </TooltipContent>
+        </Tooltip>
+        <Button
+          disabled={session.current || revoking}
+          onClick={onRevoke}
+          size="xs"
+          variant="outline"
+        >
+          下线
+        </Button>
+      </div>
+    </div>
   );
 }
 
