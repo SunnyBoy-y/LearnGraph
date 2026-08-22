@@ -300,7 +300,8 @@ class DockerRuntimeBackend:
             return None
         try:
             network = client.networks.get(spec.egress_network)
-            if network.labels.get("com.learngraph.managed") != "true" or network.labels.get(
+            network_labels = (network.attrs or {}).get("Labels") or {}
+            if network_labels.get("com.learngraph.managed") != "true" or network_labels.get(
                 "com.learngraph.deployment_id"
             ) != self.deployment_id:
                 raise DockerRuntimeUnavailable(
@@ -356,7 +357,8 @@ class DockerRuntimeBackend:
             client.images.get(spec.runtime_ref)
             try:
                 volume = client.volumes.get(spec.workspace_ref)
-                if volume.labels.get("com.learngraph.managed") != "true":
+                volume_labels = (volume.attrs or {}).get("Labels") or {}
+                if volume_labels.get("com.learngraph.managed") != "true":
                     raise DockerRuntimeUnavailable(
                         f"volume {spec.workspace_ref} exists but is not managed by this deployment"
                     )
@@ -1240,7 +1242,7 @@ class DockerRuntimeBackend:
                 raise DockerWorkspaceQuotaExceeded("workspace byte quota exceeded")
             if usage["files"] + 1 > MAX_WORKSPACE_FILES:
                 raise DockerWorkspaceQuotaExceeded("workspace file count quota exceeded")
-            tar_stream = _tar_single_file(safe.value, data, mode=mode)
+            tar_stream = _tar_file_with_dirs(safe.value, data, mode=mode)
             try:
                 container.put_archive(WORKSPACE_MOUNT, tar_stream)
             except Exception as exc:
@@ -1413,24 +1415,39 @@ class _StreamReader(io.RawIOBase):
         return chunk
 
 
-def _tar_single_file(relative_path: str, data: bytes, *, mode: int) -> io.BytesIO:
-    """Build a strict single-file tar archive with a validated member name.
+def _tar_file_with_dirs(relative_path: str, data: bytes, *, mode: int) -> io.BytesIO:
+    """Build a strict tar archive: the target file plus every parent directory.
 
-    uid/gid are pinned to the runner user (65532) so the Docker daemon's
-    ``put_archive`` extraction chowns the file to the exec user; otherwise the
-    archive lands as root-owned and the hardened runner cannot read it.
+    uid/gid are pinned to the runner user (65532) for every member so the
+    Docker daemon's ``put_archive`` extraction chowns both files and the
+    directories it creates to the exec user. Without explicit DIRECTORY
+    members the daemon creates missing parent dirs as root, and the hardened
+    runner (UID 65532) then gets PermissionError when a script writes a new
+    file inside them (python-pptx / openpyxl / zipfile ...).
     """
-    info = tarfile.TarInfo(name=relative_path)
-    info.size = len(data)
-    info.mode = mode
-    info.uid = 65532
-    info.gid = 65532
-    info.uname = "learngraph"
-    info.gname = "learngraph"
-    info.mtime = int(time.time())
-    info.type = tarfile.REGTYPE
+    parts = [p for p in relative_path.replace("\\", "/").split("/") if p]
     stream = io.BytesIO()
+    now = int(time.time())
     with tarfile.open(fileobj=stream, mode="w") as tar:
+        for depth in range(1, len(parts)):
+            dir_info = tarfile.TarInfo(name="/".join(parts[:depth]))
+            dir_info.type = tarfile.DIRTYPE
+            dir_info.mode = 0o750
+            dir_info.uid = 65532
+            dir_info.gid = 65532
+            dir_info.uname = "learngraph"
+            dir_info.gname = "learngraph"
+            dir_info.mtime = now
+            tar.addfile(dir_info)
+        info = tarfile.TarInfo(name="/".join(parts))
+        info.size = len(data)
+        info.mode = mode
+        info.uid = 65532
+        info.gid = 65532
+        info.uname = "learngraph"
+        info.gname = "learngraph"
+        info.mtime = now
+        info.type = tarfile.REGTYPE
         tar.addfile(info, io.BytesIO(data))
     stream.seek(0)
     return stream
