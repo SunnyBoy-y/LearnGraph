@@ -1456,6 +1456,20 @@ docker compose up -d --build</code></pre>
             <div><code>backend/app/providers/local|remote/</code><span>适配器实现</span></div>
             <div><code>backend/app/domain/models.py</code><span>核心持久化模型</span></div>
             <div><code>backend/app/domain/schemas/</code><span>API 输入输出 Schema</span></div>
+            <div><code>mobile/native/</code><span>手机 APK（原生 Compose + 内嵌网页版，v0.12.0）</span></div>
+            <div><code>mobile/native/…/util/Haptics.kt</code><span>A类触觉：回复/agent/达成 震感 + 提示音</span></div>
+            <div><code>mobile/native/…/util/TtsSynth.kt</code><span>文本朗读（B4 任务结果/耳机）</span></div>
+            <div><code>mobile/native/…/widget/…</code><span>桌面小组件（B3 入口版）</span></div>
+            <div><code>mobile/native/…/notify/ReplyNotifier.kt</code><span>B1 agent摘要/B2 复习提醒 轮询进通知</span></div>
+            <div><code>mobile/native/…/data/ShareInbox.kt</code><span>分享收件箱（Share Target 本地暂存）</span></div>
+            <div><code>mobile/native/…/ShareReceiverActivity.kt</code><span>ACTION_SEND 接收（文本/图片）</span></div>
+            <div><code>mobile/native/…/QrScanActivity.kt</code><span>扫码连接（CameraX + ML Kit）</span></div>
+            <div><code>mobile/native/…/util/PhotoCapture.kt</code><span>拍照即问（系统相机 → data URL 回调）</span></div>
+            <div><code>mobile/native/…/util/ShortcutActions.kt</code><span>长按快捷方式（新对话/记笔记/任务/切换服务器）</span></div>
+            <div><code>mobile/native/…/ui/web/WebAppScreen.kt</code><span>网页版桥（LearnGraphNative）扩展 + 断线横幅/重连</span></div>
+            <div><code>frontend/src/lib/native-bridge.ts</code><span>网页版原生桥类型化封装</span></div>
+            <div><code>frontend/src/features/mobile/</code><span>收件箱三选一 / 快捷动作消费 / 连接二维码</span></div>
+            <div><code>backend/app/api/routers/chat.py</code><span>POST /sessions/{id}/messages/async 后台生成端点</span></div>
           </div>
         </section>
 
