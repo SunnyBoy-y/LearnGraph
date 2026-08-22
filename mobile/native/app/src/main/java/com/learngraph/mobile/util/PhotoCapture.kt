@@ -89,21 +89,23 @@ object PhotoCapture {
     /** 直接启动系统相机 App（需已有 CAMERA 权限） */
     private fun startCameraIntent(context: Context) {
         val l = launcher ?: return
-        val dir = File(context.cacheDir, "photos").apply { mkdirs() }
-        val file = File(dir, "capture_${UUID.randomUUID()}.jpg")
-        val uri = FileProvider.getUriForFile(
-            context,
-            "com.learngraph.mobile.fileprovider",
-            file,
-        )
-        pendingCaptureUri = uri
         try {
+            val dir = File(context.cacheDir, "photos").apply { mkdirs() }
+            val file = File(dir, "capture_${UUID.randomUUID()}.jpg")
+            val uri = FileProvider.getUriForFile(
+                context,
+                "com.learngraph.mobile.fileprovider",
+                file,
+            )
+            pendingCaptureUri = uri
             val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
                 putExtra(MediaStore.EXTRA_OUTPUT, uri)
                 addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             l.launch(intent)
         } catch (_: Exception) {
+            // FileProvider 失败 / 设备无相机应用等：回调失败，避免崩溃
+            pendingCaptureUri = null
             deliverPhoto(context, null)
         }
     }
@@ -168,10 +170,37 @@ object PhotoCapture {
         }
     }
 
+    /**
+     * JPEG 体积上限（字节）：evaluateJavascript 注入超长字符串在部分 WebView
+     * 会静默截断导致 base64 损坏（表现为网页版「图片处理失败」）。控制在
+     * ~1MB 以内（base64 ≈ 1.33MB）留足余量；超限先降质、再缩小，最终必达上限内。
+     */
+    private const val MAX_JPEG_BYTES = 1_000_000
+
     private fun bitmapToJpegDataUrl(bitmap: Bitmap): String {
-        val bytes = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, bytes)
-        val base64 = Base64.encodeToString(bytes.toByteArray(), Base64.NO_WRAP)
+        var bmp = bitmap
+        var quality = 82
+        var bytes = ByteArray(0)
+        while (true) {
+            val out = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            bytes = out.toByteArray()
+            if (bytes.size <= MAX_JPEG_BYTES) break
+            if (quality > 50) {
+                quality -= 20 // 先降质
+                continue
+            }
+            if (bmp.width > 900) {
+                // 再缩小（降质到底仍超限时）
+                val scaled = Bitmap.createScaledBitmap(bmp, bmp.width / 2, bmp.height / 2, true)
+                if (scaled !== bmp) bmp.recycle()
+                bmp = scaled
+                quality = 75
+                continue
+            }
+            break // 已到极限，接受当前大小
+        }
+        val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
         return "data:image/jpeg;base64,$base64"
     }
 }

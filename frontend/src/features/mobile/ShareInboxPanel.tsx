@@ -28,6 +28,7 @@ import { useAuth } from '@/features/auth/auth-context-value'
 import {
   clearInbox,
   clearInboxItem,
+  dataUrlToFile,
   getInboxImageDataUrl,
   getInboxItems,
   type NativeShareInboxItem,
@@ -189,8 +190,7 @@ export function ShareInboxPanel() {
       if (item.kind === 'image') {
         const dataUrl = getInboxImageDataUrl(item.id)
         if (dataUrl) {
-          const blob = await (await fetch(dataUrl)).blob()
-          const file = new File([blob], `share-${Date.now()}.jpg`, { type: 'image/jpeg' })
+          const file = dataUrlToFile(dataUrl, `share-${Date.now()}.jpg`)
           const record = await uploadFile(file)
           fileIds = [record.id]
         }

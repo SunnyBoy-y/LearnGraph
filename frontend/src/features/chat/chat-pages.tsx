@@ -164,6 +164,7 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import {
+  dataUrlToFile,
   isNativeApp,
   takePhoto,
   startReplyVibration,
@@ -8164,10 +8165,7 @@ export function ChatCanvasPage() {
         return;
       }
       try {
-        const blob = await (await fetch(dataUrl)).blob();
-        const file = new File([blob], `photo-${Date.now()}.jpg`, {
-          type: "image/jpeg",
-        });
+        const file = dataUrlToFile(dataUrl, `photo-${Date.now()}.jpg`);
         const record = await uploadFile(file);
         setPendingFiles((current) =>
           current.some((item) => item.id === record.id)

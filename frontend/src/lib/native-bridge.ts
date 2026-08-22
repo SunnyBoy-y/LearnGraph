@@ -112,6 +112,28 @@ export function takePhoto(callback: PhotoCallback): void {
   bridge.takePhoto()
 }
 
+/**
+ * data URL（data:image/jpeg;base64,...）→ File。
+ *
+ * 必须直接解码 base64，不能走 `fetch(dataUrl)`：前端 CSP 的
+ * connect-src 不含 data:，fetch 数据 URL 会被浏览器拦截抛错
+ * （实机表现为「图片处理失败」）。atob 解码绕开 CSP 且更快。
+ */
+export function dataUrlToFile(
+  dataUrl: string,
+  fileName: string,
+  fallbackType = 'image/jpeg',
+): File {
+  const comma = dataUrl.indexOf(',')
+  const meta = comma >= 0 ? dataUrl.slice(5, comma) : ''
+  const mime = meta.split(';')[0] || fallbackType
+  const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return new File([bytes], fileName, { type: mime })
+}
+
 // ------------------------------------------------------------------ //
 // 快捷动作（长按图标 / 通知打开会话）
 // ------------------------------------------------------------------ //
