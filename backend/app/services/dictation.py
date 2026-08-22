@@ -147,7 +147,8 @@ def build_realtime_run_task(
     task_id = uuid4().hex
     parameters: dict[str, Any] = {"format": "pcm", "sample_rate": sample_rate}
     if language and language != "auto":
-        parameters["language"] = language
+        # 与 input_audio 通道一致：DashScope 实时 ASR 只接受 ISO 639-1 语言码。
+        parameters["language"] = language.split("-")[0]
     if hotwords:
         parameters["hotwords"] = hotwords
     message = {

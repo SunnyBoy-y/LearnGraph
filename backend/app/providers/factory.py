@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -161,6 +163,8 @@ from app.services.provider_secrets import (
     decrypt_secret_fields,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _provider_priority_order():
     return (
@@ -188,6 +192,34 @@ def _secret_for_provider(
         algorithm=snapshot.algorithm,
         key_provider=snapshot.key_provider,
         key_version=snapshot.key_version,
+    )
+
+
+def _log_secret_failure(
+    workspace_id: str,
+    provider: ProviderConfig | ProviderRowSnapshot,
+    exc: Exception,
+) -> None:
+    """Log why a provider's secret lookup failed before it is skipped.
+
+    A revoked secret is an expected, operator-driven state, so it is skipped
+    quietly at debug level. Any other failure — ciphertext corruption, key-ring
+    change, decrypt error — is an operational anomaly worth a warning, so a
+    "provider unavailable" result stays debuggable from logs instead of silent.
+    """
+    if isinstance(exc, ProviderSecretRevoked):
+        logger.debug(
+            "Provider %s (workspace %s): secret revoked, skipping",
+            provider.id,
+            workspace_id,
+        )
+        return
+    logger.warning(
+        "Provider %s (workspace %s): secret lookup failed, skipping: %s",
+        provider.id,
+        workspace_id,
+        exc,
+        exc_info=True,
     )
 
 
@@ -415,7 +447,8 @@ def model_provider_for_workspace(
             )
         try:
             api_key = _secret_for_provider(db, workspace_id, provider, settings)
-        except Exception:
+        except Exception as exc:  # intentional log-and-skip
+            _log_secret_failure(workspace_id, provider, exc)
             return UnavailableModelProvider(
                 "The enabled model provider secret cannot be decrypted",
                 provider_id=provider.id,
@@ -765,7 +798,8 @@ def image_provider_for_workspace(
         )
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace_id, provider, exc)
         return unavailable(
             "The enabled image generation provider secret cannot be decrypted"
         )
@@ -868,7 +902,8 @@ def vision_provider_for_workspace(
         )
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace_id, provider, exc)
         return unavailable("The enabled vision provider secret cannot be decrypted")
     if not api_key:
         return unavailable(
@@ -984,7 +1019,8 @@ def _qwen_vision_companion_for_workspace(
         resolved_model_id, effective = selected
         try:
             api_key = _secret_for_provider(db, workspace_id, provider, settings)
-        except Exception:
+        except Exception as exc:  # intentional log-and-skip
+            _log_secret_failure(workspace_id, provider, exc)
             continue
         if not api_key:
             continue
@@ -1125,7 +1161,8 @@ def search_provider_for_workspace(
         return UnavailableSearchProvider(provider.id, "Configured SearchProvider has no base URL")
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace_id, provider, exc)
         return UnavailableSearchProvider(provider.id, "Configured SearchProvider secret cannot be decrypted")
     from app.providers.remote.search import CloudSearchProvider
 
@@ -1186,9 +1223,15 @@ DEFAULT_DASHSCOPE_ASYNC_ASR_MODEL = "paraformer-v2"
 
 def _is_dashscope_provider_row(provider: ProviderConfig) -> bool:
     base_url = (provider.base_url or "").strip()
-    return is_dashscope_api_base_url(base_url) or base_url.casefold().endswith(
-        ".maas.aliyuncs.com"
-    )
+    if is_dashscope_api_base_url(base_url):
+        return True
+    # base_url 常带 /compatible-mode/v1 路径，必须解析 host 后再判断
+    # （*.maas.aliyuncs.com 租户也讲同一套 DashScope 兼容方言）。
+    try:
+        host = (urlsplit(base_url).hostname or "").casefold()
+    except ValueError:
+        return False
+    return host.endswith(".maas.aliyuncs.com")
 
 
 def transcription_provider_for_workspace(
@@ -1279,7 +1322,8 @@ def transcription_provider_for_workspace(
             continue
         try:
             api_key = _secret_for_provider(db, workspace_id, provider, settings)
-        except Exception:
+        except Exception as exc:  # intentional log-and-skip
+            _log_secret_failure(workspace_id, provider, exc)
             continue
         if not api_key:
             continue
@@ -1335,7 +1379,8 @@ def embedding_provider_for_workspace(
         return None
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace_id, provider, exc)
         return None
     is_ollama = is_ollama_provider_type(provider.provider_type) or (
         str((provider.capabilities or {}).get("brand_id") or "").casefold() == "ollama"
@@ -1387,7 +1432,8 @@ def deep_research_provider_for_workspace(
         return UnavailableDeepResearchProvider(provider.id, "Configured research provider has no base URL")
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace_id, provider, exc)
         return UnavailableDeepResearchProvider(provider.id, "Configured research secret cannot be decrypted")
     if not api_key:
         return UnavailableDeepResearchProvider(provider.id, "Configured research provider has no encrypted secret")
@@ -1547,7 +1593,8 @@ def _remote_fetch_provider(
         )
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace_id, provider, exc)
         return UnavailableFetchProvider(
             provider.id,
             f"Configured {provider.provider_type} secret cannot be decrypted",
@@ -1708,7 +1755,8 @@ def _qwen_companion_for_workspace(
         model_id = selected
         try:
             api_key = _secret_for_provider(db, workspace_id, provider, settings)
-        except Exception:
+        except Exception as exc:  # intentional log-and-skip
+            _log_secret_failure(workspace_id, provider, exc)
             continue
         if not api_key:
             continue
@@ -1757,7 +1805,8 @@ def _rest_image_search_provider_for_workspace(
         if spec.requires_secret:
             try:
                 api_key = _secret_for_provider(db, workspace_id, provider, settings)
-            except Exception:
+            except Exception as exc:  # intentional log-and-skip
+                _log_secret_failure(workspace_id, provider, exc)
                 continue
             if not api_key:
                 continue
@@ -1840,7 +1889,8 @@ def memory_provider_for_workspace(
         )
     try:
         api_key = _secret_for_provider(db, workspace.id, provider, settings)
-    except Exception:
+    except Exception as exc:  # intentional log-and-skip
+        _log_secret_failure(workspace.id, provider, exc)
         return UnavailableMemoryProvider(
             provider.id,
             "The enabled Mem0 Platform secret cannot be decrypted",
@@ -1852,7 +1902,14 @@ def memory_provider_for_workspace(
         )
     try:
         identity_key = secret_store_from_settings(settings).identity_key(create=True)
-    except SecretStoreUnavailable:
+    except SecretStoreUnavailable as exc:
+        logger.warning(
+            "Provider %s (workspace %s): Mem0 identity key unavailable: %s",
+            provider.id,
+            workspace.id,
+            exc,
+            exc_info=True,
+        )
         return UnavailableMemoryProvider(
             provider.id,
             "The Mem0 Platform secret store identity key is unavailable",

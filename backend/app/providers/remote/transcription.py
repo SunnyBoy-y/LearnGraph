@@ -196,7 +196,9 @@ class OpenAICompatibleTranscriptionProvider:
             ],
         }
         if language:
-            payload["asr_options"] = {"language": language}
+            # DashScope 兼容模式只接受 ISO 639-1 语言码（zh/en/ja…），
+            # BCP-47（zh-CN/en-US）会触发 InvalidParameter 400。
+            payload["asr_options"] = {"language": language.split("-")[0]}
         try:
             with httpx.Client(
                 headers={"Authorization": f"Bearer {self.api_key}"},
