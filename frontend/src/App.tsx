@@ -42,6 +42,7 @@ const PersonalizationPage = lazy(() => import('@/features/settings/personalizati
 const AccessManagementPage = lazy(() => import('@/features/settings/control-pages').then((module) => ({ default: module.AccessManagementPage })))
 const AboutPage = lazy(() => import('@/features/settings/about-page').then((module) => ({ default: module.AboutPage })))
 const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
+const SessionShareViewPage = lazy(() => import('@/features/chat/session-share-view').then((module) => ({ default: module.SessionShareViewPage })))
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -154,6 +155,7 @@ function AppRoutes() {
         <Route element={<ArtifactsPage />} path="settings/artifacts" />
       </Route>
       <Route element={<NotFound />} path="*" />
+      <Route element={<SessionShareViewPage />} path="/share/:token" />
     </Routes></Suspense>
   )
 }

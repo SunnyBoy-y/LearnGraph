@@ -398,6 +398,97 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
     )
 
 
+class SessionShare(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Immutable snapshot of a chat session's visible messages for sharing.
+
+    Freezes the selected message range at share time; later edits to the source
+    session never mutate an existing snapshot. The snapshot deliberately stores
+    only display-safe fields (role/content/parts) — no memory projections,
+    provider traces, response continuation state, or identity data.
+    """
+
+    __tablename__ = "session_shares"
+    __table_args__ = (
+        Index(
+            "ix_session_shares_workspace_source",
+            "workspace_id",
+            "source_session_id",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(240), default="")
+    # full | range | answers
+    scope: Mapped[str] = mapped_column(String(16), default="full")
+    from_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    to_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+
+
+class SessionShareMessage(Base, TimestampMixin, WorkspaceScopedMixin):
+    """One frozen, display-safe message inside a session share snapshot."""
+
+    __tablename__ = "session_share_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_share_id",
+            "ordinal",
+            name="uq_session_share_message_ordinal",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_share_id: Mapped[str] = mapped_column(
+        ForeignKey("session_shares.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text, default="")
+    parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    parent_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_message_id: Mapped[str] = mapped_column(String(36), index=True)
+
+
+class SessionShareToken(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Revocable, read-only view token scoped to one session share snapshot.
+
+    The raw token is returned once at creation; only a SHA-256 digest and a
+    display prefix are persisted. Viewing increments ``view_count`` atomically
+    and records the most recent visitor fingerprint (IP + User-Agent) for
+    privacy-aware audit.
+    """
+
+    __tablename__ = "session_share_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_session_share_token_hash"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    session_share_id: Mapped[str] = mapped_column(
+        ForeignKey("session_shares.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(64))
+    token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    token_prefix: Mapped[str] = mapped_column(String(16))
+    label: Mapped[str] = mapped_column(String(120), default="")
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    max_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_viewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_viewer: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+
 class SubAppSession(Base, TimestampMixin, WorkspaceScopedMixin):
     """Workspace-scoped, replay-resistant runtime for one published sub-application."""
 

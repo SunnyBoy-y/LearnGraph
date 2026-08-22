@@ -119,6 +119,7 @@ const KnowledgeGraph = lazy(() =>
 );
 import { NodeExploreChain } from "@/components/graph/node-explore";
 import { SessionFilesList } from "@/features/chat/session-files-list";
+import { SessionShareDialog } from "@/features/chat/session-share-dialog";
 import {
   archiveProject,
   archiveSession,
@@ -513,6 +514,7 @@ function SidebarNav({
   const [ungroupedSessions, setUngroupedSessions] = useState<SidebarSession[]>(
     [],
   );
+  const [shareTarget, setShareTarget] = useState<SidebarSession | null>(null);
   // Subscribe so completion black-dots and activity-based sort re-render live.
   const sessionActivity = useSyncExternalStore(
     subscribeSessionActivity,
@@ -1532,13 +1534,7 @@ function SidebarNav({
   }
 
   async function shareSession(session: SidebarSession) {
-    const url = `${window.location.origin}/w/${workspaceId}/chat/${session.id}`;
-    try {
-      await navigator.clipboard.writeText(url);
-      toast.success("会话链接已复制");
-    } catch {
-      toast.error("无法复制会话链接");
-    }
+    setShareTarget(session);
   }
 
   async function toggleProjectArchive(project: SidebarProject) {
@@ -1826,6 +1822,14 @@ function SidebarNav({
                   ? `永久删除会话「${deleteTarget.session.title}」？`
                   : undefined
         }
+      />
+      <SessionShareDialog
+        onOpenChange={(next) => {
+          if (!next) setShareTarget(null);
+        }}
+        open={Boolean(shareTarget)}
+        sessionId={shareTarget?.id ?? ""}
+        sessionTitle={shareTarget?.title ?? ""}
       />
       <UserMenu collapsed={collapsed} mobile={mobile} />
     </div>

@@ -36,6 +36,7 @@ from app.api.routers import (
     usage,
     workflow,
     sandbox,
+    session_sharing,
 )
 
 
@@ -76,5 +77,6 @@ for router in (
     audit_settings.router,
     workflow.router,
     sandbox.router,
+    session_sharing.router,
 ):
     api_router.include_router(router)
