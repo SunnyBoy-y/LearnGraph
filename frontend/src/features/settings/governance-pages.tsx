@@ -131,6 +131,10 @@ import {
 import { Switch } from "@/components/ui/switch";
 import {
   areChatSuggestedPromptsEnabled,
+  CHAT_ASR_HOTWORDS_SETTING_KEY,
+  CHAT_ASR_LANGUAGE_SETTING_KEY,
+  CHAT_ASR_VAD_ADAPTIVE_SETTING_KEY,
+  CHAT_ASR_VAD_MODE_SETTING_KEY,
   CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
   CHAT_CONTEXT_USAGE_SETTING_KEY,
   CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY,
@@ -139,12 +143,17 @@ import {
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
   CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY,
+  isAsrVadAdaptive,
   isChatContextUsageEnabled,
   isChatDictationCleanupEnabled,
+  readAsrHotwords,
+  readAsrLanguage,
+  readAsrVadMode,
   readChatDefaultResponseMode,
   readChatFeatureModelSetting,
   readChatThinkingChainDefault,
 } from "@/lib/workspace-settings";
+import type { AsrHotword } from "@/lib/workspace-settings";
 import type { ResponseMode } from "@/lib/session-composer-prefs";
 import { downloadViaNative, saveBlobViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { cn } from "@/lib/utils";
@@ -2305,6 +2314,54 @@ export function WorkspaceSettingsPage() {
       toast.success("语音转写整理设置已更新");
     },
   });
+  const saveAsrLanguage = useMutation({
+    mutationFn: (language: string) =>
+      updateSetting(CHAT_ASR_LANGUAGE_SETTING_KEY, language),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("语音识别语言已更新");
+    },
+  });
+  const saveAsrVadMode = useMutation({
+    mutationFn: (mode: string) =>
+      updateSetting(CHAT_ASR_VAD_MODE_SETTING_KEY, mode),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("VAD 分工模式已更新");
+    },
+  });
+  const saveAsrVadAdaptive = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateSetting(CHAT_ASR_VAD_ADAPTIVE_SETTING_KEY, enabled),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("自适应底噪基线设置已更新");
+    },
+  });
+  const saveAsrHotwords = useMutation({
+    mutationFn: (hotwords: AsrHotword[]) =>
+      updateSetting(CHAT_ASR_HOTWORDS_SETTING_KEY, hotwords),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+        ...(current ?? []).filter((item) => item.key !== setting.key),
+        setting,
+      ]);
+      toast.success("ASR 热词表已更新");
+    },
+  });
   const saveContextUsage = useMutation({
     mutationFn: (enabled: boolean) =>
       updateSetting(CHAT_CONTEXT_USAGE_SETTING_KEY, { enabled }),
@@ -2565,6 +2622,11 @@ export function WorkspaceSettingsPage() {
     [settings.data],
   );
   const dictationCleanupEnabled = isChatDictationCleanupEnabled(settings.data);
+  const asrLanguage = readAsrLanguage(settings.data);
+  const asrVadMode = readAsrVadMode(settings.data);
+  const asrVadAdaptive = isAsrVadAdaptive(settings.data);
+  const asrHotwords = readAsrHotwords(settings.data);
+  const [hotwordDraft, setHotwordDraft] = useState("");
   const contextUsageEnabled = isChatContextUsageEnabled(settings.data);
   const defaultResponseMode = readChatDefaultResponseMode(settings.data);
   const thinkingChainDefaultOpen = readChatThinkingChainDefault(settings.data);
@@ -2797,6 +2859,121 @@ export function WorkspaceSettingsPage() {
               disabled={saveDictationCleanup.isPending}
               onCheckedChange={(enabled) => saveDictationCleanup.mutate(enabled)}
             />
+          </div>
+          <div className="rounded-xl border p-4">
+            <div className="flex items-center gap-3">
+              <Mic className="size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">语音输入（ASR）</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  麦克风听写的语言选择、热词表与本机/云端 VAD 分工
+                </p>
+              </div>
+            </div>
+            <div className="mt-3 grid gap-3 pl-8">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-sm">识别语言</p>
+                  <p className="text-xs text-muted-foreground">
+                    显式选择语言提升单语识别率；自动模式支持中英混说
+                  </p>
+                </div>
+                <Select
+                  value={asrLanguage}
+                  onValueChange={(value) => saveAsrLanguage.mutate(value)}
+                >
+                  <SelectTrigger className="w-36" aria-label="ASR 识别语言">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">自动（混说）</SelectItem>
+                    <SelectItem value="zh-CN">中文</SelectItem>
+                    <SelectItem value="en-US">英文</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-sm">本机/云端 VAD 分工</p>
+                  <p className="text-xs text-muted-foreground">
+                    本机优先让实时模型也走分段上传省计费；云端仅调试用
+                  </p>
+                </div>
+                <Select
+                  value={asrVadMode}
+                  onValueChange={(value) => saveAsrVadMode.mutate(value)}
+                >
+                  <SelectTrigger className="w-36" aria-label="VAD 分工模式">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">自动</SelectItem>
+                    <SelectItem value="local_only">本机优先</SelectItem>
+                    <SelectItem value="cloud_only">云端</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-sm">自适应底噪基线</p>
+                  <p className="text-xs text-muted-foreground">
+                    学习环境底噪动态调整切段阈值，减少噪声被切成段
+                  </p>
+                </div>
+                <Switch
+                  aria-label="自适应底噪基线"
+                  checked={asrVadAdaptive}
+                  disabled={saveAsrVadAdaptive.isPending}
+                  onCheckedChange={(enabled) => saveAsrVadAdaptive.mutate(enabled)}
+                />
+              </div>
+              <div className="grid gap-1">
+                <p className="text-sm">热词表</p>
+                <p className="text-xs text-muted-foreground">
+                  术语/人名/代码标识符；paraformer-realtime-v2 原生支持，其他模型可能忽略
+                </p>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {asrHotwords.map((hotword, index) => (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full border bg-muted px-2 py-0.5 text-xs"
+                      key={`${hotword.text}-${index}`}
+                    >
+                      {hotword.text}
+                      <button
+                        aria-label={`删除热词 ${hotword.text}`}
+                        className="text-muted-foreground hover:text-destructive"
+                        onClick={() =>
+                          saveAsrHotwords.mutate(
+                            asrHotwords.filter((item) => item.text !== hotword.text),
+                          )
+                        }
+                        type="button"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  <input
+                    aria-label="新增 ASR 热词"
+                    className="h-7 w-44 rounded-md border bg-transparent px-2 text-xs outline-none focus:border-primary"
+                    onChange={(event) => setHotwordDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter") return;
+                      const text = hotwordDraft.trim();
+                      if (!text) return;
+                      if (asrHotwords.some((item) => item.text === text)) {
+                        setHotwordDraft("");
+                        return;
+                      }
+                      saveAsrHotwords.mutate([...asrHotwords, { text }]);
+                      setHotwordDraft("");
+                    }}
+                    placeholder="输入热词后回车"
+                    value={hotwordDraft}
+                  />
+                </div>
+              </div>
+            </div>
           </div>
           <div className="flex items-center justify-between gap-4 rounded-xl border p-4">
             <div className="flex min-w-0 items-center gap-3">

@@ -288,8 +288,12 @@ import {
 } from "@/lib/model-choices";
 import {
   areChatSuggestedPromptsEnabled,
+  isAsrVadAdaptive,
   isChatContextUsageEnabled,
   isChatDictationCleanupEnabled,
+  readAsrHotwords,
+  readAsrLanguage,
+  readAsrVadMode,
   readChatDefaultResponseMode,
   readChatFeatureModelSetting,
   readChatThinkingChainDefault,
@@ -4396,6 +4400,18 @@ export function ChatCanvasPage() {
       ),
     [settings.data],
   );
+  const asrLanguage = readAsrLanguage(settings.data);
+  const asrHotwords = readAsrHotwords(settings.data);
+  const asrVadMode = readAsrVadMode(settings.data);
+  const asrVadAdaptive = isAsrVadAdaptive(settings.data);
+  const asrLanguageLabel =
+    asrLanguage === "auto"
+      ? "语音 · 自动"
+      : asrLanguage === "zh-CN"
+        ? "语音 · 中文"
+        : asrLanguage === "en-US"
+          ? "语音 · 英文"
+          : `语音 · ${asrLanguage}`;
   const canPrepareSuggestedPrompts = Boolean(
     !goalMode &&
       settings.isSuccess &&
@@ -7116,6 +7132,8 @@ export function ChatCanvasPage() {
         handleFatal("尚未配置文件/分段转写模型");
         return;
       }
+      const asrLanguageValue =
+        asrLanguage && asrLanguage !== "auto" ? asrLanguage : undefined;
       const transcribeSegment = async (segment: Blob) => {
         if (!storedAudioTranscriptionProvider)
           throw new Error("尚未配置文件/分段转写模型");
@@ -7126,16 +7144,21 @@ export function ChatCanvasPage() {
               storedAudioTranscriptionProvider,
               "stored",
             ),
+            language: asrLanguageValue,
           })
         ).text;
       };
       startDictationOrchestrator({
-        realtime: asrRealtimeConfigured
-          ? {
-              providerId: realtimeAudioTranscriptionProvider!.id,
-              modelId: realtimeAudioTranscriptionModel,
-            }
-          : undefined,
+        realtime:
+          asrRealtimeConfigured && asrVadMode !== "local_only"
+            ? {
+                providerId: realtimeAudioTranscriptionProvider!.id,
+                modelId: realtimeAudioTranscriptionModel,
+                language: asrLanguageValue,
+                hotwords: asrHotwords.map((item) => item.text),
+              }
+            : undefined,
+        adaptiveVad: asrVadAdaptive,
         transcribeSegment,
         onPartial: (text) => {
           if (dictationCleanupSessionRef.current !== session) return;
@@ -7289,7 +7312,11 @@ export function ChatCanvasPage() {
   }, [
     activeModelProvider?.id,
     asrAvailable,
+    asrHotwords,
+    asrLanguage,
     asrRealtimeConfigured,
+    asrVadAdaptive,
+    asrVadMode,
     composerText,
     dictationCleanupModel,
     dictationEngine,
@@ -8898,6 +8925,14 @@ export function ChatCanvasPage() {
               {pendingFiles.length ? `参考图 ${pendingFiles.length}` : "添加参考图"}
             </Button>
           </div>
+        ) : null}
+        {isListening ? (
+          <span
+            className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
+            title="当前语音识别语言（设置页可修改）"
+          >
+            {asrLanguageLabel}
+          </span>
         ) : null}
         {dictationFinalizing ? (
           <button

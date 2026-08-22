@@ -6,6 +6,13 @@ const VAD_POLL_MS = 100;
 // 时域 RMS 高于该值视为有人声。配合浏览器的降噪(noiseSuppression)使用,
 // 普通环境噪声低于该阈值。
 const VAD_RMS_THRESHOLD = 0.012;
+// 自适应 VAD:以环境底噪为基线,动态阈值 = 基线 × 倍率(不低于固定下限),
+// 段起始底噪采样 + 噪声帧指数滑动平均跟随,避免空调/风扇等环境噪声被切成段。
+const VAD_ADAPTIVE_BASELINE_MS = 300;
+const VAD_ADAPTIVE_MULTIPLIER = 2.5;
+const VAD_BASELINE_EMA_ALPHA = 0.05;
+const VAD_BASELINE_MIN = 0.001;
+const VAD_BASELINE_MAX = 0.05;
 // 有声后静音持续该时长即在停顿处切段。
 const SEGMENT_SILENCE_MS = 700;
 // 段最短时长,避免把一次口误切成过碎的计费请求。
@@ -32,6 +39,8 @@ export type ProviderDictationOptions = {
   onPendingChange?: (pending: number) => void;
   /** 不可恢复的失败(连续转写失败、麦克风被拔出等),调用方负责收尾。 */
   onFatal: (message: string) => void;
+  /** 本机 VAD 自适应基线开关(默认开启)。 */
+  adaptiveVad?: boolean;
 };
 
 function pickRecorderMimeType(): string {
@@ -85,6 +94,8 @@ export async function startProviderDictation(
   let stopped = false;
   let aborted = false;
   let consecutiveFailures = 0;
+  // 自适应 VAD 底噪基线:初始为固定阈值的对应底噪,跨段保留(学习整会话环境)。
+  let noiseBaseline = VAD_RMS_THRESHOLD / VAD_ADAPTIVE_MULTIPLIER;
   let pending = 0;
   let uploadQueue: Promise<void> = Promise.resolve();
   let vadTimer: number | null = null;
@@ -189,11 +200,32 @@ export async function startProviderDictation(
     }
     const rms = Math.sqrt(sum / samples.length);
     const now = performance.now();
-    if (rms >= VAD_RMS_THRESHOLD) {
+    const elapsed = now - segmentStartedAt;
+
+    // 自适应基线:段起始底噪窗口内无条件采样,之后仅噪声帧(rms 低于当前
+    // 动态阈值)按 EMA 缓慢跟随,避免人声帧污染基线;阈值上下限钳制。
+    const adaptiveVad = options.adaptiveVad !== false;
+    if (adaptiveVad) {
+      const thresholdNow = Math.max(
+        VAD_RMS_THRESHOLD,
+        noiseBaseline * VAD_ADAPTIVE_MULTIPLIER,
+      );
+      if (elapsed < VAD_ADAPTIVE_BASELINE_MS || rms < thresholdNow) {
+        noiseBaseline += (rms - noiseBaseline) * VAD_BASELINE_EMA_ALPHA;
+        noiseBaseline = Math.min(
+          VAD_BASELINE_MAX,
+          Math.max(VAD_BASELINE_MIN, noiseBaseline),
+        );
+      }
+    }
+    const threshold = adaptiveVad
+      ? Math.max(VAD_RMS_THRESHOLD, noiseBaseline * VAD_ADAPTIVE_MULTIPLIER)
+      : VAD_RMS_THRESHOLD;
+
+    if (rms >= threshold) {
       voicedMs += VAD_POLL_MS;
       lastVoiceAt = now;
     }
-    const elapsed = now - segmentStartedAt;
     const pausedAfterSpeech =
       voicedMs >= SEGMENT_MIN_VOICED_MS &&
       lastVoiceAt > 0 &&
