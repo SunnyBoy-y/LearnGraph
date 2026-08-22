@@ -26,6 +26,7 @@ CHANNEL_A_TYPES = frozenset(
         "image_frame",
         "goal_draft_editor",
         "question_batch",
+        "stepper",
     }
 )
 MAX_MAGIC_CARD_PREVIEW_CHARS = 100_000
@@ -250,6 +251,17 @@ def _normalize_props(component_type: str, props: dict[str, Any]) -> dict[str, An
                 **props,
                 "alt": props.get("title") if isinstance(props.get("title"), str) else "image",
             }
+    if component_type == "stepper":
+        if not isinstance(props.get("steps"), list) or not props["steps"]:
+            props = {**props, "steps": []}
+        if "controls" not in props:
+            props = {**props, "controls": "manual"}
+        if "interval_ms" not in props:
+            props = {**props, "interval_ms": 1_000}
+        if not isinstance(props.get("slot_labels"), list):
+            props = {**props, "slot_labels": []}
+        if not isinstance(props.get("slots"), list):
+            props = {**props, "slots": []}
     return props
 
 

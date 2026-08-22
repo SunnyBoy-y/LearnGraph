@@ -59,6 +59,7 @@ BUILTIN_COMPONENT_IDS = frozenset(
         "image_frame",
         "goal_draft_editor",
         "question_batch",
+        "stepper",
     }
 )
 MAX_SCHEMA_BYTES = 64 * 1024
@@ -569,7 +570,88 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
         "options": {"type": "array", "maxItems": 100, "items": option},
         **answer_key_props,
     }
+    stepper_slot = {
+        "oneOf": [
+            {"type": "string", "maxLength": 120},
+            {"type": "number"},
+            {"type": "null"},
+        ],
+    }
+    stepper_step = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["caption"],
+        "properties": {
+            "caption": {"type": "string", "maxLength": 500},
+            "highlight": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "integer", "minimum": 0},
+            },
+            "slot_values": {
+                "type": "array",
+                "maxItems": 64,
+                "items": stepper_slot,
+            },
+            "annotations": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "string", "maxLength": 120},
+            },
+            "note": {"type": "string", "maxLength": 500},
+            "pointers": {
+                "type": "object",
+                "additionalProperties": False,
+                "maxProperties": 8,
+                "properties": {
+                    "label": {"type": "string", "maxLength": 20},
+                    "index": {"type": "integer", "minimum": 0},
+                },
+            },
+        },
+    }
     return {
+        "stepper": {
+            "display_name": "Stepper 教学步进视图",
+            "data_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "steps"],
+                "properties": {
+                    "title": {"type": "string", "maxLength": 500},
+                    "description": {"type": "string", "maxLength": 2_000},
+                    "controls": {"type": "string", "enum": ["manual", "auto"]},
+                    "interval_ms": {"type": "integer", "minimum": 300, "maximum": 60_000},
+                    "slot_labels": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {"type": "string", "maxLength": 20},
+                    },
+                    "slots": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": stepper_slot,
+                    },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 120,
+                        "items": stepper_step,
+                    },
+                },
+            },
+            "example_data": {
+                "title": "线性探测：插入 51",
+                "description": "逐步展示 H(51)=51%13 的冲突探测过程",
+                "controls": "auto",
+                "slot_labels": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"],
+                "steps": [
+                    {"caption": "H(51)=51%13=12，12 已被 25 占用", "highlight": [12], "slot_values": [25, 38, None, None, None, None, None, None, None, None, None, None, None]},
+                    {"caption": "线性探测到 0，返回", "highlight": [0], "annotations": ["冲突"]},
+                    {"caption": "到 1，空位，存入", "highlight": [1], "slot_values": [25, 11, None, None, None, None, None, None, None, None, None, None, None]},
+                ],
+            },
+        },
         "weather_card": {
             "display_name": "Weather Card",
             "data_schema": {

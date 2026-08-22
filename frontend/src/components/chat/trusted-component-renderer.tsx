@@ -29,6 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { DateScheduleCalendar } from "@/components/chat/date-schedule-calendar";
+import { StepperCard, type StepperProps } from "@/components/chat/stepper-renderer";
 
 const optionSchema = z.object({
   id: z.string().min(1).max(160),
@@ -142,6 +143,30 @@ const metricComponentSchema = z.object({
   allowed_events: z.array(z.string()).max(10).default([]),
 });
 
+const stepperSlotSchema = z.union([z.string().max(120), z.number()]).nullable();
+const stepperStepSchema = z.object({
+  caption: z.string().min(1).max(500),
+  highlight: z.array(z.number().int().nonnegative()).max(64).optional(),
+  slot_values: z.array(stepperSlotSchema).max(64).optional(),
+  annotations: z.array(z.string().max(120)).max(64).optional(),
+  note: z.string().max(500).optional(),
+});
+const stepperComponentSchema = z.object({
+  component_type: z.literal("stepper"),
+  component_id: z.string().min(1).max(160).optional(),
+  schema_version: z.string().min(1).max(32),
+  props: z.object({
+    title: z.string().min(1).max(500),
+    description: z.string().max(2_000).nullish(),
+    controls: z.enum(["manual", "auto"]).optional().default("manual"),
+    interval_ms: z.number().int().min(300).max(60_000).optional().default(1_000),
+    slot_labels: z.array(z.string().max(20)).max(64).optional(),
+    slots: z.array(stepperSlotSchema).max(64).optional(),
+    steps: z.array(stepperStepSchema).min(1).max(120),
+  }),
+  allowed_events: z.array(z.string()).max(10).default([]),
+});
+
 const graphNodeSchema = z.object({
   id: z.string().min(1).max(160),
   ref: z.string().min(1).max(160),
@@ -248,6 +273,7 @@ const trustedComponentSchema = z.union([
   graphProposalSchema,
   goalDraftEditorSchema,
   questionBatchSchema,
+  stepperComponentSchema,
 ]);
 
 export type TrustedComponentAction = {
@@ -567,6 +593,10 @@ export function TrustedComponentRenderer({
         ) : null}
       </section>
     );
+  }
+
+  if (component.component_type === "stepper") {
+    return <StepperCard {...(component.props as StepperProps)} />;
   }
 
   if (component.component_type === "question_batch") {
