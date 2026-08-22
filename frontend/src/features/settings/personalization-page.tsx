@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Palette, RotateCcw, Sparkles, Trash2 } from "lucide-react";
+import { Activity, Palette, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { listSettings, updateSetting } from "@/api";
 import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { isTrajectoryEnabled, TRAJECTORY_ENABLED_SETTING_KEY } from "@/lib/workspace-settings";
 import {
   ErrorState,
   LoadingState,
@@ -24,6 +25,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import type { WorkspaceSetting } from "@/types/settings";
 import {
   BASE_STYLE_OPTIONS,
@@ -89,6 +91,23 @@ export function PersonalizationPage() {
   ) {
     setDraft((current) => ({ ...current, [key]: value }));
   }
+
+  const trajectoryEnabled = isTrajectoryEnabled(settings.data);
+  const trajectorySave = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateSetting(TRAJECTORY_ENABLED_SETTING_KEY, enabled),
+    onError: (error: Error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(
+        workspaceQueryKey(workspaceId, "settings"),
+        (current) => [
+          ...(current ?? []).filter((item) => item.key !== setting.key),
+          setting,
+        ],
+      );
+      toast.success("轨迹追踪设置已更新");
+    },
+  });
 
   if (settings.isPending) {
     return (
@@ -181,6 +200,26 @@ export function PersonalizationPage() {
               只改变“如何表达”，不改变“能做什么”。代码、JSON、邮件等成品优先遵循任务体裁。
             </p>
           </div>
+        </div>
+      </Surface>
+
+      <Surface className="mt-5 p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <Activity className="mt-0.5 size-5 shrink-0 text-primary" />
+            <div className="min-w-0 text-sm leading-6 text-muted-foreground">
+              <p className="font-medium text-foreground">轨迹追踪</p>
+              <p className="mt-1">
+                开启后，对话页右侧栏会显示“轨迹”标签页，可查看每条回复的耗时、
+                Token 用量、推理与工具调用概览。
+              </p>
+            </div>
+          </div>
+          <Switch
+            checked={trajectoryEnabled}
+            disabled={trajectorySave.isPending}
+            onCheckedChange={(checked) => trajectorySave.mutate(checked)}
+          />
         </div>
       </Surface>
 
