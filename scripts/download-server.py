@@ -15,6 +15,7 @@ import argparse
 import datetime
 import html
 import os
+import re
 import socketserver
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler
@@ -24,6 +25,7 @@ DEFAULT_PORT = 18002
 
 class ApkDownloadHandler(SimpleHTTPRequestHandler):
     apk_dir: str = ""
+    protocol_version = "HTTP/1.1"  # Python 3.14 默认 1.0 且无 Range，这里显式开 1.1
 
     # ------------------------------------------------------------------ #
     # 路由
@@ -42,10 +44,52 @@ class ApkDownloadHandler(SimpleHTTPRequestHandler):
         if not full.startswith(os.path.normpath(self.apk_dir)) or not os.path.isfile(full):
             self.send_error(404, "Not Found")
             return
-        # 交给 SimpleHTTPRequestHandler 的标准文件服务（支持 Range）
-        self.directory = self.apk_dir
-        self.path = "/" + name
-        super().do_GET()
+        self._serve_apk(full)
+
+    # ------------------------------------------------------------------ #
+    # APK 直链：自定义 Range 支持（Python 3.14 移除了 SimpleHTTPRequestHandler 的 Range）
+    # ------------------------------------------------------------------ #
+
+    def _serve_apk(self, full: str) -> None:
+        size = os.path.getsize(full)
+        start, end = 0, size - 1
+        range_header = self.headers.get("Range")
+        if range_header:
+            match = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+            if match:
+                raw_start, raw_end = match.groups()
+                if raw_start:
+                    start = int(raw_start)
+                    if raw_end:
+                        end = min(int(raw_end), size - 1)
+                elif raw_end:  # suffix range: bytes=-N
+                    start = max(size - int(raw_end), 0)
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+
+        partial = start > 0 or end < size - 1
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "application/vnd.android.package-archive")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        try:
+            with open(full, "rb") as fh:
+                fh.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = fh.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 客户端中断下载：静默
 
     # ------------------------------------------------------------------ #
     # 首页：APK 列表
@@ -53,7 +97,7 @@ class ApkDownloadHandler(SimpleHTTPRequestHandler):
 
     def _serve_index(self) -> None:
         entries: list[tuple[str, int, float]] = []
-        for fname in sorted(os.listdir(self.apk_dir), reverse=True):
+        for fname in os.listdir(self.apk_dir):
             if not fname.endswith(".apk"):
                 continue
             full = os.path.join(self.apk_dir, fname)
@@ -62,6 +106,8 @@ class ApkDownloadHandler(SimpleHTTPRequestHandler):
             except OSError:
                 continue
             entries.append((fname, stat.st_size, stat.st_mtime))
+        # 按修改时间倒序：新的版本排最前
+        entries.sort(key=lambda e: e[2], reverse=True)
 
         rows = "\n".join(self._row(fname, size, mtime) for fname, size, mtime in entries)
         body = f"""<!doctype html>
