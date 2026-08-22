@@ -344,20 +344,35 @@ def web_fetch_egress_envelope(
         return None
     from app.services.sandbox_network_policy import (
         EgressPolicyInvalid,
-        derive_egress_policy_for_fetch,
-        store_workspace_fetch_policy_file,
+        load_workspace_fetch_policy_file,
+        refresh_workspace_fetch_policy_file,
     )
 
     try:
-        policy = derive_egress_policy_for_fetch(
-            workspace_id=workspace_id,
-            allowed_domains=allowed_domains,
+        refresh_workspace_fetch_policy_file(
+            settings.sandbox_egress_policy_dir,
+            workspace_id,
+            allowed_domains,
             allow_all_public=allow_all,
         )
     except EgressPolicyInvalid:
         logger.exception("Web fetch egress policy could not be derived; fetch stays offline")
         return None
-    store_workspace_fetch_policy_file(settings.sandbox_egress_policy_dir, policy)
+    # The digest must come from the on-disk policy that the egress proxy
+    # actually loads: the idempotent refresh skips the write when the file is
+    # still valid and unchanged, so re-deriving here could yield a *different*
+    # digest (issued_at/expires_at rotate) and hand the runner a digest the
+    # proxy has not registered. Read the persisted policy instead.
+    policy = load_workspace_fetch_policy_file(
+        settings.sandbox_egress_policy_dir, workspace_id
+    )
+    if policy is None:
+        logger.error(
+            "Web fetch egress policy is missing or invalid after refresh; "
+            "fetch stays offline for workspace %s",
+            workspace_id,
+        )
+        return None
     return {
         "policy_digest": policy.digest,
         "network": settings.sandbox_egress_network,

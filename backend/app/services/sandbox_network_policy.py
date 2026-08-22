@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 HOSTNAME_MAX_LENGTH = 253
@@ -37,9 +39,17 @@ DEFAULT_PORT = 443
 # source of truth, and fetch egress is derived from it into a *separate* policy
 # file with its own provenance. This keeps the generic per-workspace reviewed
 # policy (and therefore generic Agent egress) untouched by fetch approvals.
+# The default TTL is the maximum (1 day) on purpose: the policy digest is the
+# SHA-256 of the document, so rewriting the file on expiry rotates the digest
+# and every warm pooled runner container (which carries the digest it was
+# created with) would fail CONNECT until it is evicted and recreated. A long
+# TTL keeps the digest stable across the warm-pool lifetime, and
+# ``refresh_workspace_fetch_policy_file`` still re-derives on every fetch so a
+# shorter effective rotation only happens when the allowlist itself changes
+# (which also evicts/rebuilds pool entries) or after a full day of inactivity.
 WEB_FETCH_POLICY_ISSUER = "web_fetch_policy"
 WEB_FETCH_POLICY_APPROVAL_ID = "web_fetch_policy"
-WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS = 600
+WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS = 86400
 WEB_FETCH_POLICY_MAX_TTL_SECONDS = 86400
 WEB_FETCH_POLICY_FILE_SUFFIX = ".web_fetch.json"
 
@@ -170,6 +180,29 @@ def normalize_hostname(host: str) -> str:
     return candidate
 
 
+def _is_fake_ip_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether ``address`` falls inside a configured fake-IP range.
+
+    Fake-IP is the synthetic address space a local TUN proxy (Clash-style,
+    fake-ip mode) answers DNS with; the egress proxy must treat those
+    addresses as public so sandbox CONNECTs keep working on such machines.
+    Opt-in via ``ssrf_fake_ip_ranges``; empty keeps the strict classifier.
+    """
+    raw = get_settings().ssrf_fake_ip_ranges
+    if not raw:
+        return False
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            if address in ipaddress.ip_network(candidate, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def classify_ip_address(value: str) -> str:
     """Return a coarse classification: 'public' or a forbidden category name."""
     try:
@@ -179,6 +212,8 @@ def classify_ip_address(value: str) -> str:
     normalized = str(address)
     if normalized in KNOWN_METADATA_ADDRESSES:
         return "metadata"
+    if _is_fake_ip_address(address):
+        return "public"
     for category, networks in FORBIDDEN_FAMILIES:
         if any(address in network for network in networks):
             return category
@@ -488,6 +523,49 @@ def store_workspace_fetch_policy_file(policy_dir: str | Path, policy: EgressPoli
     finally:
         temporary.unlink(missing_ok=True)
     return policy_path
+
+
+def refresh_workspace_fetch_policy_file(
+    policy_dir: str | Path,
+    workspace_id: str,
+    allowed_domains: Iterable[str],
+    *,
+    allow_all_public: bool = False,
+    ttl_seconds: int = WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    """Idempotently refresh the derived fetch egress policy file.
+
+    Returns ``True`` when the file was (re)written, ``False`` when the on-disk
+    policy is still valid and semantically identical. The warm container pool
+    reuses fetch containers without re-deriving the envelope, so without a
+    refresh here the short-lived policy (default 600s TTL) would silently
+    expire and the egress proxy would deny every CONNECT for the workspace
+    until the next container creation — this is the fix for that gap: refresh
+    on every fetch, but skip the disk write when the existing policy is
+    unexpired and unchanged.
+    """
+    policy = derive_egress_policy_for_fetch(
+        workspace_id=workspace_id,
+        allowed_domains=allowed_domains,
+        ttl_seconds=ttl_seconds,
+        allow_all_public=allow_all_public,
+        now=now,
+    )
+    policy_path = Path(policy_dir) / f"{workspace_id}{WEB_FETCH_POLICY_FILE_SUFFIX}"
+    try:
+        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+        existing = validate_egress_policy(raw, now=now)  # raises when expired/invalid
+    except (OSError, ValueError, EgressPolicyInvalid):
+        existing = None
+    if (
+        existing is not None
+        and existing.allow_all_public == policy.allow_all_public
+        and set(existing.hosts) == set(policy.hosts)
+    ):
+        return False
+    store_workspace_fetch_policy_file(policy_dir, policy)
+    return True
 
 
 def store_workspace_policy_file(policy_dir: str | Path, policy: EgressPolicy) -> Path:

@@ -123,6 +123,41 @@ class SandboxFetchProvider:
     # --- FetchProviderPort ----------------------------------------------------
 
     def fetch(self, url: str) -> FetchedDocument:
+        # Keep the derived web-fetch egress policy fresh before every fetch.
+        # The warm container pool reuses containers without re-deriving the
+        # envelope, so without this the short-lived policy file would expire
+        # and the egress proxy would deny every CONNECT for the workspace.
+        # The refresh is idempotent: it skips the disk write when the on-disk
+        # policy is still valid and unchanged.
+        from app.services.sandbox_network_policy import (
+            EgressPolicyInvalid,
+            refresh_workspace_fetch_policy_file,
+        )
+
+        try:
+            refresh_workspace_fetch_policy_file(
+                self.settings.sandbox_egress_policy_dir,
+                self.workspace_id,
+                self.allowed_domains,
+                allow_all_public=self.allow_all,
+            )
+        except EgressPolicyInvalid:
+            # A policy that cannot be derived means fetch egress stays offline;
+            # the container creation path reports the same state precisely.
+            raise FetchProviderError(
+                "Sandbox web fetch egress policy could not be derived"
+            ) from None
+        except OSError:
+            # Transient concurrent-write conflict (e.g. Windows os.replace while
+            # another thread reads the same policy file). Best-effort refresh:
+            # if the on-disk policy is still valid it stays authoritative, and
+            # an expired file is rewritten by the next fetch or the container
+            # creation path. Never fail the fetch over a refresh race.
+            logger.warning(
+                "Web fetch egress policy refresh hit a transient file conflict; "
+                "continuing with the existing policy",
+                exc_info=True,
+            )
         target = url.strip()
         if not _host_allowed(target, self.allowed_domains, allow_all=self.allow_all):
             raise UnsafeFetchURL(
