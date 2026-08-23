@@ -278,11 +278,17 @@ h1, h2, h3, p { margin-top: 0; }
   .workspace-shell { grid-template-columns: 232px minmax(520px,1fr) 280px; }
   .workspace-shell--collapsed { grid-template-columns: 50px minmax(520px,1fr) 280px; }
 }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .auth-page { padding: 16px; }
   .auth-modal { padding: 26px 22px; border-radius: 16px; max-height: calc(100dvh - 32px); }
   .auth-brand { margin-bottom: 26px; }
 }
+
+  html.is-native-app .auth-page{ padding: 16px; }
+  html.is-native-app .auth-modal{ padding: 26px 22px; border-radius: 16px; max-height: calc(100dvh - 32px); }
+  html.is-native-app .auth-brand{ margin-bottom: 26px; }
+
+
 
 @media (max-width: 420px) {
   .auth-page { padding: 12px; }
@@ -781,7 +787,7 @@ h1, h2, h3, p { margin-top: 0; }
 .roadmap-rules__assumptions ul { margin: 0; padding-left: 16px; color: #696f6b; }
 .roadmap-rules__capacity { margin: 12px 0 0; color: #955c0a; font-size: 11px; }
 
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .roadmap-history-notice, .roadmap-board-header { align-items: flex-start; flex-direction: column; }
   .roadmap-gaps, .roadmap-blocked > ul > li, .roadmap-rules__assumptions { grid-template-columns: 1fr; }
   .roadmap-days { grid-auto-columns: minmax(270px, 86vw); }
@@ -789,6 +795,15 @@ h1, h2, h3, p { margin-top: 0; }
   .roadmap-rules dl > div:nth-child(2) { border-right: 0; }
   .roadmap-rules dl > div:nth-child(-n+2) { border-bottom: 1px solid #e5e7e4; }
 }
+
+  html.is-native-app .roadmap-history-notice, html.is-native-app .roadmap-board-header{ align-items: flex-start; flex-direction: column; }
+  html.is-native-app .roadmap-gaps, html.is-native-app .roadmap-blocked > ul > li, html.is-native-app .roadmap-rules__assumptions{ grid-template-columns: 1fr; }
+  html.is-native-app .roadmap-days{ grid-auto-columns: minmax(270px, 86vw); }
+  html.is-native-app .roadmap-rules dl{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  html.is-native-app .roadmap-rules dl > div:nth-child(2){ border-right: 0; }
+  html.is-native-app .roadmap-rules dl > div:nth-child(-n+2){ border-bottom: 1px solid #e5e7e4; }
+
+
 .split-grid, .practice-grid, .usage-grid, .versions-grid, .question-page { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .trend-line { height: 100px; display: flex; align-items: end; justify-content: space-around; border-bottom: 1px solid #dfe1dd; }
 .trend-line span { width: 9px; height: 9px; border-radius: 50%; background: var(--lg-green); transform: translateY(calc(-1 * var(--i, 0px))); }
@@ -874,7 +889,7 @@ h1, h2, h3, p { margin-top: 0; }
   .entry-visual { min-height: 520px; }
 }
 
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   body { overflow: auto; }
   .entry-page { padding: 12px; }
   .entry-shell { padding: 24px; gap: 20px; border-radius: 22px; }
@@ -891,11 +906,28 @@ h1, h2, h3, p { margin-top: 0; }
   .roadmap-board>section{min-height:auto}.goal-field-grid{grid-template-columns:1fr}.goal-field-grid .span-2{grid-column:1}.question-actions{align-items:stretch;flex-direction:column}.question-actions .capability-notice{width:100%}.review-action-bar{align-items:stretch;flex-direction:column;bottom:-114px}.upload-zone{grid-template-columns:1fr;text-align:center;justify-items:center}.search-bar{grid-template-columns:auto 1fr}.search-bar button{grid-row:2}.quiz-options{grid-template-columns:1fr}.part-grid{grid-template-columns:1fr}.dev-parts-page{padding:18px}.memory-columns{grid-template-columns:1fr}.strategy-matrix{grid-template-columns:1fr}.runtime-pills button{display:flex}
 }
 
+  html.is-native-app body{ overflow: auto; }
+  html.is-native-app .entry-page{ padding: 12px; }
+  html.is-native-app .entry-shell{ padding: 24px; gap: 20px; border-radius: 22px; }
+  html.is-native-app .entry-brand p{ font-size: 14px; }html.is-native-app .login-form{margin:45px 0 20px}html.is-native-app .login-actions{grid-template-columns:1fr}html.is-native-app .entry-visual{min-height:420px}html.is-native-app .entry-visual__footer{flex-wrap:wrap}
+  html.is-native-app .workspace-shell, html.is-native-app .workspace-shell--collapsed, html.is-native-app .workspace-shell--no-inspector{ height: 100dvh; grid-template-columns: 1fr; padding: 0; gap: 0; }
+  html.is-native-app .desktop-sidebar{ display: none; }
+  html.is-native-app .workspace-main{ border: 0; border-radius: 0; grid-template-rows: 48px 64px 1fr; }
+  html.is-native-app .mobile-topbar{ display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid #e5e6e3; }
+  html.is-native-app .workspace-header{ grid-row: 2; padding: 0 12px; }html.is-native-app .page-icon{display:none}html.is-native-app .workspace-header h1{font-size:17px}html.is-native-app .runtime-pills>span{display:none}html.is-native-app .workspace-header .runtime-pills{margin-left:auto}
+  html.is-native-app .page-stage{ padding: 12px 12px 126px; }
+  html.is-native-app .global-composer{ left: 9px; right: 9px; bottom: 8px; }
+  html.is-native-app .metric-strip{ grid-template-columns: 1fr 1fr; }html.is-native-app .dashboard-grid, html.is-native-app .split-grid, html.is-native-app .practice-grid, html.is-native-app .usage-grid, html.is-native-app .versions-grid, html.is-native-app .question-page, html.is-native-app .research-grid, html.is-native-app .joint-result-grid, html.is-native-app .migration-grid, html.is-native-app .settings-grid, html.is-native-app .memory-editor{grid-template-columns:1fr}html.is-native-app .metric{padding:12px}html.is-native-app .metric strong{font-size:20px}
+  html.is-native-app .roadmap-board, html.is-native-app .provider-setting-grid, html.is-native-app .extension-grid, html.is-native-app .capability-matrix{ grid-template-columns: 1fr; }
+  html.is-native-app .roadmap-board>section{min-height:auto}html.is-native-app .goal-field-grid{grid-template-columns:1fr}html.is-native-app .goal-field-grid .span-2{grid-column:1}html.is-native-app .question-actions{align-items:stretch;flex-direction:column}html.is-native-app .question-actions .capability-notice{width:100%}html.is-native-app .review-action-bar{align-items:stretch;flex-direction:column;bottom:-114px}html.is-native-app .upload-zone{grid-template-columns:1fr;text-align:center;justify-items:center}html.is-native-app .search-bar{grid-template-columns:auto 1fr}html.is-native-app .search-bar button{grid-row:2}html.is-native-app .quiz-options{grid-template-columns:1fr}html.is-native-app .part-grid{grid-template-columns:1fr}html.is-native-app .dev-parts-page{padding:18px}html.is-native-app .memory-columns{grid-template-columns:1fr}html.is-native-app .strategy-matrix{grid-template-columns:1fr}html.is-native-app .runtime-pills button{display:flex}
+
+
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
 
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .workspace-shell, .workspace-shell--collapsed { display: block; height: auto; min-height: 100dvh; padding: 0; }
   .workspace-sidebar, .context-rail { display: none; }
   .workspace-main { display: block; min-height: 100dvh; border: 0; border-radius: 0; box-shadow: none; overflow-y: auto !important; }
@@ -904,6 +936,16 @@ h1, h2, h3, p { margin-top: 0; }
   .graph-workbench-copy__status { grid-template-columns: 1fr; }
   .graph-workbench-copy__status > div + div { padding-left: 0; border-left: 0; border-top: 1px solid #e5e5e5; }
 }
+
+  html.is-native-app .workspace-shell, html.is-native-app .workspace-shell--collapsed{ display: block; height: auto; min-height: 100dvh; padding: 0; }
+  html.is-native-app .workspace-sidebar, html.is-native-app .context-rail{ display: none; }
+  html.is-native-app .workspace-main{ display: block; min-height: 100dvh; border: 0; border-radius: 0; box-shadow: none; overflow-y: auto !important; }
+  html.is-native-app .graph-workbench-copy{ width: 100%; margin-top: 24px; padding-inline: 16px; }
+  html.is-native-app .graph-workbench-copy h2{ font-size: 25px; }
+  html.is-native-app .graph-workbench-copy__status{ grid-template-columns: 1fr; }
+  html.is-native-app .graph-workbench-copy__status > div + div{ padding-left: 0; border-left: 0; border-top: 1px solid #e5e5e5; }
+
+
 
 .growth-graph { position: relative; min-height: 0; height: 100%; overflow: hidden; border-top: 1px solid #e8e8e8; background-image: radial-gradient(#e5e5e5 .7px, transparent .7px); background-size: 18px 18px; }
 .growth-graph__links { position: absolute; inset: 0; width: 100%; height: 100%; }
@@ -2582,10 +2624,15 @@ body.is-resizing .workspace-resizer {
 .topic-preview-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 12px 0; border-top: 1px solid #eceeeb; }
 .goal-graph-review-tools { display: flex; align-items: center; gap: 8px; }
 .goal-flow-graph-review.topic-preview-panel .goal-flow-node-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .goal-flow-graph-review.topic-preview-panel .goal-flow-node-grid { grid-template-columns: 1fr; }
   .goal-quiz .option-group__choices { grid-template-columns: 1fr; }
 }
+
+  html.is-native-app .goal-flow-graph-review.topic-preview-panel .goal-flow-node-grid{ grid-template-columns: 1fr; }
+  html.is-native-app .goal-quiz .option-group__choices{ grid-template-columns: 1fr; }
+
+
 
 .message-part-empty { margin: 8px 0; border-left: 2px solid #b8b8b8; padding: 7px 10px; color: #777; font-size: 12px; line-height: 1.55; }
 .message-acknowledgement { display: flex; align-items: flex-start; gap: 8px; margin: 7px 0; background: #f5f5f5; padding: 8px 10px; color: #6c6c6c; font-size: 12px; line-height: 1.6; }
@@ -2896,7 +2943,7 @@ body.is-resizing .workspace-resizer {
   .workspace-shell { grid-template-columns: var(--sidebar-width, 64px) minmax(0, 1fr) !important; }
   .workspace-resizer, .context-rail { display: none !important; }
 }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .workspace-shell { display: block !important; min-height: 100dvh; height: auto; }
   .workspace-sidebar { display: none !important; }
   .workspace-main { min-height: 100dvh; overflow-y: auto; }
@@ -2911,6 +2958,22 @@ body.is-resizing .workspace-resizer {
   .goal-questionnaire__navigator p { grid-column: 1 / -1; grid-row: 2; text-align: left; }
   .candidate-knowledge-grid { grid-template-columns: 1fr; }
 }
+
+  html.is-native-app .workspace-shell{ display: block !important; min-height: 100dvh; height: auto; }
+  html.is-native-app .workspace-sidebar{ display: none !important; }
+  html.is-native-app .workspace-main{ min-height: 100dvh; overflow-y: auto; }
+  html.is-native-app .goal-clarify-canvas{ height: calc(100svh - 4rem); min-height: 560px; }
+  html.is-native-app .goal-clarify-canvas__meta{ align-items: flex-start; flex-direction: column; gap: 4px; padding: 10px 18px; }
+  html.is-native-app .goal-clarify-canvas__meta p{ display: none; }
+  html.is-native-app .goal-clarify-canvas__conversation{ padding-inline: 18px !important; }
+  html.is-native-app .goal-clarify-canvas__composer{ padding-inline: 12px; }
+  html.is-native-app .goal-clarify-canvas__user{ max-width: 90%; }
+  html.is-native-app .goal-draft-grid{ grid-template-columns: 1fr; }
+  html.is-native-app .goal-questionnaire__navigator{ grid-template-columns: auto 1fr; }
+  html.is-native-app .goal-questionnaire__navigator p{ grid-column: 1 / -1; grid-row: 2; text-align: left; }
+  html.is-native-app .candidate-knowledge-grid{ grid-template-columns: 1fr; }
+
+
 
 /* Graph library and canvas flow */
 .graph-library-page { max-width: none !important; min-height: calc(100dvh - 64px); padding-bottom: 40px !important; }
@@ -4039,16 +4102,22 @@ html[data-color-mode='mono'] .topbar-model-status {
   .roadmap-day > header { position: static; }
 }
 
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .document-pdf-surface { padding: 14px; }
   .document-word-preview .docx-wrapper { padding: 14px !important; }
   .document-excel-pagination { align-items: flex-start; flex-direction: column; }
 }
 
+  html.is-native-app .document-pdf-surface{ padding: 14px; }
+  html.is-native-app .document-word-preview .docx-wrapper{ padding: 14px !important; }
+  html.is-native-app .document-excel-pagination{ align-items: flex-start; flex-direction: column; }
+
+
+
 /* -------------------------------------------------------------------------- */
 /* Phone-width chat canvas — keep the composer usable on narrow screens.      */
 /* -------------------------------------------------------------------------- */
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   /* The mode/model label (智能体 · Provider / model-id) otherwise squeezes the
      textarea down to a couple of characters. */
   .chat-composer__mode { max-width: min(38vw, 190px); }
@@ -4061,6 +4130,20 @@ html[data-color-mode='mono'] .topbar-model-status {
   }
   .chat-composer-dock { padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)) !important; }
 }
+
+  /* The mode/model label (智能体 · Provider / model-id) otherwise squeezes the
+     textarea down to a couple of characters. */
+  html.is-native-app .chat-composer__mode{ max-width: min(38vw, 190px); }
+  html.is-native-app .chat-composer__mode span{ display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  html.is-native-app .chat-composer__textarea::placeholder{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Right-edge fade signals that the capability/context rows scroll sideways. */
+  html.is-native-app .chat-workbench-toolbar, html.is-native-app .chat-context-bar{
+    mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent);
+    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent);
+  }
+  html.is-native-app .chat-composer-dock{ padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)) !important; }
+
+
 @media (max-width: 640px) {
   .chat-composer__mode { max-width: 33vw; }
   .chat-composer__start { padding-left: 3px !important; }
@@ -4701,7 +4784,7 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 }
 .topbar-model-trigger { max-width: 46vw; gap: 3px; border-radius: 999px !important; font-size: 11px; font-weight: 650; }
 .topbar-model-trigger > span:first-child { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   /* Inline sections (thinking + model list) make the menu tall — cap it and
      keep it inside the viewport. */
   .chat-model-menu { width: min(320px, calc(100vw - 24px)); max-height: min(68dvh, 540px); overflow-y: auto; overscroll-behavior: contain; }
@@ -4714,6 +4797,20 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     overscroll-behavior-y: auto;
   }
 }
+
+  /* Inline sections (thinking + model list) make the menu tall — cap it and
+     keep it inside the viewport. */
+  html.is-native-app .chat-model-menu{ width: min(320px, calc(100vw - 24px)); max-height: min(68dvh, 540px); overflow-y: auto; overscroll-behavior: contain; }
+  /* Phones scroll the document (workspace-main grows with content), but the
+     base `overflow-y: auto; overscroll-behavior-y: contain` still marks main
+     as a scroll container, so wheel/touch scrolling dies inside it instead of
+     chaining up to the page. Chat/goal keep their own inner scroll. */
+  html.is-native-app .workspace-main:not(.workspace-main--chat):not(.workspace-main--goal){
+    overflow-y: visible !important;
+    overscroll-behavior-y: auto;
+  }
+
+
 .topbar-graph-toggle { display: none !important; }
 .topbar-rail-toggle { display: inline-flex; }
 .graph-drawer-backdrop, .graph-drawer-close { display: none; }
@@ -5403,12 +5500,12 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
 
 /* ===========================================================================
    APK 内嵌窄屏优化（v0.7.0）
-   适用：APK WebView 手机窄屏（360–430dp）。桌面不受影响（规则以
-   max-width: 780px 限定，或为全局增强且对桌面同样友好）。
+   适用：APK WebView 手机窄/宽屏（360–1024px）。桌面不受影响（规则以
+   max-width: 1024px 限定，或为全局增强且对桌面同样友好）。
    =========================================================================== */
 
 /* 1) 左上 / 右上角按钮：圆润白色背景包裹底色（胶囊白底 + 轻阴影） */
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .workspace-topbar__left button,
   .workspace-topbar__actions button {
     width: 34px;
@@ -5437,8 +5534,32 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   }
 }
 
+  html.is-native-app .workspace-topbar__left button, html.is-native-app .workspace-topbar__actions button{
+    width: 34px;
+    height: 34px;
+    flex: none;
+    border-radius: 999px !important;
+    background: rgba(255, 255, 255, 0.94) !important;
+    box-shadow:
+      0 1px 3px rgba(15, 20, 35, 0.1),
+      0 0 0 1px rgba(15, 20, 35, 0.05) !important;
+    color: #333 !important;
+  }
+  html.is-native-app .workspace-topbar__left button:hover, html.is-native-app .workspace-topbar__actions button:hover, html.is-native-app .workspace-topbar__left button:focus-visible, html.is-native-app .workspace-topbar__actions button:focus-visible{
+    background: #ffffff !important;
+    box-shadow:
+      0 2px 6px rgba(15, 20, 35, 0.14),
+      0 0 0 1px rgba(15, 20, 35, 0.07) !important;
+  }
+  html.is-native-app .dark .workspace-topbar__left button, html.is-native-app .dark .workspace-topbar__actions button{
+    background: rgba(255, 255, 255, 0.92) !important;
+    color: #222 !important;
+  }
+
+
+
 /* 2) 底部画布突出：输入条更圆润、阴影更强，窄屏下更醒目 */
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .chat-composer [data-slot='input-group'] {
     border-radius: 20px !important;
     box-shadow:
@@ -5460,6 +5581,28 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   }
 }
 
+  html.is-native-app .chat-composer [data-slot='input-group']{
+    border-radius: 20px !important;
+    box-shadow:
+      0 1px 0 color-mix(in srgb, #fff 70%, transparent) inset,
+      0 10px 32px rgba(15, 20, 35, 0.16),
+      0 0 0 1px rgba(15, 20, 35, 0.05) !important;
+  }
+  html.is-native-app .chat-composer [data-slot='input-group']:focus-within{
+    box-shadow:
+      0 1px 0 color-mix(in srgb, #fff 80%, transparent) inset,
+      0 14px 38px rgba(15, 20, 35, 0.2),
+      0 0 0 1.5px color-mix(in srgb, var(--border) 70%, var(--foreground)) !important;
+  }
+  html.is-native-app .dark .chat-composer [data-slot='input-group']{
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.06) inset,
+      0 10px 32px rgba(0, 0, 0, 0.32),
+      0 0 0 1px rgba(255, 255, 255, 0.1) !important;
+  }
+
+
+
 /* 3) 输入框点击展开动效：聚焦或已有文字 → 变高约一行；
       失焦且内容为空（:placeholder-shown）→ 恢复原状 */
 .chat-composer__textarea {
@@ -5467,15 +5610,21 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     min-height 0.24s cubic-bezier(0.4, 0, 0.2, 1),
     padding 0.24s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .chat-composer__textarea:focus,
   .chat-composer__textarea:not(:placeholder-shown) {
     min-height: 78px !important; /* 52px + 约一行 26px */
   }
 }
 
+  html.is-native-app .chat-composer__textarea:focus, html.is-native-app .chat-composer__textarea:not(:placeholder-shown){
+    min-height: 78px !important; /* 52px + 约一行 26px */
+  }
+
+
+
 /* 4) 文字与两旁的间距缩小到二分之一（48px → 24px，每边 24px → 12px） */
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .chat-message-version-row,
   .chat-composer-dock,
   .chat-follow-up-prompts,
@@ -5484,17 +5633,29 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   }
 }
 
+  html.is-native-app .chat-message-version-row, html.is-native-app .chat-composer-dock, html.is-native-app .chat-follow-up-prompts, html.is-native-app .is-assistant [data-message-content]{
+    width: min(var(--chat-content-width), calc(100% - 24px));
+  }
+
+
+
 /* ===========================================================================
    手机窄屏：消息内消息 ID 中间截断（MiddleEllipsis，长按复制完整 ID）
    =========================================================================== */
 .chat-message-id {
   display: block;
 }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .chat-message-id {
     max-width: min(56vw, 15rem);
   }
 }
+
+  html.is-native-app .chat-message-id{
+    max-width: min(56vw, 15rem);
+  }
+
+
 
 
 /* ===========================================================================
@@ -5545,11 +5706,17 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   outline: 2px solid color-mix(in srgb, var(--primary) 60%, transparent);
   outline-offset: 1px;
 }
-@media (max-width: 780px) {
+@media (max-width: 1024px) {
   .message-stream-stats {
     width: min(var(--chat-content-width), calc(100% - 24px));
   }
 }
+
+  html.is-native-app .message-stream-stats{
+    width: min(var(--chat-content-width), calc(100% - 24px));
+  }
+
+
 
 /* ===========================================================================
    Public session share viewer (read-only snapshot page)

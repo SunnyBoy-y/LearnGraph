@@ -440,13 +440,18 @@ type ConversationJumpItem = {
 type ConversationBranchLink = { id: string; label: string; active: boolean };
 
 /** Matches the phone breakpoint used by the workspace CSS (index.css). */
-const PHONE_LAYOUT_QUERY = "(max-width: 780px)";
+const PHONE_LAYOUT_QUERY = "(max-width: 1024px)";
 
 function usePhoneLayout() {
   const [isPhone, setIsPhone] = useState(
-    () => window.matchMedia(PHONE_LAYOUT_QUERY).matches,
+    () => isNativeApp() || window.matchMedia(PHONE_LAYOUT_QUERY).matches,
   );
   useEffect(() => {
+    // APK 内强制手机布局：不跟随窗口宽度变化
+    if (isNativeApp()) {
+      setIsPhone(true);
+      return;
+    }
     const query = window.matchMedia(PHONE_LAYOUT_QUERY);
     const update = () => setIsPhone(query.matches);
     update();
