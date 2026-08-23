@@ -20,6 +20,7 @@ export * from "./search";
 export * from "./research";
 export * from "./evidence";
 export * from "./mastery";
+export * from "./learning";
 export * from "./exercises";
 export * from "./memory";
 export * from "./memory-events";

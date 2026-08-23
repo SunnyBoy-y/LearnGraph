@@ -56,6 +56,7 @@ import {
   getCapabilityReport,
   getGraph,
   getGoalDeleteImpact,
+  getLearningNodeState,
   getMastery,
   getMasteryAlignment,
   listGoals,
@@ -101,6 +102,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -2477,6 +2479,15 @@ export function JointStudyPage() {
   );
 }
 
+const LEARNING_STATUS_LABEL: Record<string, string> = {
+  unseen: "未评估",
+  weak: "薄弱",
+  mastered: "已掌握",
+  familiar: "熟悉",
+  learning: "学习中",
+  needs_review: "待复习",
+};
+
 export function CapabilityGraphPage() {
   const { workspaceId = "" } = useParams();
   const mastery = useQuery({
@@ -2551,6 +2562,16 @@ export function CapabilityGraphPage() {
     () => mastery.data?.find((node) => node.node_id === selectedId),
     [mastery.data, selectedId],
   );
+  const learningState = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "learning-node-state", selectedId),
+    queryFn: () => getLearningNodeState(selectedId),
+    enabled: Boolean(selectedId),
+    retry: false,
+  });
+  const isLearningStateMissing =
+    learningState.error instanceof ApiError &&
+    learningState.error.status === 404 &&
+    learningState.error.code === "learning_state_not_found";
   if (mastery.isPending)
     return (
       <PageFrame>
@@ -2618,20 +2639,75 @@ export function CapabilityGraphPage() {
             title={selected ? `能力节点 · ${selected.label}` : "能力节点"}
           />
           <div className="mt-4 space-y-4">
-            <div className="rounded-xl bg-muted/40 p-4">
-              <p className="text-xs text-muted-foreground">成长星级</p>
-              <div className="mt-1">
-                <GrowthStars value={selected?.mastery_stars ?? 0} />
+            {selectedId && learningState.isPending ? (
+              <div className="rounded-xl bg-muted/40 p-4 text-xs text-muted-foreground">
+                正在读取学习状态…
               </div>
-            </div>
-            <div>
-              <p className="text-sm font-medium">证据来源</p>
-              <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                {selected
-                  ? `${selected.accepted_evidence_count} 条已接受证据 · ${selected.evidence_state}`
-                  : "选择能力节点后查看证据状态。"}
-              </p>
-            </div>
+            ) : isLearningStateMissing ? (
+              <div className="rounded-xl bg-muted/40 p-4">
+                <p className="text-xs text-muted-foreground">掌握度</p>
+                <div className="mt-1">
+                  <GrowthStars value={selected?.mastery_stars ?? 0} />
+                </div>
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  该节点尚未通过新链路评估，暂无连续掌握分，暂显示成长星级。
+                </p>
+              </div>
+            ) : learningState.data ? (
+              <>
+                <div className="rounded-xl bg-muted/40 p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">掌握度</p>
+                    <Badge variant="secondary">
+                      {LEARNING_STATUS_LABEL[learningState.data.status] ??
+                        learningState.data.status}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 flex items-center gap-3">
+                    <Progress
+                      className="flex-1"
+                      value={Math.round(learningState.data.mastery_score * 100)}
+                    />
+                    <span className="font-mono text-sm text-primary">
+                      {Math.round(learningState.data.mastery_score * 100)}%
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    置信度 {Math.round(learningState.data.confidence * 100)}% ·{" "}
+                    {learningState.data.evidence_count} 条证据
+                  </p>
+                </div>
+                {learningState.data.misconceptions.length > 0 && (
+                  <div>
+                    <p className="text-sm font-medium">误区记录</p>
+                    <ul className="mt-2 space-y-1">
+                      {learningState.data.misconceptions.map((m) => (
+                        <li
+                          key={m.evidence_id}
+                          className="text-xs leading-5 text-muted-foreground"
+                        >
+                          {m.summary}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {learningState.data.next_review_at && (
+                  <p className="text-xs text-muted-foreground">
+                    下次复习：
+                    {new Date(learningState.data.next_review_at).toLocaleDateString()}
+                  </p>
+                )}
+              </>
+            ) : selectedId ? (
+              <div className="rounded-xl bg-muted/40 p-4 text-xs text-muted-foreground">
+                学习状态读取失败，请稍后重试。
+              </div>
+            ) : (
+              <div className="rounded-xl bg-muted/40 p-4 text-xs text-muted-foreground">
+                选择能力节点后查看掌握度。
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-2">
               <Button asChild size="sm" variant="outline">
                 <Link to={`/w/${workspaceId}/evidence/review`}>

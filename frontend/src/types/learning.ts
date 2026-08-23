@@ -183,3 +183,26 @@ export interface AnswerResult {
   evidence_signal_id: string;
   mastery_star_awarded?: boolean;
 }
+
+/**
+ * 事件溯源学习状态（GET /api/v1/learning/nodes/{node_id}/state）。
+ * 后端 LearningStateProjector 由证据投影出连续掌握分（0–1）、置信度与误区清单，
+ * 取代旧版 MasteryNode 的 0–5 星标作为单一事实来源。
+ */
+export interface Misconception {
+  evidence_id: string;
+  summary: string;
+}
+
+export interface LearningNodeStateView {
+  node_id: string;
+  status: string;
+  mastery_score: number;
+  confidence: number;
+  evidence_count: number;
+  misconceptions: Misconception[];
+  last_assessed_at: IsoDateTime | null;
+  next_review_at: IsoDateTime | null;
+  evidence_ids: string[];
+  algorithm_version: string;
+}
