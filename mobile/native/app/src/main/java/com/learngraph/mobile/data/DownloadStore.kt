@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -12,6 +13,7 @@ import android.os.Build
 import android.os.Environment
 import android.webkit.MimeTypeMap
 import android.webkit.URLUtil
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -271,7 +273,13 @@ object DownloadStore {
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             context.startActivity(intent)
             true
-        } catch (_: Exception) {
+        } catch (e: ActivityNotFoundException) {
+            // 该文件类型没有可处理的应用（如 md/svg/ics 等小众类型）
+            Toast.makeText(context, "没有可打开该文件的应用", Toast.LENGTH_SHORT).show()
+            false
+        } catch (e: Exception) {
+            // FileProvider 路径不匹配 / 文件损坏等，给出反馈而不是静默
+            Toast.makeText(context, "无法打开该文件", Toast.LENGTH_SHORT).show()
             false
         }
     }

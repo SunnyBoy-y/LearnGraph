@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- 内置下载器文件（应用专属外部存储） -->
-    <external-files-path name="downloads" path="Downloads/" />
+    <!-- 内置下载器文件（应用专属外部存储）。
+         注意：Environment.DIRECTORY_DOWNLOADS 常量值是单数 "Download"，
+         getExternalFilesDir(DIRECTORY_DOWNLOADS) 实际落在 .../files/Download/，
+         此处 path 必须为单数，否则 FileProvider 匹配不到真实路径，
+         getUriForFile 抛异常导致「打开文件」静默失败。 -->
+    <external-files-path name="downloads" path="Download/" />
     <files-path name="internal_downloads" path="downloads/" />
     <!-- 拍照即问：照片写入 cacheDir/photos/，必须暴露 cache-path 供 FileProvider 生成 content URI -->
     <cache-path name="photos" path="photos/" />
