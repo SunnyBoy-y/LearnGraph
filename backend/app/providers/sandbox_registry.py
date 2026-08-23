@@ -1,4 +1,4 @@
-"""Backend registry for sandbox runtimes (Phase 1 of the sandboxd migration).
+"""Backend registry for sandbox runtimes (sandboxd migration — registry layer).
 
 Every persisted sandbox session records the backend that created it
 (``SandboxSession.backend_id``). The registry is the single place that maps a
@@ -8,11 +8,12 @@ backend id to a ``SandboxBackendPort`` implementation:
 - resuming / stopping / deleting EXISTING sessions MUST use the backend
   recorded on the session — never the current default.
 
-Today only the explicit ``docker`` backend is registered; ``sandboxd`` is
-reserved for the daemon migration (see docs/sandboxd-migration-plan.md) and
-fails closed until it is implemented and registered here. Unknown backend ids
-must never silently fall back to the default backend: that would let a stale
-or tampered session resume/delete resources through the wrong runtime.
+Both backends are registered: the legacy in-process ``docker`` backend (kept
+as a migration shim for sessions created before the sandboxd cutover) and the
+``sandboxd`` control-plane backend (the runtime of record, and the default via
+``settings.sandbox_backend == "sandboxd"``). Unknown backend ids must never
+silently fall back to the default backend: that would let a stale or tampered
+session resume/delete resources through the wrong runtime.
 """
 
 from __future__ import annotations

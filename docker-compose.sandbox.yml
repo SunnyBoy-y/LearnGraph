@@ -7,7 +7,7 @@
 # zero host setup — on Docker Desktop (Windows/macOS) and native Linux alike.
 # Use this override only when you want the hardened shape:
 #
-#   export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # optional host data path
+#   export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # optional host data path (default: named volume; migrate data before switching)
 #   mkdir -p secrets && openssl rand -hex 32 > secrets/sandboxd-token
 #   openssl rand -hex 32 > secrets/sandboxd-admin-token
 #   docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d

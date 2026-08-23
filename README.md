@@ -187,10 +187,26 @@ powershell -ExecutionPolicy Bypass -File scripts/install-docker-env-hook.ps1
 mkdir -p secrets
 openssl rand -hex 32 > secrets/sandboxd-token
 openssl rand -hex 32 > secrets/sandboxd-admin-token   # Bootstrap 管理面（拉取+digest+冒烟）
-export LEARNGRAPH_DATA_DIR=/var/lib/learngraph
+# export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # 可选：数据落宿主机路径（默认命名卷，见下）
 export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
 docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
 ```
+
+**数据存储位置与备份**
+
+默认全部数据落在 Docker 命名卷 `learngraph-data`（Docker 管理，`docker volume ls` 可见；Linux 上物理路径约在 `/var/lib/docker/volumes/learngraph_learngraph-data/_data`），不在项目目录里。备份/升级用一键脚本：
+
+```bash
+./scripts/docker-update.sh --backup-only   # 打包 SQLite + 数据卷 + sandboxd 状态卷，输出到 backups/
+```
+
+如需数据落在宿主机指定目录（NFS / 外部备份 / 迁移服务器），在首次 `up` 前设置（仅 Linux 宿主）：
+
+```bash
+export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # 设为宿主机绝对路径即启用 bind mount
+```
+
+⚠️ 从命名卷切到 bind 目录前务必先迁移数据（数据含 `.master-key` 主密钥，漏迁会导致 provider 密钥无法解密）：`docker compose down`（**不要 `-v`**）→ `docker run --rm -v <旧卷>:/src:ro -v /var/lib/learngraph:/dst alpine sh -c 'tar cf - -C /src . | tar xf - -C /dst'` → 设好变量再 `up`，验证通过后才可删旧卷。任何形态下都不要执行 `docker compose down -v` 或 `docker volume prune`，除非已确认备份。
 
 **访问宿主机本机服务（Ollama / LM Studio / 本地 MCP）**
 

@@ -371,14 +371,16 @@ class Settings(BaseSettings):
     # chain; the tool returns a timeout failure and the chain can continue.
     agent_tool_timeout_seconds: int = 120
     # ── Parallel Agent tool execution ─────────────────────────────────
-    # Default OFF. When enabled, a provider round whose tools are ALL in the
+    # Default ON. When enabled, a provider round whose tools are ALL in the
     # audited parallel-safe allowlist (get_current_time / search_web /
-    # search_images) runs them concurrently on a bounded process-wide pool.
-    # Each parallel tool executes on its own SQLAlchemy Session; every other
-    # tool keeps the legacy serial single-worker path (exact prior behavior).
-    # agent_parallel_tools_max_workers caps the whole process; the per-batch
-    # cap is min(len(calls), max_workers).
-    agent_parallel_tools_enabled: bool = False
+    # search_images / canvas_get_render_contract / lg_goal_read) runs them
+    # concurrently on a bounded process-wide pool. Each parallel tool executes
+    # on its own SQLAlchemy Session; every other tool keeps the legacy serial
+    # single-worker path (exact prior behavior). Set
+    # LEARNGRAPH_AGENT_PARALLEL_TOOLS_ENABLED=false to roll back to fully
+    # serial execution. agent_parallel_tools_max_workers caps the whole
+    # process; the per-batch cap is min(len(calls), max_workers).
+    agent_parallel_tools_enabled: bool = True
     agent_parallel_tools_max_workers: int = 4
     # Hosted 文搜图/图搜图 (Qwen Responses web_search_image / image_search)
     # provider timeout. Image search is slower than plain web search (the

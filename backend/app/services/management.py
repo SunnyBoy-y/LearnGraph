@@ -2227,7 +2227,14 @@ class ProviderService:
             return
         try:
             encrypted = encrypt_provider_secret(self.settings, secret)
-        except (SecretStoreUnavailable, ValueError):
+        except (SecretStoreUnavailable, ValueError) as exc:
+            logger.warning(
+                "Codex credential refresh for provider %s could not be encrypted, "
+                "keeping existing credentials: %s",
+                provider_id,
+                exc,
+                exc_info=True,
+            )
             return
         record.ciphertext = encrypted.ciphertext
         record.algorithm = encrypted.algorithm

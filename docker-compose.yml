@@ -83,6 +83,11 @@ x-app-environment: &app-environment
   LEARNGRAPH_SANDBOX_ENABLED: ${LEARNGRAPH_SANDBOX_ENABLED:-true}
   # Code release default wins when unset (config.py DEFAULT_SANDBOX_PREBUILT_IMAGE).
   LEARNGRAPH_SANDBOX_PREBUILT_IMAGE: ${LEARNGRAPH_SANDBOX_PREBUILT_IMAGE:-}
+  # Parallel Agent tool execution (default ON). Only parallel-safe, side-effect-free
+  # tools (get_current_time/search_web/search_images/canvas_get_render_contract/
+  # lg_goal_read) run concurrently on isolated Sessions; everything else stays serial.
+  LEARNGRAPH_AGENT_PARALLEL_TOOLS_ENABLED: ${LEARNGRAPH_AGENT_PARALLEL_TOOLS_ENABLED:-true}
+  LEARNGRAPH_AGENT_PARALLEL_TOOLS_MAX_WORKERS: ${LEARNGRAPH_AGENT_PARALLEL_TOOLS_MAX_WORKERS:-4}
 
 services:
   app:
@@ -122,7 +127,7 @@ services:
       LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE: ${LEARNGRAPH_SANDBOXD_ADMIN_TOKEN_FILE:-/data/sandboxd/sandboxd-admin-token}
       LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID: ${LEARNGRAPH_SANDBOXD_DEPLOYMENT_ID:-learngraph-compose}
     volumes:
-      - learngraph-data:/data
+      - "${LEARNGRAPH_DATA_DIR:-learngraph-data}:/data"
       - "${LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE:-./data/host-bridge/token}:/run/secrets/host-bridge-token:ro"
       # sandboxd 自举凭据与状态（共享卷，只读；token 由 sandboxd 首启生成）。
       - sandboxd-state:/data/sandboxd:ro
@@ -177,7 +182,7 @@ services:
       <<: *app-environment
       LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE: /run/secrets/host-bridge-token
     volumes:
-      - learngraph-data:/data
+      - "${LEARNGRAPH_DATA_DIR:-learngraph-data}:/data"
       - "${LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE:-./data/host-bridge/token}:/run/secrets/host-bridge-token:ro"
     depends_on:
       app:
@@ -220,7 +225,7 @@ services:
       # CONNECT 时地址重分类同样需要 fake-ip 容忍（与 app 一致的配置来源）。
       LEARNGRAPH_SSRF_FAKE_IP_RANGES: ${LEARNGRAPH_SSRF_FAKE_IP_RANGES:-}
     volumes:
-      - learngraph-data:/data
+      - "${LEARNGRAPH_DATA_DIR:-learngraph-data}:/data"
     networks:
       - default
       - learngraph-egress

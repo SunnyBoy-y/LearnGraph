@@ -1,6 +1,6 @@
 # LearnGraph 沙箱控制面拆分（sandboxd）详细修改方案
 
-> 文档状态：设计方案，尚未实施  
+> 文档状态：已实施（核心 Phase 0–6 落地，`sandboxd` 已成为默认后端；剩余真实 Docker 验收与 drain 后移除 app socket 等收尾项见 [`sandboxd-migration-todo.md`](./sandboxd-migration-todo.md) 的「未完成」段）  
 > 代码审计基线：`397811308a00` 及工作区当前未提交修改  
 > 审计日期：2026-08-14  
 > 配套执行清单：[`sandboxd-migration-todo.md`](./sandboxd-migration-todo.md)

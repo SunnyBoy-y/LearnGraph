@@ -81,19 +81,28 @@ print('sqlite backup ok')
 }
 
 backup_volume() {
-  local volume dest stamp
-  # 卷的实际 docker 名称带 compose 项目前缀（learngraph_learngraph-data）。
-  # 精确匹配项目卷，避免误中无前缀的同名卷（docker run -v 自动创建的匿名/裸卷）。
-  volume="$(docker volume ls --format '{{.Name}}' | grep -E '^learngraph_learngraph-data$' | head -1)"
-  [ -z "$volume" ] && volume="$(docker volume ls --format '{{.Name}}' | grep -E 'learngraph[-_]data' | head -1)"
-  [ -z "$volume" ] && die "找不到数据卷（docker volume ls 中无 learngraph 数据卷）"
+  local volume dest stamp data_dir
   dest="$1"
   stamp="$2"
-  say "数据卷 $volume 打包备份 -> $dest/${stamp}-volume.tar.gz"
-  # MSYS_NO_PATHCONV=1：Git Bash 会把容器内 /backup/... 误转为 Windows 路径
-  MSYS_NO_PATHCONV=1 docker run --rm -v "${volume}:/data:ro" -v "${dest}:/backup" alpine \
-    tar czf "/backup/${stamp}-volume.tar.gz" -C /data . >/dev/null 2>&1 \
-    || die "数据卷备份失败"
+  # bind 挂载形态：LEARNGRAPH_DATA_DIR 设为宿主机路径时，数据直接落在该目录，
+  # 直接 tar 打包（含 .master-key 主密钥）；否则走 Docker 命名卷打包。
+  data_dir="${LEARNGRAPH_DATA_DIR:-}"
+  if [ -n "$data_dir" ]; then
+    say "数据目录(bind) $data_dir 打包备份 -> $dest/${stamp}-volume.tar.gz"
+    MSYS_NO_PATHCONV=1 tar czf "${dest}/${stamp}-volume.tar.gz" -C "$data_dir" . 2>/dev/null \
+      || die "数据目录备份失败（路径: $data_dir）"
+  else
+    # 卷的实际 docker 名称带 compose 项目前缀（learngraph_learngraph-data）。
+    # 精确匹配项目卷，避免误中无前缀的同名卷（docker run -v 自动创建的匿名/裸卷）。
+    volume="$(docker volume ls --format '{{.Name}}' | grep -E '^learngraph_learngraph-data$' | head -1)"
+    [ -z "$volume" ] && volume="$(docker volume ls --format '{{.Name}}' | grep -E 'learngraph[-_]data' | head -1)"
+    [ -z "$volume" ] && die "找不到数据卷（docker volume ls 中无 learngraph 数据卷）"
+    say "数据卷 $volume 打包备份 -> $dest/${stamp}-volume.tar.gz"
+    # MSYS_NO_PATHCONV=1：Git Bash 会把容器内 /backup/... 误转为 Windows 路径
+    MSYS_NO_PATHCONV=1 docker run --rm -v "${volume}:/data:ro" -v "${dest}:/backup" alpine \
+      tar czf "/backup/${stamp}-volume.tar.gz" -C /data . >/dev/null 2>&1 \
+      || die "数据卷备份失败"
+  fi
 
   # sandboxd 状态卷（控制面 state.db）：升级/回滚需要一致快照。
   local sandboxd_volume
@@ -130,8 +139,12 @@ do_check() {
   else
     warn "栈未在运行"
   fi
-  echo "数据卷:"
-  docker volume ls --format '{{.Name}}' | grep -E 'learngraph' || warn "未发现数据卷（尚未 docker compose up？）"
+  if [ -n "${LEARNGRAPH_DATA_DIR:-}" ]; then
+    echo "数据目录(bind): ${LEARNGRAPH_DATA_DIR}"
+  else
+    echo "数据卷:"
+    docker volume ls --format '{{.Name}}' | grep -E 'learngraph' || warn "未发现数据卷（尚未 docker compose up？）"
+  fi
   echo "备份目录: ${BACKUP_DIR}"
   ls -1t "${BACKUP_DIR}" 2>/dev/null | head -5 || true
 }
