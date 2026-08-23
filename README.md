@@ -6,7 +6,8 @@
 
 <p align="center">
   <strong>让人从 AI 学习，高效进入并掌握陌生领域。</strong><br>
-  <span>从一个真实目标出发，获得一张随学习持续生长的知识路线图。</span>
+  <span>从一个真实目标出发，让 <strong>图谱、Agent、Sandbox、Memory 与交互式学习环境</strong> 一起随学习持续生长。</span><br>
+  <span>Web + Android · Self-hosted · Agent-native Learning Workspace</span>
 </p>
 
 <p align="center">
@@ -43,6 +44,7 @@
 | 🌱 | **可生长的知识路线图** | 从一句真实目标出发，生成可审核、可修订的知识图谱；随着学习进展持续调整，用户始终掌握决定权。 |
 | 🤖 | **Agent 级学习智能** | Agent 会主动规划执行：找资料、组织解释、设计练习、调用工具；能力采用**渐进式披露**，效率高，成本可控。 |
 | 🛡 | **Docker 隔离沙箱** | Agent 执行代码、处理文件、构建预览都在 Docker-only 的隔离工作区：**默认断网 + 审批制出网**。 |
+| 📱 | **Android 原生移动端** | Kotlin / Jetpack Compose + GeckoView 客户端，将 LearnGraph 完整工作台带到手机，并打通拍照、分享、扫码、下载、通知、TTS 等原生能力。 |
 | 🧠 | **事件溯源长期记忆** | 记忆不是"摘要 + 向量库"，而是**事件溯源底座 + 分层投影 + 混合检索 + Context Builder 动态装配**：可重放、可溯源、可治理、防注入。 |
 | 🃏 | **Magic Card 可信组件** | AI 生成的不只是文字，还有可交互、有状态、可收集数据的页面组件。 |
 | 🔎 | **人在回路的可信成长** | 每次对话、作答、解释、实践都沉淀为带来源的证据；重要判断（图谱、联网、付费操作）永远由用户审核确认，结论可溯源、可复盘。 |
@@ -54,15 +56,23 @@
 
 <table>
   <tr>
-    <th width="50%">主对话页面</th>
-    <th width="50%">可交互web组件生成</th>
+    <th width="50%">主对话工作台</th>
+    <th width="50%">双向交互子应用</th>
   </tr>
   <tr>
-    <td><img src=".github/assets/chat.jpg" alt="LearnGraph 主对话页面：知识图谱、智能体、主交互页面图"></td>
-    <td><img src=".github/assets/product-artifact-preview.png" alt="LearnGraph 可交互式web组件"></td>
+    <td><img src=".github/assets/chat.jpg" alt="LearnGraph 主对话工作台：知识图谱、智能体、主交互页面"></td>
+    <td><img src=".github/assets/product-artifact-preview.png" alt="LearnGraph 双向交互子应用：用户在子应用中的操作可回流为 Agent 输入"></td>
   </tr>
   <tr>
-    <th>随心练习速览解释</th>
+    <th>Android 移动端</th>
+    <th>学习 / 能力图谱</th>
+  </tr>
+  <tr>
+    <td><img src=".github/assets/product-android-home.png" alt="LearnGraph Android 客户端主界面"></td>
+    <td><img src=".github/assets/product-graph.png" alt="LearnGraph 学习与能力图谱"></td>
+  </tr>
+  <tr>
+    <th>随心练习</th>
     <th>文档学习与溯源问答</th>
   </tr>
   <tr>
@@ -227,6 +237,46 @@ node scripts/host-bridge.mjs
 
 ---
 
+### 📱 Android 客户端
+
+LearnGraph 提供 Android 原生客户端，可以连接自己部署的 LearnGraph 服务。
+
+当前客户端采用：
+
+**Kotlin + Jetpack Compose + GeckoView + WebExtension Bridge**
+
+移动端并不是独立的一套 LearnGraph 后端，而是作为个人 LearnGraph 工作区的移动入口。
+
+支持：
+
+* 📷 拍照并直接交给 Agent
+* 📂 系统文件选择
+* 📥 原生文件下载与管理
+* 📤 Android 分享到 LearnGraph
+* 📱 扫码连接服务
+* 🔐 生物识别
+* 🔔 回复通知
+* 🔊 TTS 朗读
+* 📳 原生震动反馈
+* 📴 网络异常与恢复处理
+
+在局域网使用时，请确保 LearnGraph 服务允许其他设备访问：
+
+```bash
+export LEARNGRAPH_LISTEN_HOST=0.0.0.0
+docker compose up -d
+```
+
+然后在 Android 客户端输入电脑的局域网地址进行连接，例如：
+
+```text
+http://192.168.x.x:18000
+```
+
+> Android 客户端目前仍处于快速迭代阶段。
+
+---
+
 ### 方式二：源码开发模式（`npm run dev`）
 
 适合参与开发或调试源码。需要本机环境：Node.js 20+、npm 10+、Python 3.11+、[uv](https://docs.astral.sh/uv/)（最新稳定版）；Docker 可选（仅沙箱能力需要）。
@@ -294,27 +344,44 @@ LEARNGRAPH_SANDBOX_EGRESS_PROXY_URL=http://host.docker.internal:8888 \
 ## 🏗 技术架构
 
 ```text
-Browser / React 19 + TypeScript + Vite
-├─ React Router · TanStack Query · React Flow
-├─ Streamdown / AI Elements · trusted-renderer · subapp-bridge
-└─ ApiClient: Bearer + X-Workspace-ID + JSON/SSE
+Clients
+├─ Web
+│  └─ React 19 + TypeScript + Vite
+│     ├─ React Router · TanStack Query · React Flow
+│     ├─ Streamdown / AI Elements · trusted-renderer · subapp-bridge
+│     └─ ApiClient: Bearer + X-Workspace-ID + JSON/SSE
+│
+└─ Android
+   └─ Kotlin + Jetpack Compose
+      ├─ GeckoView 139
+      ├─ WebExtension Bridge
+      ├─ Camera / Share / Download / Notification
+      └─ Native ↔ Web capability bridge
+
                          │
                          ▼
-FastAPI /api/v1
+
+LearnGraph API / FastAPI
 ├─ routers: HTTP/SSE 契约、认证、权限与错误边界
 ├─ services
 │  ├─ 学习闭环: Goal · Graph · Chat · Evidence · Mastery · Action
 │  ├─ 记忆:     Event Store · Projection · Retrieval · Context Builder
-│  ├─ 运行时:   Agent · Tools · Skills · MCP · 可信组件 · 子应用事件
+│  ├─ 运行时:   Agent · Tools · Skills · MCP · SubAgent · 可信组件 · 子应用事件
 │  ├─ 沙箱:     Agent Workspace · Egress 审批 · 热容器池 · ASR 桥
 │  └─ 产物:     Artifact Gateway · 分享令牌 · 卡片索引
 ├─ repositories: 工作区作用域的数据访问
 └─ provider ports
    ├─ local:  文件存储
    └─ remote: 模型(Chat/Embedding/ASR/Image) · 搜索 · 抓取 · 研究 · 沙箱
+
                          │
                          ▼
-SQLAlchemy 2 · SQLite(WAL) · local filesystem · Docker(可选)
+
+Sandbox Control Plane
+├─ sandboxd
+├─ Docker isolated runtime
+├─ egress-proxy
+└─ capability / approval / audit
 ```
 
 SQLite(WAL) 是当前 MVP 的规范业务事实源。SSE 负责传输，Session、Message、MessageVersion、MessagePart、流事件和记忆事件仍会持久化（支持断线恢复、重放与审计）。前端统一访问 LearnGraph 后端，由服务端完成认证、工作区授权、Provider 调用和事实写入。
@@ -339,7 +406,9 @@ LearnGraph/
 │     ├─ skills/         沙箱能力 Skill 包（pdf/docx/表格/PPT/媒体/生图/抓取…）
 │     └─ domain/         模型与 Schema（含记忆事件模型）
 ├─ sandboxd/             沙箱控制面守护进程（唯一接触 Docker Engine 的组件）
-├─ mobile/               Capacitor Android 移动客户端
+├─ mobile/
+│  ├─ native/            Android 原生客户端（Kotlin / Jetpack Compose / GeckoView）
+│  └─ android/           早期 Capacitor Android 实现
 ├─ docs/                 可公开部署的开发者 HTML 文档（GitHub Pages）
 ├─ scripts/              跨平台启动、检查与运维脚本
 ├─ Dockerfile            应用镜像（前端生产构建 + FastAPI）
@@ -357,6 +426,7 @@ LearnGraph/
 | --- | --- |
 | **目标与图谱** | Goal 澄清与确认、候选图谱审核、目标图谱、能力图谱与图谱工作台；图谱生成支持极速/思考模式与流式根预览 |
 | **学习对话** | Session、Message/MessagePart、SSE 事件溯源流、断线恢复与重试、消息版本和分支、结构化消息渲染 |
+| **移动端** | Android 原生客户端（Kotlin / Jetpack Compose + GeckoView 139 + WebExtension Bridge）：拍照与系统文件选择、原生文件下载、系统分享收件箱、扫码连接、生物识别、回复通知、TTS 朗读、震动反馈、断线恢复与登录态持久化 |
 | **资料与来源** | 文件上传、解析状态、本地对象存储、文档学习、联网来源与引用（Qwen 原生搜索来源 + 角标）；文搜图/图搜图链接可经可信宿主下载器完成图片净化、来源固化并注入无网沙箱（多图支持 `urls` 并行下载），GitHub 文件/目录/仓库按固定 commit 生成哈希清单后注入 |
 | **证据与行动** | Evidence、Mastery、练习、作答反馈、复习风险和下一步行动相关流程 |
 | **长期记忆** | 事件溯源记忆（加密事件流、分层投影、混合检索、Context Builder 预算装配）、学习状态衰减、文件修订失效、记忆治理 |
@@ -385,7 +455,7 @@ LearnGraph/
 
 - **更多主流模型适配**：持续扩展文本、视觉、推理、图片生成和语音模型，让不同学习任务可以匹配更合适的模型能力。
 - **可更换的 Agent 内核**：在统一的 Goal、Graph、Evidence、Mastery 和 Action 契约之上接入不同 Agent Runtime，支持按场景选择和演进智能体内核。
-- **移动端**：围绕连续学习体验建设移动客户端，让路线、资料、对话、练习与复习跨设备衔接。
+- **移动端持续演进**：Android 客户端已可用，继续打磨跨设备连续学习体验（路线、资料、对话、练习与复习衔接），并扩展更多原生能力与平台。
 - **更丰富的学习工具生态**：继续完善 Skills、MCP、可信组件、文档学习和研究能力，让 Agent 可以组合更多专业工具完成真实学习任务。
 - **更完整的端到端验收**：持续覆盖跨模块浏览器场景、真实远程 Provider、权限边界和完整 Agent 学习闭环。
 
