@@ -22,16 +22,17 @@ export function NativeActions() {
   useEffect(() => {
     if (consumedRef.current || !wid) return
     consumedRef.current = true
-    const action = consumeShortcutAction()
-    if (!action) return
-    if (action === 'new-chat') {
-      navigate(`/w/${wid}/chat/new`)
-    } else if (action === 'note') {
-      navigate(`/w/${wid}/memory`)
-    } else if (action.startsWith('open-session:')) {
-      const sessionId = action.slice('open-session:'.length)
-      if (sessionId) navigate(`/w/${wid}/chat/${sessionId}`)
-    }
+    void consumeShortcutAction().then((action) => {
+      if (!action) return
+      if (action === 'new-chat') {
+        navigate(`/w/${wid}/chat/new`)
+      } else if (action === 'note') {
+        navigate(`/w/${wid}/memory`)
+      } else if (action.startsWith('open-session:')) {
+        const sessionId = action.slice('open-session:'.length)
+        if (sessionId) navigate(`/w/${wid}/chat/${sessionId}`)
+      }
+    })
   }, [navigate, wid])
 
   return null

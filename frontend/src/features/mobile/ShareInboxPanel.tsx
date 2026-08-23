@@ -130,7 +130,7 @@ export function ShareInboxPanel() {
   }, [pos])
 
   const refresh = useCallback(() => {
-    setItems(getInboxItems())
+    void getInboxItems().then(setItems)
   }, [])
 
   useEffect(() => {
@@ -188,7 +188,7 @@ export function ShareInboxPanel() {
       const session = await createSession({ title: item.kind === 'text' ? titleFromText(item.text) : '图片提问' })
       let fileIds: string[] | undefined
       if (item.kind === 'image') {
-        const dataUrl = getInboxImageDataUrl(item.id)
+        const dataUrl = await getInboxImageDataUrl(item.id)
         if (dataUrl) {
           const file = dataUrlToFile(dataUrl, `share-${Date.now()}.jpg`)
           const record = await uploadFile(file)
@@ -386,7 +386,7 @@ export function ShareInboxPanel() {
 function ImageThumb({ item }: { item: NativeShareInboxItem }) {
   const [src, setSrc] = useState<string | null>(null)
   useEffect(() => {
-    setSrc(getInboxImageDataUrl(item.id) || null)
+    void getInboxImageDataUrl(item.id).then((url) => setSrc(url || null))
   }, [item.id])
   return src ? (
     <img

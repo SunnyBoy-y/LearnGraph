@@ -61,11 +61,11 @@ export function isNativeApp(): boolean {
 // 分享收件箱
 // ------------------------------------------------------------------ //
 
-export function getInboxItems(): NativeShareInboxItem[] {
+export async function getInboxItems(): Promise<NativeShareInboxItem[]> {
   const bridge = nativeBridge()
   if (!bridge?.getInboxItems) return []
   try {
-    const raw = bridge.getInboxItems()
+    const raw = await bridge.getInboxItems()
     if (!raw) return []
     const parsed = JSON.parse(raw) as unknown
     return Array.isArray(parsed) ? (parsed as NativeShareInboxItem[]) : []
@@ -83,9 +83,10 @@ export function clearInbox(): void {
 }
 
 /** 收件箱图片 → data URL（大图由原生压缩；超限/缺失返回空串） */
-export function getInboxImageDataUrl(id: string): string {
+export async function getInboxImageDataUrl(id: string): Promise<string> {
   try {
-    return nativeBridge()?.getInboxImageDataUrl?.(id) ?? ''
+    const url = await nativeBridge()?.getInboxImageDataUrl?.(id)
+    return url ?? ''
   } catch {
     return ''
   }
@@ -144,9 +145,13 @@ export type NativeShortcutAction =
   | `open-session:${string}`
 
 /** 读取并消费一次待执行的快捷动作；无则返回 null */
-export function consumeShortcutAction(): NativeShortcutAction | null {
-  const action = nativeBridge()?.consumeShortcutAction?.()
-  return action && action.length > 0 ? (action as NativeShortcutAction) : null
+export async function consumeShortcutAction(): Promise<NativeShortcutAction | null> {
+  try {
+    const action = await nativeBridge()?.consumeShortcutAction?.()
+    return action && action.length > 0 ? (action as NativeShortcutAction) : null
+  } catch {
+    return null
+  }
 }
 
 // ------------------------------------------------------------------ //

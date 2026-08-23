@@ -48,7 +48,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PhotoCapture.init(this)
-        PhotoCapture.setWebView(null)
+        PhotoCapture.setSession(null)
         ShortcutActions.register(this)
         // 从启动 Intent（快捷方式/分享）读取动作
         ShortcutActions.ingestFromIntent(this, intent)
