@@ -16,6 +16,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.database import active_stream_count
 from app.core.database import commit_with_locked_retry
+from app.core.database import run_sqlite_gate_watchdog
 from app.core.database import snapshot_sqlite_metrics
 from app.core.process_lock import acquire_advisory_lock, release_advisory_lock
 from app.domain.models import (
@@ -1037,6 +1038,12 @@ async def wal_checkpoint_scheduler(
             await asyncio.to_thread(run_wal_checkpoint)
         except Exception:
             logger.debug("WAL checkpoint round skipped", exc_info=True)
+        # v2.0: write-gate watchdog — force-release a stranded hold (possible
+        # leak) so the service self-heals instead of wedging every writer.
+        try:
+            await asyncio.to_thread(run_sqlite_gate_watchdog)
+        except Exception:
+            logger.debug("SQLite gate watchdog round skipped", exc_info=True)
         # P4-L2: periodically surface SQLite contention/throughput so lock
         # storms and commit pressure stay observable without an external
         # metrics backend. ~once per minute.
@@ -1048,13 +1055,16 @@ async def wal_checkpoint_scheduler(
                 logger.info(
                     "SQLite metrics: write_gate_contentions=%s gate_wait_ms=%s "
                     "write_ms=%s locked_retries=%s gate_timeouts=%s "
-                    "release_failures=%s wal_bytes=%s",
+                    "release_failures=%s gate_held_seconds=%s "
+                    "gate_watchdog_resets=%s wal_bytes=%s",
                     int(metrics.get("gate_contentions") or 0),
                     int(metrics.get("gate_wait_ms") or 0),
                     int(metrics.get("write_ms") or 0),
                     int(metrics.get("locked_retries") or 0),
                     int(metrics.get("gate_timeouts") or 0),
                     int(metrics.get("release_failures") or 0),
+                    int(metrics.get("gate_held_seconds") or 0),
+                    int(metrics.get("gate_watchdog_resets") or 0),
                     int(metrics.get("wal_bytes") or 0),
                 )
             except Exception:

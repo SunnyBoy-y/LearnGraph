@@ -188,6 +188,12 @@ class Settings(BaseSettings):
     # maintenance writer collides less often with active streams. 0 disables
     # the loop.
     wal_checkpoint_interval_seconds: int = 60
+    # v2.0: watchdog threshold (seconds) for the SQLite write gate. If one
+    # hold outlives this window, the maintenance loop force-releases the gate
+    # (self-heal) and bumps gate_watchdog_resets. Must exceed the longest
+    # legitimate write transaction (WAL TRUNCATE checkpoint, large imports);
+    # 0 disables the watchdog.
+    sqlite_gate_watchdog_threshold_seconds: int = 60
     # P3-S1: while any agent SSE stream is generating, non-urgent scheduler
     # sweeps defer to the next tick so the single SQLite writer serves
     # interactive traffic first. This caps how many consecutive ticks a sweep
@@ -249,7 +255,10 @@ class Settings(BaseSettings):
     # disable quota enforcement (not recommended on shared deployments).
     workspace_storage_quota_bytes: int = 10 * 1024 * 1024 * 1024
     max_backup_bytes: int = 1024 * 1024 * 1024
-    max_document_parse_bytes: int = 50 * 1024 * 1024
+    # Document parsing reads the whole file into memory; this per-file cap for
+    # the text-index pipeline (independent from max_upload_bytes) keeps typical
+    # learning decks and media-heavy PPTX (100-200 MB) indexable.
+    max_document_parse_bytes: int = 200 * 1024 * 1024
     # Trusted host-side acquisition. Remote bytes are verified and persisted
     # before they are linked into a sandbox session; the sandbox stays offline.
     external_download_timeout_seconds: float = 20.0

@@ -114,7 +114,19 @@ if is_sqlite:
 # events cover every session, including the ad-hoc sessionmakers used by
 # stream workers, graph-proposal workers and scheduler sweeps. Non-SQLite
 # engines skip the gate entirely.
-_SQLITE_WRITE_LOCK: threading.RLock = threading.RLock()
+#
+# Gate ownership model (v2.0): the gate is a _CrossThreadRLock, i.e. a
+# reentrant lock whose release() may legally run on a DIFFERENT thread than
+# acquire(). The ownership marker lives on the connection (conn.info /
+# record.info) while connections can be handed across threads (asyncio.to_thread
+# workers, pool checkin from another thread), so a plain threading.RLock would
+# leak permanently the moment a cross-thread commit/rollback/checkin releases
+# it ("release failed (not owned by this thread)" → every later writer times
+# out at 30s → service wedges). The reference-counted implementation below is
+# thread-agnostic: any thread can fully release the gate; reentrancy is kept
+# per-thread; a watchdog can force-reset a stranded hold without breaking
+# stale per-thread state (epoch invalidation).
+_SQLITE_WRITE_LOCK: _CrossThreadRLock | None = None  # instantiated below
 # A write that cannot get the gate within this window means the gate leaked
 # (connection died mid-transaction). Log loudly and proceed ungated — SQLite's
 # own busy_timeout still bounds the write — rather than wedging every writer.
@@ -158,6 +170,9 @@ _sqlite_metrics: dict[str, float] = {
     # (cross-thread Session use). Both must stay ~0 in healthy operation.
     "gate_timeouts": 0.0,
     "release_failures": 0.0,
+    # v2.0: watchdog force-resets of a stranded hold (possible leak). Must stay
+    # ~0; >0 means the watchdog had to break a wedged gate (self-healed).
+    "gate_watchdog_resets": 0.0,
 }
 _METRICS_LOCK = threading.Lock()
 
@@ -176,6 +191,9 @@ def snapshot_sqlite_metrics() -> dict[str, Any]:
     """
     with _METRICS_LOCK:
         out: dict[str, Any] = dict(_sqlite_metrics)
+    # v2.0: live gate state (instantaneous, not a counter).
+    out["gate_held_seconds"] = _SQLITE_WRITE_LOCK.held_seconds()
+    out["gate_owner_tid"] = _SQLITE_WRITE_LOCK.owner_thread_id()
     try:
         if is_sqlite and database_url.database and database_url.database != ":memory:":
             wal_path = Path(str(database_url.database) + "-wal")
@@ -189,6 +207,172 @@ def reset_sqlite_metrics() -> None:
     with _METRICS_LOCK:
         for key in _sqlite_metrics:
             _sqlite_metrics[key] = 0.0
+
+
+# ── v2.0: cross-thread-safe reentrant gate lock ──────────────────────────
+#
+# threading.RLock release() must run on the acquiring thread; a connection
+# holding the write gate can legally be handed to another thread (asyncio
+# to_thread workers, pool checkin/invalidate), where a plain RLock release
+# raises RuntimeError and permanently leaks the gate. This class keeps the
+# RLock interface (acquire/release, per-thread reentrancy, timeout) but the
+# underlying mutex is a plain threading.Lock whose release() any thread may
+# call, protected by a global reference count. A watchdog (epoch-based) can
+# force-reset a stranded hold without corrupting stale per-thread counters.
+class _CrossThreadRLock:
+    __slots__ = (
+        "_state_lock",
+        "_mutex",
+        "_held",
+        "_tls",
+        "_epoch",
+        "_held_since",
+        "_owner_tid",
+    )
+
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._mutex = threading.Lock()  # the actual serialization mutex
+        self._held = 0  # global hold count (protected by _state_lock)
+        self._tls = threading.local()  # per-thread reentrancy count
+        self._epoch = 0  # bumped on watchdog reset; invalidates stale TLS
+        self._held_since: float | None = None  # monotonic ts of first hold
+        self._owner_tid: int | None = None  # thread that first acquired
+
+    def _sync_tls(self) -> bool:
+        # Called with _state_lock held. Returns True when this thread's TLS
+        # was stale (a watchdog force-reset happened since its last acquire)
+        # and has just been re-initialized. A per-thread counter acquired
+        # under an older epoch is stale and must be dropped.
+        if getattr(self._tls, "epoch", None) != self._epoch:
+            self._tls.epoch = self._epoch
+            self._tls.count = 0
+            return True
+        return False
+
+    def _mark_acquired(self) -> None:
+        # Called with _state_lock held.
+        self._tls.count = 1
+        self._held += 1
+        if self._held_since is None:
+            self._held_since = time.monotonic()
+            self._owner_tid = threading.get_ident()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        # Same-thread reentrancy (interface parity with threading.RLock).
+        with self._state_lock:
+            self._sync_tls()
+            if self._tls.count > 0:
+                self._tls.count += 1
+                return True
+            if not blocking:
+                acquired = self._mutex.acquire(blocking=False)
+                if not acquired:
+                    return False
+                self._mark_acquired()
+                return True
+            if self._held > 0:
+                pass  # fall through to the blocking wait below
+            else:
+                # Appears free; try to grab it under the state lock so two
+                # waiters cannot both conclude "free" and race the mutex.
+                if self._mutex.acquire(blocking=False):
+                    self._mark_acquired()
+                    return True
+        # Blocking wait WITHOUT holding _state_lock (a waiting thread must not
+        # block the watchdog or other threads' release bookkeeping).
+        wait = None if timeout is None or timeout < 0 else timeout
+        if not self._mutex.acquire(blocking=True, timeout=wait):
+            return False
+        with self._state_lock:
+            self._sync_tls()
+            self._mark_acquired()
+        return True
+
+    def release(self) -> None:
+        # Thread-agnostic: a connection handed to another thread can fully
+        # release the gate here; a stale holder's later release is a no-op.
+        release_mutex = False
+        with self._state_lock:
+            if self._sync_tls():
+                # This thread's hold was force-cleared by a watchdog reset;
+                # there is nothing left to release and no imbalance to count.
+                return
+            if self._tls.count > 1:
+                self._tls.count -= 1
+                return
+            self._tls.count = 0
+            if self._held <= 0:
+                # Over-release: count imbalance (double release or release after
+                # a watchdog reset already cleared global state). This must
+                # stay ~0; it signals a caller bug, not a leak.
+                _sqlite_metrics_bump("release_failures", 1.0)
+                logger.error(
+                    "SQLite write gate over-release by thread %s "
+                    "(held=%s, epoch=%s)",
+                    threading.get_ident(),
+                    self._held,
+                    self._epoch,
+                )
+                return
+            self._held -= 1
+            if self._held == 0:
+                self._held_since = None
+                self._owner_tid = None
+                release_mutex = True
+        if release_mutex:
+            self._mutex.release()
+
+    def held_seconds(self) -> float:
+        with self._state_lock:
+            if self._held <= 0 or self._held_since is None:
+                return 0.0
+            return time.monotonic() - self._held_since
+
+    def owner_thread_id(self) -> int | None:
+        with self._state_lock:
+            return self._owner_tid
+
+    def watchdog_check(self, threshold_seconds: float) -> dict[str, Any]:
+        """Force-reset the gate if a single hold exceeds the threshold.
+
+        Returns ``{"reset": bool, "held_seconds": float}``. A reset bumps
+        ``_epoch`` so every stale per-thread counter is invalidated before the
+        next acquire/release on that thread, and releases the underlying mutex
+        (thread-agnostic). This is the last line of defence: even a brand-new
+        leak path cannot wedge the service beyond the watchdog window.
+        """
+        reset = False
+        owner = None
+        held_seconds = 0.0
+        with self._state_lock:
+            if self._held <= 0 or self._held_since is None:
+                return {"reset": False, "held_seconds": 0.0}
+            held_seconds = time.monotonic() - self._held_since
+            if held_seconds < threshold_seconds:
+                return {"reset": False, "held_seconds": held_seconds}
+            reset = True
+            owner = self._owner_tid
+            self._held = 0
+            self._held_since = None
+            self._owner_tid = None
+            self._epoch += 1
+        if reset:
+            try:
+                self._mutex.release()
+            except RuntimeError:  # pragma: no cover - defensive
+                pass
+            _sqlite_metrics_bump("gate_watchdog_resets", 1.0)
+            logger.error(
+                "SQLite write gate held %.0fs by thread %s; watchdog force-"
+                "released (possible leak, self-healed)",
+                held_seconds,
+                owner,
+            )
+        return {"reset": reset, "held_seconds": held_seconds}
+
+
+_SQLITE_WRITE_LOCK = _CrossThreadRLock()
 
 
 def record_sqlite_locked_retry() -> None:
@@ -238,14 +422,10 @@ def _sqlite_release_gate(conn: Any) -> None:
             record.info.pop(_WRITE_GATE_MARKER, None)
         except Exception:  # pragma: no cover - defensive
             pass
-    try:
-        _SQLITE_WRITE_LOCK.release()
-    except RuntimeError:
-        # P0-3: count it, not just log it — a nonzero release_failures trend
-        # means a cross-thread Session handoff is back (the ownership marker
-        # was set by a different thread than the one committing here).
-        _sqlite_metrics_bump("release_failures", 1.0)
-        logger.error("SQLite write gate release failed (not owned by this thread)")
+    # v2.0: the gate lock is thread-agnostic — release() is legal from any
+    # thread (cross-thread connection handoff is the designed path, not a
+    # bug). Over-release (count imbalance) is counted inside the lock object.
+    _SQLITE_WRITE_LOCK.release()
     # P0-3 lock-order fix: bump metrics only AFTER releasing the gate so this
     # path never holds GATE while taking METRICS (the acquire path takes
     # METRICS before GATE; holding them in reverse order is a deadlock hazard).
@@ -307,10 +487,9 @@ def _sqlite_pool_safety_release(dbapi_conn: Any, connection_record: Any) -> None
     practically unreachable, but the gate must never wedge the process)."""
     try:
         if connection_record.info.pop(_WRITE_GATE_MARKER, None) is not None:
-            try:
-                _SQLITE_WRITE_LOCK.release()
-            except RuntimeError:  # pragma: no cover - defensive
-                pass
+            # v2.0: thread-agnostic release; over-release is counted inside
+            # the lock object and only signals a caller bug, never a leak.
+            _SQLITE_WRITE_LOCK.release()
     except Exception:  # pragma: no cover - defensive
         pass
 
@@ -343,6 +522,21 @@ def install_sqlite_write_gate(target_engine: Any) -> None:
 
 if is_sqlite:
     install_sqlite_write_gate(engine)
+
+
+def run_sqlite_gate_watchdog(threshold_seconds: float | None = None) -> dict[str, Any]:
+    """Periodic watchdog: force-release a write gate stranded beyond the
+    threshold so a (future) leak path can never wedge the service beyond the
+    watchdog window. Threshold 0 disables. Consumed by the maintenance loop
+    (``scheduler.wal_checkpoint_scheduler``); the underlying mutex release is
+    thread-agnostic and epoch-invalidated, so this is always safe to run.
+    """
+    settings = get_settings()
+    if threshold_seconds is None:
+        threshold_seconds = float(settings.sqlite_gate_watchdog_threshold_seconds)
+    if threshold_seconds <= 0:
+        return {"reset": False, "held_seconds": 0.0, "disabled": True}
+    return _SQLITE_WRITE_LOCK.watchdog_check(threshold_seconds)
 
 
 # ── Active-stream counter (P3-S1/C3b) ─────────────────────────────────────
@@ -488,8 +682,12 @@ def commit_with_locked_retry(
     session across a long model call). Background sweeps should retry briefly
     instead of dropping a sweep.  ``redo`` re-applies the pending ORM changes
     after the mandatory rollback so the retried commit writes the same values.
+    ``redo`` performs writes itself and can hit the same lock window; that is
+    treated as a transient failure too — the whole commit is retried on the
+    next attempt instead of burning the budget on a raise.
     """
 
+    last_error: OperationalError | None = None
     for attempt in range(1, attempts + 1):
         try:
             db.commit()
@@ -498,25 +696,40 @@ def commit_with_locked_retry(
             if not _is_sqlite_locked_error(exc):
                 raise
             record_sqlite_locked_retry()
+            last_error = exc
             try:
                 db.rollback()
             except Exception:  # pragma: no cover - defensive
                 pass
             if attempt >= attempts:
-                logger.warning(
-                    "SQLite write still locked after %d attempts: %s",
-                    attempts,
-                    str(getattr(exc, "orig", exc))[:200],
-                )
-                raise
+                break
             if redo is not None:
                 try:
                     redo()
-                except Exception:  # pragma: no cover - the retry would be futile
+                except OperationalError as exc:
+                    # The redo write hit the same lock window; roll back and
+                    # let the next attempt re-apply it rather than raising.
+                    if not _is_sqlite_locked_error(exc):
+                        raise
+                    record_sqlite_locked_retry()
+                    last_error = exc
+                    try:
+                        db.rollback()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    time.sleep(base_delay_seconds * (2 ** (attempt - 1)))
+                    continue
+                except Exception:  # pragma: no cover - non-lock redo failure
                     logger.warning("redo of a locked SQLite write failed", exc_info=True)
                     raise
             time.sleep(base_delay_seconds * (2 ** (attempt - 1)))
-    raise OperationalError("commit retries exhausted", {}, None)  # pragma: no cover
+    assert last_error is not None
+    logger.warning(
+        "SQLite write still locked after %d attempts: %s",
+        attempts,
+        str(getattr(last_error, "orig", last_error))[:200],
+    )
+    raise last_error
 
 
 def get_db() -> Generator[Session, None, None]:
