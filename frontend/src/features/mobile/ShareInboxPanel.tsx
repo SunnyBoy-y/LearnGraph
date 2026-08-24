@@ -149,6 +149,31 @@ export function ShareInboxPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items.length, enabled])
 
+  // 浮窗定位样式：必须在早退之前声明，保证 Hook 调用顺序稳定（Rules of Hooks）
+  const panelStyle = useMemo<CSSProperties>(() => {
+    const BUTTON = 44
+    const GAP = 8
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const pw = Math.min(360, vw - 16)
+    let left: number
+    const rightSpace = vw - (pos.x + BUTTON)
+    if (rightSpace >= pw + GAP) {
+      // 右侧空间足够 → 面板在按钮右侧
+      left = pos.x + BUTTON + GAP
+    } else if (pos.x - GAP >= pw) {
+      // 右侧不足但左侧够 → 面板在按钮左侧
+      left = pos.x - GAP - pw
+    } else {
+      // 两侧都不足 → 靠右对齐，不溢出
+      left = Math.max(8, vw - pw - 8)
+    }
+    // 垂直：面板底边贴在按钮上方 GAP；高度受按钮到顶部距离约束，防顶部溢出
+    const bottom = vh - pos.y - BUTTON + GAP
+    const maxHeight = Math.max(120, Math.min(vh * 0.5, pos.y - 16))
+    return { left, bottom, width: pw, maxHeight }
+  }, [pos])
+
   if (!enabled) return null
 
   const loadGoals = async () => {
@@ -229,30 +254,6 @@ export function ShareInboxPanel() {
       setBusyId(null)
     }
   }
-
-  const panelStyle = useMemo<CSSProperties>(() => {
-    const BUTTON = 44
-    const GAP = 8
-    const vw = window.innerWidth
-    const vh = window.innerHeight
-    const pw = Math.min(360, vw - 16)
-    let left: number
-    const rightSpace = vw - (pos.x + BUTTON)
-    if (rightSpace >= pw + GAP) {
-      // 右侧空间足够 → 面板在按钮右侧
-      left = pos.x + BUTTON + GAP
-    } else if (pos.x - GAP >= pw) {
-      // 右侧不足但左侧够 → 面板在按钮左侧
-      left = pos.x - GAP - pw
-    } else {
-      // 两侧都不足 → 靠右对齐，不溢出
-      left = Math.max(8, vw - pw - 8)
-    }
-    // 垂直：面板底边贴在按钮上方 GAP；高度受按钮到顶部距离约束，防顶部溢出
-    const bottom = vh - pos.y - BUTTON + GAP
-    const maxHeight = Math.max(120, Math.min(vh * 0.5, pos.y - 16))
-    return { left, bottom, width: pw, maxHeight }
-  }, [pos])
 
   return (
     <>
