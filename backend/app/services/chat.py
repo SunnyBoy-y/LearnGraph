@@ -1558,7 +1558,7 @@ class ChatService:
                 usage_events.append(usage_event.id)
                 for key in total_usage:
                     total_usage[key] += int(usage.get(key) or 0)
-                self.db.commit()
+                self._commit_usage_best_effort(usage_event)
 
             if provider_error is not None:
                 self.audit.record(
@@ -6944,7 +6944,7 @@ class ChatService:
                 self.db.rollback()
             if provider_returned:
                 attempt_usage = dict(getattr(self.model_provider, "last_usage", {}) or {})
-                self.billing.record_usage(
+                attempt_usage_event = self.billing.record_usage(
                     quote,
                     input_tokens=int(attempt_usage.get("input_tokens") or 0),
                     output_tokens=int(attempt_usage.get("output_tokens") or 0),
@@ -6958,7 +6958,7 @@ class ChatService:
                 # A structured model attempt may be billable even when its JSON
                 # later fails domain validation, so usage is committed separately
                 # from the still-inert proposal and message transaction.
-                self.db.commit()
+                self._commit_usage_best_effort(attempt_usage_event)
             if proposal is not None:
                 break
         if proposal is None:
@@ -7292,7 +7292,7 @@ class ChatService:
             usage_event_id = usage_event.id
             # A real Provider call is billable even if validation or the later
             # conditional title update fails.
-            self.db.commit()
+            self._commit_usage_best_effort(usage_event)
 
         trace = {
             "feature": AUTO_TITLE_USAGE_FEATURE,
@@ -7556,7 +7556,7 @@ class ChatService:
             )
             usage_event_id = usage_event.id
             # A real Provider call is billable even if validation fails.
-            self.db.commit()
+            self._commit_usage_best_effort(usage_event)
 
         trace = {
             "feature": ACTIVITY_SUMMARY_USAGE_FEATURE,
@@ -7765,7 +7765,7 @@ class ChatService:
         finally:
             latency_ms = int((time.monotonic() - started_at) * 1000)
             usage = dict(getattr(self.model_provider, "last_usage", {}) or {})
-            self.billing.record_usage(
+            usage_event = self.billing.record_usage(
                 quote,
                 input_tokens=int(usage.get("input_tokens") or 0),
                 output_tokens=int(usage.get("output_tokens") or 0),
@@ -7777,7 +7777,7 @@ class ChatService:
                 usage_reported=bool(usage),
             )
             # A real Provider call is billable even if validation fails.
-            self.db.commit()
+            self._commit_usage_best_effort(usage_event)
 
         if provider_error is not None or cleaned is None:
             if isinstance(provider_error, AppError):
@@ -9753,6 +9753,42 @@ class ChatService:
             raise last_error
         finally:
             self._stream_redo_fn = None
+
+    def _commit_usage_best_effort(self, *pending_usage: Any) -> None:
+        """Commit a usage-only transaction, retrying transient SQLite locks.
+
+        ``pending_usage`` are the ORM rows returned by ``billing.record_usage``.
+        On lock contention the transaction is rolled back and the rows are
+        re-added before the retried commit — SQLAlchemy resets a flushed
+        object to transient on rollback, so re-adding the same object is safe
+        and keeps ids stable. After the retry budget the rows are dropped with
+        a warning: usage accounting must never kill a stream.
+        """
+        from app.core.database import commit_with_locked_retry
+
+        pending = [obj for obj in pending_usage if obj is not None]
+
+        def redo() -> None:
+            for obj in pending:
+                self.db.add(obj)
+
+        try:
+            commit_with_locked_retry(
+                self.db,
+                redo=redo if pending else None,
+                attempts=3,
+                base_delay_seconds=0.1,
+            )
+        except Exception:
+            try:
+                self.db.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            logger.warning(
+                "usage commit dropped under SQLite lock contention "
+                "(workspace_id=%s)",
+                self.workspace_id,
+            )
 
     def _start_graph_proposal_worker(
         self,
