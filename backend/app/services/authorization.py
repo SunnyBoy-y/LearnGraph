@@ -486,7 +486,7 @@ class IdentityManagementService:
         )
         if duplicate is not None:
             raise AppError(409, "identity_conflict", "Username or email already exists")
-        validate_new_password(payload.password, username=payload.username)
+        validate_new_password(payload.password)
         user = User(
             tenant_id=self.principal.tenant_id,
             username=payload.username.strip(),

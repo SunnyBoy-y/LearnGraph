@@ -113,7 +113,7 @@ export function ChangePasswordPage() {
                 aria-describedby="new-password-hint"
                 autoComplete="new-password"
                 id="new-password"
-                minLength={12}
+                minLength={8}
                 onChange={(event) => setNewPassword(event.target.value)}
                 required
                 type="password"
@@ -131,7 +131,7 @@ export function ChangePasswordPage() {
               <Input
                 autoComplete="new-password"
                 id="password-confirmation"
-                minLength={12}
+                minLength={8}
                 onChange={(event) => setPasswordConfirmation(event.target.value)}
                 required
                 type="password"

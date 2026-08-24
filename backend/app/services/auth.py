@@ -49,22 +49,14 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
-def validate_new_password(password: str, *, username: str = "") -> None:
-    if len(password) < 12:
-        raise AppError(422, "weak_password", "Password must contain at least 12 characters")
-    normalized = password.casefold()
-    if normalized in {"password1234", "adminadmin123", "learn-graph-local"}:
-        raise AppError(422, "weak_password", "This password is reserved or commonly guessed")
-    # Email addresses are valid login identities. Do not reject a long,
-    # sufficiently varied password merely because it matches that identity.
-    if username and "@" not in username and normalize_identity(username) in normalized:
-        raise AppError(422, "weak_password", "Password must not contain the username")
-    if len(set(password)) < 6 or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
-        raise AppError(
-            422,
-            "weak_password",
-            "Password must contain varied characters, including a letter and a number",
-        )
+def validate_new_password(password: str) -> None:
+    # Policy deliberately relaxed: a minimum of 8 characters combining at least
+    # one letter and one digit. The username-containment and reserved-password
+    # blacklist checks were removed by product decision.
+    if len(password) < 8:
+        raise AppError(422, "weak_password", "Password must contain at least 8 characters")
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        raise AppError(422, "weak_password", "Password must contain both a letter and a number")
 
 
 class AuthService:
@@ -216,7 +208,7 @@ class AuthService:
             duplicate_conditions.append(User.email_normalized == email_normalized)
         if self.db.scalar(select(User).where(or_(*duplicate_conditions))) is not None:
             raise AppError(409, "identity_conflict", "Username or email already exists")
-        validate_new_password(payload.password, username=username)
+        validate_new_password(payload.password)
 
         tenant = Tenant(id=str(uuid4()), name=f"{payload.display_name.strip()} 的 LearnGraph", status="active")
         self.db.add(tenant)
@@ -391,7 +383,7 @@ class AuthService:
             raise AppError(401, "invalid_credentials", "Current password is incorrect")
         if verify_password(payload.new_password, user.password_hash):
             raise AppError(422, "password_unchanged", "New password must be different")
-        validate_new_password(payload.new_password, username=user.username)
+        validate_new_password(payload.new_password)
         user.password_hash = hash_password(payload.new_password)
         user.password_changed_at = utc_now()
         user.must_change_password = False

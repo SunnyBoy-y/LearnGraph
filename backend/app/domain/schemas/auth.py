@@ -18,7 +18,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@-]+$")
     email: str | None = Field(default=None, max_length=320)
     display_name: str = Field(min_length=1, max_length=160)
-    password: str = Field(min_length=12, max_length=1024)
+    password: str = Field(min_length=8, max_length=1024)
 
 
 class DemoLoginRequest(LoginRequest):
@@ -56,7 +56,7 @@ class CurrentUserView(BaseModel):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=1024)
-    new_password: str = Field(min_length=12, max_length=1024)
+    new_password: str = Field(min_length=8, max_length=1024)
 
 
 class DeleteAccountRequest(BaseModel):
@@ -89,7 +89,7 @@ class UserCreateRequest(BaseModel):
     username: str = Field(min_length=3, max_length=120, pattern=r"^[A-Za-z0-9_.@-]+$")
     email: str | None = Field(default=None, max_length=320)
     display_name: str = Field(min_length=1, max_length=160)
-    password: str = Field(min_length=12, max_length=1024)
+    password: str = Field(min_length=8, max_length=1024)
     is_system_admin: bool = False
 
 

@@ -66,7 +66,7 @@ def ensure_auth_identities(db: Session) -> None:
             "Lg!" + secrets.token_urlsafe(24) + "9"
         )
         if settings.bootstrap_admin_password:
-            validate_new_password(bootstrap_password, username=admin_name)
+            validate_new_password(bootstrap_password)
         admin = User(
             id="bootstrap-admin",
             tenant_id=LOCAL_TENANT_ID,

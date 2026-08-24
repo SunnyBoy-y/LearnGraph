@@ -208,7 +208,7 @@ export function LoginPage() {
                   aria-describedby="register-password-hint"
                   autoComplete="new-password"
                   id="register-password"
-                  minLength={12}
+                  minLength={8}
                   onChange={(event) => setPassword(event.target.value)}
                   required
                   type="password"
@@ -224,7 +224,7 @@ export function LoginPage() {
               <Input
                 autoComplete="new-password"
                 id="register-password-confirmation"
-                minLength={12}
+                minLength={8}
                 onChange={(event) => setPasswordConfirmation(event.target.value)}
                 required
                 type="password"

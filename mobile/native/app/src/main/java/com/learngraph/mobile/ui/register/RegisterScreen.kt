@@ -124,7 +124,9 @@ fun RegisterScreen(onRegistered: () -> Unit, onBack: () -> Unit) {
                 when {
                     username.isBlank() -> error = "请输入用户名"
                     displayName.isBlank() -> error = "请输入显示名称"
-                    password.length < 6 -> error = "密码至少 6 位"
+                    password.length < 8 -> error = "密码至少 8 位"
+                    !(password.any { it.isLetter() } && password.any { it.isDigit() }) ->
+                        error = "密码需同时包含字母和数字"
                     password != password2 -> error = "两次输入的密码不一致"
                     else -> {
                         loading = true
