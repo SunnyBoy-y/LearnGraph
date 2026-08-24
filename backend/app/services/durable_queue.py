@@ -396,7 +396,7 @@ def run_one_durable_job(worker_id: str) -> bool:
         return True
 
 
-def reconcile_research_polling(db: Session | None = None) -> int:
+def reconcile_research_polling() -> int:
     """Ensure an active durable poll job for every in-flight remote research task.
 
     Handles research jobs created before the durable queue (no poll row yet)
@@ -404,14 +404,16 @@ def reconcile_research_polling(db: Session | None = None) -> int:
     task. Skipped for terminal and awaiting-approval research jobs (the latter
     has no provider task yet). Runs at startup while the durable worker is
     starting. Returns the number of poll jobs ensured.
+
+    v2.0: always owns its own session (no caller-injected ``db``) so a caller
+    can never hand a session across an ``asyncio.to_thread`` boundary.
     """
 
     from app.domain.models import ResearchJob
     from app.services.research import ACTIVE_RESEARCH_STATUSES
 
     settings = get_settings()
-    owns_session = db is None
-    session = db or SessionLocal()
+    session = SessionLocal()
     ensured = 0
     try:
         research_jobs = session.scalars(
@@ -456,8 +458,7 @@ def reconcile_research_polling(db: Session | None = None) -> int:
             ensured += 1
         session.commit()
     finally:
-        if owns_session:
-            session.close()
+        session.close()
     return ensured
 
 
