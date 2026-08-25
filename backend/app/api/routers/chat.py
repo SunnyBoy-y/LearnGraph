@@ -23,7 +23,6 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB, WorkspaceContext
@@ -61,17 +60,10 @@ from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRe
 from app.providers.factory import (
     fetch_provider_for_workspace,
     image_provider_for_workspace,
-    image_search_provider_for_workspace,
-    memory_provider_for_workspace,
     model_provider_for_workspace,
-    search_provider_for_workspace,
     transcription_provider_for_workspace,
-    vision_provider_for_workspace,
 )
 from app.services.chat import ChatService
-from app.services.context_builder import ContextBuilder
-from app.services.memory_retrieval import MemoryHybridRetriever
-from app.services.memory_router import MemoryRouter
 from app.services.dictation import (
     DictationService,
     authenticate_realtime_dictation,
@@ -84,12 +76,7 @@ from app.services.dictation import (
 from app.services.billing import BillingService
 from app.services.graph_changes import GraphChangeSetService
 from app.services.image_chat import ImageChatService
-from app.services.memory import MemoryService
 from app.services.authorization import AuthorizationService
-from app.services.agent_runtime import AgentToolRuntime
-from app.services.mcp_skills import MCPAndSkillService
-from app.services.sandbox import SandboxAgentWorkspaceService
-from app.services.session_retrieval import SessionRetrievalService
 
 
 router = APIRouter(prefix="/sessions", tags=["chat"])
@@ -359,172 +346,22 @@ def service(
     *,
     agent_mode: bool = True,
 ) -> ChatService:
-    authorization = AuthorizationService(db, context.principal)
-    search_provider = search_provider_for_workspace(
-        db, context.workspace_id, settings, route=search_route
-    )
-    image_search_provider = image_search_provider_for_workspace(
-        db, context.workspace_id, settings
-    )
-    memory_service = MemoryService(
-        db,
-        context.workspace,
-        context.principal.user_id,
-        memory_provider_for_workspace(
-            db,
-            context.workspace,
-            context.principal.user_id,
-            settings,
-        ),
-        settings.memory_root,
-    )
-    model_kwargs: dict[str, str] = {}
-    if model_id is not None:
-        model_kwargs["model_id"] = model_id
-    if provider_id is not None:
-        model_kwargs["provider_id"] = provider_id
-    if thinking_mode is not None:
-        model_kwargs["thinking_mode"] = thinking_mode
-    if search_route not in {None, "disabled"}:
-        model_kwargs["search_route"] = search_route
-    agent_tool_runtime = None
-    if agent_mode:
-        # 延迟 import 避免 chat ↔ chat_service_factory 循环依赖。
-        # 仅 agent_mode 需要隔离 worker factory（并行安全工具批量并行 +
-        # 串行工具隔离 Session 执行）。
-        from app.services.chat_service_factory import build_agent_tool_worker_runtime
+    # 单一装配点：委托 chat_service_factory.build_chat_service，避免与
+    # subapp 路径的 ChatService / AgentToolRuntime 装配漂移（历史上曾因两处
+    # 重复装配漏传 tool_worker_factory，导致并行工具执行器形同虚设）。
+    from app.services.chat_service_factory import build_chat_service
 
-        sandbox_authorized = "workspace.manage" in authorization.workspace_permissions(
-            context.workspace
-        )
-        extension_service = MCPAndSkillService(
-            db,
-            context.workspace_id,
-            context.principal.user_id,
-            settings,
-            workspace=context.workspace,
-            principal=context.principal,
-        )
-        sandbox = (
-            SandboxAgentWorkspaceService(
-                db,
-                context.workspace_id,
-                context.principal.user_id,
-                settings,
-                workspace=context.workspace,
-                principal=context.principal,
-            )
-            if sandbox_authorized and settings.sandbox_agent_enabled
-            else None
-        )
-        agent_tool_runtime = AgentToolRuntime(
-            workspace_id=context.workspace_id,
-            actor_id=context.principal.user_id,
-            search_provider=search_provider,
-            extensions=extension_service,
-            sandbox=sandbox,
-            sandbox_authorized=sandbox_authorized,
-            memory_tools=memory_service,
-            session_retrieval=SessionRetrievalService(
-                db,
-                context.workspace,
-                context.principal.user_id,
-                authorization,
-            ),
-            image_provider=image_provider_for_workspace(
-                db, context.workspace_id, settings
-            ),
-            image_provider_resolver=lambda image_provider_id, image_model_id: (
-                image_provider_for_workspace(
-                    db,
-                    context.workspace_id,
-                    settings,
-                    provider_id=image_provider_id,
-                    model_id=image_model_id,
-                )
-            ),
-            settings=settings,
-            can_manage_providers="workspace.manage" in context.permissions,
-            fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
-            image_search_provider=image_search_provider,
-        )
-    return ChatService(
+    return build_chat_service(
         db,
-        context.workspace_id,
-        context.principal.user_id,
-        model_provider_for_workspace(db, context.workspace_id, settings, **model_kwargs),
-        tenant_id=context.principal.tenant_id,
-        context_builder=(
-            ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db)))
-            if settings.memory_context_builder_v2
-            else None
-        ),
-        search_provider=search_provider,
-        memory_context_loader=(
-            None
-            if settings.memory_context_builder_v2
-            else memory_service.context_for_session
-        ),
-        memory_cache_context_loader=(
-            None
-            if settings.memory_read_mode == "events"
-            else memory_service.context_for_session
-        ),
-        suggested_prompt_context_access_checker=lambda session, session_permission: (
-            authorization.can_access_resource(
-                context.workspace,
-                "session",
-                session.id,
-                session_permission,
-            )
-            and authorization.can_access_bindings(
-                context.workspace,
-                "read",
-                project_id=session.project_id,
-                goal_id=session.goal_id,
-                graph_id=session.graph_id,
-            )
-        ),
-        learning_context_access_checker=lambda resource_type, resource_id: (
-            authorization.can_access_bindings(
-                context.workspace,
-                "read",
-                node_id=resource_id,
-            )
-            if resource_type == "node"
-            else authorization.can_access_resource(
-                context.workspace,
-                resource_type,
-                resource_id,
-                "read",
-            )
-        ),
-        session_binding_access_checker=lambda project_id, goal_id, graph_id: (
-            authorization.can_access_bindings(
-                context.workspace,
-                "read",
-                project_id=project_id,
-                goal_id=goal_id,
-                graph_id=graph_id,
-            )
-        ),
-        agent_tool_runtime=agent_tool_runtime,
-        vision_provider=vision_provider_for_workspace(
-            db, context.workspace_id, settings
-        ),
-        tool_worker_factory=(
-            None
-            if not agent_mode
-            else lambda worker_db: build_agent_tool_worker_runtime(
-                worker_db,
-                workspace_id=context.workspace_id,
-                actor_id=context.principal.user_id,
-                tenant_id=context.principal.tenant_id,
-                permissions=context.permissions,
-                settings=settings,
-            )
-        ),
+        workspace_context=context,
+        settings=settings,
+        model_id=model_id,
+        provider_id=provider_id,
+        thinking_mode=thinking_mode,
+        search_route=search_route,
+        agent_mode=agent_mode,
     )
+
 
 
 def graph_change_service(db: DB, context: CurrentWorkspace) -> GraphChangeSetService:

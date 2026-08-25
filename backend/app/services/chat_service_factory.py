@@ -171,12 +171,14 @@ def build_chat_service(
     provider_id: str | None = None,
     thinking_mode: str | None = None,
     search_route: str | None = None,
+    agent_mode: bool = True,
 ) -> ChatService:
     """Assemble a ChatService for a workspace/actor in one place.
 
     The HTTP router and the event-driven subapp Agent worker share this factory
     so both paths use the same Provider, Memory, Search and AgentToolRuntime
-    composition.
+    composition. ``agent_mode=False`` assembles a tool-less service (no
+    AgentToolRuntime, no isolated worker factory).
     """
     context = workspace_context
     authorization = AuthorizationService(db, context.principal)
@@ -204,7 +206,9 @@ def build_chat_service(
         model_kwargs["thinking_mode"] = thinking_mode
     if search_route not in {None, "disabled"}:
         model_kwargs["search_route"] = search_route
-    agent_tool_runtime = build_agent_tool_runtime(db, context, settings)
+    agent_tool_runtime = (
+        build_agent_tool_runtime(db, context, settings) if agent_mode else None
+    )
     return ChatService(
         db,
         context.workspace_id,
@@ -269,12 +273,16 @@ def build_chat_service(
         vision_provider=vision_provider_for_workspace(
             db, context.workspace_id, settings
         ),
-        tool_worker_factory=lambda worker_db: build_agent_tool_worker_runtime(
-            worker_db,
-            workspace_id=context.workspace_id,
-            actor_id=context.principal.user_id,
-            tenant_id=context.principal.tenant_id,
-            permissions=context.permissions,
-            settings=settings,
+        tool_worker_factory=(
+            None
+            if not agent_mode
+            else lambda worker_db: build_agent_tool_worker_runtime(
+                worker_db,
+                workspace_id=context.workspace_id,
+                actor_id=context.principal.user_id,
+                tenant_id=context.principal.tenant_id,
+                permissions=context.permissions,
+                settings=settings,
+            )
         ),
     )
