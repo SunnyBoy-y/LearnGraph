@@ -98,7 +98,10 @@ def ensure_auth_identities(db: Session) -> None:
             logger.warning(format_bootstrap_credentials(admin_name, bootstrap_password))
 
     demo = db.get(User, "demo-user")
-    demo_identity_enabled = settings.demo_login_enabled or settings.demo_seed_enabled
+    # 身份存在性只由登录开关控制（演示数据另由 demo_seed_enabled 控制）。
+    # 若身份门取 or（login or seed），仅关闭 login 时 demo 身份仍保持 active，
+    # 普通登录 /auth/login 会继续接受公开的 demo 凭据——"关了入口还能登录"。
+    demo_identity_enabled = settings.demo_login_enabled
     if demo_identity_enabled and demo is None:
         demo = User(
             id="demo-user",

@@ -134,7 +134,8 @@ docker compose up -d --build
 
 启动后访问 **http://127.0.0.1:18000**，使用容器日志中首次打印的管理员临时密码登录（用户名为 `admin`），登录后请立即修改密码。
 
-> 默认配置会创建 Demo 身份，也不会启用本地演示模型。如需显式开发演示，可在本地 `.env` 中单独开启，并与真实功能验收区分。
+> 默认配置会创建**可登录**的 Demo 身份，如需禁用请配置本地".env"文件
+> 
 
 | 服务 | 默认地址 | 说明 |
 | --- | --- | --- |
@@ -476,7 +477,6 @@ LearnGraph/
 | `npm run docker -- <args>` | 任意 compose 子命令透传（如 `npm run docker -- down` / `logs -f app`） |
 | `node scripts/host-bridge.mjs` | 宿主机一键启动 Host Service Bridge（Docker 部署访问本机服务，可选） |
 
-> 公共代码快照不包含内部开发文档、测试夹具或浏览器产物，因此 `npm run check` 不代表真实 E2E 或远程 Provider 验收已经完成。涉及模型、搜索、研究或关键业务流程的发布，还应使用真实配置、真实 HTTP/SSE 和真实浏览器操作完成验证。
 
 ## 📚 开发者文档
 

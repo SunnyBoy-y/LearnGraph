@@ -1413,7 +1413,7 @@ docker compose up -d --build</code></pre>
           </div>
           <h3>认证、供应链与发布治理</h3>
           <div class="definition-list compact">
-            <div><span class="status status-current">认证加固</span><p>首次登录强制改密（独立页面 + 刷新恢复）、Demo 登录默认关闭、认证限流防灌水；按端点明确权限边界、避免尾斜杠绕过。</p></div>
+            <div><span class="status status-current">认证加固</span><p>首次登录强制改密（独立页面 + 刷新恢复）、认证限流防灌水；按端点明确权限边界、避免尾斜杠绕过。Demo 身份（demo/learn-graph-local）在开发环境（LEARNGRAPH_ENV=development）默认可登录、非开发环境默认关闭；ENABLE_DEMO_LOGIN=false 重启后身份即被禁用（普通登录同样拒绝），演示数据另由 ENABLE_DEMO_SEED 单独控制（见 backend/.env.example）。</p></div>
             <div><span class="status status-current">供应链</span><p>沙箱镜像 lockfile + 供应链清单校验、镜像只持久化 RepoDigest、MCP 凭据接入版本化密钥存储加密、工具输出脱敏（URL 凭据/密钥赋值）。</p></div>
             <div><span class="status status-current">资源配额</span><p>沙箱 inode / 文件数 / 目录数 / 快照保留限额；浏览器预览 Range 截断；宿主内存/CPU/磁盘保留水位。</p></div>
             <div><span class="status status-current">发布门禁</span><p>上线前全盘审计（生产构建、登录并发、SSE 心跳、越权、限流、关页计费、首屏体积）→ 分级修复 → 回归验证 → 按"个人/小团队、单实例单进程"边界放行（CONDITIONAL_GO）。</p></div>
