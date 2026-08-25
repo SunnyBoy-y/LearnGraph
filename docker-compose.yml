@@ -61,6 +61,8 @@ x-app-environment: &app-environment
   LEARNGRAPH_DATABASE_URL: sqlite:////data/learngraph.db
   LEARNGRAPH_STORAGE_ROOT: /data/storage
   LEARNGRAPH_MEMORY_ROOT: /data/memory
+
+  LEARNGRAPH_MAX_DOCUMENT_PARSE_BYTES: ${LEARNGRAPH_MAX_DOCUMENT_PARSE_BYTES:-209715200}
   LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: /data/sandbox-workspaces
   LEARNGRAPH_SANDBOX_EGRESS_POLICY_DIR: /data/egress-policies
   # SSRF 公网校验的 fake-ip 容忍网段（逗号分隔 CIDR，默认空=严格公网校验）。
