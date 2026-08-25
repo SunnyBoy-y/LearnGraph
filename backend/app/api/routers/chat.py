@@ -389,6 +389,11 @@ def service(
         model_kwargs["search_route"] = search_route
     agent_tool_runtime = None
     if agent_mode:
+        # 延迟 import 避免 chat ↔ chat_service_factory 循环依赖。
+        # 仅 agent_mode 需要隔离 worker factory（并行安全工具批量并行 +
+        # 串行工具隔离 Session 执行）。
+        from app.services.chat_service_factory import build_agent_tool_worker_runtime
+
         sandbox_authorized = "workspace.manage" in authorization.workspace_permissions(
             context.workspace
         )
@@ -506,6 +511,18 @@ def service(
         agent_tool_runtime=agent_tool_runtime,
         vision_provider=vision_provider_for_workspace(
             db, context.workspace_id, settings
+        ),
+        tool_worker_factory=(
+            None
+            if not agent_mode
+            else lambda worker_db: build_agent_tool_worker_runtime(
+                worker_db,
+                workspace_id=context.workspace_id,
+                actor_id=context.principal.user_id,
+                tenant_id=context.principal.tenant_id,
+                permissions=context.permissions,
+                settings=settings,
+            )
         ),
     )
 
