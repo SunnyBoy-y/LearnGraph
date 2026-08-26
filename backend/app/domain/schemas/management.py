@@ -546,6 +546,19 @@ class ProviderImportRequest(BaseModel):
     base_url: str | None = Field(default=None, max_length=500)
 
 
+class CcSwitchImportRequest(BaseModel):
+    """从 cc-switch 配置导入供应商。
+
+    config_json 为 cc-switch 的 ``~/.cc-switch/config.json`` 内容；后端解析
+    providers 的 settingsConfig.env，提取 Anthropic/OpenAI 的 base_url 与
+    api_key。provider_type 缺省时按 env 字段推断（Anthropic → anthropic_messages，
+    OpenAI → openai_compatible_chat）。
+    """
+
+    config_json: str = Field(min_length=1, max_length=1_000_000)
+    provider_type: str | None = Field(default=None, min_length=1, max_length=80)
+
+
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[

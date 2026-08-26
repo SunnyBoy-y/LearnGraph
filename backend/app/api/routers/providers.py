@@ -11,6 +11,7 @@ from app.domain.schemas.management import (
     CodexDeviceLoginPollView,
     CodexDeviceLoginStartView,
     MasterKeyRotationView,
+    CcSwitchImportRequest,
     ProviderCreateRequest,
     ProviderImportRequest,
     ProviderTypeCatalogView,
@@ -112,6 +113,17 @@ def import_provider(
 ) -> ProviderView:
     """复用已配置供应商的凭据，为目标能力新建一个 Provider。"""
     return ProviderView.model_validate(service(db, context, settings).import_from(payload))
+
+
+@router.post("/import-ccswitch")
+def import_ccswitch(
+    payload: CcSwitchImportRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    """从 cc-switch 配置批量导入供应商。"""
+    return service(db, context, settings).import_from_ccswitch(payload)
 
 
 @router.get("/secret-store/status", response_model=SecretStoreStatusView)

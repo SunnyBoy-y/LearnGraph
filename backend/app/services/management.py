@@ -55,6 +55,7 @@ from app.domain.schemas.management import (
     ProviderBalanceQueryConfig,
     ProviderBalanceQueryExecuteRequest,
     ProviderBalanceQueryResultRequest,
+    CcSwitchImportRequest,
     ProviderCreateRequest,
     ProviderImportRequest,
     ProviderSecretRotateRequest,
@@ -747,6 +748,129 @@ class ProviderService:
         ):
             provider = self._import_discover(provider)
         return provider
+
+    def import_from_ccswitch(self, payload: CcSwitchImportRequest) -> dict:
+        """从 cc-switch 配置导入供应商（批量创建 model 角色 Provider）。
+
+        解析 ``~/.cc-switch/config.json``，从每个 provider 的 settingsConfig.env
+        提取 base_url 与 api_key，推断协议后复用 create() 建行；同 base_url 已
+        存在的跳过，避免重复。
+        """
+        parsed = self._parse_ccswitch_providers(payload.config_json)
+        created: list[dict] = []
+        skipped: list[dict] = []
+        for item in parsed:
+            provider_type = payload.provider_type or item["provider_type"]
+            spec = provider_type_spec(provider_type)
+            if spec is None or not spec.create_allowed or spec.role != "model":
+                skipped.append(
+                    {"name": item["name"], "reason": "unsupported_provider_type"}
+                )
+                continue
+            existing = self._find_provider_by_base_url(item["base_url"], provider_type)
+            if existing is not None:
+                skipped.append(
+                    {
+                        "name": item["name"],
+                        "reason": "duplicate",
+                        "provider_id": existing.id,
+                    }
+                )
+                continue
+            try:
+                provider = self.create(
+                    ProviderCreateRequest(
+                        display_name=self._unique_display_name(item["name"]),
+                        provider_type=provider_type,
+                        base_url=item["base_url"],
+                        api_key=SecretStr(item["api_key"]) if item["api_key"] else None,
+                    )
+                )
+                created.append(
+                    {
+                        "name": item["name"],
+                        "provider_id": provider.id,
+                        "enabled": provider.enabled,
+                    }
+                )
+            except AppError as exc:
+                skipped.append({"name": item["name"], "reason": exc.code})
+        return {"created": created, "skipped": skipped}
+
+    def _parse_ccswitch_providers(self, config_json: str) -> list[dict]:
+        """解析 cc-switch config.json，提取 Anthropic/OpenAI 供应商连接信息。"""
+        try:
+            data = json.loads(config_json)
+        except json.JSONDecodeError as exc:
+            raise AppError(
+                422,
+                "ccswitch_config_invalid",
+                f"cc-switch 配置 JSON 解析失败：{exc}",
+            )
+        raw = data.get("providers") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            items = list(raw.values())
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            raise AppError(
+                422,
+                "ccswitch_config_invalid",
+                "cc-switch 配置缺少 providers 字段",
+            )
+        result: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            settings = item.get("settingsConfig") or {}
+            if isinstance(settings, str):
+                try:
+                    settings = json.loads(settings)
+                except json.JSONDecodeError:
+                    settings = {}
+            env = settings.get("env") or {} if isinstance(settings, dict) else {}
+            base_url = str(
+                env.get("ANTHROPIC_BASE_URL")
+                or env.get("OPENAI_BASE_URL")
+                or ""
+            ).strip()
+            api_key = str(
+                env.get("ANTHROPIC_AUTH_TOKEN")
+                or env.get("ANTHROPIC_API_KEY")
+                or env.get("OPENAI_API_KEY")
+                or ""
+            ).strip()
+            if not base_url:
+                continue
+            name = str(item.get("name") or "").strip() or base_url
+            result.append(
+                {
+                    "name": name,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "provider_type": self._infer_ccswitch_type(env),
+                }
+            )
+        return result
+
+    def _infer_ccswitch_type(self, env: dict) -> str:
+        """按 env 字段推断协议：OPENAI_API_KEY → openai_compatible_chat，否则 anthropic。"""
+        if env.get("OPENAI_API_KEY"):
+            return "openai_compatible_chat"
+        return "anthropic_messages"
+
+    def _find_provider_by_base_url(
+        self, base_url: str, provider_type: str
+    ) -> ProviderConfig | None:
+        return self.db.scalar(
+            select(ProviderConfig)
+            .where(
+                ProviderConfig.workspace_id == self.workspace_id,
+                ProviderConfig.base_url == base_url,
+                ProviderConfig.provider_type == provider_type,
+            )
+            .order_by(ProviderConfig.created_at.desc())
+        )
 
     def _import_default_name(self, source: ProviderConfig, spec: object) -> str:
         base = source.display_name.strip()
