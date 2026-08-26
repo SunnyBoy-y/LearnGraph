@@ -73,6 +73,34 @@ PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
         # 保持串行，避免 SQLite 写门闸的跨线程并发冲突。
         "canvas_get_render_contract",
         "lg_goal_read",
+        # M1（批量只读并行）：以下 builtin 只读查询已审计为执行路径零写——
+        # 正常路径走 _success 返回，不写 ExtensionInvocation、不调 audit.record、
+        # 不 commit，因此可在隔离 Session 上并发。添加新工具前必须逐个审计其
+        # 完整执行路径零写（无 db.commit、无 audit.record、无 sandbox _touch、
+        # 无 provider 实例可变状态跨调用共享），否则不要加入。
+        "list_providers",
+        "list_provider_models",
+        "get_model_capabilities",
+        "get_usage_summary",
+        "list_usage_events",
+        "get_memory_policy",
+        # M2（第二批审计扩展）：同上，纯读（catalog/get/status/budget 查询）。
+        # 架构决策：完整"记账异步化"（把 invoke_builtin_tool / invoke_mcp 的
+        # commit 改为 outbox 批量 flush）不做——那些 commit 是工具功能本身的
+        # DB 写（graph 落库、canvas 组件、skill 状态），不是纯记账，延后提交会
+        # 改变工具语义与失败回滚；且扩展工具（MCP/Skill）有副作用，本就不该
+        # 并行。并行白名单的策略就是"有记账的工具不并行"，已覆盖主要收益。
+        "get_secret_store_status",
+        "list_settings",
+        "get_setting",
+        "get_budget_status",
+        # M3（评估后不进白名单）：sandbox_read_file / sandbox_grep /
+        # sandbox_list_files 即使 _touch_session 已降频（60s 窗口，
+        # _touch_session_throttled），每次调用仍同步写 audit.record +
+        # commit（安全审计要求逐次记录），不满足"执行路径零写"的并行
+        # 准入门槛，保持串行。批量场景用 sandbox_read_file 的 paths 参数
+        # 一次读多个文件（一次 audit+commit），效果等价于并行而无需放宽
+        # 审计语义。
     }
 )
 

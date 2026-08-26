@@ -59,6 +59,7 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileWriteRequest,
     SandboxAgentNotebookRequest,
     SandboxAgentPatchRequest,
+    SandboxAgentPipelineRequest,
     SandboxAgentSearchRequest,
     SandboxAgentSessionCreateRequest,
     SandboxAgentSkillListRequest,
@@ -1687,6 +1688,32 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         )
         session.expires_at = session.workspace_expires_at
 
+    # M3: throttled touch for read-only tools (read/grep/list). Writing
+    # last_used_at on every read multiplies single-writer gate pressure
+    # (one write per read); a 60s window keeps session-liveness tracking
+    # intact while cutting that write frequency by ~60x, so serialized
+    # reads commit a no-op on most calls.
+    _TOUCH_THROTTLE_SECONDS = 60
+
+    def _touch_session_throttled(
+        self, session: SandboxSession, throttle_seconds: int | None = None
+    ) -> bool:
+        """Touch a session only if it was last touched more than the window ago.
+
+        Returns True when a write actually happened. Read-only tools use this
+        so their audit/commit stays cheap on the hot path; sandbox session
+        cleanup still sees fresh last_used_at values on any real activity.
+        """
+        window = throttle_seconds or self._TOUCH_THROTTLE_SECONDS
+        last = session.last_used_at
+        if last is not None:
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if (utc_now() - last).total_seconds() < window:
+                return False
+        self._touch_session(session)
+        return True
+
     def _ensure_backend_session(self, session: SandboxSession) -> SandboxSessionHandle:
         if not self.settings.sandbox_agent_enabled:
             raise SandboxBackendUnavailable("Agent sandbox execution is disabled by deployment configuration")
@@ -2454,16 +2481,66 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         return result
 
     def read_file(self, payload: SandboxAgentFileReadRequest) -> dict[str, Any]:
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        requested = payload.paths or ([payload.path] if payload.path else None)
+        if not requested:
+            raise AppError(422, "invalid_tool_arguments", "path or paths is required")
+        if len(requested) > 16:
+            raise AppError(422, "sandbox_too_many_paths", "paths supports at most 16 entries")
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for path in requested:
+            try:
+                results.append(self._read_one_file(payload, path, session))
+            except AppError as exc:
+                # Single-path calls keep the legacy contract: raise the error
+                # instead of folding it into an errors list. Batch calls
+                # collect per-file errors so one bad path does not fail the
+                # whole read.
+                if len(requested) == 1:
+                    raise
+                errors.append({"path": path, "error_code": exc.code, "message": exc.message})
+        # One throttled touch + audit + commit per batch (not per file): keeps
+        # the single-writer gate pressure proportional to tool calls, not reads.
+        self._touch_session_throttled(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.file_read",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={
+                "paths": requested,
+                "file_count": len(results),
+                "error_count": len(errors),
+            },
+        )
+        self.db.commit()
+        if len(results) == 1 and not errors:
+            return results[0]
+        return {
+            "sandbox_session_id": session.id,
+            "files": results,
+            "errors": errors,
+            "truncated": bool(any(item.get("truncated") for item in results)),
+        }
+
+    def _read_one_file(
+        self,
+        payload: SandboxAgentFileReadRequest,
+        path: str,
+        session: Any,
+    ) -> dict[str, Any]:
+        """Read one workspace file (shared by single-path and batch reads)."""
         try:
-            path = validate_agent_workspace_path(payload.path)
+            path = validate_agent_workspace_path(path)
         except SandboxCapabilityMismatch as exc:
             self._record_policy_block(
                 action="sandbox.agent.file_read.blocked",
                 reason=str(exc),
-                path=payload.path,
+                path=path,
             )
             raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
-        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
         data: bytes | None = None
         # Prefer the content-addressed session workspace so chat-seeded inputs/
         # remain readable even when Docker is unavailable or not yet synced.
@@ -2520,22 +2597,6 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         if payload.max_chars is not None and len(content) > payload.max_chars:
             content = content[: payload.max_chars]
             truncated = True
-        self._touch_session(session)
-        session.lifecycle_state = "WARM_IDLE"
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="sandbox.agent.file_read",
-            resource_type="sandbox_session",
-            resource_id=session.id,
-            details={
-                "path": path,
-                "size_bytes": len(data),
-                "total_lines": total_lines,
-                "start_line": lo + 1 if payload.start_line is not None else None,
-                "end_line": hi if payload.end_line is not None else None,
-            },
-        )
-        self.db.commit()
         return {
             "sandbox_session_id": session.id,
             "path": path,
@@ -2604,7 +2665,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             by_path = filtered
         limit = payload.max_results or 200
         files = sorted(by_path.values(), key=lambda item: item["path"])[:limit]
-        self._touch_session(session)
+        self._touch_session_throttled(session)
         session.lifecycle_state = "WARM_IDLE"
         self.audit.record(
             actor_id=self.actor_id,
@@ -2650,12 +2711,14 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
 
         matches: list[dict[str, Any]] = []
         file_counts: list[dict[str, Any]] = []
+        contents: list[dict[str, str]] = []
         searched = 0
         skipped_binary = 0
         skipped_large = 0
         skipped_container_only = 0
         truncated = False
         total_scanned = 0
+        content_budget = payload.content_max_chars or 8_000
 
         for entry in self.workspace_files.list_entries(payload.chat_session_id):
             if path_filter and not fnmatch.fnmatch(entry.path, path_filter):
@@ -2682,6 +2745,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             lines = text.splitlines(keepends=True)
             line_count = len(lines)
             file_match_count = 0
+            hit_texts: list[str] = []
             index = 0
             while index < line_count:
                 if not matcher.search(lines[index]):
@@ -2708,18 +2772,29 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                         "context": context_rows,
                     }
                 )
+                if payload.include_content:
+                    hit_texts.append(matched_text)
                 if len(matches) >= max_matches:
                     truncated = True
                     break
                 index = window_hi + 1
             if file_match_count:
                 file_counts.append({"path": entry.path, "matches": file_match_count})
+            if payload.include_content and hit_texts:
+                snippet = "\n".join(hit_texts)
+                if len(snippet) > content_budget:
+                    snippet = snippet[:content_budget] + "…"
+                contents.append({"path": entry.path, "content": snippet})
+                content_budget -= len(snippet)
+                if content_budget <= 0:
+                    truncated = True
+                    break
             if truncated or total_scanned >= self.GREP_MAX_TOTAL_BYTES:
                 if not truncated:
                     truncated = True
                 break
 
-        self._touch_session(session)
+        self._touch_session_throttled(session)
         session.lifecycle_state = "WARM_IDLE"
         self.audit.record(
             actor_id=self.actor_id,
@@ -2745,7 +2820,127 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             "skipped_container_only": skipped_container_only,
             "matches": matches,
             "file_counts": file_counts,
+            "contents": contents,
             "truncated": truncated,
+        }
+
+    def run_pipeline(self, payload: SandboxAgentPipelineRequest) -> dict[str, Any]:
+        """Declarative deterministic orchestration over the durable workspace.
+
+        Host-side list -> filter -> read -> dedup -> aggregate pipeline.
+        Offline and deterministic (no container, no arbitrary code, no egress);
+        one audit + commit for the whole pipeline (coarse-grained ledger per
+        the deterministic-orchestration design). Items flow stage to stage.
+        """
+        session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
+        entries = self.workspace_files.list_entries(payload.chat_session_id)
+        items: list[dict[str, Any]] = [
+            {
+                "path": entry.path,
+                "size_bytes": int(entry.size_bytes or 0),
+                "role": entry.role,
+                "file_id": entry.file_id,
+                "source": entry.source,
+            }
+            for entry in entries
+        ]
+        applied: list[str] = []
+        for index, stage in enumerate(payload.stages):
+            if not isinstance(stage, dict):
+                raise AppError(
+                    422, "invalid_tool_arguments", f"pipeline stage {index} must be an object"
+                )
+            op = str(stage.get("op") or "").strip()
+            if op == "list":
+                pattern = stage.get("pattern")
+                if isinstance(pattern, str) and pattern:
+                    items = [item for item in items if fnmatch.fnmatch(item["path"], pattern)]
+                limit = stage.get("max_results")
+                if isinstance(limit, int) and not isinstance(limit, bool):
+                    items = items[: max(1, min(limit, 1000))]
+                applied.append("list")
+            elif op == "filter":
+                path_glob = stage.get("path_glob")
+                if isinstance(path_glob, str) and path_glob:
+                    items = [item for item in items if fnmatch.fnmatch(item["path"], path_glob)]
+                max_size = stage.get("max_size_bytes")
+                if isinstance(max_size, int) and not isinstance(max_size, bool):
+                    items = [item for item in items if item["size_bytes"] <= max_size]
+                applied.append("filter")
+            elif op == "read":
+                raw_limit = stage.get("limit")
+                raw_chars = stage.get("max_chars")
+                count = max(
+                    1,
+                    min(
+                        int(raw_limit) if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) else 10,
+                        50,
+                    ),
+                )
+                chars = max(
+                    1,
+                    min(
+                        int(raw_chars) if isinstance(raw_chars, int) and not isinstance(raw_chars, bool) else 4_000,
+                        100_000,
+                    ),
+                )
+                for item in items[:count]:
+                    try:
+                        read_payload = SandboxAgentFileReadRequest(
+                            chat_session_id=payload.chat_session_id,
+                            path=item["path"],
+                            max_chars=chars,
+                            sandbox_session_id=session.id,
+                        )
+                        view = self._read_one_file(read_payload, item["path"], session)
+                        item["content"] = view["content"]
+                        item["read_truncated"] = bool(view.get("truncated"))
+                    except AppError as exc:
+                        item["read_error"] = exc.code
+                applied.append("read:%d" % count)
+            elif op == "dedup":
+                seen: set[str] = set()
+                deduped: list[dict[str, Any]] = []
+                for item in items:
+                    if item["path"] in seen:
+                        continue
+                    seen.add(item["path"])
+                    deduped.append(item)
+                items = deduped
+                applied.append("dedup")
+            elif op == "aggregate":
+                applied.append("aggregate")
+            else:
+                raise AppError(
+                    422,
+                    "sandbox_pipeline_unknown_stage",
+                    "Unknown pipeline stage op: %s" % (op or "(empty)"),
+                )
+        summary = {
+            "file_count": len(items),
+            "total_size_bytes": sum(int(item.get("size_bytes") or 0) for item in items),
+            "read_count": sum(1 for item in items if item.get("content") is not None),
+            "stages_applied": applied,
+        }
+        self._touch_session_throttled(session)
+        session.lifecycle_state = "WARM_IDLE"
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="sandbox.agent.pipeline",
+            resource_type="sandbox_session",
+            resource_id=session.id,
+            details={
+                "stages": applied,
+                "file_count": len(items),
+                "read_count": summary["read_count"],
+            },
+        )
+        self.db.commit()
+        return {
+            "sandbox_session_id": session.id,
+            "items": items,
+            "summary": summary,
+            "truncated": False,
         }
 
     def delete_file(self, payload: SandboxAgentFileDeleteRequest) -> dict[str, Any]:
@@ -3253,17 +3448,18 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_read_file",
-                    "description": "Read a UTF-8 file from the isolated Agent workspace. Pass start_line/end_line to read only a line range (1-based, inclusive) and max_chars to bound the returned text; the response reports total_lines/total_bytes so you can page through large files without re-reading everything.",
+                    "description": "Read UTF-8 files from the isolated Agent workspace. Pass paths (list) to read several files in one call instead of looping read_file calls; pass start_line/end_line to read only a line range (1-based, inclusive) and max_chars to bound each file's returned text; the response reports total_lines/total_bytes so you can page through large files without re-reading everything.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string"},
+                            "path": {"type": "string", "description": "Single file to read (ignored when paths is provided)."},
+                            "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Multiple files to read in one call (prefer over repeated single reads)."},
                             "start_line": {"type": "integer", "minimum": 1, "description": "First line to return (1-based)."},
                             "end_line": {"type": "integer", "minimum": 1, "description": "Last line to return (inclusive); values beyond the file are clamped."},
-                            "max_chars": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "Optional character cap on the returned content (truncated=true when applied)."},
+                            "max_chars": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "Optional character cap on each file's returned content (truncated=true when applied)."},
                             "sandbox_session_id": session_property,
                         },
-                        "required": ["path"],
+                        "required": [],
                         "additionalProperties": False,
                     },
                 },
@@ -3288,7 +3484,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_grep",
-                    "description": "Search workspace file contents with a regular expression and return matching lines with optional context. Use this instead of sandbox_exec for locating symbols, error strings, or patterns before editing — it runs host-side without starting a container command. Searches the durable session workspace (chat attachments and files written by sandbox tools); files created by sandbox_exec inside the container are not indexed — read those files first or search them inside the script.",
+                    "description": "Search workspace file contents with a regular expression and return matching lines with optional context. Set include_content=true to also get a per-file hit snippet so you can judge a match without a follow-up read_file call. Use this instead of sandbox_exec for locating symbols, error strings, or patterns before editing — it runs host-side without starting a container command. Searches the durable session workspace (chat attachments and files written by sandbox tools); files created by sandbox_exec inside the container are not indexed — read those files first or search them inside the script.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3297,9 +3493,27 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                             "case_sensitive": {"type": "boolean", "description": "Match case-sensitively (default false)."},
                             "context_lines": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Lines of context before/after each match (default 0)."},
                             "max_matches": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum matching lines to return (default 50; truncated=true when the cap is hit)."},
+                            "include_content": {"type": "boolean", "description": "Return per-file hit snippets (contents) with the results (default false)."},
+                            "content_max_chars": {"type": "integer", "minimum": 1, "maximum": 200000, "description": "Total character budget for snippets (default 8000)."},
                             "sandbox_session_id": session_property,
                         },
                         "required": ["pattern"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sandbox_pipeline",
+                    "description": "Declarative deterministic orchestration over the durable session workspace in ONE tool call. stages = [{\"op\":\"list\",\"pattern\":\"work/**/*.py\",\"max_results\":200}, {\"op\":\"filter\",\"path_glob\":\"*.py\"} or {\"op\":\"filter\",\"max_size_bytes\":1048576}, {\"op\":\"read\",\"limit\":10,\"max_chars\":4000}, {\"op\":\"dedup\"}, {\"op\":\"aggregate\"}]. Items flow stage to stage. Use this when a task is a mechanical batch over files (list all work/**/*.py, read the first N, summarize) — it avoids repeated sandbox_read_file / sandbox_grep round trips and records ONE audit entry for the whole pipeline. Offline and deterministic; does not run arbitrary code.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "stages": {"type": "array", "items": {"type": "object"}, "description": "Ordered pipeline stages (1..10)."},
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["stages"],
                         "additionalProperties": False,
                     },
                 },
@@ -3325,9 +3539,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "function": {
                     "name": "sandbox_exec",
                     "description": (
-                        "Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file in the isolated, "
-                        "offline sandbox (argv is never evaluated by a shell; pip/npm install and "
-                        "internet access fail by design). Prefer the dedicated sandbox_write_file / "
+                        "【批量/多文件操作首选】Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file "
+                        "in the isolated, offline sandbox (argv is never evaluated by a shell; pip/npm "
+                        "install and internet access fail by design). For batch work (looping over many "
+                        "files, filtering, dedup, aggregation), write one script and run it once instead "
+                        "of repeated sandbox_read_file / sandbox_grep calls. Prefer the dedicated sandbox_write_file / "
                         "sandbox_edit_file / sandbox_read_file / sandbox_grep / sandbox_list_files "
                         "tools for single-file operations — sandbox_exec is for scripts that need "
                         "Chromium, ffmpeg, the Python/Node toolchain, or batch/multi-file work. "
@@ -3660,8 +3876,12 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "function": {
                     "name": "sandbox_bash",
                     "description": (
-                        "Run an arbitrary shell command string inside the sandbox container via "
+                        "【批量操作首选】Preferred for batch/loop operations: run an arbitrary shell "
+                        "command string inside the sandbox container via "
                         "bash -lc (the string is one argv element; no host shell is involved). "
+                        "When a task needs loops over many files, filtering, dedup, or batch retries, "
+                        "write one script and run it here once instead of repeated sandbox_read_file "
+                        "or sandbox_grep calls. "
                         "Use this for toolchain work, file inspection, piping, loops and anything "
                         "sandbox_exec's script-file rule cannot express. Destructive commands "
                         "(rm/mv/... on work/ paths) require the same single-use user authorization "
@@ -4056,6 +4276,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 return self.list_files(SandboxAgentFileListRequest.model_validate(payload))
             if name == "sandbox_grep":
                 return self.grep_files(SandboxAgentFileGrepRequest.model_validate(payload))
+            if name == "sandbox_pipeline":
+                return self.run_pipeline(SandboxAgentPipelineRequest.model_validate(payload))
             if name == "sandbox_delete_file":
                 return self.delete_file(SandboxAgentFileDeleteRequest.model_validate(payload))
             if name == "sandbox_exec":

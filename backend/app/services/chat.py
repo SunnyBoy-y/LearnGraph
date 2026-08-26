@@ -2775,6 +2775,16 @@ class ChatService:
                         "generate_image.source_file_ids so the original pixels "
                         "are preserved. Only access another session's files "
                         "when the user explicitly asks."
+                        "Tool usage strategy (deterministic orchestration first): "
+                        "whenever a task can be expressed as loops / batch reads / "
+                        "filter / dedup / retry / aggregation over a set of files "
+                        "or results, prefer writing one Python script and running "
+                        "it once via sandbox_bash (or sandbox_write_file then "
+                        "sandbox_exec) instead of making repeated sandbox_read_file "
+                        "or sandbox_grep calls one by one. As a rule of thumb, if "
+                        "the same tool call would be repeated 3 or more times for "
+                        "similar work, write a script and run it once; keep single "
+                        "tool calls for one-off operations."
                     ),
                 )
             )

@@ -255,6 +255,11 @@ class SandboxAgentImagePublishRequest(BaseModel):
 class SandboxAgentFileReadRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
     path: str = Field(min_length=1, max_length=255)
+    # Batch mode: read multiple files in one tool call. When set (1..16 paths),
+    # ``path`` is ignored and each file is read with the same start_line /
+    # end_line / max_chars applied per file. Results merge into a ``files``
+    # list and only one audit/touch/commit happens for the whole batch.
+    paths: list[str] | None = Field(default=None, max_length=16)
     # Optional line-range view: read only lines [start_line, end_line] (1-based,
     # inclusive). Combined with max_chars this keeps large files out of the
     # model context. When omitted the whole file is returned.
@@ -275,6 +280,11 @@ class SandboxAgentFileGrepRequest(BaseModel):
     case_sensitive: bool = False
     context_lines: int = Field(default=0, ge=0, le=5)
     max_matches: int = Field(default=50, ge=1, le=500)
+    # When true, each matching file also returns a ``content`` snippet (all
+    # hit lines, capped by content_max_chars) so the agent can judge a hit
+    # without a follow-up sandbox_read_file round trip.
+    include_content: bool = False
+    content_max_chars: int | None = Field(default=None, ge=1, le=200_000)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
@@ -364,7 +374,30 @@ class SandboxAgentFileGrepView(BaseModel):
     skipped_container_only: int
     matches: list[SandboxAgentFileGrepMatch] = Field(default_factory=list)
     file_counts: list[SandboxAgentFileGrepCount] = Field(default_factory=list)
+    # include_content=true: per-file hit snippets [{path, content}].
+    contents: list[dict[str, str]] = Field(default_factory=list)
     truncated: bool = False
+
+
+class SandboxAgentPipelineRequest(BaseModel):
+    """Declarative deterministic orchestration (sandbox_pipeline).
+
+    Host-side pipeline over the durable session workspace: list -> filter ->
+    read -> dedup -> aggregate. Deterministic, offline, one audit+commit for
+    the whole pipeline. Stages carry a working set of file items forward.
+
+    Supported stage shapes (op + keys):
+      {"op": "list",  "pattern": "work/**/*.py", "max_results": 200}
+      {"op": "filter", "path_glob": "*.py"}          # fnmatch on item path
+      {"op": "filter", "max_size_bytes": 1048576}    # size_bytes <= cap
+      {"op": "read",  "limit": 10, "max_chars": 4000}  # attach content
+      {"op": "dedup"}                                  # drop duplicate paths
+      {"op": "aggregate"}                              # count/size summary
+    """
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    stages: list[dict[str, Any]] = Field(min_length=1, max_length=10)
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
 class SandboxAgentCommandView(ORMModel):
