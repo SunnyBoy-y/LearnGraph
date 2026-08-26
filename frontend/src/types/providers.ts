@@ -43,6 +43,30 @@ export interface ProviderCreateRequest {
   capabilities?: UnknownRecord;
 }
 
+/** 便捷导入：复用已配置供应商凭据的目标能力候选。 */
+export interface ProviderImportTarget {
+  provider_type: string;
+  role: ProviderRole;
+  label: string;
+  base_url: string | null;
+  already_imported: boolean;
+}
+
+export interface ProviderImportCandidate {
+  source_provider_id: string;
+  display_name: string;
+  provider_type: string;
+  brand_id: string | null;
+  targets: ProviderImportTarget[];
+}
+
+export interface ProviderImportRequest {
+  source_provider_id: string;
+  target_provider_type: string;
+  display_name?: string;
+  base_url?: string;
+}
+
 export interface ProviderUpdateRequest {
   enabled?: boolean;
   /** Catalog provider type, which determines the connection protocol. */

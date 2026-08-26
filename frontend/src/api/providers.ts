@@ -10,6 +10,8 @@ import type {
   ProviderBalanceQueryLastResult,
   Provider,
   ProviderCreateRequest,
+  ProviderImportCandidate,
+  ProviderImportRequest,
   ProviderUpdateRequest,
   ProviderModelsResponse,
   ProviderModelCapabilityUpdateRequest,
@@ -40,6 +42,19 @@ export function createProvider(
   payload: ProviderCreateRequest,
 ): Promise<Provider> {
   return apiClient.post<Provider, ProviderCreateRequest>("/providers", payload);
+}
+
+export function listProviderImportCandidates(): Promise<
+  ProviderImportCandidate[]
+> {
+  return apiClient.get<ProviderImportCandidate[]>("/providers/import-candidates");
+}
+
+export function importProvider(payload: ProviderImportRequest): Promise<Provider> {
+  return apiClient.post<Provider, ProviderImportRequest>(
+    "/providers/import",
+    payload,
+  );
 }
 
 export function discoverProviderModels(
