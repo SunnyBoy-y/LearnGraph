@@ -67,6 +67,17 @@ export interface ProviderImportRequest {
   base_url?: string;
 }
 
+/** 从 cc-switch 配置批量导入供应商。 */
+export interface CcSwitchImportRequest {
+  config_json: string;
+  provider_type?: string;
+}
+
+export interface CcSwitchImportResult {
+  created: Array<{ name: string; provider_id: string; enabled: boolean }>;
+  skipped: Array<{ name: string; reason: string; provider_id?: string }>;
+}
+
 export interface ProviderUpdateRequest {
   enabled?: boolean;
   /** Catalog provider type, which determines the connection protocol. */

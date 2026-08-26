@@ -9,6 +9,8 @@ import type {
   ProviderBalanceQueryHttpRequest,
   ProviderBalanceQueryLastResult,
   Provider,
+  CcSwitchImportRequest,
+  CcSwitchImportResult,
   ProviderCreateRequest,
   ProviderImportCandidate,
   ProviderImportRequest,
@@ -53,6 +55,15 @@ export function listProviderImportCandidates(): Promise<
 export function importProvider(payload: ProviderImportRequest): Promise<Provider> {
   return apiClient.post<Provider, ProviderImportRequest>(
     "/providers/import",
+    payload,
+  );
+}
+
+export function importCcSwitchProviders(
+  payload: CcSwitchImportRequest,
+): Promise<CcSwitchImportResult> {
+  return apiClient.post<CcSwitchImportResult, CcSwitchImportRequest>(
+    "/providers/import-ccswitch",
     payload,
   );
 }

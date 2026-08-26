@@ -55,6 +55,7 @@ import {
   getProviderModelDefaults,
   getHostBridgeStatus,
   getSecretStoreStatus,
+  importCcSwitchProviders,
   importProvider,
   listProviderCatalog,
   listProviderImportCandidates,
@@ -703,6 +704,23 @@ export function ProvidersPage() {
     },
     onError: (error) => toast.error(error.message),
   });
+  const importCcSwitchMutation = useMutation({
+    mutationFn: importCcSwitchProviders,
+    onSuccess: (result) => {
+      const n = result.created.length;
+      const skipped = result.skipped.length;
+      toast.success(
+        skipped > 0
+          ? `从 cc-switch 导入 ${n} 个供应商，跳过 ${skipped} 个（重复或不支持）`
+          : `从 cc-switch 导入 ${n} 个供应商`,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({
+        queryKey: ["provider-import-candidates"],
+      });
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const update = useMutation({
     mutationFn: ({
       id,
@@ -890,6 +908,9 @@ export function ProvidersPage() {
             <ImportProviderDialog
               busy={importProviderMutation.isPending}
               candidates={importCandidates.data ?? []}
+              onCcSwitchImport={(configJson) =>
+                importCcSwitchMutation.mutate({ config_json: configJson })
+              }
               onImport={(payload) => importProviderMutation.mutate(payload)}
             />
           </div>
@@ -2982,15 +3003,18 @@ function providerQuickBrand(provider: Provider): QuickProvider | undefined {
 function ImportProviderDialog({
   busy,
   candidates,
+  onCcSwitchImport,
   onImport,
 }: {
   busy: boolean;
   candidates: ProviderImportCandidate[];
+  onCcSwitchImport: (configJson: string) => void;
   onImport: (payload: {
     source_provider_id: string;
     target_provider_type: string;
   }) => void;
 }) {
+  const [ccswitchText, setCcswitchText] = useState("");
   return (
     <Dialog>
       <DialogTrigger asChild>
@@ -3048,6 +3072,25 @@ function ImportProviderDialog({
               </div>
             ))
           )}
+          <div className="space-y-2 border-t pt-3">
+            <Label>从 cc-switch 导入</Label>
+            <Textarea
+              onChange={(event) => setCcswitchText(event.currentTarget.value)}
+              placeholder="粘贴 ~/.cc-switch/config.json 的完整内容"
+              rows={4}
+              value={ccswitchText}
+            />
+            <Button
+              disabled={busy || !ccswitchText.trim()}
+              onClick={() => onCcSwitchImport(ccswitchText)}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              <Copy className="size-4" />
+              从 cc-switch 导入
+            </Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>
