@@ -14,6 +14,7 @@ import {
   Activity,
   AlertTriangle,
   Bot,
+  Copy,
   LockKeyhole,
   Pencil,
   Plus,
@@ -874,19 +875,22 @@ export function ProvidersPage() {
         actions={
           <div className="flex flex-wrap gap-2">
             <ProviderDialog
-              busy={create.isPending || importProviderMutation.isPending}
+              busy={create.isPending}
               catalog={providerCatalog.data ?? []}
               catalogError={
                 providerCatalog.isError ? providerCatalog.error.message : undefined
               }
               catalogPending={providerCatalog.isPending}
-              importCandidates={importCandidates.data ?? []}
               initialRole={roleFilter === "all" ? undefined : roleFilter}
               onCreate={(payload) => create.mutate(payload)}
-              onImport={(payload) => importProviderMutation.mutate(payload)}
               secretStoreAvailable={
                 !secretStore.isPending && Boolean(secretStore.data?.available)
               }
+            />
+            <ImportProviderDialog
+              busy={importProviderMutation.isPending}
+              candidates={importCandidates.data ?? []}
+              onImport={(payload) => importProviderMutation.mutate(payload)}
             />
           </div>
         }
@@ -2975,22 +2979,94 @@ function providerQuickBrand(provider: Provider): QuickProvider | undefined {
   return preset;
 }
 
+function ImportProviderDialog({
+  busy,
+  candidates,
+  onImport,
+}: {
+  busy: boolean;
+  candidates: ProviderImportCandidate[];
+  onImport: (payload: {
+    source_provider_id: string;
+    target_provider_type: string;
+  }) => void;
+}) {
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <Button size="sm" variant="outline">
+          <Copy className="size-4" />
+          导入
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>快捷导入</DialogTitle>
+          <DialogDescription>
+            复用已配置供应商的凭据，复制到其他服务能力，无需重复填写地址与密钥。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-5">
+          {candidates.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              暂无已配置的供应商可导入。请先在「新增 Provider」中配置至少一个供应商。
+            </p>
+          ) : (
+            candidates.map((candidate) => (
+              <div
+                className="rounded-lg border p-3"
+                key={candidate.source_provider_id}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="grid size-7 shrink-0 place-items-center rounded-md bg-muted">
+                    <Bot className="size-3.5" />
+                  </span>
+                  <span className="text-sm font-medium">
+                    {candidate.display_name}
+                  </span>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {candidate.targets.map((target) => (
+                    <button
+                      className="rounded-full border px-2.5 py-1 text-xs transition-colors enabled:border-border enabled:bg-background enabled:hover:border-primary/40 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={busy || target.already_imported}
+                      key={target.provider_type}
+                      onClick={() =>
+                        onImport({
+                          source_provider_id: candidate.source_provider_id,
+                          target_provider_type: target.provider_type,
+                        })
+                      }
+                      type="button"
+                    >
+                      {target.already_imported
+                        ? `${target.label} · 已导入`
+                        : `导入为 ${target.label}`}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ProviderDialog({
   busy,
   catalog,
   catalogError,
   catalogPending,
-  importCandidates,
   initialRole,
   onCreate,
-  onImport,
   secretStoreAvailable,
 }: {
   busy: boolean;
   catalog: ProviderTypeCatalogItem[];
   catalogError?: string;
   catalogPending: boolean;
-  importCandidates: ProviderImportCandidate[];
   initialRole?: ProviderRole;
   onCreate: (payload: {
     display_name: string;
@@ -2998,12 +3074,6 @@ function ProviderDialog({
     base_url?: string;
     api_key?: string;
     capabilities?: Record<string, unknown>;
-  }) => void;
-  onImport: (payload: {
-    source_provider_id: string;
-    target_provider_type: string;
-    display_name?: string;
-    base_url?: string;
   }) => void;
   secretStoreAvailable: boolean;
 }) {
@@ -3279,13 +3349,6 @@ function ProviderDialog({
   const baseUrlValid =
     !trimmedBaseUrl || isValidHttpUrl(trimmedBaseUrl);
   const baseUrlPathHint = missingApiPathHint(trimmedBaseUrl);
-  // 便捷导入：仅展示当前服务能力下可导入的源供应商，已导入的置灰。
-  const importForRole = importCandidates
-    .map((candidate) => ({
-      ...candidate,
-      targets: candidate.targets.filter((target) => target.role === role),
-    }))
-    .filter((candidate) => candidate.targets.length > 0);
 
   return (
     <Dialog
@@ -3347,42 +3410,6 @@ function ProviderDialog({
                 ))}
               </div>
             </div>
-            {importForRole.length > 0 ? (
-              <div className="space-y-2">
-                <Label>从已配置供应商导入</Label>
-                <div className="space-y-1.5">
-                  {importForRole.map((candidate) => (
-                    <div
-                      className="flex flex-wrap items-center gap-1.5"
-                      key={candidate.source_provider_id}
-                    >
-                      <span className="text-xs text-muted-foreground">
-                        {candidate.display_name}
-                      </span>
-                      {candidate.targets.map((target) => (
-                        <button
-                          aria-label={`从 ${candidate.display_name} 导入为 ${target.label}`}
-                          className="rounded-full border px-2.5 py-1 text-xs transition-colors enabled:border-border enabled:bg-background enabled:hover:border-primary/40 disabled:cursor-not-allowed disabled:opacity-50"
-                          disabled={busy || target.already_imported}
-                          key={target.provider_type}
-                          onClick={() =>
-                            onImport({
-                              source_provider_id: candidate.source_provider_id,
-                              target_provider_type: target.provider_type,
-                            })
-                          }
-                          type="button"
-                        >
-                          {target.already_imported
-                            ? `${target.label} · 已导入`
-                            : `导入为 ${target.label}`}
-                        </button>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
             <div className="space-y-2">
               <Label>快捷接入</Label>
               <div className="grid max-h-56 grid-cols-2 gap-2 overflow-y-auto pr-1 sm:grid-cols-3">
