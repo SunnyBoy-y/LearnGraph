@@ -831,3 +831,63 @@ def provider_catalog(*, include_development: bool = False) -> list[dict[str, obj
         for item in PROVIDER_TYPE_SPECS
         if include_development or item.role != "development"
     ]
+
+
+# --- 便捷导入（复用已配置供应商的凭据，不重构） ---------------------------
+# 源 provider_type -> 可导入的目标 provider_type 列表。
+# 每个目标为 (目标 provider_type, base_url override or None)。
+# base_url override 为 None 时，导入用目标 provider_type 的 default_base_url。
+# 仅覆盖「同一供应商 / 同一密钥能提供多个独立 provider_type」的组合；靠模型
+# 原生能力实现的（qwen 视觉/原生搜索、qwen 图片生成）不在此列，避免误导。
+PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
+    "qwen": (
+        ("qwen_image_search", None),
+        ("qwen_deep_research", None),
+        (
+            "openai_compatible_transcription",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        ("openai_compatible_embedding", None),
+    ),
+    "openai_responses": (
+        ("openai_responses_vision", None),
+        ("openai_images", None),
+        ("openai_deep_research", None),
+        ("openai_compatible_transcription", None),
+        ("openai_compatible_embedding", None),
+    ),
+    "openai_compatible_chat": (
+        ("openai_compatible_vision", None),
+        ("openai_compatible_transcription", None),
+        ("openai_compatible_embedding", None),
+    ),
+    "ollama": (
+        ("ollama_embedding", None),
+    ),
+    "ollama_cloud": (
+        ("ollama_cloud_search", None),
+    ),
+}
+
+# B 类能力（转写 / Embedding）的默认模型名过滤：这些目标的 /models 会返回该
+# 供应商的全部模型，自动取第一个可能选错（聊天模型而非 ASR / Embedding 模型）。
+# 导入时按模式挑出能力匹配的第一个作为默认模型；无匹配则保持未启用。
+IMPORT_MODEL_FILTERS: dict[str, tuple[str, ...]] = {
+    "openai_compatible_transcription": (
+        "asr",
+        "whisper",
+        "paraformer",
+        "sensevoice",
+        "transcription",
+        "speech",
+    ),
+    "openai_compatible_embedding": (
+        "text-embedding",
+        "embed",
+        "bge",
+        "m3e",
+        "e5",
+        "nomic",
+        "gte",
+    ),
+}

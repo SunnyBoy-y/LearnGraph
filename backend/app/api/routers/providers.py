@@ -12,6 +12,7 @@ from app.domain.schemas.management import (
     CodexDeviceLoginStartView,
     MasterKeyRotationView,
     ProviderCreateRequest,
+    ProviderImportRequest,
     ProviderTypeCatalogView,
     ProviderSecretLifecycleView,
     ProviderSecretRotateRequest,
@@ -92,6 +93,25 @@ def provider_catalog(
         ProviderTypeCatalogView.model_validate(item)
         for item in service(db, context, settings).catalog()
     ]
+
+
+@router.get("/import-candidates")
+def import_candidates(
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> list[dict]:
+    """列出可从已配置供应商导入的能力候选（便捷导入）。"""
+    return service(db, context, settings).import_candidates()
+
+
+@router.post("/import", response_model=ProviderView, status_code=status.HTTP_201_CREATED)
+def import_provider(
+    payload: ProviderImportRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderView:
+    """复用已配置供应商的凭据，为目标能力新建一个 Provider。"""
+    return ProviderView.model_validate(service(db, context, settings).import_from(payload))
 
 
 @router.get("/secret-store/status", response_model=SecretStoreStatusView)

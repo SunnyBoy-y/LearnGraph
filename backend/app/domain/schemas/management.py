@@ -533,6 +533,19 @@ class ProviderCreateRequest(BaseModel):
     capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProviderImportRequest(BaseModel):
+    """便捷导入：复用已配置供应商的凭据，为目标能力新建 Provider。
+
+    只需源 Provider id 与目标 provider_type；命名与 base_url 可选，缺省时
+    后端按导入兼容矩阵自动生成。
+    """
+
+    source_provider_id: str = Field(min_length=1, max_length=36)
+    target_provider_type: str = Field(min_length=1, max_length=80)
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+    base_url: str | None = Field(default=None, max_length=500)
+
+
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[

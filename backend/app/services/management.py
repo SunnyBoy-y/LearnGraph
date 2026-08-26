@@ -5,7 +5,7 @@ from datetime import datetime
 import json
 from urllib.parse import urlsplit
 
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -56,6 +56,7 @@ from app.domain.schemas.management import (
     ProviderBalanceQueryExecuteRequest,
     ProviderBalanceQueryResultRequest,
     ProviderCreateRequest,
+    ProviderImportRequest,
     ProviderSecretRotateRequest,
     ProviderUpdateRequest,
     ProviderModelCapabilityUpdateRequest,
@@ -76,8 +77,10 @@ from app.providers.catalog import (
     FETCH_PROVIDER_TYPES,
     IMAGE_GENERATION_PROVIDER_TYPES,
     IMAGE_SEARCH_PROVIDER_TYPES,
+    IMPORT_MODEL_FILTERS,
     MEMORY_PROVIDER_TYPES,
     MODEL_PROVIDER_TYPES,
+    PROVIDER_IMPORT_TARGETS,
     REST_IMAGE_SEARCH_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
     TRANSCRIPTION_PROVIDER_TYPES,
@@ -631,6 +634,187 @@ class ProviderService:
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
         return provider
+
+    def import_candidates(self) -> list[dict]:
+        """列出可从已配置供应商导入的能力候选（便捷导入，不重构）。
+
+        仅返回「已启用 + 可用凭据」的源 provider，并按导入兼容矩阵给出其
+        可导入的目标能力；已导入的能力标记 already_imported 供前端置灰。
+        """
+        providers = self.list()
+        configured_types = {p.provider_type for p in providers}
+        result: list[dict] = []
+        for provider in providers:
+            targets = PROVIDER_IMPORT_TARGETS.get(provider.provider_type)
+            if not targets:
+                continue
+            if not provider.enabled or not provider.remote_capability:
+                continue
+            # 目标能力需要密钥时，源必须持有可用密钥（本地 Ollama 无需真实 key）。
+            if (
+                provider.provider_type != "ollama"
+                and self._active_secret_record(provider.id) is None
+            ):
+                continue
+            target_list: list[dict] = []
+            for target_type, base_url_hint in targets:
+                spec = provider_type_spec(target_type)
+                if spec is None or not spec.create_allowed:
+                    continue
+                target_list.append(
+                    {
+                        "provider_type": target_type,
+                        "role": spec.role,
+                        "label": spec.label,
+                        "base_url": base_url_hint or spec.default_base_url,
+                        "already_imported": target_type in configured_types,
+                    }
+                )
+            if not target_list:
+                continue
+            result.append(
+                {
+                    "source_provider_id": provider.id,
+                    "display_name": provider.display_name,
+                    "provider_type": provider.provider_type,
+                    "brand_id": (provider.capabilities or {}).get("brand_id"),
+                    "targets": target_list,
+                }
+            )
+        return result
+
+    def import_from(self, payload: ProviderImportRequest) -> ProviderConfig:
+        """复用已配置供应商的凭据，为目标能力新建一个 Provider。
+
+        便捷导入：读源 provider 的密钥与网关，按目标 provider_type 建新行并
+        复制（重加密）密钥，再按目标角色生成默认能力。源 provider 与其密钥
+        记录保持不变；新行独立发现模型、独立启用。
+        """
+        source = self.providers.require(payload.source_provider_id, "provider")
+        targets = PROVIDER_IMPORT_TARGETS.get(source.provider_type)
+        if not targets:
+            raise AppError(
+                422,
+                "provider_import_not_supported",
+                "This provider type cannot be imported into other capabilities",
+            )
+        target_entry = next(
+            (t for t in targets if t[0] == payload.target_provider_type), None
+        )
+        if target_entry is None:
+            raise AppError(
+                422,
+                "provider_import_incompatible",
+                "The selected source provider cannot provide this capability",
+            )
+        spec = provider_type_spec(payload.target_provider_type)
+        if spec is None or not spec.create_allowed:
+            raise AppError(
+                422,
+                "unsupported_provider_type",
+                "This provider type cannot be created by the current backend",
+            )
+
+        # 复用源密钥：后端解密后重加密到新 provider 下，密钥不出后端。
+        secret_plaintext: str | None = None
+        if spec.requires_secret and source.provider_type != "ollama":
+            secret_plaintext = self._decrypt_secret(source.id)
+
+        resolved_base_url = (
+            (payload.base_url or "").strip()
+            or target_entry[1]
+            or spec.default_base_url
+        )
+        resolved_name = (
+            (payload.display_name or "").strip()
+            or self._import_default_name(source, spec)
+        )
+
+        provider = self.create(
+            ProviderCreateRequest(
+                display_name=resolved_name,
+                provider_type=payload.target_provider_type,
+                base_url=resolved_base_url,
+                api_key=SecretStr(secret_plaintext) if secret_plaintext else None,
+            )
+        )
+        # create() 已对 supports_probe 的目标自动 probe。仅对 A 类（非转写/
+        # Embedding）目标自动发现并启用；B 类的 /models 返回供应商全部模型，
+        # 自动取第一个可能选错默认模型，保持现状由用户手动发现/选择。
+        if (
+            spec.supports_model_discovery
+            and payload.target_provider_type not in IMPORT_MODEL_FILTERS
+        ):
+            provider = self._import_discover(provider)
+        return provider
+
+    def _import_default_name(self, source: ProviderConfig, spec: object) -> str:
+        base = source.display_name.strip()
+        role = getattr(spec, "role", None)
+        if role == "model":
+            return self._unique_display_name(base)
+        suffix = {
+            "vision": "视觉",
+            "image_generation": "生图",
+            "image_search": "图搜",
+            "search": "搜索",
+            "fetch": "抓取",
+            "deep_research": "研究",
+            "transcription": "转写",
+            "embedding": "Embedding",
+            "memory": "记忆",
+        }.get(role, str(role))
+        return self._unique_display_name(f"{base}-{suffix}")
+
+    def _unique_display_name(self, base: str) -> str:
+        existing = {
+            name
+            for (name,) in self.db.execute(
+                select(ProviderConfig.display_name).where(
+                    ProviderConfig.workspace_id == self.workspace_id
+                )
+            ).all()
+        }
+        if base not in existing:
+            return base
+        i = 2
+        while f"{base}-{i}" in existing:
+            i += 1
+        return f"{base}-{i}"
+
+    def _import_discover(self, provider: ProviderConfig) -> ProviderConfig:
+        """导入后自动发现模型，发现成功且可选默认模型则自动启用。"""
+        try:
+            self.models(provider.id)
+            provider = self.providers.require(provider.id, "provider")
+            self.db.refresh(provider)
+        except AppError:
+            # 发现失败不阻断导入：新行已建、凭据已复制，用户可手动发现。
+            return provider
+        if self._import_default_model_id(provider):
+            try:
+                return self.update(provider.id, ProviderUpdateRequest(enabled=True))
+            except AppError:
+                return provider
+        return provider
+
+    def _import_default_model_id(self, provider: ProviderConfig) -> str:
+        caps = provider.capabilities or {}
+        if provider.provider_type in IMAGE_GENERATION_PROVIDER_TYPES:
+            return str(caps.get("default_image_generation_model_id") or "").strip()
+        if provider.provider_type in EMBEDDING_PROVIDER_TYPES:
+            return str(
+                caps.get("default_embedding_model_id") or caps.get("default_model") or ""
+            ).strip()
+        if provider.provider_type in VISION_PROVIDER_TYPES:
+            return str(
+                caps.get("default_vision_model_id") or caps.get("default_model") or ""
+            ).strip()
+        if provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
+            return str(
+                caps.get("deep_research_model") or caps.get("default_model") or ""
+            ).strip()
+        return str(caps.get("default_model") or "").strip()
 
     def default_model_capabilities(
         self,
