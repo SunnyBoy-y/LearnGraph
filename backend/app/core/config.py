@@ -208,6 +208,16 @@ class Settings(BaseSettings):
     stream_event_retention_enabled: bool = True
     stream_event_retention_days: int = 90
     stream_event_retention_interval_seconds: int = 3600
+    # M5: hot append-only projection tables (message_stream_events /
+    # sandbox_agent_events) archive rows older than ``hot_table_archive_days``
+    # into same-schema ``*_archive`` cold tables instead of deleting them, so
+    # old transport/replay projections stay inspectable while the hot tables
+    # stay small. memory_events is the event-sourced authoritative store and is
+    # intentionally NOT archived (replay depends on it). 0 disables archiving.
+    hot_table_archive_enabled: bool = True
+    hot_table_archive_days: int = 90
+    hot_table_archive_interval_seconds: int = 7200
+    hot_table_archive_batch_size: int = 5000
     storage_root: Path = Path("./data/storage")
     memory_root: Path = Path("./data/memory")
     # Production SPA directory served by the API process. Empty keeps the

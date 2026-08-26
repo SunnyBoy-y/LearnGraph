@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
@@ -1155,6 +1155,128 @@ async def stream_events_retention_scheduler(
             await asyncio.to_thread(run_stream_events_retention)
         except Exception:
             logger.exception("Stream-event retention wake-up failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+# M5: hot append-only projection tables whose authoritative rows live
+# elsewhere (messages/message_parts for stream events; sandbox_agent_tasks
+# for agent events). Rows older than the archive window move into same-schema
+# ``*_archive`` cold tables instead of being deleted. memory_events is NOT
+# here: it is the event-sourced authoritative store and replay depends on it.
+_HOT_ARCHIVE_TABLES: tuple[tuple[str, str], ...] = (
+    ("message_stream_events", "message_stream_events_archive"),
+    ("sandbox_agent_events", "sandbox_agent_events_archive"),
+)
+
+
+def run_hot_table_archive(*, now: datetime | None = None) -> dict[str, int]:
+    """Archive old rows of hot append-only projection tables into cold tables.
+
+    Batch-moves rows older than ``hot_table_archive_days`` from
+    ``message_stream_events`` / ``sandbox_agent_events`` into same-schema
+    ``*_archive`` tables (created on demand), then deletes them from the hot
+    table. Fenced by the advisory lock and deferred while agent streams are
+    generating, like the other maintenance sweeps. Returns
+    ``{source_table: moved_rows}``.
+    """
+
+    settings = get_settings()
+    if not settings.hot_table_archive_enabled:
+        return {}
+    days = settings.hot_table_archive_days
+    if days <= 0:
+        return {}
+    if _should_defer_sweep("sweep.hot_table_archive"):
+        return {}
+    cutoff = (now or utc_now()) - timedelta(days=days)
+    with SessionLocal() as lock_db:
+        lock_token = acquire_advisory_lock(
+            lock_db, "sweep.hot_table_archive", ttl_seconds=1200
+        )
+    if lock_token is None:
+        return {}
+    moved: dict[str, int] = {}
+    try:
+        batch = max(100, min(int(settings.hot_table_archive_batch_size), 20_000))
+        with SessionLocal() as db:
+            for source, archive in _HOT_ARCHIVE_TABLES:
+                db.execute(
+                    text(
+                        f"CREATE TABLE IF NOT EXISTS {archive} AS "
+                        f"SELECT * FROM {source} WHERE 1=0"
+                    )
+                )
+                db.commit()
+                table_total = 0
+                while True:
+                    inserted = int(
+                        db.execute(
+                            text(
+                                f"INSERT INTO {archive} "
+                                f"SELECT * FROM {source} WHERE created_at < :cutoff "
+                                f"LIMIT :batch"
+                            ),
+                            {"cutoff": cutoff, "batch": batch},
+                        ).rowcount
+                        or 0
+                    )
+                    if not inserted:
+                        break
+                    db.execute(
+                        text(
+                            f"DELETE FROM {source} WHERE rowid IN ("
+                            f"SELECT rowid FROM {source} "
+                            f"WHERE created_at < :cutoff LIMIT :batch)"
+                        ),
+                        {"cutoff": cutoff, "batch": batch},
+                    )
+                    db.commit()
+                    table_total += inserted
+                    if inserted < batch:
+                        break
+                moved[source] = table_total
+                if table_total:
+                    logger.info(
+                        "Hot-table archive moved %s rows %s -> %s",
+                        table_total,
+                        source,
+                        archive,
+                    )
+        _note_sweep_ran("sweep.hot_table_archive")
+        return moved
+    except Exception:
+        logger.exception("Hot-table archive sweep failed")
+        return {}
+    finally:
+        try:
+            with SessionLocal() as lock_db:
+                release_advisory_lock(
+                    lock_db, "sweep.hot_table_archive", lock_token
+                )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+
+async def hot_table_archive_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    """Periodically archive old rows of hot append-only projection tables."""
+
+    interval = max(
+        600,
+        interval_seconds
+        if interval_seconds is not None
+        else get_settings().hot_table_archive_interval_seconds,
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_hot_table_archive)
+        except Exception:
+            logger.exception("Hot-table archive wake-up failed")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

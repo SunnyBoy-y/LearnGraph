@@ -16,6 +16,7 @@ from app.core.errors import install_error_handlers
 from app.frontend_static import install_frontend_static
 from app.core.seed import ensure_demo_data
 from app.core.scheduler import (
+    hot_table_archive_scheduler,
     mastery_scheduler,
     memory_extraction_scheduler,
     memory_retention_scheduler,
@@ -112,6 +113,11 @@ async def lifespan(_: FastAPI):
         stream_events_retention_task = asyncio.create_task(
             stream_events_retention_scheduler(stream_events_retention_stop)
         )
+    if settings.hot_table_archive_interval_seconds > 0:
+        hot_archive_stop = asyncio.Event()
+        hot_archive_task = asyncio.create_task(
+            hot_table_archive_scheduler(hot_archive_stop)
+        )
     try:
         yield
     finally:
@@ -148,6 +154,9 @@ async def lifespan(_: FastAPI):
         ):
             stream_events_retention_stop.set()
             await stream_events_retention_task
+        if hot_archive_stop is not None and hot_archive_task is not None:
+            hot_archive_stop.set()
+            await hot_archive_task
 
 
 class SecurityHeadersMiddleware:
