@@ -3566,7 +3566,9 @@ class AgentToolRuntime:
                 "source_assistant_message_id": assistant_message_id,
             },
         )
-        db.flush()
+       
+        db.commit()
+        db.refresh(item)
         view = GraphChangeSetView.model_validate(item).model_dump(mode="json")
         component = service.component_data(item)
         return self._success(
