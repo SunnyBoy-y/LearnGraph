@@ -559,6 +559,35 @@ class CcSwitchImportRequest(BaseModel):
     provider_type: str | None = Field(default=None, min_length=1, max_length=80)
 
 
+class DiscoveredProviderImportRequest(BaseModel):
+    """无感探测导入：后端按探测项 source_id 解析来源信息后创建 Provider。
+
+    - ``env-*`` 前缀：source_id 为 ``env-DASHSCOPE_API_KEY`` 之类，后端读取
+      对应系统环境变量注入 Secret Store，密钥不会回传前端；
+    - 本地服务项（如 ``discovered-ollama`` / ``discovered-lmstudio``）：后端仅按
+      provider_type + base_url 建立免密钥 Provider。
+    """
+
+    source_id: str = Field(min_length=1, max_length=100)
+    target_provider_type: str = Field(min_length=1, max_length=80)
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+    base_url: str | None = Field(default=None, max_length=500)
+
+
+class ProviderImportBatchTarget(BaseModel):
+    """批量流转目标：仅协议（provider_type）与可选命名；base_url 与密钥随源流转。"""
+
+    target_provider_type: str = Field(min_length=1, max_length=80)
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ProviderImportBatchRequest(BaseModel):
+    """批量流转请求：同一源 Provider 一次性流转到多个目标能力。"""
+
+    source_provider_id: str = Field(min_length=1, max_length=36)
+    targets: list[ProviderImportBatchTarget] = Field(min_length=1, max_length=32)
+
+
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[

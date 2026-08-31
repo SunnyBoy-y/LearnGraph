@@ -56,7 +56,9 @@ from app.domain.schemas.management import (
     ProviderBalanceQueryExecuteRequest,
     ProviderBalanceQueryResultRequest,
     CcSwitchImportRequest,
+    DiscoveredProviderImportRequest,
     ProviderCreateRequest,
+    ProviderImportBatchRequest,
     ProviderImportRequest,
     ProviderSecretRotateRequest,
     ProviderUpdateRequest,
@@ -685,29 +687,18 @@ class ProviderService:
         return result
 
     def import_from(self, payload: ProviderImportRequest) -> ProviderConfig:
-        """复用已配置供应商的凭据，为目标能力新建一个 Provider。
+        """复用已配置供应商的凭据，为目标能力新建一个 Provider（支持平台内 A ⇄ B 双向流转）。
 
         便捷导入：读源 provider 的密钥与网关，按目标 provider_type 建新行并
         复制（重加密）密钥，再按目标角色生成默认能力。源 provider 与其密钥
-        记录保持不变；新行独立发现模型、独立启用。
+        记录保持不变；新行独立发现模型、独立启用。兼容矩阵之外的组合在密钥可
+        复用时也允许流转（base_url 按目标默认值 / 源值兜底），仅拒绝不支持创建的目标类型。
         """
         source = self.providers.require(payload.source_provider_id, "provider")
-        targets = PROVIDER_IMPORT_TARGETS.get(source.provider_type)
-        if not targets:
-            raise AppError(
-                422,
-                "provider_import_not_supported",
-                "This provider type cannot be imported into other capabilities",
-            )
+        targets = PROVIDER_IMPORT_TARGETS.get(source.provider_type) or ()
         target_entry = next(
             (t for t in targets if t[0] == payload.target_provider_type), None
         )
-        if target_entry is None:
-            raise AppError(
-                422,
-                "provider_import_incompatible",
-                "The selected source provider cannot provide this capability",
-            )
         spec = provider_type_spec(payload.target_provider_type)
         if spec is None or not spec.create_allowed:
             raise AppError(
@@ -721,9 +712,11 @@ class ProviderService:
         if spec.requires_secret and source.provider_type != "ollama":
             secret_plaintext = self._decrypt_secret(source.id)
 
+        target_base_url_override = target_entry[1] if target_entry else None
         resolved_base_url = (
             (payload.base_url or "").strip()
-            or target_entry[1]
+            or (source.base_url or "").strip()
+            or target_base_url_override
             or spec.default_base_url
         )
         resolved_name = (
@@ -742,6 +735,190 @@ class ProviderService:
         # create() 已对 supports_probe 的目标自动 probe。仅对 A 类（非转写/
         # Embedding）目标自动发现并启用；B 类的 /models 返回供应商全部模型，
         # 自动取第一个可能选错默认模型，保持现状由用户手动发现/选择。
+        if (
+            spec.supports_model_discovery
+            and payload.target_provider_type not in IMPORT_MODEL_FILTERS
+        ):
+            provider = self._import_discover(provider)
+        return provider
+
+    def import_batch(self, payload: ProviderImportBatchRequest) -> dict:
+        """批量流转：将同一源 Provider 的 base_url 与密钥一次性流转到多个目标能力。
+
+        每个目标独立走 import_from（协议由 target_provider_type 决定，base_url 与
+        key 随源流转），单项失败不阻断其它目标，逐项返回 created / skipped。
+        """
+        created: list[dict] = []
+        skipped: list[dict] = []
+        for target in payload.targets:
+            try:
+                provider = self.import_from(
+                    ProviderImportRequest(
+                        source_provider_id=payload.source_provider_id,
+                        target_provider_type=target.target_provider_type,
+                        display_name=target.display_name,
+                    )
+                )
+                created.append(
+                    {
+                        "provider_id": provider.id,
+                        "display_name": provider.display_name,
+                        "provider_type": provider.provider_type,
+                        "enabled": provider.enabled,
+                    }
+                )
+            except AppError as exc:
+                skipped.append(
+                    {
+                        "target_provider_type": target.target_provider_type,
+                        "reason": exc.code,
+                    }
+                )
+        return {"created": created, "skipped": skipped}
+
+    def discover_environment_providers(self) -> list[dict]:
+        """无感自动探测当前环境中的本地运行服务（Ollama / LM Studio）与系统凭据。
+
+        探测项统一返回标准化结构；环境凭据仅回传脱敏摘要与 env 变量名，明文
+        密钥绝不进入返回体，由 ``import_from_discovered`` 在后端读取并注入。
+        """
+        import os
+
+        import httpx
+
+        discovered: list[dict] = []
+        configured_types = {p.provider_type for p in self.list() if p.enabled}
+
+        # 1. 本地 Ollama (11434)
+        try:
+            with httpx.Client(timeout=1.0) as client:
+                res = client.get("http://127.0.0.1:11434/api/tags")
+                if res.status_code == 200:
+                    models = [m.get("name") for m in res.json().get("models", []) if m.get("name")]
+                    discovered.append({
+                        "id": "discovered-ollama",
+                        "display_name": "本地 Ollama 服务",
+                        "provider_type": "ollama",
+                        "brand_id": "ollama",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "role": "model",
+                        "requires_secret": False,
+                        "status": "online",
+                        "status_text": f"服务运行中 · 发现 {len(models)} 个模型" if models else "服务在线",
+                        "detected_models": models[:6],
+                        "already_imported": "ollama" in configured_types,
+                        "suggested_roles": [
+                            {"role": "model", "label": "主对话与推理", "provider_type": "ollama"},
+                            {"role": "embedding", "label": "向量嵌入", "provider_type": "ollama_embedding"},
+                        ],
+                    })
+        except Exception:
+            pass
+
+        # 2. 本地 LM Studio (1234)
+        try:
+            with httpx.Client(timeout=1.0) as client:
+                res = client.get("http://127.0.0.1:1234/v1/models")
+                if res.status_code == 200:
+                    models = [m.get("id") for m in res.json().get("data", []) if m.get("id")]
+                    discovered.append({
+                        "id": "discovered-lmstudio",
+                        "display_name": "本地 LM Studio",
+                        "provider_type": "openai_compatible_chat",
+                        "brand_id": "openai_compatible",
+                        "base_url": "http://127.0.0.1:1234/v1",
+                        "role": "model",
+                        "requires_secret": False,
+                        "status": "online",
+                        "status_text": f"服务运行中 · 发现 {len(models)} 个模型" if models else "服务在线",
+                        "detected_models": models[:6],
+                        "already_imported": any(p.base_url and "1234" in p.base_url for p in self.list()),
+                        "suggested_roles": [
+                            {"role": "model", "label": "主对话与推理", "provider_type": "openai_compatible_chat"},
+                            {"role": "vision", "label": "多模态视觉", "provider_type": "openai_compatible_vision"},
+                        ],
+                    })
+        except Exception:
+            pass
+
+        # 3. 系统环境变量凭据（只读白名单，脱敏展示）
+        env_mappings = [
+            ("DASHSCOPE_API_KEY", "qwen", "通义千问 (环境变量)", "qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", [
+                {"role": "model", "label": "主对话与推理", "provider_type": "qwen"},
+                {"role": "image_search", "label": "文搜图/图搜图", "provider_type": "qwen_image_search"},
+                {"role": "transcription", "label": "语音转写 (SenseVoice)", "provider_type": "openai_compatible_transcription"},
+                {"role": "embedding", "label": "向量嵌入", "provider_type": "openai_compatible_embedding"},
+            ]),
+            ("DEEPSEEK_API_KEY", "openai_compatible_chat", "DeepSeek (环境变量)", "deepseek", "https://api.deepseek.com", [
+                {"role": "model", "label": "主对话与深度思考", "provider_type": "openai_compatible_chat"},
+            ]),
+            ("OPENAI_API_KEY", "openai_responses", "OpenAI (环境变量)", "openai", "https://api.openai.com/v1", [
+                {"role": "model", "label": "主对话 Responses", "provider_type": "openai_responses"},
+                {"role": "image_generation", "label": "DALL·E 生图", "provider_type": "openai_images"},
+                {"role": "embedding", "label": "向量嵌入", "provider_type": "openai_compatible_embedding"},
+            ]),
+        ]
+        for env_var, p_type, name, brand, default_url, roles in env_mappings:
+            val = os.environ.get(env_var)
+            if val and len(val.strip()) > 8:
+                masked = val[:4] + "****" + val[-4:] if len(val) >= 12 else "****"
+                role_types = {r["provider_type"] for r in roles}
+                discovered.append({
+                    "id": f"env-{env_var}",
+                    "display_name": name,
+                    "provider_type": p_type,
+                    "brand_id": brand,
+                    "base_url": default_url,
+                    "role": "model",
+                    "requires_secret": True,
+                    "status": "ready",
+                    "status_text": f"系统环境发现凭据 ({masked})",
+                    "detected_models": [],
+                    "env_key_name": env_var,
+                    "already_imported": bool(configured_types & role_types),
+                    "suggested_roles": roles,
+                })
+        return discovered
+
+    def import_from_discovered(self, payload: DiscoveredProviderImportRequest) -> ProviderConfig:
+        """按探测项 source_id 在后端解析来源并创建 Provider。
+
+        环境凭据（``env-*``）由后端读取系统环境变量注入 Secret Store，明文密钥
+        不经过前端；本地服务项免密钥创建。环境变量缺失时明确报错而非静默建空。
+        """
+        import os
+
+        spec = provider_type_spec(payload.target_provider_type)
+        if spec is None or not spec.create_allowed:
+            raise AppError(
+                422,
+                "unsupported_provider_type",
+                "This provider type cannot be created by the current backend",
+            )
+        resolved_base_url = (payload.base_url or "").strip() or spec.default_base_url
+        resolved_name = (payload.display_name or "").strip() or spec.label
+
+        secret_plaintext: str | None = None
+        if payload.source_id.startswith("env-"):
+            env_var = payload.source_id[4:]
+            secret_plaintext = os.environ.get(env_var)
+            if spec.requires_secret and not secret_plaintext:
+                raise AppError(
+                    422,
+                    "env_secret_unavailable",
+                    f"系统环境变量 {env_var} 未提供可用的密钥，无法导入",
+                )
+            if secret_plaintext is not None:
+                secret_plaintext = secret_plaintext.strip()
+
+        provider = self.create(
+            ProviderCreateRequest(
+                display_name=resolved_name,
+                provider_type=payload.target_provider_type,
+                base_url=resolved_base_url,
+                api_key=SecretStr(secret_plaintext) if secret_plaintext else None,
+            )
+        )
         if (
             spec.supports_model_discovery
             and payload.target_provider_type not in IMPORT_MODEL_FILTERS
@@ -786,11 +963,17 @@ class ProviderService:
                         api_key=SecretStr(item["api_key"]) if item["api_key"] else None,
                     )
                 )
+                # 探测真机模型：调用 /models 端点列出该供应商实际可用的模型并
+                # 自动挑选默认模型；探测失败不阻断导入（凭据与地址已写入）。
+                provider = self._import_discover(provider)
                 created.append(
                     {
                         "name": item["name"],
                         "provider_id": provider.id,
                         "enabled": provider.enabled,
+                        "models": list(
+                            (provider.capabilities or {}).get("discovered_model_ids") or []
+                        ),
                     }
                 )
             except AppError as exc:

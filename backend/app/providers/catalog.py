@@ -833,12 +833,10 @@ def provider_catalog(*, include_development: bool = False) -> list[dict[str, obj
     ]
 
 
-# --- 便捷导入（复用已配置供应商的凭据，不重构） ---------------------------
+# --- 便捷导入与双向流转（复用已配置供应商凭据） ---------------------------
 # 源 provider_type -> 可导入的目标 provider_type 列表。
 # 每个目标为 (目标 provider_type, base_url override or None)。
-# base_url override 为 None 时，导入用目标 provider_type 的 default_base_url。
-# 仅覆盖「同一供应商 / 同一密钥能提供多个独立 provider_type」的组合；靠模型
-# 原生能力实现的（qwen 视觉/原生搜索、qwen 图片生成）不在此列，避免误导。
+# 支持平台内 A ⇄ B 双向能力流转与凭据复用。
 PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
     "qwen": (
         ("qwen_image_search", None),
@@ -848,6 +846,19 @@ PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
         ),
         ("openai_compatible_embedding", None),
+        ("openai_compatible_chat", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ),
+    "qwen_image_search": (
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("qwen_deep_research", None),
+        ("openai_compatible_transcription", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("openai_compatible_embedding", None),
+    ),
+    "qwen_deep_research": (
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("qwen_image_search", None),
+        ("openai_compatible_transcription", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("openai_compatible_embedding", None),
     ),
     "openai_responses": (
         ("openai_responses_vision", None),
@@ -855,17 +866,64 @@ PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
         ("openai_deep_research", None),
         ("openai_compatible_transcription", None),
         ("openai_compatible_embedding", None),
+        ("openai_compatible_chat", None),
+    ),
+    "openai_responses_vision": (
+        ("openai_responses", None),
+        ("openai_images", None),
+        ("openai_deep_research", None),
+        ("openai_compatible_transcription", None),
+        ("openai_compatible_embedding", None),
+    ),
+    "openai_images": (
+        ("openai_responses", None),
+        ("openai_compatible_chat", None),
+        ("openai_compatible_embedding", None),
+    ),
+    "openai_deep_research": (
+        ("openai_responses", None),
+        ("openai_compatible_chat", None),
+        ("openai_compatible_embedding", None),
     ),
     "openai_compatible_chat": (
         ("openai_compatible_vision", None),
         ("openai_compatible_transcription", None),
         ("openai_compatible_embedding", None),
+        ("openai_images", None),
+    ),
+    "openai_compatible_vision": (
+        ("openai_compatible_chat", None),
+        ("openai_compatible_transcription", None),
+        ("openai_compatible_embedding", None),
+    ),
+    "openai_compatible_transcription": (
+        ("openai_compatible_chat", None),
+        ("openai_compatible_embedding", None),
+        ("openai_compatible_vision", None),
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ),
+    "openai_compatible_embedding": (
+        ("openai_compatible_chat", None),
+        ("openai_compatible_transcription", None),
+        ("openai_compatible_vision", None),
+        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ),
+    "deepseek": (
+        ("openai_compatible_chat", "https://api.deepseek.com"),
+        ("openai_compatible_embedding", None),
+        ("openai_compatible_transcription", None),
     ),
     "ollama": (
         ("ollama_embedding", None),
     ),
+    "ollama_embedding": (
+        ("ollama", None),
+    ),
     "ollama_cloud": (
         ("ollama_cloud_search", None),
+    ),
+    "ollama_cloud_search": (
+        ("ollama_cloud", None),
     ),
 }
 

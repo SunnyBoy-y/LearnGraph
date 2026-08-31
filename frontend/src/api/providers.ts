@@ -11,7 +11,11 @@ import type {
   Provider,
   CcSwitchImportRequest,
   CcSwitchImportResult,
+  DiscoveredProviderItem,
+  DiscoveredProviderImportRequest,
   ProviderCreateRequest,
+  ProviderImportBatchRequest,
+  ProviderImportBatchResult,
   ProviderImportCandidate,
   ProviderImportRequest,
   ProviderUpdateRequest,
@@ -52,9 +56,31 @@ export function listProviderImportCandidates(): Promise<
   return apiClient.get<ProviderImportCandidate[]>("/providers/import-candidates");
 }
 
+export function discoverProviders(): Promise<DiscoveredProviderItem[]> {
+  return apiClient.get<DiscoveredProviderItem[]>("/providers/discover");
+}
+
+export function importDiscoveredProvider(
+  payload: DiscoveredProviderImportRequest,
+): Promise<Provider> {
+  return apiClient.post<Provider, DiscoveredProviderImportRequest>(
+    "/providers/import-discovered",
+    payload,
+  );
+}
+
 export function importProvider(payload: ProviderImportRequest): Promise<Provider> {
   return apiClient.post<Provider, ProviderImportRequest>(
     "/providers/import",
+    payload,
+  );
+}
+
+export function importProviderBatch(
+  payload: ProviderImportBatchRequest,
+): Promise<ProviderImportBatchResult> {
+  return apiClient.post<ProviderImportBatchResult, ProviderImportBatchRequest>(
+    "/providers/import-batch",
     payload,
   );
 }

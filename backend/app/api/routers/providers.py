@@ -12,7 +12,9 @@ from app.domain.schemas.management import (
     CodexDeviceLoginStartView,
     MasterKeyRotationView,
     CcSwitchImportRequest,
+    DiscoveredProviderImportRequest,
     ProviderCreateRequest,
+    ProviderImportBatchRequest,
     ProviderImportRequest,
     ProviderTypeCatalogView,
     ProviderSecretLifecycleView,
@@ -102,6 +104,42 @@ def import_candidates(
 ) -> list[dict]:
     """列出可从已配置供应商导入的能力候选（便捷导入）。"""
     return service(db, context, settings).import_candidates()
+
+
+@router.get("/discover")
+def discover_providers(
+    db: DB, context: CurrentWorkspace, settings: AppSettings
+) -> list[dict]:
+    """无感自动探测当前环境中的本地运行服务与系统凭据候选。"""
+    return service(db, context, settings).discover_environment_providers()
+
+
+@router.post(
+    "/import-discovered",
+    response_model=ProviderView,
+    status_code=status.HTTP_201_CREATED,
+)
+def import_discovered_provider(
+    payload: DiscoveredProviderImportRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ProviderView:
+    """按探测项来源在后端解析环境凭据或本地服务信息并创建 Provider。"""
+    return ProviderView.model_validate(
+        service(db, context, settings).import_from_discovered(payload)
+    )
+
+
+@router.post("/import-batch")
+def import_batch_providers(
+    payload: ProviderImportBatchRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    """批量流转：同一源 Provider 的 base_url 与密钥一次性流转到多个目标能力。"""
+    return service(db, context, settings).import_batch(payload)
 
 
 @router.post("/import", response_model=ProviderView, status_code=status.HTTP_201_CREATED)

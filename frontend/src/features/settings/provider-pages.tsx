@@ -14,7 +14,6 @@ import {
   Activity,
   AlertTriangle,
   Bot,
-  Copy,
   LockKeyhole,
   Pencil,
   Plus,
@@ -55,10 +54,7 @@ import {
   getProviderModelDefaults,
   getHostBridgeStatus,
   getSecretStoreStatus,
-  importCcSwitchProviders,
-  importProvider,
   listProviderCatalog,
-  listProviderImportCandidates,
   listProviders,
   pollCodexDeviceLogin,
   pollCopilotDeviceLogin,
@@ -152,13 +148,13 @@ import {
   BalanceQueryConfigDialog,
   CustomBalanceDialog,
 } from "./balance-query";
+import { ImportProviderDialog } from "./import-provider-dialog";
 import type {
   CodexDeviceLoginStart,
   CopilotDeviceLoginStart,
   HostBridgeStatus,
   Provider,
   ProviderBalance,
-  ProviderImportCandidate,
   ProviderModelCapabilities,
   ProviderModelCapabilityView,
   ProviderModelsResponse,
@@ -503,10 +499,6 @@ export function ProvidersPage() {
     queryKey: ["provider-catalog"],
     queryFn: listProviderCatalog,
   });
-  const importCandidates = useQuery({
-    queryKey: ["provider-import-candidates"],
-    queryFn: listProviderImportCandidates,
-  });
   const secretStore = useQuery({
     queryKey: ["provider-secret-store"],
     queryFn: getSecretStoreStatus,
@@ -686,38 +678,6 @@ export function ProvidersPage() {
         toast.success("Provider 元数据已创建");
       }
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const importProviderMutation = useMutation({
-    mutationFn: importProvider,
-    onSuccess: (provider) => {
-      toast.success(
-        provider.enabled
-          ? `已从供应商导入并启用「${provider.display_name}」`
-          : `已从供应商导入「${provider.display_name}」`,
-      );
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      void queryClient.invalidateQueries({
-        queryKey: ["provider-import-candidates"],
-      });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const importCcSwitchMutation = useMutation({
-    mutationFn: importCcSwitchProviders,
-    onSuccess: (result) => {
-      const n = result.created.length;
-      const skipped = result.skipped.length;
-      toast.success(
-        skipped > 0
-          ? `从 cc-switch 导入 ${n} 个供应商，跳过 ${skipped} 个（重复或不支持）`
-          : `从 cc-switch 导入 ${n} 个供应商`,
-      );
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      void queryClient.invalidateQueries({
-        queryKey: ["provider-import-candidates"],
-      });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -906,12 +866,8 @@ export function ProvidersPage() {
               }
             />
             <ImportProviderDialog
-              busy={importProviderMutation.isPending}
-              candidates={importCandidates.data ?? []}
-              onCcSwitchImport={(configJson) =>
-                importCcSwitchMutation.mutate({ config_json: configJson })
-              }
-              onImport={(payload) => importProviderMutation.mutate(payload)}
+              providers={providers.data ?? []}
+              catalog={providerCatalog.data ?? []}
             />
           </div>
         }
@@ -2998,103 +2954,6 @@ function providerQuickBrand(provider: Provider): QuickProvider | undefined {
     return undefined;
   }
   return preset;
-}
-
-function ImportProviderDialog({
-  busy,
-  candidates,
-  onCcSwitchImport,
-  onImport,
-}: {
-  busy: boolean;
-  candidates: ProviderImportCandidate[];
-  onCcSwitchImport: (configJson: string) => void;
-  onImport: (payload: {
-    source_provider_id: string;
-    target_provider_type: string;
-  }) => void;
-}) {
-  const [ccswitchText, setCcswitchText] = useState("");
-  return (
-    <Dialog>
-      <DialogTrigger asChild>
-        <Button size="sm" variant="outline">
-          <Copy className="size-4" />
-          导入
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>快捷导入</DialogTitle>
-          <DialogDescription>
-            复用已配置供应商的凭据，复制到其他服务能力，无需重复填写地址与密钥。
-          </DialogDescription>
-        </DialogHeader>
-        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-5 py-5">
-          {candidates.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              暂无已配置的供应商可导入。请先在「新增 Provider」中配置至少一个供应商。
-            </p>
-          ) : (
-            candidates.map((candidate) => (
-              <div
-                className="rounded-lg border p-3"
-                key={candidate.source_provider_id}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="grid size-7 shrink-0 place-items-center rounded-md bg-muted">
-                    <Bot className="size-3.5" />
-                  </span>
-                  <span className="text-sm font-medium">
-                    {candidate.display_name}
-                  </span>
-                </div>
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {candidate.targets.map((target) => (
-                    <button
-                      className="rounded-full border px-2.5 py-1 text-xs transition-colors enabled:border-border enabled:bg-background enabled:hover:border-primary/40 disabled:cursor-not-allowed disabled:opacity-50"
-                      disabled={busy || target.already_imported}
-                      key={target.provider_type}
-                      onClick={() =>
-                        onImport({
-                          source_provider_id: candidate.source_provider_id,
-                          target_provider_type: target.provider_type,
-                        })
-                      }
-                      type="button"
-                    >
-                      {target.already_imported
-                        ? `${target.label} · 已导入`
-                        : `导入为 ${target.label}`}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ))
-          )}
-          <div className="space-y-2 border-t pt-3">
-            <Label>从 cc-switch 导入</Label>
-            <Textarea
-              onChange={(event) => setCcswitchText(event.currentTarget.value)}
-              placeholder="粘贴 ~/.cc-switch/config.json 的完整内容"
-              rows={4}
-              value={ccswitchText}
-            />
-            <Button
-              disabled={busy || !ccswitchText.trim()}
-              onClick={() => onCcSwitchImport(ccswitchText)}
-              size="sm"
-              type="button"
-              variant="outline"
-            >
-              <Copy className="size-4" />
-              从 cc-switch 导入
-            </Button>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
 }
 
 function ProviderDialog({

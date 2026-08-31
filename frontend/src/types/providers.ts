@@ -60,11 +60,60 @@ export interface ProviderImportCandidate {
   targets: ProviderImportTarget[];
 }
 
+export interface DiscoveredRoleOption {
+  role: ProviderRole;
+  label: string;
+  provider_type: string;
+}
+
+export interface DiscoveredProviderItem {
+  id: string;
+  display_name: string;
+  provider_type: string;
+  brand_id: string | null;
+  base_url: string;
+  role: ProviderRole;
+  requires_secret: boolean;
+  status: "online" | "ready" | "offline";
+  status_text: string;
+  detected_models: string[];
+  env_key_name?: string;
+  already_imported: boolean;
+  suggested_roles: DiscoveredRoleOption[];
+}
+
 export interface ProviderImportRequest {
   source_provider_id: string;
   target_provider_type: string;
   display_name?: string;
   base_url?: string;
+}
+
+export interface DiscoveredProviderImportRequest {
+  source_id: string;
+  target_provider_type: string;
+  display_name?: string;
+  base_url?: string;
+}
+
+export interface ProviderImportBatchTarget {
+  target_provider_type: string;
+  display_name?: string;
+}
+
+export interface ProviderImportBatchRequest {
+  source_provider_id: string;
+  targets: ProviderImportBatchTarget[];
+}
+
+export interface ProviderImportBatchResult {
+  created: Array<{
+    provider_id: string;
+    display_name: string;
+    provider_type: string;
+    enabled: boolean;
+  }>;
+  skipped: Array<{ target_provider_type: string; reason: string }>;
 }
 
 /** 从 cc-switch 配置批量导入供应商。 */
