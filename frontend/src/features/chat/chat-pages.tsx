@@ -3181,6 +3181,10 @@ export function ChatCanvasPage() {
   // that should inherit the workspace default 智能体).
   const [composerPrefsReadySessionId, setComposerPrefsReadySessionId] =
     useState<string | null>(null);
+  // One-shot downgrade notices per (session, provider/model): a provider or
+  // model saved by the session is no longer available in the current catalog.
+  const providerDowngradeNotifiedRef = useRef<string>("");
+  const modelDowngradeNotifiedRef = useRef<string>("");
 
   // Restore per-session composer prefs whenever the active session changes.
   useEffect(() => {
@@ -3267,20 +3271,12 @@ export function ChatCanvasPage() {
       thinkingMode,
       searchRoute,
       generationMode,
-      providerId: selectedProviderId || undefined,
-      modelId: selectedModelId || undefined,
-      imageProviderId: selectedImageProviderId || undefined,
-      imageModelId: selectedImageModelId || undefined,
     });
   }, [
     composerPrefsReadySessionId,
     generationMode,
     responseMode,
     searchRoute,
-    selectedModelId,
-    selectedProviderId,
-    selectedImageModelId,
-    selectedImageProviderId,
     sessionId,
     thinkingMode,
   ]);
@@ -3625,20 +3621,37 @@ export function ChatCanvasPage() {
     ],
   );
   useEffect(() => {
-    setSelectedProviderId((current) =>
-      modelProviders.some((provider) => provider.id === current)
-        ? current
-        : (modelProviders[0]?.id ?? ""),
-    );
-  }, [modelProviders]);
+    // Wait for the provider catalog before downgrading: while `providers` is
+    // still pending the restored per-session provider would look "missing" and
+    // get clobbered to the first provider (and persisted as an empty value).
+    if (providers.isPending) return;
+    const current = selectedProviderId;
+    const next = modelProviders[0]?.id ?? "";
+    if (!modelProviders.some((provider) => provider.id === current)) {
+      if (current && current !== next) {
+        const notifyKey = `${sessionId}:${current}`;
+        if (providerDowngradeNotifiedRef.current !== notifyKey) {
+          providerDowngradeNotifiedRef.current = notifyKey;
+          toast.message(
+            next
+              ? `上次使用的服务商已不可用，已切换到 ${next}`
+              : "当前没有可用的模型服务商，请在设置中配置",
+          );
+        }
+      }
+      if (current !== next) setSelectedProviderId(next);
+    }
+  }, [modelProviders, providers.isPending, selectedProviderId, sessionId]);
   useEffect(() => {
+    if (providers.isPending) return;
     setSelectedImageProviderId((current) =>
       imageProviders.some((provider) => provider.id === current)
         ? current
         : (imageProviders[0]?.id ?? ""),
     );
-  }, [imageProviders]);
+  }, [imageProviders, providers.isPending]);
   useEffect(() => {
+    if (providers.isPending || discoveredImageModels?.isPending) return;
     setSelectedImageModelId((current) =>
       imageModelOptions.some((model) => model.id === current)
         ? current
@@ -3647,14 +3660,77 @@ export function ChatCanvasPage() {
           imageModelOptions[0]?.id ??
           ""),
     );
-  }, [defaultImageModelId, imageModelOptions]);
+  }, [
+    defaultImageModelId,
+    discoveredImageModels?.isPending,
+    imageModelOptions,
+    providers.isPending,
+  ]);
   useEffect(() => {
-    setSelectedModelId((current) =>
-      modelOptions.some((model) => model.id === current)
-        ? current
-        : (modelOptions[0]?.id ?? ""),
-    );
-  }, [modelOptions]);
+    // Wait for the active provider's model discovery before downgrading: while
+    // it is still pending the restored per-session model would look "missing"
+    // and get reset to the first model (then persisted as an empty value).
+    if (providers.isPending || discoveredModels?.isPending) return;
+    const current = selectedModelId;
+    const next = modelOptions[0]?.id ?? "";
+    if (!modelOptions.some((model) => model.id === current)) {
+      if (current && current !== next) {
+        const notifyKey = `${sessionId}:${current}`;
+        if (modelDowngradeNotifiedRef.current !== notifyKey) {
+          modelDowngradeNotifiedRef.current = notifyKey;
+          toast.message(
+            next
+              ? `上次使用的模型 ${current} 已不可用，已切换到 ${next}`
+              : "当前服务商没有可用模型，请在设置中检查模型配置",
+          );
+        }
+      }
+      if (current !== next) setSelectedModelId(next);
+    }
+  }, [
+    discoveredModels?.isPending,
+    modelOptions,
+    providers.isPending,
+    selectedModelId,
+    sessionId,
+  ]);
+  // Persist per-session provider/model selection only after the provider and
+  // model lists have finished loading. While they are still pending the
+  // selection may be a restored placeholder (or empty); writing it back would
+  // wipe the user's saved choice and force a fallback to defaults after refresh.
+  useEffect(() => {
+    if (!sessionId || sessionId === "new") return;
+    if (composerPrefsReadySessionId !== sessionId) return;
+    const modelSelectionReady =
+      !providers.isPending &&
+      !discoveredModels?.isPending &&
+      !discoveredImageModels?.isPending;
+    const existing = getSessionComposerPrefs(sessionId);
+    setSessionComposerPrefs(sessionId, {
+      providerId: modelSelectionReady
+        ? (selectedProviderId || undefined)
+        : existing.providerId,
+      modelId: modelSelectionReady
+        ? (selectedModelId || undefined)
+        : existing.modelId,
+      imageProviderId: modelSelectionReady
+        ? (selectedImageProviderId || undefined)
+        : existing.imageProviderId,
+      imageModelId: modelSelectionReady
+        ? (selectedImageModelId || undefined)
+        : existing.imageModelId,
+    });
+  }, [
+    composerPrefsReadySessionId,
+    discoveredImageModels?.isPending,
+    discoveredModels?.isPending,
+    providers.isPending,
+    selectedImageModelId,
+    selectedImageProviderId,
+    selectedModelId,
+    selectedProviderId,
+    sessionId,
+  ]);
   useEffect(() => {
     if (!thinkingModes.length) return;
     setThinkingMode((current) =>
@@ -3662,12 +3738,13 @@ export function ChatCanvasPage() {
     );
   }, [thinkingModes]);
   useEffect(() => {
+    if (retryDiscoveredModels.isPending) return;
     setRetryModelId((current) =>
       retryModelOptions.some((model) => model.id === current && model.remote)
         ? current
         : (retryModelOptions.find((model) => model.remote)?.id ?? ""),
     );
-  }, [retryModelOptions]);
+  }, [retryDiscoveredModels.isPending, retryModelOptions]);
   useEffect(() => {
     if (retryTarget && retryDiscoveredModels.isPending) return;
     if (!retryThinkingModes.length) {
@@ -9469,7 +9546,13 @@ export function ChatCanvasPage() {
                const modelTriggerLabel =
                  generationMode === "image"
                    ? `绘图 · ${selectedImageModel?.id ?? "未选择"}`
-                   : `${responseModeLabel} · ${activeModelProvider?.display_name ?? "模型"} / ${selectedModel?.id ?? "未选择"}`;
+                   : `${responseModeLabel} · ${
+                       activeModelProvider?.display_name ??
+                       (providers.isPending ? "加载中" : "模型")
+                     } / ${
+                       selectedModel?.id ??
+                       (discoveredModels?.isPending ? "加载中" : "未选择")
+                     }`;
                // Phone top bar is tight: show only the two-character mode word
                // (极速/思考/智能, or 绘图 for image mode) instead of the full
                // label + arrow.
