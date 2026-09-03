@@ -7,6 +7,7 @@ import {
   useSyncExternalStore,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
 } from "react"
 import { lazy, Suspense } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -95,7 +96,8 @@ import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { SettingsModal } from "@/components/layout/settings-modal";
 import { NativeActions } from "@/features/mobile/NativeActions";
-import { ShareInboxPanel } from "@/features/mobile/ShareInboxPanel";
+import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
+import { OPEN_GRAPH_EVENT, OPEN_SIDEBAR_EVENT } from "@/lib/mobile-shell";
 // F1-2/P0-1: the selection-explanation panel pulls the whole chat renderer
 // (streamdown/hast/parse5/mermaid/d3 subtree) into the first-screen entry
 // chunk, which rolldown mis-orders at module eval (TDZ crash). Load it lazily.
@@ -1615,6 +1617,7 @@ function SidebarNav({
       className={cn(
         "sidebar-nav flex h-full flex-col bg-sidebar px-3 py-4 text-sidebar-foreground",
         collapsed && "is-collapsed",
+        mobile && "is-mobile",
       )}
     >
       <div className="sidebar-nav__top flex items-center justify-between">
@@ -1903,6 +1906,33 @@ function SessionProjects({
   const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(
     () => new Set(),
   );
+  // 会话「更多」菜单受控态（长按/右键唤起，与 MoreHorizontal 触发共用）
+  const [menuOpenFor, setMenuOpenFor] = useState<string | null>(null);
+  const longPressRef = useRef<{
+    timer: number | null;
+    id: string | null;
+    fired: boolean;
+  }>({ timer: null, id: null, fired: false });
+  const beginLongPress =
+    (sessionId: string) => (event: ReactPointerEvent<HTMLElement>) => {
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      const lp = longPressRef.current;
+      lp.id = sessionId;
+      lp.fired = false;
+      if (lp.timer != null) window.clearTimeout(lp.timer);
+      lp.timer = window.setTimeout(() => {
+        lp.fired = true;
+        setMenuOpenFor(sessionId);
+      }, 500);
+    };
+  const cancelLongPress = () => {
+    const lp = longPressRef.current;
+    if (lp.timer != null) {
+      window.clearTimeout(lp.timer);
+      lp.timer = null;
+    }
+    lp.id = null;
+  };
   const sessionActivity = useSyncExternalStore(
     subscribeSessionActivity,
     getSessionActivitySnapshot,
@@ -2201,11 +2231,23 @@ function SessionProjects({
           ) : (
             <button
               className="sidebar-project__session-title min-w-0 flex-1 truncate text-left"
-              onClick={() =>
-                selectionMode
-                  ? toggleSessionSelection(session.id)
-                  : onSelectSession(session.id, options.project)
-              }
+              onClick={() => {
+                if (longPressRef.current.fired) {
+                  longPressRef.current.fired = false;
+                  return;
+                }
+                if (selectionMode) toggleSessionSelection(session.id);
+                else onSelectSession(session.id, options.project);
+              }}
+              onContextMenu={(event) => {
+                if (selectionMode) return;
+                event.preventDefault();
+                setMenuOpenFor(session.id);
+              }}
+              onPointerCancel={cancelLongPress}
+              onPointerDown={beginLongPress(session.id)}
+              onPointerLeave={cancelLongPress}
+              onPointerUp={cancelLongPress}
               type="button"
             >
               {getSessionActivity(session.id).unreadCompleted ? (
@@ -2255,7 +2297,12 @@ function SessionProjects({
                   {session.pinned ? "取消置顶" : "置顶会话"}
                 </TooltipContent>
               </Tooltip>
-              <DropdownMenu>
+              <DropdownMenu
+                onOpenChange={(open) =>
+                  setMenuOpenFor(open ? session.id : null)
+                }
+                open={menuOpenFor === session.id}
+              >
                 <DropdownMenuTrigger asChild>
                   <Button
                     aria-label={`更多会话操作 ${session.title}`}
@@ -2269,7 +2316,7 @@ function SessionProjects({
                 <DropdownMenuContent
                   align="end"
                   className="w-48"
-                  side="right"
+                  side="bottom"
                 >
                   <DropdownMenuItem onSelect={() => onShareSession(session)}>
                     <Share2 className="size-3.5" />
@@ -2769,19 +2816,54 @@ function UserMenu({
 
 function MobileNavigation() {
   const [open, setOpen] = useState(false);
+  const swipeRef = useRef<{ x: number; y: number } | null>(null);
+
+  // 画布右滑手势 → 打开左侧栏（跨组件经 window 事件触发）
+  useEffect(() => {
+    const openNav = () => setOpen(true);
+    window.addEventListener(OPEN_SIDEBAR_EVENT, openNav);
+    return () => window.removeEventListener(OPEN_SIDEBAR_EVENT, openNav);
+  }, []);
+
+  const handleTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) {
+      swipeRef.current = null;
+      return;
+    }
+    const touch = event.touches[0];
+    swipeRef.current = { x: touch.clientX, y: touch.clientY };
+  };
+
+  // 左侧栏已打开时，左滑关闭
+  const handleTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
+    const start = swipeRef.current;
+    swipeRef.current = null;
+    if (!start) return;
+    const touch = event.changedTouches[0];
+    if (!touch) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (dx < -60 && Math.abs(dx) > Math.abs(dy) * 1.5) setOpen(false);
+  };
+
   return (
     <Sheet onOpenChange={setOpen} open={open}>
       <SheetTrigger asChild>
         <Button
           aria-label="打开导航"
-          className="lg:hidden"
+          className="topbar-menu-trigger lg:hidden"
           size="icon"
           variant="ghost"
         >
           <Menu className="size-5" />
         </Button>
       </SheetTrigger>
-      <SheetContent className="w-[286px] p-0" side="left">
+      <SheetContent
+        className="w-[286px] p-0"
+        onTouchEnd={handleTouchEnd}
+        onTouchStart={handleTouchStart}
+        side="left"
+      >
         <SheetTitle className="sr-only">LearnGraph 导航</SheetTitle>
         <SidebarNav mobile onNavigate={() => setOpen(false)} />
       </SheetContent>
@@ -4648,6 +4730,29 @@ export function WorkspaceShell() {
   const [activityOpen, setActivityOpen] = useState(false);
   // Narrow screens hide the context rail; this re-opens it as a right drawer.
   const [graphDrawerOpen, setGraphDrawerOpen] = useState(false);
+  // 图谱抽屉打开时，在其外部区域右滑收起
+  const graphBackdropSwipeRef = useRef<{ x: number; y: number } | null>(null);
+  const handleGraphBackdropTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) {
+      graphBackdropSwipeRef.current = null;
+      return;
+    }
+    const touch = event.touches[0];
+    graphBackdropSwipeRef.current = { x: touch.clientX, y: touch.clientY };
+  };
+  const handleGraphBackdropTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
+    const start = graphBackdropSwipeRef.current;
+    graphBackdropSwipeRef.current = null;
+    if (!start) return;
+    const touch = event.changedTouches[0];
+    if (!touch) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (dx > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      setGraphDrawerOpen(false);
+      setSelectionExplanationOpen(false);
+    }
+  };
   // Keep the inspector mounted while 划词解释 is open, even if the graph rail
   // was folded — otherwise the independent canvas cannot appear.
   const [selectionExplanationOpen, setSelectionExplanationOpen] = useState(false);
@@ -4679,6 +4784,12 @@ export function WorkspaceShell() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [graphDrawerOpen]);
+  // 画布左滑手势 → 打开右侧图谱抽屉
+  useEffect(() => {
+    const openGraph = () => setGraphDrawerOpen(true);
+    window.addEventListener(OPEN_GRAPH_EVENT, openGraph);
+    return () => window.removeEventListener(OPEN_GRAPH_EVENT, openGraph);
+  }, []);
   useEffect(() => {
     // Listen at the shell level so a collapsed rail can re-open before ContextRail mounts.
     const forceOpen = (event: Event) => {
@@ -4840,6 +4951,8 @@ export function WorkspaceShell() {
               setGraphDrawerOpen(false);
               setSelectionExplanationOpen(false);
             }}
+            onTouchEnd={handleGraphBackdropTouchEnd}
+            onTouchStart={handleGraphBackdropTouchStart}
           />
           <ContextRail
             // Desktop fold, or narrow drawer closed: keep mounted for CSS but not interactive.
@@ -4868,7 +4981,7 @@ export function WorkspaceShell() {
           </div>
         </SheetContent>
       </Sheet>
-      <ShareInboxPanel />
+      <PendingShareConsumer />
       <NativeActions />
     </div>
   );

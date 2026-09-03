@@ -13,10 +13,11 @@
 
 export interface NativeShareInboxItem {
   id: string
-  kind: 'text' | 'image'
+  kind: 'text' | 'image' | 'file'
   text: string
   imagePath: string
   mime: string
+  name?: string
   source: string
   created_at?: number
 }
@@ -29,6 +30,7 @@ interface LearnGraphNativeBridge {
   clearInboxItem?: (id: string) => void
   clearInbox?: () => void
   getInboxImageDataUrl?: (id: string) => string
+  getInboxFileDataUrl?: (id: string) => string
   takePhoto?: () => void
   consumeShortcutAction?: () => string
   // A 类触觉 / 提示音 / 朗读
@@ -87,6 +89,19 @@ export async function getInboxImageDataUrl(id: string): Promise<string> {
   try {
     const url = await nativeBridge()?.getInboxImageDataUrl?.(id)
     return url ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** 收件箱文件（任意类型）→ data URL；超限/缺失返回空串 */
+export async function getInboxFileDataUrl(id: string): Promise<string> {
+  try {
+    const url =
+      (await nativeBridge()?.getInboxFileDataUrl?.(id)) ??
+      (await nativeBridge()?.getInboxImageDataUrl?.(id)) ??
+      ''
+    return url
   } catch {
     return ''
   }

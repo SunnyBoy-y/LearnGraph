@@ -171,7 +171,7 @@ export function ContextUsageRing({
         <button
           aria-label={`上下文已使用约 ${percent}%，点击查看并压缩`}
           className={cn(
-            "group flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md",
+            "group flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md",
             "transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
             className,
           )}
@@ -180,7 +180,7 @@ export function ContextUsageRing({
           <RingGlyph
             colorClass={cn(tone.ring, "transition-colors group-hover:opacity-80")}
             fraction={fraction}
-            sizeClass="size-[18px]"
+            sizeClass="size-4"
           />
         </button>
       </PopoverTrigger>

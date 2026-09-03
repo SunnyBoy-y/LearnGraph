@@ -5918,3 +5918,141 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   font-size: 12px;
   line-height: 1.5;
 }
+
+/* ===========================================================================
+   APK 移动端升级（v0.16）：语音条 / 顶栏缩放 / 侧栏 / 画布 / 模型滑动条
+   =========================================================================== */
+
+/* 长按说话语音条：直接替换对话框内容（非浮窗叠加） */
+.chat-voice-bar {
+  position: relative;
+  width: 100%;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  min-height: 54px;
+  border: 1px solid rgba(0, 0, 0, .09);
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .09);
+  transition: background .16s ease, border-color .16s ease;
+}
+.dark .chat-voice-bar { border-color: rgba(255,255,255,.14); background: var(--background); }
+.chat-voice-bar.is-canceling { border-color: rgba(244,67,54,.55); background: rgba(244,67,54,.08); }
+.chat-voice-bar__bars { display: flex; align-items: center; gap: 3px; height: 44px; }
+.chat-voice-bar__bar { display: block; width: 4px; border-radius: 999px; background: var(--foreground); opacity: .85; transition: height .08s ease, background .16s ease; }
+.chat-voice-bar.is-canceling .chat-voice-bar__bar { background: #f44336; }
+.chat-voice-bar__hint { display: flex; gap: 14px; font-size: 12px; color: var(--muted-foreground); }
+.chat-voice-bar__cancel { color: var(--destructive); }
+.chat-voice-bar.is-canceling .chat-voice-bar__cancel { color: #f44336; font-weight: 700; }
+.chat-composer-dock.is-recording > :not(.chat-voice-bar) { display: none; }
+
+/* 需求4：手机顶栏左上/右上按钮 0.8 倍；模型按钮两字完整不截断 */
+@media (max-width: 1024px) {
+  .workspace-topbar .topbar-menu-trigger,
+  .workspace-topbar .topbar-graph-toggle,
+  .workspace-topbar .topbar-status {
+    transform: scale(0.96);
+    transform-origin: center;
+  }
+  .topbar-model-trigger {
+    height: 32px !important;
+    min-width: 56px;
+    max-width: none;
+    border-radius: 999px !important;
+    font-size: 13px !important;
+    font-weight: 650 !important;
+    padding: 0 14px !important;
+  }
+  .topbar-model-trigger > span:first-child { overflow: visible !important; text-overflow: clip !important; white-space: nowrap !important; }
+}
+html.is-native-app .workspace-topbar .topbar-menu-trigger,
+html.is-native-app .workspace-topbar .topbar-graph-toggle,
+html.is-native-app .workspace-topbar .topbar-status {
+  transform: scale(0.96);
+  transform-origin: center;
+}
+html.is-native-app .topbar-model-trigger {
+  height: 32px !important;
+  min-width: 56px;
+  max-width: none;
+  border-radius: 999px !important;
+  font-size: 13px !important;
+  font-weight: 650 !important;
+  padding: 0 14px !important;
+}
+html.is-native-app .topbar-model-trigger > span:first-child { overflow: visible !important; text-overflow: clip !important; white-space: nowrap !important; }
+
+/* 需求6：移动侧栏取消加粗；会话行隐藏顶置/更多按钮，标题占满 */
+.sidebar-nav.is-mobile .sidebar-project__session { font-size: 16px; font-weight: 400; }
+.sidebar-nav.is-mobile .sidebar-project__header { font-size: 17px; font-weight: 400; }
+.sidebar-nav.is-mobile .sidebar-nav__primary .sidebar-text,
+.sidebar-nav.is-mobile .sidebar-nav__scroll .sidebar-text { font-size: 16px; font-weight: 400; }
+.sidebar-nav.is-mobile svg { transform: scale(1.1); transform-origin: center; }
+.sidebar-nav.is-mobile .sidebar-project__session .sidebar-project__pin { display: none !important; }
+.sidebar-nav.is-mobile .sidebar-project__session .sidebar-project__more { visibility: hidden !important; }
+
+/* 需求6：会话盒子左边距减半（26px -> 13px） */
+.sidebar-nav.is-mobile .sidebar-project__session { padding-left: 13px; }
+
+/* 需求5：画布文字显示宽度与对话框一致，避免两侧边距过大 */
+@media (max-width: 1024px) {
+  .chat-messages-content {
+    max-width: none !important;
+    width: min(var(--chat-content-width), calc(100% - 24px));
+    margin-inline: auto;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+}
+html.is-native-app .chat-messages-content {
+  max-width: none !important;
+  width: min(var(--chat-content-width), calc(100% - 24px));
+  margin-inline: auto;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+
+/* 需求9：模型选择滑动条（思考力度） */
+.thinking-slider { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.thinking-slider__track {
+  position: relative;
+  height: 24px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  cursor: pointer;
+  touch-action: none;
+}
+.thinking-slider__fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width .12s ease;
+}
+.thinking-slider__dots { position: absolute; inset: 0; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; }
+.thinking-slider__dot { width: 5px; height: 5px; border-radius: 999px; background: color-mix(in srgb, var(--foreground) 25%, transparent); }
+.thinking-slider__thumb {
+  position: absolute;
+  top: 50%;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #fff;
+  border: 2px solid var(--primary);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 4px rgba(0,0,0,.18);
+  pointer-events: none;
+}
+.thinking-slider__labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted-foreground); }
+.thinking-slider__labels .is-active { color: var(--foreground); font-weight: 700; }
+
+/* 需求10：移动端通用过渡动画 */
+.workspace-topbar .topbar-menu-trigger,
+.workspace-topbar .topbar-graph-toggle,
+.workspace-topbar .topbar-status { transition: transform .18s ease; }

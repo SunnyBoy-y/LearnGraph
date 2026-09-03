@@ -41,6 +41,8 @@ export type ProviderDictationOptions = {
   onFatal: (message: string) => void;
   /** 本机 VAD 自适应基线开关(默认开启)。 */
   adaptiveVad?: boolean;
+  /** 实时音量(0..1,按时域 RMS 归一化),用于语音条波形。 */
+  onLevel?: (level: number) => void;
 };
 
 function pickRecorderMimeType(): string {
@@ -199,6 +201,7 @@ export async function startProviderDictation(
       sum += value * value;
     }
     const rms = Math.sqrt(sum / samples.length);
+    options.onLevel?.(Math.min(1, rms * 4));
     const now = performance.now();
     const elapsed = now - segmentStartedAt;
 

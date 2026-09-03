@@ -55,6 +55,8 @@ export type DictationOrchestratorOptions = {
   onFinal: (text: string) => void;
   /** 通道降级轻提示。 */
   onDegrade: (message: string) => void;
+  /** 实时音量(0..1)，用于语音条波形。 */
+  onLevel?: (level: number) => void;
   /** 在途 + 排队请求数变化（分段通道）。 */
   onPendingChange?: (pending: number) => void;
   /** 不可恢复失败（整条降级链走完，或协议/鉴权/麦克风权限类错误）。 */
@@ -104,6 +106,7 @@ export function startDictationOrchestrator(
     startProviderDictation({
       transcribe: options.transcribeSegment,
       adaptiveVad: options.adaptiveVad,
+      onLevel: options.onLevel,
       onSegmentText: (text) => {
         if (stopped || aborted) return;
         options.onFinal(text);
@@ -128,6 +131,7 @@ export function startDictationOrchestrator(
       modelId: realtime.modelId,
       language: realtime.language,
       hotwords: realtime.hotwords,
+      onLevel: options.onLevel,
       onPartial: (text) => {
         if (stopped || aborted) return;
         options.onPartial(text);

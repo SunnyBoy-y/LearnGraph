@@ -7,7 +7,9 @@ import {
   useMemo,
   useRef,
   useState,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type TouchEvent as ReactTouchEvent,
 } from "react";
 import { createPortal } from "react-dom";
 import { createUuid } from "@/lib/uuid";
@@ -108,6 +110,9 @@ import {
   transcribeDictationSegment,
 } from "@/api";
 import { hashFileSha256 } from "@/lib/file-hash";
+import { dispatchOpenGraph, dispatchOpenSidebar } from "@/lib/mobile-shell";
+import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
+import { ThinkingSlider, THINKING_STOPS, thinkingStopIndex } from "@/components/chat/thinking-slider";
 import { providerDictationSupported } from "@/lib/provider-dictation";
 import {
   startDictationOrchestrator,
@@ -2690,6 +2695,38 @@ function ConversationQuickActions({
   );
 }
 
+function VoiceBar({ level, canceling }: { level: number; canceling?: boolean }) {
+  const bars = 24;
+  return (
+    <div
+      className={canceling ? "chat-voice-bar is-canceling" : "chat-voice-bar"}
+      role="status"
+      aria-label="正在聆听"
+    >
+      <div className="chat-voice-bar__bars">
+        {Array.from({ length: bars }).map((_, index) => {
+          const variation = 0.5 + 0.5 * Math.sin(index * 1.7);
+          const height = Math.min(
+            1,
+            Math.max(0.12, level * variation + (level > 0.02 ? 0.08 : 0)),
+          );
+          return (
+            <span
+              key={index}
+              className="chat-voice-bar__bar"
+              style={{ height: `${Math.round(height * 100)}%` }}
+            />
+          );
+        })}
+      </div>
+      <div className="chat-voice-bar__hint">
+        <span>松开发送</span>
+        <span className="chat-voice-bar__cancel">上滑取消</span>
+      </div>
+    </div>
+  );
+}
+
 export function ChatCanvasPage() {
   const { workspaceId = "", sessionId = "" } = useParams();
   const location = useLocation();
@@ -2720,6 +2757,32 @@ export function ChatCanvasPage() {
   const [activeConversationQuestionId, setActiveConversationQuestionId] =
     useState<string | null>(null);
   const [longPaste, setLongPaste] = useState<string | null>(null);
+  // 画布左右滑手势（右滑开左侧栏 / 左滑开右侧图谱）
+  const canvasSwipeRef = useRef<{ x: number; y: number; id: number } | null>(null);
+  const handleCanvasTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) {
+      canvasSwipeRef.current = null;
+      return;
+    }
+    const touch = event.touches[0];
+    canvasSwipeRef.current = { x: touch.clientX, y: touch.clientY, id: touch.identifier };
+  };
+  const handleCanvasTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
+    const start = canvasSwipeRef.current;
+    canvasSwipeRef.current = null;
+    if (!start) return;
+    let touch = null;
+    for (let i = 0; i < event.changedTouches.length; i += 1) {
+      const item = event.changedTouches[i];
+      if (item && item.identifier === start.id) { touch = item; break; }
+    }
+    if (!touch) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    if (dx > 0) dispatchOpenSidebar();
+    else dispatchOpenGraph();
+  };
 
   useEffect(() => {
     setSelectionExplanationMarks(listSelectionExplanations(sessionId));
@@ -2858,6 +2921,7 @@ export function ChatCanvasPage() {
       驱动正文动态安全区 / 底部淡出 / 悬浮按钮位置，禁止固定像素值。 */
   const composerDockRef = useRef<HTMLDivElement | null>(null);
   const [composerExpanded, setComposerExpanded] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
   const openFileDialogRef = useRef<() => void>(() => undefined);
   const pendingHandled = useRef(false);
   const draftSessionCreationRef = useRef<{
@@ -2870,6 +2934,19 @@ export function ChatCanvasPage() {
   /** True after the user manually exited goal mode; disables wizard snapshot restore. */
   const goalModeExitedManuallyRef = useRef(false);
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  // 长按语音条（push-to-talk）：空输入框长按启动 ASR，松开发送 / 上滑取消
+  const [voiceBarActive, setVoiceBarActive] = useState(false);
+  const [voiceLevel, setVoiceLevel] = useState(0);
+  const [holdCanceling, setHoldCanceling] = useState(false);
+  const holdRef = useRef<{
+    active: boolean;
+    timer: number | null;
+    startY: number;
+    handle: DictationOrchestratorHandle | null;
+    speech: BrowserSpeechRecognition | null;
+    final: string;
+    interim: string;
+  }>({ active: false, timer: null, startY: 0, handle: null, speech: null, final: "", interim: "" });
   const dictationStopRequestedRef = useRef(false);
   const dictationCleanupSessionRef = useRef<DictationCleanupSession | null>(
     null,
@@ -3766,9 +3843,6 @@ export function ChatCanvasPage() {
   const supportsAgentMode =
     activeProviderSupportsStructuredAgent &&
     Boolean(selectedModel?.remote);
-  const agentModeUnavailableLabel = !activeProviderSupportsStructuredAgent
-    ? "（当前接口未声明结构化工具能力）"
-    : "";
   // Response mode is an explicit user preference. Capability changes may make
   // the selected mode temporarily unavailable, but must never silently rewrite
   // 智能体 to 思考/极速; the disabled send path explains the unavailable model.
@@ -7041,6 +7115,33 @@ export function ChatCanvasPage() {
     return () => window.removeEventListener("learngraph:compose", listener);
   }, [send]);
 
+  // 分享直连：文件→挂附件、文本→填对话框（PendingShareConsumer 触发）
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ text?: string; files?: FileRecord[] }>
+      ).detail;
+      if (!detail) return;
+      if (detail.text?.trim()) {
+        setComposerText((current) =>
+          current ? `${current}
+${detail.text!.trim()}` : detail.text!.trim(),
+        );
+      }
+      if (detail.files?.length) {
+        setPendingFiles((current) => {
+          const existing = new Set(current.map((item) => item.id));
+          return [
+            ...current,
+            ...detail.files!.filter((item) => !existing.has(item.id)),
+          ];
+        });
+      }
+    };
+    window.addEventListener(PREFILL_COMPOSER_EVENT, listener);
+    return () => window.removeEventListener(PREFILL_COMPOSER_EVENT, listener);
+  }, []);
+
   useEffect(() => {
     const listener = () => {
       void queryClient.invalidateQueries({
@@ -7475,6 +7576,206 @@ export function ChatCanvasPage() {
     storedAudioTranscriptionProvider,
     workspaceId,
   ]);
+
+  // ------------------------------------------------------------------ //
+  // 长按语音条（push-to-talk）
+  // ------------------------------------------------------------------ //
+  const beginHoldDictation = () => {
+    const hold = holdRef.current;
+    if (hold.active || isListening) return;
+    if (composerText.trim().length > 0) return;
+    hold.active = true;
+    hold.final = "";
+    hold.interim = "";
+    hold.handle = null;
+    hold.speech = null;
+    setVoiceBarActive(true);
+    setVoiceLevel(0);
+
+    const applyLevel = (level: number) => setVoiceLevel(level);
+
+    if (asrAvailable && providerDictationSupported()) {
+      const asrLanguageValue =
+        asrLanguage && asrLanguage !== "auto" ? asrLanguage : undefined;
+      const transcribeSegment = async (segment: Blob) => {
+        if (!storedAudioTranscriptionProvider)
+          throw new Error("尚未配置文件/分段转写模型");
+        return (
+          await transcribeDictationSegment(segment, {
+            provider_id: storedAudioTranscriptionProvider.id,
+            model_id: providerAsrModelId(storedAudioTranscriptionProvider, "stored"),
+            language: asrLanguageValue,
+          })
+        ).text;
+      };
+      startDictationOrchestrator({
+        realtime:
+          asrRealtimeConfigured && asrVadMode !== "local_only"
+            ? {
+                providerId: realtimeAudioTranscriptionProvider!.id,
+                modelId: realtimeAudioTranscriptionModel,
+                language: asrLanguageValue,
+                hotwords: asrHotwords.map((item) => item.text),
+              }
+            : undefined,
+        adaptiveVad: asrVadAdaptive,
+        transcribeSegment,
+        onLevel: applyLevel,
+        onPartial: (text) => {
+          if (!holdRef.current.active) return;
+          holdRef.current.interim = text;
+        },
+        onFinal: (text) => {
+          if (!holdRef.current.active) return;
+          holdRef.current.final += text;
+          holdRef.current.interim = "";
+        },
+        onDegrade: () => {},
+        onFatal: (message) => {
+          holdRef.current.active = false;
+          setVoiceBarActive(false);
+          toast.error(message);
+        },
+      })
+        .then((handle) => {
+          if (holdRef.current.active) holdRef.current.handle = handle;
+        })
+        .catch((error: unknown) => {
+          holdRef.current.active = false;
+          setVoiceBarActive(false);
+          toast.error(
+            error instanceof Error && error.message
+              ? error.message
+              : "无法启动语音转写",
+          );
+        });
+      return;
+    }
+
+    const speechWindow = window as Window & {
+      SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+      webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    };
+    const SpeechRecognition =
+      speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      holdRef.current.active = false;
+      setVoiceBarActive(false);
+      toast.message("当前浏览器不支持语音转写");
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = navigator.language.startsWith("zh")
+      ? "zh-CN"
+      : navigator.language || "zh-CN";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+      if (!holdRef.current.active) return;
+      let finalText = "";
+      let interimText = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const text = result[0]?.transcript ?? "";
+        if (result.isFinal) finalText += text;
+        else interimText += text;
+      }
+      holdRef.current.final += finalText;
+      holdRef.current.interim = interimText;
+      // 浏览器引擎无音量回调，给波形一个恒定的“在听”基线
+      applyLevel(0.35);
+    };
+    recognition.onerror = () => {};
+    recognition.onend = () => {
+      if (!holdRef.current.active) return;
+      try {
+        recognition.start();
+      } catch {
+        // 忽略自动重启失败
+      }
+    };
+    holdRef.current.speech = recognition;
+    try {
+      recognition.start();
+    } catch {
+      holdRef.current.active = false;
+      setVoiceBarActive(false);
+      toast.error("无法启动语音转写");
+    }
+  };
+
+  const endHoldDictation = (send: boolean) => {
+    const hold = holdRef.current;
+    if (!hold.active) return;
+    hold.active = false;
+    setVoiceBarActive(false);
+    setVoiceLevel(0);
+    setHoldCanceling(false);
+    const handle = hold.handle;
+    const speech = hold.speech;
+    hold.handle = null;
+    hold.speech = null;
+
+    if (!send) {
+      hold.final = "";
+      hold.interim = "";
+      handle?.abort();
+      speech?.abort();
+      return;
+    }
+
+    const finish = () => {
+      const text = `${hold.final}${hold.interim}`.trim();
+      hold.final = "";
+      hold.interim = "";
+      if (text) void submitPrompt({ text, files: [] });
+    };
+    if (handle) {
+      void handle.stop().then(finish);
+    } else if (speech) {
+      speech.stop();
+      window.setTimeout(finish, 300);
+    }
+  };
+
+  const handleComposerPointerDown = (event: ReactPointerEvent<HTMLTextAreaElement>) => {
+    if (composerHasText) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const hold = holdRef.current;
+    hold.startY = event.clientY;
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // ignore
+    }
+    hold.timer = window.setTimeout(() => {
+      hold.timer = null;
+      beginHoldDictation();
+    }, 500);
+  };
+  const handleComposerPointerUp = (event: ReactPointerEvent<HTMLTextAreaElement>) => {
+    const hold = holdRef.current;
+    if (hold.timer != null) {
+      window.clearTimeout(hold.timer);
+      hold.timer = null;
+    }
+    if (!hold.active) return;
+    const swipedUp = hold.startY - event.clientY > 80;
+    endHoldDictation(!swipedUp);
+  };
+  const handleComposerPointerCancel = () => {
+    const hold = holdRef.current;
+    if (hold.timer != null) {
+      window.clearTimeout(hold.timer);
+      hold.timer = null;
+    }
+    if (hold.active) endHoldDictation(false);
+  };
+  const handleComposerPointerMove = (event: ReactPointerEvent<HTMLTextAreaElement>) => {
+    const hold = holdRef.current;
+    if (!hold.active) return;
+    setHoldCanceling(hold.startY - event.clientY > 80);
+  };
 
   const skipDictationFinalizing = useCallback(() => {
     // 跳过收尾:转写阶段丢弃未完成的语音段,润色阶段废弃在途整理结果,
@@ -8486,7 +8787,11 @@ export function ChatCanvasPage() {
             ?.scrollIntoView({ behavior: "smooth", block: "center" });
         }}
       />
-      <Conversation className="min-h-0 flex-1">
+      <Conversation
+        className="min-h-0 flex-1"
+        onTouchEnd={handleCanvasTouchEnd}
+        onTouchStart={handleCanvasTouchStart}
+      >
         <ConversationContent
           className="chat-messages-content mx-auto w-full max-w-4xl gap-7 px-4 py-6 sm:px-7 sm:py-7"
           onMouseUp={() => {
@@ -8917,7 +9222,8 @@ export function ChatCanvasPage() {
         </div>
       ) : null}
 
-      <div className="chat-composer-dock" ref={composerDockRef}>
+      <div className={cn("chat-composer-dock", voiceBarActive && "is-recording")} ref={composerDockRef}>
+        {voiceBarActive ? <VoiceBar level={voiceLevel} canceling={holdCanceling} /> : null}
         {responseMode === "agentic" ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
@@ -9516,6 +9822,12 @@ export function ChatCanvasPage() {
                     : "输入消息，或输入 @ 选择模式 / 文件…"
               }
               ref={composerTextareaRef}
+              onBlur={() => setComposerFocused(false)}
+              onFocus={() => setComposerFocused(true)}
+              onPointerCancel={handleComposerPointerCancel}
+              onPointerDown={handleComposerPointerDown}
+              onPointerMove={handleComposerPointerMove}
+              onPointerUp={handleComposerPointerUp}
               role="combobox"
               value={composerText}
             />
@@ -9524,6 +9836,7 @@ export function ChatCanvasPage() {
             {contextUsageEnabled &&
             generationMode === "text" &&
             sessionId !== "new" &&
+            (composerExpanded || composerFocused) &&
             contextUsage.data ? (
               <ContextUsageRing
                 usage={contextUsage.data}
@@ -9561,23 +9874,25 @@ export function ChatCanvasPage() {
                    ? "绘图"
                    : responseMode === "fast"
                      ? "极速"
-                     : responseMode === "thinking"
-                       ? "思考"
-                       : "智能";
-               const thinkingChoices = thinkingModes.length ? (
-                 <DropdownMenuRadioGroup
-                   onValueChange={(value) => setThinkingMode(value as ThinkingMode)}
-                   value={thinkingMode}
-                 >
-                   {thinkingModes.map((mode) => (
-                     <DropdownMenuRadioItem key={mode} value={mode}>
-                       {thinkingLabels[mode]}
-                     </DropdownMenuRadioItem>
-                   ))}
-                 </DropdownMenuRadioGroup>
-               ) : (
-                 <DropdownMenuItem disabled>由当前服务商决定</DropdownMenuItem>
-               );
+                     : responseMode === "agentic"
+                       ? "智能"
+                       : thinkingLabels[thinkingMode] || "思考";
+               const thinkingSliderValue = thinkingStopIndex(responseMode, thinkingMode);
+               const handleThinkingSliderChange = (index: number) => {
+                 const stop = THINKING_STOPS[index];
+                 if (!stop) return;
+                 setGenerationMode("text");
+                 if (stop.responseMode === "fast") {
+                   setResponseMode("fast");
+                   setThinkingMode("off");
+                 } else {
+                   setResponseMode("agentic");
+                   setThinkingMode(stop.thinking as ThinkingMode);
+                   if (hasAuthorizedAgentSearchProvider) {
+                     setSearchRoute((current) => (current === "disabled" ? "auto" : current));
+                   }
+                 }
+               };
                const modelChoices = (
                  <>
                    <div className="relative px-1 pb-1">
@@ -9730,107 +10045,25 @@ export function ChatCanvasPage() {
                   </>
                 ) : (
                   <>
-                <DropdownMenuLabel>响应模式</DropdownMenuLabel>
-                <DropdownMenuRadioGroup
-                  onValueChange={(value) => {
-                    const nextMode = value as ResponseMode;
-                    setGenerationMode("text");
-                    setResponseMode(nextMode);
-                    if (nextMode === "fast") {
-                      setThinkingMode("off");
-                    } else if (nextMode === "agentic") {
-                      // Prefer medium thinking intensity for agent mode (product default).
-                      const preferred = ["medium", "high", "low", "xhigh"].find(
-                        (mode) => thinkingModes.includes(mode as ThinkingMode),
-                      );
-                      setThinkingMode((preferred as ThinkingMode | undefined) ?? thinkingMode);
-                      // Only auto-enable search when a SearchProvider is already
-                      // enabled; otherwise leave search off so agent tools work
-                      // without forcing web_search against an unavailable provider.
-                      if (hasAuthorizedAgentSearchProvider) {
-                        setSearchRoute((current) =>
-                          current === "disabled" ? "auto" : current,
-                        );
-                      }
-                    } else if (thinkingMode === "off") {
-                      setThinkingMode(
-                        thinkingModes.includes("medium") ? "medium" : thinkingModes[0] ?? "medium",
-                      );
-                    }
-                  }}
-                  value={responseMode}
-                >
-                  <DropdownMenuRadioItem
-                    disabled={thinkingRequired}
-                    onSelect={
-                      isPhoneLayout ? (event) => event.preventDefault() : undefined
-                    }
-                    value="fast"
-                  >
-                    极速{thinkingRequired ? "（该模型仅支持思考）" : ""}
-                  </DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem
-                    disabled={!supportsThinkingMode}
-                    onSelect={
-                      isPhoneLayout ? (event) => event.preventDefault() : undefined
-                    }
-                    value="thinking"
-                  >
-                    思考{supportsThinkingMode ? "" : "（模型未声明推理能力）"}
-                  </DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem
-                    disabled={!supportsAgentMode}
-                    onSelect={
-                      isPhoneLayout ? (event) => event.preventDefault() : undefined
-                    }
-                    value="agentic"
-                  >
-                    智能体{supportsAgentMode ? "" : agentModeUnavailableLabel}
-                  </DropdownMenuRadioItem>
-                </DropdownMenuRadioGroup>
-                <DropdownMenuSeparator />
-                {isPhoneLayout ? (
-                  // Sub-menus open sideways and overflow narrow screens, so
-                  // phones get every section inline in one scrollable menu.
-                  <>
-                    <DropdownMenuLabel>
-                      思考力度
-                      {responseMode === "fast" ? (
-                        <span className="ml-2 text-xs font-normal text-muted-foreground">
-                          极速模式下已关闭
-                        </span>
-                      ) : null}
-                    </DropdownMenuLabel>
-                    {responseMode === "fast" ? null : thinkingChoices}
+                    <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
+                    <div className="px-2 py-1">
+                      <ThinkingSlider
+                        value={thinkingSliderValue}
+                        onChange={handleThinkingSliderChange}
+                      />
+                    </div>
                     <DropdownMenuSeparator />
                     <DropdownMenuLabel>模型</DropdownMenuLabel>
-                    {modelChoices}
-                  </>
-                ) : (
-                  <>
-                    <DropdownMenuSub>
-                      <DropdownMenuSubTrigger disabled={responseMode === "fast"}>
-                        思考力度
-                        <span className="ml-auto text-xs text-muted-foreground">
-                          {responseMode === "fast"
-                            ? "已关闭"
-                            : thinkingModes.length
-                            ? thinkingLabels[thinkingMode]
-                            : "当前模型未声明"}
-                        </span>
-                      </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent>
-                        {thinkingChoices}
-                      </DropdownMenuSubContent>
-                    </DropdownMenuSub>
-                    <DropdownMenuSub>
-                      <DropdownMenuSubTrigger>模型</DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent className="max-h-[min(60vh,32rem)] overflow-y-auto">
-                        {modelChoices}
-                      </DropdownMenuSubContent>
-                    </DropdownMenuSub>
-                  </>
-                )}
+                    {isPhoneLayout ? (
+                      modelChoices
+                    ) : (
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>选择模型</DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent className="max-h-[min(60vh,32rem)] overflow-y-auto">
+                          {modelChoices}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    )}
                   </>
                 )}
               </DropdownMenuContent>

@@ -31,6 +31,8 @@ export type RealtimeDictationOptions = {
   onFinal: (text: string) => void;
   /** 不可恢复失败(鉴权、上游任务失败、麦克风断开),调用方负责收尾。 */
   onFatal: (message: string, code?: string) => void;
+  /** 实时音量(0..1,按时域 RMS 归一化),用于语音条波形。 */
+  onLevel?: (level: number) => void;
 };
 
 export function realtimeDictationSupported(): boolean {
@@ -219,6 +221,14 @@ export async function startRealtimeDictation(
   const source = audioContext.createMediaStreamSource(stream);
   processor = audioContext.createScriptProcessor(FRAME_SAMPLES, 1, 1);
   processor.onaudioprocess = (event) => {
+    // 波形音量：即使尚未 ready 也采样，保证语音条即时反馈。
+    const frame = event.inputBuffer.getChannelData(0);
+    let levelSum = 0;
+    for (let index = 0; index < frame.length; index += 1) {
+      const value = frame[index];
+      levelSum += value * value;
+    }
+    options.onLevel?.(Math.min(1, Math.sqrt(levelSum / frame.length) * 4));
     if (!ready || stopped || aborted) return;
     const ws = socket;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
