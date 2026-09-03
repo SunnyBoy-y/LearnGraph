@@ -6,14 +6,17 @@ import { toast } from "sonner";
 import {
   getAccessAllowlist,
   getResearchPolicy,
+  getSandboxEgress,
   updateAccessAllowlist,
   updateResearchPolicy,
+  updateSandboxEgress,
 } from "@/api/settings";
 import {
   accessAllowlistQueryKey,
   fetchPolicyQueryKey,
   getFetchPolicy,
   researchPolicyQueryKey,
+  sandboxEgressQueryKey,
   updateFetchPolicy,
   type DomainPolicy,
 } from "@/components/shared/domain-policy";
@@ -251,6 +254,55 @@ export function UnifiedAllowlistEditor() {
           emptyLabel="尚未设置白名单域名。"
         />
       )}
+    </div>
+  );
+}
+
+/** 沙箱联网开关：工作区级，仅公网，默认关闭（沙箱完全断网）。 */
+export function SandboxEgressSwitch() {
+  const queryClient = useQueryClient();
+  const policy = useQuery({
+    queryKey: sandboxEgressQueryKey,
+    queryFn: getSandboxEgress,
+  });
+  const update = useMutation({
+    mutationFn: updateSandboxEgress,
+    onSuccess: (next) => {
+      queryClient.setQueryData(sandboxEgressQueryKey, next);
+      toast.success("沙箱联网设置已更新");
+    },
+    onError: (error) =>
+      toast.error(error instanceof Error ? error.message : "沙箱联网设置更新失败"),
+  });
+  if (policy.isPending) {
+    return <p className="text-sm text-muted-foreground">正在读取沙箱联网设置…</p>;
+  }
+  if (policy.isError) {
+    return (
+      <div className="flex items-center justify-between gap-3 text-sm text-destructive">
+        <span>{policy.error.message || "沙箱联网设置读取失败"}</span>
+        <Button onClick={() => void policy.refetch()} size="sm" variant="outline">
+          重试
+        </Button>
+      </div>
+    );
+  }
+  const allow = policy.data?.allow_public_network ?? false;
+  const toggle = (checked: boolean) =>
+    update.mutate({ allow_public_network: checked });
+  return (
+    <div className="flex items-start justify-between gap-4 rounded-lg border p-3">
+      <div className="min-w-0 space-y-1">
+        <p className="text-sm font-medium">允许沙箱访问公网</p>
+        <p className="text-xs text-muted-foreground">
+          关闭（默认）：沙箱完全断网，仅能按白名单审批出网。开启后，沙箱可经出站代理访问所有公网域名；内网、本机与云元数据地址仍被拒绝。
+        </p>
+      </div>
+      <Switch
+        checked={allow}
+        disabled={update.isPending}
+        onCheckedChange={toggle}
+      />
     </div>
   );
 }

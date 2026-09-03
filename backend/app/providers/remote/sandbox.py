@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from app.providers.ports.sandbox import (
     SandboxBackendPort,
@@ -26,6 +27,26 @@ from app.providers.ports.sandbox import (
 
 class SandboxBackendError(RuntimeError):
     pass
+
+
+def _proxy_url_with_digest(proxy_url: str, digest: str | None) -> str:
+    """Embed the egress policy digest as proxy URL userinfo for plain clients.
+
+    Plain HTTP clients (curl/wget/requests) send a bare CONNECT; the multi-tenant
+    egress proxy identifies the workspace by ``Proxy-Authorization: Basic
+    <digest>:...``. Embedding the digest as URL userinfo makes those clients
+    authenticate automatically.
+    """
+    if not digest:
+        return proxy_url
+    parts = urlsplit(proxy_url)
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{digest}:x@{host}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 class SandboxBackendUnavailable(SandboxBackendError):
@@ -461,9 +482,12 @@ class DockerSandboxBackend(SandboxBackendPort):
             container_env: list[str] = []
             if egress.get("policy_digest") and egress.get("network") and egress.get("proxy_url"):
                 network_kwargs = {"network": str(egress["network"])}
+                proxy_url = _proxy_url_with_digest(
+                    str(egress["proxy_url"]), str(egress["policy_digest"])
+                )
                 container_env = [
-                    "HTTP_PROXY=" + str(egress["proxy_url"]),
-                    "HTTPS_PROXY=" + str(egress["proxy_url"]),
+                    "HTTP_PROXY=" + proxy_url,
+                    "HTTPS_PROXY=" + proxy_url,
                     "NO_PROXY=localhost,127.0.0.1,.local",
                     "LEARNGRAPH_EGRESS_POLICY_DIGEST=" + str(egress["policy_digest"]),
                 ]

@@ -49,6 +49,7 @@ from app.domain.schemas.management import (
     ChatSuggestedPromptsSettingValue,
     FunctionalModelDefaultsSettingValue,
     ResearchPolicySettingValue,
+    SandboxEgressSettingValue,
     WebFetchPolicySettingValue,
     MigrationPreflightRequest,
     PluginToggleRequest,
@@ -4359,6 +4360,15 @@ class SettingsService:
             "default": {"allow_all": False, "allowed_domains": []},
             "risk": "high",
         },
+        "sandbox.egress": {
+            "description": (
+                "Workspace sandbox outbound-network switch (public-only); "
+                "allow_public_network=true lets sandboxes reach any public host "
+                "through the egress proxy, private/loopback/metadata still denied"
+            ),
+            "default": {"allow_public_network": False},
+            "risk": "high",
+        },
         "usage.display_currency": {
             "description": "Display currency for usage views",
             "default": "CNY",
@@ -4596,6 +4606,16 @@ class SettingsService:
                     "of exact DNS allowed_domains",
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc
+        elif key == "sandbox.egress":
+            try:
+                value = SandboxEgressSettingValue.model_validate(value).model_dump()
+            except ValidationError as exc:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "sandbox.egress must contain an allow_public_network boolean",
+                    {"key": key, "errors": exc.errors(include_input=False)},
+                ) from exc
         elif key == FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY:
             try:
                 value = FunctionalModelDefaultsSettingValue.model_validate(
@@ -4647,7 +4667,7 @@ class SettingsService:
         self.audit.record(actor_id=self.actor_id, action="settings.update", resource_type="setting", resource_id=key)
         self.db.commit()
         self.db.refresh(setting)
-        if key == "access.allowlist":
+        if key in {"access.allowlist", "sandbox.egress"}:
             self._refresh_egress_policies()
         return setting
 

@@ -1310,6 +1310,21 @@ class AccessAllowlistSettingValue(BaseModel):
         return normalize_allowed_domains(domains)
 
 
+class SandboxEgressSettingValue(BaseModel):
+    """Workspace sandbox outbound-network switch.
+
+    ``allow_public_network`` (default False) keeps sandboxes offline by default
+    (``network_mode="none"``). When enabled, the generic Agent egress policy is
+    derived with ``allow_all_public`` so sandbox containers may reach any public
+    host through the egress proxy — private / loopback / link-local /
+    cloud-metadata targets remain denied by the CONNECT-time classifier.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_public_network: bool = Field(default=False, strict=True)
+
+
 def normalize_allowed_domains(domains: list[str]) -> list[str]:
     from app.domain.schemas.components import DOMAIN_PATTERN
 

@@ -17,6 +17,12 @@ export interface AccessAllowlist {
   allow_all: boolean
 }
 
+/** 沙箱出站联网开关（工作区级，仅公网，默认关闭）。 */
+export interface SandboxEgress {
+  /** true = 沙箱可经代理访问所有公网域名（内网/本机/云元数据仍被拒绝）。 */
+  allow_public_network: boolean
+}
+
 export interface SettingUpdateRequest {
   value: unknown
 }

@@ -292,6 +292,26 @@ def access_allow_all(db: Session, workspace_id: str) -> bool:
     return isinstance(raw, dict) and raw.get("allow_all") is True
 
 
+SANDBOX_EGRESS_SETTING_KEY = "sandbox.egress"
+
+
+def sandbox_egress_allow_public(db: Session, workspace_id: str) -> bool:
+    """Whether the workspace enabled public sandbox outbound networking.
+
+    A sandbox-only switch (distinct from the unified ``access.allowlist``
+    ``allow_all`` that also disables search/fetch interception): when true, the
+    generic Agent egress policy is derived with ``allow_all_public`` so sandbox
+    containers may reach any public host through the egress proxy.
+    Private/loopback/link-local/metadata targets stay denied at CONNECT time.
+    """
+    from app.providers.provider_plan_cache import cached_workspace_setting_value
+
+    raw = cached_workspace_setting_value(
+        db, workspace_id, SANDBOX_EGRESS_SETTING_KEY
+    )
+    return isinstance(raw, dict) and raw.get("allow_public_network") is True
+
+
 def _workspace_policy_domains(
     db: Session, workspace_id: str, key: str
 ) -> frozenset[str]:
@@ -413,12 +433,15 @@ def model_provider_for_workspace(
             # Provider-level defaults are protocol facts, not a hard-coded
             # model catalogue. Individual discovered models may still override
             # these values through their versioned capability snapshot.
+            # DeepSeek 官方直连（api.deepseek.com）的 reasoning_effort 档位语义
+            # 直通（low/medium 档真正发 low/medium），区别于 DashScope 托管模型
+            # 仅 high/max 两档的旧映射。
             capabilities = {
                 "reasoning_efforts": ["low", "medium", "high", "xhigh"],
                 "thinking_mapping": {
                     "off": None,
-                    "low": "high",
-                    "medium": "high",
+                    "low": "low",
+                    "medium": "medium",
                     "high": "high",
                     "xhigh": "max",
                 },
@@ -516,21 +539,6 @@ def model_provider_for_workspace(
             capabilities,
             resolved_model_id,
         )
-        if is_deepseek:
-            # DeepSeek 官方直连（api.deepseek.com）：reasoning_effort 档位语义
-            # 直通，区别于 DashScope 托管模型（qwen_catalog 对 DeepSeek 记为
-            # high/max only）。旧逻辑把 low/medium/high 统一压成 high，导致
-            # thinking_mode=low 时实际按 high 推理（实测教学轮思考 217s）。此处
-            # 覆盖 per-model 快照，让 low/medium 档真正生效。注意：若官方 API
-            # 拒绝 low/medium，请在 Provider 能力页调回，或让调用方用
-            # thinking_mode=off（模型 thinking_required=false 支持直关）。
-            effective_model_capabilities["thinking_mapping"] = {
-                "off": None,
-                "low": "low",
-                "medium": "medium",
-                "high": "high",
-                "xhigh": "max",
-            }
         context_window_tokens = int(
             effective_model_capabilities.get("context_window_tokens") or 256_000
         )

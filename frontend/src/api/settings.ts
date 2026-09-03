@@ -1,6 +1,7 @@
 import type {
   AccessAllowlist,
   ResearchPolicy,
+  SandboxEgress,
   SettingUpdateRequest,
   WorkspaceSetting,
 } from "@/types/settings";
@@ -93,6 +94,24 @@ export async function updateAccessAllowlist(
       : [],
     allow_all: value.allow_all === true,
   };
+}
+
+export async function getSandboxEgress(): Promise<SandboxEgress> {
+  const settings = await listSettings();
+  const raw = settings.find((item) => item.key === "sandbox.egress")?.value;
+  if (!raw || typeof raw !== "object") return { allow_public_network: false };
+  const value = raw as Partial<SandboxEgress>;
+  return { allow_public_network: value.allow_public_network === true };
+}
+
+export async function updateSandboxEgress(
+  policy: SandboxEgress,
+): Promise<SandboxEgress> {
+  const setting = await updateSetting("sandbox.egress", policy);
+  const raw = setting.value;
+  if (!raw || typeof raw !== "object") return { allow_public_network: false };
+  const value = raw as Partial<SandboxEgress>;
+  return { allow_public_network: value.allow_public_network === true };
 }
 
 export function exportWorkspace(): Promise<Blob> {

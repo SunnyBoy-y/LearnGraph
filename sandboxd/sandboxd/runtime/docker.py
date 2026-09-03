@@ -29,6 +29,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from sandboxd.runtime.port import (
     RuntimeCapability,
@@ -81,6 +82,28 @@ def sanitize_name(value: str, *, max_len: int = 63) -> str:
     """Docker object name sanitization (lowercase alnum, dash, underscore, dot)."""
     cleaned = _SANITIZE.sub("-", value.casefold()).strip("-")
     return cleaned[:max_len]
+
+
+def proxy_url_with_digest(proxy_url: str, digest: str | None) -> str:
+    """Embed the egress policy digest as proxy URL userinfo.
+
+    Plain HTTP clients (curl/wget/requests) read HTTP(S)_PROXY and send a bare
+    CONNECT; the multi-tenant egress proxy identifies the workspace by the
+    ``Proxy-Authorization: Basic <digest>:...`` header. Embedding the digest as
+    URL userinfo makes every plain client authenticate automatically. The
+    dedicated fetch runner still sets ``auth=(digest, "")`` explicitly (httpx
+    honors it over URL userinfo), so both paths agree on the username=digest.
+    """
+    if not digest:
+        return proxy_url
+    parts = urlsplit(proxy_url)
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{digest}:x@{host}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _seccomp_options(seccomp_dir: str, runtime_kind: str) -> list[str]:
@@ -379,9 +402,12 @@ class DockerRuntimeBackend:
             container_env: list[str] = []
             if egress_network:
                 network_kwargs = {"network": egress_network}
+                proxy_url = proxy_url_with_digest(
+                    self.egress_proxy_url, spec.policy_digest
+                )
                 container_env = [
-                    "HTTP_PROXY=" + self.egress_proxy_url,
-                    "HTTPS_PROXY=" + self.egress_proxy_url,
+                    "HTTP_PROXY=" + proxy_url,
+                    "HTTPS_PROXY=" + proxy_url,
                     "NO_PROXY=localhost,127.0.0.1,.local",
                     "LEARNGRAPH_EGRESS_POLICY_DIGEST=" + spec.policy_digest,
                 ]

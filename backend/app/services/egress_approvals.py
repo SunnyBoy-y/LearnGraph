@@ -109,13 +109,18 @@ class EgressApprovalService:
         Source of truth: workspace-scoped ``agent_egress`` grants, active
         ``allow_once`` leases, plus the unified ``access.allowlist`` domains
         (whitelisted hosts bypass the approval queue). When the workspace opted
-        into no-interception mode (``access.allowlist.allow_all``), an
+        into no-interception mode (``access.allowlist.allow_all`` or the
+        sandbox-only ``sandbox.egress.allow_public_network`` switch), an
         allow-all public policy is derived instead — the proxy still rejects
         private/loopback/metadata targets at CONNECT time. A deployment-reviewed
         baseline file is preserved and unioned so approvals only add hosts.
         Returns the effective policy or ``None`` (offline).
         """
-        from app.providers.factory import access_allow_all, access_allowlist_domains
+        from app.providers.factory import (
+            access_allow_all,
+            access_allowlist_domains,
+            sandbox_egress_allow_public,
+        )
         from app.services.sandbox_network_policy import (
             AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
             AGENT_EGRESS_POLICY_ISSUER,
@@ -165,7 +170,9 @@ class EgressApprovalService:
                 continue
             hosts.add(lease.hostname)
             expirations.append(lease_expires)
-        allow_all = access_allow_all(self.db, self.workspace_id)
+        allow_all = access_allow_all(
+            self.db, self.workspace_id
+        ) or sandbox_egress_allow_public(self.db, self.workspace_id)
         if not allow_all:
             hosts.update(access_allowlist_domains(self.db, self.workspace_id))
         if not hosts and not allow_all:

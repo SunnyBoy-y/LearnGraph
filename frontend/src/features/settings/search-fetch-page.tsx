@@ -17,7 +17,10 @@ import {
   updateWebFetchSettings,
 } from "@/api/fetch-authorizations";
 import { listSandboxNetAudit } from "@/api/sandbox-net";
-import { UnifiedAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
+import {
+  SandboxEgressSwitch,
+  UnifiedAllowlistEditor,
+} from "@/components/shared/domain-allowlist-editor";
 import {
   EmptyState,
   ErrorState,
@@ -653,6 +656,13 @@ export function SearchFetchPage() {
         eyebrow="Search, fetch & egress"
         title="搜索与抓取"
       />
+      <Surface className="space-y-5 p-5">
+        <SectionHeading
+          description="控制沙箱（Agent 代码执行环境）的出站网络。关闭时沙箱完全断网，仅能按白名单审批出网。"
+          title="沙箱联网"
+        />
+        <SandboxEgressSwitch />
+      </Surface>
       <Surface className="space-y-5 p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <SectionHeading
