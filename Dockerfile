@@ -40,9 +40,16 @@ COPY backend/sandbox ./sandbox
 
 FROM python:3.12-slim-bookworm AS runtime
 
-RUN apt-get update \
+# 可选：国内构建时用 DEBIAN_MIRROR 覆盖 deb.debian.org（Fastly 线路偶发 502，
+# 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。默认不变。
+ARG DEBIAN_MIRROR=deb.debian.org
+RUN if [ "$DEBIAN_MIRROR" != "deb.debian.org" ]; then \
+        sed -i "s|deb\.debian\.org|$DEBIAN_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries \
+    && apt-get update \
     && apt-get install -y --no-install-recommends tini \
-    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99retries \
     && useradd --system --uid 1000 --create-home --home-dir /home/learngraph \
         --shell /usr/sbin/nologin learngraph \
     && mkdir -p /app /data \

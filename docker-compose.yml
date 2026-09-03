@@ -106,6 +106,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # 国内构建若 deb.debian.org (Fastly) 偶发 502，可在根 .env 设
+        # LEARNGRAPH_DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn 切换镜像源。
+        DEBIAN_MIRROR: ${LEARNGRAPH_DEBIAN_MIRROR:-deb.debian.org}
     ports:
       # Host binding default is loopback-only, mirroring `npm run dev`
       # (listenHost defaults to 127.0.0.1). Set LEARNGRAPH_LISTEN_HOST=0.0.0.0
@@ -276,6 +280,8 @@ services:
     build:
       context: .
       dockerfile: sandboxd/Dockerfile
+      args:
+        DEBIAN_MIRROR: ${LEARNGRAPH_DEBIAN_MIRROR:-deb.debian.org}
     environment:
       SANDBOXD_LISTEN_HOST: "0.0.0.0"
       SANDBOXD_PORT: "8090"
