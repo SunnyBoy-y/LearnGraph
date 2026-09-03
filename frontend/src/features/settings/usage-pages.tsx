@@ -82,6 +82,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { currentWorkspaceQueryKey } from "@/lib/query-keys";
 import { saveBlobViaNative } from "@/lib/native-download";
 import {
   Command,
@@ -2373,8 +2374,11 @@ function UsageEventsTable({
 
 export function UsagePage() {
   const queryClient = useQueryClient();
+  // Workspace-scoped settings cache: must match the key the chat shell /
+  // chat canvas read so display-currency changes propagate to the same cache.
+  const settingsQueryKey = currentWorkspaceQueryKey("settings");
   const usageDisplaySetting = useQuery({
-    queryKey: ["settings"],
+    queryKey: settingsQueryKey,
     queryFn: listSettings,
   });
   const summary = useQuery({
@@ -2471,7 +2475,7 @@ export function UsagePage() {
     mutationFn: (currency: "USD" | "CNY") =>
       updateSetting("usage.display_currency", currency),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["settings"] });
+      void queryClient.invalidateQueries({ queryKey: settingsQueryKey });
     },
     onError: (error) => toast.error(error.message),
   });

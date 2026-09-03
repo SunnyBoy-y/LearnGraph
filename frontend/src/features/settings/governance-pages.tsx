@@ -171,6 +171,7 @@ import type {
 } from "@/types/migrations";
 import type { Provider, ProviderModel } from "@/types/providers";
 import type { WorkspaceSetting } from "@/types/settings";
+import { currentWorkspaceQueryKey } from "@/lib/query-keys";
 import { fuzzyModelMatch } from "@/lib/model-choices";
 
 function SearchableFeatureModelSelect({
@@ -2207,8 +2208,15 @@ export function WorkspaceSettingsPage() {
   const auth = useAuth();
   const queryClient = useQueryClient();
   const session = authStore.getSession();
+  // Workspace-scoped settings cache: must match the key the chat shell /
+  // chat canvas read (workspaceQueryKey(workspaceId, "settings")) so saving a
+  // setting here invalidates/updates the same cache entry the chat side
+  // consumes. The previous bare ["settings"] key created a second, isolated
+  // cache entry — saved defaults (e.g. 默认响应模式) never reached the chat
+  // canvas until a full page refresh.
+  const settingsQueryKey = currentWorkspaceQueryKey("settings");
   const settings = useQuery({
-    queryKey: ["settings"],
+    queryKey: settingsQueryKey,
     queryFn: listSettings,
     staleTime: 30_000,
   });
@@ -2286,7 +2294,7 @@ export function WorkspaceSettingsPage() {
     onError: (error) => toast.error(error.message),
     onSuccess: () => {
       toast.success("工作区设置已更新");
-      void queryClient.invalidateQueries({ queryKey: ["settings"] });
+      void queryClient.invalidateQueries({ queryKey: settingsQueryKey });
     },
   });
   const saveSuggestedPrompts = useMutation({
@@ -2294,7 +2302,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_SUGGESTED_PROMPTS_SETTING_KEY, { enabled }),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2307,7 +2315,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_DICTATION_CLEANUP_SETTING_KEY, { enabled }),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2319,7 +2327,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_ASR_LANGUAGE_SETTING_KEY, language),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2331,7 +2339,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_ASR_VAD_MODE_SETTING_KEY, mode),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2343,7 +2351,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_ASR_VAD_ADAPTIVE_SETTING_KEY, enabled),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2355,7 +2363,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_ASR_HOTWORDS_SETTING_KEY, hotwords),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2367,7 +2375,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_CONTEXT_USAGE_SETTING_KEY, { enabled }),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2379,7 +2387,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY, { response_mode }),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2391,7 +2399,7 @@ export function WorkspaceSettingsPage() {
       updateSetting(CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY, { default_state }),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -2578,7 +2586,7 @@ export function WorkspaceSettingsPage() {
     }) => updateSetting(key, { provider_id, model_id }),
     onError: (error) => toast.error(error.message),
     onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(["settings"], (current) => [
+      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);

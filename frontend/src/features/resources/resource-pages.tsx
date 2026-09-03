@@ -54,6 +54,7 @@ import { SourceDetailDialog } from "@/components/resources/source-detail-dialog"
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import {
   ErrorState,
   LoadingState,
@@ -1086,7 +1087,8 @@ export function SearchPage() {
   const [saved, setSaved] = useState<SourceRecord | null>(null);
   const [domainInput, setDomainInput] = useState("");
   const queryClient = useQueryClient();
-  const settings = useQuery({ queryKey: ["settings"], queryFn: listSettings });
+  const settingsQueryKey = workspaceQueryKey(workspaceId, "settings");
+  const settings = useQuery({ queryKey: settingsQueryKey, queryFn: listSettings });
   const fetchPolicy = useMemo<WebFetchPolicy>(() => {
     const raw = settings.data?.find((item) => item.key === "web_fetch.policy")?.value;
     if (!raw || typeof raw !== "object") return { allow_without_confirmation: false, allowed_domains: [] };
@@ -1099,7 +1101,7 @@ export function SearchPage() {
   const updateFetchPolicy = useMutation({
     mutationFn: (policy: WebFetchPolicy) => updateSetting("web_fetch.policy", policy),
     onSuccess: (updated) => {
-      queryClient.setQueryData(["settings"], (current: unknown) =>
+      queryClient.setQueryData(settingsQueryKey, (current: unknown) =>
         Array.isArray(current)
           ? [...current.filter((item) => item?.key !== updated.key), updated]
           : [updated],
