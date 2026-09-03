@@ -258,6 +258,44 @@ export function DashboardPage() {
         })}
       </Surface>
 
+      <Surface className="p-5 sm:p-6">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-muted-foreground">
+              最近会话 · 学习助手正在延续你的上下文
+            </p>
+            <h2 className="mt-1 truncate text-base font-semibold">
+              {recentSession?.title ?? "还没有学习会话"}
+            </h2>
+          </div>
+          {recentSession ? (
+            <Button asChild className="shrink-0" size="sm" variant="outline">
+              <Link to={`${base}/chat/${recentSession.id}`}>
+                打开会话
+                <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+          ) : null}
+        </div>
+        <div className="mt-4 border-t pt-4">
+          {recentSummary ? (
+            <MessageResponse className="text-sm leading-6 text-muted-foreground [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-sm [&_pre]:max-h-20">
+              {recentSummary}
+            </MessageResponse>
+          ) : (
+            <p className="text-sm leading-6 text-muted-foreground">
+              {recentMessages.isPending && recentSession
+                ? "正在读取最近回复…"
+                : recentMessages.isError
+                  ? "最近回复暂时无法读取。"
+                  : recentSession
+                    ? "这个会话还没有助手回复。"
+                    : "创建会话后，最近的学习摘要会显示在这里。"}
+            </p>
+          )}
+        </div>
+      </Surface>
+
       <div className="grid items-stretch gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(280px,.55fr)]">
         <Surface className="flex flex-col p-5 sm:p-6">
           <SectionHeading
@@ -371,44 +409,6 @@ export function DashboardPage() {
 
       <Surface aria-label="学习活动热力图" className="p-5 sm:p-6">
         <ActivityHeatmap variant="panel" />
-      </Surface>
-
-      <Surface className="p-5 sm:p-6">
-        <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <p className="text-xs font-medium text-muted-foreground">
-              最近会话 · 学习助手正在延续你的上下文
-            </p>
-            <h2 className="mt-1 truncate text-base font-semibold">
-              {recentSession?.title ?? "还没有学习会话"}
-            </h2>
-          </div>
-          {recentSession ? (
-            <Button asChild className="shrink-0" size="sm" variant="outline">
-              <Link to={`${base}/chat/${recentSession.id}`}>
-                打开会话
-                <ArrowRight className="size-4" />
-              </Link>
-            </Button>
-          ) : null}
-        </div>
-        <div className="mt-4 border-t pt-4">
-          {recentSummary ? (
-            <MessageResponse className="text-sm leading-6 text-muted-foreground [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-sm [&_pre]:max-h-20">
-              {recentSummary}
-            </MessageResponse>
-          ) : (
-            <p className="text-sm leading-6 text-muted-foreground">
-              {recentMessages.isPending && recentSession
-                ? "正在读取最近回复…"
-                : recentMessages.isError
-                  ? "最近回复暂时无法读取。"
-                  : recentSession
-                    ? "这个会话还没有助手回复。"
-                    : "创建会话后，最近的学习摘要会显示在这里。"}
-            </p>
-          )}
-        </div>
       </Surface>
     </PageFrame>
   );
