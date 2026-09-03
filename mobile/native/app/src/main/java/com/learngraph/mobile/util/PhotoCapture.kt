@@ -31,7 +31,7 @@ import java.util.UUID
 object PhotoCapture {
 
     @Volatile
-    var session: org.mozilla.geckoview.GeckoSession? = null
+    var webView: android.webkit.WebView? = null
         private set
 
     @Volatile
@@ -62,8 +62,8 @@ object PhotoCapture {
         }
     }
 
-    fun setSession(s: org.mozilla.geckoview.GeckoSession?) {
-        session = s
+    fun setWebView(wv: android.webkit.WebView?) {
+        webView = wv
     }
 
     /** 现场拍照入口：先申请相机权限，再跳转系统相机控件 */
@@ -110,28 +110,25 @@ object PhotoCapture {
         }
     }
 
-    /** 经 GeckoRuntimeHolder 的 WebExtension Port 回调网页版（GeckoView 无 evaluate） */
-    private fun evalJs(js: String) {
-        com.learngraph.mobile.ui.web.GeckoRuntimeHolder.evalJs(js)
-    }
-
     private fun deliverPhoto(context: Context, uri: Uri?) {
+        val wv = webView ?: return
         if (uri == null) {
-            evalJs("try{window.__lgPhotoCallback&&window.__lgPhotoCallback(null)}catch(e){}")
+            wv.evaluateJavascript("try{window.__lgPhotoCallback&&window.__lgPhotoCallback(null)}catch(e){}", null)
             return
         }
         try {
             val bitmap = decodeSampled(context, uri) ?: run {
-                evalJs("try{window.__lgPhotoCallback&&window.__lgPhotoCallback(null)}catch(e){}")
+                wv.evaluateJavascript("try{window.__lgPhotoCallback&&window.__lgPhotoCallback(null)}catch(e){}", null)
                 return
             }
             val dataUrl = bitmapToJpegDataUrl(bitmap)
             val escaped = dataUrl.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
-            evalJs(
+            wv.evaluateJavascript(
                 "try{window.__lgPhotoCallback&&window.__lgPhotoCallback('$escaped')}catch(e){}",
+                null,
             )
         } catch (_: Exception) {
-            evalJs("try{window.__lgPhotoCallback&&window.__lgPhotoCallback(null)}catch(e){}")
+            wv.evaluateJavascript("try{window.__lgPhotoCallback&&window.__lgPhotoCallback(null)}catch(e){}", null)
         }
     }
 

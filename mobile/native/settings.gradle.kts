@@ -15,8 +15,6 @@ dependencyResolutionManagement {
     repositories {
         maven { url = uri("https://maven.aliyun.com/repository/google") }
         maven { url = uri("https://maven.aliyun.com/repository/central") }
-        // GeckoView（内嵌浏览器内核）官方 maven 仓库
-        maven { url = uri("https://maven.mozilla.org/maven2") }
         google()
         mavenCentral()
     }

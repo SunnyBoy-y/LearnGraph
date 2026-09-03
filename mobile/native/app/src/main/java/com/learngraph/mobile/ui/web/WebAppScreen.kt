@@ -9,6 +9,14 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -56,24 +64,15 @@ import com.learngraph.mobile.data.DownloadStatus
 import com.learngraph.mobile.data.DownloadStore
 import com.learngraph.mobile.util.PhotoCapture
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
-import org.mozilla.geckoview.AllowOrDeny
-import org.mozilla.geckoview.GeckoResult
-import org.mozilla.geckoview.GeckoSession
-import org.mozilla.geckoview.GeckoView
-import org.mozilla.geckoview.WebResponse
 
 /**
- * 纯网页模式（v0.8.0；v0.14.0 内核换成内嵌 GeckoView）：
+ * 纯网页模式（v0.8.0）：
  *  - 无原生控件：没有底栏、没有顶栏按钮；顶部仅一层很薄的白色
- *  - 全屏 GeckoView 承载网页版，内核随 APK 分发，不再受手机自带 WebView 影响
- *  - 内置下载器：网页下载由 DownloadStore 接管（进度/通知/打开/管理），
+ *  - 全屏 WebView 承载网页版；Cookie 保存（登录态跨重启保持）
+ *  - 内置下载器：网页下载链接由 DownloadStore 接管（进度/通知/打开/管理），
  *    右下角悬浮入口（仅存在下载任务时显示）进入下载管理页
  *  - 登录态注入：localStorage（learngraph.*）写入后 reload 一次
- *  - 系统返回键：GeckoSession 可后退则后退，否则退出
- *  - JS 桥：GeckoView 无 addJavascriptInterface，改走内置 WebExtension
- *    （assets/messaging/）→ window.LearnGraphNative，消息由 BridgeHandlerImpl 处理
+ *  - 系统返回键：WebView 可后退则后退，否则退出
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -85,29 +84,20 @@ fun WebAppScreen(
     val app = context.applicationContext as LearnGraphApp
     val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
 
-    val sessionRef = remember { mutableStateOf<GeckoSession?>(null) }
+    val webViewRef = remember { mutableStateOf<WebView?>(null) }
     val downloadTasks by DownloadStore.tasks.collectAsState()
     val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
     val scope = rememberCoroutineScope()
-
-    // 导航状态（GeckoView 139 无 canGoBack() 同步查询，用回调维护）
-    var canGoBackState by remember { mutableStateOf(false) }
-    // 当前 URL（onCrash 恢复用；GeckoSession 139 无 url 属性）
-    var currentUrl by remember { mutableStateOf<String?>(null) }
-    // 主框架加载失败防抖
-    var loadFailed by remember { mutableStateOf(false) }
-    // 外链已跳系统浏览器（防止其 DENY 导航触发 onPageStop(false) 误判加载失败）
-    var externalNav by remember { mutableStateOf(false) }
 
     // 断网检测：离线时显示横幅，网络恢复后自动 reload 网页版
     var offline by remember { mutableStateOf(false) }
     val networkMonitor = remember {
         ConnectivityMonitor(
-            sessionProvider = { sessionRef.value },
+            webViewProvider = { webViewRef.value },
             onOffline = { offline = true },
-            onOnline = { s ->
+            onOnline = { wv ->
                 offline = false
-                s?.reload()
+                wv?.reload()
             },
         )
     }
@@ -117,110 +107,27 @@ fun WebAppScreen(
     }
 
     // 文件选择器（网页版「添加资料」按钮 → input[type=file] → 系统文件管理器）
-    var pendingFilePrompt by remember {
-        mutableStateOf<GeckoSession.PromptDelegate.FilePrompt?>(null)
-    }
-    var pendingFileResult by remember {
-        mutableStateOf<GeckoResult<GeckoSession.PromptDelegate.PromptResponse>?>(null)
-    }
-    fun completeFileResult(uris: Array<Uri>) {
-        val prompt = pendingFilePrompt
-        pendingFileResult?.complete(prompt?.confirm(context, uris) ?: return)
-        pendingFilePrompt = null
-        pendingFileResult = null
-    }
+    var fileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
     val fileLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
-    ) { uri -> completeFileResult(if (uri != null) arrayOf(uri) else emptyArray()) }
+    ) { uri ->
+        fileCallback?.onReceiveValue(uri?.let { arrayOf(it) })
+        fileCallback = null
+    }
     val multiFileLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments(),
-    ) { uris -> completeFileResult(uris.toTypedArray()) }
-
-    // 原生 JS 桥处理器（注册到 GeckoRuntimeHolder，页面加载期间有效）
-    val bridgeHandler = remember {
-        BridgeHandlerImpl(
-            context = context,
-            onClearAuth = {
-                scope.launch { runCatching { app.authStore.clearAuth() } }
-            },
-            onDownload = { url, fileName ->
-                requestNotifPermissionIfNeeded(context)
-                val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) authState.token else null
-                scope.launch {
-                    runCatching {
-                        DownloadStore.enqueue(
-                            context = context,
-                            url = url,
-                            authToken = token,
-                            fileNameOverride = fileName,
-                            workspaceId = authState.workspaceId,
-                            deviceId = authState.deviceId,
-                        )
-                    }
-                }
-            },
-            onSaveBase64 = { dataUrl, fileName ->
-                scope.launch {
-                    runCatching { DownloadStore.saveBase64(context, dataUrl, fileName) }
-                }
-            },
-            onTakePhoto = { PhotoCapture.launch(context) },
-            onReportToken = { token, ws ->
-                scope.launch {
-                    runCatching {
-                        app.authStore.updateToken(token)
-                        if (ws != null) app.authStore.updateWorkspace(ws)
-                    }
-                }
-            },
-        )
-    }
-    DisposableEffect(Unit) {
-        GeckoRuntimeHolder.bridgeHandler = bridgeHandler
-        onDispose {
-            if (GeckoRuntimeHolder.bridgeHandler === bridgeHandler) {
-                GeckoRuntimeHolder.bridgeHandler = null
-            }
-        }
+    ) { uris ->
+        fileCallback?.onReceiveValue(uris.toTypedArray())
+        fileCallback = null
     }
 
-    // 登录态同步（免登录核心）：经 WebExtension 广播执行 JS，
-    // localStorage 注入后由页面自身 reload；token 不一致时经 __reportToken 回写原生
-    fun syncLoginState() {
-        val nativeToken = authState.token
-        val js = buildString {
-            append("(function(){")
-            append("var cur=localStorage.getItem('learngraph.access_token')||'';")
-            append("var curWs=localStorage.getItem('learngraph.workspace_id')||'';")
-            append("var want='")
-            append(escapeJs(nativeToken.orEmpty()))
-            append("';")
-            append("if(!cur){")
-            append("if(!want){return;}")
-            append("localStorage.setItem('learngraph.access_token',want);")
-            append("localStorage.setItem('learngraph.workspace_id','")
-            append(escapeJs(authState.workspaceId.orEmpty()))
-            append("');")
-            append("localStorage.setItem('learngraph.device_id','")
-            append(escapeJs(authState.deviceId))
-            append("');")
-            append("location.reload();")
-            append("return;")
-            append("}")
-            append("if(cur!==want){")
-            append("try{window.LearnGraphNative&&window.LearnGraphNative.__reportToken(cur,curWs||'');}catch(e){}")
-            append("}")
-            append("})()")
-        }
-        GeckoRuntimeHolder.evalJs(js)
-    }
-
-    // 系统返回键：优先 GeckoSession 后退，无历史时退出应用。
+    // 系统返回键：优先 WebView 后退，无历史时退出应用。
+    // ⚠️ 禁止在回调里调用 onBackPressedDispatcher.onBackPressed()：会重新
+    // 触发本 BackHandler 回调造成无限递归（StackOverflowError 闪退，实机复现）。
     BackHandler {
-        val s = sessionRef.value
-        if (s != null && canGoBackState) {
-            s.goBack()
-        } else {
+        val wv = webViewRef.value
+        if (wv != null && wv.canGoBack()) {
+            wv.goBack()        } else {
             (context as? Activity)?.finish()
         }
     }
@@ -236,11 +143,13 @@ fun WebAppScreen(
                     .height(2.dp),
             ) {}
 
-            // 全屏网页（imePadding：键盘弹出时整体抬升，输入框不被键盘遮挡）
+            // 全屏网页（imePadding：键盘弹出时 WebView 整体抬升，输入框不被键盘遮挡；
+            // navigationBarsPadding：三键导航时底部内容显示在导航键上方）
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .imePadding(),
+                    .imePadding()
+                    .navigationBarsPadding(),
             ) {
                 // 断网横幅（网络恢复后自动消失并 reload）
                 if (offline) {
@@ -261,150 +170,325 @@ fun WebAppScreen(
                 }
                 AndroidView(
                     factory = { ctx ->
-                        GeckoRuntimeHolder.init(ctx)
-                        val geckoView = GeckoView(ctx).apply {
+                        WebView(ctx).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                             )
-                        }
-                        val session = GeckoSession()
-                        session.open(GeckoRuntimeHolder.runtime)
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            settings.textZoom = 100
+                            // 宽度定死为手机真实宽度：尊重 viewport meta（device-width），
+                            // 初始缩放强制 100%（1:1 不缩放），禁用双指/页面缩放，不缩略显示
+                            settings.useWideViewPort = true
+                            settings.loadWithOverviewMode = false
+                            this.setInitialScale(100)
+                            settings.setSupportZoom(false)
+                            settings.builtInZoomControls = false
+                            settings.displayZoomControls = false
+                            overScrollMode = android.view.View.OVER_SCROLL_NEVER
 
-                        // 导航：外链跳系统浏览器、主框架加载失败 → 连接页
-                        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
-                            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
-                                canGoBackState = canGoBack
-                            }
+                            // Cookie 保存（登录态跨重启保持）
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
-                            override fun onLoadRequest(
-                                session: GeckoSession,
-                                request: GeckoSession.NavigationDelegate.LoadRequest,
-                            ): GeckoResult<AllowOrDeny>? {
-                                val url = request.uri
-                                val scheme = Uri.parse(url).scheme?.lowercase()
-                                if (scheme == "http" || scheme == "https") {
-                                    // 非本服务器主机（外链）→ 跳系统浏览器
-                                    if (!isSameServer(Uri.parse(url), app.api.baseUrl)) {
-                                        externalNav = true
-                                        openInSystemBrowser(ctx, url.toString())
-                                        return GeckoResult.fromValue(AllowOrDeny.DENY)
+                            // 原生 JS bridge：
+                            //  - clearAuth：网页登出/会话失效时清空 DataStore（防注入死循环）
+                            //  - download：网页真实 URL 下载走原生 OkHttp（自动附 Bearer/进度/管理页）
+                            //  - saveBase64：网页纯前端生成的 blob 下载（导出 md/svg/ics 等）
+                            addJavascriptInterface(
+                                NativeBridge(
+                                    context = ctx,
+                                    onClearAuth = {
+                                        scope.launch { runCatching { app.authStore.clearAuth() } }
+                                    },
+                                    onDownload = { url, fileName ->
+                                        val appCtx = ctx.applicationContext
+                                        val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) {
+                                            authState.token
+                                        } else {
+                                            null
+                                        }
+                                        scope.launch {
+                                            runCatching {
+                                                DownloadStore.enqueue(
+                                                    appCtx,
+                                                    url,
+                                                    authToken = token,
+                                                    fileNameOverride = fileName,
+                                                    workspaceId = authState.workspaceId,
+                                                    deviceId = authState.deviceId,
+                                                )
+                                            }
+                                        }
+                                    },
+                                    onSaveBase64 = { dataUrl, fileName ->
+                                        scope.launch {
+                                            runCatching {
+                                                DownloadStore.saveBase64(ctx.applicationContext, dataUrl, fileName)
+                                            }
+                                        }
+                                    },
+                                    onGetInbox = {
+                                        com.learngraph.mobile.data.ShareInbox
+                                            .encode(com.learngraph.mobile.data.ShareInbox.list(ctx.applicationContext))
+                                    },
+                                    onClearInboxItem = { id ->
+                                        scope.launch {
+                                            runCatching {
+                                                com.learngraph.mobile.data.ShareInbox.remove(ctx.applicationContext, id)
+                                            }
+                                        }
+                                    },
+                                    onClearInbox = {
+                                        scope.launch {
+                                            runCatching {
+                                                com.learngraph.mobile.data.ShareInbox.clear(ctx.applicationContext)
+                                            }
+                                        }
+                                    },
+                                    onGetInboxImageDataUrl = { id ->
+                                        com.learngraph.mobile.data.ShareInbox.imageDataUrl(ctx.applicationContext, id)
+                                    },
+                                    onGetInboxFileDataUrl = { id ->
+                                        com.learngraph.mobile.data.ShareInbox.fileDataUrl(ctx.applicationContext, id)
+                                    },
+                                    onTakePhoto = {
+                                        com.learngraph.mobile.util.PhotoCapture.launch(ctx)
+                                    },
+                                    onShortcutAction = {
+                                        com.learngraph.mobile.util.ShortcutActions.consume(ctx.applicationContext)
+                                    },
+                                ),
+                                "LearnGraphNative",
+                            )
+
+                            webViewClient = object : WebViewClient() {
+                                private var loadFailed = false
+
+                                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                                    val url = request.url
+                                    val scheme = url.scheme?.lowercase()
+                                    if (scheme == "http" || scheme == "https") {
+                                        // 非本服务器主机（外链）→ 跳系统浏览器，防闪退
+                                        if (!isSameServer(url, app.api.baseUrl)) {
+                                            openInSystemBrowser(ctx, url.toString())
+                                            return true
+                                        }
+                                        return false
                                     }
-                                    return GeckoResult.fromValue(AllowOrDeny.ALLOW)
+                                    return false
                                 }
-                                return GeckoResult.fromValue(AllowOrDeny.DENY)
-                            }
-                        }
 
-                        // 进度：页面加载完成 → 登录态同步
-                        session.progressDelegate = object : GeckoSession.ProgressDelegate {
-                            override fun onPageStart(session: GeckoSession, url: String) {
-                                loadFailed = false
-                                currentUrl = url
-                            }
-
-                            override fun onPageStop(session: GeckoSession, success: Boolean) {
-                                // 主文档加载失败（网络错误/服务器不可达）→ 连接页；
-                                // 外链 DENY 后跳过的导航不算失败
-                                if (!success) {
-                                    if (externalNav) {
-                                        externalNav = false
-                                        return
+                                override fun onPageFinished(view: WebView, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    try {
+                                        syncLoginState(view)
+                                    } catch (_: Exception) {
+                                        // JS 桥/注入异常不打断页面加载
                                     }
-                                    if (!loadFailed) {
+                                    // Cookie 强制写盘：登录态持久化（重启免登录）
+                                    try {
+                                        CookieManager.getInstance().flush()
+                                    } catch (_: Exception) {
+                                        // flush 失败不影响页面
+                                    }
+                                }
+
+                                override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                                    super.onPageStarted(view, url, favicon)
+                                    loadFailed = false
+                                }
+
+                                // 网页加载失败（服务器不可达/网络异常）→ 自动调回连接页
+                                override fun onReceivedError(
+                                    view: WebView,
+                                    request: WebResourceRequest,
+                                    error: WebResourceError,
+                                ) {
+                                    super.onReceivedError(view, request, error)
+                                    if (request.isForMainFrame && !loadFailed) {
                                         loadFailed = true
                                         onLoadFailed()
                                     }
-                                    return
                                 }
-                                try {
-                                    syncLoginState()
-                                } catch (_: Exception) {
-                                    // 同步失败不影响页面
+
+                                /**
+                                 * WebView renderer 进程崩溃接管（API 26+，Android 8+）。
+                                 *
+                                 * renderer（渲染/JS 进程）是独立进程，内存不足或渲染错误时可能
+                                 * 被杀。默认行为是连带杀掉整个应用 → 表现为「进网页时闪退」。
+                                 * 返回 true 表示应用自行处理：记录日志并在原 URL 上重新加载
+                                 * （reload 会重新拉起 renderer 进程）。Android 6/7 为单进程
+                                 * WebView，无此回调，崩溃只能靠减少内存压力规避。
+                                 */
+                                @android.annotation.SuppressLint("WebViewClientOnRenderProcessGone")
+                                override fun onRenderProcessGone(
+                                    view: WebView,
+                                    detail: android.webkit.RenderProcessGoneDetail,
+                                ): Boolean {
+                                    try {
+                                        android.util.Log.e(
+                                            "LearnGraphWeb",
+                                            "WebView renderer 崩溃：crash=${detail.didCrash()} 已接管恢复",
+                                        )
+                                    } catch (_: Exception) {
+                                    }
+                                    val target = view.url ?: app.api.baseUrl
+                                    view.post {
+                                        try {
+                                            view.loadUrl(target)
+                                        } catch (_: Exception) {
+                                            onLoadFailed()
+                                        }
+                                    }
+                                    return true
+                                }
+
+                                /**
+                                 * 登录态同步（免登录核心）：
+                                 *  - 网页版未登录（localStorage 无 token）且原生 DataStore 有 token
+                                 *    → 注入原生 token + reload（自愈）
+                                 *  - 网页版已登录且 token 与原生一致 → 无事
+                                 *  - 网页版 token 与原生不同（首次登录/网页版内重登/换账号）
+                                 *    → 回写 DataStore（token + workspace），持续免登录
+                                 *  reload 后再次 onPageFinished：token 已一致 → 停止，无循环。
+                                 * 说明：前端 auth-store 登录时会把 token 双写 sessionStorage +
+                                 * localStorage（见 frontend/src/api/auth-store.ts），这里从
+                                 * localStorage 读取即为网页真实登录态；登出时前端会通过
+                                 * LearnGraphNative.clearAuth() 通知本端清空 DataStore，
+                                 * 避免旧 token 被重新注入。
+                                 */
+                                private fun syncLoginState(view: WebView) {
+                                    val nativeToken = authState.token
+                                    val js = buildString {
+                                        append("(function(){")
+                                        append("var cur=localStorage.getItem('learngraph.access_token')||'';")
+                                        append("var curWs=localStorage.getItem('learngraph.workspace_id')||'';")
+                                        append("var want='")
+                                        append(escapeJs(nativeToken.orEmpty()))
+                                        append("';")
+                                        append("if(!cur){")
+                                        append("if(!want){return 'none';}")
+                                        append("localStorage.setItem('learngraph.access_token',want);")
+                                        append("localStorage.setItem('learngraph.workspace_id','")
+                                        append(escapeJs(authState.workspaceId.orEmpty()))
+                                        append("');")
+                                        append("localStorage.setItem('learngraph.device_id','")
+                                        append(escapeJs(authState.deviceId))
+                                        append("');")
+                                        append("return 'injected';")
+                                        append("}")
+                                        append("if(cur!==want){return 'token:'+cur+'|ws:'+curWs;}")
+                                        append("return 'ok';")
+                                        append("})()")
+                                    }
+                                    try {
+                                        view.evaluateJavascript(js) { result ->
+                                            val trimmed = result?.trim()?.trim('"') ?: return@evaluateJavascript
+                                            when {
+                                                trimmed == "injected" -> view.post { view.reload() }
+                                                trimmed.startsWith("token:") -> {
+                                                    val payload = trimmed.removePrefix("token:")
+                                                    val sep = payload.indexOf("|ws:")
+                                                    val newToken = if (sep >= 0) payload.substring(0, sep) else payload
+                                                    val newWs = if (sep >= 0) payload.substring(sep + 4).takeIf { it.isNotBlank() } else null
+                                                    if (newToken.isNotBlank()) {
+                                                        scope.launch {
+                                                            runCatching {
+                                                                app.authStore.updateToken(newToken)
+                                                                if (newWs != null) app.authStore.updateWorkspace(newWs)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } catch (_: Exception) {
+                                        // WebView 已销毁/状态异常时静默跳过同步
+                                    }
                                 }
                             }
 
-                            override fun onProgressChange(session: GeckoSession, progress: Int) {}
-                        }
-
-                        // 内容：下载（onExternalResponse）、内核崩溃接管（onCrash）
-                        session.contentDelegate = object : GeckoSession.ContentDelegate {
-                            override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
+                            // 内置下载器：拦截网页下载
+                            setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
                                 requestNotifPermissionIfNeeded(ctx)
-                                val url = response.uri
-                                val contentType =
-                                    response.headers["Content-Type"] ?: response.headers["content-type"]
-                                val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) {
-                                    authState.token
-                                } else {
-                                    null
-                                }
+                                val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) authState.token else null
                                 DownloadStore.enqueue(
                                     context = ctx,
                                     url = url,
-                                    contentDisposition = null,
-                                    mimeType = contentType,
-                                    userAgent = null,
+                                    contentDisposition = contentDisposition,
+                                    mimeType = mimeType,
+                                    userAgent = userAgent,
                                     authToken = token,
                                     workspaceId = authState.workspaceId,
                                     deviceId = authState.deviceId,
                                 )
                             }
 
-                            override fun onCrash(session: GeckoSession) {
-                                val target = currentUrl ?: app.api.baseUrl
-                                session.loadUri(target)
-                            }
-                        }
-
-                        // 文件选择：网页版「添加资料」→ input[type=file] → 系统文件管理器
-                        session.promptDelegate = object : GeckoSession.PromptDelegate {
-                            override fun onFilePrompt(
-                                session: GeckoSession,
-                                prompt: GeckoSession.PromptDelegate.FilePrompt,
-                            ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
-                                val result = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
-                                // 取消上一次未消费的回调，避免页面卡住
-                                val old = pendingFilePrompt
-                                if (old != null) {
-                                    pendingFileResult?.complete(old.confirm(ctx, emptyArray<Uri>()))
+                            // 文件选择：网页版「添加资料」→ input[type=file] → 系统文件管理器
+                            webChromeClient = object : WebChromeClient() {
+                                override fun onShowFileChooser(
+                                    webView: WebView,
+                                    filePathCallback: ValueCallback<Array<Uri>>,
+                                    fileChooserParams: FileChooserParams,
+                                ): Boolean {
+                                    // 网页 input[type=file][capture] → 直接走系统相机（拍照即问）
+                                    if (fileChooserParams.isCaptureEnabled) {
+                                        PhotoCapture.setWebView(webView)
+                                        PhotoCapture.launch(ctx)
+                                        return true
+                                    }
+                                    // 取消上一次未消费的回调，避免 WebView 卡住
+                                    fileCallback?.onReceiveValue(null)
+                                    fileCallback = filePathCallback
+                                    val mimeTypes = fileChooserParams.acceptTypes
+                                        .filter { it.isNotBlank() }
+                                        .toTypedArray()
+                                        .ifEmpty { arrayOf("*/*") }
+                                    if (fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                                        multiFileLauncher.launch(mimeTypes)
+                                    } else {
+                                        fileLauncher.launch(mimeTypes)
+                                    }
+                                    return true
                                 }
-                                pendingFilePrompt = prompt
-                                pendingFileResult = result
-                                // 网页 input[type=file][capture] → 直接走系统相机（拍照即问）
-                                if (prompt.capture != 0) {
-                                    PhotoCapture.launch(ctx)
-                                    return result
+
+                                // 麦克风（语音输入 / 长按语音条）：网页 getUserMedia({audio})
+                                // 必须在这里显式授权，否则 WebView 默认拒绝 → "permission denied"。
+                                // 仅放行纯音频捕获；同时申请摄像头的一律拒绝（隐私最小化）。
+                                override fun onPermissionRequest(request: android.webkit.PermissionRequest) {
+                                    val resources = request.resources
+                                    val audioOnly = resources.isNotEmpty() &&
+                                        resources.all { it == android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE }
+                                    if (audioOnly) {
+                                        request.grant(
+                                            arrayOf(android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE),
+                                        )
+                                    } else {
+                                        request.deny()
+                                    }
                                 }
-                                val mimeTypes = (prompt.mimeTypes ?: emptyArray())
-                                    .filter { it.isNotBlank() }
-                                    .toTypedArray()
-                                    .ifEmpty { arrayOf("*/*") }
-                                // 多选兼容单选（单选时用户选一个文件即可）
-                                multiFileLauncher.launch(mimeTypes)
-                                return result
                             }
+
+                            webViewRef.value = this
+                            PhotoCapture.setWebView(this)
+                            loadUrl(app.api.baseUrl)
                         }
-
-                        geckoView.setSession(session)
-                        sessionRef.value = session
-                        PhotoCapture.setSession(session)
-
-                        // 等 WebExtension 就绪后再加载（content script 需在导航前注入；
-                        // 即使扩展失败也照常加载页面，仅桥功能不可用）
-                        GeckoRuntimeHolder.ensureExtension()
-                            .accept { session.loadUri(app.api.baseUrl) }
-                        geckoView
                     },
                     update = { },
-                    // 页面离开组合时销毁 session，避免每次进出累积内存
-                    onRelease = { gv ->
-                        sessionRef.value = null
-                        PhotoCapture.setSession(null)
+                    // 页面离开组合时销毁 WebView，避免每次进出网页累积内存
+                    // （WebView 不销毁会持续占用内存，最终 OOM 触发 renderer 崩溃）
+                    onRelease = { wv ->
+                        webViewRef.value = null
+                        PhotoCapture.setWebView(null)
                         try {
-                            gv.session?.close()
+                            wv.stopLoading()
+                            wv.removeAllViews()
+                            wv.destroy()
                         } catch (_: Exception) {
-                            // close 失败静默
+                            // destroy 失败静默
                         }
                     },
                 )
@@ -452,110 +536,117 @@ private fun requestNotifPermissionIfNeeded(ctx: Context) {
     }
 }
 
-/**
- * 网页 → 原生 JS 桥（GeckoView 版）：
- *  - 消息格式：{id, method, args}（JSON string）
- *  - 响应格式：{id, result}（JSON string）
- *  - 与旧版 addJavascriptInterface 的 NativeBridge 方法一一对应；
- *    getInboxItems / getInboxImageDataUrl / consumeShortcutAction 返回
- *    JSON 字符串结果，前端保持原有解析方式。
- */
-private class BridgeHandlerImpl(
+/** 网页 → 原生 JS bridge（Android 4.2+ 需要 @JavascriptInterface 才暴露） */
+private class NativeBridge(
     private val context: Context,
     private val onClearAuth: () -> Unit,
     private val onDownload: (url: String, fileName: String?) -> Unit,
     private val onSaveBase64: (dataUrl: String, fileName: String?) -> Unit,
+    private val onGetInbox: () -> String,
+    private val onClearInboxItem: (id: String) -> Unit,
+    private val onClearInbox: () -> Unit,
+    private val onGetInboxImageDataUrl: (id: String) -> String?,
+    private val onGetInboxFileDataUrl: (id: String) -> String?,
     private val onTakePhoto: () -> Unit,
-    private val onReportToken: (token: String, workspaceId: String?) -> Unit,
-) : BridgeMessageHandler {
-
-    override fun handle(messageJson: String): GeckoResult<Any>? {
-        return try {
-            val obj = JSONObject(messageJson)
-            val id = obj.optLong("id")
-            val method = obj.optString("method")
-            val args = obj.optJSONArray("args") ?: JSONArray()
-            val result = dispatch(method, args)
-            GeckoResult.fromValue(
-                JSONObject().put("id", id).put("result", result ?: JSONObject.NULL).toString(),
-            )
-        } catch (_: Exception) {
-            null
-        }
+    private val onShortcutAction: () -> String?,
+) {
+    @android.webkit.JavascriptInterface
+    fun clearAuth() {
+        onClearAuth()
     }
 
-    private fun dispatch(method: String, args: JSONArray): Any? = when (method) {
-        "clearAuth" -> {
-            onClearAuth()
-            null
-        }
-        "download" -> {
-            onDownload(args.optString(0), args.optString(1).ifBlank { null })
-            null
-        }
-        "saveBase64" -> {
-            onSaveBase64(args.optString(0), args.optString(1).ifBlank { null })
-            null
-        }
-        "getInboxItems" ->
-            com.learngraph.mobile.data.ShareInbox.encode(
-                com.learngraph.mobile.data.ShareInbox.list(context),
-            )
-        "clearInboxItem" -> {
-            com.learngraph.mobile.data.ShareInbox.remove(context, args.optString(0))
-            null
-        }
-        "clearInbox" -> {
-            com.learngraph.mobile.data.ShareInbox.clear(context)
-            null
-        }
-        "getInboxImageDataUrl" ->
-            com.learngraph.mobile.data.ShareInbox.imageDataUrl(context, args.optString(0)) ?: ""
-        "takePhoto" -> {
-            onTakePhoto()
-            null
-        }
-        "consumeShortcutAction" ->
-            com.learngraph.mobile.util.ShortcutActions.consume(context) ?: ""
-        "__reportToken" -> {
-            val token = args.optString(0)
-            val ws = args.optString(1).ifBlank { null }
-            if (token.isNotBlank()) onReportToken(token, ws)
-            null
-        }
-        "haptic" -> {
-            com.learngraph.mobile.util.Haptics.haptic(context, args.optInt(0))
-            null
-        }
-        "replyHaptic" -> {
-            com.learngraph.mobile.util.Haptics.replyHaptic(context)
-            null
-        }
-        "startReplyVibration" -> {
-            com.learngraph.mobile.util.Haptics.startReplyVibration(context)
-            null
-        }
-        "stopReplyVibration" -> {
-            com.learngraph.mobile.util.Haptics.stopReplyVibration(context)
-            null
-        }
-        "stepHaptic" -> {
-            com.learngraph.mobile.util.Haptics.stepHaptic(context)
-            null
-        }
-        "celebration" -> {
-            com.learngraph.mobile.util.Haptics.celebration(context)
-            null
-        }
-        "chime" -> {
-            com.learngraph.mobile.util.Haptics.chime()
-            null
-        }
-        "speak" -> {
-            com.learngraph.mobile.util.TtsSynth.speak(context, args.optString(0))
-            null
-        }
-        else -> null
+    @android.webkit.JavascriptInterface
+    fun download(url: String, fileName: String?) {
+        onDownload(url, fileName)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun saveBase64(dataUrl: String, fileName: String?) {
+        onSaveBase64(dataUrl, fileName)
+    }
+
+    /** 返回分享收件箱 JSON 数组（[{id,kind,text,imagePath,mime,source,created_at}]） */
+    @android.webkit.JavascriptInterface
+    fun getInboxItems(): String = onGetInbox()
+
+    @android.webkit.JavascriptInterface
+    fun clearInboxItem(id: String) {
+        onClearInboxItem(id)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun clearInbox() {
+        onClearInbox()
+    }
+
+    /** 收件箱图片转 base64 data URL（无则返回空字符串） */
+    @android.webkit.JavascriptInterface
+    fun getInboxImageDataUrl(id: String): String = onGetInboxImageDataUrl(id) ?: ""
+
+    /** 收件箱文件（任意类型）转 base64 data URL（无则返回空字符串） */
+    @android.webkit.JavascriptInterface
+    fun getInboxFileDataUrl(id: String): String = onGetInboxFileDataUrl(id) ?: ""
+
+    /** 打开系统相机拍照（结果经 window.__lgPhotoCallback 回调网页版） */
+    @android.webkit.JavascriptInterface
+    fun takePhoto() {
+        onTakePhoto()
+    }
+
+    /** 读取待消费的快捷动作（如 "new-chat"），消费后返回空字符串 */
+    @android.webkit.JavascriptInterface
+    fun consumeShortcutAction(): String = onShortcutAction() ?: ""
+
+    // ------------------------------------------------------------------ //
+    // A 类触觉 / 提示音：网页版在渲染关键时刻触发
+    // ------------------------------------------------------------------ //
+
+    /** 触觉反馈（轻微震动）：intensity 0/1/2 */
+    @android.webkit.JavascriptInterface
+    fun haptic(intensity: Int) {
+        com.learngraph.mobile.util.Haptics.haptic(context, intensity)
+    }
+
+    /** 最终回复到达轻震（思维链结束后第一帧正文） */
+    @android.webkit.JavascriptInterface
+    fun replyHaptic() {
+        com.learngraph.mobile.util.Haptics.replyHaptic(context)
+    }
+
+    /** 开始最终回答渲染期「答答答」持续震动 */
+    @android.webkit.JavascriptInterface
+    fun startReplyVibration() {
+        com.learngraph.mobile.util.Haptics.startReplyVibration(context)
+    }
+
+    /** 结束回答渲染期持续震动 */
+    @android.webkit.JavascriptInterface
+    fun stopReplyVibration() {
+        com.learngraph.mobile.util.Haptics.stopReplyVibration(context)
+    }
+
+    /** agent 工具/步骤完成弱震 */
+    @android.webkit.JavascriptInterface
+    fun stepHaptic() {
+        com.learngraph.mobile.util.Haptics.stepHaptic(context)
+    }
+
+    /** 目标/掌握度达成庆祝（短-长-短） */
+    @android.webkit.JavascriptInterface
+    fun celebration() {
+        com.learngraph.mobile.util.Haptics.celebration(context)
+    }
+
+    /** 提示音（可选，默认关） */
+    @android.webkit.JavascriptInterface
+    fun chime() {
+        com.learngraph.mobile.util.Haptics.chime()
+    }
+
+    /** 朗读文本（B4 耳机自动朗读 / 手动播报） */
+    @android.webkit.JavascriptInterface
+    fun speak(text: String) {
+        com.learngraph.mobile.util.TtsSynth.speak(context, text)
     }
 }
 
@@ -576,13 +667,13 @@ private fun escapeJs(s: String): String =
  *  - 离线 → onOffline（显示横幅）
  *  - 恢复在线 → onOnline（自动 reload 网页版）
  * 仅关注传输层连通性（Wi-Fi/蜂窝），与「服务器可达性」解耦——
- * 服务器不可达仍由 NavigationDelegate.onLoadError 处理（跳连接页）。
+ * 服务器不可达仍由 WebView 的 onReceivedError 处理（跳连接页）。
  * 所有回调统一 post 到主线程；注册后首次 onAvailable（当前已有网络）不触发 reload。
  */
 private class ConnectivityMonitor(
-    private val sessionProvider: () -> GeckoSession?,
+    private val webViewProvider: () -> WebView?,
     private val onOffline: () -> Unit,
-    private val onOnline: (session: GeckoSession?) -> Unit,
+    private val onOnline: (webView: WebView?) -> Unit,
 ) {
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     @Volatile
@@ -596,7 +687,7 @@ private class ConnectivityMonitor(
         override fun onAvailable(network: android.net.Network) {
             // 注册本身会立即触发一次 onAvailable：仅当之后真的断开又恢复才 reload
             if (!registered) return
-            mainHandler.post { if (registered) onOnline(sessionProvider()) }
+            mainHandler.post { if (registered) onOnline(webViewProvider()) }
         }
     }
 
@@ -614,6 +705,7 @@ private class ConnectivityMonitor(
         runCatching { cm.unregisterNetworkCallback(callback) }
     }
 }
+
 
 /** 外链跳系统浏览器：异常兜底，绝不闪退 */
 private fun openInSystemBrowser(context: Context, url: String) {

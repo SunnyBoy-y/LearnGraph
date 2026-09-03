@@ -13,13 +13,8 @@ android {
         applicationId = "com.learngraph.mobile"
         minSdk = 23
         targetSdk = 35
-        versionCode = 29
-        versionName = "0.14.0"
-        // v0.14.0 内嵌 GeckoView 内核：只打包 arm64（现代手机全兼容，控制体积）；
-        // 如需兼容老 32 位手机再加 armeabi-v7a（体积约翻倍）。
-        ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
+        versionCode = 30
+        versionName = "0.15.0"
     }
 
     buildTypes {
@@ -57,9 +52,6 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
-
-    // v0.14.0：内嵌 GeckoView 浏览器内核（不依赖手机自带 WebView，解决国产 ROM 内核渲染问题）
-    implementation("org.mozilla.geckoview:geckoview-arm64-v8a:139.0.20250609112858")
 
     // v0.11.0：扫码连接（CameraX + ML Kit 条码）、生物识别解锁
     implementation("androidx.camera:camera-core:1.3.4")

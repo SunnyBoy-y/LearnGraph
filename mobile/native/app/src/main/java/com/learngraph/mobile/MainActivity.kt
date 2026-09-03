@@ -48,7 +48,7 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PhotoCapture.init(this)
-        PhotoCapture.setSession(null)
+        PhotoCapture.setWebView(null)
         ShortcutActions.register(this)
         // 从启动 Intent（快捷方式/分享）读取动作
         ShortcutActions.ingestFromIntent(this, intent)
@@ -84,6 +84,7 @@ class MainActivity : FragmentActivity() {
     private fun proceed() {
         ReplyNotifier.start(this)
         requestNotifPermissionIfNeeded()
+        requestMicPermissionIfNeeded()
         setContent {
             LearnGraphTheme {
                 AppNav()
@@ -193,6 +194,20 @@ class MainActivity : FragmentActivity() {
                 this,
                 arrayOf(Manifest.permission.POST_NOTIFICATIONS),
                 1001,
+            )
+        }
+    }
+
+    /** 语音输入（长按语音条 / 麦克风）所需的麦克风运行时权限。 */
+    private fun requestMicPermissionIfNeeded() {
+        if (
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                1002,
             )
         }
     }

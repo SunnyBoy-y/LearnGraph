@@ -14,20 +14,20 @@ import java.util.UUID
 /**
  * 分享收件箱（Share Target 本地暂存）。
  *
- * 任意 App 通过系统分享（ACTION_SEND）投递的文本/图片先落在本地收件箱，
- * 避免「后台鉴权」问题——用户下次打开 App 时，网页版通过
- * LearnGraphNative.getInboxItems() 拉取并在登录态下执行
- * 「存记忆 / 发起对话 / 挂目标」。
+ * 任意 App 通过系统分享（ACTION_SEND / ACTION_SEND_MULTIPLE）投递的文本/文件
+ * 先落在本地收件箱，网页版通过 LearnGraphNative.getInboxItems() 拉取并自动
+ * 消费（文本→填对话框；文件→上传为新会话附件），无需中转箱手动点击。
  *
  * 存储：
  *  - 元数据：SharedPreferences("lg_share_inbox") 一条 JSON 数组
- *  - 图片：filesDir/inbox/<id>.<ext>（应用私有，跨重启保留）
+ *  - 文件：filesDir/inbox/<id>.<ext>（应用私有，跨重启保留）
  */
 object ShareInbox {
 
     private const val PREFS = "lg_share_inbox"
     private const val KEY_ITEMS = "items"
-    private const val MAX_IMAGE_BYTES = 15 * 1024 * 1024 // 15 MiB 上限，防超大分享
+    // 单个文件 15 MiB 上限：桥接走 base64，过大会撑爆 WebView 桥接消息。
+    private const val MAX_FILE_BYTES = 15 * 1024 * 1024
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -50,10 +50,11 @@ object ShareInbox {
     @Serializable
     data class Item(
         val id: String,
-        val kind: String,            // "text" | "image"
-        val text: String = "",       // 文本内容 / 图片说明（可空）
-        val imagePath: String = "",  // kind=image 时缓存文件绝对路径
+        val kind: String,            // "text" | "image" | "file"
+        val text: String = "",       // 文本内容（kind=text 时）
+        val imagePath: String = "",  // 缓存文件绝对路径（image/file）
         val mime: String = "text/plain",
+        val name: String = "",       // 原始文件名（image/file）
         val source: String = "",     // 来源包名，如 com.android.chrome
         @SerialName("created_at") val createdAt: Long = System.currentTimeMillis(),
     )
@@ -76,13 +77,16 @@ object ShareInbox {
     }
 
     /**
-     * 从 content:// 或 file:// URI 复制图片到应用私有缓存并登记。
+     * 从 content:// 或 file:// URI 复制任意文件到应用私有缓存并登记（通用）。
      * 失败（URI 无权限/损坏/超限）返回 null。
      */
-    fun addImage(context: Context, uri: Uri, source: String = ""): Item? {
+    fun addFile(context: Context, uri: Uri, source: String = ""): Item? {
         return try {
             val resolver = context.contentResolver
-            val ext = guessExtension(resolver, uri)
+            val mime = resolver.getType(uri) ?: "application/octet-stream"
+            val name = queryDisplayName(resolver, uri)
+                ?: "share-${System.currentTimeMillis()}"
+            val ext = guessFileExtension(name, mime)
             val dir = File(context.filesDir, "inbox").apply { mkdirs() }
             val target = File(dir, "${UUID.randomUUID()}.$ext")
 
@@ -90,17 +94,18 @@ object ShareInbox {
                 target.outputStream().use { output -> input.copyTo(output) }
             } ?: return null
 
-            if (target.length() > MAX_IMAGE_BYTES) {
+            if (target.length() > MAX_FILE_BYTES) {
                 target.delete()
                 return null
             }
 
             val item = Item(
                 id = UUID.randomUUID().toString(),
-                kind = "image",
+                kind = "file",
                 text = "",
                 imagePath = target.absolutePath,
-                mime = resolver.getType(uri) ?: "image/jpeg",
+                mime = mime,
+                name = name,
                 source = source,
             )
             addItem(context, item)
@@ -135,20 +140,23 @@ object ShareInbox {
         File(context.filesDir, "inbox").listFiles()?.forEach { it.delete() }
     }
 
-    /** 图片转 base64 data URL 供网页版直接上传（限制大小防撑爆 bridge）。 */
-    fun imageDataUrl(context: Context, id: String): String? {
+    /** 文件转 base64 data URL 供网页版直接上传（限制大小防撑爆 bridge）。 */
+    fun fileDataUrl(context: Context, id: String): String? {
         val item = list(context).firstOrNull { it.id == id } ?: return null
-        if (item.kind != "image" || item.imagePath.isBlank()) return null
+        if (item.kind != "file" && item.kind != "image") return null
         val file = File(item.imagePath)
-        if (!file.exists() || file.length() > MAX_IMAGE_BYTES) return null
+        if (!file.exists() || file.length() > MAX_FILE_BYTES) return null
         return try {
             val bytes = file.readBytes()
-            val mime = if (item.mime.isNotBlank()) item.mime else "image/jpeg"
+            val mime = if (item.mime.isNotBlank()) item.mime else "application/octet-stream"
             "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
         } catch (_: Exception) {
             null
         }
     }
+
+    /** 兼容旧桥接：等价于 fileDataUrl。 */
+    fun imageDataUrl(context: Context, id: String): String? = fileDataUrl(context, id)
 
     // ------------------------------------------------------------------ //
     // 内部
@@ -162,7 +170,7 @@ object ShareInbox {
 
     private fun save(context: Context, items: List<Item>) {
         prefs(context).edit().putString(KEY_ITEMS, json.encodeToString(items)).apply()
-        // 清理已被删除条目对应的孤儿图片
+        // 清理已被删除条目对应的孤儿文件
         val keepIds = items.mapTo(HashSet()) { it.id }
         File(context.filesDir, "inbox").listFiles()?.forEach { file ->
             val id = file.name.substringBeforeLast('.').takeIf { keepIds.contains(it) }
@@ -173,15 +181,28 @@ object ShareInbox {
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private fun guessExtension(resolver: ContentResolver, uri: Uri): String {
-        val mime = resolver.getType(uri) ?: return "jpg"
+    private fun queryDisplayName(resolver: ContentResolver, uri: Uri): String? {
+        return try {
+            resolver.query(uri, null, null, null, null)?.use { cursor ->
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && cursor.moveToFirst()) cursor.getString(idx) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun guessFileExtension(name: String, mime: String): String {
+        val dot = name.lastIndexOf('.')
+        if (dot > 0 && dot < name.length - 1) {
+            val ext = name.substring(dot + 1).lowercase()
+            if (ext.length in 1..10 && ext.all { it.isLetterOrDigit() }) return ext
+        }
         return when (mime.lowercase()) {
-            "image/png" -> "png"
-            "image/webp" -> "webp"
-            "image/gif" -> "gif"
-            "image/bmp" -> "bmp"
-            "image/heic", "image/heif" -> "heic"
-            else -> "jpg"
+            "application/pdf" -> "pdf"
+            "text/plain" -> "txt"
+            "application/json" -> "json"
+            else -> "bin"
         }
     }
 }
