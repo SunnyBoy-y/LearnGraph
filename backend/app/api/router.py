@@ -35,6 +35,7 @@ from app.api.routers import (
     sandbox_net,
     usage,
     workflow,
+    voice,
     sandbox,
     session_sharing,
 )
@@ -76,6 +77,7 @@ for router in (
     migrations.router,
     audit_settings.router,
     workflow.router,
+    voice.router,
     sandbox.router,
     session_sharing.router,
 ):

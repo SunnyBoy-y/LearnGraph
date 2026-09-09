@@ -21,6 +21,7 @@ import {
 } from "@tanstack/react-query";
 import {
   ArrowUp,
+  AudioWaveform,
   Bot,
   CalendarDays,
   Check,
@@ -109,6 +110,7 @@ import {
   transcribeAudioFile,
   transcribeDictationSegment,
 } from "@/api";
+import { useVoiceSession, type ThinkingLimit } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
 import { dispatchOpenGraph, dispatchOpenSidebar } from "@/lib/mobile-shell";
 import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
@@ -2727,6 +2729,78 @@ function VoiceBar({ level, canceling }: { level: number; canceling?: boolean }) 
   );
 }
 
+/**
+ * Voice surface for the conversation composer. The transport remains owned by
+ * the chat page; this dialog is intentionally a presentation layer so it can
+ * later be backed by the Pipecat/SmallWebRTC session without changing the
+ * surrounding conversation layout.
+ */
+function VoiceModeDialog({
+  workspaceId,
+  sessionId,
+  onClose,
+}: {
+  workspaceId: string;
+  sessionId: string;
+  onClose: () => void;
+}) {
+  const voice = useVoiceSession(workspaceId, sessionId);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+  const isListening = voice.state === "listening";
+  const status = voice.transport === "connecting" ? "正在连接语音服务…" : voice.transport === "error" ? voice.error || "语音连接失败" : voice.state === "speaking" ? "导师正在回答，你可以随时打断" : isListening ? "正在聆听，你可以随时打断" : "点击开始连接语音导师";
+  const toggle = () => { if (voice.transport !== "connected") void voice.connect(); else voice.toggleListening(); };
+  return (
+    <div className="chat-voice-dialog" role="dialog" aria-modal="true" aria-labelledby="voice-dialog-title">
+      <button className="chat-voice-dialog__scrim" onClick={onClose} type="button" aria-label="关闭语音导师" />
+      <section className="chat-voice-dialog__panel">
+        <header className="chat-voice-dialog__header">
+          <div>
+            <p className="chat-voice-dialog__eyebrow">LEARNGRAPH VOICE</p>
+          <h2 id="voice-dialog-title">语音导师</h2>
+          </div>
+          <button ref={closeRef} className="chat-voice-dialog__close" onClick={onClose} type="button" aria-label="关闭语音导师">
+            <X className="size-4" />
+          </button>
+        </header>
+        <div className={cn("chat-voice-orb", isListening && "is-listening")} aria-hidden="true">
+          <span className="chat-voice-orb__core" />
+          <span className="chat-voice-orb__halo chat-voice-orb__halo--one" />
+          <span className="chat-voice-orb__halo chat-voice-orb__halo--two" />
+        </div>
+        <p className="chat-voice-dialog__status" role="status" aria-live="polite">
+          {status}
+        </p>
+        <div className="chat-voice-dialog__hint">
+          <span>当前会话</span>
+          <strong>{voice.transport === "connected" ? "已接入当前会话的上下文与记忆" : "连接后将沿用当前会话的上下文与记忆"}</strong>
+        </div>
+        <div className="chat-voice-dialog__thinking" role="group" aria-label="语音导师最高思维能力">
+          <span>最高思维能力</span>
+          <select value={voice.thinkingLimit} onChange={(event) => voice.setThinkingLimit(event.target.value as ThinkingLimit)} aria-label="选择最高思维能力">
+            <option value="off">极速</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option>
+          </select>
+        </div>
+        {voice.transcript.length > 0 ? <div className="chat-voice-dialog__captions" aria-live="polite">{voice.transcript.slice(-2).map((item) => <p key={item.id}><b>{item.role === "user" ? "你" : "导师"}</b>{item.text}</p>)}</div> : null}
+        {voice.tasks.length > 0 ? <div className="chat-voice-dialog__tasks" aria-label="后台任务">{voice.tasks.slice(-2).map((task) => <p key={task.taskId}><span>{task.title || "后台任务"}</span><small>{task.status === "completed" ? "已完成" : task.status === "running" ? "进行中" : task.status}</small></p>)}</div> : null}
+        <div className="chat-voice-dialog__actions">
+          <button className={cn("chat-voice-dialog__mic", isListening && "is-active")} onClick={toggle} type="button" aria-pressed={isListening} disabled={voice.transport === "connecting"}>
+            <Mic className="size-5" />
+            <span>{voice.transport === "connected" ? (isListening ? "结束聆听" : "开始说话") : "连接语音"}</span>
+          </button>
+          <button className="chat-voice-dialog__secondary" onClick={onClose} type="button">返回文字对话</button>
+        </div>
+        <p className="chat-voice-dialog__note">语音入口会保留在当前会话中，任务和页面产物仍显示在对话消息里。</p>
+      </section>
+    </div>
+  );
+}
+
 export function ChatCanvasPage() {
   const { workspaceId = "", sessionId = "" } = useParams();
   const location = useLocation();
@@ -2873,6 +2947,7 @@ export function ChatCanvasPage() {
   const [rejectReason, setRejectReason] = useState("");
   const [closeDialogOpen, setCloseDialogOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [voiceModeOpen, setVoiceModeOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -8773,6 +8848,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
 
   return (
     <div className="chat-canvas-page relative flex h-full min-h-0 flex-col bg-background">
+      {voiceModeOpen ? (
+        <VoiceModeDialog
+          workspaceId={workspaceId}
+          sessionId={sessionId}
+          onClose={() => setVoiceModeOpen(false)}
+        />
+      ) : null}
       <ConversationJumpNav
         branches={conversationBranchLinks}
         items={conversationJumpItems}
@@ -10075,8 +10157,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                  ? createPortal(modelMenu, topbarModelSlot)
                  : modelMenu;
              })()}
-            <PromptInputButton
-              aria-label={isListening ? "停止语音输入" : "开始语音输入"}
+              <PromptInputButton
+                aria-label={isListening ? "停止语音输入" : "开始语音输入"}
               aria-pressed={isListening}
               className="chat-composer__microphone"
               disabled={
@@ -10088,8 +10170,17 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               onClick={toggleDictation}
               tooltip={isListening ? "停止语音输入" : "语音输入"}
             >
-              <Mic className="size-4" />
-            </PromptInputButton>
+                <Mic className="size-4" />
+              </PromptInputButton>
+              <PromptInputButton
+                aria-label="打开语音导师"
+                className="chat-composer__voice-mode"
+                disabled={sessionIsClosed || closeSessionMutation.isPending || goalFlow.busy}
+                onClick={() => setVoiceModeOpen(true)}
+                tooltip="语音导师"
+              >
+                <AudioWaveform className="size-4" />
+              </PromptInputButton>
             <PromptInputSubmit
               aria-label={
                 queueOnClick

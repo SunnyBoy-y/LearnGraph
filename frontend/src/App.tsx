@@ -10,6 +10,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { AuthProvider, RequireAuth } from '@/features/auth/auth-context'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { registerAuthQueryClient } from '@/lib/auth-query-cache'
+import { VoiceSessionProvider } from '@/features/voice/voice-session-controller'
 
 const LoginPage = lazy(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
 const ChangePasswordPage = lazy(() => import('@/features/auth/change-password-page').then((module) => ({ default: module.ChangePasswordPage })))
@@ -166,7 +167,9 @@ export default function App() {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={220}>
         <AuthProvider>
-          <BrowserRouter><AppRoutes /></BrowserRouter>
+          <VoiceSessionProvider>
+            <BrowserRouter><AppRoutes /></BrowserRouter>
+          </VoiceSessionProvider>
           <Toaster closeButton position="top-right" richColors />
         </AuthProvider>
       </TooltipProvider>
