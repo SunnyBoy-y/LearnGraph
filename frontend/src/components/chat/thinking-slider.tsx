@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { haptic } from "@/lib/native-bridge";
 
@@ -34,6 +34,13 @@ export function ThinkingSlider({
 }) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const lastIndexRef = useRef(value);
+  const draggingRef = useRef(false);
+
+  // Keep the deduplication baseline aligned when the selected mode changes
+  // outside the slider (for example, from the model menu).
+  useEffect(() => {
+    lastIndexRef.current = value;
+  }, [value]);
 
   const indexFromEvent = (clientX: number): number => {
     const el = trackRef.current;
@@ -53,6 +60,7 @@ export function ThinkingSlider({
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (disabled) return;
+    draggingRef.current = true;
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
@@ -61,8 +69,14 @@ export function ThinkingSlider({
     commit(indexFromEvent(event.clientX));
   };
   const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (disabled) return;
+    // Pointer movement while merely hovering must not change the selection.
+    // Movement becomes active only after a press starts a drag gesture.
+    if (disabled || !draggingRef.current) return;
     commit(indexFromEvent(event.clientX));
+  };
+
+  const stopDragging = () => {
+    draggingRef.current = false;
   };
 
   const pct = (value / (THINKING_STOPS.length - 1)) * 100;
@@ -76,6 +90,9 @@ export function ThinkingSlider({
         className="thinking-slider__track"
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
+        onPointerUp={stopDragging}
+        onPointerCancel={stopDragging}
+        onLostPointerCapture={stopDragging}
         role="slider"
         ref={trackRef}
       >

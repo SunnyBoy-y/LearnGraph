@@ -28,6 +28,7 @@ from app.providers.catalog import (
     REST_IMAGE_SEARCH_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
     TRANSCRIPTION_PROVIDER_TYPES,
+    TTS_PROVIDER_TYPES,
     VISION_PROVIDER_TYPES,
     provider_type_spec,
 )
@@ -45,6 +46,13 @@ from app.providers.ports.memory import MemoryProviderPort
 from app.providers.ports.research import DeepResearchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.ports.transcription import TranscriptionProviderPort
+from app.providers.ports.tts import TTSProviderPort
+from app.providers.remote.dashscope_realtime import DashScopeRealtimeASRProvider
+from app.providers.remote.volcengine_tts import (
+    DEFAULT_ENDPOINT as VOLCENGINE_TTS_DEFAULT_ENDPOINT,
+    SUPPORTED_MODELS,
+    VolcengineBidirectionalTTSProvider,
+)
 
 
 def _resolve_provider_base_url(
@@ -1352,6 +1360,107 @@ def transcription_provider_for_workspace(
             timeout_seconds=float(capabilities.get("transcription_timeout_seconds") or 180),
         )
     return None
+
+
+def realtime_asr_provider_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    *,
+    provider_id: str | None = None,
+    model_id: str | None = None,
+) -> DashScopeRealtimeASRProvider | None:
+    """Build the native DashScope realtime ASR adapter for voice runtimes.
+
+    The legacy browser dictation proxy still owns its WebSocket bridge.  This
+    selector is for Pipecat/voice runtimes that need to feed PCM frames and
+    consume normalized partial/final events directly.
+    """
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(db, workspace_id, "transcription")
+    provider = cached_first_provider_row(
+        db, workspace_id, TRANSCRIPTION_PROVIDER_TYPES | DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES,
+        provider_id=provider_id,
+        remote_capability=True,
+        priority_order=_provider_priority_order(),
+    )
+    if provider is None or not provider.base_url:
+        return None
+    capabilities = dict(provider.capabilities or {})
+    resolved_model = (model_id or capabilities.get("default_realtime_transcription_model_id") or "").strip()
+    if not resolved_model:
+        resolved_model = DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL
+    # Runtime ASR is model-driven. The selected model determines the protocol;
+    # a workspace may store it under a generic transcription Provider row.
+    if resolved_model != DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL:
+        return None
+    try:
+        api_key = _secret_for_provider(db, workspace_id, provider, settings)
+    except Exception as exc:
+        _log_secret_failure(workspace_id, provider, exc)
+        return None
+    if not api_key:
+        return None
+    return DashScopeRealtimeASRProvider(
+        provider_id=provider.id,
+        model_id=resolved_model,
+        base_url=str(capabilities.get("realtime_ws_url") or provider.base_url),
+        api_key=api_key,
+        sample_rate=int(capabilities.get("realtime_sample_rate") or 16_000),
+        silence_ms=int(capabilities.get("realtime_silence_ms") or 400),
+        language=str(capabilities.get("realtime_language") or "zh"),
+    )
+
+
+def tts_provider_for_workspace(
+    db: Session,
+    workspace_id: str,
+    settings: Settings,
+    *,
+    provider_id: str | None = None,
+    model_id: str | None = None,
+) -> TTSProviderPort | None:
+    """Resolve the workspace's enabled streaming TTS provider."""
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(db, workspace_id, "tts")
+    provider = cached_first_provider_row(
+        db,
+        workspace_id,
+        TTS_PROVIDER_TYPES,
+        provider_id=provider_id,
+        remote_capability=True,
+        priority_order=_provider_priority_order(),
+    )
+    if provider is None:
+        return None
+    capabilities = dict(provider.capabilities or {})
+    endpoint = str(provider.base_url or capabilities.get("endpoint") or VOLCENGINE_TTS_DEFAULT_ENDPOINT).strip()
+    resolved_model = str(
+        model_id or capabilities.get("default_tts_model_id") or capabilities.get("default_model") or "seed-tts-2.0-standard"
+    ).strip()
+    if resolved_model not in SUPPORTED_MODELS:
+        return None
+    try:
+        api_key = _secret_for_provider(db, workspace_id, provider, settings)
+    except Exception as exc:
+        _log_secret_failure(workspace_id, provider, exc)
+        return None
+    if not api_key:
+        return None
+    try:
+        return VolcengineBidirectionalTTSProvider(
+            provider_id=provider.id,
+            model_id=resolved_model,
+            base_url=endpoint,
+            api_key=api_key,
+            voice_type=str(capabilities.get("voice_type") or "ICL_uranus_zh_female_heainainai_tob"),
+            resource_id=str(capabilities.get("resource_id") or ""),
+            sample_rate=int(capabilities.get("sample_rate") or 24_000),
+            emotion=str(capabilities.get("emotion") or "") or None,
+            speech_rate=int(capabilities["speech_rate"]) if capabilities.get("speech_rate") is not None else None,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def embedding_provider_for_workspace(

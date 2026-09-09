@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { apiClient, ApiError } from "@/api/client";
+import { setVoiceSessionActive } from "./voice-session-markers";
 
 export type VoiceTransportState = "idle" | "connecting" | "connected" | "reconnecting" | "error";
 export type VoiceSessionState = "closed" | "ready" | "listening" | "thinking" | "speaking" | "error";
@@ -18,14 +19,17 @@ export interface VoiceSessionSnapshot {
   workspaceId: string; sessionId: string; transport: VoiceTransportState; state: VoiceSessionState;
   thinkingLimit: ThinkingLimit; transcript: VoiceTranscript[]; tasks: VoiceTaskEvent[]; error: string | null;
   sessionIdRemote: string | null;
+  signalingUrl: string | null;
 }
 
 const STORAGE_KEY = "learngraph.voice.preferences.v1";
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, sessionIdRemote: null };
+const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, sessionIdRemote: null, signalingUrl: null };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
 let abortController: AbortController | null = null;
+let peerConnection: RTCPeerConnection | null = null;
+let localStream: MediaStream | null = null;
 
 function emit() { for (const listener of listeners) listener(); }
 function update(patch: Partial<VoiceSessionSnapshot>) { snapshot = { ...snapshot, ...patch }; emit(); }
@@ -33,6 +37,12 @@ function readLimit(): ThinkingLimit {
   try { const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")?.thinkingLimit; return ["off", "low", "medium", "high", "xhigh"].includes(value) ? value : "high"; } catch { return "high"; }
 }
 function persistLimit(value: ThinkingLimit) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ thinkingLimit: value })); } catch { /* storage is optional */ } }
+function cleanupAudioTransport() {
+  localStream?.getTracks().forEach((track) => track.stop());
+  localStream = null;
+  peerConnection?.close();
+  peerConnection = null;
+}
 
 export const voiceSessionController = {
   getSnapshot: () => snapshot,
@@ -51,24 +61,60 @@ export const voiceSessionController = {
     if (!snapshot.sessionId || snapshot.transport === "connecting" || snapshot.transport === "connected") return;
     abortController?.abort(); abortController = new AbortController();
     update({ transport: "connecting", state: "ready", error: null });
+    let remoteId: string | null = null;
     try {
       // The endpoint is intentionally explicit: until the backend voice contract
       // is deployed, the UI reports the unavailable service instead of faking a call.
       const path = import.meta.env.VITE_VOICE_SESSION_PATH || "/voice/sessions";
-      const result = await apiClient.post<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean }>(path, { session_id: snapshot.sessionId, thinking_limit: snapshot.thinkingLimit }, { signal: abortController.signal });
-      const remoteId = result?.id || result?.session_id || result?.sessionId || null;
+      const result = await apiClient.post<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean; signaling_url?: string | null; reason?: string }>(path, { session_id: snapshot.sessionId, thinking_limit: snapshot.thinkingLimit }, { signal: abortController.signal });
+      remoteId = result?.id || result?.session_id || result?.sessionId || null;
       if (result?.runtime_ready !== true) {
-        update({ transport: "error", state: "error", sessionIdRemote: remoteId, error: "语音会话已创建，但 SmallWebRTC 实时服务尚未部署。" });
+        setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false);
+        const error = result?.reason === "voice_runtime_dependency_missing" ? "语音运行时依赖未安装，请安装 LearnGraph 的 voice 依赖后重启后端。" : "语音会话已创建，但内置 SmallWebRTC 运行时尚未就绪。";
+        update({ transport: "error", state: "error", sessionIdRemote: remoteId, signalingUrl: result?.signaling_url || null, error });
         return;
       }
-      update({ transport: "connected", state: "listening", sessionIdRemote: remoteId });
+      const configuredOfferPath = (result?.signaling_url || "").replace("{session_id}", remoteId || "");
+      // The backend advertises its mounted API path (`/api/v1/...`), while
+      // apiClient already prefixes relative requests with `/api/v1`. Strip
+      // that prefix once to avoid posting to `/api/v1/api/v1/...`.
+      const apiBase = apiClient.baseUrl.replace(/\/+$/, "");
+      const offerPath = configuredOfferPath.startsWith(`${apiBase}/`)
+        ? configuredOfferPath.slice(apiBase.length)
+        : configuredOfferPath;
+      if (!offerPath || typeof RTCPeerConnection === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+        throw new Error("当前浏览器或内置语音运行时不支持 WebRTC。");
+      }
+      peerConnection = new RTCPeerConnection();
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStream.getTracks().forEach((track) => peerConnection?.addTrack(track, localStream!));
+      peerConnection.ontrack = (event) => {
+        const audio = new Audio();
+        audio.autoplay = true;
+        audio.srcObject = event.streams[0];
+        void audio.play().catch(() => undefined);
+      };
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      const answer = await apiClient.post<{ sdp: string; type: RTCSdpType }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId } });
+      await peerConnection.setRemoteDescription(answer);
+      if (remoteId) setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, true);
+      update({ transport: "connected", state: "listening", sessionIdRemote: remoteId, signalingUrl: result?.signaling_url || null });
     } catch (error) {
+      cleanupAudioTransport();
+      if (remoteId) void apiClient.delete(`/voice/sessions/${remoteId}`).catch(() => undefined);
       if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof ApiError && error.status === 404 ? "语音服务尚未启用，请先部署 SmallWebRTC 语音服务。" : error instanceof Error ? error.message : "语音连接失败";
       update({ transport: "error", state: "error", error: message });
     }
   },
-  disconnect() { abortController?.abort(); abortController = null; const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); },
+  disconnect() { const remote = snapshot.sessionIdRemote; abortController?.abort(); abortController = null; cleanupAudioTransport(); if (remote) void apiClient.delete(`/voice/sessions/${remote}`).catch(() => undefined); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); },
+  async interrupt() {
+    const remote = snapshot.sessionIdRemote;
+    if (!remote) return false;
+    try { await apiClient.post(`/voice/sessions/${remote}/interrupt`, {}); update({ state: "ready" }); return true; }
+    catch (error) { update({ error: error instanceof Error ? error.message : "语音打断失败" }); return false; }
+  },
   toggleListening() {
     if (snapshot.transport !== "connected") return;
     update({ state: snapshot.state === "listening" ? "ready" : "listening" });
@@ -120,5 +166,5 @@ export function useVoiceSession(workspaceId?: string, sessionId?: string) {
   const controller = useContext(VoiceSessionContext);
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   useEffect(() => { if (workspaceId && sessionId) controller.open(workspaceId, sessionId); }, [controller, sessionId, workspaceId]);
-  return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, toggleListening: controller.toggleListening, setThinkingLimit: controller.setThinkingLimit, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendTurn: controller.sendTurn, startTask: controller.startTask }), [controller, state]);
+  return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, interrupt: controller.interrupt, toggleListening: controller.toggleListening, setThinkingLimit: controller.setThinkingLimit, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendTurn: controller.sendTurn, startTask: controller.startTask }), [controller, state]);
 }

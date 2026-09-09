@@ -2745,30 +2745,38 @@ function VoiceModeDialog({
   onClose: () => void;
 }) {
   const voice = useVoiceSession(workspaceId, sessionId);
+  const [voiceText, setVoiceText] = useState("");
+  const disconnectVoice = voice.disconnect;
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     closeRef.current?.focus();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") { voice.disconnect(); onClose(); } };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [disconnectVoice, onClose]);
   const isListening = voice.state === "listening";
   const status = voice.transport === "connecting" ? "正在连接语音服务…" : voice.transport === "error" ? voice.error || "语音连接失败" : voice.state === "speaking" ? "导师正在回答，你可以随时打断" : isListening ? "正在聆听，你可以随时打断" : "点击开始连接语音导师";
-  const toggle = () => { if (voice.transport !== "connected") void voice.connect(); else voice.toggleListening(); };
+  const toggle = () => { if (voice.transport !== "connected") void voice.connect(); else if (voice.state === "speaking") void voice.interrupt(); else voice.toggleListening(); };
+  const submitVoiceText = () => {
+    const text = voiceText.trim();
+    if (!text || voice.transport !== "connected") return;
+    setVoiceText("");
+    void voice.sendTurn(text);
+  };
   return (
     <div className="chat-voice-dialog" role="dialog" aria-modal="true" aria-labelledby="voice-dialog-title">
-      <button className="chat-voice-dialog__scrim" onClick={onClose} type="button" aria-label="关闭语音导师" />
+      <button className="chat-voice-dialog__scrim" onClick={() => { voice.disconnect(); onClose(); }} type="button" aria-label="关闭语音导师" />
       <section className="chat-voice-dialog__panel">
         <header className="chat-voice-dialog__header">
           <div>
             <p className="chat-voice-dialog__eyebrow">LEARNGRAPH VOICE</p>
           <h2 id="voice-dialog-title">语音导师</h2>
           </div>
-          <button ref={closeRef} className="chat-voice-dialog__close" onClick={onClose} type="button" aria-label="关闭语音导师">
+          <button ref={closeRef} className="chat-voice-dialog__close" onClick={() => { voice.disconnect(); onClose(); }} type="button" aria-label="关闭语音导师">
             <X className="size-4" />
           </button>
         </header>
-        <div className={cn("chat-voice-orb", isListening && "is-listening")} aria-hidden="true">
+        <div className={cn("chat-voice-orb", isListening && "is-listening", voice.state === "speaking" && "is-speaking")} aria-hidden="true">
           <span className="chat-voice-orb__core" />
           <span className="chat-voice-orb__halo chat-voice-orb__halo--one" />
           <span className="chat-voice-orb__halo chat-voice-orb__halo--two" />
@@ -2788,12 +2796,16 @@ function VoiceModeDialog({
         </div>
         {voice.transcript.length > 0 ? <div className="chat-voice-dialog__captions" aria-live="polite">{voice.transcript.slice(-2).map((item) => <p key={item.id}><b>{item.role === "user" ? "你" : "导师"}</b>{item.text}</p>)}</div> : null}
         {voice.tasks.length > 0 ? <div className="chat-voice-dialog__tasks" aria-label="后台任务">{voice.tasks.slice(-2).map((task) => <p key={task.taskId}><span>{task.title || "后台任务"}</span><small>{task.status === "completed" ? "已完成" : task.status === "running" ? "进行中" : task.status}</small></p>)}</div> : null}
+        <div className="chat-voice-dialog__text-input">
+          <input value={voiceText} onChange={(event) => setVoiceText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) submitVoiceText(); }} placeholder="也可以直接输入，语音导师会沿用当前上下文" aria-label="发送文字给语音导师" disabled={voice.transport !== "connected"} />
+          <button type="button" onClick={submitVoiceText} disabled={voice.transport !== "connected" || !voiceText.trim()}>发送</button>
+        </div>
         <div className="chat-voice-dialog__actions">
           <button className={cn("chat-voice-dialog__mic", isListening && "is-active")} onClick={toggle} type="button" aria-pressed={isListening} disabled={voice.transport === "connecting"}>
             <Mic className="size-5" />
-            <span>{voice.transport === "connected" ? (isListening ? "结束聆听" : "开始说话") : "连接语音"}</span>
+            <span>{voice.transport === "connected" ? (voice.state === "speaking" ? "打断回答" : isListening ? "结束聆听" : "开始说话") : "连接语音"}</span>
           </button>
-          <button className="chat-voice-dialog__secondary" onClick={onClose} type="button">返回文字对话</button>
+          <button className="chat-voice-dialog__secondary" onClick={() => { voice.disconnect(); onClose(); }} type="button">返回文字对话</button>
         </div>
         <p className="chat-voice-dialog__note">语音入口会保留在当前会话中，任务和页面产物仍显示在对话消息里。</p>
       </section>

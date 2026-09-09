@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from app.providers.speech_models import speech_models_for_provider
+
 
 ProviderRole = Literal[
     "model",
@@ -14,6 +16,8 @@ ProviderRole = Literal[
     "deep_research",
     "memory",
     "transcription",
+    "tts",
+    "embedding",
     "development",
 ]
 
@@ -50,9 +54,17 @@ class ProviderTypeSpec:
     # 免费供应商标记：前端展示"免费"徽标；无需 Key 且无需 Base URL 的免费源
     # 在创建实例时默认启用（可由用户随时关闭）。
     is_free: bool = False
+    supported_model_ids: tuple[str, ...] = ()
 
     def view(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        # Speech model cards are selected by model purpose, not guessed from
+        # provider labels.  Keep the field present on every catalog item so
+        # older clients can ignore it safely.
+        payload["speech_models"] = [
+            item.view() for item in speech_models_for_provider(self.provider_type)
+        ]
+        return payload
 
 
 PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
@@ -666,6 +678,24 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         key_management_url="https://platform.openai.com/api-keys",
     ),
     ProviderTypeSpec(
+        provider_type="volcengine_tts",
+        role="tts",
+        label="火山引擎双向流式 TTS",
+        description=(
+            "火山引擎语音合成 2.0 双向流式 WebSocket。用于全双工语音导师，"
+            "支持 PCM 音频分片、会话取消和打断后的过期音频过滤。"
+        ),
+        requires_base_url=True,
+        requires_secret=True,
+        supports_model_discovery=False,
+        supports_probe=False,
+        default_base_url="wss://openspeech.bytedance.com/api/v3/tts/bidirection",
+        brand_id="volcengine",
+        brand_icon_url="https://www.volcengine.com/favicon.ico",
+        documentation_url="https://www.volcengine.com/docs/6561/1257543",
+        key_management_url="https://console.volcengine.com/accesskey",
+    ),
+    ProviderTypeSpec(
         provider_type="openai_compatible_embedding",
         role="embedding",
         label="OpenAI-compatible Embedding",
@@ -815,6 +845,9 @@ DEEP_RESEARCH_PROVIDER_TYPES = frozenset(
 )
 TRANSCRIPTION_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "transcription"
+)
+TTS_PROVIDER_TYPES = frozenset(
+    item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "tts"
 )
 EMBEDDING_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "embedding"

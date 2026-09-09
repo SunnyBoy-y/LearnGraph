@@ -17,6 +17,7 @@ import {
   Search,
   Sparkles,
   Upload,
+  Volume2,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -68,6 +69,8 @@ function getRoleMeta(role: ProviderRole | string) {
       return { label: "主对话与推理", icon: Bot, badgeColor: "text-blue-600 bg-blue-50 border-blue-200 dark:bg-blue-950/40 dark:border-blue-800 dark:text-blue-300" };
     case "transcription":
       return { label: "语音转写 (ASR)", icon: Mic, badgeColor: "text-emerald-600 bg-emerald-50 border-emerald-200 dark:bg-emerald-950/40 dark:border-emerald-800 dark:text-emerald-300" };
+    case "tts":
+      return { label: "语音合成 (TTS)", icon: Volume2, badgeColor: "text-violet-600 bg-violet-50 border-violet-200 dark:bg-violet-950/40 dark:border-violet-800 dark:text-violet-300" };
     case "image_generation":
       return { label: "图像生成", icon: ImageIcon, badgeColor: "text-pink-600 bg-pink-50 border-pink-200 dark:bg-pink-950/40 dark:border-pink-800 dark:text-pink-300" };
     case "embedding":
@@ -90,6 +93,8 @@ function roleCategoryLabel(role: ProviderRole | string) {
       return "对话模型";
     case "transcription":
       return "语音转写";
+    case "tts":
+      return "语音合成";
     case "image_generation":
       return "图像生成";
     case "embedding":
@@ -120,6 +125,7 @@ const ROLE_ORDER: ProviderRole[] = [
   "fetch",
   "deep_research",
   "transcription",
+  "tts",
   "embedding",
   "memory",
 ];

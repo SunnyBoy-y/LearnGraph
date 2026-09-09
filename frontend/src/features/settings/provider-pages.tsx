@@ -161,10 +161,17 @@ import type {
   ProviderModelStatesView,
   ProviderRole,
   ProviderTypeCatalogItem,
+  SpeechModelPreset,
   ReasoningParameter,
   SearchRoute,
   ThinkingMode,
 } from "@/types/providers";
+import {
+  buildSpeechProviderPayload,
+  speechDraftForModel,
+  speechModelsForRole,
+  type SpeechProviderDraft,
+} from "./speech-provider-config";
 import { Textarea } from "@/components/ui/textarea";
 import { isRealtimeTranscriptionModel } from "@/lib/model-choices";
 
@@ -813,21 +820,17 @@ export function ProvidersPage() {
     "fetch",
     "deep_research",
     "transcription",
+    "tts",
     "embedding",
     "memory",
   ];
-  const availableRoles = (
-    catalogRoles.length
-      ? catalogRoles
-      : [
-          ...new Set(
-            providers.data.flatMap((provider) => {
-              const role = catalogByType.get(provider.provider_type)?.role;
-              return role ? [role] : [];
-            }),
-          ),
-        ]
-  ).sort(
+  const availableRoles = [...new Set([
+    ...ROLE_ORDER,
+    ...(catalogRoles.length ? catalogRoles : providers.data.flatMap((provider) => {
+      const role = catalogByType.get(provider.provider_type)?.role;
+      return role ? [role] : [];
+    })),
+  ])].sort(
     (a, b) =>
       (ROLE_ORDER.indexOf(a) === -1 ? 99 : ROLE_ORDER.indexOf(a)) -
       (ROLE_ORDER.indexOf(b) === -1 ? 99 : ROLE_ORDER.indexOf(b)),
@@ -1677,7 +1680,11 @@ export function ProvidersPage() {
               event.preventDefault();
               if (!endpointTarget) return;
               const trimmed = endpointValue.trim();
-              if (trimmed && !isValidHttpUrl(trimmed)) {
+              const endpointSpec = catalogByType.get(endpointTarget.provider_type);
+              const valid = endpointSpec?.role === "tts"
+                ? isValidWsUrl(trimmed)
+                : isValidHttpUrl(trimmed);
+              if (trimmed && !valid) {
                 toast.error(invalidBaseUrlMessage(trimmed));
                 return;
               }
@@ -1692,8 +1699,11 @@ export function ProvidersPage() {
                 ? catalogByType.get(endpointTarget.provider_type)
                 : undefined;
               const trimmedEndpoint = endpointValue.trim();
+              const endpointUsesWebSocket = spec?.role === "tts";
               const endpointValid =
-                !trimmedEndpoint || isValidHttpUrl(trimmedEndpoint);
+                !trimmedEndpoint || (endpointUsesWebSocket
+                  ? isValidWsUrl(trimmedEndpoint)
+                  : isValidHttpUrl(trimmedEndpoint));
               const endpointPathHint = missingApiPathHint(trimmedEndpoint);
               return (
                 <>
@@ -1710,7 +1720,7 @@ export function ProvidersPage() {
                         aria-invalid={Boolean(trimmedEndpoint) && !endpointValid}
                         id="provider-endpoint-edit"
                         onChange={(event) => setEndpointValue(event.currentTarget.value)}
-                        placeholder={spec?.default_base_url ?? "https://provider.example/v1"}
+                        placeholder={spec?.default_base_url ?? (endpointUsesWebSocket ? "wss://provider.example/tts" : "https://provider.example/v1")}
                         value={endpointValue}
                       />
                       {trimmedEndpoint && !endpointValid ? (
@@ -1730,7 +1740,9 @@ export function ProvidersPage() {
                         </p>
                       ) : (
                         <p className="text-xs text-muted-foreground">
-                          支持官方 API 或兼容网关地址。OpenAI 兼容网关的 API 地址通常以 /v1 结尾（如 http://localhost:8080/v1）。
+                          {endpointUsesWebSocket
+                            ? "TTS 连接地址必须使用 ws:// 或 wss:// 协议。"
+                            : "支持官方 API 或兼容网关地址。OpenAI 兼容网关的 API 地址通常以 /v1 结尾（如 http://localhost:8080/v1）。"}
                         </p>
                       )}
                       {endpointValid && endpointPathHint ? (
@@ -2128,6 +2140,8 @@ function providerRoleLabel(role: ProviderRole) {
       return "共同记忆";
     case "transcription":
       return "语音转写";
+    case "tts":
+      return "语音合成";
     case "embedding":
       return "Embedding";
   }
@@ -2870,6 +2884,15 @@ function isValidHttpUrl(value: string): boolean {
   }
 }
 
+function isValidWsUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value.trim());
+    return (parsed.protocol === "ws:" || parsed.protocol === "wss:") && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function invalidBaseUrlMessage(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "Base URL 不能为空";
@@ -2989,6 +3012,7 @@ function ProviderDialog({
     "fetch",
     "deep_research",
     "transcription",
+    "tts",
     "embedding",
     "memory",
   ];
@@ -3012,6 +3036,9 @@ function ProviderDialog({
   const [baseUrl, setBaseUrl] = useState("https://api.deepseek.com");
   const [key, setKey] = useState("");
   const [headersText, setHeadersText] = useState("");
+  const [speechDraft, setSpeechDraft] = useState<SpeechProviderDraft>(() =>
+    speechDraftForModel(),
+  );
   // DeepSeek is no longer a separate protocol — it is an OpenAI-compatible preset.
   const [deepSeekPresetActive, setDeepSeekPresetActive] = useState(true);
   const [quickPreset, setQuickPreset] = useState<string>("deepseek");
@@ -3019,6 +3046,25 @@ function ProviderDialog({
   const selected = catalog.find((item) => item.provider_type === type);
   const roleTypes = creatable.filter((item) => item.role === role);
   const quickProviders = roleQuickProviders(role, catalog);
+  const isSpeechRole = role === "transcription" || role === "tts";
+  const speechModels = speechModelsForRole(catalog, role);
+  const selectedSpeechModel = speechModels.find(
+    (model) => model.id === speechDraft.modelId,
+  );
+
+  function selectSpeechModel(model: SpeechModelPreset) {
+    const current = speechDraft;
+    const next = speechDraftForModel(model);
+    setSpeechDraft({
+      ...next,
+      name: current.name.trim() && current.modelId === model.id ? current.name : next.name,
+      apiKey: current.apiKey,
+    });
+    setType(model.provider_type);
+    setBaseUrl(model.default_base_url);
+    setName(next.name);
+    setKey(current.apiKey);
+  }
 
   useEffect(() => {
     if (!catalog.length) return;
@@ -3058,6 +3104,11 @@ function ProviderDialog({
         : "",
     );
     setBaseUrl(next.default_base_url ?? "");
+    const nextSpeechModel = (next.speech_models ?? [])[0];
+    if (nextSpeechModel) {
+      setSpeechDraft(speechDraftForModel(nextSpeechModel));
+      setKey("");
+    }
     if (next.provider_type === "openai_responses") {
       setName("OpenAI");
       return;
@@ -3079,6 +3130,11 @@ function ProviderDialog({
 
   function selectRole(nextRole: ProviderRole) {
     setRole(nextRole);
+    const nextSpeechModels = speechModelsForRole(catalog, nextRole);
+    if (nextSpeechModels.length) {
+      selectSpeechModel(nextSpeechModels[0]);
+      return;
+    }
     const first = creatable.find((item) => item.role === nextRole);
     if (first) {
       applyCatalogItem(first);
@@ -3174,6 +3230,14 @@ function ProviderDialog({
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!selected) return;
+    if (isSpeechRole) {
+      try {
+        onCreate(buildSpeechProviderPayload(speechDraft, selectedSpeechModel));
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "语音 Provider 配置不完整");
+      }
+      return;
+    }
     // Intercept unusable endpoints before the request reaches the backend
     // probe: a URL without an http(s) protocol can never be issued.
     if (selected.requires_base_url && !trimmedBaseUrl) {
@@ -3214,7 +3278,7 @@ function ProviderDialog({
     if (role === "transcription" && activeQuickProvider?.brandId === "qwen") {
       capabilities.default_transcription_model_id = "qwen3-asr-flash";
       capabilities.default_realtime_transcription_model_id =
-        "paraformer-realtime-v2";
+        "qwen3-asr-flash-realtime";
     }
     if (role === "embedding" && activeQuickProvider?.brandId === "qwen") {
       capabilities.default_model = "text-embedding-v4";
@@ -3249,7 +3313,7 @@ function ProviderDialog({
   // The backend probe can never issue an endpoint without an http(s) protocol;
   // intercept such URLs before submission instead of surfacing a 500.
   const baseUrlValid =
-    !trimmedBaseUrl || isValidHttpUrl(trimmedBaseUrl);
+    !trimmedBaseUrl || (role === "tts" ? isValidWsUrl(trimmedBaseUrl) : isValidHttpUrl(trimmedBaseUrl));
   const baseUrlPathHint = missingApiPathHint(trimmedBaseUrl);
 
   return (
@@ -3278,7 +3342,9 @@ function ProviderDialog({
           <DialogHeader className="shrink-0 px-5 pt-5 pr-12">
             <DialogTitle>新增 Provider</DialogTitle>
             <DialogDescription>
-              快捷项仅预填厂商名称、地址和协议；填入 API Key 后仍需执行真实能力探测。
+              {isSpeechRole
+                ? "选择已适配的 ASR/TTS 模型，地址与运行参数会按模型能力填充。"
+                : "快捷项仅预填厂商名称、地址和协议；填入 API Key 后仍需执行真实能力探测。"}
             </DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-5">
@@ -3312,6 +3378,75 @@ function ProviderDialog({
                 ))}
               </div>
             </div>
+            {isSpeechRole ? (
+              <div className="space-y-4 rounded-2xl border border-primary/20 bg-primary/[0.035] p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold">选择已适配模型</p>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                      语音配置按模型能力生成，避免先选厂商再猜协议和参数。
+                    </p>
+                  </div>
+                  <span className="rounded-full bg-primary/10 px-2 py-1 text-[10px] font-medium text-primary">
+                    {role === "tts" ? "TTS" : "ASR"}
+                  </span>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {speechModels.map((model) => (
+                    <button
+                      aria-pressed={selectedSpeechModel?.id === model.id}
+                      className={`rounded-xl border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selectedSpeechModel?.id === model.id ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/45"}`}
+                      key={model.id}
+                      onClick={() => selectSpeechModel(model)}
+                      type="button"
+                    >
+                      <span className="block text-sm font-medium">{model.label}</span>
+                      <span className="mt-1 block font-mono text-[11px] text-muted-foreground">{model.id}</span>
+                      <span className="mt-1 line-clamp-2 block text-xs leading-5 text-muted-foreground">{model.description}</span>
+                    </button>
+                  ))}
+                </div>
+                {!speechModels.length ? (
+                  <p className="rounded-lg border border-dashed p-3 text-xs text-muted-foreground">当前服务端尚未返回已适配的语音模型。</p>
+                ) : null}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="speech-name">显示名称</Label>
+                    <Input id="speech-name" value={speechDraft.name} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, name: event.target.value }))} />
+                  </div>
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="speech-base-url">服务地址</Label>
+                    <Input id="speech-base-url" value={speechDraft.baseUrl} onChange={(event) => { const value = event.target.value; setSpeechDraft((draft) => ({ ...draft, baseUrl: value })); setBaseUrl(value); }} placeholder={selectedSpeechModel?.default_base_url ?? "https://provider.example/v1"} />
+                  </div>
+                  {selectedSpeechModel?.purpose === "realtime" ? (
+                    <div className="space-y-2 sm:col-span-2">
+                      <Label htmlFor="speech-ws-url">实时 WebSocket 地址</Label>
+                      <Input id="speech-ws-url" value={speechDraft.websocketUrl} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, websocketUrl: event.target.value }))} placeholder="wss://..." />
+                    </div>
+                  ) : null}
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="speech-key">API Key{selected?.requires_secret ? "（必填）" : "（可选）"}</Label>
+                    <Input autoComplete="off" id="speech-key" type="password" value={speechDraft.apiKey} onChange={(event) => { const value = event.target.value; setSpeechDraft((draft) => ({ ...draft, apiKey: value })); setKey(value); }} placeholder="仅提交一次" />
+                  </div>
+                  {selectedSpeechModel?.purpose === "tts" ? (
+                    <>
+                      <div className="space-y-2"><Label htmlFor="speech-voice">音色 ID</Label><Input id="speech-voice" value={speechDraft.voice} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, voice: event.target.value }))} /></div>
+                      <div className="space-y-2"><Label htmlFor="speech-resource">资源 ID</Label><Input id="speech-resource" value={speechDraft.resourceId} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, resourceId: event.target.value }))} /></div>
+                      <div className="space-y-2"><Label htmlFor="speech-rate">采样率</Label><Input id="speech-rate" inputMode="numeric" value={speechDraft.sampleRate} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, sampleRate: event.target.value }))} /></div>
+                      <div className="space-y-2"><Label htmlFor="speech-speed">语速（-50 至 100）</Label><Input id="speech-speed" inputMode="numeric" value={speechDraft.speechRate} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, speechRate: event.target.value }))} /></div>
+                    </>
+                  ) : null}
+                  {selectedSpeechModel?.purpose === "realtime" ? (
+                    <>
+                      <div className="space-y-2"><Label htmlFor="speech-sample-rate">采样率</Label><Input id="speech-sample-rate" inputMode="numeric" value={speechDraft.sampleRate} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, sampleRate: event.target.value }))} /></div>
+                      <div className="space-y-2"><Label htmlFor="speech-silence">断句等待（毫秒）</Label><Input id="speech-silence" inputMode="numeric" value={speechDraft.silenceMs} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, silenceMs: event.target.value }))} /></div>
+                      <div className="space-y-2"><Label htmlFor="speech-language">语言</Label><Input id="speech-language" value={speechDraft.language} onChange={(event) => setSpeechDraft((draft) => ({ ...draft, language: event.target.value }))} /></div>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+            {!isSpeechRole ? <>
             <div className="space-y-2">
               <Label>快捷接入</Label>
               <div className="grid max-h-56 grid-cols-2 gap-2 overflow-y-auto pr-1 sm:grid-cols-3">
@@ -3549,11 +3684,13 @@ function ProviderDialog({
                 当前系统安全凭据库不可用。可先不填 API Key 保存配置，恢复安全凭据库后再录入。
               </div>
             ) : null}
+            </> : null}
           </div>
           <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none">
             <Button
               disabled={
-                busy || catalogPending || Boolean(catalogError) || !name.trim() || !selected || !baseUrlValid
+                busy || catalogPending || Boolean(catalogError) || !selected || !baseUrlValid ||
+                (isSpeechRole ? !speechDraft.name.trim() || !selectedSpeechModel : !name.trim())
               }
               type="submit"
             >

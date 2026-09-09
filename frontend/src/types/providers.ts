@@ -10,6 +10,7 @@ export type ProviderRole =
   | "deep_research"
   | "memory"
   | "transcription"
+  | "tts"
   | "embedding";
 
 export interface ProviderTypeCatalogItem {
@@ -33,6 +34,18 @@ export interface ProviderTypeCatalogItem {
   image_search_modes?: Array<"text" | "image">;
   /** 免费供应商标记；无需 Key/Base URL 的免费源创建实例时默认启用。 */
   is_free: boolean;
+  supported_model_ids?: string[];
+  speech_models?: SpeechModelPreset[];
+}
+
+export interface SpeechModelPreset {
+  id: string;
+  label: string;
+  purpose: "realtime" | "stored" | "stored_async" | "tts";
+  provider_type: string;
+  default_base_url: string;
+  default_capabilities: Record<string, unknown>;
+  description: string;
 }
 
 export interface ProviderCreateRequest {

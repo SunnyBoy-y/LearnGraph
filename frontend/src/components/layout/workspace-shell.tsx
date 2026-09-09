@@ -98,6 +98,7 @@ import { SettingsModal } from "@/components/layout/settings-modal";
 import { NativeActions } from "@/features/mobile/NativeActions";
 import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
 import { OPEN_GRAPH_EVENT, OPEN_SIDEBAR_EVENT } from "@/lib/mobile-shell";
+import { isVoiceSessionActive } from "@/features/voice/voice-session-markers";
 // F1-2/P0-1: the selection-explanation panel pulls the whole chat renderer
 // (streamdown/hast/parse5/mermaid/d3 subtree) into the first-screen entry
 // chunk, which rolldown mis-orders at module eval (TDZ crash). Load it lazily.
@@ -1737,6 +1738,7 @@ function SidebarNav({
 
         <SessionProjects
           activeSessionId={activeSessionId}
+          workspaceId={workspaceId}
           onCreateConversation={(projectId) =>
             projectId
               ? createConversation(projectId)
@@ -1846,6 +1848,7 @@ function SidebarNav({
 }
 
 function SessionProjects({
+  workspaceId,
   activeSessionId,
   onCreateConversation,
   onCreateProject,
@@ -1864,6 +1867,7 @@ function SessionProjects({
   projects,
   ungroupedSessions,
 }: {
+  workspaceId: string;
   activeSessionId: string;
   onCreateConversation: (projectId?: string) => Promise<void>;
   onCreateProject: (title: string) => Promise<string>;
@@ -1885,6 +1889,16 @@ function SessionProjects({
   projects: SidebarProject[];
   ungroupedSessions: SidebarSession[];
 }) {
+  const [voiceMarkerVersion, setVoiceMarkerVersion] = useState(0);
+  useEffect(() => {
+    const refresh = () => setVoiceMarkerVersion((value) => value + 1);
+    window.addEventListener("learngraph:voice-session-marker", refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener("learngraph:voice-session-marker", refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
   const [expandedProjects, setExpandedProjects] = useState<
     Record<string, boolean>
   >({});
@@ -2143,6 +2157,10 @@ function SessionProjects({
       );
     // Auto-expand when a nested child is the active route.
     const effectivelyOpen = open || childActive;
+    // Read the marker during render so active voice sessions are identifiable
+    // even after navigating away from the conversation route.
+    void voiceMarkerVersion;
+    const voiceActive = isVoiceSessionActive(workspaceId, session.id);
 
     return (
       <div className="sidebar-session-tree" key={session.id}>
@@ -2258,6 +2276,7 @@ function SessionProjects({
                 />
               ) : null}
               <span className="min-w-0 flex-1 truncate">{session.title}</span>
+              {voiceActive ? <span aria-label="语音导师已开启" className="sidebar-session__voice" title="语音导师已开启">◉</span> : null}
               {hasChildren ? (
                 <small className="sidebar-session__child-count">
                   {children.length}

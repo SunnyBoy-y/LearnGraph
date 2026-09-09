@@ -88,10 +88,12 @@ from app.providers.catalog import (
     REST_IMAGE_SEARCH_PROVIDER_TYPES,
     SEARCH_PROVIDER_TYPES,
     TRANSCRIPTION_PROVIDER_TYPES,
+    TTS_PROVIDER_TYPES,
     VISION_PROVIDER_TYPES,
     provider_catalog,
     provider_type_spec,
 )
+from app.providers.speech_models import speech_model_spec
 from app.providers.model_catalog import unified_model_defaults
 from app.providers.remote.fetch import (
     Crawl4AIHTTPFetchProvider,
@@ -343,11 +345,22 @@ class ProviderService:
                 "This Provider type cannot be created by the current backend",
                 {"provider_type": payload.provider_type},
             )
+        if (
+            payload.provider_type in TTS_PROVIDER_TYPES
+            and payload.base_url
+            and not payload.base_url.strip().lower().startswith(("ws://", "wss://"))
+        ):
+            raise AppError(
+                422,
+                "provider_websocket_url_required",
+                "A TTS Provider base URL must use ws:// or wss://",
+            )
         existing = self.db.scalar(
             self.providers.query().where(ProviderConfig.display_name == payload.display_name)
         )
         if existing is not None:
             raise AppError(409, "provider_name_conflict", "Provider display name already exists")
+        configured_base_url = payload.base_url
         secret = payload.api_key.get_secret_value() if payload.api_key else None
         encrypted = None
         if secret:
@@ -523,6 +536,53 @@ class ProviderService:
             }
         # Sanitize optional custom headers used by proxy / relay stations.
         incoming_capabilities = dict(payload.capabilities or {})
+        selected_speech_model_id = str(
+            incoming_capabilities.get("speech_model_id") or ""
+        ).strip()
+        if selected_speech_model_id:
+            selected_speech_model = speech_model_spec(selected_speech_model_id)
+            if (
+                selected_speech_model is None
+                or selected_speech_model.provider_type != payload.provider_type
+            ):
+                raise AppError(
+                    422,
+                    "unsupported_speech_model",
+                    "The selected speech model is not supported by this Provider type",
+                    {
+                        "speech_model_id": selected_speech_model_id,
+                        "provider_type": payload.provider_type,
+                    },
+                )
+            # Model defaults are authoritative for transport selection, while
+            # explicit form values (voice, sample rate, etc.) override them.
+            incoming_capabilities = {
+                **selected_speech_model.default_capabilities,
+                **incoming_capabilities,
+                "speech_model_id": selected_speech_model.id,
+            }
+            purpose_field = {
+                "realtime": "default_realtime_transcription_model_id",
+                "stored": "default_transcription_model_id",
+                "stored_async": "default_async_transcription_model_id",
+                "tts": "default_tts_model_id",
+            }[selected_speech_model.purpose]
+            for field_name in (purpose_field, "default_model"):
+                selected_value = str(incoming_capabilities.get(field_name) or "").strip()
+                if selected_value and selected_value != selected_speech_model.id:
+                    raise AppError(
+                        422,
+                        "unsupported_speech_model",
+                        "The selected speech model must match its purpose-specific default model",
+                        {
+                            "speech_model_id": selected_speech_model.id,
+                            "field": field_name,
+                            "value": selected_value,
+                        },
+                    )
+            incoming_capabilities[purpose_field] = selected_speech_model.id
+            if not configured_base_url:
+                configured_base_url = selected_speech_model.default_base_url
         if "extra_headers" in incoming_capabilities:
             incoming_capabilities["extra_headers"] = self._sanitize_extra_headers(
                 incoming_capabilities.get("extra_headers")
@@ -565,7 +625,7 @@ class ProviderService:
                 workspace_id=self.workspace_id,
                 display_name=payload.display_name,
                 provider_type=payload.provider_type,
-                base_url=payload.base_url,
+                base_url=configured_base_url,
                 api_key_masked=masked,
                 secret_fingerprint=fingerprint,
                 enabled=auto_enable_keyless_free,
@@ -1373,6 +1433,16 @@ class ProviderService:
                     "provider_base_url_required",
                     "This Provider requires a base URL",
                 )
+            if (
+                provider.provider_type in TTS_PROVIDER_TYPES
+                and updated_base_url
+                and not updated_base_url.lower().startswith(("ws://", "wss://"))
+            ):
+                raise AppError(
+                    422,
+                    "provider_websocket_url_required",
+                    "A TTS Provider base URL must use ws:// or wss://",
+                )
             provider.base_url = updated_base_url
         if "extra_headers" in fields_set:
             capabilities["extra_headers"] = self._sanitize_extra_headers(
@@ -1679,11 +1749,14 @@ class ProviderService:
             realtime_model = str(
                 capabilities.get("default_realtime_transcription_model_id") or ""
             ).strip()
-            if not stored_model and not realtime_model:
+            async_model = str(
+                capabilities.get("default_async_transcription_model_id") or ""
+            ).strip()
+            if not stored_model and not realtime_model and not async_model:
                 raise AppError(
                     409,
                     "provider_transcription_model_required",
-                    "A stored-file or realtime transcription model is required before enabling",
+                    "A stored-file, asynchronous, or realtime transcription model is required before enabling",
                 )
             for current in self.providers.list():
                 if (
@@ -1696,6 +1769,53 @@ class ProviderService:
             provider.remote_capability = True
             capabilities["remote_calls_enabled"] = True
             capabilities["provider_role"] = "transcription"
+            provider.status = "enabled_unverified"
+        elif enabled and provider.provider_type in TTS_PROVIDER_TYPES:
+            secret = self._active_secret_record(provider.id)
+            if secret is None or not provider.base_url:
+                raise AppError(
+                    409,
+                    "provider_not_configured",
+                    "TTS Provider requires a WebSocket base URL and encrypted secret before enabling",
+                )
+            if not provider.base_url.lower().startswith(("ws://", "wss://")):
+                raise AppError(
+                    409,
+                    "provider_websocket_url_required",
+                    "A TTS Provider base URL must use ws:// or wss://",
+                )
+            selected_speech_model_id = str(
+                capabilities.get("speech_model_id") or ""
+            ).strip()
+            selected_speech_model = speech_model_spec(selected_speech_model_id)
+            if (
+                selected_speech_model is None
+                or selected_speech_model.provider_type != provider.provider_type
+                or selected_speech_model.purpose != "tts"
+            ):
+                raise AppError(
+                    409,
+                    "provider_tts_model_required",
+                    "A supported TTS speech model is required before enabling",
+                )
+            configured_tts_model = str(
+                capabilities.get("default_tts_model_id") or selected_speech_model.id
+            ).strip()
+            if not configured_tts_model:
+                raise AppError(
+                    409,
+                    "provider_tts_model_required",
+                    "A default TTS model is required before enabling",
+                )
+            if configured_tts_model != selected_speech_model.id:
+                raise AppError(
+                    409,
+                    "provider_tts_model_mismatch",
+                    "The selected speech model must match default_tts_model_id",
+                )
+            provider.remote_capability = True
+            capabilities["remote_calls_enabled"] = True
+            capabilities["provider_role"] = "tts"
             provider.status = "enabled_unverified"
         elif enabled and provider.provider_type in EMBEDDING_PROVIDER_TYPES:
             secret = self._active_secret_record(provider.id)

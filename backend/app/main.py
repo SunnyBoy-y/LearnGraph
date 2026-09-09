@@ -34,10 +34,11 @@ from app.services.memory_outbox_runtime import memory_outbox_scheduler
 from app.services.document_learning import mark_interrupted_document_jobs
 from app.services.chat import mark_interrupted_message_streams
 from app.services.chat_durable import enqueue_interrupted_chat_resumes
+from app.voice.embedded_runtime import close_embedded_runtime, install_embedded_runtime
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     settings = get_settings()
     settings.storage_root.mkdir(parents=True, exist_ok=True)
     settings.memory_root.mkdir(parents=True, exist_ok=True)
@@ -121,6 +122,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await close_embedded_runtime(app)
         if durable_queue_stop is not None and durable_queue_task is not None:
             durable_queue_stop.set()
             await durable_queue_task
@@ -237,4 +239,5 @@ app.add_middleware(
 app.add_middleware(SecurityHeadersMiddleware)
 install_error_handlers(app)
 app.include_router(api_router)
+install_embedded_runtime(app)
 install_frontend_static(app, settings.resolved_frontend_dist)

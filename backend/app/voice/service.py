@@ -21,6 +21,7 @@ from app.domain.schemas.sandbox import (
     SandboxAgentSubagentStatusRequest,
 )
 from .policy import clip_thinking_mode, next_event_seq
+from .runtime import runtime_info
 from .schemas import (
     RTVIEventEnvelope, VoiceSession, VoiceTaskLink, VoiceTaskStartRequest,
     VoiceTaskView, VoiceTurn, VoiceTurnRequest,
@@ -61,6 +62,9 @@ class VoiceSessionService:
             max_thinking_mode=clip_thinking_mode(maximum, maximum),
             created_at=now, updated_at=now,
         )
+        runtime = runtime_info(self.settings)
+        session.runtime_ready = runtime.ready
+        session.signaling_url = runtime.signaling_url
         session.session_id = session.id
         with self._lock:
             self._sessions[session.id] = session
@@ -87,9 +91,57 @@ class VoiceSessionService:
             session.seq = next_event_seq(session.seq)
             session.turns.append(turn)
             session.updated_at = now
-        if request.final and request.text.strip():
+        # Only finalized user speech is an input turn.  Assistant/system
+        # events are accepted for timeline synchronization, but must never
+        # recursively enqueue another assistant response.
+        if request.role == "user" and request.final and request.text.strip():
             self.ingest_memory(session, turn)
+            # Feed finalized user speech into the same durable ChatService
+            # pipeline as typed messages.  The audio worker can then stream or
+            # synthesize the assistant response without creating a second
+            # agent identity for voice.
+            self._queue_chat_response(session, request.text, mode)
         return turn
+
+    def _queue_chat_response(self, session: VoiceSession, text: str, mode: str) -> None:
+        """Start a detached agent turn; failures remain visible to the caller's
+        normal chat event stream and never make ASR acknowledgement fail."""
+        try:
+            from sqlalchemy.orm import sessionmaker
+            from app.api.routers.chat import _detached_message_stream, service as chat_service
+            from app.domain.schemas.chat import MessageCreateRequest
+
+            payload = MessageCreateRequest(
+                content=text.strip(),
+                thinking_mode=mode,
+                agent_mode=True,
+            )
+            chat_service(
+                self.db, self.context, self.settings,
+                model_id=None, provider_id=None, thinking_mode=mode,
+                search_route="auto", agent_mode=True,
+            ).preflight_create_stream(session.chat_session_id, payload)
+            events = _detached_message_stream(
+                context=self.context,
+                settings=self.settings,
+                session_id=session.chat_session_id,
+                payload=payload,
+                idempotency_key=f"voice:{session.id}:{session.seq}",
+                last_event_id=None,
+                session_factory=sessionmaker(
+                    bind=self.db.get_bind(), autoflush=False, expire_on_commit=False,
+                ),
+            )
+            threading.Thread(
+                target=lambda: tuple(events),
+                name=f"learngraph-voice-{session.id[:8]}",
+                daemon=True,
+            ).start()
+        except Exception:
+            # Voice transport should remain usable when an optional model/tool
+            # provider is unavailable; the chat stream records the failure when
+            # preflight reached it, while this hook is deliberately best effort.
+            self.db.rollback()
 
     def ingest_memory(self, session: VoiceSession, turn: VoiceTurn) -> None:
         """Best-effort memory hook; sensitive-filter or storage failures never block voice."""
@@ -180,4 +232,30 @@ class VoiceSessionService:
             seq = session.seq
             session.updated_at = datetime.now(timezone.utc)
         return RTVIEventEnvelope(type=event_type, seq=seq, request_id=request_id or f"req_{uuid4().hex[:20]}", session_id=session.id, timestamp=datetime.now(timezone.utc), payload=payload or {})
+
+    def runtime_config(self, voice_session_id: str) -> dict[str, Any]:
+        """Return non-secret provider choices for the optional audio worker."""
+        session = self.get_session(voice_session_id)
+        runtime = runtime_info(self.settings)
+        asr = tts = None
+        try:
+            from app.providers.factory import (
+                realtime_asr_provider_for_workspace,
+                tts_provider_for_workspace,
+            )
+            asr = realtime_asr_provider_for_workspace(self.db, self.context.workspace_id, self.settings)
+            tts = tts_provider_for_workspace(self.db, self.context.workspace_id, self.settings)
+        except Exception:
+            # A worker can still use its own configured provider when the
+            # optional provider extra is not installed in the API process.
+            pass
+        return {
+            "session_id": session.id,
+            "runtime_ready": runtime.ready,
+            "signaling_url": runtime.signaling_url,
+            "asr": {"provider_id": asr.provider_id, "model_id": asr.model_id} if asr else None,
+            "tts": {"provider_id": tts.provider_id, "model_id": tts.model_id} if tts else None,
+            "spoken_style": True,
+            "max_thinking_mode": session.max_thinking_mode,
+        }
 

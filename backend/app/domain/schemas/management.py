@@ -588,10 +588,20 @@ class ProviderImportBatchRequest(BaseModel):
     targets: list[ProviderImportBatchTarget] = Field(min_length=1, max_length=32)
 
 
+class SpeechModelCatalogView(BaseModel):
+    id: str
+    label: str
+    purpose: Literal["realtime", "stored", "stored_async", "tts"]
+    provider_type: str
+    default_base_url: str
+    default_capabilities: dict[str, Any] = Field(default_factory=dict)
+    description: str
+
+
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[
-        "model", "image_generation", "vision", "search", "image_search", "fetch", "deep_research", "memory", "transcription", "embedding"
+        "model", "image_generation", "vision", "search", "image_search", "fetch", "deep_research", "memory", "transcription", "tts", "embedding", "development"
     ]
     label: str
     description: str
@@ -611,6 +621,8 @@ class ProviderTypeCatalogView(BaseModel):
     image_search_modes: tuple[Literal["text", "image"], ...] = ()
     # 免费供应商标记；无需 Key 且无需 Base URL 的免费源创建实例时默认启用。
     is_free: bool = False
+    supported_model_ids: tuple[str, ...] = ()
+    speech_models: list[SpeechModelCatalogView] = Field(default_factory=list)
 
 
 class ProviderView(ORMModel):
