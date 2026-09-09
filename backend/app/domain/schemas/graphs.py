@@ -41,6 +41,7 @@ class GraphSummary(ORMModel):
     status: str
     revision: int
     published_at: datetime | None
+    cover_svg: str | None = None
 
 
 class GraphView(GraphSummary):

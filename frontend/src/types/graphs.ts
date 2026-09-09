@@ -33,6 +33,7 @@ export interface GraphSummary {
   status: string
   revision: number
   published_at: IsoDateTime | null
+  cover_svg?: string | null
 }
 
 export interface Graph extends GraphSummary {

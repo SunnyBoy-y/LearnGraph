@@ -176,7 +176,16 @@ type ShelfBook = {
   isGoalBook: boolean;
   /** 候选图谱：不可直接学习，需先经审核发布。 */
   needsReview: boolean;
+  masteryProgress: number;
+  cover: string;
 };
+
+function generatedCover(title: string, progress: number) {
+  const hue = Math.abs([...title].reduce((sum, char) => sum + char.charCodeAt(0), 0)) % 360;
+  const safeTitle = title.slice(0, 8).replace(/[<&>"']/g, "");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300"><rect width="640" height="300" fill="hsl(${hue} 18% 94%)"/><circle cx="500" cy="120" r="82" fill="hsl(${hue} 35% 78%)"/><path d="M80 230 Q180 90 280 210 T470 180" fill="none" stroke="hsl(${hue} 30% 35%)" stroke-width="8"/><circle cx="250" cy="130" r="28" fill="hsl(${hue} 30% 35%)"/><text x="36" y="52" font-family="sans-serif" font-size="24" fill="hsl(${hue} 30% 25%)">${safeTitle}</text><rect x="36" y="260" width="568" height="10" rx="5" fill="#d8dadd"/><rect x="36" y="260" width="${568 * Math.max(0, Math.min(1, progress))}" height="10" rx="5" fill="hsl(${hue} 30% 35%)"/></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
 
 const graphStateLabels: Record<string, string> = {
   fresh: "掌握稳定",
@@ -253,6 +262,9 @@ function shelfBooks(
   const representedGoalIds = new Set(goalBooks.map((book) => book.goalId));
   const goalEntries = goalBooks.map((book) => {
     const graph = graphByGoalId.get(book.goalId);
+    const masteryProgress = graph?.id === currentGraph?.id && currentGraph?.nodes.length
+      ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length
+      : 0;
     return {
       id: book.id,
       goalId: book.goalId,
@@ -269,11 +281,16 @@ function shelfBooks(
       icon: graph ? Database : CircleDot,
       isGoalBook: !graph,
       needsReview: graph?.status === "candidate",
+      masteryProgress,
+      cover: graph?.cover_svg || generatedCover(book.title, masteryProgress),
     };
   });
   const graphEntries = graphSummaries
     .filter((graph) => !representedGoalIds.has(graph.goal_id))
     .map((graph) => ({
+      masteryProgress: graph.id === currentGraph?.id && currentGraph?.nodes.length
+        ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length
+        : 0,
       id: `graph-${graph.id}`,
       goalId: graph.goal_id,
       graphId: graph.id,
@@ -287,6 +304,7 @@ function shelfBooks(
       icon: Database,
       isGoalBook: false,
       needsReview: graph.status === "candidate",
+      cover: graph.cover_svg || generatedCover(graph.title, graph.id === currentGraph?.id && currentGraph?.nodes.length ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length : 0),
     }));
   return [...goalEntries, ...graphEntries];
 }
@@ -495,14 +513,14 @@ function GraphBookshelf({
                     : "graph-library__book"
                 }
                 key={entry.id}
-              >
-                <button
+                >
+                  <button
                   aria-pressed={selected}
                   className="graph-library__book-open"
                   onClick={() => onOpen(entry)}
                   type="button"
-                >
-                  <span className="graph-library__spine">
+                  >
+                  <span className="graph-library__spine" style={{ backgroundImage: `url(${entry.cover})`, backgroundSize: "cover", backgroundPosition: "center" }}>
                     <Icon />
                     <span>{entry.title.slice(0, 1)}</span>
                   </span>
@@ -513,6 +531,7 @@ function GraphBookshelf({
                   <span className="graph-library__book-meta">
                     <b>{entry.status}</b>
                     <small>{entry.progress}</small>
+                    <span aria-label={`掌握进度 ${Math.round(entry.masteryProgress * 100)}%`} className="mt-1 block h-1.5 w-24 overflow-hidden rounded-full bg-muted"><span className="block h-full rounded-full bg-primary" style={{ width: `${Math.round(entry.masteryProgress * 100)}%` }} /></span>
                   </span>
                 </button>
                 <div className="graph-library__book-actions">
@@ -1548,6 +1567,8 @@ export function GraphWorkspacePage() {
                     icon: Database,
                     isGoalBook: false,
                     needsReview: false,
+                    masteryProgress: 0,
+                    cover: generatedCover(activeGraph.title, 0),
                   })
                 }
                 size="sm"

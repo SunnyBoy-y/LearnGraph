@@ -22,6 +22,7 @@ from app.domain.schemas.graphs import (
 )
 from app.services.graphs import GraphService
 from app.services.authorization import AuthorizationService
+from app.services.graph_cover import generate_graph_cover
 
 
 router = APIRouter(prefix="/graphs", tags=["graphs"])
@@ -47,7 +48,7 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
     """列出当前工作区的目标图谱。无请求体，输出图谱 ID、名称、状态和节点统计。"""
     authz = AuthorizationService(db, context.principal)
     return [
-        GraphSummary.model_validate(item)
+        GraphSummary.model_validate({**item.__dict__, "cover_svg": generate_graph_cover(item.title)})
         for item in service(db, context, settings).list()
         if authz.can_access_resource(context.workspace, "graph", item.id, "read")
     ]
