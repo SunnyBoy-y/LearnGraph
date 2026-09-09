@@ -9,6 +9,13 @@ import {
   File,
   FileImage,
   FileText,
+  FileSpreadsheet,
+  Presentation,
+  FileCode,
+  Music,
+  Video,
+  LayoutGrid,
+  List,
   Globe2,
   HardDrive,
   Link2,
@@ -55,6 +62,7 @@ import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { resolveFilePreviewKind } from "@/lib/file-preview";
 import {
   ErrorState,
   LoadingState,
@@ -167,12 +175,55 @@ function parserModeLabel(mode: FileParserCapability["mode"]) {
   return "隔离处理";
 }
 
-function FileIcon({ mime }: { mime: string }) {
-  if (mime.startsWith("image/"))
-    return <FileImage className="size-4 text-blue-500" />;
-  if (mime.includes("pdf") || mime.includes("word"))
-    return <FileText className="size-4 text-red-500" />;
-  return <File className="size-4 text-muted-foreground" />;
+const fileCategories = [
+  ["all", "全部类型"], ["image", "图片"], ["document", "文档"],
+  ["spreadsheet", "电子表格"], ["powerpoint", "演示文稿"], ["pdf", "PDF"],
+  ["audio", "音频"], ["video", "视频"], ["archive", "压缩包"], ["other", "其他"],
+] as const;
+type FileCategory = typeof fileCategories[number][0];
+
+function fileCategory(file: FileRecord): FileCategory {
+  const ext = file.original_name.split(".").pop()?.toLowerCase();
+  if (["zip", "rar", "7z", "tar", "gz"].includes(ext ?? "")) return "archive";
+  if (["xls", "csv", "tsv", "ods"].includes(ext ?? "")) return "spreadsheet";
+  if (["ppt", "odp"].includes(ext ?? "")) return "powerpoint";
+  if (["doc", "odt", "rtf"].includes(ext ?? "")) return "document";
+  const kind = resolveFilePreviewKind(file.original_name, file.mime_type);
+  if (["word", "text", "html"].includes(kind)) return "document";
+  if (["image", "spreadsheet", "powerpoint", "pdf", "audio", "video"].includes(kind)) return kind as FileCategory;
+  return "other";
+}
+
+function FileIcon({ file, large = false }: { file: FileRecord; large?: boolean }) {
+  const category = fileCategory(file);
+  const Icon = { image: FileImage, document: FileText, spreadsheet: FileSpreadsheet,
+    powerpoint: Presentation, pdf: FileText, audio: Music, video: Video,
+    archive: Archive, other: File, all: File }[category];
+  const color = { image: "text-purple-500", document: "text-blue-500", spreadsheet: "text-emerald-600",
+    powerpoint: "text-orange-500", pdf: "text-red-500", audio: "text-violet-500",
+    video: "text-pink-500", archive: "text-amber-600", other: "text-muted-foreground", all: "" }[category];
+  const DisplayIcon = /\.(html?|jsx?|tsx?|py|json|css)$/i.test(file.original_name) ? FileCode : Icon;
+  return <DisplayIcon aria-hidden="true" className={`${large ? "size-12" : "size-5"} shrink-0 ${color}`} />;
+}
+
+function FileThumbnail({ file, large = false }: { file: FileRecord; large?: boolean }) {
+  const [url, setUrl] = useState<string>();
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (fileCategory(file) !== "image") return;
+    let active = true;
+    let objectUrl: string | undefined;
+    setFailed(false);
+    void downloadFile(file.id).then((blob) => {
+      if (!active) return;
+      objectUrl = URL.createObjectURL(blob);
+      setUrl(objectUrl);
+    }).catch(() => setFailed(true));
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [file.id, file.mime_type, file.original_name]);
+  return <span className={`flex shrink-0 items-center justify-center overflow-hidden ${large ? "h-40 w-full rounded-xl bg-muted/30" : "size-9 rounded-lg border bg-background"}`}>
+    {url && !failed ? <img alt={file.original_name} className="size-full object-cover" onError={() => setFailed(true)} src={url} /> : <FileIcon file={file} large={large} />}
+  </span>;
 }
 
 function parserCapabilityForFile(
@@ -196,6 +247,8 @@ export function SourcesPage() {
   const [policyOpen, setPolicyOpen] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
+  const [typeFilter, setTypeFilter] = useState<FileCategory>("all");
+  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [fileSearch, setFileSearch] = useState("");
   const [filePage, setFilePage] = useState(1);
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(
@@ -372,7 +425,7 @@ export function SourcesPage() {
 
   useEffect(() => {
     setFilePage(1);
-  }, [fileFilter, fileSearch]);
+  }, [fileFilter, fileSearch, typeFilter]);
 
   if (files.isPending)
     return (
@@ -399,6 +452,7 @@ export function SourcesPage() {
   const filteredFiles = files.data.filter(
     (file) =>
       matchesFileFilter(file, fileFilter) &&
+      (typeFilter === "all" || fileCategory(file) === typeFilter) &&
       (!normalizedFileSearch ||
         file.original_name.toLocaleLowerCase().includes(normalizedFileSearch)),
   );
@@ -557,6 +611,28 @@ export function SourcesPage() {
       </section>
 
       <Surface className="overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" aria-label="按文件类型筛选">
+                {fileCategories.find(([value]) => value === typeFilter)?.[1]}
+                <ChevronRight className="size-3.5 rotate-90" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              {fileCategories.map(([value, label]) => (
+                <DropdownMenuItem key={value} onSelect={() => setTypeFilter(value)}>
+                  <span className="flex-1">{label}</span>
+                  {typeFilter === value ? <span aria-label="已选">✓</span> : null}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <div role="group" aria-label="资料显示方式" className="flex gap-1 rounded-lg bg-muted/50 p-1">
+            <Button aria-label="网格视图" aria-pressed={viewMode === "grid"} size="icon-sm" variant={viewMode === "grid" ? "secondary" : "ghost"} onClick={() => setViewMode("grid")}><LayoutGrid className="size-4" /></Button>
+            <Button aria-label="列表视图" aria-pressed={viewMode === "list"} size="icon-sm" variant={viewMode === "list" ? "secondary" : "ghost"} onClick={() => setViewMode("list")}><List className="size-4" /></Button>
+          </div>
+        </div>
         <div className="flex flex-col gap-3 border-b p-4 lg:flex-row lg:items-center lg:justify-between">
           <div
             aria-label="资料状态筛选"
@@ -612,7 +688,33 @@ export function SourcesPage() {
             </div>
           </div>
         </div>
-        <div className="resource-file-table-wrap overflow-x-auto">
+        {viewMode === "grid" ? (
+          <div className="grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+            {pagedFiles.map((file) => (
+              <article key={file.id} className={`min-w-0 rounded-2xl border p-4 transition-shadow hover:shadow-sm ${selectedFileIds.has(file.id) ? "bg-muted/40 ring-1 ring-ring" : "bg-card"}`}>
+                <div className="mb-3 flex items-start gap-2">
+                  <button type="button" className="min-w-0 flex-1 truncate text-left text-sm font-medium hover:underline" title={file.original_name} onClick={() => setDiagnosticFile(file)}>{file.original_name}</button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild><Button aria-label={`打开 ${file.original_name} 的更多操作`} size="icon-sm" variant="ghost"><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onSelect={() => navigate(`../documents/${file.id}`)}><FileText />打开学习</DropdownMenuItem>
+                      <DropdownMenuItem disabled={download.isPending} onSelect={() => download.mutate(file)}><Download />下载文件</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => setDiagnosticFile(file)}><Search />解析与引用诊断</DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem disabled={remove.isPending} onSelect={() => setDeleteTarget(file)} variant="destructive"><Trash2 />删除文件</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+                <button type="button" aria-label={`查看 ${file.original_name}`} className="block w-full rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => navigate(`../documents/${file.id}`)}><FileThumbnail file={file} large /></button>
+                <div className="mt-3 flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">{fileType(file)} · {bytes(file.size_bytes)}</span>
+                  <Checkbox aria-label={`选择 ${file.original_name}`} checked={selectedFileIds.has(file.id)} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
+                </div>
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{formatUploadTime(file.created_at)}</span><StatePill {...fileStatus(file)} /></div>
+              </article>
+            ))}
+          </div>
+        ) : <div className="resource-file-table-wrap overflow-x-auto">
           <table className="resource-file-table w-full min-w-[760px] text-left text-sm">
             <thead className="bg-muted/35 text-xs text-muted-foreground">
               <tr>
@@ -673,7 +775,7 @@ export function SourcesPage() {
                         onClick={() => setDiagnosticFile(file)}
                         type="button"
                       >
-                        <FileIcon mime={file.mime_type} />
+                        <FileThumbnail file={file} />
                         <span className="max-w-64 truncate font-medium">
                           {file.original_name}
                         </span>
@@ -758,7 +860,7 @@ export function SourcesPage() {
               })}
             </tbody>
           </table>
-        </div>
+        </div>}
         {!files.data.length ? (
           <div className="grid min-h-48 place-items-center p-6 text-center">
             <div>
@@ -781,6 +883,7 @@ export function SourcesPage() {
                 className="mt-3"
                 onClick={() => {
                   setFileFilter("all");
+                  setTypeFilter("all");
                   setFileSearch("");
                 }}
                 size="xs"
