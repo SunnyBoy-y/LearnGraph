@@ -34,8 +34,12 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/app/.venv
 
 COPY backend/pyproject.toml backend/uv.lock ./
+# ``--frozen`` is required so the lock stays authoritative: without it uv
+# silently re-resolves whenever the lock is out of date with pyproject.toml,
+# which previously left the optional voice stack (pipecat-ai) unpinned at
+# image build time.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-install-project --no-dev --extra voice
+    uv sync --no-install-project --no-dev --extra voice --frozen
 
 COPY backend/app ./app
 COPY backend/sandbox ./sandbox
