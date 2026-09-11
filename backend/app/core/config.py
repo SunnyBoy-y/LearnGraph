@@ -675,6 +675,23 @@ class Settings(BaseSettings):
     # proxy; the ranges must never include real private networks.
     ssrf_fake_ip_ranges: str = ""
 
+    # ---- Realtime (full-duplex) voice pipeline ------------------------------
+    # Turn-boundary tuning for the Pipecat pipeline. See
+    # doc/LearnGraph_实时语音全双工管线接线设计_v1.0.md (§6.3/§8.1).
+    #
+    # The three Smart Turn / VAD knobs default to ``None`` meaning "leave it to
+    # Pipecat": the library's own constants are the single source of truth, and
+    # this module must not import the optional ``pipecat`` extra. Set a value
+    # only to override, which is also what
+    # ``GET /api/v1/voice/sessions/{id}/runtime-config`` echoes back.
+    voice_smart_turn_stop_secs: float | None = None
+    voice_smart_turn_pre_speech_ms: float | None = None
+    voice_vad_stop_secs: float | None = None
+    # Mirrors Pipecat's ``LLMUserAggregatorParams.user_turn_stop_timeout``
+    # default (5.0s): the hard ceiling on how long a user turn may stay open
+    # when no stop strategy fires.
+    voice_turn_stop_timeout: float = 5.0
+
     @property
     def resolved_sandbox_workspace_root(self) -> Path:
         """Resolve sandbox data relative to backend/, not the launch directory."""
