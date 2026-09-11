@@ -15,15 +15,18 @@ export type ThinkingLimit = "off" | "low" | "medium" | "high" | "xhigh";
 export type VoiceTranscriptRole = "user" | "assistant";
 export interface VoiceTranscript { id: string; role: VoiceTranscriptRole; text: string; final: boolean; createdAt: string }
 export interface VoiceTaskEvent { taskId: string; status: "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled"; title?: string; summary?: string; progress?: number; updatedAt: string }
+/** 与 Pipecat `SmallWebRTCPatchRequest.candidates[].IceCandidate` 一一对应（snake_case）。 */
+export interface VoiceIceCandidate { candidate: string; sdp_mid: string; sdp_mline_index: number }
 export interface VoiceSessionSnapshot {
   workspaceId: string; sessionId: string; transport: VoiceTransportState; state: VoiceSessionState;
   thinkingLimit: ThinkingLimit; transcript: VoiceTranscript[]; tasks: VoiceTaskEvent[]; error: string | null;
+  modelId: string | null; providerId: string | null;
   sessionIdRemote: string | null;
   signalingUrl: string | null;
 }
 
 const STORAGE_KEY = "learngraph.voice.preferences.v1";
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, sessionIdRemote: null, signalingUrl: null };
+const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
@@ -38,6 +41,7 @@ function readLimit(): ThinkingLimit {
 }
 function persistLimit(value: ThinkingLimit) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ thinkingLimit: value })); } catch { /* storage is optional */ } }
 function cleanupAudioTransport() {
+  if (peerConnection) peerConnection.onicecandidate = null;
   localStream?.getTracks().forEach((track) => track.stop());
   localStream = null;
   peerConnection?.close();
@@ -47,14 +51,15 @@ function cleanupAudioTransport() {
 export const voiceSessionController = {
   getSnapshot: () => snapshot,
   subscribe(listener: () => void) { listeners.add(listener); return () => listeners.delete(listener); },
-  open(workspaceId: string, sessionId: string) {
+  open(workspaceId: string, sessionId: string, modelId?: string | null, providerId?: string | null) {
     const same = snapshot.workspaceId === workspaceId && snapshot.sessionId === sessionId;
     if (!same) {
       if (snapshot.sessionId) sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, snapshot);
       const cached = sessionCache.get(`${workspaceId}:${sessionId}`);
-      update(cached ? { ...cached, state: cached.state === "closed" ? "ready" : cached.state } : { ...defaultSnapshot, workspaceId, sessionId, thinkingLimit: readLimit(), state: "ready" });
+      update(cached ? { ...cached, state: cached.state === "closed" ? "ready" : cached.state, modelId: modelId ?? cached.modelId, providerId: providerId ?? cached.providerId } : { ...defaultSnapshot, workspaceId, sessionId, modelId: modelId ?? null, providerId: providerId ?? null, thinkingLimit: readLimit(), state: "ready" });
     }
-    else if (snapshot.state === "closed") update({ state: "ready" });
+    else if (snapshot.state === "closed") update({ state: "ready", modelId: modelId ?? snapshot.modelId, providerId: providerId ?? snapshot.providerId });
+    else if (modelId !== undefined || providerId !== undefined) update({ modelId: modelId ?? snapshot.modelId, providerId: providerId ?? snapshot.providerId });
   },
   setThinkingLimit(value: ThinkingLimit) { persistLimit(value); update({ thinkingLimit: value }); },
   async connect() {
@@ -66,7 +71,7 @@ export const voiceSessionController = {
       // The endpoint is intentionally explicit: until the backend voice contract
       // is deployed, the UI reports the unavailable service instead of faking a call.
       const path = import.meta.env.VITE_VOICE_SESSION_PATH || "/voice/sessions";
-      const result = await apiClient.post<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean; signaling_url?: string | null; reason?: string }>(path, { session_id: snapshot.sessionId, thinking_limit: snapshot.thinkingLimit }, { signal: abortController.signal });
+      const result = await apiClient.post<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean; signaling_url?: string | null; reason?: string }>(path, { session_id: snapshot.sessionId, thinking_limit: snapshot.thinkingLimit, model_id: snapshot.modelId, provider_id: snapshot.providerId }, { signal: abortController.signal });
       remoteId = result?.id || result?.session_id || result?.sessionId || null;
       if (result?.runtime_ready !== true) {
         setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false);
@@ -86,6 +91,33 @@ export const voiceSessionController = {
         throw new Error("当前浏览器或内置语音运行时不支持 WebRTC。");
       }
       peerConnection = new RTCPeerConnection();
+      // Trickle ICE：候选地址边收集边 PATCH 给后端 SmallWebRTC handler
+      // （Pipecat 的 handle_patch_request）。必须在 setLocalDescription 之前
+      // 挂上，否则会漏掉首批候选；在拿到 offer 响应里的 pc_id 之前先缓冲，
+      // 避免 PATCH 打到尚未注册的 peer connection（后端会 404）。
+      const pendingCandidates: VoiceIceCandidate[] = [];
+      let remotePcId: string | null = null;
+      const flushIceCandidates = () => {
+        if (!remotePcId || pendingCandidates.length === 0) return;
+        const candidates = pendingCandidates.splice(0, pendingCandidates.length);
+        // 失败不致命：非 trickle 路径仍可依赖 SDP 内联候选建连。
+        void apiClient
+          .patch<unknown, { pc_id: string; candidates: VoiceIceCandidate[] }>(offerPath, {
+            pc_id: remotePcId,
+            candidates,
+          })
+          .catch(() => undefined);
+      };
+      peerConnection.onicecandidate = (event) => {
+        // 空 candidate 字符串是 RFC 8840 的 end-of-candidates 标记，
+        // Pipecat 侧明确支持（映射为 aiortc 的 None）。
+        pendingCandidates.push({
+          candidate: event.candidate?.candidate ?? "",
+          sdp_mid: event.candidate?.sdpMid ?? "0",
+          sdp_mline_index: event.candidate?.sdpMLineIndex ?? 0,
+        });
+        flushIceCandidates();
+      };
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localStream.getTracks().forEach((track) => peerConnection?.addTrack(track, localStream!));
       peerConnection.ontrack = (event) => {
@@ -96,8 +128,11 @@ export const voiceSessionController = {
       };
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
-      const answer = await apiClient.post<{ sdp: string; type: RTCSdpType }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId } });
+      const answer = await apiClient.post<{ sdp: string; type: RTCSdpType; pc_id?: string }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId } });
       await peerConnection.setRemoteDescription(answer);
+      // 拿到 pc_id 后补发缓冲中的候选，并放行后续候选。
+      remotePcId = answer?.pc_id ?? null;
+      flushIceCandidates();
       if (remoteId) setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, true);
       update({ transport: "connected", state: "listening", sessionIdRemote: remoteId, signalingUrl: result?.signaling_url || null });
     } catch (error) {
@@ -162,9 +197,9 @@ export function VoiceSessionProvider({ children }: { children: ReactNode }) {
   }, []);
   return <VoiceSessionContext.Provider value={voiceSessionController}>{children}</VoiceSessionContext.Provider>;
 }
-export function useVoiceSession(workspaceId?: string, sessionId?: string) {
+export function useVoiceSession(workspaceId?: string, sessionId?: string, modelId?: string | null, providerId?: string | null) {
   const controller = useContext(VoiceSessionContext);
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
-  useEffect(() => { if (workspaceId && sessionId) controller.open(workspaceId, sessionId); }, [controller, sessionId, workspaceId]);
+  useEffect(() => { if (workspaceId && sessionId) controller.open(workspaceId, sessionId, modelId, providerId); }, [controller, sessionId, workspaceId, modelId, providerId]);
   return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, interrupt: controller.interrupt, toggleListening: controller.toggleListening, setThinkingLimit: controller.setThinkingLimit, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendTurn: controller.sendTurn, startTask: controller.startTask }), [controller, state]);
 }
