@@ -10,8 +10,6 @@ import { useNavigate } from "react-router-dom";
 import { createUuid } from "@/lib/uuid";
 import {
   ArrowUp,
-  Bot,
-  Brain,
   ChevronDown,
   ExternalLink,
   FileText,
@@ -21,7 +19,6 @@ import {
   Search,
   Square,
   X,
-  Zap,
   Image as ImageIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -43,6 +40,11 @@ import {
 } from "@/components/chat/question-set-pager";
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
+import {
+  ThinkingSlider,
+  THINKING_STOPS,
+  thinkingStopIndex,
+} from "@/components/chat/thinking-slider";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
 import {
   groupPartsForDisplay,
@@ -252,6 +254,8 @@ export function DocumentChatPanel({
     () => getSessionComposerPrefs(sessionId).thinkingMode,
   );
   const [modelSearch, setModelSearch] = useState("");
+  /** 响应与模型菜单是否展开：展开时胶囊显示「思考强度」，收起时显示当前档位。 */
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
 
   const providers = useQuery({ queryKey: workspaceQueryKey(workspaceId, "providers"), queryFn: listProviders });
   const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
@@ -397,13 +401,48 @@ export function DocumentChatPanel({
     });
   }
 
+  /** 极速：清空思考力度；智能体：力度缺失时补一个可用档位。 */
   function setMode(mode: ResponseMode) {
     setResponseMode(mode);
-    if (mode === "fast") setThinkingMode("off");
-    else if (mode === "thinking" && thinkingMode === "off" && thinkingModes.length) {
-      setThinkingMode(thinkingModes.includes("medium") ? "medium" : thinkingModes[0]!);
+    if (mode === "fast") {
+      setThinkingMode("off");
+      if (sessionId) {
+        persistComposerPrefs(sessionId, { responseMode: "fast", thinkingMode: "off" });
+      }
+      return;
     }
-    if (sessionId) persistComposerPrefs(sessionId, { responseMode: mode });
+    const nextThinking =
+      thinkingMode === "off" && thinkingModes.length
+        ? thinkingModes.includes("medium")
+          ? "medium"
+          : thinkingModes[0]!
+        : thinkingMode;
+    setThinkingMode(nextThinking);
+    if (sessionId) {
+      persistComposerPrefs(sessionId, {
+        responseMode: "agentic",
+        thinkingMode: nextThinking,
+      });
+    }
+  }
+
+  /** 「响应与思考力度」滑块：档位 0 = 极速，其后每档 = 智能体 + 一个思考力度。 */
+  function handleThinkingSliderChange(index: number) {
+    const stop = THINKING_STOPS[index];
+    if (!stop) return;
+    if (stop.responseMode === "fast") {
+      setMode("fast");
+      return;
+    }
+    const nextThinking = stop.thinking as ThinkingMode;
+    setResponseMode("agentic");
+    setThinkingMode(nextThinking);
+    if (sessionId) {
+      persistComposerPrefs(sessionId, {
+        responseMode: "agentic",
+        thinkingMode: nextThinking,
+      });
+    }
   }
 
   useEffect(() => {
@@ -814,72 +853,39 @@ export function DocumentChatPanel({
             {activeProvider ? `${activeProvider.display_name} · 持久会话` : "真实模型未配置"}
           </p>
         </div>
-        <DropdownMenu onOpenChange={(open) => { if (!open) setModelSearch(""); }}>
+        <DropdownMenu
+          open={modeMenuOpen}
+          onOpenChange={(open) => {
+            setModeMenuOpen(open);
+            if (!open) setModelSearch("");
+          }}
+        >
           <DropdownMenuTrigger asChild>
-            <Button
-              aria-label="选择响应模式与模型"
-              className="max-w-40 gap-1 px-2"
+            <button
+              aria-label="选择响应模式、思考力度和模型"
+              className="chat-mode-chip"
               disabled={!modelProviders.length || busy}
-              size="xs"
-              variant="outline"
+              title="响应模式与模型"
+              type="button"
             >
-              {responseMode === "fast" ? (
-                <Zap className="size-3 flex-none" />
-              ) : responseMode === "agentic" ? (
-                <Bot className="size-3 flex-none" />
-              ) : (
-                <Brain className="size-3 flex-none" />
-              )}
-              <span className="text-[10px]">
-                {responseMode === "fast" ? "极速" : responseMode === "agentic" ? "智能体" : "思考"}
+              <span>
+                {modeMenuOpen
+                  ? "思考强度"
+                  : responseMode === "fast"
+                    ? "极速"
+                    : thinkingLabels[thinkingMode]}
               </span>
-              <ChevronDown className="size-3 flex-none" />
-            </Button>
+              <ChevronDown aria-hidden="true" className="size-3.5" />
+            </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-64" collisionPadding={12}>
-            <DropdownMenuLabel>响应模式</DropdownMenuLabel>
-            <DropdownMenuRadioGroup
-              onValueChange={(value) => setMode(value as ResponseMode)}
-              value={responseMode}
-            >
-              <DropdownMenuRadioItem value="fast">
-                <Zap className="mr-2 size-3.5" />
-                极速
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="thinking">
-                <Brain className="mr-2 size-3.5" />
-                思考
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="agentic">
-                <Bot className="mr-2 size-3.5" />
-                智能体
-              </DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>
-              思考力度{responseMode === "fast" ? "（极速模式下已关闭）" : ""}
-            </DropdownMenuLabel>
-            <DropdownMenuRadioGroup
-              onValueChange={(value) => {
-                const mode = value as ThinkingMode;
-                setThinkingMode(mode);
-                if (mode !== "off" && responseMode === "fast") setResponseMode("thinking");
-                if (sessionId) persistComposerPrefs(sessionId, {
-                  thinkingMode: mode,
-                  responseMode: mode === "off" && responseMode !== "agentic" ? "fast" : responseMode === "fast" ? "thinking" : responseMode,
-                });
-              }}
-              value={responseMode === "fast" && !thinkingRequired ? "off" : thinkingModes.includes(thinkingMode) ? thinkingMode : "off"}
-            >
-              <DropdownMenuRadioItem disabled={thinkingRequired || responseMode === "fast"} value="off">
-                关闭{thinkingRequired ? "（该模型仅支持思考）" : ""}
-              </DropdownMenuRadioItem>
-              {thinkingModes.map((mode) => (
-                <DropdownMenuRadioItem disabled={responseMode === "fast"} key={mode} value={mode}>
-                  {thinkingLabels[mode]}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
+            <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
+            <div className="px-2 py-1">
+              <ThinkingSlider
+                onChange={handleThinkingSliderChange}
+                value={thinkingStopIndex(responseMode, thinkingMode)}
+              />
+            </div>
             {!thinkingModes.length ? (
               <p className="px-2 pb-1 text-[10px] text-muted-foreground">
                 当前模型未声明推理能力，按服务商默认执行。

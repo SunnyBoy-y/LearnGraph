@@ -7,6 +7,18 @@
 import type { MessageCreateRequest } from "@/types/sessions";
 
 export type ResponseMode = "fast" | "thinking" | "agentic";
+
+/**
+ * Response modes exposed in the UI. 「思考」(reasoning without tools) was
+ * retired: legacy values collapse into 智能体 so stored prefs and workspace
+ * defaults keep working while the recorded thinking effort is preserved.
+ */
+export type UiResponseMode = "fast" | "agentic";
+
+export function normalizeResponseMode(value: unknown): UiResponseMode {
+  return value === "fast" ? "fast" : "agentic";
+}
+
 export type ThinkingMode = NonNullable<MessageCreateRequest["thinking_mode"]>;
 export type SearchRoute = NonNullable<MessageCreateRequest["search_route"]>;
 export type GenerationMode = NonNullable<MessageCreateRequest["generation_mode"]>;
@@ -59,10 +71,6 @@ function writeAll(map: PrefsMap): void {
   }
 }
 
-function isResponseMode(value: unknown): value is ResponseMode {
-  return value === "fast" || value === "thinking" || value === "agentic";
-}
-
 function isThinkingMode(value: unknown): value is ThinkingMode {
   return (
     value === "off" ||
@@ -93,9 +101,7 @@ export function normalizeComposerPrefs(
   if (!value || typeof value !== "object") return { ...DEFAULT_PREFS };
   const record = value as Record<string, unknown>;
   return {
-    responseMode: isResponseMode(record.responseMode)
-      ? record.responseMode
-      : DEFAULT_PREFS.responseMode,
+    responseMode: normalizeResponseMode(record.responseMode),
     thinkingMode: isThinkingMode(record.thinkingMode)
       ? record.thinkingMode
       : DEFAULT_PREFS.thinkingMode,
@@ -187,7 +193,8 @@ export function prefsFromModelSnapshot(
   if (agentMode === true) {
     result.responseMode = "agentic";
   } else if (isThinkingMode(thinking) && thinking !== "off") {
-    result.responseMode = "thinking";
+    // 「思考」已下线：保留思考力度，响应模式落到智能体。
+    result.responseMode = "agentic";
     result.thinkingMode = thinking;
   } else if (thinking === "off") {
     result.responseMode = "fast";
@@ -204,14 +211,12 @@ export function defaultComposerPrefs(
 
 /**
  * Build new-session defaults, optionally applying a workspace-level response
- * mode override (极速 / 思考 / 智能体).
+ * mode override (极速 / 智能体).
  */
 export function defaultComposerPrefsForResponseMode(
   responseMode: ResponseMode | null | undefined,
 ): SessionComposerPrefs {
-  const mode = isResponseMode(responseMode)
-    ? responseMode
-    : PRODUCT_DEFAULT_RESPONSE_MODE;
+  const mode = normalizeResponseMode(responseMode);
   return defaultComposerPrefs({
     responseMode: mode,
     thinkingMode: mode === "fast" ? "off" : DEFAULT_PREFS.thinkingMode,
