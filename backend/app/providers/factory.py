@@ -1378,38 +1378,64 @@ def realtime_asr_provider_for_workspace(
     """
     if provider_id is None and model_id is None:
         provider_id, model_id = _functional_model_target(db, workspace_id, "transcription")
-    provider = cached_first_provider_row(
-        db, workspace_id, TRANSCRIPTION_PROVIDER_TYPES | DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES,
+    rows = cached_provider_rows(
+        db,
+        workspace_id,
+        TRANSCRIPTION_PROVIDER_TYPES | DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES,
         provider_id=provider_id,
         remote_capability=True,
         priority_order=_provider_priority_order(),
     )
-    if provider is None or not provider.base_url:
-        return None
-    capabilities = dict(provider.capabilities or {})
-    resolved_model = (model_id or capabilities.get("default_realtime_transcription_model_id") or "").strip()
-    if not resolved_model:
-        resolved_model = DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL
-    # Runtime ASR is model-driven. The selected model determines the protocol;
-    # a workspace may store it under a generic transcription Provider row.
-    if resolved_model != DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL:
-        return None
-    try:
-        api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception as exc:
-        _log_secret_failure(workspace_id, provider, exc)
-        return None
-    if not api_key:
-        return None
-    return DashScopeRealtimeASRProvider(
-        provider_id=provider.id,
-        model_id=resolved_model,
-        base_url=str(capabilities.get("realtime_ws_url") or provider.base_url),
-        api_key=api_key,
-        sample_rate=int(capabilities.get("realtime_sample_rate") or 16_000),
-        silence_ms=int(capabilities.get("realtime_silence_ms") or 400),
-        language=str(capabilities.get("realtime_language") or "zh"),
-    )
+    for provider in rows:
+        # Only DashScope origins speak the realtime WebSocket protocol.  A
+        # generic OpenAI-compatible relay may expose an ASR model name but it
+        # must not be selected as a DashScope realtime transport.
+        if (
+            provider.provider_type in DASHSCOPE_TRANSCRIPTION_FALLBACK_TYPES
+            and not _is_dashscope_provider_row(provider)
+        ):
+            continue
+        if not provider.base_url:
+            continue
+        capabilities = dict(provider.capabilities or {})
+        configured_model = str(
+            model_id
+            or capabilities.get("default_realtime_transcription_model_id")
+            or ""
+        ).strip()
+        resolved_model = configured_model or DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL
+        # Runtime ASR is model-driven. The selected model determines the
+        # protocol; unsupported realtime models must be skipped so the next
+        # eligible DashScope row can be tried.
+        if resolved_model != DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL:
+            # A DashScope transcription row may have been created for the
+            # file-ASR model (for example ``paraformer-realtime-v2``) while
+            # the same endpoint advertises Qwen's WebSocket model.  Reuse it
+            # only when the advertised catalog confirms that the compatible
+            # realtime model exists; never reinterpret an explicit caller
+            # selection or a non-DashScope relay.
+            discovered = set(capabilities.get("discovered_model_ids") or [])
+            discovered.update((capabilities.get("model_states") or {}).keys())
+            if model_id or DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL not in discovered:
+                continue
+            resolved_model = DEFAULT_DASHSCOPE_REALTIME_ASR_MODEL
+        try:
+            api_key = _secret_for_provider(db, workspace_id, provider, settings)
+        except Exception as exc:
+            _log_secret_failure(workspace_id, provider, exc)
+            continue
+        if not api_key:
+            continue
+        return DashScopeRealtimeASRProvider(
+            provider_id=provider.id,
+            model_id=resolved_model,
+            base_url=str(capabilities.get("realtime_ws_url") or provider.base_url),
+            api_key=api_key,
+            sample_rate=int(capabilities.get("realtime_sample_rate") or 16_000),
+            silence_ms=int(capabilities.get("realtime_silence_ms") or 400),
+            language=str(capabilities.get("realtime_language") or "zh"),
+        )
+    return None
 
 
 def tts_provider_for_workspace(

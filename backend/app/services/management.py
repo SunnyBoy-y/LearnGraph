@@ -2042,7 +2042,16 @@ class ProviderService:
                     }
                 )
                 continue
-            models[model_id] = validated
+            # Discovery is an initializer. Once a user has edited a model's
+            # snapshot, a later probe/discovery must not silently restore the
+            # models.dev values over that explicit configuration.
+            existing = models.get(model_id)
+            if not (
+                isinstance(existing, dict)
+                and existing.get("capability_source")
+                in {"user_declared", "provider_probe", "runtime_observation"}
+            ):
+                models[model_id] = validated
             if validated.get("context_window_source") == "conservative_default":
                 warnings.append(
                     {

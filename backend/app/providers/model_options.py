@@ -64,21 +64,37 @@ def _model_capabilities(capabilities: dict[str, Any], model_id: str) -> dict[str
         dashscope_hosted=dashscope_hosted,
     )
     merged.update(capabilities)
+    # A manually entered/private model may have no models.dev record. Keep the
+    # product's generic "思考力度" controls available in that case instead of
+    # allowing a provider-specific catalogue branch (for example Qwen's
+    # unknown-model default) to silently remove every reasoning option. A
+    # persisted per-model snapshot or group template is applied below and can
+    # still intentionally narrow these capabilities.
+    if merged.get("models_dev_known") is False:
+        if not merged.get("reasoning_efforts"):
+            merged["reasoning_efforts"] = ["low", "medium", "high", "xhigh"]
+        if not isinstance(merged.get("thinking_mapping"), dict) or not merged.get(
+            "thinking_mapping"
+        ):
+            merged["thinking_mapping"] = {
+                "off": None,
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "xhigh",
+            }
+        if not merged.get("default_thinking_mode"):
+            merged["default_thinking_mode"] = "medium"
+        if not merged.get("reasoning_parameter"):
+            merged["reasoning_parameter"] = "reasoning_effort"
     configured_models = capabilities.get("models")
     if isinstance(configured_models, dict):
         selected = configured_models.get(model_id)
         if isinstance(selected, dict):
             merged.update(selected)
-    # The group template is an all-or-nothing global override: while the
-    # workspace switch is on it wins over per-model snapshots; while off,
-    # each model falls back to its own snapshot or catalog defaults.
-    group_defaults = capabilities.get("model_defaults")
-    if (
-        isinstance(group_defaults, dict)
-        and group_defaults
-        and capabilities.get("model_defaults_enabled") is not False
-    ):
-        merged.update(group_defaults)
+    # Model capabilities come from one per-model database snapshot. Legacy
+    # group-template fields are intentionally ignored so they cannot shadow
+    # the model's own saved parameters.
     return merged
 
 
@@ -404,6 +420,25 @@ def catalog_capability_snapshot(
             dashscope_hosted=bool(dashscope_hosted),
         )
     )
+    # models.dev has no record for this model: initialize the editable
+    # snapshot with the full generic thinking-strength surface. This is only
+    # an initialization fallback; later user edits remain authoritative.
+    if merged.get("models_dev_known") is False:
+        merged.update(
+            {
+                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "thinking_mapping": {
+                    "off": None,
+                    "low": "low",
+                    "medium": "medium",
+                    "high": "high",
+                    "xhigh": "xhigh",
+                },
+                "default_thinking_mode": "medium",
+                "reasoning_parameter": "reasoning_effort",
+                "thinking_required": False,
+            }
+        )
     if dashscope_hosted is False:
         strip_dashscope_private_capabilities(merged)
     efforts = [
