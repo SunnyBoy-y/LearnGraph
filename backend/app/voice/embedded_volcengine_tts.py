@@ -10,18 +10,23 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import struct
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, AsyncGenerator, Optional
 
 import websockets
 from loguru import logger
-from pipecat.frames.frames import Frame, TTSAudioRawFrame
+from pipecat.frames.frames import Frame, TTSAudioRawFrame, TTSStartedFrame
 from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.services.settings import TTSSettings
-from pipecat.services.tts_service import TTSService
+from pipecat.services.tts_service import TextAggregationMode, TTSService
+
+from app.voice.embedded_timeline import timeline_mark
 
 DEFAULT_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
 
@@ -240,12 +245,44 @@ class VolcengineTTSService(TTSService):
         settings.api_key = api_key
         settings.voice = None
         settings.language = None
-        super().__init__(settings=settings, **kwargs)
+        # 真流式开关：
+        #   1（默认）= Pipecat 以句为单位聚合 LLM 增量，同一个火山 session
+        #              连续 TaskRequest；第一句开始合成时就下发音频，后续句子
+        #              不需要等待整段 LLM 完成。
+        #   0        = 旧的“一次 run_tts 一个 session、整段文本一次投喂”。
+        # 句级聚合是有意的：火山协议提供 TTSSentenceStart，能够把字幕游标
+        # 绑定到对应句子的第一批音频，而不是把整段 bot-output 提前发到前端。
+        self._streaming_sentences = os.getenv("VOLC_TTS_STREAMING", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        super().__init__(
+            settings=settings,
+            # 句级聚合会在下一个句子的首字符到达时确认边界；单句回答则在
+            # LLMFullResponseEndFrame 到达时 flush。每个句子仍复用同一火山 session。
+            text_aggregation_mode=(
+                TextAggregationMode.SENTENCE if self._streaming_sentences else None
+            ),
+            **kwargs,
+        )
         self._ws: Any = None
         self._options: TTSRequestOptions | None = None
         self._logid = ""
         # 当前正在合成的 session_id，用于 interruption 取消与 stale audio 过滤。
         self._current_session_id = ""
+        # 流式模式下这个 session 服务的 audio context，以及它的音频接收任务。
+        self._streaming_context_id: str | None = None
+        self._receiver_task: asyncio.Task | None = None
+        # 单点计时用：本 session 是否已发过第一个 TaskRequest。
+        self._first_task_sent = False
+        # 火山服务端的 TTSSentenceStart/End 与 TaskRequest 保持顺序；把待合成
+        # 的句子排队，等对应句子的第一批音频到达后再发 RTVI 字幕游标。
+        self._pending_sentence_texts: deque[str] = deque()
+        self._active_sentence_text = ""
+        self._active_sentence_marker_sent = False
+        self._sentence_sequence = 0
 
     async def setup(self, setup: FrameProcessorSetup):
         await super().setup(setup)
@@ -292,6 +329,9 @@ class VolcengineTTSService(TTSService):
         继续占用服务端资源、甚至混入下一轮。这里发 CancelSession 让火山立即
         放弃当前 session（收到 SessionCanceled 后服务端释放资源）。
         """
+        # 先停接收任务再取消 session，避免接收循环把 SessionCanceled 当成
+        # "本会话正常结束"后去动已经被基类移除的 audio context。
+        await self._stop_streaming_session("interrupted")
         await self._cancel_current_session("interrupted")
 
     async def _cancel_current_session(self, reason: str) -> None:
@@ -338,6 +378,211 @@ class VolcengineTTSService(TTSService):
     async def run_tts(
         self, text: str, context_id: str
     ) -> AsyncGenerator[Frame | None, None]:
+        """把 LLM 的文本增量投喂给火山并产出音频。
+
+        流式模式（默认，`VOLC_TTS_STREAMING=1`）：同一个 audio context 内只开
+        一个火山 session，Pipecat 每确认一个句子就发送一个 `TaskRequest`；音频
+        由后台接收任务写进 audio context。文本结束（`LLMFullResponseEndFrame`
+        → `flush_audio`）时才发 `FinishSession`，所以第一句无需等待完整回答。
+
+        非流式模式（`VOLC_TTS_STREAMING=0`）：保持旧行为——每次调用都 StartSession
+        → 整段文本一次 TaskRequest → FinishSession → 同步收音频。
+        """
+        if not self._streaming_sentences:
+            async for frame in self._run_tts_one_shot(text, context_id):
+                yield frame
+            return
+
+        if not text or not text.strip():
+            yield None
+            return
+        if self._ws is None:
+            logger.warning(f"{self}: TTS WebSocket 未连接，跳过本轮合成")
+            yield None
+            return
+        try:
+            if not self.audio_context_available(context_id):
+                # 一个 turn 一个 audio context：这里同时是"开新 session"的时机。
+                # 先建 context 并放行 TTSStartedFrame，再握手 + 起接收任务，保证
+                # 音频不会排到 TTSStartedFrame 前面。
+                await self.create_audio_context(context_id)
+                await self.start_ttfb_metrics()
+                yield TTSStartedFrame(context_id=context_id)
+                await self._start_streaming_session(context_id)
+            await self._send_text(text)
+            await self.start_tts_usage_metrics(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{self}: run_tts 失败: {exc}")
+            await self.push_error(error_msg=f"TTS 合成失败: {exc}", exception=exc)
+        yield None
+
+    async def flush_audio(self, context_id: str | None = None) -> None:
+        """文本结束（基类在 LLMFullResponseEndFrame 后调用）：FinishSession 收尾。
+
+        `FinishSession` 不是"立刻切断"，而是告诉火山"文本发完了，把缓冲的音频
+        合成完并结束本 session"。收到 SessionFinished/TTSEnded 后接收任务才
+        把 audio context 标记为结束。
+        """
+        if not self._streaming_sentences:
+            return
+        session_id = self._current_session_id
+        if not session_id or self._ws is None:
+            return
+        try:
+            await self._send_event(EventType.FinishSession, session_id)
+            timeline_mark("tts", "FinishSession 已发出（文本结束）")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{self}: FinishSession 发送失败: {exc}")
+
+    async def _start_streaming_session(self, context_id: str) -> None:
+        """开一个火山 session 并把它的音频接收任务挂起来。"""
+        await self._stop_streaming_session("restart")
+        session_id = str(uuid.uuid4())
+        options = self._options
+        self._streaming_context_id = context_id
+        self._current_session_id = session_id
+        self._first_task_sent = False
+        self._pending_sentence_texts.clear()
+        self._active_sentence_text = ""
+        self._active_sentence_marker_sent = False
+        self._sentence_sequence = 0
+        await self._send_event(
+            EventType.StartSession,
+            session_id,
+            options.to_v3_start_session_payload("", "BidirectionalTTS"),
+        )
+        await self._expect_event(EventType.SessionStarted, EventType.SessionFailed)
+        timeline_mark("tts", "session 握手完成(StartSession→SessionStarted)")
+        self._receiver_task = self.create_task(
+            self._receive_streaming_audio(context_id, session_id)
+        )
+
+    async def _send_text(self, text: str) -> None:
+        """把一段增量文本追加进当前 session。"""
+        session_id = self._current_session_id
+        if not session_id or self._ws is None:
+            return
+        if not self._first_task_sent:
+            self._first_task_sent = True
+            timeline_mark("tts", "首个 TaskRequest 已发出")
+        self._pending_sentence_texts.append(text)
+        await self._send_event(
+            EventType.TaskRequest,
+            session_id,
+            self._options.to_v3_task_payload(text),
+        )
+
+    async def _receive_streaming_audio(self, context_id: str, session_id: str) -> None:
+        """后台读循环：把本 session 的音频写进 audio context，直到 session 结束。"""
+        first_audio = True
+        try:
+            while True:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=60)
+                if not isinstance(raw, bytes):
+                    raise RuntimeError(f"unexpected text frame: {raw!r}")
+                msg = Message.from_bytes(raw)
+                if msg.type == MsgType.AudioOnlyServer:
+                    # 只收当前 session 的音频，过滤打断残留的 stale audio。
+                    if msg.session_id and msg.session_id != session_id:
+                        continue
+                    if not msg.payload:
+                        continue
+                    if first_audio:
+                        first_audio = False
+                        timeline_mark("tts", "火山首个音频包")
+                    audio_frame = TTSAudioRawFrame(
+                        msg.payload, self.sample_rate, 1, context_id=context_id
+                    )
+                    # TTSSentenceStart 通常先于音频到达。若供应商省略该事件，
+                    # 则按 TaskRequest 顺序回退；两种路径都只在第一批音频入队
+                    # 后发字幕游标，避免前端先收到整段文字。
+                    if not self._active_sentence_text and self._pending_sentence_texts:
+                        self._active_sentence_text = self._pending_sentence_texts.popleft()
+                        self._active_sentence_marker_sent = False
+                    await self.append_to_audio_context(context_id, audio_frame)
+                    if self._active_sentence_text and not self._active_sentence_marker_sent:
+                        self._sentence_sequence += 1
+                        await self.append_to_audio_context(
+                            context_id,
+                            RTVIServerMessageFrame(
+                                data={
+                                    "type": "voice-sentence-start",
+                                    "text": self._active_sentence_text,
+                                    "sequence": self._sentence_sequence,
+                                }
+                            ),
+                        )
+                        self._active_sentence_marker_sent = True
+                elif msg.type == MsgType.FullServerResponse:
+                    data = decode_payload(msg.payload)
+                    if msg.event == EventType.SessionFailed:
+                        raise RuntimeError(f"TTS session failed: {data}")
+                    if msg.event == EventType.TTSSentenceStart:
+                        # The protocol event has no stable text field in all API
+                        # versions, so use the ordered TaskRequest queue as source
+                        # of truth and only fall back to a payload text when present.
+                        payload_text = data.get("text") if isinstance(data, dict) else None
+                        # A provider can repeat TTSSentenceStart or deliver it just
+                        # after the first audio packet. In that case the fallback
+                        # queue already identifies the active sentence; consuming
+                        # another entry here would shift every later caption by one.
+                        if not payload_text and self._active_sentence_text:
+                            continue
+                        self._active_sentence_text = str(
+                            payload_text or (
+                                self._pending_sentence_texts.popleft()
+                                if self._pending_sentence_texts
+                                else ""
+                            )
+                        )
+                        self._active_sentence_marker_sent = False
+                        continue
+                    if msg.event == EventType.TTSSentenceEnd:
+                        self._active_sentence_text = ""
+                        self._active_sentence_marker_sent = False
+                        continue
+                    if msg.event in (
+                        EventType.SessionFinished,
+                        EventType.SessionCanceled,
+                        EventType.TTSEnded,
+                    ):
+                        if (
+                            isinstance(data, dict)
+                            and data.get("status_code") not in (None, 20000000)
+                        ):
+                            raise RuntimeError(
+                                f"TTS session failed: {data.get('status_code')} "
+                                f"{data.get('message', '')}"
+                            )
+                        break
+                elif msg.type == MsgType.Error:
+                    raise RuntimeError(
+                        f"TTS failed: {msg.error_code} {decode_payload(msg.payload)}"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{self}: TTS 接收循环结束: {exc}")
+        finally:
+            self._pending_sentence_texts.clear()
+            self._active_sentence_text = ""
+            self._active_sentence_marker_sent = False
+            # 只有还在基类手里的 context 才由我们收尾；被打断时基类已移除它。
+            if self.audio_context_available(context_id):
+                await self.remove_audio_context(context_id)
+
+    async def _stop_streaming_session(self, reason: str) -> None:
+        """停掉接收任务（session 本身由 FinishSession / CancelSession 结束）。"""
+        task = self._receiver_task
+        self._receiver_task = None
+        self._streaming_context_id = None
+        if task is not None and not task.done():
+            await self.cancel_task(task)
+
+    async def _run_tts_one_shot(
+        self, text: str, context_id: str
+    ) -> AsyncGenerator[Frame | None, None]:
+        """旧行为：一次调用一个 session、整段文本一次投喂（回退开关用）。"""
         if not text.strip():
             yield None
             return
@@ -401,6 +646,8 @@ class VolcengineTTSService(TTSService):
         yield None
 
     async def cleanup(self):
+        # 先把接收任务停掉，否则它会在 WS 关闭后继续等 recv（并可能报错刷日志）。
+        await self._stop_streaming_session("cleanup")
         await super().cleanup()
         if self._ws:
             try:
