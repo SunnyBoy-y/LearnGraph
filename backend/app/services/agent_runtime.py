@@ -3003,12 +3003,13 @@ class AgentToolRuntime:
         # committing would hold the single SQLite write gate through this
         # call's network I/O and starve every other writer. Commit pending
         # work first; an empty transaction is a no-op.
-        if self.extensions is not None and getattr(self.extensions, "db", None) is not None:
+        extensions = getattr(self, "extensions", None)
+        if extensions is not None and getattr(extensions, "db", None) is not None:
             try:
-                self.extensions.db.commit()
+                extensions.db.commit()
             except Exception:
                 try:
-                    self.extensions.db.rollback()
+                    extensions.db.rollback()
                 except Exception:
                     pass
         function = tool_call.get("function")

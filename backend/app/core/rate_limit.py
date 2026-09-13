@@ -14,7 +14,8 @@ class SlidingWindowRateLimiter:
 
     Intended for anonymous auth endpoints (login/register/demo-login) where a
     per-account lockout is not enough: an attacker can otherwise lock out any
-    account with 5 wrong passwords (15-minute DoS) or flood registrations.
+    account
+     with 5 wrong passwords (15-minute DoS) or flood registrations.
     The limiter is in-memory and per-process; that is acceptable for the
     single-process desktop/self-hosted deployment this codebase targets, and
     a deployment behind multiple workers should move it to shared storage.
@@ -57,6 +58,6 @@ def enforce_auth_rate_limit(request: Request, limiter: SlidingWindowRateLimiter)
     if not limiter.allow(client_ip(request)):
         raise AppError(
             429,
-            "auth_rate_limited",
-            "Too many authentication attempts from this address; please try again later",
+            "认证请求过于频繁。",
+            "认证尝试次数过多，请稍后再试。",
         )
