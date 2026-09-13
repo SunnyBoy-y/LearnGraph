@@ -20,6 +20,7 @@ import {
 import { MessageResponse } from "@/components/ai-elements/message";
 import type { CodeHighlightMode } from "@/components/ai-elements/lazy-streamdown";
 import { IncrementalMarkdown } from "@/components/ai-elements/incremental-markdown";
+import { streamTextEpoch } from "@/lib/stream-text-epoch";
 import {
   Reasoning,
   ReasoningContent,
@@ -802,6 +803,34 @@ function buildCitationLookup(
   return { byFileId, byWebIndex, webIndexes };
 }
 
+/** Source-list parts retain object identity while text deltas arrive. Reusing
+ * this lookup keeps the streaming markdown renderer and its link components
+ * stable instead of rebuilding its parser on every text update. */
+function useCitationLookup(
+  parts: MessagePart[] | undefined,
+  workspaceId: string,
+): CitationLookup {
+  const cache = useRef<{
+    workspaceId: string;
+    sourceParts: MessagePart[];
+    lookup: CitationLookup;
+  } | null>(null);
+  const sourceParts = (parts ?? []).filter((part) => part.type === "source_list");
+  const current = cache.current;
+  const unchanged =
+    current?.workspaceId === workspaceId &&
+    current.sourceParts.length === sourceParts.length &&
+    current.sourceParts.every((part, index) => part === sourceParts[index]);
+  if (!unchanged) {
+    cache.current = {
+      workspaceId,
+      sourceParts,
+      lookup: buildCitationLookup(sourceParts, workspaceId),
+    };
+  }
+  return cache.current!.lookup;
+}
+
 function CitationBadge({
   fileId,
   locators,
@@ -973,17 +1002,21 @@ const INCREMENTAL_RENDER_MIN_CHARS = 8_192;
 
 function TextWithCitations({
   content,
-  lookup,
+  siblingParts,
   className,
   codeHighlight = "shiki",
   streaming = false,
+  streamEpoch,
 }: {
   content: string;
-  lookup: CitationLookup;
+  siblingParts?: MessagePart[];
   className?: string;
   codeHighlight?: CodeHighlightMode;
   streaming?: boolean;
+  streamEpoch?: object;
 }) {
+  const { workspaceId } = useAuth();
+  const lookup = useCitationLookup(siblingParts, workspaceId);
   const { markdown } = useMemo(
     () => rewriteAllCitations(content, lookup.webIndexes),
     [content, lookup.webIndexes],
@@ -1084,7 +1117,12 @@ function TextWithCitations({
   return (
     <div data-message-selectable-text>
       {useIncremental ? (
-        <IncrementalMarkdown codeHighlight={codeHighlight} text={markdown} />
+        <IncrementalMarkdown
+          codeHighlight={codeHighlight}
+          components={components}
+          epoch={streamEpoch}
+          text={markdown}
+        />
       ) : (
         <MessageResponse
           className={cn("min-w-0", className)}
@@ -2167,11 +2205,6 @@ export function MessagePartRenderer({
   streaming?: boolean;
 }) {
   const content = part.content ?? part.content_delta ?? "";
-  const { workspaceId } = useAuth();
-  const citationLookup = useMemo(
-    () => buildCitationLookup(siblingParts, workspaceId),
-    [siblingParts, workspaceId],
-  );
   switch (part.type) {
     case "acknowledgement":
       return (
@@ -2182,7 +2215,8 @@ export function MessagePartRenderer({
         <TextWithCitations
           codeHighlight={streaming ? "plain" : "shiki"}
           content={content}
-          lookup={citationLookup}
+          siblingParts={siblingParts}
+          streamEpoch={streamTextEpoch(part)}
           streaming={streaming}
         />
       ) : null;

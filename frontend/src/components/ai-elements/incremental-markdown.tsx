@@ -7,6 +7,7 @@ import {
   LazyStreamdown,
   type CodeHighlightMode,
 } from "@/components/ai-elements/lazy-streamdown";
+import { normalizeLatexDelimiters } from "@/lib/markdown";
 
 /**
  * Parser-level incremental markdown rendering for an append-only stream.
@@ -27,22 +28,33 @@ import {
  * of O(document). Fenced code renders as plain line rows with an internal
  * row cache, so a large streaming fence costs O(added lines) per frame.
  *
- * Blocks render through the SAME streamdown pipeline as settled messages
- * (each block's source slice → LazyStreamdown), so the incremental path is
- * visually identical to the full render. Known deviation, shared with dsh and
- * any prefix-freeze scheme: reference links/footnotes whose definitions land
- * on the other side of a freeze boundary render literally while streaming;
- * the settled full render self-heals them.
+ * Blocks render through the same Streamdown component pipeline as settled
+ * messages. A final full render still resolves constructs that depend on
+ * distant text, such as reference links, footnotes, and late math fences.
  */
 
 /** Trailing blocks kept unstable as a safety margin for the parse frontier. */
 const UNSTABLE_TAIL_BLOCKS = 2;
+const MAX_ACTIVE_PARSE_CHARS = 8_192;
 
 /** Maximum container recursion depth for nested block freezing. */
 const MAX_CONTAINER_DEPTH = 6;
 
 /** The shared grammar: same remark-parse + remark-gfm pipeline streamdown uses. */
 const remark = unified().use(remarkParse).use(remarkGfm);
+
+type StreamTailNode = {
+  type: "raw_stream";
+  position?: { start: { offset: number }; end: { offset: number } };
+  streamInitial?: string;
+  streamAppend?: string;
+  streamRevision?: number;
+} | (RootContent & {
+  type: "code";
+  streamInitial?: string;
+  streamAppend?: string;
+  streamRevision?: number;
+});
 
 export interface PositionedBlock {
   /** The parsed mdast block. */
@@ -79,21 +91,92 @@ export class IncrementalMarkdownParser {
   private activeStart = 0;
   private generation = 0;
   private cached: IncrementalBlocks | null = null;
+  private prevEpoch: object | undefined;
+  private overflow = false;
+  private overflowCodeStart: number | null = null;
+  private overflowFence: { char: "`" | "~"; length: number } | null = null;
+  private overflowInitial = "";
+  private overflowRevision = 0;
 
   /** Fold the current accumulated text and return the frozen/tail split. */
-  update(text: string): IncrementalBlocks {
+  update(text: string, epoch?: object): IncrementalBlocks {
     if (this.cached !== null && text === this.prevText) return this.cached;
-    // Sound divergence detection: appended text keeps the whole retained
-    // prefix byte-identical. startsWith is O(prefix) memcmp — two orders of
-    // magnitude cheaper than parsing — so a full verify is fine per update.
-    if (!text.startsWith(this.prevText)) {
+    const previousLength = this.prevText.length;
+    // Stream parts carry append provenance. This makes the hot path O(delta);
+    // snapshots and edits retain the safe prefix check and reset on mismatch.
+    const trustedAppend = epoch !== undefined && epoch === this.prevEpoch && text.length >= this.prevText.length;
+    const streamReplacement = epoch !== undefined && this.prevEpoch !== undefined && epoch !== this.prevEpoch;
+    if (streamReplacement || (!trustedAppend && !text.startsWith(this.prevText))) {
       this.prevText = "";
       this.stable = [];
       this.activeStart = 0;
       this.generation += 1;
+      this.overflow = false;
+      this.overflowCodeStart = null;
+      this.overflowFence = null;
+      this.overflowInitial = "";
+      this.overflowRevision = 0;
     }
+    this.prevEpoch = epoch;
     this.prevText = text;
     const regionStart = this.activeStart;
+    let closedOverflowFence = false;
+    if (this.overflow && this.overflowFence !== null) {
+      const { char, length } = this.overflowFence;
+      // Include the preceding fence-width plus indentation in the scan. The
+      // server may split a closing marker across two SSE chunks, so looking
+      // only at the newly appended suffix can leave an already-closed block
+      // in the raw streaming state forever.
+      const closeScanStart = Math.max(0, previousLength - length - 8);
+      const close = new RegExp(`(?:^|\\n)[ \\t]{0,3}${char}{${length},}[ \\t]*(?:\\n|$)`, "u").test(
+        text.slice(closeScanStart),
+      );
+      if (close) {
+        // The exact parser runs once when the fence closes; later updates use
+        // its bounded active frontier again, so prose after the fence is not
+        // accidentally rendered inside the code block.
+        this.overflow = false;
+        this.overflowCodeStart = null;
+        this.overflowFence = null;
+        this.overflowInitial = "";
+        closedOverflowFence = true;
+      }
+    }
+    // An unfinished paragraph/list can be arbitrarily large. Stop feeding it
+    // to remark on every token; keep its source visible as a raw tail until a
+    // final render performs the exact full-document pass.
+    if (!closedOverflowFence && (this.overflow || text.length - regionStart > MAX_ACTIVE_PARSE_CHARS)) {
+      const hadOverflow = this.overflow;
+      if (!hadOverflow) {
+        const firstBreak = text.indexOf("\n", regionStart);
+        const firstLineEnd = firstBreak < 0 ? text.length : firstBreak;
+        const opening = /^\s{0,3}(`{3,}|~{3,})/u.exec(
+          text.slice(regionStart, firstLineEnd),
+        );
+        const openingFence = opening !== null;
+        this.overflowFence = opening
+          ? { char: opening[1][0] as "`" | "~", length: opening[1].length }
+          : null;
+        this.overflowCodeStart = openingFence
+          ? Math.min(firstLineEnd + 1, text.length)
+          : null;
+        this.overflowInitial = this.overflowCodeStart === null
+          ? text.slice(regionStart)
+          : text.slice(this.overflowCodeStart);
+      }
+      this.overflow = true;
+      this.overflowRevision += 1;
+      const append = hadOverflow ? text.slice(previousLength) : "";
+      const node = this.overflowCodeStart !== null
+        ? ({ type: "code", lang: undefined, meta: undefined, value: this.overflowInitial, streamInitial: this.overflowInitial, streamAppend: append, streamRevision: this.overflowRevision, position: { start: { offset: 0 }, end: { offset: text.length - regionStart } } } as unknown as RootContent)
+        : ({ type: "raw_stream", streamInitial: this.overflowInitial, streamAppend: append, streamRevision: this.overflowRevision, position: { start: { offset: 0 }, end: { offset: text.length - regionStart } } } as unknown as RootContent);
+      this.cached = {
+        frozen: [...this.stable],
+        tail: [{ node, start: regionStart, end: text.length, key: regionStart }],
+        generation: this.generation,
+      };
+      return this.cached!;
+    }
     const tree = remark.parse(text.slice(regionStart)) as Root;
     const blocks = tree.children;
     // Positions are required for incremental cuts. remark-parse provides them
@@ -158,54 +241,97 @@ export class IncrementalMarkdownParser {
       };
     });
     this.cached = { frozen: [...this.stable], tail, generation: this.generation };
-    return this.cached;
+      return this.cached!;
   }
 }
 
 /**
  * Renders an mdast code block (fence or indented) as plain preformatted text,
- * with an internal per-instance row cache: only newly streamed lines produce
- * new React elements each frame (O(added lines)), and a non-append rewrite
- * (retry/reset) is detected by a prefix mismatch and rebuilds the rows.
+ * with an internal per-instance scanner. It advances only over the newly
+ * appended source, so an open multi-megabyte fence never repeatedly splits
+ * every already-rendered line.
  */
-function CodeBlockPlain({ node }: { node: RootContent & { type: "code" } }) {
-  const cacheRef = useRef<{ rows: ReactNode[]; count: number } | null>(null);
-  if (cacheRef.current === null) cacheRef.current = { rows: [], count: 0 };
+function CodeBlockPlain({
+  node,
+  appendOnly,
+  initialValue,
+  appendChunk,
+  appendRevision,
+}: {
+  node: RootContent & { type: "code" };
+  appendOnly: boolean;
+  initialValue?: string;
+  appendChunk?: string;
+  appendRevision?: number;
+}) {
+  const cacheRef = useRef<{
+    sourceLength: number;
+    rows: ReactNode[];
+    lineChunks: string[];
+    lastRevision?: number;
+  } | null>(null);
+  if (cacheRef.current === null)
+    cacheRef.current = { sourceLength: 0, rows: [], lineChunks: [] };
   const cache = cacheRef.current;
-  const lines = node.value.split("\n");
-  // Non-append rewrite guard: the cached prefix must still match; otherwise
-  // the whole block changed (retry / generation reset) and rows rebuild.
-  let mismatch = lines.length < cache.count;
-  for (let i = 0; !mismatch && i < cache.count; i += 1) {
-    if (cache.rows[i] === undefined) {
-      mismatch = true;
+  const isFirstStreamRevision = appendRevision !== undefined && cache.lastRevision === undefined;
+  const sameStreamRevision = appendRevision !== undefined &&
+    cache.lastRevision === appendRevision;
+  const olderStreamRevision = appendRevision !== undefined &&
+    cache.lastRevision !== undefined && appendRevision < cache.lastRevision;
+  if (!appendOnly || isFirstStreamRevision || olderStreamRevision ||
+      (appendChunk === undefined && node.value.length < cache.sourceLength)) {
+    cache.sourceLength = 0;
+    cache.rows = [];
+    cache.lineChunks = [];
+  }
+  const added = sameStreamRevision
+    ? ""
+    : appendOnly && appendChunk !== undefined && !isFirstStreamRevision
+    ? appendChunk
+    : (cache.sourceLength === 0 && initialValue !== undefined ? initialValue : node.value.slice(cache.sourceLength));
+  let cursor = 0;
+  for (;;) {
+    const newline = added.indexOf("\n", cursor);
+    if (newline < 0) {
+      if (cursor < added.length) cache.lineChunks.push(added.slice(cursor));
       break;
     }
+    if (newline > cursor) cache.lineChunks.push(added.slice(cursor, newline));
+    const line = cache.rows.length;
+    cache.rows.push(
+      createElement("div", { key: line }, cache.lineChunks),
+    );
+    cache.lineChunks = [];
+    cursor = newline + 1;
   }
-  if (mismatch || lines.length > cache.count) {
-    // Prefix-verify cheaply: compare the cached row texts against the source.
-    if (!mismatch) {
-      for (let i = 0; i < cache.count; i += 1) {
-        if (String((cache.rows[i] as { props?: { children?: unknown } }).props?.children) !== lines[i]) {
-          mismatch = true;
-          break;
-        }
-      }
-    }
-    if (mismatch) {
-      cache.rows = [];
-      cache.count = 0;
-    }
-    for (let i = cache.count; i < lines.length; i += 1) {
-      cache.rows.push(createElement("div", { key: i, children: lines[i] }));
-    }
-    cache.count = lines.length;
-  }
+  cache.sourceLength += added.length;
+  if (appendRevision !== undefined) cache.lastRevision = appendRevision;
   return (
     <pre className="incremental-markdown-fence overflow-x-auto rounded-lg border bg-muted/30 p-3 text-[13px] leading-6">
-      <code>{cache.rows}</code>
+      <code>
+        {cache.rows}
+        <div>{cache.lineChunks}</div>
+      </code>
     </pre>
   );
+}
+
+function RawStreamBlock({
+  initialValue = "",
+  appendChunk = "",
+  appendRevision,
+}: {
+  initialValue?: string;
+  appendChunk?: string;
+  appendRevision?: number;
+}) {
+  const chunksRef = useRef<{ chunks: string[]; revision: number } | null>(null);
+  if (chunksRef.current === null) chunksRef.current = { chunks: [initialValue], revision: 0 };
+  if (appendRevision !== undefined && appendRevision > chunksRef.current.revision) {
+    if (appendChunk) chunksRef.current.chunks.push(appendChunk);
+    chunksRef.current.revision = appendRevision;
+  }
+  return <div className="whitespace-pre-wrap">{chunksRef.current.chunks}</div>;
 }
 
 function isCodeBlock(node: RootContent): node is RootContent & { type: "code" } {
@@ -227,21 +353,29 @@ function isContainerBlock(node: RootContent): boolean {
 class IncrementalRenderer {
   private readonly parser = new IncrementalMarkdownParser();
   private readonly codeHighlight: CodeHighlightMode;
+  private readonly components?: Record<string, unknown>;
   private generation = -1;
   private frozenElements: ReactNode[] = [];
   private lastFrozenCount = 0;
   /** Stable-block element cache: absolute start offset -> source slice + element. */
   private blockCache = new Map<number, { src: string; element: ReactNode }>();
   private lastText: string | null = null;
+  private lastEpoch: object | undefined;
   private lastRendered: ReactNode[] = [];
 
-  constructor(codeHighlight: CodeHighlightMode) {
+  constructor(codeHighlight: CodeHighlightMode, components?: Record<string, unknown>) {
     this.codeHighlight = codeHighlight;
+    this.components = components;
   }
 
-  render(text: string): ReactNode[] {
+  render(text: string, epoch?: object): ReactNode[] {
     if (text === this.lastText) return this.lastRendered;
-    const { frozen, tail, generation } = this.parser.update(text);
+    const appendOnly =
+      epoch !== undefined &&
+      epoch === this.lastEpoch &&
+      this.lastText !== null &&
+      text.length >= this.lastText.length;
+    const { frozen, tail, generation } = this.parser.update(text, epoch);
     if (generation !== this.generation) {
       this.generation = generation;
       this.lastFrozenCount = 0;
@@ -254,7 +388,7 @@ class IncrementalRenderer {
     // any parser edge case self-heals on the next frame.
     for (let index = this.lastFrozenCount; index < frozen.length; index += 1) {
       const block = frozen[index];
-      const element = this.renderBlockElement(text, block, 0);
+      const element = this.renderBlockElement(text, block, 0, appendOnly);
       if (this.frozenElements.length > 0) this.frozenElements.push("\n");
       this.frozenElements.push(element);
     }
@@ -264,9 +398,10 @@ class IncrementalRenderer {
     const children = [...this.frozenElements];
     for (const block of tail) {
       if (children.length > 0) children.push("\n");
-      children.push(this.renderBlockElement(text, block, 0));
+      children.push(this.renderBlockElement(text, block, 0, appendOnly));
     }
     this.lastText = text;
+    this.lastEpoch = epoch;
     this.lastRendered = children;
     return children;
   }
@@ -276,11 +411,18 @@ class IncrementalRenderer {
     text: string,
     block: PositionedBlock,
     depth: number,
+    appendOnly: boolean,
   ): ReactNode {
-    const src = text.slice(block.start, block.end);
+    const streamNode = block.node as Partial<StreamTailNode>;
+    const streamedTail =
+      (streamNode.type === "raw_stream" || streamNode.type === "code") &&
+      streamNode.streamInitial !== undefined;
+    // Synthetic overflow tails carry their own append chunks; avoid copying
+    // the entire accumulated message just to compare/cache them.
+    const src = streamedTail ? `stream:${text.length}` : text.slice(block.start, block.end);
     const cached = this.blockCache.get(block.key);
     if (cached !== undefined && cached.src === src) return cached.element;
-    const element = this.buildBlockElement(text, block, src, depth);
+    const element = this.buildBlockElement(text, block, src, depth, appendOnly);
     this.blockCache.set(block.key, { src, element });
     return element;
   }
@@ -291,21 +433,44 @@ class IncrementalRenderer {
     block: PositionedBlock,
     src: string,
     depth: number,
+    appendOnly: boolean,
   ): ReactNode {
     const node = block.node;
+    // A full part replacement resets parser state. Include that generation in
+    // the React key so code-row caches cannot survive a retry/edit with the
+    // same source offset.
+    const renderKey = `${this.generation}:${block.key}`;
     if (isCodeBlock(node)) {
-      return createElement(CodeBlockPlain, { key: block.key, node });
+      const streamNode = node as unknown as StreamTailNode;
+      return createElement(CodeBlockPlain, {
+        appendChunk: streamNode.streamAppend,
+        appendRevision: streamNode.streamRevision,
+        appendOnly,
+        initialValue: streamNode.streamInitial,
+        key: renderKey,
+        node,
+      });
+    }
+    if ((node as { type?: string }).type === "raw_stream") {
+      const streamNode = node as unknown as StreamTailNode;
+      return createElement(RawStreamBlock, {
+        appendChunk: streamNode.streamAppend,
+        initialValue: streamNode.streamInitial,
+        appendRevision: streamNode.streamRevision,
+        key: renderKey,
+      });
     }
     if (depth < MAX_CONTAINER_DEPTH && isContainerBlock(node)) {
-      return this.renderContainer(text, block, node, depth);
+      return this.renderContainer(text, block, node, depth, appendOnly);
     }
     // Leaf block: render its source slice through the exact streamdown
     // pipeline settled messages use, keyed by the absolute start offset so
     // React reconciles (never remounts) when a block crosses a freeze edge.
     return createElement(LazyStreamdown, {
       codeHighlight: this.codeHighlight,
-      key: block.key,
-      children: src,
+      components: this.components,
+      key: renderKey,
+      children: normalizeLatexDelimiters(src),
     });
   }
 
@@ -319,9 +484,15 @@ class IncrementalRenderer {
       start?: number | null;
     },
     depth: number,
+    appendOnly: boolean,
   ): ReactNode {
     const children = node.children ?? [];
     const items: PositionedBlock[] = [];
+    // remark positions are relative to the parser's active slice. Translate
+    // nested positions back into the full message before slicing source.
+    const nodeStart = (node.position as { start?: { offset?: number } } | undefined)
+      ?.start?.offset ?? 0;
+    const positionBase = block.start - nodeStart;
     for (const child of children) {
       const start = (child.position as { start?: { offset?: number } } | undefined)
         ?.start?.offset;
@@ -330,9 +501,9 @@ class IncrementalRenderer {
       if (start === undefined || end === undefined) continue;
       items.push({
         node: child as RootContent,
-        start,
-        end,
-        key: start,
+        start: positionBase + start,
+        end: positionBase + end,
+        key: positionBase + start,
       });
     }
     // Stable items hit the shared block cache (zero re-render); the active
@@ -343,7 +514,7 @@ class IncrementalRenderer {
     const renderedItems: ReactNode[] = [];
     for (const item of items) {
       if (renderedItems.length > 0) renderedItems.push("\n");
-      renderedItems.push(this.renderBlockElement(text, item, depth + 1));
+      renderedItems.push(this.renderBlockElement(text, item, depth + 1, appendOnly));
     }
     if (node.type === "list") {
       const ordered = node.ordered === true;
@@ -377,13 +548,17 @@ class IncrementalRenderer {
 export function IncrementalMarkdown({
   text,
   codeHighlight = "shiki",
+  components,
+  epoch,
 }: {
   text: string;
   codeHighlight?: CodeHighlightMode;
+  components?: Record<string, unknown>;
+  epoch?: object;
 }): ReactNode {
   const renderer = useMemo(
-    () => new IncrementalRenderer(codeHighlight),
-    [codeHighlight],
+    () => new IncrementalRenderer(codeHighlight, components),
+    [codeHighlight, components],
   );
-  return useMemo(() => renderer.render(text), [renderer, text]);
+  return useMemo(() => renderer.render(text, epoch), [renderer, text, epoch]);
 }

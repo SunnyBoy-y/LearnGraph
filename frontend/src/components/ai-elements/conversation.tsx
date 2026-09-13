@@ -6,19 +6,40 @@ import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import type { ComponentProps } from "react";
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
+const ManualScrollBridge = () => {
+  const { stopScroll, scrollRef } = useStickToBottomContext();
+  useEffect(() => {
+    const stop = (event: Event) => {
+      const target = (event as CustomEvent<{ scrollElement?: Element }>).detail?.scrollElement;
+      if (!target || target !== scrollRef.current) return;
+      stopScroll();
+    };
+    window.addEventListener("learngraph:manual-scroll", stop);
+    return () => window.removeEventListener("learngraph:manual-scroll", stop);
+  }, [scrollRef, stopScroll]);
+  return null;
+};
+
+export const Conversation = ({ className, children, ...props }: ConversationProps) => (
   <StickToBottom
     className={cn("relative flex-1 overflow-y-hidden", className)}
     initial="smooth"
-    resize="smooth"
+    resize="instant"
     role="log"
     {...props}
-  />
+  >
+    {(context) => (
+      <>
+        <ManualScrollBridge />
+        {typeof children === "function" ? children(context) : children}
+      </>
+    )}
+  </StickToBottom>
 );
 
 export type ConversationContentProps = ComponentProps<
