@@ -197,8 +197,8 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
       {subappTrigger ? (
         hasSubappContent ? (
           <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
-            <iframe
-              allow=""
+            <iframe loading="lazy"
+            allow=""
               className="sandbox-artifact__preview"
               onLoad={handleSubappLoad}
               ref={iframeRef}
@@ -220,7 +220,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         )
       ) : bundlePreviewUrl ? (
         <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
-          <iframe
+          <iframe loading="lazy"
             allow=""
             className="sandbox-artifact__preview"
             ref={runtimeIframeRef}
@@ -232,7 +232,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         </FullscreenPreview>
       ) : previewHtml ? (
         <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
-          <iframe
+          <iframe loading="lazy"
             allow=""
             className="sandbox-artifact__preview"
             onLoad={(event) => postRendererUnlock(event.currentTarget, unlockMessage)}
@@ -245,7 +245,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         </FullscreenPreview>
       ) : canRenderRemote ? (
         <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
-          <iframe
+          <iframe loading="lazy"
             allow=""
             className="sandbox-artifact__preview"
             referrerPolicy="no-referrer"
@@ -377,3 +377,5 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
     </section>
   );
 }
+
+

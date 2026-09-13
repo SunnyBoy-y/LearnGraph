@@ -46,6 +46,7 @@ import {
   MoreHorizontal,
   Network,
   PanelLeftClose,
+  Pause,
   Package,
   Pencil,
   Pin,
@@ -98,6 +99,11 @@ import { SettingsModal } from "@/components/layout/settings-modal";
 import { NativeActions } from "@/features/mobile/NativeActions";
 import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
 import { OPEN_GRAPH_EVENT, OPEN_SIDEBAR_EVENT } from "@/lib/mobile-shell";
+import {
+  pauseAllPreviews,
+  resumeAllPreviews,
+  useAllPreviewsPaused,
+} from "@/lib/preview-pause-controller";
 import { isVoiceSessionActive } from "@/features/voice/voice-session-markers";
 // F1-2/P0-1: the selection-explanation panel pulls the whole chat renderer
 // (streamdown/hast/parse5/mermaid/d3 subtree) into the first-screen entry
@@ -3024,6 +3030,9 @@ function TopBar({
   const { workspaceId = "" } = useParams();
   const auth = useAuth();
   const isChat = pathname.includes("/chat/");
+  // 页面预览的全局暂停只属于「产物」页，其它页面顶栏不再常驻该按钮。
+  const isArtifacts = pathname.includes("/artifacts");
+  const previewsPaused = useAllPreviewsPaused();
   const dashboard = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "dashboard"),
     queryFn: getDashboard,
@@ -3072,6 +3081,26 @@ function TopBar({
         ) : null}
       </div>
       <div className="workspace-topbar__actions">
+        {isArtifacts ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-pressed={previewsPaused}
+                aria-label={previewsPaused ? "恢复全部页面预览" : "暂停全部页面预览"}
+                className="shrink-0"
+                onClick={() => (previewsPaused ? resumeAllPreviews() : pauseAllPreviews())}
+                size="icon-sm"
+                title={previewsPaused ? "恢复全部页面预览" : "暂停全部页面预览"}
+                variant={previewsPaused ? "default" : "ghost"}
+              >
+                {previewsPaused ? <Play className="size-4" /> : <Pause className="size-4" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {previewsPaused ? "恢复全部页面预览" : "暂停全部页面预览"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
         {onToggleGraph ? (
           <Button
             aria-expanded={graphOpen}

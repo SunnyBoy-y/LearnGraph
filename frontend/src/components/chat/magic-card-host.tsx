@@ -259,6 +259,10 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
 
     window.addEventListener("message", onMessage);
     const timer = window.setInterval(() => {
+      if (iframeRef.current?.dataset.previewPaused === "true" || runtimeIframeRef.current?.dataset.previewPaused === "true" || subappIframeRef.current?.dataset.previewPaused === "true") {
+        lastHeartbeatRef.current = Date.now();
+        return;
+      }
       if (Date.now() - lastHeartbeatRef.current > 20_000) {
         setFailureReason("卡片长时间无响应，已自动隔离。");
         setFailed(true);
@@ -284,8 +288,8 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
         </div>
         {hasSubappContent ? (
           <FullscreenPreview className="magic-card__frame-wrap" label={title}>
-            <iframe
-              allow=""
+            <iframe loading="lazy"
+            allow=""
               className="magic-card__frame"
               onLoad={handleSubappLoad}
               ref={subappIframeRef}
@@ -400,7 +404,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           </Badge>
         </div>
         <FullscreenPreview className="magic-card__frame-wrap" label={title}>
-          <iframe
+          <iframe loading="lazy"
             allow=""
             className="magic-card__frame"
             onError={() => {
@@ -435,7 +439,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           <Badge variant="secondary">bundle · 联网</Badge>
         </div>
         <FullscreenPreview className="magic-card__frame-wrap" label={title}>
-          <iframe
+          <iframe loading="lazy"
             allow=""
             className="magic-card__frame"
             ref={runtimeIframeRef}
@@ -469,7 +473,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           <Badge variant="secondary">preview · 联网</Badge>
         </div>
         <FullscreenPreview className="magic-card__frame-wrap" label={title}>
-          <iframe
+          <iframe loading="lazy"
             allow=""
             className="magic-card__frame"
             ref={runtimeIframeRef}
@@ -494,3 +498,5 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     "这张卡片没有随消息保存可执行的隔离预览内容，无法重新运行。";
   return <MagicCardFallback reason={mappedReason} title={title} />;
 }
+
+
