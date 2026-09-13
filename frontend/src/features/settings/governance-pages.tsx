@@ -3038,7 +3038,7 @@ export function WorkspaceSettingsPage() {
               <div className="min-w-0">
                 <p className="text-sm font-medium">默认响应模式</p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  新建对话时的默认状态：极速 / 思考 / 智能体；已有会话仍记住各自上次选择
+                  新建对话时的默认状态：极速 / 智能体；已有会话仍记住各自上次选择
                 </p>
               </div>
             </div>
@@ -3057,7 +3057,6 @@ export function WorkspaceSettingsPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="fast">极速</SelectItem>
-                <SelectItem value="thinking">思考</SelectItem>
                 <SelectItem value="agentic">智能体</SelectItem>
               </SelectContent>
             </Select>

@@ -64,7 +64,6 @@ import {
   startCodexDeviceLogin,
   syncProviderModelCatalogDefaults,
   updateProviderModelCapabilities,
-  updateProviderModelGroupCapabilities,
   updateProviderModelStates,
   updateProvider,
 } from "@/api";
@@ -159,6 +158,7 @@ import type {
   ProviderModelCapabilityView,
   ProviderModelsResponse,
   ProviderModelStatesView,
+  ProviderCreateRequest,
   ProviderRole,
   ProviderTypeCatalogItem,
   SpeechModelPreset,
@@ -1480,7 +1480,7 @@ export function ProvidersPage() {
                               })
                             }
                             size="xs"
-                            title="全局模板、模型开关、连接与余额查询统一在这里配置"
+                            title="模型能力、模型开关、连接与余额查询统一在这里配置"
                             variant="outline"
                           >
                             <SlidersHorizontal className="size-3" />
@@ -2993,13 +2993,7 @@ function ProviderDialog({
   catalogError?: string;
   catalogPending: boolean;
   initialRole?: ProviderRole;
-  onCreate: (payload: {
-    display_name: string;
-    provider_type: string;
-    base_url?: string;
-    api_key?: string;
-    capabilities?: Record<string, unknown>;
-  }) => void;
+  onCreate: (payload: ProviderCreateRequest) => void;
   secretStoreAvailable: boolean;
 }) {
   const creatable = catalog.filter((item) => item.create_allowed);
@@ -3273,19 +3267,9 @@ function ProviderDialog({
       capabilities.discovered_model_ids = [defaultModel];
       Object.assign(capabilities, activeQuickProvider.capabilityOverrides);
     }
-    // Seed recommended default model IDs for 通义千问 embedding / ASR presets
-    // so the row can be enabled without a second manual step.
-    if (role === "transcription" && activeQuickProvider?.brandId === "qwen") {
-      capabilities.default_transcription_model_id = "qwen3-asr-flash";
-      capabilities.default_realtime_transcription_model_id =
-        "qwen3-asr-flash-realtime";
-    }
     if (role === "embedding" && activeQuickProvider?.brandId === "qwen") {
       capabilities.default_model = "text-embedding-v4";
       capabilities.default_embedding_model_id = "text-embedding-v4";
-    }
-    if (role === "transcription" && activeQuickProvider?.brandId === "openai") {
-      capabilities.default_transcription_model_id = "whisper-1";
     }
     if (role === "embedding" && activeQuickProvider?.brandId === "openai") {
       capabilities.default_model = "text-embedding-3-small";
@@ -3885,9 +3869,7 @@ function ModelCapabilitiesDialog({
     );
     return item.create_allowed && current && item.role === current.role;
   });
-  // "none" keeps the dialog lightweight: the template form only appears after
-  // an explicit edit action. Per-model parameters open in a nested dialog.
-  const [editScope, setEditScope] = useState<"none" | "group">("none");
+  // Per-model parameters open in a nested dialog.
   const [editModelId, setEditModelId] = useState<string | null>(null);
   const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
   const [protocolType, setProtocolType] = useState(provider.provider_type);
@@ -3906,8 +3888,6 @@ function ModelCapabilitiesDialog({
   const [defaultModelId, setDefaultModelId] = useState(() =>
     providerDefaultModelId(provider),
   );
-  const [capabilities, setCapabilities] =
-    useState<ProviderModelCapabilities>(emptyModelCapabilities);
 
   const latestModels = useQuery({
     queryKey: ["provider-models", "capability-dialog", provider.id],
@@ -3945,77 +3925,6 @@ function ModelCapabilitiesDialog({
       return next;
     });
   }, [latestModels.data, provider]);
-  const templateRaw = provider.capabilities.model_defaults;
-  const templateConfigured = Boolean(
-    templateRaw &&
-      typeof templateRaw === "object" &&
-      !Array.isArray(templateRaw) &&
-      Object.keys(templateRaw as Record<string, unknown>).length > 0,
-  );
-  // Absent flag = on for providers that already carry a template (legacy data).
-  const [templateOn, setTemplateOn] = useState(() =>
-    typeof provider.capabilities.model_defaults_enabled === "boolean"
-      ? provider.capabilities.model_defaults_enabled
-      : templateConfigured,
-  );
-
-  useEffect(() => {
-    if (editScope !== "group") return;
-    const defaults = provider.capabilities.model_defaults;
-    const merged = {
-      ...emptyModelCapabilities(),
-      ...(defaults && typeof defaults === "object" && !Array.isArray(defaults)
-        ? defaults
-        : {}),
-    } as ProviderModelCapabilities;
-    setCapabilities(normalizeLoadedCapabilities(merged));
-  }, [editScope, provider.capabilities.model_defaults]);
-
-  const save = useMutation({
-    mutationFn: (payload: ProviderModelCapabilities) =>
-      updateProviderModelGroupCapabilities(provider.id, capabilitiesForSave(payload)),
-    onSuccess: (snapshot) => {
-      onSaved(snapshot);
-      toast.success("全局模板已保存");
-      onClose();
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const toggleTemplate = useMutation({
-    mutationFn: (enabled: boolean) =>
-      updateProvider(provider.id, { model_defaults_enabled: enabled }),
-    onSuccess: (_, enabled) => {
-      toast.success(
-        enabled
-          ? "全局覆盖已开启，全部模型将遵从全局模板"
-          : "全局覆盖已关闭，各模型使用自身默认配置",
-      );
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
-    },
-    onError: (error, enabled) => {
-      setTemplateOn(!enabled);
-      toast.error(error.message);
-    },
-  });
-  const syncCatalogDefaults = useMutation({
-    mutationFn: () =>
-      syncProviderModelCatalogDefaults(
-        provider.id,
-        modelsList.models.map((model) => model.id),
-      ),
-    onSuccess: (result) => {
-      for (const snapshot of result.models) {
-        queryClient.setQueryData(
-          ["provider-model-capabilities", provider.id, snapshot.model_id],
-          snapshot,
-        );
-        onSaved(snapshot);
-      }
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      toast.success(`已为 ${result.models.length} 个模型同步官方默认参数`);
-    },
-    onError: (error) => toast.error(error.message),
-  });
   const addManualModel = useMutation({
     mutationFn: (modelId: string) =>
       syncProviderModelCatalogDefaults(provider.id, [modelId]),
@@ -4090,6 +3999,24 @@ function ModelCapabilitiesDialog({
     },
     onError: (error) => toast.error(error.message),
   });
+  const saveModelStates = useMutation({
+    mutationFn: (input: { states: Record<string, boolean>; connectionDirty: boolean }) =>
+      updateProviderModelStates(provider.id, input.states).then((result) => ({
+        result,
+        connectionDirty: input.connectionDirty,
+      })),
+    onSuccess: ({ result, connectionDirty }) => {
+      onStatesSaved(result);
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      if (connectionDirty) {
+        updateConnection.mutate({ close: true });
+      } else {
+        toast.success("模型开关已保存");
+        onClose();
+      }
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const rotateSecretHere = useMutation({
     mutationFn: () => rotateProviderSecret(provider.id, secret),
     onSuccess: () => {
@@ -4107,55 +4034,14 @@ function ModelCapabilitiesDialog({
       toast.error(invalidBaseUrlMessage(trimmedConnectionUrl));
       return;
     }
-    if (editScope === "none") {
-      // 连接配置（URL/请求头/协议）在「连接配置」区有独立的「保存连接」按钮；
-      // 但用户在 URL 输入框按 Enter 或直接点底部「保存」时也会走到这里，
-      // 若连接已被改动不能静默丢弃——先提交模型开关，再一并保存连接。
-      const connectionDirty =
-        (baseUrl.trim() || null) !== (provider.base_url ?? null) ||
-        protocolType !== provider.provider_type ||
-        headers !== stringifyExtraHeaders(providerExtraHeaders(provider));
-      updateProviderModelStates(provider.id, modelStates)
-        .then((result) => {
-          onStatesSaved(result);
-          void queryClient.invalidateQueries({ queryKey: ["providers"] });
-          if (connectionDirty) {
-            updateConnection.mutate({ close: true });
-          } else {
-            toast.success("模型开关已保存");
-            onClose();
-          }
-        })
-        .catch((error: Error) => toast.error(error.message));
-      return;
-    }
-    if (
-      capabilities.default_thinking_mode !== "off" &&
-      !capabilities.reasoning_efforts.includes(capabilities.default_thinking_mode)
-    ) {
-      toast.error("默认思考模式必须已列入支持的推理强度");
-      return;
-    }
-    if (
-      capabilities.default_search_route === "model_native" &&
-      !capabilities.hosted_web_search
-    ) {
-      toast.error("模型原生联网需要先确认托管网页搜索能力");
-      return;
-    }
-    const contextError = capabilityContextError(capabilities);
-    if (contextError) {
-      toast.error(contextError);
-      return;
-    }
-    // Model switches are part of this supplier configuration and commit with
-    // the footer action, rather than requiring a second "apply" step.
-    updateProviderModelStates(provider.id, modelStates)
-      .then((result) => {
-        onStatesSaved(result);
-        save.mutate(capabilities);
-      })
-      .catch((error: Error) => toast.error(error.message));
+    // 连接配置（URL/请求头/协议）在「连接配置」区有独立的「保存连接」按钮；
+    // 但用户在 URL 输入框按 Enter 或直接点底部「保存」时也会走到这里，
+    // 若连接已被改动不能静默丢弃——先提交模型开关，再一并保存连接。
+    const connectionDirty =
+      (baseUrl.trim() || null) !== (provider.base_url ?? null) ||
+      protocolType !== provider.provider_type ||
+      headers !== stringifyExtraHeaders(providerExtraHeaders(provider));
+    saveModelStates.mutate({ states: modelStates, connectionDirty });
   }
 
   function addManualModelHandler() {
@@ -4203,7 +4089,7 @@ function ModelCapabilitiesDialog({
     ? providerBalanceQueryLastResult(provider)
     : null;
   return (
-    <Dialog onOpenChange={(open) => !open && !save.isPending && onClose()} open>
+    <Dialog onOpenChange={(open) => !open && !saveModelStates.isPending && onClose()} open>
       <DialogContent className="h-[min(88dvh,860px)] overflow-hidden p-0 sm:max-w-3xl">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={submit}>
           <DialogHeader className="shrink-0 border-b px-5 py-5 pr-14">
@@ -4211,87 +4097,6 @@ function ModelCapabilitiesDialog({
           </DialogHeader>
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5">
             <div className="space-y-5 py-5">
-              <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-sm font-semibold">全局模板</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      开启后模板覆盖该供应商全部模型；关闭后各模型使用自身默认配置。
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      disabled={
-                        modelsList.models.length === 0 ||
-                        syncCatalogDefaults.isPending
-                      }
-                      onClick={() => syncCatalogDefaults.mutate()}
-                      size="xs"
-                      title={
-                        modelsList.models.length > 0
-                          ? "为模型列表中的全部模型写入官方目录默认参数"
-                          : "请先发现模型，或手动添加模型"
-                      }
-                      type="button"
-                      variant="outline"
-                    >
-                      {syncCatalogDefaults.isPending
-                        ? "同步中…"
-                        : "一键同步官方默认参数"}
-                    </Button>
-                    <Button
-                      onClick={() =>
-                        setEditScope(editScope === "group" ? "none" : "group")
-                      }
-                      size="xs"
-                      type="button"
-                      variant={editScope === "group" ? "default" : "outline"}
-                    >
-                      {editScope === "group" ? "收起编辑" : "编辑全局模板"}
-                    </Button>
-                    <label className="flex items-center gap-2 rounded-lg border px-2.5 py-1 text-xs font-medium">
-                      全局覆盖
-                      <Switch
-                        checked={templateOn}
-                        disabled={toggleTemplate.isPending}
-                        onCheckedChange={(checked) => {
-                          setTemplateOn(checked);
-                          toggleTemplate.mutate(checked);
-                        }}
-                      />
-                    </label>
-                  </div>
-                </div>
-                <div className="flex flex-wrap gap-1.5 text-[11px]">
-                  <span
-                    className={`rounded-md border px-1.5 py-0.5 font-medium ${
-                      templateConfigured && templateOn
-                        ? "border-primary/30 bg-primary/10 text-primary"
-                        : "bg-muted/50 text-muted-foreground"
-                    }`}
-                  >
-                    {templateConfigured
-                      ? templateOn
-                        ? "全局覆盖已开启 · 模板对全部模型生效"
-                        : "模板已保存 · 全局覆盖已关闭"
-                      : "未配置模板参数"}
-                  </span>
-                  <span className="rounded-md border bg-muted/50 px-1.5 py-0.5 text-muted-foreground">
-                    {overrideModelIds.length > 0
-                      ? `${overrideModelIds.length} 个模型有单独配置`
-                      : "无单模型配置"}
-                  </span>
-                </div>
-                {templateOn && !templateConfigured ? (
-                  <p className="rounded-lg bg-muted px-3 py-2 text-xs">
-                    全局覆盖已开启，但尚未保存模板参数；请点击「编辑全局模板」完成配置。
-                  </p>
-                ) : editScope === "none" ? (
-                  <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
-                    模板参数表单在点击「编辑全局模板」后展开；单个模型的参数请在模型行「编辑」弹出的窗口中调整。
-                  </p>
-                ) : null}
-              </section>
               <section className="space-y-3 rounded-xl border p-4">
                 <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
                 <div className="flex items-center gap-2">
@@ -4340,7 +4145,7 @@ function ModelCapabilitiesDialog({
                       {overrideModelIds.includes(model.id) ? (
                         <span
                           className="rounded border px-1 py-0.5 text-[10px] text-muted-foreground"
-                          title="该模型有单独配置；全局覆盖开启时以全局模板为准"
+                          title="该模型有单独配置"
                         >
                           单独配置
                         </span>
@@ -4391,14 +4196,6 @@ function ModelCapabilitiesDialog({
                   </div>
                 </ScrollArea>
               </section>
-              {editScope === "group" ? (
-                <CapabilityFormFields
-                  capabilities={capabilities}
-                  idPrefix={`group-${provider.id}`}
-                  providerType={provider.provider_type}
-                  setCapabilities={setCapabilities}
-                />
-              ) : null}
               <section className="space-y-3 rounded-xl border p-4">
                 <div>
                   <p className="text-sm font-semibold">连接配置</p>
@@ -4492,35 +4289,31 @@ function ModelCapabilitiesDialog({
                   </Button>
                 </div>
               </section>
-              {save.isError ? (
+              {saveModelStates.isError ? (
                 <p className="text-sm text-destructive" role="alert">
-                  {save.error.message}
+                  {saveModelStates.error.message}
                 </p>
               ) : null}
             </div>
           </div>
           <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none rounded-b-2xl px-5 py-4">
             <Button
-              disabled={save.isPending}
+              disabled={saveModelStates.isPending}
               onClick={onClose}
               type="button"
               variant="outline"
             >
               取消
             </Button>
-            <Button disabled={save.isPending} type="submit">
-              {save.isPending
-                ? "保存中…"
-                : editScope === "none"
-                  ? "保存模型开关"
-                  : "保存全局模板"}
+            <Button disabled={saveModelStates.isPending} type="submit">
+              {saveModelStates.isPending ? "保存中…" : "保存模型开关"}
             </Button>
           </DialogFooter>
         </form>
       </DialogContent>
       {editModelId ? (
         <ModelOverrideDialog
-          globalOverrideOn={templateOn && templateConfigured}
+          globalOverrideOn={false}
           modelId={editModelId}
           onClose={() => setEditModelId(null)}
           onSaved={onSaved}
@@ -5183,7 +4976,7 @@ function ModelOverrideDialog({
               <div className="space-y-5 py-5">
                 {globalOverrideOn ? (
                   <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
-                    全局覆盖开启中：此单模型配置会保存，但需在供应商配置中关闭「全局覆盖」后才生效。
+                    单模型配置会直接保存并用于后续调用。
                   </p>
                 ) : null}
                 {snapshotMissing ? (

@@ -1,5 +1,8 @@
 import type { WorkspaceSetting } from "@/types/settings";
-import type { ResponseMode } from "@/lib/session-composer-prefs";
+import {
+  normalizeResponseMode,
+  type ResponseMode,
+} from "@/lib/session-composer-prefs";
 
 export const CHAT_SUGGESTED_PROMPTS_SETTING_KEY = "chat.suggested_prompts";
 export const CHAT_AUTO_TITLE_MODEL_SETTING_KEY = "chat.auto_title_model";
@@ -35,10 +38,6 @@ export type ChatDefaultResponseModeSetting = {
 };
 
 const DEFAULT_RESPONSE_MODE: ResponseMode = "agentic";
-
-function isResponseMode(value: unknown): value is ResponseMode {
-  return value === "fast" || value === "thinking" || value === "agentic";
-}
 
 export function areChatSuggestedPromptsEnabled(
   settings: WorkspaceSetting[] | undefined,
@@ -93,9 +92,7 @@ export function readChatDefaultResponseMode(
   )?.value;
   if (!value || typeof value !== "object") return DEFAULT_RESPONSE_MODE;
   const record = value as Record<string, unknown>;
-  return isResponseMode(record.response_mode)
-    ? record.response_mode
-    : DEFAULT_RESPONSE_MODE;
+  return normalizeResponseMode(record.response_mode);
 }
 
 export type ThinkingChainDefaultState = "open" | "collapsed";
