@@ -21,7 +21,6 @@ import {
 } from "@tanstack/react-query";
 import {
   ArrowUp,
-  AudioWaveform,
   Bot,
   CalendarDays,
   Check,
@@ -64,6 +63,8 @@ import {
 } from "@/features/chat/stream-stats";
 
 import { toast } from "sonner";
+import { createStreamRenderQueue } from "@/features/chat/stream-render-queue";
+import { markStreamTextUpdate } from "@/lib/stream-text-epoch";
 
 import {
   ApiError,
@@ -110,7 +111,9 @@ import {
   transcribeAudioFile,
   transcribeDictationSegment,
 } from "@/api";
-import { useVoiceSession, type ThinkingLimit } from "@/features/voice/voice-session-controller";
+import { VoiceCallControl, VoiceComposerActions, VoiceOrbDock } from "@/features/voice/voice-orb";
+import { voiceSessionController } from "@/features/voice/voice-session-controller";
+import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
 import { dispatchOpenGraph, dispatchOpenSidebar } from "@/lib/mobile-shell";
 import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
@@ -122,9 +125,11 @@ import {
 } from "@/lib/dictation-orchestrator";
 import {
   classifyNonAgentAttachment,
+  fileExtension,
   isAudioNameOrMime,
   isImageNameOrMime,
   isVideoNameOrMime,
+  LOCAL_TEXT_EXTENSIONS,
   nonAgentAttachmentBlockedMessage,
 } from "@/lib/chat-attachment-policy";
 import {
@@ -402,7 +407,6 @@ function isImageEditModel(
     id.startsWith("qwen-image-edit")
   );
 }
-
 /** Whether a model can serve as a text chat model (not image-only output). */
 function isTextChatModel(
   model: { capabilities?: ProviderModel["capabilities"] } | undefined,
@@ -1074,21 +1078,22 @@ function appendPart(
     typeof incoming.content === "string"
       ? incoming.content
       : `${visibleParts[index]?.content ?? ""}${incoming.content_delta ?? ""}`;
-  if (index === -1)
-    return [
-      ...visibleParts,
-      {
+  if (index === -1) {
+    const next = {
         ...incoming,
         content: nextContent,
         sequence:
           typeof incoming.sequence === "number"
             ? incoming.sequence
             : visibleParts.length,
-      },
-    ];
+      };
+    if (incoming.type === "text") markStreamTextUpdate(next, undefined, typeof incoming.content === "string");
+    return [...visibleParts, next];
+  }
   return visibleParts.map((part, partIndex) =>
     partIndex === index
-      ? {
+      ? (() => {
+          const next = {
           ...part,
           ...incoming,
           data: { ...(part.data ?? {}), ...(incoming.data ?? {}) },
@@ -1097,7 +1102,10 @@ function appendPart(
             typeof incoming.sequence === "number"
               ? incoming.sequence
               : (part.sequence ?? partIndex),
-        }
+          };
+          if (next.type === "text") markStreamTextUpdate(next, part, typeof incoming.content === "string");
+          return next;
+        })()
       : part,
   );
 }
@@ -1127,10 +1135,6 @@ function streamEventType(data: Record<string, unknown>): string {
 }
 
 
-const STREAM_EVENTS_PER_FRAME = 3;
-// Larger chunks cut per-frame string/array clones during long agent streams.
-// Typing animation still looks smooth; 28-char micro-slices were mostly RAM churn.
-const STREAM_DELTA_CHARS = 180;
 const DEFAULT_STREAM_RECONNECTS = 5;
 /** Newest-window size for the initial chat hydrate. Older turns load on scroll-up. */
 const INITIAL_MESSAGE_PAGE = 50;
@@ -1270,36 +1274,13 @@ function StreamConnectionFeedback({
 
 function expandStreamUpdate(
   data: Record<string, unknown>,
-  options: { animate?: boolean } = {},
+  _options: { animate?: boolean } = {},
 ) {
   const part = isMessagePart(data.part) ? data.part : undefined;
-  const eventType = streamEventType(data);
-  const delta = part?.content_delta;
-  // Skip character micro-slicing for off-screen / background streams — those
-  // intermediate clones only inflate RAM and never paint.
-  if (options.animate === false) return [data];
-  if (
-    !part ||
-    typeof delta !== "string" ||
-    !["part.delta", "message.part.delta"].includes(eventType)
-  )
-    return [data];
-  const characters = Array.from(delta);
-  if (characters.length <= STREAM_DELTA_CHARS) return [data];
-  const updates: Record<string, unknown>[] = [];
-  for (let index = 0; index < characters.length; index += STREAM_DELTA_CHARS) {
-    updates.push({
-      ...data,
-      part: {
-        ...part,
-        content: undefined,
-        content_delta: characters
-          .slice(index, index + STREAM_DELTA_CHARS)
-          .join(""),
-      },
-    });
-  }
-  return updates;
+  // Text is batched by the render queue in token-sized network updates. Keep
+  // reasoning/tool events intact so their existing chain semantics remain.
+  if (part?.type === "text") return [data];
+  return [data];
 }
 
 function applyStreamUpdates(
@@ -1419,122 +1400,6 @@ function findOptimisticCounterpart(
     );
   }
   return undefined;
-}
-
-function createAnimationFrameQueue<T>(
-  onBatch: (batch: T[]) => void,
-  options: { minIntervalMs?: number } = {},
-) {
-  const minIntervalMs = options.minIntervalMs ?? 0;
-  let pending: T[] = [];
-  let frameId: number | null = null;
-  let scheduledWithAnimationFrame = false;
-  let drainResolvers: Array<() => void> = [];
-  let lastRenderAt = 0;
-
-  const resolveDrains = () => {
-    if (pending.length || frameId !== null) return;
-    const resolvers = drainResolvers;
-    drainResolvers = [];
-    resolvers.forEach((resolve) => resolve());
-  };
-  const schedule = () => {
-    if (frameId !== null) return;
-    const run = () => {
-      frameId = null;
-      if (pending.length && minIntervalMs > 0) {
-        // Throttle stream re-renders (dsh frame-batched notifier style): large
-        // streaming text parts re-parse markdown + tokenize code per frame;
-        // skipping frames while events accumulate still yields 6-10fps
-        // typewriter updates and cuts render count proportionally.
-        const now = performance.now();
-        if (now - lastRenderAt < minIntervalMs) {
-          schedule();
-          return;
-        }
-        lastRenderAt = now;
-      } else if (minIntervalMs > 0) {
-        lastRenderAt = performance.now();
-      }
-      const batchSize =
-        pending.length > 90
-          ? STREAM_EVENTS_PER_FRAME * 12
-          : pending.length > 30
-            ? STREAM_EVENTS_PER_FRAME * 6
-            : STREAM_EVENTS_PER_FRAME * 3;
-      const batch = pending.splice(0, batchSize);
-      if (batch.length) onBatch(batch);
-      if (pending.length) schedule();
-      else resolveDrains();
-    };
-    scheduledWithAnimationFrame =
-      document.visibilityState === "visible" &&
-      typeof window.requestAnimationFrame === "function";
-    frameId = scheduledWithAnimationFrame
-      ? window.requestAnimationFrame(run)
-      : window.setTimeout(run, 16);
-  };
-
-  return {
-    push(item: T) {
-      pending.push(item);
-      schedule();
-    },
-    drain() {
-      if (!pending.length && frameId === null) return Promise.resolve();
-      return new Promise<void>((resolve) => drainResolvers.push(resolve));
-    },
-    clear() {
-      pending = [];
-      if (frameId !== null) {
-        if (scheduledWithAnimationFrame)
-          window.cancelAnimationFrame(frameId);
-        else window.clearTimeout(frameId);
-        frameId = null;
-      }
-      resolveDrains();
-    },
-  };
-}
-
-/**
- * Declared render cadence per part type (dsh node-level `publication`
- * pattern): each part type states how often its growth may commit a frame.
- * Returns the minimum interval between stream re-renders; 0 = every frame.
- * Text grows by re-parsing markdown + tokenizing code, so cadence scales
- * with content size; reasoning/tool-call streams are cheaper.
- */
-function partRenderMinIntervalMs(part: MessagePart): number {
-  switch (part.type) {
-    case "text":
-    case "acknowledgement": {
-      const len = (part.content ?? "").length;
-      if (len > 96_000) return 150;
-      if (len > 32_000) return 100;
-      if (len > 8_000) return 60;
-      return 0;
-    }
-    case "reasoning_summary":
-    case "reasoning_content":
-      return 40;
-    case "tool_call":
-      return typeof part.data?.argsRaw === "string" &&
-        part.data.argsRaw.length > 32_000
-        ? 100
-        : 0;
-    default:
-      return 0;
-  }
-}
-
-/** Streaming render throttle for a message: the strictest cadence across parts. */
-function streamRenderMinIntervalMs(parts: MessagePart[] | undefined): number {
-  let maxMs = 0;
-  for (const part of parts ?? []) {
-    const ms = partRenderMinIntervalMs(part);
-    if (ms > maxMs) maxMs = ms;
-  }
-  return maxMs;
 }
 
 async function copySelectionText(text: string): Promise<void> {
@@ -1697,6 +1562,14 @@ function MessageVersionNavigator({
  * 使其不被底部悬浮输入框盖住；同时离开底部锁定，允许用户继续滚动画布。
  */
 function scrollNewUserMessageToFifthLine(userMessageId: string) {
+  const scrollElement = document.querySelector<HTMLElement>(
+    ".chat-canvas-page [role='log']",
+  );
+  window.dispatchEvent(
+    new CustomEvent("learngraph:manual-scroll", {
+      detail: { scrollElement },
+    }),
+  );
   const attempt = () => {
     const scroller = document.querySelector<HTMLElement>(
       ".chat-canvas-page [role='log'] > div",
@@ -2524,8 +2397,6 @@ function FollowUpPrompts({
 }
 
 function ConversationQuickActions({
-  agentActive,
-  agentDisabled,
   attachDisabled,
   deepResearchDisabled,
   goalActive,
@@ -2541,14 +2412,11 @@ function ConversationQuickActions({
   onImage,
   onPractice,
   onSearch,
-  onAgent,
   practiceDisabled,
   searchActive,
   searchDisabled,
   onPhoto,
 }: {
-  agentActive: boolean;
-  agentDisabled: boolean;
   attachDisabled: boolean;
   deepResearchDisabled: boolean;
   goalActive: boolean;
@@ -2564,7 +2432,6 @@ function ConversationQuickActions({
   onImage: () => void;
   onPractice: () => void;
   onSearch: () => void;
-  onAgent: () => void;
   practiceDisabled: boolean;
   searchActive: boolean;
   searchDisabled: boolean;
@@ -2630,17 +2497,6 @@ function ConversationQuickActions({
         >
           <Search aria-hidden="true" />
           {searchActive ? "联网中" : "联网"}
-        </button>
-        <button
-          aria-pressed={agentActive}
-          className="chat-workbench-toolbar__action"
-          disabled={agentDisabled}
-          onClick={onAgent}
-          title={agentActive ? "切回普通对话模式" : "允许本轮调用已授权工具"}
-          type="button"
-        >
-          <Bot aria-hidden="true" />
-          智能体
         </button>
         <button
           className="chat-workbench-toolbar__action"
@@ -2725,90 +2581,6 @@ function VoiceBar({ level, canceling }: { level: number; canceling?: boolean }) 
         <span>松开发送</span>
         <span className="chat-voice-bar__cancel">上滑取消</span>
       </div>
-    </div>
-  );
-}
-
-/**
- * Voice surface for the conversation composer. The transport remains owned by
- * the chat page; this dialog is intentionally a presentation layer so it can
- * later be backed by the Pipecat/SmallWebRTC session without changing the
- * surrounding conversation layout.
- */
-function VoiceModeDialog({
-  workspaceId,
-  sessionId,
-  onClose,
-}: {
-  workspaceId: string;
-  sessionId: string;
-  onClose: () => void;
-}) {
-  const voice = useVoiceSession(workspaceId, sessionId);
-  const [voiceText, setVoiceText] = useState("");
-  const disconnectVoice = voice.disconnect;
-  const closeRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    closeRef.current?.focus();
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") { voice.disconnect(); onClose(); } };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [disconnectVoice, onClose]);
-  const isListening = voice.state === "listening";
-  const status = voice.transport === "connecting" ? "正在连接语音服务…" : voice.transport === "error" ? voice.error || "语音连接失败" : voice.state === "speaking" ? "导师正在回答，你可以随时打断" : isListening ? "正在聆听，你可以随时打断" : "点击开始连接语音导师";
-  const toggle = () => { if (voice.transport !== "connected") void voice.connect(); else if (voice.state === "speaking") void voice.interrupt(); else voice.toggleListening(); };
-  const submitVoiceText = () => {
-    const text = voiceText.trim();
-    if (!text || voice.transport !== "connected") return;
-    setVoiceText("");
-    void voice.sendTurn(text);
-  };
-  return (
-    <div className="chat-voice-dialog" role="dialog" aria-modal="true" aria-labelledby="voice-dialog-title">
-      <button className="chat-voice-dialog__scrim" onClick={() => { voice.disconnect(); onClose(); }} type="button" aria-label="关闭语音导师" />
-      <section className="chat-voice-dialog__panel">
-        <header className="chat-voice-dialog__header">
-          <div>
-            <p className="chat-voice-dialog__eyebrow">LEARNGRAPH VOICE</p>
-          <h2 id="voice-dialog-title">语音导师</h2>
-          </div>
-          <button ref={closeRef} className="chat-voice-dialog__close" onClick={() => { voice.disconnect(); onClose(); }} type="button" aria-label="关闭语音导师">
-            <X className="size-4" />
-          </button>
-        </header>
-        <div className={cn("chat-voice-orb", isListening && "is-listening", voice.state === "speaking" && "is-speaking")} aria-hidden="true">
-          <span className="chat-voice-orb__core" />
-          <span className="chat-voice-orb__halo chat-voice-orb__halo--one" />
-          <span className="chat-voice-orb__halo chat-voice-orb__halo--two" />
-        </div>
-        <p className="chat-voice-dialog__status" role="status" aria-live="polite">
-          {status}
-        </p>
-        <div className="chat-voice-dialog__hint">
-          <span>当前会话</span>
-          <strong>{voice.transport === "connected" ? "已接入当前会话的上下文与记忆" : "连接后将沿用当前会话的上下文与记忆"}</strong>
-        </div>
-        <div className="chat-voice-dialog__thinking" role="group" aria-label="语音导师最高思维能力">
-          <span>最高思维能力</span>
-          <select value={voice.thinkingLimit} onChange={(event) => voice.setThinkingLimit(event.target.value as ThinkingLimit)} aria-label="选择最高思维能力">
-            <option value="off">极速</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option>
-          </select>
-        </div>
-        {voice.transcript.length > 0 ? <div className="chat-voice-dialog__captions" aria-live="polite">{voice.transcript.slice(-2).map((item) => <p key={item.id}><b>{item.role === "user" ? "你" : "导师"}</b>{item.text}</p>)}</div> : null}
-        {voice.tasks.length > 0 ? <div className="chat-voice-dialog__tasks" aria-label="后台任务">{voice.tasks.slice(-2).map((task) => <p key={task.taskId}><span>{task.title || "后台任务"}</span><small>{task.status === "completed" ? "已完成" : task.status === "running" ? "进行中" : task.status}</small></p>)}</div> : null}
-        <div className="chat-voice-dialog__text-input">
-          <input value={voiceText} onChange={(event) => setVoiceText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) submitVoiceText(); }} placeholder="也可以直接输入，语音导师会沿用当前上下文" aria-label="发送文字给语音导师" disabled={voice.transport !== "connected"} />
-          <button type="button" onClick={submitVoiceText} disabled={voice.transport !== "connected" || !voiceText.trim()}>发送</button>
-        </div>
-        <div className="chat-voice-dialog__actions">
-          <button className={cn("chat-voice-dialog__mic", isListening && "is-active")} onClick={toggle} type="button" aria-pressed={isListening} disabled={voice.transport === "connecting"}>
-            <Mic className="size-5" />
-            <span>{voice.transport === "connected" ? (voice.state === "speaking" ? "打断回答" : isListening ? "结束聆听" : "开始说话") : "连接语音"}</span>
-          </button>
-          <button className="chat-voice-dialog__secondary" onClick={() => { voice.disconnect(); onClose(); }} type="button">返回文字对话</button>
-        </div>
-        <p className="chat-voice-dialog__note">语音入口会保留在当前会话中，任务和页面产物仍显示在对话消息里。</p>
-      </section>
     </div>
   );
 }
@@ -2951,6 +2723,9 @@ export function ChatCanvasPage() {
     setStreamConnectionNotice(null);
   }, [conversationResetKey]);
   const [modelSearch, setModelSearch] = useState("");
+  // Collapsed = icon + chevron, open = current mode word + chevron, matching
+  // the ChatGPT composer trigger. Drives the chip content and Ctrl+Shift+M.
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [composerInstanceKey, setComposerInstanceKey] =
     useState(conversationResetKey);
   const resumeInFlightRef = useRef<string | null>(null);
@@ -2960,6 +2735,71 @@ export function ChatCanvasPage() {
   const [closeDialogOpen, setCloseDialogOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [voiceModeOpen, setVoiceModeOpen] = useState(false);
+  // 语音通话回合 → 聊天消息列表。render 事件使用稳定 turn id，允许同一条
+  // 气泡随着 ASR/TTS 进度原地更新；最终事件再把 status 转为 completed。
+  useEffect(() => {
+    if (!voiceModeOpen) return;
+    const onVoiceRender = (event: Event) => {
+      const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
+      const text = item?.text?.trim() || "";
+      if (!item?.id || !item?.role) return;
+      // 只接受当前会话的语音回合，避免切换会话后残留的回调写进别的会话。
+      if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
+      setLocalMessages((current) => {
+        const id = `temp-voice-${item.id}`;
+        const status = item.final ? "completed" : "streaming";
+        const existing = current.find((message) => message.id === id);
+        if (existing) {
+          return current.map((message) => message.id === id
+            ? {
+                ...message,
+                content: text,
+                status,
+                parts: message.parts.map((part, index) => index === 0
+                  ? { ...part, status, content: text }
+                  : part),
+                provider_trace: {
+                  ...message.provider_trace,
+                  voice_turn: true,
+                  interrupted: Boolean(item.interrupted),
+                },
+              }
+            : message);
+        }
+        if (!text) return current;
+        if (current.some((message) => message.id === id)) return current;
+        const voiceMessage: Message = {
+          id,
+          workspace_id: workspaceId,
+          session_id: sessionId,
+          parent_message_id: null,
+          role: item.role,
+          version: 1,
+          status,
+          content: text,
+          parts: [
+            {
+              id: `temp-voice-part-${item.id}`,
+              type: "text",
+              status,
+              content: text,
+              sequence: 0,
+            },
+          ],
+          provider_trace: {
+            voice_turn: true,
+            interrupted: Boolean(item.interrupted),
+          },
+          created_at: item.createdAt || new Date().toISOString(),
+        };
+        return [...current, voiceMessage];
+      });
+    };
+    window.addEventListener("learngraph:voice-render", onVoiceRender);
+    return () => {
+      window.removeEventListener("learngraph:voice-render", onVoiceRender);
+    };
+  }, [sessionId, voiceModeOpen, workspaceId]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -2971,7 +2811,7 @@ export function ChatCanvasPage() {
   const [retryProviderId, setRetryProviderId] = useState("");
   const [retryModelId, setRetryModelId] = useState("");
   const [retryResponseMode, setRetryResponseMode] =
-    useState<ResponseMode>("thinking");
+    useState<ResponseMode>("agentic");
   const [retryThinkingMode, setRetryThinkingMode] =
     useState<ThinkingMode>("medium");
   const [retryWebSearch, setRetryWebSearch] = useState(false);
@@ -3953,7 +3793,7 @@ export function ChatCanvasPage() {
     if (!thinkingRequired || !supportsThinkingMode || responseMode !== "fast") {
       return;
     }
-    setResponseMode("thinking");
+    setResponseMode("agentic");
     setThinkingMode((current) =>
       thinkingModes.includes(current)
         ? current
@@ -3982,8 +3822,6 @@ export function ChatCanvasPage() {
     (responseMode === "fast" && !thinkingRequired) || !supportsThinkingMode
       ? "off"
       : thinkingMode;
-  const responseModeLabel =
-    responseMode === "fast" ? "极速" : responseMode === "agentic" ? "智能体" : "思考";
   const activeGenerationProvider =
     generationMode === "image" ? activeImageProvider : activeModelProvider;
   const activeGenerationModelId =
@@ -4252,7 +4090,7 @@ export function ChatCanvasPage() {
       const seenEventIds = new Set<string>();
       let lastEventSeq = 0;
       const isViewing = () => viewingSessionIdRef.current === streamSessionId;
-      const frameQueue = createAnimationFrameQueue<Record<string, unknown>>(
+      const frameQueue = createStreamRenderQueue(
         (updates) => {
           setLocalMessages((current) => {
             const existing = current.find((item) => item.id === inFlight.id);
@@ -4275,11 +4113,7 @@ export function ChatCanvasPage() {
             ];
           });
         },
-        {
-          minIntervalMs: isViewing()
-            ? streamRenderMinIntervalMs(inFlight.parts)
-            : streamRenderMinIntervalMs(inFlight.parts) * 2,
-        },
+        { isViewing },
       );
       const consume = (data: Record<string, unknown>) => {
         recordStreamDelta(inFlight.id, deltaTextOf(data));
@@ -5330,6 +5164,25 @@ export function ChatCanvasPage() {
         error instanceof Error ? error.message : "结束学习失败，请稍后重试。",
       ),
   });
+  // Shared gate for the composer's mode/model trigger: the phone button, the
+  // desktop pill, and the Ctrl+Shift+M shortcut all respect it.
+  const modelTriggerDisabled =
+    !activeGenerationProvider ||
+    sessionIsClosed ||
+    closeSessionMutation.isPending ||
+    goalFlow.busy ||
+    status !== "ready";
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+      if (event.key.toLowerCase() !== "m") return;
+      if (modelTriggerDisabled) return;
+      event.preventDefault();
+      setModelMenuOpen((open) => !open);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [modelTriggerDisabled]);
   useEffect(() => {
     window.dispatchEvent(
       new CustomEvent("learngraph:chat-header", {
@@ -5863,7 +5716,7 @@ export function ChatCanvasPage() {
       };
       // Always apply stream tokens into localMessages so returning to this
       // session mid-generation still shows the partial answer.
-      const frameQueue = createAnimationFrameQueue<Record<string, unknown>>(
+      const frameQueue = createStreamRenderQueue(
         (updates) =>
           setLocalMessages((current) =>
             current.map((message) =>
@@ -5872,11 +5725,7 @@ export function ChatCanvasPage() {
                 : message,
             ),
           ),
-        {
-          minIntervalMs: isViewingStream()
-            ? streamRenderMinIntervalMs(assistant.parts)
-            : streamRenderMinIntervalMs(assistant.parts) * 2,
-        },
+        { isViewing: isViewingStream },
       );
       try {
         for (
@@ -5926,7 +5775,8 @@ export function ChatCanvasPage() {
               if (
                 type === "message.completed" ||
                 type === "message.failed" ||
-                type === "message.cancelled"
+                type === "message.cancelled" ||
+                type === "message.interrupted"
               ) {
                 // 渲染结束/失败/取消 → 停止「答答答」震动
                 stopReplyVibration();
@@ -6035,7 +5885,7 @@ export function ChatCanvasPage() {
                     });
                 }
               }
-              if (type === "message.completed") completed = true;
+              if (type === "message.completed" || type === "message.interrupted") completed = true;
               if (type === "message.failed") {
                 const errorPayload =
                   typeof eventPayload.error === "object" &&
@@ -6314,7 +6164,12 @@ export function ChatCanvasPage() {
         file.parse_capability === "attachment_only" ||
         file.original_name.toLowerCase().endsWith(".ppt")
       ) {
-        if (!agentMode) {
+        // 文本/代码类附件（含 HTML、Markdown 等产物）在极速模式按完整文本直接提供给
+        // 模型，不要求先建立文本索引；其余仅附件类型仍需切换到智能体模式。
+        if (
+          !agentMode &&
+          !LOCAL_TEXT_EXTENSIONS.has(fileExtension(file.original_name))
+        ) {
           throw new Error(
             `「${file.original_name}」当前无法建立文本索引。请切换到智能体模式，或者删除不受支持的文件后再发送。`,
           );
@@ -6406,6 +6261,33 @@ export function ChatCanvasPage() {
         activeStreamSessionId.current === sessionId ||
         isSessionStreaming(sessionId);
       const trimmedText = message.text.trim();
+      // Voice mode is a live call: typed text must become the same turn the ASR
+      // transcript produces, not a second chat request that answers in parallel.
+      // Anything with attachments / long-paste still falls through to the normal
+      // chat path, which owns uploads and document context.
+      if (
+        voiceModeOpen &&
+        trimmedText &&
+        !effectiveFiles.length &&
+        effectiveLongPaste === null
+      ) {
+        const voice = voiceSessionController.getSnapshot();
+        if (
+          voice.sessionId === sessionId &&
+          voice.transport === "connected" &&
+          voice.sessionIdRemote
+        ) {
+          if (voiceSessionController.sendText(trimmedText)) {
+            setPendingFiles([]);
+            setComposerText("");
+            setLongPaste(null);
+            setGenerationMode("text");
+            return true;
+          }
+          toast.message("语音通道尚未就绪，请稍后重试，或退出语音模式后再发送。");
+          return false;
+        }
+      }
       if (generatingNow && trimmedText) {
         const queued: PendingSendItem = {
           id: `pending-send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -6665,6 +6547,7 @@ export function ChatCanvasPage() {
       sessionId,
       storedAudioAsrAvailable,
       uploadAndIndex,
+      voiceModeOpen,
     ],
   );
 
@@ -7139,7 +7022,29 @@ export function ChatCanvasPage() {
       pendingFileIds?: string[];
       pendingGraphAction?: GraphAction;
       learningNode?: LearningNodeContext;
+      targetMessageId?: string;
     } | null;
+    const targetMessageId = routeState?.targetMessageId;
+    if (targetMessageId && history.isSuccess) {
+      let attempts = 0;
+      const timer = window.setInterval(() => {
+        const target = document.getElementById(`conversation-jump-${targetMessageId}`);
+        if (target) {
+          target.scrollIntoView({ behavior: "smooth", block: "center" });
+          target.classList.add("ring-2", "ring-primary", "ring-offset-2");
+          window.setTimeout(() => target.classList.remove("ring-2", "ring-primary", "ring-offset-2"), 1800);
+          window.clearInterval(timer);
+          navigate(location.pathname, { replace: true });
+        } else if (historyHasMoreBefore && attempts < 30) {
+          void loadOlderMessages();
+          attempts += 1;
+        } else if (++attempts >= 12) {
+          window.clearInterval(timer);
+          navigate(location.pathname, { replace: true });
+        }
+      }, 120);
+      return () => window.clearInterval(timer);
+    }
     if (routeState?.learningNode?.graphId) {
       learningNodeRef.current = routeState.learningNode;
       setLearningNode(routeState.learningNode);
@@ -7166,6 +7071,9 @@ export function ChatCanvasPage() {
     location.state,
     navigate,
     send,
+    history.isSuccess,
+    historyHasMoreBefore,
+    loadOlderMessages,
   ]);
 
   useEffect(() => {
@@ -7999,7 +7907,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       let messageVersionId = "";
       const seenEventIds = new Set<string>();
       let lastEventSeq = 0;
-      const frameQueue = createAnimationFrameQueue<Record<string, unknown>>(
+      const frameQueue = createStreamRenderQueue(
         (updates) =>
           setLocalMessages((current) =>
             current.map((message) =>
@@ -8008,11 +7916,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 : message,
             ),
           ),
-        {
-          minIntervalMs: isViewingRetry()
-            ? streamRenderMinIntervalMs(retryMessage.parts)
-            : streamRenderMinIntervalMs(retryMessage.parts) * 2,
-        },
+        { isViewing: isViewingRetry },
       );
       const consumeRetryEvent = (data: Record<string, unknown>) => {
         const eventId =
@@ -8038,7 +7942,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           setSessionStreamMessageId(sourceSessionId, data.message_id);
         }
         const type = streamEventType(data);
-        if (type === "message.completed") completed = true;
+        if (type === "message.completed" || type === "message.interrupted") completed = true;
         if (type === "message.failed")
           terminalFailure = "重试版本生成失败，失败记录已保留。";
         if (type === "message.cancelled") terminalFailure = "生成已取消。";
@@ -8412,13 +8316,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   ]);
   const toggleAgentMode = useCallback(() => {
     if (responseMode === "agentic") {
-      setResponseMode(supportsThinkingMode ? "thinking" : "fast");
+      setResponseMode("fast");
       focusComposer();
       return;
     }
     enableAgentMode();
     focusComposer();
-  }, [enableAgentMode, focusComposer, responseMode, supportsThinkingMode]);
+  }, [enableAgentMode, focusComposer, responseMode]);
   const toggleImageMode = useCallback(() => {
     setGenerationMode((current) => (current === "image" ? "text" : "image"));
     setGraphAction("none");
@@ -8860,13 +8764,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
 
   return (
     <div className="chat-canvas-page relative flex h-full min-h-0 flex-col bg-background">
-      {voiceModeOpen ? (
-        <VoiceModeDialog
-          workspaceId={workspaceId}
-          sessionId={sessionId}
-          onClose={() => setVoiceModeOpen(false)}
-        />
-      ) : null}
       <ConversationJumpNav
         branches={conversationBranchLinks}
         items={conversationJumpItems}
@@ -9575,11 +9472,17 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             })}
           </div>
         ) : null}
+        {/* 语音球定位：悬在工作台功能条（资料/目标/联网/…）上方，
+            而不是挤在功能条与输入框之间的那道窄缝里。 */}
+        {voiceModeOpen ? (
+          <VoiceOrbDock
+            modelId={selectedModelId}
+            providerId={activeModelProvider?.id}
+            sessionId={sessionId}
+            workspaceId={workspaceId}
+          />
+        ) : null}
         <ConversationQuickActions
-          agentActive={responseMode === "agentic"}
-          agentDisabled={
-            sessionIsClosed || goalFlow.busy || !supportsAgentMode
-          }
           attachDisabled={sessionIsClosed || goalFlow.busy}
           onPhoto={handleNativePhoto}
           deepResearchDisabled={
@@ -9606,7 +9509,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             !activeImageProvider ||
             !selectedImageModel
           }
-          onAgent={toggleAgentMode}
           onAttach={openAttachmentPicker}
           onDeepResearch={startDeepResearch}
           onGoal={toggleGoalMode}
@@ -9940,26 +9842,21 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               />
             ) : null}
              {(() => {
-               const modelTriggerDisabled =
-                 !activeGenerationProvider ||
-                 sessionIsClosed ||
-                 closeSessionMutation.isPending ||
-                 goalFlow.busy ||
-                 status !== "ready";
                const modelTriggerAriaLabel =
                  generationMode === "image"
                    ? "选择绘图模型"
                    : "选择响应模式、思考力度和模型";
-               const modelTriggerLabel =
+               // Collapsed the pill shows the current value (极速 / 低 / 中 / 高 /
+               // 极高, or 绘图 for image mode) and switches to the section title
+               // 思考强度 while the menu is open, matching the ChatGPT reference.
+               const modelTriggerChipLabel =
                  generationMode === "image"
-                   ? `绘图 · ${selectedImageModel?.id ?? "未选择"}`
-                   : `${responseModeLabel} · ${
-                       activeModelProvider?.display_name ??
-                       (providers.isPending ? "加载中" : "模型")
-                     } / ${
-                       selectedModel?.id ??
-                       (discoveredModels?.isPending ? "加载中" : "未选择")
-                     }`;
+                   ? "绘图"
+                   : responseMode === "fast"
+                     ? "极速"
+                     : thinkingLabels[thinkingMode];
+               const modelTriggerOpenLabel =
+                 generationMode === "image" ? "绘图模型" : "思考强度";
                // Phone top bar is tight: show only the two-character mode word
                // (极速/思考/智能, or 绘图 for image mode) instead of the full
                // label + arrow.
@@ -10045,7 +9942,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                );
                const modelMenu = (
              <DropdownMenu
+               open={modelMenuOpen}
                onOpenChange={(open) => {
+                 setModelMenuOpen(open);
                  if (!open) setModelSearch("");
                }}
              >
@@ -10067,11 +9966,19 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     className="chat-composer__mode"
                     disabled={modelTriggerDisabled}
                     tooltip={
-                      generationMode === "image" ? "绘图模型" : "响应模式与模型"
+                      generationMode === "image"
+                        ? "绘图模型"
+                        : {
+                            content: "响应模式与模型",
+                            shortcut: "Ctrl + Shift + M",
+                            side: "top",
+                          }
                     }
                   >
-                    <span>{modelTriggerLabel}</span>
-                    <ChevronDown className="size-3.5" />
+                    <span>
+                      {modelMenuOpen ? modelTriggerOpenLabel : modelTriggerChipLabel}
+                    </span>
+                    <ChevronDown aria-hidden="true" className="size-4" />
                   </PromptInputButton>
                 )}
               </DropdownMenuTrigger>
@@ -10169,31 +10076,38 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                  ? createPortal(modelMenu, topbarModelSlot)
                  : modelMenu;
              })()}
-              <PromptInputButton
+              {!voiceModeOpen ? <PromptInputButton
                 aria-label={isListening ? "停止语音输入" : "开始语音输入"}
-              aria-pressed={isListening}
-              className="chat-composer__microphone"
-              disabled={
-                !activeGenerationProvider ||
-                sessionIsClosed ||
-                closeSessionMutation.isPending ||
-                goalFlow.busy
-              }
-              onClick={toggleDictation}
-              tooltip={isListening ? "停止语音输入" : "语音输入"}
-            >
-                <Mic className="size-4" />
-              </PromptInputButton>
-              <PromptInputButton
-                aria-label="打开语音导师"
-                className="chat-composer__voice-mode"
-                disabled={sessionIsClosed || closeSessionMutation.isPending || goalFlow.busy}
-                onClick={() => setVoiceModeOpen(true)}
-                tooltip="语音导师"
+                aria-pressed={isListening}
+                className="chat-composer__microphone"
+                disabled={
+                  !activeGenerationProvider ||
+                  sessionIsClosed ||
+                  closeSessionMutation.isPending ||
+                  goalFlow.busy
+                }
+                onClick={toggleDictation}
+                tooltip={isListening ? "停止语音输入" : "语音输入"}
               >
-                <AudioWaveform className="size-4" />
-              </PromptInputButton>
-            <PromptInputSubmit
+                <Mic className="size-4" />
+              </PromptInputButton> : <VoiceComposerActions
+                  modelId={selectedModelId}
+                  providerId={activeModelProvider?.id}
+                  sessionId={sessionId}
+                  workspaceId={workspaceId}
+                />}
+            {composerText.trim() === "" ? (
+              <VoiceCallControl
+                active={voiceModeOpen}
+                modelId={selectedModelId}
+                onExit={() => setVoiceModeOpen(false)}
+                onStart={() => setVoiceModeOpen(true)}
+                providerId={activeModelProvider?.id}
+                sessionId={sessionId}
+                workspaceId={workspaceId}
+              />
+            ) : <>
+              <PromptInputSubmit
               aria-label={
                 queueOnClick
                   ? "发送消息（加入队列）"
@@ -10233,7 +10147,19 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               ) : (
                 <ArrowUp className="size-4" />
               )}
-            </PromptInputSubmit>
+              </PromptInputSubmit>
+              {voiceModeOpen ? (
+                <VoiceCallControl
+                  active
+                  modelId={selectedModelId}
+                  onExit={() => setVoiceModeOpen(false)}
+                  onStart={() => setVoiceModeOpen(true)}
+                  providerId={activeModelProvider?.id}
+                  sessionId={sessionId}
+                  workspaceId={workspaceId}
+                />
+              ) : null}
+            </>}
           </InputGroupAddon>
          </PromptInput>
         </div>
@@ -10362,12 +10288,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   <SelectContent>
                     <SelectItem value="fast">极速</SelectItem>
                     <SelectItem
-                      disabled={!retryThinkingModes.length}
-                      value="thinking"
-                    >
-                      思考
-                    </SelectItem>
-                    <SelectItem
                       disabled={!retrySupportsAgentMode}
                       value="agentic"
                     >
@@ -10461,8 +10381,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 !retryTarget ||
                 !retryProvider ||
                 !retrySelectedModel?.remote ||
-                (retryResponseMode === "thinking" &&
-                  !retryThinkingModes.includes(retryThinkingMode)) ||
                 (retryResponseMode === "agentic" && !retrySupportsAgentMode)
               }
               onClick={submitRetry}

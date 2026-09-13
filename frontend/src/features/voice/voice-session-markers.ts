@@ -1,5 +1,20 @@
 const ACTIVE_STORAGE_KEY = "learngraph.voice.active-sessions.v1";
 
+/**
+ * A reload ends the call: the peer connection, the local mic track and the
+ * server-side voice session all go away, so any marker persisted by the previous
+ * page load is stale and would leave a phantom "在通话中" badge in the sidebar.
+ * The store is therefore emptied once per page load, before anything renders.
+ */
+function clearStaleVoiceSessionMarkers() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(ACTIVE_STORAGE_KEY);
+  } catch { /* storage is optional */ }
+}
+
+clearStaleVoiceSessionMarkers();
+
 export function setVoiceSessionActive(workspaceId: string, sessionId: string, active: boolean) {
   if (!workspaceId || !sessionId || typeof window === "undefined") return;
   try {
