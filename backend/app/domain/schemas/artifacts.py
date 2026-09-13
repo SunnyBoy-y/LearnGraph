@@ -116,6 +116,15 @@ class ArtifactCardShareTokenCreated(ArtifactCardShareTokenView):
     token: str
 
 
+class ArtifactCardShareManagementView(ArtifactCardShareTokenView):
+    """Workspace-wide share row enriched for the share management page."""
+
+    card_id: str
+    card_title: str
+    card_version: int
+    card_type: str
+
+
 class ArtifactSummaryView(ArtifactView):
     version_count: int = 0
 

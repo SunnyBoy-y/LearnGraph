@@ -3,6 +3,7 @@ import type {
   ArtifactCard,
   ArtifactCardPreview,
   ArtifactCardShareToken,
+  ArtifactCardShareManagement,
   ArtifactCardShareTokenCreated,
   ArtifactCardVersion,
   ArtifactShareToken,
@@ -112,6 +113,10 @@ export function listArtifactCardShareTokens(
   return apiClient.get<ArtifactCardShareToken[]>(
     `/artifacts/cards/versions/${encodeURIComponent(versionId)}/share-tokens`,
   );
+}
+
+export function listAllArtifactCardShares(): Promise<ArtifactCardShareManagement[]> {
+  return apiClient.get<ArtifactCardShareManagement[]>("/artifacts/cards/share-tokens");
 }
 
 export function createArtifactCardShareToken(

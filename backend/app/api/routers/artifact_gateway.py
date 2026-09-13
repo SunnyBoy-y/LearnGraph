@@ -14,6 +14,7 @@ from app.domain.schemas.artifacts import (
     ArtifactCardPublish,
     ArtifactCardShareTokenCreate,
     ArtifactCardShareTokenCreated,
+    ArtifactCardShareManagementView,
     ArtifactCardShareTokenView,
     ArtifactCardVersionView,
     ArtifactCardView,
@@ -163,6 +164,24 @@ def publish_artifact_card_version(
         publish_source="user",
     )
     return ArtifactCardVersionView.model_validate(version)
+
+
+@router.get(
+    "/artifacts/cards/share-tokens",
+    response_model=list[ArtifactCardShareManagementView],
+)
+def list_all_artifact_card_share_tokens(
+    db: DB,
+    context: CurrentWorkspace,
+) -> list[ArtifactCardShareManagementView]:
+    """List all published card shares for the workspace management view."""
+    context.require_permission("workspace.read")
+    from app.services.artifact_cards import ArtifactCardService
+
+    rows = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).list_all_share_tokens()
+    return [ArtifactCardShareManagementView.model_validate(row) for row in rows]
 
 
 @router.get(

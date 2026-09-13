@@ -100,3 +100,10 @@ export interface ArtifactCardShareToken {
 export interface ArtifactCardShareTokenCreated extends ArtifactCardShareToken {
   token: string;
 }
+
+export interface ArtifactCardShareManagement extends ArtifactCardShareToken {
+  card_id: string;
+  card_title: string;
+  card_version: number;
+  card_type: string;
+}

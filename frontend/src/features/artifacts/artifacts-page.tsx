@@ -23,10 +23,12 @@ import {
   deleteArtifact,
   deleteArtifactVersion,
   listArtifactShareTokens,
+  listAllArtifactCardShares,
   listArtifactVersions,
   listArtifacts,
   publishArtifactVersion,
   revokeArtifactShareToken,
+  revokeArtifactCardShareToken,
   updateArtifact,
   updateArtifactVersion,
 } from "@/api/artifacts";
@@ -77,6 +79,7 @@ import type {
   ArtifactShareTokenCreated,
   ArtifactSummary,
   ArtifactVersion,
+  ArtifactCardShareManagement,
 } from "@/types/artifacts";
 
 function formatBytes(bytes: number): string {
@@ -197,7 +200,7 @@ export function ArtifactsPage() {
   });
 
   return (
-    <PageFrame>
+    <PageFrame className="artifacts-page-flush max-w-[1720px]">
       <PageIntro
         description="会话中生成的交互 HTML 卡片自动聚合为草稿，可预览、跳转会话与删除；文件产物支持发布不可变版本与分享链接。"
         eyebrow="Artifacts"
@@ -208,6 +211,7 @@ export function ArtifactsPage() {
         <TabsList>
           <TabsTrigger value="cards">会话卡片</TabsTrigger>
           <TabsTrigger value="files">文件产物</TabsTrigger>
+          <TabsTrigger value="shared">已分享页面</TabsTrigger>
         </TabsList>
 
         <TabsContent className="mt-3" value="cards">
@@ -356,8 +360,58 @@ export function ArtifactsPage() {
         />
       ) : null}
         </TabsContent>
+        <TabsContent className="mt-3" value="shared">
+          <SharedCardPagesPanel workspaceId={workspaceId} />
+        </TabsContent>
       </Tabs>
     </PageFrame>
+  );
+}
+
+function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
+  const queryClient = useQueryClient();
+  const shares = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", "all"),
+    queryFn: listAllArtifactCardShares,
+  });
+  const revoke = useMutation({
+    mutationFn: revokeArtifactCardShareToken,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens"),
+      });
+      toast.success("分享已撤销");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+  return (
+    <Surface className="p-5">
+      <SectionHeading
+        description="集中查看所有已发布卡片的分享状态。撤销后链接立即失效；这里只显示令牌前缀。"
+        title="已分享页面"
+      />
+      {shares.isPending ? <Skeleton className="mt-4 h-24 w-full" /> : null}
+      {shares.isError ? <p className="mt-4 text-sm text-destructive">{shares.error.message}</p> : null}
+      {shares.isSuccess && !shares.data.length ? (
+        <p className="mt-4 rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">还没有分享页面</p>
+      ) : (
+        <div className="mt-4 grid gap-3">
+          {shares.data?.map((share: ArtifactCardShareManagement) => (
+            <div className="flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center" key={share.id}>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-medium">{share.card_title}</p>
+                <p className="mt-1 text-xs text-muted-foreground">v{share.card_version} · {share.card_type} · {share.label || "未命名分享"}</p>
+                <p className="mt-1 font-mono text-[11px] text-muted-foreground">令牌 {share.token_prefix}… · 查看 {share.view_count}{share.max_views ? ` / ${share.max_views}` : ""}</p>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                {share.revoked_at ? <Badge variant="secondary">已撤销</Badge> : share.expires_at && new Date(share.expires_at).getTime() <= Date.now() ? <Badge variant="secondary">已到期</Badge> : share.max_views && share.view_count >= share.max_views ? <Badge variant="secondary">次数已用完</Badge> : <Badge variant="outline">有效</Badge>}
+                {!share.revoked_at ? <Button disabled={revoke.isPending} onClick={() => revoke.mutate(share.id)} size="sm" variant="outline">撤销分享</Button> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Surface>
   );
 }
 

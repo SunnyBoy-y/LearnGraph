@@ -28,7 +28,6 @@ import {
   publishArtifactCardVersion,
   revokeArtifactCardShareToken,
 } from "@/api/artifacts";
-import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
 import { TrustedComponentRenderer } from "@/components/chat/trusted-component-renderer";
 import { SectionHeading, Surface } from "@/components/shared/page-elements";
@@ -114,7 +113,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   const params = useMemo(
     () => ({
       status: statusFilter === "all" ? undefined : statusFilter,
-      card_type: typeFilter === "all" ? undefined : typeFilter,
+      card_type: typeFilter === "magic_card" || typeFilter === "component" ? typeFilter : undefined,
       interactive:
         typeFilter === "interactive" ? true : typeFilter === "static" ? false : undefined,
       sort: sortOrder,
@@ -144,7 +143,9 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
 
   const openSession = (card: ArtifactCard) => {
     if (card.chat_session_id) {
-      navigate(`/w/${workspaceId}/chat/${card.chat_session_id}`);
+      navigate(`/w/${workspaceId}/chat/${card.chat_session_id}`, {
+        state: card.message_id ? { targetMessageId: card.message_id } : undefined,
+      });
     } else {
       toast.error("该卡片未关联会话");
     }
@@ -228,14 +229,15 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
 
       <Surface className="p-5">
         <SectionHeading
-          description="会话中生成的交互 HTML 页面自动聚合为草稿；发布后生成不可变版本，可切换查看与分享。"
+          description="卡片内容直接显示在下方，可操作或放大查看；通过“版本与分享”发布草稿、切换版本和分享。"
           title="会话卡片"
         />
         {cards.isPending ? (
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            <Skeleton className="h-40 w-full" />
-            <Skeleton className="h-40 w-full" />
-            <Skeleton className="h-40 w-full" />
+          <div className="artifact-card-grid mt-4">
+            <Skeleton className="h-[480px] w-full" />
+            <Skeleton className="h-[480px] w-full" />
+            <Skeleton className="h-[480px] w-full" />
+            <Skeleton className="h-[480px] w-full" />
           </div>
         ) : cards.isError ? (
           <p className="mt-4 text-sm text-destructive">
@@ -250,17 +252,15 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
             </p>
           </div>
         ) : (
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <div className="artifact-card-grid mt-4">
             {cards.data?.slice(0, visibleCount).map((card) => (
-              <div
-                className="group flex flex-col rounded-xl border bg-background p-3 transition-colors hover:border-primary/40"
+              <article
+                aria-label={card.title}
+                className="flex min-w-0 flex-col rounded-xl border bg-background p-3"
                 key={card.id}
+                style={{ contentVisibility: "auto", containIntrinsicSize: "520px" }}
               >
-                <button
-                  className="flex min-w-0 flex-1 flex-col items-start gap-2 text-left"
-                  onClick={() => setPreviewCard(card)}
-                  type="button"
-                >
+                <div className="flex min-w-0 flex-col items-start gap-2">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <CardTypeBadge card={card} />
                     <StatusBadge card={card} />
@@ -268,11 +268,12 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                       <Badge variant="destructive">有未发布更新</Badge>
                     ) : null}
                   </div>
-                  <span className="line-clamp-2 text-sm font-semibold">{card.title}</span>
+                  <h3 className="line-clamp-2 text-sm font-semibold">{card.title}</h3>
                   <span className="text-xs text-muted-foreground">
                     更新于 {formatDate(card.updated_at)}
                   </span>
-                </button>
+                </div>
+                <CardInlinePreview card={card} workspaceId={workspaceId} />
                 <div className="mt-3 flex items-center gap-1 border-t pt-2">
                   <Button
                     disabled={!card.chat_session_id}
@@ -286,15 +287,16 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                     会话
                   </Button>
                   <Button
+                    aria-label={`版本与分享 ${card.title}`}
                     className="ml-auto"
                     onClick={() => setPreviewCard(card)}
                     size="sm"
-                    title="预览 / 版本 / 分享"
+                    title="管理版本与分享"
                     type="button"
                     variant="ghost"
                   >
                     <Link2 className="size-4" />
-                    预览
+                    版本与分享
                   </Button>
                   <Button
                     aria-label={`删除 ${card.title}`}
@@ -307,7 +309,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                     <Trash2 className="size-4 text-destructive" />
                   </Button>
                 </div>
-              </div>
+              </article>
             ))}
             {cards.data && visibleCount < cards.data.length ? (
               <div
@@ -323,6 +325,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
 
       <CardPreviewDialog
         card={previewCard}
+        key={previewCard?.card_id ?? "none"}
         onClose={() => setPreviewCard(null)}
         workspaceId={workspaceId}
         onChanged={invalidateCards}
@@ -358,6 +361,54 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+function CardInlinePreview({ card, workspaceId }: { card: ArtifactCard; workspaceId: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+
+  // Keep only nearby previews running so long libraries do not start dozens
+  // of iframe runtimes at once. React Query retains the fetched snapshots.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => setVisible(entry.isIntersecting),
+      { rootMargin: "480px" },
+    );
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  const preview = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "cards", card.card_id, "preview", "draft", card.updated_at),
+    queryFn: () => getArtifactCardPreview(card.card_id),
+    enabled: visible,
+    staleTime: 60_000,
+  });
+
+  return (
+    <div className="mt-3 min-h-80 min-w-0 rounded-lg bg-muted/20" ref={containerRef}>
+      {!visible || preview.isPending ? (
+        <Skeleton aria-label={`正在加载 ${card.title} 的预览`} className="h-80 w-full" />
+      ) : preview.isError ? (
+        <div className="flex h-80 flex-col items-center justify-center gap-3 p-4 text-center">
+          <p className="text-sm text-destructive">{preview.error.message || "加载预览失败"}</p>
+          <Button onClick={() => void preview.refetch()} size="sm" type="button" variant="outline">重新加载预览</Button>
+        </div>
+      ) : card.card_type === "component" ? (
+        <div className="max-h-[420px] overflow-auto rounded-lg border bg-background p-4">
+          <TrustedComponentRenderer data={preview.data.preview_snapshot} fallbackId={card.card_id} interactive={false} />
+        </div>
+      ) : (
+        <MagicCardHost key={card.updated_at} data={preview.data.preview_snapshot} />
+      )}
+    </div>
+  );
+}
+
 function CardPreviewDialog({
   card,
   onClose,
@@ -371,7 +422,11 @@ function CardPreviewDialog({
 }) {
   const navigate = useNavigate();
   // "draft" shows the live draft; a number shows a frozen published snapshot.
-  const [selectedVersion, setSelectedVersion] = useState<number | "draft">("draft");
+  // Version/share management opens on the latest immutable release. Drafts are
+  // still available explicitly in the selector and remain separate from publish.
+  const [selectedVersion, setSelectedVersion] = useState<number | "draft">(
+    card?.latest_version && card.latest_version > 0 ? card.latest_version : "draft",
+  );
   const [publishOpen, setPublishOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
 
@@ -381,6 +436,20 @@ function CardPreviewDialog({
     enabled: Boolean(card),
   });
 
+  useEffect(() => {
+    if (!card) return;
+    const latest = versions.data?.reduce<number | null>(
+      (max, version) =>
+        version.status !== "active"
+          ? max
+          : max === null || version.version > max
+            ? version.version
+            : max,
+      null,
+    ) ?? (card.latest_version > 0 ? card.latest_version : null);
+    setSelectedVersion(latest ?? "draft");
+  }, [card, versions.data]);
+
   const preview = useQuery({
     queryKey: workspaceQueryKey(
       workspaceId,
@@ -388,6 +457,7 @@ function CardPreviewDialog({
       card?.card_id ?? "__none__",
       "preview",
       selectedVersion,
+      card?.updated_at,
     ),
     queryFn: () =>
       getArtifactCardPreview(card!.card_id, {
@@ -449,7 +519,8 @@ function CardPreviewDialog({
             <History className="size-4" />
             {title}
           </DialogTitle>
-          <DialogDescription className="flex flex-wrap items-center gap-3">
+          <DialogDescription>查看草稿与已发布版本，管理发布和分享。</DialogDescription>
+          <div className="flex flex-wrap items-center gap-3">
             <Select
               onValueChange={(value) =>
                 setSelectedVersion(value === "draft" ? "draft" : Number(value))
@@ -473,7 +544,7 @@ function CardPreviewDialog({
             <span className="text-xs">
               {isComponent ? "声明式组件 · 只读预览" : "交互页面 · 沙箱预览"}
             </span>
-          </DialogDescription>
+          </div>
         </DialogHeader>
 
         {preview.isPending ? (
@@ -491,9 +562,7 @@ function CardPreviewDialog({
             />
           </div>
         ) : (
-          <FullscreenPreview label={title}>
-            <MagicCardHost data={snapshot} />
-          </FullscreenPreview>
+          <MagicCardHost key={`${card?.card_id}-${selectedVersion}`} data={snapshot} />
         )}
 
         <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3">
@@ -522,7 +591,13 @@ function CardPreviewDialog({
             </Button>
             {card?.chat_session_id ? (
               <Button
-                onClick={() => navigate(`/w/${workspaceId}/chat/${card.chat_session_id}`)}
+                onClick={() =>
+                  navigate(`/w/${workspaceId}/chat/${card.chat_session_id}`, {
+                    state: card.message_id
+                      ? { targetMessageId: card.message_id }
+                      : undefined,
+                  })
+                }
                 size="sm"
                 type="button"
               >

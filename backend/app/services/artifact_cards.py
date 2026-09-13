@@ -10,6 +10,7 @@ into :class:`ArtifactCardVersion` and flips the card to ``published``.
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from copy import deepcopy
 from datetime import datetime
@@ -72,6 +73,16 @@ def _is_interactive(part_type: str, data: dict[str, Any]) -> bool:
     return False
 
 
+def _snapshot_fingerprint(snapshot: dict[str, Any]) -> str:
+    """Hash render-affecting data while ignoring transport instance metadata."""
+    normalized = deepcopy(snapshot)
+    for key in ("card_instance_id", "message_version_id", "chat_session_id"):
+        normalized.pop(key, None)
+    return hashlib.sha256(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 class ArtifactCardIndexer:
     """Upserts card rows from completed MessageParts at emit time."""
 
@@ -122,8 +133,32 @@ class ArtifactCardIndexer:
             existing.message_id = message_id or existing.message_id
             existing.message_version_id = message_version_id or existing.message_version_id
             existing.part_id = part_id or existing.part_id
+            changed = _snapshot_fingerprint(existing.preview_snapshot or {}) != _snapshot_fingerprint(snapshot)
             existing.preview_snapshot = snapshot
             db.flush()
+            if changed:
+                # A substantive AI edit reserves the next revision immediately.
+                # It stays a draft until the user/agent publishes that revision.
+                latest_revision = db.scalar(
+                    select(ArtifactCardVersion)
+                    .where(ArtifactCardVersion.card_id == existing.id)
+                    .order_by(ArtifactCardVersion.version.desc())
+                )
+                if latest_revision is None or _snapshot_fingerprint(latest_revision.preview_snapshot or {}) != _snapshot_fingerprint(snapshot):
+                    db.add(
+                        ArtifactCardVersion(
+                            tenant_id=tenant_id,
+                            workspace_id=workspace_id,
+                            card_id=existing.id,
+                            version=(latest_revision.version if latest_revision else 0) + 1,
+                            preview_snapshot=deepcopy(snapshot),
+                            release_notes="",
+                            published_by="agent",
+                            publish_source="agent",
+                            status="draft",
+                        )
+                    )
+                    db.flush()
             db.refresh(existing)
             return existing
 
@@ -143,6 +178,22 @@ class ArtifactCardIndexer:
             preview_snapshot=snapshot,
         )
         db.add(row)
+        db.flush()
+        # Reserve v1 at creation time; publishing changes this revision's state
+        # instead of creating a second version number.
+        db.add(
+            ArtifactCardVersion(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                card_id=row.id,
+                version=1,
+                preview_snapshot=deepcopy(snapshot),
+                release_notes="",
+                published_by="agent",
+                publish_source="agent",
+                status="draft",
+            )
+        )
         db.flush()
         db.refresh(row)
         return row
@@ -208,6 +259,15 @@ class ArtifactCardService:
             )
             .group_by(ArtifactCardVersion.card_id)
         ).all()
+        draft_rows = self.db.execute(
+            select(ArtifactCardVersion.card_id, func.count(ArtifactCardVersion.id))
+            .where(
+                ArtifactCardVersion.card_id.in_(card_ids),
+                ArtifactCardVersion.status == "draft",
+            )
+            .group_by(ArtifactCardVersion.card_id)
+        ).all()
+        draft_counts = {card_id: int(count or 0) for card_id, count in draft_rows}
         stats: dict[str, dict[str, Any]] = {}
         for card_id, count, max_version, latest_created in version_rows:
             stats[card_id] = {
@@ -229,8 +289,13 @@ class ArtifactCardService:
                     "latest_version": card_stats["latest_version"],
                     "draft_dirty": bool(
                         card.status == CARD_STATUS_PUBLISHED
-                        and card_stats["latest_version_at"] is not None
-                        and card.updated_at > card_stats["latest_version_at"]
+                        and (
+                            draft_counts.get(card.id, 0) > 0
+                            or (
+                                card_stats["latest_version_at"] is not None
+                                and card.updated_at > card_stats["latest_version_at"]
+                            )
+                        )
                     ),
                 }
             )
@@ -271,29 +336,45 @@ class ArtifactCardService:
         actor_id: str = "user",
         publish_source: str = "user",
     ) -> ArtifactCardVersion:
-        """Freeze the card's current draft snapshot as the next immutable version."""
+        """Publish the latest AI-created draft revision as an immutable version."""
         if publish_source not in {"user", "agent"}:
             publish_source = "user"
         row = self._card_for_workspace(card_id)
         if row.status == CARD_STATUS_DELETED:
             raise AppError(404, "artifact_card_not_found", "Artifact card was not found")
-        current = self.db.scalar(
-            select(func.max(ArtifactCardVersion.version)).where(
+        # Publishing promotes the latest AI-created draft revision. This keeps
+        # version identity independent from the publish action.
+        version = self.db.scalar(
+            select(ArtifactCardVersion)
+            .where(
                 ArtifactCardVersion.card_id == row.id,
-                ArtifactCardVersion.status == "active",
+                ArtifactCardVersion.status == "draft",
             )
+            .order_by(ArtifactCardVersion.version.desc())
         )
-        version = ArtifactCardVersion(
-            tenant_id=self.tenant_id,
-            workspace_id=self.workspace_id,
-            card_id=row.id,
-            version=(current or 0) + 1,
-            preview_snapshot=deepcopy(row.preview_snapshot or {}),
-            release_notes=(release_notes or "")[:4000],
-            published_by=actor_id,
-            publish_source=publish_source,
-        )
-        self.db.add(version)
+        if version is None:
+            current = self.db.scalar(
+                select(func.max(ArtifactCardVersion.version)).where(
+                    ArtifactCardVersion.card_id == row.id,
+                    ArtifactCardVersion.status != "deleted",
+                )
+            )
+            version = ArtifactCardVersion(
+                tenant_id=self.tenant_id,
+                workspace_id=self.workspace_id,
+                card_id=row.id,
+                version=(current or 0) + 1,
+                preview_snapshot=deepcopy(row.preview_snapshot or {}),
+                release_notes=(release_notes or "")[:4000],
+                published_by=actor_id,
+                publish_source=publish_source,
+            )
+            self.db.add(version)
+        else:
+            version.status = "active"
+            version.release_notes = (release_notes or "")[:4000]
+            version.published_by = actor_id
+            version.publish_source = publish_source
         if row.status == CARD_STATUS_DRAFT:
             row.status = CARD_STATUS_PUBLISHED
         self.db.commit()
@@ -366,6 +447,30 @@ class ArtifactCardService:
                 .order_by(ArtifactCardShareToken.created_at.desc())
             )
         )
+
+    def list_all_share_tokens(self) -> list[dict[str, Any]]:
+        """Return every share in this workspace with card/version context."""
+        rows = self.db.execute(
+            select(ArtifactCardShareToken, ArtifactCardVersion, ArtifactCard)
+            .join(ArtifactCardVersion, ArtifactCardVersion.id == ArtifactCardShareToken.artifact_card_version_id)
+            .join(ArtifactCard, ArtifactCard.id == ArtifactCardVersion.card_id)
+            .where(
+                ArtifactCardShareToken.workspace_id == self.workspace_id,
+                ArtifactCardShareToken.tenant_id == self.tenant_id,
+                ArtifactCard.status != CARD_STATUS_DELETED,
+            )
+            .order_by(ArtifactCardShareToken.created_at.desc())
+        ).all()
+        return [
+            {
+                **token.__dict__,
+                "card_id": card.card_id,
+                "card_title": card.title,
+                "card_version": version.version,
+                "card_type": card.card_type,
+            }
+            for token, version, card in rows
+        ]
 
     def revoke_share_token(self, token_id: str) -> ArtifactCardShareToken:
         token = self.db.scalar(
