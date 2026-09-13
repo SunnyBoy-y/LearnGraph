@@ -261,6 +261,9 @@ class Graph(Base, TimestampMixin, WorkspaceScopedMixin):
     status: Mapped[str] = mapped_column(String(40), default="candidate", index=True)
     revision: Mapped[int] = mapped_column(Integer, default=1)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # User or Agent selected cover. It may be an SVG data URL or a bounded
+    # image data URL; generated covers remain the fallback when this is empty.
+    cover_svg: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class GraphNode(Base, TimestampMixin, WorkspaceScopedMixin):

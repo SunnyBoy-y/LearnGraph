@@ -63,6 +63,7 @@ import {
   listGraphs,
   studyMultipleNodes,
   updateGraphNode,
+  updateGraphCover,
 } from "@/api";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { saveBlobViaNative } from "@/lib/native-download";
@@ -358,6 +359,64 @@ function toWorkbenchKnowledgeGraph(
   return { nodes, edges };
 }
 
+function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => void }) {
+  const { workspaceId = "" } = useParams();
+  const queryClient = useQueryClient();
+  const save = useMutation({
+    mutationFn: (payload: Parameters<typeof updateGraphCover>[1]) => updateGraphCover(book!.graphId!, payload),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graphs") });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graph", book?.graphId) });
+      toast.success("封面已更新");
+      onClose();
+    },
+    onError: (error) => toast.error(error.message),
+  });
+  function upload(file?: File) {
+    if (!file) return;
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type) || file.size > 2 * 1024 * 1024) {
+      toast.error("请选择不超过 2 MB 的 PNG、JPG、WebP 或 GIF 图片");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => save.mutate({ mode: "image", image_data_url: String(reader.result) });
+    reader.onerror = () => toast.error("图片读取失败，请重新选择");
+    reader.readAsDataURL(file);
+  }
+  return (
+    <Dialog open={Boolean(book)} onOpenChange={(open) => { if (!open && !save.isPending) onClose(); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>替换「{book?.title}」的封面</DialogTitle>
+          <DialogDescription>选择模板、上传图片，或根据图谱内容生成封面。</DialogDescription>
+        </DialogHeader>
+        {book ? <img className="aspect-[32/15] w-full rounded-lg object-cover" src={book.cover} onError={(event) => { event.currentTarget.src = generatedCover(book.title, book.masteryProgress); }} alt={`${book.title} 当前封面`} /> : null}
+        <div className="grid grid-cols-5 gap-2">
+          {([
+            { id: "ancient", label: "古风", color: "text-white", image: "/graph-covers/ancient.jpg" },
+            { id: "literature", label: "文学", color: "text-white", image: "/graph-covers/literature.jpg" },
+            { id: "history", label: "历史", color: "text-white", image: "/graph-covers/history.jpg" },
+            { id: "science", label: "理科", color: "text-white", image: "/graph-covers/science.jpg" },
+            { id: "chemistry", label: "化学", color: "text-white", image: "/graph-covers/chemistry.jpg" },
+          ] as const).map((template) => (
+              <Button key={template.id} className={`h-20 ${template.color} relative overflow-hidden border-0`} style={{ backgroundImage: `linear-gradient(180deg, transparent 20%, rgba(0,0,0,.65)), url(${template.image})`, backgroundSize: "cover", backgroundPosition: "center" }} disabled={save.isPending} variant="outline" onClick={() => save.mutate({ mode: "template", template: template.id })}>
+              {template.label}
+            </Button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button disabled={save.isPending} onClick={() => save.mutate({ mode: "generated" })}><Sparkles className="size-4" />{save.isPending ? "处理中…" : "生成封面"}</Button>
+          <label className="inline-flex cursor-pointer items-center rounded-lg border px-3 py-2 text-sm">
+            上传图片
+            <input className="sr-only" type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={save.isPending} onChange={(event) => { upload(event.target.files?.[0]); event.target.value = ""; }} />
+          </label>
+          <span className="text-xs text-muted-foreground">最大 2 MB</span>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function GraphBookshelf({
   books,
   selectedId,
@@ -376,6 +435,7 @@ function GraphBookshelf({
   onStartLearning: (book: ShelfBook) => void;
 }) {
   const [view, setView] = useState<"shelf" | "constellation">("shelf");
+  const [coverBook, setCoverBook] = useState<ShelfBook>();
   const [constellation, setConstellation] = useState({ scale: 1, x: 0, y: 0 });
   const selectedBook = books.find((book) => book.id === selectedId);
   const drag = useRef<{
@@ -464,6 +524,7 @@ function GraphBookshelf({
 
   return (
     <section className="graph-library" aria-label="图谱书架">
+      <GraphCoverEditor book={coverBook} onClose={() => setCoverBook(undefined)} />
       <header className="graph-library__header">
         <div>
           <h1>图谱书架</h1>
@@ -520,7 +581,7 @@ function GraphBookshelf({
                   onClick={() => onOpen(entry)}
                   type="button"
                   >
-                  <span className="graph-library__spine" style={{ backgroundImage: `url(${entry.cover})`, backgroundSize: "cover", backgroundPosition: "center" }}>
+                  <span className="graph-library__spine" style={{ backgroundImage: `url("${entry.cover}"), url("${generatedCover(entry.title, entry.masteryProgress)}")`, backgroundSize: "cover", backgroundPosition: "center" }}>
                     <Icon />
                     <span>{entry.title.slice(0, 1)}</span>
                   </span>
@@ -535,6 +596,11 @@ function GraphBookshelf({
                   </span>
                 </button>
                 <div className="graph-library__book-actions">
+                  {entry.graphId ? (
+                    <Button onClick={() => setCoverBook(entry)} size="xs" variant="outline">
+                      封面
+                    </Button>
+                  ) : null}
                   {entry.needsReview && entry.graphId ? (
                     <Button
                       onClick={() => onReview(entry)}

@@ -166,7 +166,7 @@ SYSTEM_CANVAS_SKILL_NAME = "Canvas 可信组件发布"
 SYSTEM_CANVAS_SKILL_VERSION = "1.0.0"
 SYSTEM_GOAL_ROUTE_SKILL_KEY = "goal-learning-route"
 SYSTEM_GOAL_ROUTE_SKILL_NAME = "目标学习路线编排"
-SYSTEM_GOAL_ROUTE_SKILL_VERSION = "2.0.1"
+SYSTEM_GOAL_ROUTE_SKILL_VERSION = "2.0.2"
 
 _CANVAS_FALLBACK_MD = (
     "---\n"
@@ -204,7 +204,9 @@ _GOAL_ROUTE_FALLBACK_MD = (
     "Extract known goal facts first, ask only for consequential missing "
     "information, use only tools actually provided for this turn, and never "
     "emit tool protocol text as the user-facing answer. Graph and roadmap "
-    "writes must remain reviewable proposals."
+    "writes must remain reviewable proposals. After graph confirmation, the "
+    "backend automatically generates an SVG cover following graph-cover; "
+    "cover failures use the default cover and must not block learning."
 )
 
 
@@ -286,6 +288,23 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "or lg_graph_propose_change (update)."
         ),
         grant_reason="official_skill_auto_enable",
+    ),
+    OfficialSkillSpec(
+        key="graph-cover",
+        display_name="图谱 SVG 封面",
+        version="1.0.0",
+        dir_name="graph_cover",
+        description=(
+            "Generate and manage graph covers: read graph context, choose a "
+            "generated/template/image cover, or persist safe static SVG; "
+            "refreshes use a default cover on failure."
+        ),
+        grant_reason="official_skill_auto_enable",
+        required_tools=(
+            "lg_graph_read",
+            "lg_graph_cover_read",
+            "lg_graph_cover_update",
+        ),
     ),
     OfficialSkillSpec(
         key="roadmap-planning",
@@ -850,6 +869,17 @@ def ensure_official_skill_package(
             manifest = dict(skill.manifest_json or {})
             manifest.update({**manifest_meta, "description": spec.description})
             skill.manifest_json = manifest
+
+    # Keep curated metadata current even when the shipped package body did not
+    # change. This matters when a new built-in tool is added to an already-
+    # installed official skill.
+    skill.required_tools = list(spec.required_tools)
+    if spec.required_permissions:
+        skill.required_permissions = list(spec.required_permissions)
+    skill.allowed_components = list(spec.allowed_components)
+    manifest = dict(skill.manifest_json or {})
+    manifest.update({**manifest_meta, "description": spec.description})
+    skill.manifest_json = manifest
 
     # Instruction-only official skill: durable always grant so prompt injection works.
     grants = ExtensionPermissionGrantRepository(db, workspace_id)

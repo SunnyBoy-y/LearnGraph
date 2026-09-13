@@ -44,6 +44,41 @@ class GraphSummary(ORMModel):
     cover_svg: str | None = None
 
 
+class GraphCoverUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["generated", "template", "image", "svg"]
+    template: Literal["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"] | None = None
+    image_data_url: str | None = Field(default=None, max_length=2_800_000)
+    svg: str | None = Field(default=None, max_length=48_000)
+
+    @model_validator(mode="after")
+    def require_cover_content(self):
+        if self.mode == "image" and not self.image_data_url:
+            raise ValueError("image_data_url is required for image mode")
+        if self.mode == "svg" and not self.svg:
+            raise ValueError("svg is required for svg mode")
+        if self.mode == "template" and not self.template:
+            raise ValueError("template is required for template mode")
+        return self
+
+
+class GraphCoverTemplate(BaseModel):
+    id: Literal["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"]
+    name: str
+    cover_svg: str
+
+
+class GraphCoverView(BaseModel):
+    graph_id: str
+    title: str
+    graph_revision: int
+    node_count: int
+    cover_svg: str
+    templates: list[GraphCoverTemplate]
+    used_default: bool = False
+
+
 class GraphView(GraphSummary):
     nodes: list[GraphNodeView]
     edges: list[GraphEdgeView]

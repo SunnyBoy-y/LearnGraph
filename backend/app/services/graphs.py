@@ -34,6 +34,7 @@ from app.repositories.domain import (
     GraphRepository,
 )
 from app.services.billing import BillingService
+from app.services.graph_cover import generate_graph_cover
 
 
 class GraphService:
@@ -117,12 +118,21 @@ class GraphService:
         graph = self.graphs.require(graph_id, "graph")
         if not self._can_access_graph(graph.id, "read"):
             raise AppError(404, "graph_not_found", "Graph was not found")
-        nodes = self.db.scalars(self.nodes.query().where(GraphNode.graph_id == graph.id)).all()
+        nodes = self.db.scalars(
+            self.nodes.query()
+            .where(GraphNode.graph_id == graph.id)
+            .order_by(GraphNode.id)
+        ).all()
         edges = self.db.scalars(self.edges.query().where(GraphEdge.graph_id == graph.id)).all()
         return GraphView.model_validate({
             **graph.__dict__,
             "nodes": nodes,
             "edges": edges,
+            "cover_svg": graph.cover_svg or generate_graph_cover(
+                graph.title,
+                node_labels=[node.label for node in nodes],
+                progress=sum(node.mastery_stars >= 3 for node in nodes) / len(nodes) if nodes else 0.0,
+            ),
         })
 
     def update_node(self, graph_id: str, node_id: str, payload: UpdateNodeRequest) -> GraphNode:

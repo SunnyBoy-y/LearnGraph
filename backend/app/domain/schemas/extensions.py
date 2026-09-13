@@ -35,6 +35,8 @@ MCPPermission = Literal[
 BuiltinSkillTool = Literal[
     "builtin.review.list_due",
     "builtin.graph.read",
+    "builtin.graph.cover.read",
+    "builtin.graph.cover.update",
     "builtin.graph.update_candidate_node",
     "builtin.roadmap.read",
     "builtin.roadmap.replan",

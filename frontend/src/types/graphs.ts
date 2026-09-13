@@ -36,6 +36,24 @@ export interface GraphSummary {
   cover_svg?: string | null
 }
 
+export type GraphCoverMode = 'generated' | 'template' | 'image' | 'svg'
+
+export interface GraphCoverTemplate {
+  id: 'ancient' | 'literature' | 'history' | 'science' | 'chemistry' | 'paper' | 'midnight' | 'sunrise'
+  name: string
+  cover_svg: string
+}
+
+export interface GraphCoverView {
+  graph_id: string
+  title: string
+  graph_revision: number
+  node_count: number
+  cover_svg: string
+  templates: GraphCoverTemplate[]
+  used_default: boolean
+}
+
 export interface Graph extends GraphSummary {
   nodes: GraphNode[]
   edges: GraphEdge[]

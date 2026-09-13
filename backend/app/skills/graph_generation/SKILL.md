@@ -35,6 +35,7 @@ metadata:
 7. 提交提案前先确认工具语义：会话 Goal **尚无图谱**时调用 `lg_graph_create`（新建，仅首次生成）；**已有候选/已发布图谱**时调用 `lg_graph_propose_change`（更新，`graph_id` 缺省取会话绑定图谱或 Goal 最新图谱）。每个节点/边都要给出简短 `rationale`。
 8. 若工具返回校验错误（如 `graph_proposal_duplicate_label` / `graph_proposal_orphaned_nodes` / `graph_proposal_hierarchy_invalid` / `graph_proposal_contains_cycle` / `graph_proposal_prerequisite_cycle`），根据错误修正后重试，**不要**向用户展示半成品审核卡或声称已写入。
 9. 局部修订单个候选节点时可用 `lg_graph_update_candidate_node`，不要为小改动重发整图提案。
+10. 图谱审核确认后，系统按 `graph-cover` 自动生成 SVG 封面，确认结果在 `result.cover_svg` 返回；列表/详情读取时根据当前图谱刷新。封面失败使用默认封面，不重提图谱、不阻断后续学习；无需向图谱工具传入 SVG 代码。
 
 ## 图谱生成模式与等待体验
 

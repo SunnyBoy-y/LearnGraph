@@ -80,12 +80,7 @@ def _memory_outbox_lease_generation(connection: Connection) -> None:
 
 
 def _record_ledger_baseline(connection: Connection) -> None:
-    """No-op: the v1.0.0 row this migration inserts is the ledger baseline.
-
-    Both fresh and migration-era databases end with this as the latest
-    revision, matching CURRENT_SCHEMA_REVISION in app.core.database, so the
-    startup revision check no longer warns on every boot.
-    """
+    """No-op: the v1.0.0 row this migration inserts is the ledger baseline."""
     del connection
 
 
@@ -247,6 +242,21 @@ def _sandbox_agent_tables(connection: Connection) -> None:
     SandboxAgentEvent.__table__.create(bind=connection, checkfirst=True)
 
 
+def _graph_cover_column(connection: Connection) -> None:
+    """Add the optional user/Agent-selected cover to existing graph tables.
+
+    ``Base.metadata.create_all`` handles fresh databases, while this additive
+    migration covers persisted SQLite, PostgreSQL, and MySQL installations.
+    ``TEXT`` is portable across the supported SQLAlchemy dialects.
+    """
+
+    graph_columns = {
+        column["name"] for column in inspect(connection).get_columns("graphs")
+    }
+    if "cover_svg" not in graph_columns:
+        connection.exec_driver_sql("ALTER TABLE graphs ADD COLUMN cover_svg TEXT")
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -290,6 +300,11 @@ MIGRATIONS = (
         "v1.5.0",
         "Durable sub-agent tasks and lifecycle events",
         _sandbox_agent_tables,
+    ),
+    SchemaMigration(
+        "v1.6.0",
+        "Add optional user-selected graph cover data",
+        _graph_cover_column,
     ),
 )
 

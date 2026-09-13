@@ -22,6 +22,7 @@ from app.domain.models import (
 from app.domain.schemas.graphs import ModelConversationGraphProposal
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import GraphChangeSetRepository
+from app.services.graph_cover import generate_graph_cover
 
 
 class GraphChangeSetService:
@@ -994,6 +995,22 @@ class GraphChangeSetService:
                 session.graph_id = graph.id
         if session.goal_id is None:
             session.goal_id = goal.id
+        # Cover generation is decoration after the reviewed graph is materialized.
+        # Its renderer falls back independently, so failure cannot undo confirmation.
+        cover_nodes = self.db.scalars(
+            select(GraphNode).where(
+                GraphNode.workspace_id == self.workspace_id,
+                GraphNode.graph_id == graph.id,
+            ).order_by(GraphNode.id)
+        ).all()
+        item.result = {
+            **item.result,
+            "cover_svg": generate_graph_cover(
+                graph.title,
+                node_labels=[node.label for node in cover_nodes],
+                progress=sum(node.mastery_stars >= 3 for node in cover_nodes) / len(cover_nodes) if cover_nodes else 0.0,
+            ),
+        }
         self._sync_component_snapshot(item)
         self.audit.record(
             actor_id=self.actor_id,

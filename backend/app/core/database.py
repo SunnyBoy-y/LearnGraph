@@ -783,10 +783,10 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 
 
 # Current schema revision identifier.  Bump this whenever an additive or
-# destructive migration is applied (via _apply_migration) so the startup
+# destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.5.0"
-CURRENT_SCHEMA_DESCRIPTION = "Durable sub-agent tasks and lifecycle events"
+CURRENT_SCHEMA_REVISION = "v1.6.0"
+CURRENT_SCHEMA_DESCRIPTION = "Add optional user-selected graph cover data"
 
 
 def _compute_schema_checksum() -> str:
@@ -1385,6 +1385,9 @@ def _apply_sqlite_additive_migrations() -> None:
         # memories participate in the same visible layering as v1 records.
         "memory_search_documents": {
             "zone": "VARCHAR(16) NOT NULL DEFAULT 'recent'",
+        },
+        "graphs": {
+            "cover_svg": "TEXT",
         },
     }
     with engine.begin() as connection:

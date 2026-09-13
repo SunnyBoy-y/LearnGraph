@@ -113,6 +113,8 @@ SENSITIVE_KEYS = {
 BUILTIN_TOOL_PERMISSIONS: dict[str, list[str]] = {
     "builtin.review.list_due": ["mastery.read"],
     "builtin.graph.read": ["graph.read"],
+    "builtin.graph.cover.read": ["graph.read"],
+    "builtin.graph.cover.update": ["graph.write"],
     "builtin.graph.update_candidate_node": ["graph.write"],
     "builtin.roadmap.read": ["roadmap.read"],
     "builtin.roadmap.replan": ["roadmap.write"],
@@ -163,6 +165,8 @@ MANAGEMENT_TOOL_NAMES = {
 CORE_BUILTIN_TOOL_NAMES = {
     "builtin.review.list_due",
     "builtin.graph.read",
+    "builtin.graph.cover.read",
+    "builtin.graph.cover.update",
     "builtin.roadmap.read",
     "builtin.action.list",
     "builtin.learning.mastery.read",
@@ -195,6 +199,33 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
             "required": ["graph_id"],
             "additionalProperties": False,
+        },
+    },
+    "builtin.graph.cover.read": {
+        "function_name": "lg_graph_cover_read",
+        "description": "Read the current graph cover and available cover modes for a permitted graph.",
+        "parameters": {
+            "type": "object",
+            "properties": {"graph_id": {"type": "string", "minLength": 1, "maxLength": 36}},
+            "required": ["graph_id"], "additionalProperties": False,
+        },
+    },
+    "builtin.graph.cover.update": {
+        "function_name": "lg_graph_cover_update",
+        "description": (
+            "Change a graph cover using a generated cover, a built-in template, "
+            "a validated image data URL, or safe static SVG."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "graph_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                "mode": {"type": "string", "enum": ["generated", "template", "image", "svg"]},
+                "template": {"type": "string", "enum": ["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"]},
+                "image_data_url": {"type": "string", "maxLength": 2800000},
+                "svg": {"type": "string", "maxLength": 48000},
+            },
+            "required": ["graph_id", "mode"], "additionalProperties": False,
         },
     },
     "builtin.graph.update_candidate_node": {
@@ -631,6 +662,8 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
 BUILTIN_TOOL_DESCRIPTION_ZH: dict[str, str] = {
     "builtin.review.list_due": "读取当前到期的 LearnGraph 复习节点。",
     "builtin.graph.read": "读取已授权的目标图谱，并按标签或描述检索匹配的节点。",
+    "builtin.graph.cover.read": "读取已授权图谱的当前封面及可用封面模式。",
+    "builtin.graph.cover.update": "为已授权图谱选择生成封面、模板封面、图片封面或安全静态 SVG 封面。",
     "builtin.graph.update_candidate_node": "更新候选图谱修订中的一个节点。已发布的图谱不可变，必须通过经审核的提案修改。",
     "builtin.roadmap.read": "按路线图 ID 或 Goal 的最新路线图读取已授权路线图。",
     "builtin.roadmap.replan": "基于 Goal 当前的图谱与已验证的学习事实，创建新的可审核路线图草稿。不会直接发布路线图。",
@@ -1113,6 +1146,7 @@ class MCPAndSkillService:
             "authorized": True,
             "activation_required": True,
             "permissions": list(skill.required_permissions or []),
+            "required_tools": list(skill.required_tools or []),
             "has_scripts": bool(skill.has_scripts),
             "official": bool(skill.is_official),
             "function_name": None,
@@ -4763,6 +4797,48 @@ class MCPAndSkillService:
                 "nodes_truncated": len(nodes) > limit,
                 "edges_truncated": edges_truncated,
             }
+
+        if tool_name in {"builtin.graph.cover.read", "builtin.graph.cover.update"}:
+            graph_id = str(arguments["graph_id"])
+            from app.domain.schemas.graphs import GraphCoverUpdateRequest
+            from app.services.graph_cover import default_graph_cover
+            from app.services.graph_cover_management import GraphCoverService
+            cover_service = GraphCoverService(
+                self.db, self.workspace_id, self.principal.user_id,
+                can_access=lambda target_id, access: authz.can_access_resource(workspace, "graph", target_id, access),
+            )
+            if tool_name.endswith("read"):
+                view = cover_service.read(graph_id)
+                graph_row = self.db.scalar(
+                    select(Graph).where(
+                        Graph.workspace_id == self.workspace_id,
+                        Graph.id == graph_id,
+                    )
+                )
+                return {
+                    "graph_id": graph_id,
+                    "title": view.title,
+                    "graph_revision": view.graph_revision,
+                    "node_count": view.node_count,
+                    "cover": view.cover_svg if len(view.cover_svg) <= 48_000 else None,
+                    "cover_available": True,
+                    "is_custom": bool(
+                        graph_row
+                        and graph_row.cover_svg
+                        and graph_row.cover_svg != default_graph_cover(graph_row.title)
+                    ),
+                    "available_modes": ["generated", "template", "image", "svg"],
+                    "templates": ["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"],
+                }
+            payload = GraphCoverUpdateRequest.model_validate(
+                {
+                    key: value
+                    for key, value in arguments.items()
+                    if key != "graph_id"
+                }
+            )
+            view = cover_service.update(graph_id, payload)
+            return {"graph_id": graph_id, "cover": view.cover_svg if len(view.cover_svg) <= 48_000 else None, "mode": payload.mode, "updated": True, "used_default": view.used_default}
 
         if tool_name == "builtin.graph.update_candidate_node":
             from app.domain.schemas.graphs import GraphNodeView, UpdateNodeRequest

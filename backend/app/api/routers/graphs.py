@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
+from sqlalchemy import select
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.providers.factory import model_provider_for_workspace
 from app.domain.schemas.common import ActionResponse
+from app.domain.models import GraphNode
 from app.domain.schemas.graphs import (
+    GraphCoverUpdateRequest,
+    GraphCoverView,
     GraphNodeView,
     GraphRevisionView,
     GraphSummary,
@@ -23,6 +27,7 @@ from app.domain.schemas.graphs import (
 from app.services.graphs import GraphService
 from app.services.authorization import AuthorizationService
 from app.services.graph_cover import generate_graph_cover
+from app.services.graph_cover_management import GraphCoverService
 
 
 router = APIRouter(prefix="/graphs", tags=["graphs"])
@@ -47,11 +52,60 @@ def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> GraphSe
 def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[GraphSummary]:
     """列出当前工作区的目标图谱。无请求体，输出图谱 ID、名称、状态和节点统计。"""
     authz = AuthorizationService(db, context.principal)
-    return [
-        GraphSummary.model_validate({**item.__dict__, "cover_svg": generate_graph_cover(item.title)})
-        for item in service(db, context, settings).list()
+    graph_items = [
+        item for item in service(db, context, settings).list()
         if authz.can_access_resource(context.workspace, "graph", item.id, "read")
     ]
+    node_labels: dict[str, list[str]] = {}
+    mastered_counts: dict[str, int] = {}
+    if graph_items:
+        nodes = db.scalars(
+            select(GraphNode).where(
+                GraphNode.workspace_id == context.workspace_id,
+                GraphNode.graph_id.in_([item.id for item in graph_items]),
+            ).order_by(GraphNode.graph_id, GraphNode.id)
+        ).all()
+        for node in nodes:
+            node_labels.setdefault(node.graph_id, []).append(node.label)
+            if node.mastery_stars >= 3:
+                mastered_counts[node.graph_id] = mastered_counts.get(node.graph_id, 0) + 1
+    return [
+        GraphSummary.model_validate({
+            **item.__dict__,
+            "cover_svg": item.cover_svg or generate_graph_cover(
+                item.title,
+                node_labels=node_labels.get(item.id),
+                progress=mastered_counts.get(item.id, 0) / max(1, len(node_labels.get(item.id, []))),
+            ),
+        })
+        for item in graph_items
+    ]
+
+
+@router.patch("/{graph_id}/cover", response_model=GraphCoverView)
+def update_graph_cover(
+    graph_id: str,
+    payload: GraphCoverUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> GraphCoverView:
+    """Select a generated/template/image cover without changing graph revision."""
+    authz = AuthorizationService(db, context.principal)
+    service = GraphCoverService(
+        db, context.workspace_id, context.principal.user_id,
+        can_access=lambda target_id, permission: authz.can_access_resource(context.workspace, "graph", target_id, permission),
+    )
+    return service.update(graph_id, payload)
+
+
+@router.get("/{graph_id}/cover", response_model=GraphCoverView)
+def graph_cover(graph_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> GraphCoverView:
+    authz = AuthorizationService(db, context.principal)
+    return GraphCoverService(
+        db, context.workspace_id, context.principal.user_id,
+        can_access=lambda target_id, permission: authz.can_access_resource(context.workspace, "graph", target_id, permission),
+    ).read(graph_id)
 
 
 @router.get("/merges", response_model=list[NodeMergeView])

@@ -1,5 +1,7 @@
 import type {
   Graph,
+  GraphCoverMode,
+  GraphCoverView,
   GraphRevision,
   GraphNode,
   GraphSummary,
@@ -20,6 +22,24 @@ export function listGraphs(): Promise<GraphSummary[]> {
 
 export function getGraph(graphId: string): Promise<Graph> {
   return apiClient.get<Graph>(`/graphs/${encodeURIComponent(graphId)}`)
+}
+
+export function updateGraphCover(
+  graphId: string,
+  payload: {
+    mode: GraphCoverMode
+    template?: 'ancient' | 'literature' | 'history' | 'science' | 'chemistry' | 'paper' | 'midnight' | 'sunrise'
+    image_data_url?: string
+    svg?: string
+  },
+): Promise<GraphCoverView> {
+  return apiClient.patch<GraphCoverView>(`/graphs/${encodeURIComponent(graphId)}/cover`, payload)
+}
+
+export function getGraphCover(graphId: string): Promise<GraphCoverView> {
+  return apiClient.get<GraphCoverView>(
+    `/graphs/${encodeURIComponent(graphId)}/cover`,
+  )
 }
 
 export function listGraphRevisions(graphId: string): Promise<GraphRevision[]> {
