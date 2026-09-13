@@ -18,6 +18,7 @@ import type { Cell, Workbook, Worksheet } from "exceljs";
 import { Button } from "@/components/ui/button";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { createSandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
+import { usePreviewPause } from "@/lib/preview-pause-controller";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 
@@ -901,6 +902,8 @@ export function HtmlDocumentViewer({
   const [previewHtml, setPreviewHtml] = useState("");
   const [error, setError] = useState("");
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  usePreviewPause(rootRef);
 
   // Browser-sandbox runtime bridge: relays JS network requests (net.fetch)
   // to the approval-free sandbox-net gateway. No bundle context here, so
@@ -933,7 +936,7 @@ export function HtmlDocumentViewer({
   }, [blob]);
 
   return (
-    <div className="flex h-full min-h-[36rem] flex-col">
+    <div className="flex h-full min-h-[36rem] flex-col" ref={rootRef}>
       <div className="sticky top-0 z-10 flex shrink-0 flex-wrap items-center gap-2 border-b bg-background/95 p-2 backdrop-blur">
         <div className="flex rounded-lg border p-0.5" role="group" aria-label="HTML 查看模式">
           <button
@@ -982,8 +985,8 @@ export function HtmlDocumentViewer({
         </pre>
       ) : null}
       {mode === "preview" && previewHtml ? (
-        <iframe
-          className="min-h-[36rem] w-full flex-1 border-0 bg-white"
+        <iframe loading="lazy"
+            className="min-h-[36rem] w-full flex-1 border-0 bg-white"
           ref={iframeRef}
           referrerPolicy="no-referrer"
           sandbox="allow-scripts"
@@ -1037,3 +1040,5 @@ export function TextDocumentViewer({
     </pre>
   );
 }
+
+

@@ -4,6 +4,7 @@ import { LoaderCircle, Pause, Play, RotateCcw, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
+import { usePreviewPause } from "@/lib/preview-pause-controller";
 
 function clock(value: number) {
   if (!Number.isFinite(value)) return "0:00";
@@ -12,6 +13,7 @@ function clock(value: number) {
 }
 
 export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: string }) {
+  const playerRef = useRef<HTMLElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [source, setSource] = useState("");
   const [peaks, setPeaks] = useState<number[]>([]);
@@ -21,6 +23,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
   const [currentTime, setCurrentTime] = useState(0);
   const [volume, setVolume] = useState(1);
   const [rate, setRate] = useState(1);
+  const { paused: systemPaused, toggle: toggleSystemPause } = usePreviewPause(playerRef);
 
   useEffect(() => {
     const url = URL.createObjectURL(blob);
@@ -70,7 +73,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
   }
 
   return (
-    <section className="audio-learning-player" aria-label={`音频播放器 ${filename}`}>
+    <section className="audio-learning-player" aria-label={`音频播放器 ${filename}`} ref={playerRef}>
       <audio
         onDurationChange={(event) => setDuration(event.currentTarget.duration || 0)}
         onEnded={() => setPlaying(false)}
@@ -122,7 +125,13 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
           onClick={() => {
             const audio = audioRef.current;
             if (!audio) return;
-            if (audio.paused) void audio.play(); else audio.pause();
+            if (systemPaused) {
+              toggleSystemPause();
+            } else if (audio.paused) {
+              void audio.play();
+            } else {
+              audio.pause();
+            }
           }}
           size="icon"
         >

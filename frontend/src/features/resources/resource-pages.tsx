@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
@@ -109,12 +117,13 @@ function bytes(value: number) {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
-type FileFilter = "all" | "indexed" | "pending" | "failed";
+type FileFilter = "all" | "indexed" | "pending" | "attachment" | "failed";
 
 const fileFilters: Array<{ value: FileFilter; label: string }> = [
   { value: "all", label: "全部" },
   { value: "indexed", label: "可问答" },
-  { value: "pending", label: "解析中" },
+  { value: "pending", label: "未建索引" },
+  { value: "attachment", label: "仅附件" },
   { value: "failed", label: "解析失败" },
 ];
 
@@ -139,6 +148,26 @@ function fileType(file: Pick<FileRecord, "original_name" | "mime_type">) {
   return extension ? extension.toUpperCase() : "文件";
 }
 
+/**
+ * 资料库状态口径（与后端 parse_status / parse_capability 对齐）：
+ * - 可问答：已建文本索引；
+ * - 未建索引：本可解析、但还没请求过解析（需要时才做）；
+ * - 仅附件：按设计只作附件直接使用（图片/音视频/压缩包/SVG，以及智能体产物导出的文件），
+ *   不建立文本索引，因此不能叫「待解析」；
+ * - 缺少解析器 / 解析失败 / 解析中：解析链路自己的状态。
+ */
+const ATTACHMENT_ONLY_CATEGORIES: ReadonlySet<FileCategory> = new Set([
+  "image",
+  "audio",
+  "video",
+  "archive",
+]);
+
+function isAttachmentOnlyFile(file: FileRecord) {
+  if (file.parse_capability === "attachment_only") return true;
+  return ATTACHMENT_ONLY_CATEGORIES.has(fileCategory(file));
+}
+
 function fileStatus(file: FileRecord) {
   if (file.parse_status === "indexed")
     return { label: "可问答", status: "approved" };
@@ -148,14 +177,19 @@ function fileStatus(file: FileRecord) {
     return { label: "缺少解析器", status: "pending" };
   if (["queued", "running", "processing"].includes(file.parse_status))
     return { label: "解析中", status: "pending" };
-  return { label: "待解析", status: "pending" };
+  if (isAttachmentOnlyFile(file)) return { label: "仅附件", status: "consumed" };
+  return { label: "未建索引", status: "pending" };
 }
 
 function matchesFileFilter(file: FileRecord, filter: FileFilter) {
   if (filter === "all") return true;
   if (filter === "indexed") return file.parse_status === "indexed";
   if (filter === "failed") return file.parse_status === "failed";
-  return !["indexed", "failed"].includes(file.parse_status);
+  if (filter === "attachment") return isAttachmentOnlyFile(file);
+  return (
+    !["indexed", "failed"].includes(file.parse_status) &&
+    !isAttachmentOnlyFile(file)
+  );
 }
 
 function formatUploadTime(value: string) {
@@ -221,8 +255,9 @@ function FileThumbnail({ file, large = false }: { file: FileRecord; large?: bool
     }).catch(() => setFailed(true));
     return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [file.id, file.mime_type, file.original_name]);
-  return <span className={`flex shrink-0 items-center justify-center overflow-hidden ${large ? "h-40 w-full rounded-xl bg-muted/30" : "size-9 rounded-lg border bg-background"}`}>
-    {url && !failed ? <img alt={file.original_name} className="size-full object-cover" onError={() => setFailed(true)} src={url} /> : <FileIcon file={file} large={large} />}
+  const isImage = fileCategory(file) === "image";
+  return <span className={`flex shrink-0 items-center justify-center overflow-hidden ${large ? `w-full rounded-xl bg-muted/30 ${isImage ? "min-h-40" : "h-40"}` : "size-9 rounded-lg border bg-background"}`}>
+    {url && !failed ? <img alt={file.original_name} className={large ? "h-auto max-h-[28rem] w-full object-contain" : "size-full object-cover"} onError={() => setFailed(true)} src={url} /> : <FileIcon file={file} large={large} />}
   </span>;
 }
 
@@ -248,7 +283,7 @@ export function SourcesPage() {
   const [supportOpen, setSupportOpen] = useState(false);
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
   const [typeFilter, setTypeFilter] = useState<FileCategory>("all");
-  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
+  const [viewMode, setViewMode] = useState<"list" | "grid">("grid");
   const [fileSearch, setFileSearch] = useState("");
   const [filePage, setFilePage] = useState(1);
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(
@@ -262,6 +297,8 @@ export function SourcesPage() {
     useState<SourceRecord | null>(null);
   const [sourceDeleteTarget, setSourceDeleteTarget] =
     useState<SourceRecord | null>(null);
+  // 全局拖入检测：鼠标松开前显示整页“拖入文件”遮罩
+  const [dropActive, setDropActive] = useState(false);
   const files = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
   const storageSummary = useQuery({
     queryKey: ["files-storage-summary"],
@@ -286,6 +323,14 @@ export function SourcesPage() {
     },
     onError: (error) => toast.error(error.message),
   });
+  const uploadRef = useRef(upload.mutate);
+  useEffect(() => {
+    uploadRef.current = upload.mutate;
+  }, [upload.mutate]);
+  // 稳定的上传入口，供整页拖入监听器复用
+  const uploadFiles = useCallback((selectedFiles: FileList | File[]) => {
+    for (const file of Array.from(selectedFiles)) uploadRef.current(file);
+  }, []);
   const download = useMutation({
     mutationFn: async (file: FileRecord) => {
       // 移动端 WebView：真实 URL 交给原生下载器
@@ -427,6 +472,61 @@ export function SourcesPage() {
     setFilePage(1);
   }, [fileFilter, fileSearch, typeFilter]);
 
+  useEffect(() => {
+    // 资料库整页接管拖入：dragover/drop 默认行为必须拦掉，否则浏览器会直接打开文件
+    const hasFiles = (event: DragEvent) =>
+      Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    let depth = 0;
+    const onDragEnter = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      depth += 1;
+      setDropActive(true);
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      setDropActive(true);
+    };
+    const onDragLeave = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDropActive(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth = 0;
+      setDropActive(false);
+      const dropped = event.dataTransfer?.files;
+      if (dropped && dropped.length > 0) uploadFiles(dropped);
+    };
+    const reset = () => {
+      depth = 0;
+      setDropActive(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      // 拖拽过程中按 Esc 取消：浏览器不一定补发 dragleave，这里兜底
+      if (event.key === "Escape") reset();
+    };
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    window.addEventListener("dragend", reset);
+    window.addEventListener("blur", reset);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+      window.removeEventListener("dragend", reset);
+      window.removeEventListener("blur", reset);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [uploadFiles]);
+
   if (files.isPending)
     return (
       <PageFrame>
@@ -446,8 +546,11 @@ export function SourcesPage() {
     (file) => file.parse_status === "failed",
   ).length;
   const pending = files.data.filter(
-    (file) => !["indexed", "failed"].includes(file.parse_status),
+    (file) =>
+      !["indexed", "failed"].includes(file.parse_status) &&
+      !isAttachmentOnlyFile(file),
   ).length;
+  const attachmentOnly = files.data.filter(isAttachmentOnlyFile).length;
   const normalizedFileSearch = fileSearch.trim().toLocaleLowerCase();
   const filteredFiles = files.data.filter(
     (file) =>
@@ -475,9 +578,6 @@ export function SourcesPage() {
   const somePageSelected =
     selectedOnPageCount > 0 && selectedOnPageCount < pageFileIds.length;
   const chooseFiles = () => inputRef.current?.click();
-  const uploadFiles = (selectedFiles: FileList | File[]) => {
-    for (const file of Array.from(selectedFiles)) upload.mutate(file);
-  };
   const toggleFileSelected = (fileId: string, checked: boolean) => {
     setSelectedFileIds((current) => {
       const next = new Set(current);
@@ -498,6 +598,34 @@ export function SourcesPage() {
   };
   return (
     <PageFrame>
+      {dropActive
+        ? createPortal(
+            <div
+              aria-hidden="true"
+              className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-background/70 p-6 backdrop-blur-sm"
+            >
+              <div className="flex w-full max-w-xl flex-col items-center gap-3 rounded-2xl border-2 border-dashed border-primary/50 bg-card/95 px-8 py-14 text-center shadow-lg">
+                <span className="grid size-14 place-items-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/25">
+                  {upload.isPending ? (
+                    <LoaderCircle className="size-6 animate-spin" />
+                  ) : (
+                    <UploadCloud className="size-6" />
+                  )}
+                </span>
+                <strong className="text-lg">
+                  {upload.isPending ? "上传中…" : "拖入文件"}
+                </strong>
+                <span className="text-sm text-muted-foreground">
+                  松开鼠标即上传，文件会被安全解析并存储。
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  支持 PDF、Word、Excel、Markdown 等格式；不可解析的文件仍会安全存储。
+                </span>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
       <PageIntro
         actions={
           <Button disabled={upload.isPending} onClick={chooseFiles} size="sm">
@@ -543,7 +671,13 @@ export function SourcesPage() {
           <strong className="font-semibold tabular-nums text-foreground">
             {pending}
           </strong>{" "}
-          个待解析或处理中
+          个未建索引
+        </span>
+        <span>
+          <strong className="font-semibold tabular-nums text-foreground">
+            {attachmentOnly}
+          </strong>{" "}
+          个仅附件（直接使用）
         </span>
         <span>
           <strong className="font-semibold tabular-nums text-foreground">
@@ -564,39 +698,12 @@ export function SourcesPage() {
             )}
           </strong>
         </span>
-      </div>
-
-      <section
-        aria-label="上传资料"
-        className="grid gap-3 rounded-lg border border-dashed bg-muted/15 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
-      >
-        <button
-          className="flex min-h-24 items-center gap-4 rounded-md p-3 text-left transition-colors hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          disabled={upload.isPending}
-          onClick={chooseFiles}
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={(event) => {
-            event.preventDefault();
-            uploadFiles(event.dataTransfer.files);
-          }}
-          type="button"
-        >
-          <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-background ring-1 ring-border">
-            {upload.isPending ? (
-              <LoaderCircle className="size-5 animate-spin" />
-            ) : (
-              <UploadCloud className="size-5" />
-            )}
-          </span>
-          <span className="min-w-0">
-            <strong className="block text-sm">拖入文件或点击选择</strong>
-            <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-              支持 PDF、Word、Excel、Markdown 等格式；不可解析的文件仍会安全存储。
-            </span>
-          </span>
-        </button>
-        <div className="flex flex-wrap gap-2 sm:justify-end">
-          <Button onClick={() => setWebDialogOpen(true)} size="sm" variant="outline">
+        <span className="ml-auto flex flex-wrap items-center gap-2">
+          <Button
+            onClick={() => setWebDialogOpen(true)}
+            size="sm"
+            variant="outline"
+          >
             <Link2 className="size-4" />
             粘贴网页
           </Button>
@@ -607,8 +714,8 @@ export function SourcesPage() {
             <ShieldCheck className="size-4" />
             缓存策略
           </Button>
-        </div>
-      </section>
+        </span>
+      </div>
 
       <Surface className="overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
@@ -689,9 +796,9 @@ export function SourcesPage() {
           </div>
         </div>
         {viewMode === "grid" ? (
-          <div className="grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          <div className="columns-1 gap-4 p-4 sm:columns-2 xl:columns-3 2xl:columns-4">
             {pagedFiles.map((file) => (
-              <article key={file.id} className={`min-w-0 rounded-2xl border p-4 transition-shadow hover:shadow-sm ${selectedFileIds.has(file.id) ? "bg-muted/40 ring-1 ring-ring" : "bg-card"}`}>
+              <article key={file.id} className={`mb-4 min-w-0 break-inside-avoid rounded-2xl border p-4 transition-shadow hover:shadow-sm ${selectedFileIds.has(file.id) ? "bg-muted/40 ring-1 ring-ring" : "bg-card"}`} style={{ contentVisibility: "auto", containIntrinsicSize: "320px" }}>
                 <div className="mb-3 flex items-start gap-2">
                   <button type="button" className="min-w-0 flex-1 truncate text-left text-sm font-medium hover:underline" title={file.original_name} onClick={() => setDiagnosticFile(file)}>{file.original_name}</button>
                   <DropdownMenu>
@@ -832,9 +939,11 @@ export function SourcesPage() {
                                 ? "重新解析"
                                 : file.parse_status === "indexed"
                                   ? "已可问答"
-                                  : parserUnavailable
-                                    ? "解析不可用"
-                                    : "解析文件"}
+                                  : file.parse_capability === "attachment_only"
+                                    ? "仅附件，无需解析"
+                                    : parserUnavailable
+                                      ? "缺少解析器"
+                                      : "解析文件"}
                             </DropdownMenuItem>
                             <DropdownMenuItem
                               onSelect={() => setDiagnosticFile(file)}

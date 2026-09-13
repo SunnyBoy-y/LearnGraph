@@ -131,6 +131,7 @@ from app.services.chat_attachment_policy import (
     file_extension,
     is_audio_attachment,
     is_image_attachment as policy_is_image_attachment,
+    is_inline_text_attachment,
     is_video_attachment as policy_is_video_attachment,
     non_agent_attachment_error,
 )
@@ -955,7 +956,7 @@ class ChatService:
                 file,
                 asr_available=asr_available,
             )
-            if classification in {"image", "video"}:
+            if classification in {"image", "video", "text_inline"}:
                 continue
             if classification == "document_ready":
                 continue
@@ -9277,6 +9278,7 @@ class ChatService:
                     if not self._is_image_attachment(file)
                     and not self._is_video_attachment(file)
                     and not is_audio_attachment(file)
+                    and not is_inline_text_attachment(file)
                     and file.parse_status != "indexed"
                 ]
                 if unavailable:

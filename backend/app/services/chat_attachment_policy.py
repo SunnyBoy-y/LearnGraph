@@ -85,6 +85,22 @@ def is_fast_thinking_whitelist_document(file: FileRecord) -> bool:
     return extension in LOCAL_TEXT_EXTENSIONS or extension in WHITELIST_DOCUMENT_EXTENSIONS
 
 
+def is_inline_text_attachment(file: FileRecord) -> bool:
+    """True when the attachment travels to the model as its complete stored text.
+
+    Text, code and markup attachments (including HTML/Markdown artifacts) are
+    inlined by ``ChatService._inline_text_attachment_context`` instead of being
+    retrieved through the sparse index, so they never need a text index and must
+    not be gated behind one.
+    """
+
+    if is_special_binary_attachment(file):
+        return False
+    if is_image_attachment(file) or is_audio_attachment(file) or is_video_attachment(file):
+        return False
+    return file_extension(file.original_name) in LOCAL_TEXT_EXTENSIONS
+
+
 def classify_non_agent_attachment(
     file: FileRecord,
     *,
@@ -104,6 +120,12 @@ def classify_non_agent_attachment(
         return "unsupported"
     if file.parse_status == "indexed":
         return "document_ready"
+    if is_inline_text_attachment(file):
+        # Text/code attachments (including HTML/Markdown artifacts) are delivered
+        # to the model as their complete stored text, so they never need a text
+        # index. Requiring one here blocked exactly the attachments that are
+        # meant to be used as-is.
+        return "text_inline"
     return "document_not_ready"
 
 
