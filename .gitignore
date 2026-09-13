@@ -141,7 +141,11 @@ temp/
 /three-files.yaml
 /workspace-*.yaml
 
-# Product/security regressions under backend/tests and frontend/src/test are version-controlled.
+# 测试文件默认不入公开仓库：这里只保留「忽略」规则，不再用白名单把
+# backend/tests 与 frontend/src/test 纳入版本控制。新写的测试文件留在本地。
+#
+# 注意：.gitignore 对「已被跟踪」的文件无效，因此历史上已入库的测试仍会随
+# 仓库分发（CI 的 pytest / npm test 继续可用）；本策略只约束新增测试文件。
 /frontend/e2e/
 /frontend/playwright.config.*
 **/__tests__/
@@ -153,21 +157,6 @@ temp/
 **/*.spec.*
 **/*_spec.py
 **/test/**/*.{ts,tsx,js,jsx}
-!backend/tests/
-!backend/tests/**
-!backend/tests/security/
-!backend/tests/security/test_*.py
-!backend/tests/security/**/test_*.py
-!frontend/src/test/
-!frontend/src/test/**
-
-# Long-term memory architecture regression tests are an explicit tracked exception.
-!backend/tests/memory/
-!backend/tests/context/
-!backend/tests/integration/
-!backend/tests/memory/**
-!backend/tests/context/**
-!backend/tests/integration/**
 
 # Local editor, operating-system, and agent state
 .idea/
