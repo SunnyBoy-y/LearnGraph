@@ -1,0 +1,15 @@
+README: minimal vendored punkt_tab data for LearnGraph images.
+
+Pipecat (pipecat.utils.string.match_endofsentence) always calls NLTK's
+sent_tokenize, so the container needs `tokenizers/punkt_tab/english/` to exist.
+The official download pulls ~11 MB of every language from
+raw.githubusercontent.com, which is not reachable from the build or the runtime
+container of this deployment.
+
+NLTK's loader (nltk/tokenize/punkt.py: load_punkt_params) reads exactly four
+files and accepts empty ones, so this directory ships them empty on purpose:
+Punkt then splits on orthographic rules instead of learned statistics, which is
+what the voice pipeline needs (Chinese/English sentence boundaries).
+
+Regenerate equivalent data locally with:
+    python -m nltk.downloader -d <dir> punkt_tab

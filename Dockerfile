@@ -69,6 +69,14 @@ COPY --from=backend --chown=learngraph:learngraph /app/sandbox /app/sandbox
 COPY --from=frontend --chown=learngraph:learngraph /frontend/dist /app/frontend-dist
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/learngraph-entrypoint
 
+# Pipecat 的句级切分（pipecat.utils.string.match_endofsentence → NLTK
+# sent_tokenize）每次 LLM 文本帧都会调用，缺少 punkt_tab 时语音管线每轮抛
+# ErrorFrame，并把上一轮答复重新拼进本轮 TTS 文本（用户会听到上一轮回答被
+# 重复朗读）。官方下载要访问 raw.githubusercontent.com（构建/运行容器都不可达），
+# 故直接内置最小语料：见 docker/nltk_data/.../README。
+COPY --chown=learngraph:learngraph docker/nltk_data /usr/local/share/nltk_data
+ENV NLTK_DATA=/usr/local/share/nltk_data
+
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
