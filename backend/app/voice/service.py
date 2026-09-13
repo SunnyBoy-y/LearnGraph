@@ -8,12 +8,9 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.memory_deps import event_store, memory_scope
 from app.core.errors import AppError
 from app.domain.models import ChatSession, SandboxAgentTask
-from app.domain.schemas.memory_v2 import MemoryEventAppendRequest
 from app.services.authorization import AuthorizationService
-from app.services.memory_event_ingestor import EventActor, MemoryEventIngestor
 from app.services.sandbox import SandboxAgentWorkspaceService
 from app.domain.schemas.sandbox import (
     SandboxAgentSubagentCancelRequest,
@@ -24,7 +21,7 @@ from .policy import clip_thinking_mode, next_event_seq
 from .runtime import runtime_info
 from .schemas import (
     RTVIEventEnvelope, VoiceSession, VoiceTaskLink, VoiceTaskStartRequest,
-    VoiceTaskView, VoiceTurn, VoiceTurnRequest,
+    VoiceTaskView,
 )
 
 class VoiceSessionService:
@@ -52,7 +49,7 @@ class VoiceSessionService:
             raise AppError(404, "session_not_found", "Chat session was not found")
         return chat
 
-    def create_session(self, chat_session_id: str, maximum: str) -> VoiceSession:
+    def create_session(self, chat_session_id: str, maximum: str, model_id: str | None = None, provider_id: str | None = None) -> VoiceSession:
         self._chat(chat_session_id, write=True)
         now = datetime.now(timezone.utc)
         session = VoiceSession(
@@ -61,6 +58,8 @@ class VoiceSessionService:
             owner_user_id=self.context.principal.user_id,
             max_thinking_mode=clip_thinking_mode(maximum, maximum),
             created_at=now, updated_at=now,
+            model_id=model_id,
+            provider_id=provider_id,
         )
         runtime = runtime_info(self.settings)
         session.runtime_ready = runtime.ready
@@ -78,91 +77,14 @@ class VoiceSessionService:
         self._chat(session.chat_session_id, write=write)
         return session
 
-    def append_turn(self, voice_session_id: str, request: VoiceTurnRequest) -> VoiceTurn:
+    def update_model(self, voice_session_id: str, model_id: str | None, provider_id: str | None) -> VoiceSession:
+        """Update the model pin used by the next Pipecat turn/reconnect."""
         session = self.get_session(voice_session_id, write=True)
-        if session.status != "active":
-            raise AppError(409, "voice_session_ended", "Voice session has ended")
-        mode = clip_thinking_mode(request.thinking_mode, session.max_thinking_mode)
-        now = datetime.now(timezone.utc)
-        turn = VoiceTurn(id=f"vt_{uuid4().hex[:24]}", role=request.role, text=request.text,
-                         final=request.final, thinking_mode=mode, created_at=now,
-                         request_id=request.request_id)
         with self._lock:
-            session.seq = next_event_seq(session.seq)
-            session.turns.append(turn)
-            session.updated_at = now
-        # Only finalized user speech is an input turn.  Assistant/system
-        # events are accepted for timeline synchronization, but must never
-        # recursively enqueue another assistant response.
-        if request.role == "user" and request.final and request.text.strip():
-            self.ingest_memory(session, turn)
-            # Feed finalized user speech into the same durable ChatService
-            # pipeline as typed messages.  The audio worker can then stream or
-            # synthesize the assistant response without creating a second
-            # agent identity for voice.
-            self._queue_chat_response(session, request.text, mode)
-        return turn
-
-    def _queue_chat_response(self, session: VoiceSession, text: str, mode: str) -> None:
-        """Start a detached agent turn; failures remain visible to the caller's
-        normal chat event stream and never make ASR acknowledgement fail."""
-        try:
-            from sqlalchemy.orm import sessionmaker
-            from app.api.routers.chat import _detached_message_stream, service as chat_service
-            from app.domain.schemas.chat import MessageCreateRequest
-
-            payload = MessageCreateRequest(
-                content=text.strip(),
-                thinking_mode=mode,
-                agent_mode=True,
-            )
-            chat_service(
-                self.db, self.context, self.settings,
-                model_id=None, provider_id=None, thinking_mode=mode,
-                search_route="auto", agent_mode=True,
-            ).preflight_create_stream(session.chat_session_id, payload)
-            events = _detached_message_stream(
-                context=self.context,
-                settings=self.settings,
-                session_id=session.chat_session_id,
-                payload=payload,
-                idempotency_key=f"voice:{session.id}:{session.seq}",
-                last_event_id=None,
-                session_factory=sessionmaker(
-                    bind=self.db.get_bind(), autoflush=False, expire_on_commit=False,
-                ),
-            )
-            threading.Thread(
-                target=lambda: tuple(events),
-                name=f"learngraph-voice-{session.id[:8]}",
-                daemon=True,
-            ).start()
-        except Exception:
-            # Voice transport should remain usable when an optional model/tool
-            # provider is unavailable; the chat stream records the failure when
-            # preflight reached it, while this hook is deliberately best effort.
-            self.db.rollback()
-
-    def ingest_memory(self, session: VoiceSession, turn: VoiceTurn) -> None:
-        """Best-effort memory hook; sensitive-filter or storage failures never block voice."""
-        chat = self.db.get(ChatSession, session.chat_session_id)
-        if chat is None or not chat.memory_enabled or not chat.memory_learning_enabled:
-            return
-        try:
-            req = MemoryEventAppendRequest(
-                aggregate_type="episode", aggregate_id=session.chat_session_id,
-                event_type="voice.turn.final", producer="agent",
-                idempotency_key=f"voice:{turn.id}", sensitivity="normal",
-                payload={"role": turn.role, "text": turn.text, "thinking_mode": turn.thinking_mode},
-                conversation_id=session.chat_session_id,
-                metadata={"voice_session_id": session.id},
-            )
-            MemoryEventIngestor(event_store(self.db, self.settings)).ingest(
-                memory_scope(self.context, conversation_id=session.chat_session_id),
-                EventActor("agent", self.context.principal.user_id), req,
-            )
-        except Exception:
-            self.db.rollback()
+            session.model_id = model_id or None
+            session.provider_id = provider_id or None
+            session.updated_at = datetime.now(timezone.utc)
+        return session
 
     def start_task(self, voice_session_id: str, request: VoiceTaskStartRequest) -> VoiceTaskView:
         session = self.get_session(voice_session_id, write=True)

@@ -3,8 +3,6 @@
 This is the demo-voice2o2 runner reduced to a router: the same API process owns
 the offer endpoint and starts the Pipecat pipeline per peer connection.
 """
-from __future__ import annotations
-
 import importlib.util
 import uuid
 from typing import Any
@@ -30,6 +28,14 @@ def install_embedded_runtime(app: Any) -> bool:
 
     @app.post("/api/v1/voice/sessions/{session_id}/api/offer")
     async def voice_offer(session_id: str, request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
+        # The offer route is outside the normal APIRouter dependency chain;
+        # reject stale or fabricated ids before allocating a WebRTC worker.
+        from app.voice.service import VoiceSessionService
+        with VoiceSessionService._lock:
+            session = VoiceSessionService._sessions.get(session_id)
+        if session is None or session.status != "active":
+            raise HTTPException(status_code=404, detail="Voice session was not found")
+
         async def on_connection(connection: SmallWebRTCConnection):
             args = SmallWebRTCRunnerArguments(
                 webrtc_connection=connection,
@@ -42,6 +48,11 @@ def install_embedded_runtime(app: Any) -> bool:
 
     @app.patch("/api/v1/voice/sessions/{session_id}/api/offer")
     async def voice_ice(session_id: str, request: SmallWebRTCPatchRequest):
+        from app.voice.service import VoiceSessionService
+        with VoiceSessionService._lock:
+            session = VoiceSessionService._sessions.get(session_id)
+        if session is None or session.status != "active":
+            raise HTTPException(status_code=404, detail="Voice session was not found")
         await handler.handle_patch_request(request)
         return {"status": "success"}
 

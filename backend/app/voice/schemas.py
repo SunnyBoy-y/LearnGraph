@@ -5,7 +5,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
-VoiceTurnRole = Literal["user", "assistant", "system"]
 
 class RTVIEventEnvelope(BaseModel):
     """Stable event envelope shared by WebRTC/RTVI clients."""
@@ -16,15 +15,6 @@ class RTVIEventEnvelope(BaseModel):
     session_id: str = Field(min_length=1, max_length=64)
     timestamp: datetime | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
-
-class VoiceTurn(BaseModel):
-    id: str
-    role: VoiceTurnRole
-    text: str
-    final: bool = True
-    thinking_mode: ThinkingMode = "off"
-    created_at: datetime
-    request_id: str | None = None
 
 class VoiceTaskLink(BaseModel):
     voice_session_id: str
@@ -45,7 +35,6 @@ class VoiceSession(BaseModel):
     status: Literal["active", "ended"] = "active"
     max_thinking_mode: ThinkingMode = "high"
     seq: int = 0
-    turns: list[VoiceTurn] = Field(default_factory=list)
     tasks: list[VoiceTaskLink] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
@@ -53,12 +42,16 @@ class VoiceSession(BaseModel):
     # runtime is deployed. Clients must not treat it as an audio connection.
     runtime_ready: bool = False
     signaling_url: str | None = None
+    model_id: str | None = None
+    provider_id: str | None = None
 
 class VoiceSessionCreateRequest(BaseModel):
     chat_session_id: str | None = Field(default=None, min_length=1, max_length=36)
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
     max_thinking_mode: ThinkingMode = "high"
     thinking_limit: ThinkingMode | None = None
+    model_id: str | None = Field(default=None, max_length=160)
+    provider_id: str | None = Field(default=None, max_length=80)
 
     @model_validator(mode="after")
     def normalize_aliases(self) -> "VoiceSessionCreateRequest":
@@ -69,13 +62,6 @@ class VoiceSessionCreateRequest(BaseModel):
         if not self.chat_session_id:
             raise ValueError("chat_session_id is required")
         return self
-
-class VoiceTurnRequest(BaseModel):
-    role: VoiceTurnRole
-    text: str = Field(min_length=1, max_length=50_000)
-    final: bool = True
-    thinking_mode: ThinkingMode | None = None
-    request_id: str | None = Field(default=None, max_length=96)
 
 class VoiceTaskStartRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16_384)
