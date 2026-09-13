@@ -28,6 +28,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
@@ -38,12 +39,16 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     TranscriptionFrame,
     UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import DEFAULT_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.utils.time import time_now_iso8601
+
+from app.voice.embedded_timeline import timeline_mark
 
 
 @dataclass
@@ -106,6 +111,29 @@ class DashScopeSTTService(STTService):
                 f"{self}: DASHSCOPE_ASR_COMMIT_ON_EOU 已关闭，但 Manual 模式下"
                 " commit 是唯一的 finalize 触发手段——本服务将不会产生 final 转录。"
             )
+        # 本机 VAD 自上次 commit 以来是否真的听到过语音。DashScope 在
+        # Manual 模式下对"纯静音缓冲"的 commit 会稳定返回幻觉 final（实测
+        # 连续 5 次静音 commit 均返回「嗯。」），该幻觉会被回合层当作真实
+        # 用户发言，形成「EOU→commit→幻觉→新回合→EOU」自激循环。因此
+        # commit 与 final 都必须以"本机确实听到语音"为前提。
+        self._speech_seen = False
+        self._commit_in_flight = False
+        # commit 的触发点（2026-09-12 单点计时定位后修正）：
+        #   "1"（默认）→ 本机 VAD 判定停止（VADUserStoppedSpeakingFrame）即 commit；
+        #   "0"        → 等聚合器广播 UserStoppedSpeakingFrame 再 commit（旧行为）。
+        #
+        # 旧行为把 DashScope 的 commit→final 往返串行压在「回合已经结束」之后，
+        # 而聚合器的 stop 策略（Smart Turn v3）在 wait_for_transcript=True 下
+        # 必须"有文本 + （final 已到 或 p99 安全网超时）"才放行，于是构成
+        # 「策略等文本、文本等策略」的循环依赖，只能靠 p99 安全网超时兜底：
+        # 实测每轮固定多等 ttfs_p99 − stop_secs = 1.0 − 0.2 ≈ 0.8s，之后才
+        # commit，再串行等 commit 往返。VAD 停止即 commit 让这段往返与
+        # Smart Turn 推理并行，final 一到就能立刻结束回合。
+        self._commit_on_vad_stop = os.getenv(
+            "DASHSCOPE_ASR_COMMIT_ON_VAD_STOP", "1"
+        ).lower() not in ("0", "false", "no", "off")
+        # 单点计时：记录 commit 发出的时刻，用于算 commit→final 的往返。
+        self._commit_sent_at: float | None = None
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -188,14 +216,31 @@ class DashScopeSTTService(STTService):
         ``conversation.item.input_audio_transcription.completed``。
         """
         await super().process_frame(frame, direction)
-        if isinstance(frame, UserStoppedSpeakingFrame):
-            await self._send_commit()
+        # 本机 VAD 判定用户开口：标记"这一轮确实有语音"，供 commit 门闩使用。
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._speech_seen = True
+        # commit 触发点：默认在 VAD 判定停止时（最早的可提交时刻），旧行为则
+        # 等聚合器广播 UserStoppedSpeakingFrame（回合已经结束之后）。
+        if isinstance(frame, VADUserStoppedSpeakingFrame) and self._commit_on_vad_stop:
+            timeline_mark("stt", "收到 VAD 停止帧")
+            await self._send_commit("vad-stop")
+        if isinstance(frame, UserStoppedSpeakingFrame) and not self._commit_on_vad_stop:
+            timeline_mark("stt", "收到回合结束帧")
+            await self._send_commit("turn-stopped")
 
-    async def _send_commit(self) -> None:
-        """向 DashScope 发送 input_audio_buffer.commit，强制立即出 final。"""
+    async def _send_commit(self, trigger: str) -> None:
+        """向 DashScope 发送 input_audio_buffer.commit，强制立即出 final。
+
+        只有在本机 VAD 本回合确实听到过语音时才 commit：静音缓冲的 commit
+        会拿到幻觉 final（见 ``__init__`` 的说明），进而自激出无限空回合。
+        ``trigger`` 仅用于单点计时日志，标明这次 commit 是被谁触发的。
+        """
         if self._ws is None:
             return
         if not self._commit_on_eou:
+            return
+        if not self._speech_seen:
+            logger.debug(f"{self}: skipped commit on EOU (no local speech this turn)")
             return
         try:
             await self._ws.send(
@@ -206,7 +251,11 @@ class DashScopeSTTService(STTService):
                     }
                 )
             )
+            self._commit_sent_at = time.time()
             logger.debug(f"{self}: committed audio buffer on EOU")
+            timeline_mark("stt", "commit 已发出", f"trigger={trigger}")
+            self._speech_seen = False
+            self._commit_in_flight = True
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{self}: commit failed: {exc}")
 
@@ -231,7 +280,9 @@ class DashScopeSTTService(STTService):
                     )
                 if etype == "conversation.item.input_audio_transcription.text":
                     text = str(payload.get("text") or "").strip()
-                    if text:
+                    # 仅在"本回合确实有语音"时上报 partial，避免静音期间的
+                    # 服务端幻觉 partial 触发一次空回合。
+                    if text and self._speech_seen:
                         await self.push_frame(
                             InterimTranscriptionFrame(
                                 text, self._user_id, time_now_iso8601()
@@ -241,6 +292,23 @@ class DashScopeSTTService(STTService):
                     text = str(
                         payload.get("transcript") or payload.get("text") or ""
                     ).strip()
+                    if not self._commit_in_flight:
+                        # Manual 模式下 final 只可能由本服务的 commit 触发；
+                        # 没有在途 commit 的 final 是服务端对静音的无源幻觉，
+                        # 丢弃以免污染回合层（曾导致无限空回合自激）。
+                        logger.debug(
+                            "[DashScopeEvt] dropping unsolicited final (text_len={})",
+                            len(text),
+                        )
+                        continue
+                    self._commit_in_flight = False
+                    if self._commit_sent_at is not None:
+                        timeline_mark(
+                            "stt",
+                            "commit→final 往返",
+                            f"{time.time() - self._commit_sent_at:.3f}s text_len={len(text)}",
+                        )
+                        self._commit_sent_at = None
                     if text:
                         await self.emit_stt_usage_metrics()
                         await self.push_frame(
