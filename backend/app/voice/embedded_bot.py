@@ -22,6 +22,9 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.bus import BusBridgeProcessor
 from pipecat.frames.frames import (
     Frame,
@@ -40,6 +43,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.openai.llm import OpenAILLMService
@@ -48,9 +52,13 @@ from pipecat.workers.llm import LLMWorker
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
+)
 
 from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
 from app.voice.embedded_dashscope_stt import DashScopeSTTService
+from app.voice.embedded_timeline import insert_timeline_probes, timeline_enabled
 from app.voice.embedded_volcengine_tts import VolcengineTTSService
 
 load_dotenv(override=True)
@@ -59,6 +67,10 @@ load_dotenv(override=True)
 MAIN_WORKER_NAME = "learngraph"
 # 子 agent 名：将来加检索/任务 worker 时，用 activate_worker(name, ...) 做交接。
 TUTOR_WORKER_NAME = "tutor"
+# 前端手动打断用的 RTVI 自定义消息类型（须与
+# frontend/src/features/voice/voice-session-controller.tsx 的
+# VOICE_INTERRUPT_MESSAGE 保持一致）。
+VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt"
 
 SYSTEM_INSTRUCTION = (
     "你是一个友好的中文语音助手。你的回答会被直接朗读出来，"
@@ -219,6 +231,11 @@ transport_params = {
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting ChatGPT-style CN bot")
+    if timeline_enabled():
+        logger.info(
+            "VOICE_TIMELINE_DEBUG 已开启：本轮通话将输出 [VT] 单点计时时间线"
+            "（锚点=VAD 判定用户开口）"
+        )
 
     providers = _resolve_voice_provider_config(
         str(getattr(runner_args, "session_id", "") or "")
@@ -304,17 +321,61 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # runner 必须先建：BusBridgeProcessor 需要 runner.bus（进程内 AsyncQueueBus）。
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
+    # 回合边界参数（A1 拍板纳入 Settings，2026-09-12 起真正生效）：
+    # 三个 Smart Turn / VAD 旋钮默认 None = 交给 Pipecat 常量（库是唯一真源，
+    # 且 core/config.py 不得 import 可选的 pipecat extra）；显式设值才覆盖。
+    # 它们直接决定 §6.5.2 里"闭嘴 → 回合边界"的耗时，因此必须可调，
+    # 否则用户报的 EOU 延迟只能靠改代码收敛。
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    vad_params = (
+        VADParams(stop_secs=settings.voice_vad_stop_secs)
+        if settings.voice_vad_stop_secs
+        else None
+    )
+    smart_turn_overrides = {
+        key: value
+        for key, value in (
+            ("stop_secs", settings.voice_smart_turn_stop_secs),
+            ("pre_speech_ms", settings.voice_smart_turn_pre_speech_ms),
+        )
+        if value
+    }
+    stop_strategies = (
+        [
+            TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3(
+                    params=SmartTurnParams(**smart_turn_overrides)
+                )
+            )
+        ]
+        if smart_turn_overrides
+        else None
+    )
+    if vad_params or smart_turn_overrides:
+        logger.info(
+            "Voice turn tuning: vad_stop_secs={} smart_turn={} turn_stop_timeout={}",
+            settings.voice_vad_stop_secs,
+            smart_turn_overrides or "pipecat-default",
+            settings.voice_turn_stop_timeout,
+        )
+
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(params=vad_params),
+            # 硬上限：没有任何 stop 策略命中时，回合最多开多久。
+            user_turn_stop_timeout=settings.voice_turn_stop_timeout,
             # 保留既有回合策略：start 仍是自研策略（附和词过滤 + 真实打断），
-            # stop 保持缺省 —— UserTurnStrategies.__post_init__ 会回填
+            # stop 缺省时 —— UserTurnStrategies.__post_init__ 会回填
             # TurnAnalyzerUserTurnStopStrategy(LocalSmartTurnAnalyzerV3())，
-            # 即 Smart Turn v3 端点检测（实测确认，见设计文档 §4.1/§6.3）。
+            # 即 Smart Turn v3 端点检测（实测确认，见设计文档 §4.1/§6.3）；
+            # 只有在设置里显式给了 Smart Turn 参数时才换成显式实例。
             user_turn_strategies=UserTurnStrategies(
                 start=[AdaptiveUserTurnStartStrategy()],
+                stop=stop_strategies,
             ),
         ),
     )
@@ -329,22 +390,31 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         name=f"{MAIN_WORKER_NAME}::BusBridge",
     )
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            user_aggregator,
-            bridge,
-            tts,
-            latency,
-            transport.output(),
-            assistant_aggregator,
-        ]
-    )
+    # 排障用单点计时（VOICE_TIMELINE_DEBUG=1）：把「用户闭嘴 → 出文字 → 出
+    # 声音」拆成可分段的日志时间线；关闭时原样返回，不额外挂处理器。
+    pipeline_steps = [
+        transport.input(),
+        stt,
+        user_aggregator,
+        bridge,
+        tts,
+        latency,
+        transport.output(),
+        assistant_aggregator,
+    ]
+    pipeline = Pipeline(insert_timeline_probes(pipeline_steps))
 
     worker = PipelineWorker(
         pipeline,
         name=MAIN_WORKER_NAME,
+        # The default RTVI observer queues and flushes every bot-output segment
+        # when the first audio frame starts. That makes a fast LLM response appear
+        # in full before the browser has played it. Sentence markers emitted by
+        # VolcengineTTSService are the sole assistant caption source instead.
+        rtvi_observer_params=RTVIObserverParams(
+            bot_output_enabled=False,
+            bot_tts_enabled=False,
+        ),
         params=PipelineParams(
             # 显式声明，与 DashScope ASR(16k) / 火山 TTS(24k) 对齐，
             # 不依赖 Pipecat 默认值将来是否变化。
@@ -362,6 +432,24 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     # 子 agent 先注册、主 worker 后注册（与官方 local-handoff 同序）。
     await runner.add_workers(agent, worker)
+
+    # 客户端手动打断：走同一条 RTVI data channel，把一键打断落到这条管线自己的
+    # 打断路径上（与 VAD 自动打断完全同路），不依赖 HTTP 路由与进程内注册表。
+    # 浏览器在 data channel 上发 RTVI client-message：
+    #   {label:"rtvi-ai", type:"client-message", data:{t:VOICE_INTERRUPT_MESSAGE}}
+    try:
+        rtvi = worker.rtvi
+    except Exception:  # RTVI 被显式关闭时访问器会抛错；此时没有手动打断通道
+        rtvi = None
+
+    if rtvi is not None:
+
+        @rtvi.event_handler("on_client_message")
+        async def on_client_message(rtvi_processor, message):
+            if getattr(message, "type", "") != VOICE_INTERRUPT_MESSAGE:
+                return
+            logger.info("Client requested barge-in over RTVI; interrupting the bot")
+            await rtvi_processor.interrupt_bot()
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):

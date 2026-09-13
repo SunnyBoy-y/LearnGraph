@@ -682,8 +682,10 @@ class Settings(BaseSettings):
     # The three Smart Turn / VAD knobs default to ``None`` meaning "leave it to
     # Pipecat": the library's own constants are the single source of truth, and
     # this module must not import the optional ``pipecat`` extra. Set a value
-    # only to override, which is also what
-    # ``GET /api/v1/voice/sessions/{id}/runtime-config`` echoes back.
+    # only to override; ``embedded_bot.run_bot`` logs the effective values
+    # ("Voice turn tuning: ...") once per call, and they define the
+    # "user stopped speaking → turn boundary" latency documented in
+    # doc/LearnGraph_实时语音全双工管线接线设计_v1.0.md §6.5.2.
     voice_smart_turn_stop_secs: float | None = None
     voice_smart_turn_pre_speech_ms: float | None = None
     voice_vad_stop_secs: float | None = None
