@@ -68,6 +68,18 @@ x-app-environment: &app-environment
   LEARNGRAPH_STORAGE_ROOT: /data/storage
   LEARNGRAPH_MEMORY_ROOT: /data/memory
   LEARNGRAPH_VOICE_RUNTIME_EMBEDDED: ${LEARNGRAPH_VOICE_RUNTIME_EMBEDDED:-true}
+  # 语音回合结束（EOU）单点计时探针：1 = 每轮输出一条 [VT] 时间线，用于把
+  # 「用户闭嘴 → 出文字 → 出声音」拆成分段耗时；0（或缺省关闭）时管线里不会
+  # 多出任何处理器。见 backend/app/voice/embedded_timeline.py。
+  VOICE_TIMELINE_DEBUG: ${VOICE_TIMELINE_DEBUG:-0}
+  # DashScope ASR 的 commit 触发点：1 = VAD 判定停止即 commit（与 Smart Turn
+  # 推理并行）；0 = 等聚合器回合结束再 commit（旧行为，会把 commit→final 往返
+  # 串行压在回合边界之后）。排障对照用，缺省 1。
+  DASHSCOPE_ASR_COMMIT_ON_VAD_STOP: ${DASHSCOPE_ASR_COMMIT_ON_VAD_STOP:-1}
+  # 火山 TTS 文本投喂方式：1 = 句级真流式（同一 audio context 内一个 session、
+  # 每句一个 TaskRequest，并以首个音频包发送字幕进度标记）；0 = 旧的"每次调用一个
+  # session、整段一次投喂"。
+  VOLC_TTS_STREAMING: ${VOLC_TTS_STREAMING:-1}
 
   LEARNGRAPH_MAX_DOCUMENT_PARSE_BYTES: ${LEARNGRAPH_MAX_DOCUMENT_PARSE_BYTES:-209715200}
   LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: /data/sandbox-workspaces
@@ -75,8 +87,13 @@ x-app-environment: &app-environment
   # SSRF 公网校验的 fake-ip 容忍网段（逗号分隔 CIDR，默认空=严格公网校验）。
   # Clash 类本地代理 fake-ip 模式下（198.18.0.0/15）抓取被误拦时按需配置。
   LEARNGRAPH_SSRF_FAKE_IP_RANGES: ${LEARNGRAPH_SSRF_FAKE_IP_RANGES:-}
-  LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:18001}
-  LEARNGRAPH_SUBAPP_PREVIEW_PORT: "8001"
+  # Preview origin 默认值跟随 LEARNGRAPH_PREVIEW_PORT 联动（嵌套插值）：
+  # 只改端口时 origin 自动同步，无需再手动改两处。局域网/公网部署仍需显式
+  # 设置 LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN 为浏览器可访问的地址（如 http://192.168.x.x:PORT）。
+  LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN: ${LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN:-http://127.0.0.1:${LEARNGRAPH_PREVIEW_PORT:-18001}}
+  # 后端推导 preview origin 的 fallback 端口 = 宿主映射端口（原写死容器内 8001，
+  # 浏览器不可达；现跟随宿主端口，仅当 ORIGIN 未设置时生效）。
+  LEARNGRAPH_SUBAPP_PREVIEW_PORT: ${LEARNGRAPH_PREVIEW_PORT:-18001}
   # Host Service Bridge endpoint on the real machine. Leave EMPTY (default):
   # containerized profiles auto-derive http://host.docker.internal:34115
   # (see backend Settings.effective_host_bridge_url). Set explicitly only to
@@ -87,7 +104,7 @@ x-app-environment: &app-environment
   # host.docker.internal:同端口，无需 Bridge/token/注册/审计，仅建议 Windows/
   # macOS Docker Desktop 个人可信环境；沙箱容器绝不继承）| off（关闭全部改写）。
   LEARNGRAPH_HOST_ACCESS_MODE: ${LEARNGRAPH_HOST_ACCESS_MODE:-auto}
-  LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:18000","http://localhost:18000"]}
+  LEARNGRAPH_CORS_ORIGINS: ${LEARNGRAPH_CORS_ORIGINS:-["http://127.0.0.1:${LEARNGRAPH_PORT:-18000}","http://localhost:${LEARNGRAPH_PORT:-18000}"]}
   LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS: ${LEARNGRAPH_ALLOW_PRIVATE_BRIDGE_URLS:-true}
   LEARNGRAPH_SANDBOX_ENABLED: ${LEARNGRAPH_SANDBOX_ENABLED:-true}
   # Code release default wins when unset (config.py DEFAULT_SANDBOX_PREBUILT_IMAGE).
