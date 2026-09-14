@@ -17,7 +17,8 @@ from app.domain.schemas.practice import (
     PracticeSessionView,
     WrongBookView,
 )
-from app.providers.factory import model_provider_for_workspace
+from app.domain.settings import PRACTICE_EXERCISE_MODEL_SETTING_KEY
+from app.providers.factory import feature_model_target, model_provider_for_workspace
 from app.services.practice import PracticeService
 
 
@@ -33,7 +34,15 @@ def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> Practic
         db,
         context.workspace_id,
         context.principal.user_id,
-        model_provider_for_workspace(db, context.workspace_id, settings),
+        model_provider_for_workspace(
+            db,
+            context.workspace_id,
+            settings,
+            # 出题与判分走「练习」专属模型；未配置时回落工作区对话模型。
+            **feature_model_target(
+                db, context.workspace_id, PRACTICE_EXERCISE_MODEL_SETTING_KEY
+            ),
+        ),
         settings,
     )
 

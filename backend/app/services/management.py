@@ -38,6 +38,7 @@ from app.domain.settings import (
     CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
     FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
+    PRACTICE_EXERCISE_MODEL_SETTING_KEY,
 )
 from app.domain.schemas.management import (
     AccessAllowlistSettingValue,
@@ -4452,6 +4453,11 @@ class SettingsService:
             "default": {"provider_id": None, "model_id": None},
             "risk": "medium",
         },
+        PRACTICE_EXERCISE_MODEL_SETTING_KEY: {
+            "description": "Default model for practice exercise generation and grading",
+            "default": {"provider_id": None, "model_id": None},
+            "risk": "medium",
+        },
         FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY: {
             "description": "Capability-specific default Provider/model routing",
             "default": {},
@@ -4659,6 +4665,7 @@ class SettingsService:
             CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
             CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
             CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+            PRACTICE_EXERCISE_MODEL_SETTING_KEY,
         }:
             try:
                 value = ChatFeatureModelSettingValue.model_validate(value).model_dump()
@@ -4796,6 +4803,10 @@ class SettingsService:
         self.audit.record(actor_id=self.actor_id, action="settings.update", resource_type="setting", resource_id=key)
         self.db.commit()
         self.db.refresh(setting)
+        # Provider resolution caches workspace settings for a short TTL; drop
+        # this key so a freshly saved feature model (auto title, practice
+        # exercises, ...) takes effect on the very next request.
+        invalidate_provider_plan_cache(self.workspace_id, setting_key=key)
         if key in {"access.allowlist", "sandbox.egress"}:
             self._refresh_egress_policies()
         return setting

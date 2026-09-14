@@ -143,6 +143,7 @@ import {
   CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
   CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
   CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY,
+  PRACTICE_EXERCISE_MODEL_SETTING_KEY,
   isAsrVadAdaptive,
   isChatContextUsageEnabled,
   isChatDictationCleanupEnabled,
@@ -2646,6 +2647,14 @@ export function WorkspaceSettingsPage() {
       ),
     [settings.data],
   );
+  const exerciseModel = useMemo(
+    () =>
+      readChatFeatureModelSetting(
+        settings.data,
+        PRACTICE_EXERCISE_MODEL_SETTING_KEY,
+      ),
+    [settings.data],
+  );
   const activeWorkspace = useMemo(
     () =>
       (workspaces.data ?? []).find((item) => item.id === auth.workspaceId) ??
@@ -3293,7 +3302,7 @@ export function WorkspaceSettingsPage() {
 
       <Surface className="p-5">
         <SectionHeading
-          description="为自动标题、下一步问题提示、语音转写整理、记忆整理与 Embedding 选择模型；对话类功能留空则跟随对话当前模型。"
+          description="为自动标题、下一步问题提示、语音转写整理、练习出题与判分、记忆整理与 Embedding 选择模型；对话类功能留空则跟随对话当前模型。"
           title="功能模型"
         />
         <div className="mt-5 grid gap-3 lg:grid-cols-2">
@@ -3346,6 +3355,23 @@ export function WorkspaceSettingsPage() {
               options={[{ value: "default", label: "跟随对话模型" }, ...featureModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
               placeholder="跟随对话模型"
               value={featureModelValue(dictationCleanupModel.provider_id, dictationCleanupModel.model_id)}
+            />
+          </div>
+          <div className="rounded-xl border p-4">
+            <p className="text-sm font-medium">练习出题与判分模型</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              复习与练习中心的出题与简答题判分；建议选择支持思考的强模型，未配置时跟随对话模型
+            </p>
+            <SearchableFeatureModelSelect
+              ariaLabel="练习出题与判分模型"
+              disabled={saveFeatureModel.isPending || providers.isPending}
+              onValueChange={(value) => {
+                const parsed = parseFeatureModelValue(value);
+                saveFeatureModel.mutate({ key: PRACTICE_EXERCISE_MODEL_SETTING_KEY, ...parsed });
+              }}
+              options={[{ value: "default", label: "跟随对话模型" }, ...featureModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
+              placeholder="跟随对话模型"
+              value={featureModelValue(exerciseModel.provider_id, exerciseModel.model_id)}
             />
           </div>
           <div className="rounded-xl border p-4">

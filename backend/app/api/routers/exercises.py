@@ -10,7 +10,8 @@ from app.domain.schemas.learning import (
     ExerciseGenerateRequest,
     ExerciseView,
 )
-from app.providers.factory import model_provider_for_workspace
+from app.domain.settings import PRACTICE_EXERCISE_MODEL_SETTING_KEY
+from app.providers.factory import feature_model_target, model_provider_for_workspace
 from app.services.authorization import AuthorizationService
 from app.services.learning import ExerciseService
 
@@ -23,7 +24,15 @@ def service(db: DB, context: CurrentWorkspace, settings: AppSettings) -> Exercis
         db,
         context.workspace_id,
         context.principal.user_id,
-        model_provider_for_workspace(db, context.workspace_id, settings),
+        model_provider_for_workspace(
+            db,
+            context.workspace_id,
+            settings,
+            # 与「复习与练习中心」共用同一个专属出题模型入口。
+            **feature_model_target(
+                db, context.workspace_id, PRACTICE_EXERCISE_MODEL_SETTING_KEY
+            ),
+        ),
         settings,
     )
 

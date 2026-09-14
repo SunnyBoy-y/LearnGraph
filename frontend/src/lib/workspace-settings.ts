@@ -12,6 +12,8 @@ export const CHAT_DICTATION_CLEANUP_SETTING_KEY = "chat.dictation_cleanup";
 export const CHAT_CONTEXT_USAGE_SETTING_KEY = "chat.context_usage";
 export const CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY =
   "chat.dictation_cleanup_model";
+/** 复习与练习中心的出题与简答题判分模型；未配置时回落对话模型。 */
+export const PRACTICE_EXERCISE_MODEL_SETTING_KEY = "practice.exercise_model";
 /** ASR 显式语言选择（"auto" / zh-CN / en-US / 其他 BCP-47）。 */
 export const CHAT_ASR_LANGUAGE_SETTING_KEY = "chat.asr_language";
 /** ASR 热词表（术语/人名/代码标识符），paraformer-realtime-v2 原生支持。 */

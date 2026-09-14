@@ -357,6 +357,65 @@ def _functional_model_target(
     return provider_id, model_id
 
 
+def feature_model_target(
+    db: Session,
+    workspace_id: str,
+    setting_key: str,
+) -> dict[str, str]:
+    """Resolve a per-feature model setting into factory keyword arguments.
+
+    Feature models (``chat.auto_title_model``, ``practice.exercise_model``, ...)
+    all share the same paired ``{provider_id, model_id}`` setting shape, so the
+    result can be splatted straight into :func:`model_provider_for_workspace`.
+    An unset, half-set or unreadable setting resolves to ``{}`` so the caller
+    keeps falling back to the workspace default model instead of failing.
+    """
+
+    value = cached_workspace_setting_value(db, workspace_id, setting_key) or {}
+    if not isinstance(value, dict):
+        return {}
+    provider_id = str(value.get("provider_id") or "").strip()
+    model_id = str(value.get("model_id") or "").strip()
+    if not provider_id or not model_id:
+        return {}
+    return {"provider_id": provider_id, "model_id": model_id}
+
+
+def _pinned_model_rejection(capabilities: dict, model_id: str) -> str | None:
+    """Why an explicitly pinned model id must be treated as unusable.
+
+    Only covers the two facts the workspace actually owns: the model was deleted
+    from this Provider's list, or a discovery snapshot exists and does not
+    contain it any more. An empty catalog means "never discovered", so nothing
+    is asserted there.
+    """
+
+    hidden = {
+        str(item).strip()
+        for item in capabilities.get("hidden_model_ids") or []
+        if str(item).strip()
+    }
+    if model_id in hidden:
+        return (
+            "The selected model was removed from this Provider's model list; "
+            "pick another model or discover models again"
+        )
+    known = {
+        str(item).strip()
+        for item in capabilities.get("discovered_model_ids") or []
+        if str(item).strip()
+    }
+    known |= {
+        str(key).strip() for key in (capabilities.get("models") or {}) if str(key).strip()
+    }
+    if known and model_id not in known:
+        return (
+            "The selected model is no longer in this Provider's model list; "
+            "discover models again and pick one that still exists"
+        )
+    return None
+
+
 def model_provider_for_workspace(
     db: Session,
     workspace_id: str,
@@ -409,6 +468,18 @@ def model_provider_for_workspace(
                 provider_id=provider.id,
                 model_id=resolved_model_id or "unavailable",
             )
+        if selected_model_id:
+            # A caller-pinned model id is a claim about this Provider's catalog,
+            # so check it against the catalog we already have: a model the vendor
+            # dropped or the workspace deleted would otherwise only surface as an
+            # opaque upstream 404 minutes later, mid-generation.
+            rejection = _pinned_model_rejection(capabilities, selected_model_id)
+            if rejection:
+                return UnavailableModelProvider(
+                    rejection,
+                    provider_id=provider.id,
+                    model_id=selected_model_id,
+                )
         # A model identifier is not a protocol declaration.  Compatible
         # gateways (for example DashScope) can expose hosted DeepSeek models,
         # but still require their own OpenAI-compatible request shape.  Routing
