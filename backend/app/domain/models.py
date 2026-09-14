@@ -1531,6 +1531,40 @@ class Exercise(Base, TimestampMixin, WorkspaceScopedMixin):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class PracticeSession(Base, TimestampMixin, WorkspaceScopedMixin):
+    """One durable practice run (今日练习 / 自由练习 / 错题重练 / 节点练习).
+
+    The session owns the question list so a browser refresh can always resume
+    the run: answers live in ``AnswerRecord.practice_session_id`` while the
+    question order, hint texts and the mastery snapshot taken at start live in
+    ``source_metadata``. Nothing here computes mastery — the session only
+    records what the learner did.
+    """
+
+    __tablename__ = "practice_sessions"
+    __table_args__ = (
+        Index("ix_practice_sessions_workspace_status", "workspace_id", "status"),
+        Index("ix_practice_sessions_workspace_created", "workspace_id", "created_at"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    mode: Mapped[str] = mapped_column(String(32), default="scheduled")
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    planned_question_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_question_count: Mapped[int] = mapped_column(Integer, default=0)
+    node_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Question order, plan reasons, hint texts and mastery snapshots.
+    source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    first_try_correct_count: Mapped[int] = mapped_column(Integer, default=0)
+    final_correct_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class AnswerRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "answer_records"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -1539,6 +1573,18 @@ class AnswerRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     is_correct: Mapped[bool] = mapped_column(Boolean)
     feedback: Mapped[str] = mapped_column(Text)
     actor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Practice binding. Nullable so the legacy one-off answer endpoint (chat
+    # exercise cards, 题库卡片作答) keeps working unchanged.
+    practice_session_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    attempt_index: Mapped[int] = mapped_column(Integer, default=1)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    hint_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Partial-credit ratio for short answers (1.0 for objective question types).
+    score_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Fine-grained evaluation: covered/missing points, misconceptions, error_type.
+    evaluation_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class SubAppInteractionEvent(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -2623,8 +2669,11 @@ class ArtifactCardShareToken(Base, TimestampMixin, WorkspaceScopedMixin):
     """Revocable, read-only token scoped to one published card version.
 
     Opens a public HTML viewer page (sandboxed preview) instead of a file
-    download. The raw token is returned once; only a SHA-256 digest and a
-    display prefix are persisted.
+    download. Resolution always goes through the SHA-256 ``token_hash`` column;
+    the raw token additionally survives in master-key encrypted form so the
+    owner can re-copy an existing share link from 「已分享页面」. Rows created
+    before that column existed keep ``token_ciphertext`` NULL and cannot be
+    re-copied.
     """
 
     __tablename__ = "artifact_card_share_tokens"
@@ -2638,6 +2687,12 @@ class ArtifactCardShareToken(Base, TimestampMixin, WorkspaceScopedMixin):
     )
     created_by: Mapped[str] = mapped_column(String(64))
     token_hash: Mapped[str] = mapped_column(String(64), index=True)
+    # Encrypted raw token (master-key Fernet); NULL when the row predates the
+    # column or encryption was unavailable at creation time.
+    token_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_algorithm: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    token_key_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    token_key_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     token_prefix: Mapped[str] = mapped_column(String(16))
     label: Mapped[str] = mapped_column(String(120), default="")
     expires_at: Mapped[datetime | None] = mapped_column(
@@ -3339,3 +3394,229 @@ class AdvisoryLock(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(120), primary_key=True)
     token: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+# Durable full-duplex voice control plane.  These rows deliberately live in
+# the shared ORM metadata so SQLite/Postgres workers observe the same session
+# and event cursor after a restart.
+class VoiceSessionRecord(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "voice_sessions"
+    __table_args__ = (
+        Index("ix_voice_sessions_tenant_owner", "tenant_id", "owner_user_id"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    chat_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), default="local-tenant", server_default="local-tenant", index=True
+    )
+    owner_user_id: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="active", index=True)
+    peer_connection_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    peer_generation: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    runtime_owner_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    max_thinking_mode: Mapped[str] = mapped_column(String(16), default="high")
+    event_seq: Mapped[int] = mapped_column(Integer, default=0)
+    session_epoch: Mapped[int] = mapped_column(Integer, default=1)
+    model_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    provider_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    runtime_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    signaling_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    context_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class VoiceTurnRecord(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "voice_turns"
+    __table_args__ = (
+        UniqueConstraint("voice_session_id", "client_message_id", name="uq_voice_turn_idempotency"),
+        Index("ix_voice_turns_session_created", "voice_session_id", "created_at"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    voice_session_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), default="local-tenant", server_default="local-tenant", index=True
+    )
+    chat_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    client_message_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="accepted", index=True)
+    user_text: Mapped[str] = mapped_column(Text, default="")
+    assistant_text: Mapped[str] = mapped_column(Text, default="")
+    # Why a terminal turn produced no answer ("llm_error", "turn_idle_timeout",
+    # ...). A failed turn still keeps the user's question in the transcript so a
+    # refresh cannot silently drop it; this column is what lets the client show
+    # a retry affordance instead of an empty bubble.
+    failure_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    context_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class VoiceEventRecord(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "voice_events"
+    __table_args__ = (
+        UniqueConstraint("voice_session_id", "event_seq", name="uq_voice_event_seq"),
+        UniqueConstraint("voice_session_id", "request_id", "event_type", name="uq_voice_event_request"),
+        Index("ix_voice_events_session_seq", "voice_session_id", "event_seq"),
+    )
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    voice_session_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), default="local-tenant", server_default="local-tenant", index=True
+    )
+    session_epoch: Mapped[int] = mapped_column(Integer, default=1)
+    turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    event_seq: Mapped[int] = mapped_column(Integer)
+    request_id: Mapped[str] = mapped_column(String(96), index=True)
+    # The physical column must stay ``event_type``: ``uq_voice_event_request``
+    # (and every ORM filter in ``app.voice.service``) addresses it by that name.
+    # A ``mapped_column("type", ...)`` alias here made the unique constraint
+    # unresolvable at import time, which took the whole application down.
+    event_type: Mapped[str] = mapped_column(String(96), index=True)
+    phase: Mapped[str] = mapped_column(String(24), default="authoritative")
+    causality: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    audio_cursor_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class VoiceTaskLinkRecord(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "voice_task_links"
+    __table_args__ = (
+        UniqueConstraint("voice_session_id", "subagent_id", name="uq_voice_task_link"),
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_voice_task_idempotency"),
+        Index("ix_voice_task_links_session_requirement", "voice_session_id", "requirement_version"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    voice_session_id: Mapped[str] = mapped_column(String(64), index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), default="local-tenant", server_default="local-tenant", index=True
+    )
+    subagent_id: Mapped[str] = mapped_column(String(120), index=True)
+    chat_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    trigger_turn_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    thinking_mode: Mapped[str] = mapped_column(String(16), default="off")
+    title: Mapped[str] = mapped_column(String(200), default="")
+    original_prompt: Mapped[str] = mapped_column(Text, default="")
+    current_prompt: Mapped[str] = mapped_column(Text, default="")
+    requirement_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1"
+    )
+    latest_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    last_observed_event_seq: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    latest_result_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    allowed_tools: Mapped[list[str]] = mapped_column(JSON, default=list)
+    auto_delivery: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1"
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_checkpoint_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class VoiceResultInboxRecord(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Durable result envelope produced by a linked background Agent task.
+
+    The task row remains the execution fact. This table is the delivery-facing
+    projection: it freezes the result version, requirement version and safe
+    payload that the foreground tutor may later choose to speak.
+    """
+
+    __tablename__ = "voice_result_inbox"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "dedupe_key", name="uq_voice_result_dedupe"),
+        UniqueConstraint(
+            "voice_session_id",
+            "subagent_id",
+            "result_version",
+            name="uq_voice_result_version",
+        ),
+        Index("ix_voice_result_inbox_ready", "voice_session_id", "status", "available_at"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    voice_session_id: Mapped[str] = mapped_column(String(64), index=True)
+    task_link_id: Mapped[str] = mapped_column(
+        ForeignKey("voice_task_links.id", ondelete="CASCADE"), index=True
+    )
+    subagent_id: Mapped[str] = mapped_column(String(120), index=True)
+    requirement_version: Mapped[int] = mapped_column(Integer, default=1)
+    result_version: Mapped[int] = mapped_column(Integer, default=1)
+    dedupe_key: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(24), default="ready", index=True)
+    result_type: Mapped[str] = mapped_column(String(40), default="agent_result")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    safe_error: Mapped[str] = mapped_column(String(160), default="")
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    dismissed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stale_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class VoiceSpeechDeliveryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Idempotent record that a result was handed to the foreground tutor.
+
+    This is not a claim that every audio sample played. It proves the result
+    was claimed for delivery once and lets reconnect recovery distinguish a
+    ready result from one already spoken.
+    """
+
+    __tablename__ = "voice_speech_deliveries"
+    __table_args__ = (
+        UniqueConstraint("result_id", name="uq_voice_delivery_result"),
+        UniqueConstraint(
+            "workspace_id", "idempotency_key", name="uq_voice_delivery_idempotency"
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    voice_session_id: Mapped[str] = mapped_column(String(64), index=True)
+    result_id: Mapped[str] = mapped_column(
+        ForeignKey("voice_result_inbox.id", ondelete="CASCADE"), index=True
+    )
+    subagent_id: Mapped[str] = mapped_column(String(120), index=True)
+    requirement_version: Mapped[int] = mapped_column(Integer, default=1)
+    result_version: Mapped[int] = mapped_column(Integer, default=1)
+    idempotency_key: Mapped[str] = mapped_column(String(160))
+    speech_id: Mapped[str] = mapped_column(String(64), default=new_id)
+    status: Mapped[str] = mapped_column(String(24), default="delivered")
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    interrupted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    playback_cursor_ms: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

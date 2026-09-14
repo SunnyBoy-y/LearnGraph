@@ -754,6 +754,30 @@ def init_database() -> None:
     _verify_schema_revisions()
 
 
+def ensure_voice_event_type_column(connection: Any) -> None:
+    """Rename a legacy ``voice_events.type`` column to ``event_type``.
+
+    An earlier revision of ``VoiceEventRecord`` aliased the attribute to a
+    physically named ``type`` column. Any database that already created that
+    table (Docker data volumes) must be brought back to the canonical name,
+    because ``uq_voice_event_request`` and every ORM filter address the column
+    as ``event_type``. Idempotent: a missing table or an already-correct table
+    is a no-op.
+    """
+
+    from sqlalchemy import inspect
+
+    inspector = inspect(connection)
+    if not inspector.has_table("voice_events"):
+        return
+    columns = {str(column["name"]) for column in inspector.get_columns("voice_events")}
+    if "event_type" in columns or "type" not in columns:
+        return
+    connection.exec_driver_sql(
+        'ALTER TABLE voice_events RENAME COLUMN "type" TO event_type'
+    )
+
+
 def _apply_sqlite_subapp_persistence_migration() -> None:
     """T2.3 additive tables; never rebuild existing SQLite tables or foreign keys."""
 
@@ -765,6 +789,7 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
     # additive-column ledger below.  In particular, do not rebuild the existing
     # ``subapp_interaction_events`` table merely to add a foreign key.
     with engine.begin() as connection:
+        ensure_voice_event_type_column(connection)
         for table_name in (
             "subapp_sessions",
             "subapp_states",
@@ -778,6 +803,10 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
             "sandbox_workspaces",
             "sandbox_jobs",
             "sandbox_reservations",
+            "voice_sessions",
+            "voice_turns",
+            "voice_events",
+            "voice_task_links",
         ):
             Base.metadata.tables[table_name].create(connection, checkfirst=True)
 
@@ -785,8 +814,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.6.0"
-CURRENT_SCHEMA_DESCRIPTION = "Add optional user-selected graph cover data"
+CURRENT_SCHEMA_REVISION = "v1.8.0"
+CURRENT_SCHEMA_DESCRIPTION = "Voice result inbox, idempotent delivery, revision and peer isolation; voice turn failure reasons"
 
 
 def _compute_schema_checksum() -> str:
@@ -1272,8 +1301,22 @@ def _apply_sqlite_additive_migrations() -> None:
             "rubric_json": "JSON NOT NULL DEFAULT '{}'",
             "metadata_json": "JSON NOT NULL DEFAULT '{}'",
         },
+        "voice_turns": {
+            # A terminal voice turn that produced no answer records *why*, so the
+            # client can render a retry affordance instead of an empty bubble.
+            # Additive: existing rows stay NULL and keep reading as finalized or
+            # interrupted turns.
+            "failure_reason": "VARCHAR(120)",
+        },
         "answer_records": {
             "actor_id": "VARCHAR(64)",
+            # Practice Session 绑定与逐次作答评价（旧行保持默认值，仍可正常读取）。
+            "practice_session_id": "VARCHAR(36)",
+            "attempt_index": "INTEGER NOT NULL DEFAULT 1",
+            "duration_ms": "INTEGER NOT NULL DEFAULT 0",
+            "hint_count": "INTEGER NOT NULL DEFAULT 0",
+            "score_ratio": "FLOAT",
+            "evaluation_json": "JSON NOT NULL DEFAULT '{}'",
         },
         "sandbox_destructive_grants": {
             "command_intent_digest": "VARCHAR(64)",
@@ -1388,6 +1431,14 @@ def _apply_sqlite_additive_migrations() -> None:
         },
         "graphs": {
             "cover_svg": "TEXT",
+        },
+        # 「已分享页面」管理视图需要能再次复制既有分享链接：原始令牌以
+        # master-key 加密形式随行保存（旧行保持 NULL，只能重新生成链接）。
+        "artifact_card_share_tokens": {
+            "token_ciphertext": "TEXT",
+            "token_algorithm": "VARCHAR(40)",
+            "token_key_provider": "VARCHAR(32)",
+            "token_key_version": "INTEGER",
         },
     }
     with engine.begin() as connection:

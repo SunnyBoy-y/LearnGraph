@@ -38,6 +38,7 @@ from app.domain.models import (
     MigrationJob,
     PluginRecord,
     PriceVersion,
+    PracticeSession,
     ProviderConfig,
     ProviderResponseState,
     ResearchJob,
@@ -46,6 +47,12 @@ from app.domain.models import (
     SuggestedPromptBatch,
     UsageEvent,
     WorkspaceSetting,
+    VoiceEventRecord,
+    VoiceResultInboxRecord,
+    VoiceSessionRecord,
+    VoiceSpeechDeliveryRecord,
+    VoiceTaskLinkRecord,
+    VoiceTurnRecord,
 )
 from app.repositories.scoped import ScopedRepository
 
@@ -190,6 +197,11 @@ class AnswerRepository(ScopedRepository[AnswerRecord]):
         super().__init__(db, AnswerRecord, workspace_id)
 
 
+class PracticeSessionRepository(ScopedRepository[PracticeSession]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, PracticeSession, workspace_id)
+
+
 class MemoryRepository(ScopedRepository[MemoryRecord]):
     def __init__(self, db: Session, workspace_id: str) -> None:
         super().__init__(db, MemoryRecord, workspace_id)
@@ -263,3 +275,173 @@ class MigrationRepository(ScopedRepository[MigrationJob]):
 class SettingRepository(ScopedRepository[WorkspaceSetting]):
     def __init__(self, db: Session, workspace_id: str) -> None:
         super().__init__(db, WorkspaceSetting, workspace_id)
+
+
+class VoiceSessionRepository(ScopedRepository[VoiceSessionRecord]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, VoiceSessionRecord, workspace_id)
+
+    def get_owned(
+        self, voice_session_id: str, *, tenant_id: str, owner_user_id: str
+    ) -> VoiceSessionRecord | None:
+        return self.db.scalar(
+            self.query().where(
+                VoiceSessionRecord.id == voice_session_id,
+                VoiceSessionRecord.tenant_id == tenant_id,
+                VoiceSessionRecord.owner_user_id == owner_user_id,
+            )
+        )
+
+    def find_active_for_chat(
+        self,
+        chat_session_id: str,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+    ) -> VoiceSessionRecord | None:
+        return self.db.scalar(
+            self.query()
+            .where(
+                VoiceSessionRecord.chat_session_id == chat_session_id,
+                VoiceSessionRecord.tenant_id == tenant_id,
+                VoiceSessionRecord.owner_user_id == owner_user_id,
+                VoiceSessionRecord.status == "active",
+            )
+            .order_by(VoiceSessionRecord.updated_at.desc())
+        )
+
+
+class VoiceTurnRepository(ScopedRepository[VoiceTurnRecord]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, VoiceTurnRecord, workspace_id)
+
+    def get_for_session(
+        self, voice_session_id: str, turn_id: str
+    ) -> VoiceTurnRecord | None:
+        return self.db.scalar(
+            self.query().where(
+                VoiceTurnRecord.voice_session_id == voice_session_id,
+                VoiceTurnRecord.id == turn_id,
+            )
+        )
+
+
+class VoiceEventRepository(ScopedRepository[VoiceEventRecord]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, VoiceEventRecord, workspace_id)
+
+
+class VoiceTaskLinkRepository(ScopedRepository[VoiceTaskLinkRecord]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, VoiceTaskLinkRecord, workspace_id)
+
+    def get_by_subagent(
+        self,
+        voice_session_id: str,
+        subagent_id: str,
+        *,
+        tenant_id: str,
+    ) -> VoiceTaskLinkRecord | None:
+        return self.db.scalar(
+            self.query().where(
+                VoiceTaskLinkRecord.voice_session_id == voice_session_id,
+                VoiceTaskLinkRecord.subagent_id == subagent_id,
+                VoiceTaskLinkRecord.tenant_id == tenant_id,
+            )
+        )
+
+    def get_by_idempotency_key(
+        self, idempotency_key: str, *, tenant_id: str
+    ) -> VoiceTaskLinkRecord | None:
+        if not idempotency_key:
+            return None
+        return self.db.scalar(
+            self.query().where(
+                VoiceTaskLinkRecord.tenant_id == tenant_id,
+                VoiceTaskLinkRecord.idempotency_key == idempotency_key
+            )
+        )
+
+    def list_for_session(
+        self, voice_session_id: str, *, tenant_id: str
+    ) -> list[VoiceTaskLinkRecord]:
+        return list(
+            self.db.scalars(
+                self.query()
+                .where(VoiceTaskLinkRecord.tenant_id == tenant_id)
+                .where(VoiceTaskLinkRecord.voice_session_id == voice_session_id)
+                .order_by(VoiceTaskLinkRecord.created_at.asc())
+            ).all()
+        )
+
+
+class VoiceResultInboxRepository(ScopedRepository[VoiceResultInboxRecord]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, VoiceResultInboxRecord, workspace_id)
+
+    def get_by_dedupe_key(
+        self, dedupe_key: str, *, tenant_id: str
+    ) -> VoiceResultInboxRecord | None:
+        return self.db.scalar(
+            self.query().where(
+                VoiceResultInboxRecord.tenant_id == tenant_id,
+                VoiceResultInboxRecord.dedupe_key == dedupe_key,
+            )
+        )
+
+    def list_for_session(
+        self,
+        voice_session_id: str,
+        *,
+        tenant_id: str,
+        include_terminal: bool = True,
+        limit: int = 50,
+    ) -> list[VoiceResultInboxRecord]:
+        query = self.query().where(
+            VoiceResultInboxRecord.tenant_id == tenant_id,
+            VoiceResultInboxRecord.voice_session_id == voice_session_id
+        )
+        if not include_terminal:
+            query = query.where(
+                VoiceResultInboxRecord.status.in_((
+                    "pending",
+                    "ready",
+                    "failed",
+                    "stale",
+                ))
+            )
+        return list(
+            self.db.scalars(
+                query.order_by(
+                    VoiceResultInboxRecord.available_at.desc(),
+                    VoiceResultInboxRecord.result_version.desc(),
+                ).limit(max(1, min(int(limit), 200)))
+            ).all()
+        )
+
+
+class VoiceSpeechDeliveryRepository(ScopedRepository[VoiceSpeechDeliveryRecord]):
+    def __init__(self, db: Session, workspace_id: str) -> None:
+        super().__init__(db, VoiceSpeechDeliveryRecord, workspace_id)
+
+    def get_by_result(
+        self, result_id: str, *, tenant_id: str
+    ) -> VoiceSpeechDeliveryRecord | None:
+        return self.db.scalar(
+            self.query().where(
+                VoiceSpeechDeliveryRecord.tenant_id == tenant_id,
+                VoiceSpeechDeliveryRecord.result_id == result_id,
+            )
+        )
+
+    def get_by_idempotency_key(
+        self, idempotency_key: str, *, tenant_id: str
+    ) -> VoiceSpeechDeliveryRecord | None:
+        if not idempotency_key:
+            return None
+        return self.db.scalar(
+            self.query().where(
+                VoiceSpeechDeliveryRecord.tenant_id == tenant_id,
+                VoiceSpeechDeliveryRecord.idempotency_key == idempotency_key,
+            )
+        )

@@ -8,6 +8,7 @@ from sqlalchemy import inspect
 from sqlalchemy.engine import Connection
 
 from app.domain.migration_models import SchemaRevision
+from app.core.migrations.voice_reliability import apply_voice_reliability_migration
 from app.domain.models import SubAppInteractionEvent, utc_now
 
 
@@ -257,6 +258,51 @@ def _graph_cover_column(connection: Connection) -> None:
         connection.exec_driver_sql("ALTER TABLE graphs ADD COLUMN cover_svg TEXT")
 
 
+def _voice_foundation(connection: Connection) -> None:
+    """Create the durable full-duplex voice control-plane tables.
+
+    ``create_all`` covers new databases; this additive revision is needed for
+    existing installations and is intentionally idempotent for rolling
+    deploys/multi-worker startup.
+    """
+    from app.domain.models import (
+        VoiceEventRecord,
+        VoiceSessionRecord,
+        VoiceTaskLinkRecord,
+        VoiceTurnRecord,
+    )
+
+    from app.core.database import ensure_voice_event_type_column
+
+    ensure_voice_event_type_column(connection)
+    for table in (
+        VoiceSessionRecord.__table__,
+        VoiceTurnRecord.__table__,
+        VoiceEventRecord.__table__,
+        VoiceTaskLinkRecord.__table__,
+    ):
+        table.create(bind=connection, checkfirst=True)
+
+
+def _voice_turn_failure_reason(connection: Connection) -> None:
+    """Add ``voice_turns.failure_reason`` for pre-existing installations.
+
+    ``create_all`` covers new databases; this keeps an upgraded database able to
+    explain a turn that ended without an answer. Idempotent, like every other
+    additive revision here.
+    """
+
+    from sqlalchemy import inspect
+
+    inspector = inspect(connection)
+    if not inspector.has_table("voice_turns"):
+        return
+    columns = {str(column["name"]) for column in inspector.get_columns("voice_turns")}
+    if "failure_reason" in columns:
+        return
+    connection.exec_driver_sql("ALTER TABLE voice_turns ADD COLUMN failure_reason VARCHAR(120)")
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -305,6 +351,21 @@ MIGRATIONS = (
         "v1.6.0",
         "Add optional user-selected graph cover data",
         _graph_cover_column,
+    ),
+    SchemaMigration(
+        "v1.7.0",
+        "Durable full-duplex voice sessions, turns, events and task links",
+        _voice_foundation,
+    ),
+    SchemaMigration(
+        "v1.7.1",
+        "Record why a completed voice turn produced no answer",
+        _voice_turn_failure_reason,
+    ),
+    SchemaMigration(
+        "v1.8.0",
+        "Voice result inbox, idempotent delivery, revision and peer isolation",
+        apply_voice_reliability_migration,
     ),
 )
 

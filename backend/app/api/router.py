@@ -28,6 +28,7 @@ from app.api.routers import (
     mcp_skills,
     migrations,
     plugins,
+    practice,
     providers,
     research,
     sources,
@@ -63,6 +64,7 @@ for router in (
     sandbox_net.router,
     evidence.router,
     exercises.router,
+    practice.router,
     # Memory V2 static routes must be registered before V1 /memory/{memory_id}.
     memory_v2.router,
     tasks.router,

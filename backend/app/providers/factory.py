@@ -365,6 +365,7 @@ def model_provider_for_workspace(
     thinking_mode: str | None = None,
     search_route: str | None = None,
     provider_id: str | None = None,
+    disable_thinking_fallback: bool = False,
 ) -> ModelProviderPort:
     if provider_id is None and model_id is None:
         provider_id, model_id = _functional_model_target(
@@ -594,6 +595,7 @@ def model_provider_for_workspace(
                 resolved_model_id,
                 thinking_mode=thinking_mode,
                 search_route=search_route,
+                disable_thinking_fallback=disable_thinking_fallback,
             )
         except ModelCapabilityError as exc:
             return UnavailableModelProvider(

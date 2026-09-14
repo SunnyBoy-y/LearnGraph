@@ -43,7 +43,13 @@ class ProviderInvalidUrlError(ProviderHTTPError):
 
 
 def _strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Convert a Pydantic schema to the strict structured-output subset."""
+    """Convert a Pydantic schema to the strict structured-output subset.
+
+    This shape exists for the *request*: OpenAI-style ``json_schema`` mode wants
+    every property required, no extra properties, and no unsupported keywords.
+    It must never be used to validate what the model returns — see
+    :meth:`_StreamingHTTPProvider._validate_structured_result`.
+    """
 
     def convert(node: object) -> object:
         if isinstance(node, list):
@@ -523,6 +529,16 @@ class _StreamingHTTPProvider:
         result: object,
         schema: dict[str, Any],
     ) -> dict[str, Any]:
+        """Structurally sanity-check the model's JSON.
+
+        Validate against the *authored* schema (what the caller asked for), never
+        the strict request variant: the strict shape marks fields that carry
+        defaults as ``required`` and forbids extra properties, so a perfectly
+        usable answer — an omitted empty ``rubric_points`` array, or one extra
+        explanation key — would be rejected and the caller left with an opaque
+        "structured generation failed" after the retries. Semantics stay with
+        the caller's Pydantic model; this is only a structural gate.
+        """
         if not isinstance(result, dict):
             raise ProviderResponseError("Structured result must be an object")
         try:
@@ -1107,7 +1123,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
             raise ProviderResponseError("Responses output contains no single structured text result")
         result = _parse_json_object_text(texts[0])
         self.last_usage = self._usage_from_response(response)
-        return self._validate_structured_result(result, wire_schema)
+        return self._validate_structured_result(result, schema)
 
 
 class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
@@ -1500,6 +1516,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         prompt: str,
         schema_name: str,
         wire_schema: dict[str, Any],
+        response_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         schema_json = json.dumps(wire_schema, ensure_ascii=False, separators=(",", ":"))
         messages = [
@@ -1529,12 +1546,14 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             raise ProviderResponseError("Provider response contains no chat text") from exc
         result = _parse_json_object_text(content)
         self.last_usage = self._usage_from_chat_chunk(response.get("usage")) or {}
-        return self._validate_structured_result(result, wire_schema)
+        return self._validate_structured_result(
+            result, response_schema if response_schema is not None else wire_schema
+        )
 
     def generate_json(self, prompt: str, schema_name: str, schema: dict[str, Any]) -> dict[str, Any]:
         wire_schema = _strict_json_schema(schema)
         if self.capabilities.get("supports_structured_output") is False:
-            return self._generate_prompted_json(prompt, schema_name, wire_schema)
+            return self._generate_prompted_json(prompt, schema_name, wire_schema, schema)
         if self.structured_output_mode == "json_object":
             schema_json = json.dumps(wire_schema, ensure_ascii=False, separators=(",", ":"))
             messages = [
@@ -1581,7 +1600,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             "output_tokens": int(usage.get("completion_tokens") or 0),
             "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
         }
-        return self._validate_structured_result(result, wire_schema)
+        return self._validate_structured_result(result, schema)
 
 
 class QwenChatProvider(OpenAICompatibleChatProvider):
@@ -1882,6 +1901,7 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
                 prompt,
                 schema_name,
                 _strict_json_schema(schema),
+                schema,
             )
         original_options = self.call_options
         if original_options is not None:

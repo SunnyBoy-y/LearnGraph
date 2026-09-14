@@ -28,6 +28,14 @@ SEARCH_ROUTES: tuple[SearchRoute, ...] = (
 )
 IMAGE_INPUT_MODES: tuple[ImageInputMode, ...] = ("native", "external_vision", "auto")
 
+# ``reasoning_effort`` has no "disabled" tier: every gateway that speaks it also
+# offers a separate boolean switch (DashScope, DeepSeek relays, vLLM, SGLang...).
+# A model whose snapshot maps ``off -> null`` therefore cannot turn thinking off
+# through its declared parameter — the request just omits every thinking field
+# and the upstream silently keeps thinking on. Batch callers that explicitly ask
+# for the fallback get this switch instead.
+DISABLE_THINKING_PARAMETER = "enable_thinking"
+
 
 class ModelCapabilityError(ValueError):
     """The requested call mode is not supported by the selected model snapshot."""
@@ -112,6 +120,7 @@ def resolve_model_call_options(
     *,
     thinking_mode: str | None = None,
     search_route: str | None = None,
+    disable_thinking_fallback: bool = False,
 ) -> ModelCallOptions:
     resolved = _model_capabilities(capabilities, model_id)
     requested_thinking = thinking_mode or resolved.get("default_thinking_mode") or "off"
@@ -125,6 +134,21 @@ def resolve_model_call_options(
     raw_mapping = resolved.get("thinking_mapping") or {}
     if not isinstance(raw_mapping, dict):
         raise ModelCapabilityError("Model thinking_mapping must be an object")
+
+    if requested_thinking != "off" and requested_thinking not in efforts:
+        # Prefer the nearest lower tier, then the lowest offered tier, then
+        # off. A provider capability gap must degrade instead of crashing a
+        # durable voice task.
+        supported = [mode for mode in THINKING_MODES if mode in efforts]
+        requested_index = THINKING_MODES.index(requested_thinking)
+        lower = [
+            mode
+            for mode in supported
+            if THINKING_MODES.index(mode) <= requested_index
+        ]
+        requested_thinking = (
+            lower[-1] if lower else supported[0] if supported else "off"
+        )
 
     if requested_thinking == "off":
         actual = raw_mapping.get("off")
@@ -160,6 +184,24 @@ def resolve_model_call_options(
         raise ModelCapabilityError("Unsupported reasoning parameter mapping")
     provider_options: dict[str, Any] = {}
     if parameter == "enable_thinking":
+        if requested_thinking != "off" and requested_thinking not in efforts:
+            # Provider/model snapshots differ in which reasoning tiers they
+            # expose. Prefer the closest lower tier, then the lowest offered
+            # tier, and finally off so a background task never dies merely
+            # because the UI request asked for a stronger mode than the model
+            # declares.
+            supported = [mode for mode in THINKING_MODES if mode in efforts]
+            requested_index = THINKING_MODES.index(requested_thinking)
+            lower = [
+                mode
+                for mode in supported
+                if THINKING_MODES.index(mode) <= requested_index
+            ]
+            requested_thinking = (
+                lower[-1] if lower else supported[0] if supported else "off"
+            )
+
+
         if requested_thinking == "off":
             provider_options["enable_thinking"] = False
         elif isinstance(actual, bool):
@@ -180,6 +222,21 @@ def resolve_model_call_options(
             provider_options["thinking_budget"] = actual
     elif parameter == "thinking":
         provider_options["thinking"] = actual
+
+    if (
+        disable_thinking_fallback
+        and requested_thinking == "off"
+        and actual is None
+        and parameter in {"reasoning_effort", "reasoning.effort", "thinking"}
+    ):
+        # ``off`` was requested and is inexpressible through the declared
+        # parameter, so the request would otherwise carry no thinking field at
+        # all and the upstream would keep its own default (thinking on). Batch
+        # callers opt into this fallback so "fast mode" really means fast.
+        if parameter == "thinking":
+            provider_options["thinking"] = {"type": "disabled"}
+        else:
+            provider_options[DISABLE_THINKING_PARAMETER] = False
 
     requested_route = search_route or resolved.get("default_search_route") or "auto"
     if requested_route not in SEARCH_ROUTES:
