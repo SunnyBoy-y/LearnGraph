@@ -100,7 +100,6 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -273,12 +272,40 @@ function parserCapabilityForFile(
   );
 }
 
+/**
+ * 可执行文件 / 脚本 / 磁盘镜像：与后端 `SPECIAL_BINARY_EXTENSIONS` 对齐。
+ * 上传前先给即时提示，服务端仍会二次校验（前端提示不是安全边界）。
+ */
+const BLOCKED_UPLOAD_EXTENSIONS = new Set([
+  ".exe",
+  ".dll",
+  ".so",
+  ".dylib",
+  ".msi",
+  ".bat",
+  ".cmd",
+  ".com",
+  ".scr",
+  ".sys",
+  ".apk",
+  ".dmg",
+  ".iso",
+  ".img",
+  ".bin",
+  ".appimage",
+]);
+
+/** 小写扩展名（含点）；无扩展名时返回空串。 */
+function uploadExtension(name: string) {
+  const index = name.lastIndexOf(".");
+  if (index <= 0) return "";
+  return name.slice(index).toLowerCase();
+}
+
 export function SourcesPage() {
   const inputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const [webUrl, setWebUrl] = useState("");
-  const [webDialogOpen, setWebDialogOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
@@ -329,7 +356,15 @@ export function SourcesPage() {
   }, [upload.mutate]);
   // 稳定的上传入口，供整页拖入监听器复用
   const uploadFiles = useCallback((selectedFiles: FileList | File[]) => {
-    for (const file of Array.from(selectedFiles)) uploadRef.current(file);
+    for (const file of Array.from(selectedFiles)) {
+      if (BLOCKED_UPLOAD_EXTENSIONS.has(uploadExtension(file.name))) {
+        toast.error(
+          `「${file.name}」属于可执行文件/脚本/磁盘镜像，资料库不接受此类文件。`,
+        );
+        continue;
+      }
+      uploadRef.current(file);
+    }
   }, []);
   const download = useMutation({
     mutationFn: async (file: FileRecord) => {
@@ -427,17 +462,6 @@ export function SourcesPage() {
         queryClient.invalidateQueries({ queryKey: ["files"] }),
         queryClient.invalidateQueries({ queryKey: ["files-storage-summary"] }),
       ]);
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const fetchPage = useMutation({
-    mutationFn: () => fetchSource(webUrl.trim()),
-    onSuccess: (source) => {
-      toast.success(`已保存网页“${source.title}”`);
-      setWebUrl("");
-      setWebDialogOpen(false);
-      setSourceAssociation(source);
-      void queryClient.invalidateQueries({ queryKey: ["source-records"] });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -597,7 +621,7 @@ export function SourcesPage() {
     });
   };
   return (
-    <PageFrame>
+    <PageFrame className="max-w-[1600px] gap-4 pb-16">
       {dropActive
         ? createPortal(
             <div
@@ -651,9 +675,10 @@ export function SourcesPage() {
         type="file"
       />
 
+      {/* 概况：一行纯文本，层级靠字重与字号；不再单独套 Card。 */}
       <div
         aria-label="资料库概况"
-        className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground"
+        className="flex flex-wrap items-center gap-x-5 gap-y-2 text-[13px] text-muted-foreground"
       >
         <span>
           <strong className="font-semibold tabular-nums text-foreground">
@@ -669,25 +694,12 @@ export function SourcesPage() {
         </span>
         <span>
           <strong className="font-semibold tabular-nums text-foreground">
-            {pending}
-          </strong>{" "}
-          个未建索引
-        </span>
-        <span>
-          <strong className="font-semibold tabular-nums text-foreground">
             {attachmentOnly}
           </strong>{" "}
-          个仅附件（直接使用）
-        </span>
-        <span>
-          <strong className="font-semibold tabular-nums text-foreground">
-            {failed}
-          </strong>{" "}
-          个解析失败
+          个仅附件
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <HardDrive className="size-3.5" aria-hidden="true" />
-          总占用{" "}
+          <HardDrive aria-hidden="true" className="size-3.5" />
           <strong className="font-semibold tabular-nums text-foreground">
             {bytes(
               storageSummary.data?.total_bytes ??
@@ -698,35 +710,76 @@ export function SourcesPage() {
             )}
           </strong>
         </span>
-        <span className="ml-auto flex flex-wrap items-center gap-2">
+        {/* 未建索引 / 解析失败只在确有其事时出现，避免 0 值长期与核心数字同权重。 */}
+        {pending > 0 ? (
+          <span>
+            <strong className="font-semibold tabular-nums text-foreground">
+              {pending}
+            </strong>{" "}
+            个未建索引
+          </span>
+        ) : null}
+        {failed > 0 ? (
+          <span className="text-destructive">
+            <strong className="font-semibold tabular-nums">{failed}</strong>{" "}
+            个解析失败
+          </span>
+        ) : null}
+        <span className="ml-auto flex items-center gap-2">
+          {/* 资料库已停用「粘贴网页抓取正文」；对话内的网页解析链路不受影响。 */}
           <Button
-            onClick={() => setWebDialogOpen(true)}
+            disabled
             size="sm"
+            title="已停用：资料库不再保存网页正文"
             variant="outline"
           >
             <Link2 className="size-4" />
-            粘贴网页
+            粘贴网页（已停用）
           </Button>
-          <Button onClick={() => setSupportOpen(true)} size="sm" variant="ghost">
-            查看支持范围
-          </Button>
-          <Button onClick={() => setPolicyOpen(true)} size="sm" variant="ghost">
-            <ShieldCheck className="size-4" />
-            缓存策略
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button aria-label="更多资料库操作" size="icon-sm" variant="ghost">
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => setSupportOpen(true)}>
+                查看支持的文件格式
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setPolicyOpen(true)}>
+                <ShieldCheck className="size-4" />
+                网页缓存策略
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </span>
       </div>
 
-      <Surface className="overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
+      {/* 扁平工具栏：搜索 + 类型一行，状态 chips 一行；外层没有 Card。 */}
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[180px] flex-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              aria-label="搜索资料"
+              className="h-9 pl-9"
+              onChange={(event) => setFileSearch(event.target.value)}
+              placeholder="搜索文件名"
+              value={fileSearch}
+            />
+          </div>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" aria-label="按文件类型筛选">
+              <Button
+                aria-label="按文件类型筛选"
+                className="h-9 shrink-0"
+                variant="outline"
+              >
                 {fileCategories.find(([value]) => value === typeFilter)?.[1]}
                 <ChevronRight className="size-3.5 rotate-90" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start">
+            <DropdownMenuContent align="end">
               {fileCategories.map(([value, label]) => (
                 <DropdownMenuItem key={value} onSelect={() => setTypeFilter(value)}>
                   <span className="flex-1">{label}</span>
@@ -735,71 +788,74 @@ export function SourcesPage() {
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
-          <div role="group" aria-label="资料显示方式" className="flex gap-1 rounded-lg bg-muted/50 p-1">
+        </div>
+        <div
+          aria-label="资料状态筛选"
+          className="-mx-1 flex max-w-full gap-1 overflow-x-auto px-1 pb-0.5"
+          role="group"
+        >
+          {fileFilters.map((filter) => (
+            <Button
+              aria-pressed={fileFilter === filter.value}
+              className="h-8 shrink-0 rounded-full px-3"
+              key={filter.value}
+              onClick={() => setFileFilter(filter.value)}
+              size="sm"
+              variant={fileFilter === filter.value ? "secondary" : "ghost"}
+            >
+              {filter.label}
+            </Button>
+          ))}
+        </div>
+      </div>
+
+      {/* 结果头部：计数 / 视图切换 / 批量操作都在这条扁平行上，与内容只隔一条细线。 */}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+        <p className="text-[13px] text-muted-foreground">
+          共{" "}
+          <strong className="font-semibold tabular-nums text-foreground">
+            {filteredFiles.length}
+          </strong>{" "}
+          个资料
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          {selectedFileIds.size > 0 ? (
+            <>
+              <span className="text-xs text-muted-foreground">
+                已选 {selectedFileIds.size} 项
+              </span>
+              <Button
+                disabled={removeBatch.isPending}
+                onClick={() => setBatchDeleteOpen(true)}
+                size="xs"
+                variant="destructive"
+              >
+                <Trash2 className="size-3.5" />
+                批量删除
+              </Button>
+              <Button
+                onClick={() => setSelectedFileIds(new Set())}
+                size="xs"
+                variant="ghost"
+              >
+                取消选择
+              </Button>
+            </>
+          ) : null}
+          <div role="group" aria-label="资料显示方式" className="flex gap-1">
             <Button aria-label="网格视图" aria-pressed={viewMode === "grid"} size="icon-sm" variant={viewMode === "grid" ? "secondary" : "ghost"} onClick={() => setViewMode("grid")}><LayoutGrid className="size-4" /></Button>
             <Button aria-label="列表视图" aria-pressed={viewMode === "list"} size="icon-sm" variant={viewMode === "list" ? "secondary" : "ghost"} onClick={() => setViewMode("list")}><List className="size-4" /></Button>
           </div>
         </div>
-        <div className="flex flex-col gap-3 border-b p-4 lg:flex-row lg:items-center lg:justify-between">
-          <div
-            aria-label="资料状态筛选"
-            className="flex max-w-full gap-1 overflow-x-auto rounded-lg bg-muted/60 p-1"
-            role="group"
-          >
-            {fileFilters.map((filter) => (
-              <Button
-                aria-pressed={fileFilter === filter.value}
-                className="shrink-0"
-                key={filter.value}
-                onClick={() => setFileFilter(filter.value)}
-                size="xs"
-                variant={fileFilter === filter.value ? "secondary" : "ghost"}
-              >
-                {filter.label}
-              </Button>
-            ))}
-          </div>
-          <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center lg:w-auto">
-            {selectedFileIds.size > 0 ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-muted-foreground">
-                  已选 {selectedFileIds.size} 项
-                </span>
-                <Button
-                  disabled={removeBatch.isPending}
-                  onClick={() => setBatchDeleteOpen(true)}
-                  size="xs"
-                  variant="destructive"
-                >
-                  <Trash2 className="size-3.5" />
-                  批量删除
-                </Button>
-                <Button
-                  onClick={() => setSelectedFileIds(new Set())}
-                  size="xs"
-                  variant="ghost"
-                >
-                  取消选择
-                </Button>
-              </div>
-            ) : null}
-            <div className="relative w-full lg:w-64">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                aria-label="搜索资料"
-                className="pl-9"
-                onChange={(event) => setFileSearch(event.target.value)}
-                placeholder="搜索文件名"
-                value={fileSearch}
-              />
-            </div>
-          </div>
-        </div>
+      </div>
+
+      <div>
         {viewMode === "grid" ? (
-          <div className="columns-1 gap-4 p-4 sm:columns-2 xl:columns-3 2xl:columns-4">
+          /* auto-fill：卡片最小 240px，宽屏自然铺满，窄屏自动单列。 */
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
             {pagedFiles.map((file) => (
-              <article key={file.id} className={`mb-4 min-w-0 break-inside-avoid rounded-2xl border p-4 transition-shadow hover:shadow-sm ${selectedFileIds.has(file.id) ? "bg-muted/40 ring-1 ring-ring" : "bg-card"}`} style={{ contentVisibility: "auto", containIntrinsicSize: "320px" }}>
-                <div className="mb-3 flex items-start gap-2">
+              <article key={file.id} className={`flex min-w-0 flex-col rounded-xl border bg-card p-4 transition-colors ${selectedFileIds.has(file.id) ? "border-ring bg-muted/40" : "hover:border-foreground/20"}`} style={{ contentVisibility: "auto", containIntrinsicSize: "320px" }}>
+                <div className="flex items-start gap-2">
                   <button type="button" className="min-w-0 flex-1 truncate text-left text-sm font-medium hover:underline" title={file.original_name} onClick={() => setDiagnosticFile(file)}>{file.original_name}</button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild><Button aria-label={`打开 ${file.original_name} 的更多操作`} size="icon-sm" variant="ghost"><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger>
@@ -812,12 +868,15 @@ export function SourcesPage() {
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
-                <button type="button" aria-label={`查看 ${file.original_name}`} className="block w-full rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => navigate(`../documents/${file.id}`)}><FileThumbnail file={file} large /></button>
-                <div className="mt-3 flex items-center justify-between gap-2">
-                  <span className="text-xs text-muted-foreground">{fileType(file)} · {bytes(file.size_bytes)}</span>
-                  <Checkbox aria-label={`选择 ${file.original_name}`} checked={selectedFileIds.has(file.id)} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
+                <button type="button" aria-label={`查看 ${file.original_name}`} className="mt-3 block w-full overflow-hidden rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => navigate(`../documents/${file.id}`)}><FileThumbnail file={file} large /></button>
+                <p className="mt-3 text-xs text-muted-foreground">{fileType(file)} · {bytes(file.size_bytes)}</p>
+                <div className="mt-1.5 flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">{formatUploadTime(file.created_at)}</span>
+                  <span className="flex items-center gap-2">
+                    <StatePill {...fileStatus(file)} />
+                    <Checkbox className="opacity-70" aria-label={`选择 ${file.original_name}`} checked={selectedFileIds.has(file.id)} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
+                  </span>
                 </div>
-                <div className="mt-2 flex flex-wrap items-center justify-between gap-2"><span className="text-xs text-muted-foreground">{formatUploadTime(file.created_at)}</span><StatePill {...fileStatus(file)} /></div>
               </article>
             ))}
           </div>
@@ -1003,7 +1062,7 @@ export function SourcesPage() {
             </div>
           </div>
         ) : (
-          <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-3">
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-4">
             <p className="text-xs text-muted-foreground">
               第 {safePage} / {totalPages} 页 · 共 {filteredFiles.length} 项 ·
               每页 {FILE_PAGE_SIZE} 项
@@ -1032,7 +1091,7 @@ export function SourcesPage() {
             </div>
           </div>
         )}
-      </Surface>
+      </div>
       <DeleteImpactDialog
         error={deleteImpact.error?.message ?? remove.error?.message}
         impact={deleteImpact.data}
@@ -1232,33 +1291,6 @@ export function SourcesPage() {
               ) : null}
             </div>
           ) : null}
-        </DialogContent>
-      </Dialog>
-      <Dialog onOpenChange={setWebDialogOpen} open={webDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>保存网页到资料库</DialogTitle>
-            <DialogDescription>
-              系统会校验授权域名与私网地址边界，抓取成功后持久化正文快照。
-            </DialogDescription>
-          </DialogHeader>
-          <Label htmlFor="source-url">网页 URL</Label>
-          <Input
-            id="source-url"
-            onChange={(event) => setWebUrl(event.target.value)}
-            placeholder="https://example.com/article"
-            value={webUrl}
-          />
-          <DialogFooter>
-            <Button
-              disabled={
-                fetchPage.isPending || !webUrl.trim().startsWith("http")
-              }
-              onClick={() => fetchPage.mutate()}
-            >
-              {fetchPage.isPending ? "抓取中…" : "抓取并保存"}
-            </Button>
-          </DialogFooter>
         </DialogContent>
       </Dialog>
       <Dialog onOpenChange={setPolicyOpen} open={policyOpen}>

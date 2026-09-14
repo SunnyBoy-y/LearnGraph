@@ -1,8 +1,12 @@
 """Chat attachment mode policy (D-082 / D-083).
 
-Fast/thinking modes may use files that have a safe text extraction path, direct
-image/video input, or audio when stored-file ASR is configured. Agent mode may
-attach any stored workspace file.
+Non-agent (fast/thinking) turns may use files that have a safe text extraction
+path, direct image input, video input the selected model can actually consume
+(natively or through a video-capable vision companion), or audio when
+stored-file ASR is configured. Anything else is still accepted as an attachment
+and is rejected at send time with a typed error that points at Agent mode, which
+may attach any stored workspace file. Executables, scripts and disk images are
+the single exception: they are refused in every mode.
 """
 
 from __future__ import annotations

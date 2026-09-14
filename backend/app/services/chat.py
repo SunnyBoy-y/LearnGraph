@@ -223,8 +223,12 @@ MULTIMODAL_IMAGE_MIME_TYPES = {
 # Keep the body below the common remote model attachment limits and, more
 # importantly, avoid turning an otherwise bounded chat request into a huge
 # base64 payload.  The original object remains in configured object storage.
-MULTIMODAL_IMAGE_MAX_BYTES = 10 * 1024 * 1024
-MULTIMODAL_IMAGE_MAX_PIXELS = 40_000_000
+# 32 MiB keeps scanned pages and phone photos inside one request; anything
+# larger belongs in the Agent sandbox rather than in a base64 chat payload.
+MULTIMODAL_IMAGE_MAX_BYTES = 32 * 1024 * 1024
+# Pillow decodes the whole bitmap to verify it, so this ceiling is a host-memory
+# guard as much as a model-input guard: 80 MP is roughly 320 MB of decoded RGBA.
+MULTIMODAL_IMAGE_MAX_PIXELS = 80_000_000
 MULTIMODAL_IMAGE_FORMAT_MIME_TYPES = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
@@ -240,7 +244,10 @@ MULTIMODAL_VIDEO_MIME_TYPES = {
     "video/x-flv",
     "video/x-ms-wmv",
 }
-MULTIMODAL_VIDEO_MAX_BYTES = 10 * 1024 * 1024
+# Transport ceiling for videos that are actually handed to (or described by)
+# a model. The attachment itself may be as large as max_upload_bytes; a larger
+# video, or a model without video understanding, goes to the Agent sandbox.
+MULTIMODAL_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 
 
 def _normalize_web_sources(raw_sources: list) -> list[dict]:
@@ -909,6 +916,62 @@ class ChatService:
             {"provider_id": self.model_provider.provider_id},
         )
 
+    def voice_context_snapshot(
+        self,
+        session_id: str,
+        *,
+        query: str = "",
+        node_ids: list[str] | None = None,
+        task_id: str | None = None,
+        token_budget: int | None = None,
+    ):
+        """Build the context package pinned by a full duplex voice session."""
+        from app.services.voice_context import VoiceContextService
+
+        return VoiceContextService(self).load_snapshot(
+            session_id,
+            query=query,
+            node_ids=node_ids,
+            task_id=task_id,
+            token_budget=token_budget,
+        )
+
+    def persist_voice_turn(
+        self,
+        session_id: str,
+        *,
+        turn_id: str,
+        user_text: str,
+        assistant_text: str,
+        request_id: str | None = None,
+        client_message_id: str | None = None,
+        audio_cursor_ms: int | None = None,
+        commit: bool = True,
+        memory: bool = True,
+        include_assistant: bool = True,
+        assistant_status: str = "completed",
+    ):
+        """Persist one authoritative finalized voice turn idempotently.
+
+        ``memory=False`` keeps a barged-in turn in the transcript without
+        offering text the user never heard to long-term memory.
+        """
+        from app.services.voice_context import VoiceContextService
+
+        return VoiceContextService(self).finalize_turn(
+            session_id,
+            turn_id=turn_id,
+            user_text=user_text,
+            assistant_text=assistant_text,
+            request_id=request_id,
+            client_message_id=client_message_id,
+            audio_cursor_ms=audio_cursor_ms,
+            commit=commit,
+            memory=memory,
+            include_assistant=include_assistant,
+            assistant_status=assistant_status,
+        )
+
     @staticmethod
     def _is_image_attachment(file: FileRecord) -> bool:
         return policy_is_image_attachment(file)
@@ -1119,10 +1182,17 @@ class ChatService:
         Falls back to SessionWorkspaceService when sandbox tools are disabled.
         """
 
+        # Image-like attachments whose bytes cannot become direct image input
+        # (TIFF/SVG/BMP/…) are materialized too, so sandbox tools can convert or
+        # inspect them instead of the attachment silently doing nothing.
         seedable = [
             file
             for file in files
-            if not self._is_image_attachment(file) and file.storage_status == "stored"
+            if file.storage_status == "stored"
+            and (
+                not self._is_image_attachment(file)
+                or not self._is_multimodal_image(file)
+            )
         ]
         if not seedable:
             return []
@@ -1136,6 +1206,7 @@ class ChatService:
             views = sandbox.seed_chat_attachments(
                 chat_session_id=session_id,
                 files=seedable,
+                include_images=True,
             )
         else:
             workspace = SessionWorkspaceService(
@@ -1241,11 +1312,12 @@ class ChatService:
         raise AppError(
             409,
             "model_video_input_unsupported",
-            "The selected model has no native video input and no video-capable Qwen "
-            "vision companion is configured",
+            "当前模型不具备视频理解能力，也没有可用的视频视觉伴生模型。"
+            "请切换到智能体模式（用沙箱分析视频），或改用具备视频理解能力的模型。",
             {
                 "provider_id": self.model_provider.provider_id,
                 "vision_provider_id": getattr(self.vision_provider, "provider_id", None),
+                "suggested_response_mode": "agentic",
             },
         )
 
@@ -1255,26 +1327,20 @@ class ChatService:
         *,
         agent_mode: bool,
     ) -> None:
-        """Videos are Agent workspace inputs, never direct chat payloads."""
+        """Validate video attachments against the selected model's capability.
+
+        Agent mode keeps videos as session-workspace references, so any video
+        file can be attached and the sandbox tools consume it. A non-agent turn
+        has no tools, so the video must be consumable by the model itself —
+        natively or through a video-capable vision companion — and must fit the
+        base64 transport ceiling. Everything else is a typed error that points
+        at Agent mode instead of silently dropping the attachment.
+        """
 
         video_files = [file for file in files if self._is_video_attachment(file)]
         if not video_files:
             return
-        if not agent_mode:
-            raise AppError(
-                409,
-                "video_agent_mode_required",
-                "Video attachments are available only in Agent mode; switch to Agent mode to analyze videos with sandbox tools.",
-            )
         for file in video_files:
-            mime_type = (file.mime_type or "").casefold().split(";", 1)[0].strip()
-            if mime_type not in MULTIMODAL_VIDEO_MIME_TYPES:
-                raise AppError(
-                    415,
-                    "unsupported_video_attachment",
-                    "The video MIME type is not supported for Agent video tools",
-                    {"file_id": file.id, "mime_type": mime_type},
-                )
             if file.storage_status != "stored":
                 raise AppError(
                     409,
@@ -1282,13 +1348,52 @@ class ChatService:
                     "The video attachment is not available in persistent file storage",
                     {"file_id": file.id},
                 )
-            if file.size_bytes > self.settings.sandbox_disk_bytes:
-                raise AppError(
-                    413,
-                    "video_attachment_too_large",
-                    "Video attachments must fit within the configured Agent sandbox workspace limit",
-                    {"file_id": file.id, "max_bytes": self.settings.sandbox_disk_bytes},
-                )
+        if agent_mode:
+            for file in video_files:
+                if file.size_bytes > self.settings.sandbox_disk_bytes:
+                    raise AppError(
+                        413,
+                        "video_attachment_too_large",
+                        "Video attachments must fit within the configured Agent sandbox workspace limit",
+                        {"file_id": file.id, "max_bytes": self.settings.sandbox_disk_bytes},
+                    )
+            return
+        # Resolve native vs companion before the stream starts so the client gets
+        # a typed 409 rather than a mid-stream provider failure.
+        self._require_video_input_path(video_files)
+        oversized = [
+            file.id
+            for file in video_files
+            if file.size_bytes > MULTIMODAL_VIDEO_MAX_BYTES
+        ]
+        if oversized:
+            raise AppError(
+                413,
+                "video_attachment_too_large",
+                "视频附件超过直传上限（100 MiB）。请切换到智能体模式用沙箱分析，"
+                "或压缩后重试。",
+                {
+                    "file_ids": oversized,
+                    "max_bytes": MULTIMODAL_VIDEO_MAX_BYTES,
+                    "suggested_response_mode": "agentic",
+                },
+            )
+        unsupported_mime = [
+            file.id
+            for file in video_files
+            if (file.mime_type or "").casefold().split(";", 1)[0].strip()
+            not in MULTIMODAL_VIDEO_MIME_TYPES
+        ]
+        if unsupported_mime:
+            raise AppError(
+                415,
+                "unsupported_video_attachment",
+                "该视频格式无法直接传给模型；请切换到智能体模式，沙箱可以处理更多格式。",
+                {
+                    "file_ids": unsupported_mime,
+                    "suggested_response_mode": "agentic",
+                },
+            )
 
     def _image_input_parts(self, files: list[FileRecord]) -> list[dict]:
         image_files = [file for file in files if self._is_multimodal_image(file)]
@@ -1308,7 +1413,7 @@ class ChatService:
                 raise AppError(
                     413,
                     "image_attachment_too_large",
-                    "Image attachments must be 10 MiB or smaller for direct model input",
+                    "Image attachments must be 32 MiB or smaller for direct model input",
                     {"file_id": file.id, "max_bytes": MULTIMODAL_IMAGE_MAX_BYTES},
                 )
             try:
@@ -1327,7 +1432,7 @@ class ChatService:
                 raise AppError(
                     413,
                     "image_attachment_too_large",
-                    "Image attachments must be 10 MiB or smaller for direct model input",
+                    "Image attachments must be 32 MiB or smaller for direct model input",
                     {"file_id": file.id, "max_bytes": MULTIMODAL_IMAGE_MAX_BYTES},
                 )
             mime_type = self._validated_multimodal_image_mime(file, content)
@@ -1369,8 +1474,8 @@ class ChatService:
                 raise AppError(
                     413,
                     "video_attachment_too_large",
-                    "Base64 video attachments must be 10 MiB or smaller; use a public "
-                    "video URL for larger Qwen inputs",
+                    "Video attachments must be 100 MiB or smaller for direct model "
+                    "input; switch to Agent mode for larger videos",
                     {"file_id": file.id, "max_bytes": MULTIMODAL_VIDEO_MAX_BYTES},
                 )
             try:
@@ -1389,7 +1494,7 @@ class ChatService:
                 raise AppError(
                     413,
                     "video_attachment_too_large",
-                    "Base64 video attachments must be 10 MiB or smaller",
+                    "Video attachments must be 100 MiB or smaller for direct model input",
                     {"file_id": file.id, "max_bytes": MULTIMODAL_VIDEO_MAX_BYTES},
                 )
             encoded = base64.b64encode(content).decode("ascii")
@@ -1735,64 +1840,6 @@ class ChatService:
             break
         return cleaned, {"image_input_mode": "external_vision", **vision_trace}
 
-    def _with_image_only_inputs(
-        self,
-        messages: list[ProviderChatMessage],
-        files: list[FileRecord],
-        *,
-        user_prompt_hint: str = "",
-    ) -> tuple[list[ProviderChatMessage], dict]:
-        image_files = [file for file in files if self._is_multimodal_image(file)]
-        if not image_files:
-            return messages, {}
-        mode = self._require_image_input_path(image_files)
-        if mode == "native":
-            if not getattr(self.model_provider, "supports_structured_chat", False):
-                raise AppError(
-                    409,
-                    "multimodal_transport_unsupported",
-                    "The selected model does not expose a structured multimodal chat transport",
-                    {"provider_id": self.model_provider.provider_id},
-                )
-            image_parts = self._image_input_parts(files)
-            # Strip internal routing keys before they leave LearnGraph.
-            transport_parts = [
-                {
-                    "type": "input_image",
-                    "image_url": part["image_url"],
-                    "detail": part.get("detail") or "auto",
-                }
-                for part in image_parts
-            ]
-            for index in range(len(messages) - 1, -1, -1):
-                message = messages[index]
-                if message.role != "user":
-                    continue
-                updated = replace(
-                    message,
-                    content_parts=[*message.content_parts, *transport_parts],
-                )
-                return [
-                    *messages[:index],
-                    updated,
-                    *messages[index + 1 :],
-                ], {"image_input_mode": "native", "image_count": len(transport_parts)}
-            raise AppError(
-                409,
-                "multimodal_user_message_missing",
-                "No user message is available to attach image inputs",
-            )
-
-        # external_vision is intentionally deferred until the assistant stream
-        # exists, so the companion work can be represented in the thinking chain.
-        return messages, {
-            "image_input_mode": "external_vision",
-            "external_vision_pending": True,
-            "image_count": len(image_files),
-            "provider_id": getattr(self.vision_provider, "provider_id", None),
-            "model_id": getattr(self.vision_provider, "model_id", None),
-        }
-
     def _with_image_inputs(
         self,
         messages: list[ProviderChatMessage],
@@ -1800,13 +1847,139 @@ class ChatService:
         *,
         user_prompt_hint: str = "",
     ) -> tuple[list[ProviderChatMessage], dict]:
-        """Attach image inputs only; videos remain Agent workspace references."""
+        """Attach image and video inputs for a structured provider turn."""
 
-        return self._with_image_only_inputs(
+        return self._with_media_inputs(
             messages,
             files,
             user_prompt_hint=user_prompt_hint,
         )
+
+    def _with_media_inputs(
+        self,
+        messages: list[ProviderChatMessage],
+        files: list[FileRecord],
+        *,
+        user_prompt_hint: str = "",
+    ) -> tuple[list[ProviderChatMessage], dict]:
+        """Attach media inputs, choosing native vs companion per media kind.
+
+        Images and videos are resolved independently: a model can accept images
+        natively while its videos still need a video-capable companion model.
+        Kinds served by the companion are deferred (``external_vision_pending``)
+        so the caption work can be represented in the thinking chain.
+        """
+
+        image_files = [file for file in files if self._is_multimodal_image(file)]
+        video_files = [file for file in files if self._is_video_attachment(file)]
+        if not image_files and not video_files:
+            return messages, {}
+        trace: dict = {}
+        pending_kinds: list[str] = []
+        transport_parts: list[dict] = []
+        if image_files:
+            if self._require_image_input_path(image_files) == "native":
+                if not getattr(
+                    self.model_provider, "supports_structured_chat", False
+                ):
+                    raise AppError(
+                        409,
+                        "multimodal_transport_unsupported",
+                        "The selected model does not expose a structured multimodal chat transport",
+                        {"provider_id": self.model_provider.provider_id},
+                    )
+                transport_parts.extend(
+                    {
+                        "type": "input_image",
+                        "image_url": part["image_url"],
+                        "detail": part.get("detail") or "auto",
+                    }
+                    for part in self._image_input_parts(files)
+                )
+                trace["image_input_mode"] = "native"
+            else:
+                pending_kinds.append("image")
+                trace["image_input_mode"] = "external_vision"
+        if video_files:
+            if self._require_video_input_path(video_files) == "native":
+                if not getattr(
+                    self.model_provider, "supports_structured_chat", False
+                ):
+                    raise AppError(
+                        409,
+                        "multimodal_transport_unsupported",
+                        "The selected model does not expose a structured multimodal chat transport",
+                        {"provider_id": self.model_provider.provider_id},
+                    )
+                transport_parts.extend(
+                    {
+                        "type": "input_video",
+                        "video_url": part["video_url"],
+                        "fps": part.get("fps") or 2,
+                    }
+                    for part in self._video_input_parts(files)
+                )
+                trace["video_input_mode"] = "native"
+            else:
+                pending_kinds.append("video")
+                trace["video_input_mode"] = "external_vision"
+        trace["image_count"] = len(image_files)
+        trace["video_count"] = len(video_files)
+        if pending_kinds:
+            trace.update(
+                {
+                    "external_vision_pending": True,
+                    "pending_media_kinds": pending_kinds,
+                    "provider_id": getattr(self.vision_provider, "provider_id", None),
+                    "model_id": getattr(self.vision_provider, "model_id", None),
+                }
+            )
+        if not transport_parts:
+            return messages, trace
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.role != "user":
+                continue
+            updated = replace(
+                message,
+                content_parts=[*message.content_parts, *transport_parts],
+            )
+            return [
+                *messages[:index],
+                updated,
+                *messages[index + 1 :],
+            ], trace
+        raise AppError(
+            409,
+            "multimodal_user_message_missing",
+            "No user message is available to attach media inputs",
+        )
+
+    def _pending_media_groups(
+        self,
+        files: list[FileRecord],
+    ) -> list[tuple[str, list[FileRecord]]]:
+        """Media groups that must travel as companion-model captions.
+
+        Used by the text-only provider path, which cannot carry native parts.
+        """
+
+        groups: list[tuple[str, list[FileRecord]]] = []
+        images = [file for file in files if self._is_multimodal_image(file)]
+        if images:
+            groups.append(("image", images))
+        videos = [file for file in files if self._is_video_attachment(file)]
+        if videos:
+            if not self._video_vision_available():
+                raise AppError(
+                    409,
+                    "model_video_input_unsupported",
+                    "当前模型通道无法接收视频，也没有可用的视频视觉伴生模型。"
+                    "请切换到智能体模式（用沙箱分析视频），或改用具备视频理解能力的模型。",
+                    {"suggested_response_mode": "agentic"},
+                )
+            groups.append(("video", videos))
+        return groups
 
     def _attached_files(self, file_ids: list[str]) -> list[FileRecord]:
         if not file_ids:
@@ -2273,6 +2446,13 @@ class ChatService:
                                 {
                                     "type": "image_url",
                                     "image_url": "[binary image omitted from local estimate]",
+                                }
+                            )
+                        elif part.get("type") == "video_url":
+                            redacted_parts.append(
+                                {
+                                    "type": "video_url",
+                                    "video_url": "[binary video omitted from local estimate]",
                                 }
                             )
                         else:
@@ -4227,7 +4407,7 @@ class ChatService:
         """Detach ephemeral model image parts from a tool result meta.
 
         They must never be persisted to MessagePart.data or streamed over SSE:
-        a 10 MiB base64 data URL belongs on the provider boundary only.
+        a multi-megabyte base64 data URL belongs on the provider boundary only.
         """
 
         extracted = result_meta.pop("model_image_parts", None)
@@ -9225,21 +9405,43 @@ class ChatService:
                     "attachment_not_found",
                     "At least one attachment is outside this workspace",
                 )
-            image_files = [file for file in files if self._is_image_attachment(file)]
-            unsupported_images = [
-                file.id
-                for file in image_files
-                if not self._is_multimodal_image(file)
+            blocked = [
+                file.id for file in files if is_special_binary_attachment(file)
             ]
-            if unsupported_images:
+            if blocked:
                 raise AppError(
                     415,
-                    "unsupported_image_attachment",
-                    "Only PNG, JPEG, WEBP, and GIF files can be sent as direct image input",
-                    {"file_ids": unsupported_images},
+                    "unsupported_attachment_type",
+                    "可执行文件、脚本与磁盘镜像不能作为附件（.exe/.dll/.so/.dylib/.msi/"
+                    ".bat/.cmd/.com/.scr/.sys/.apk/.dmg/.iso/.img/.bin/.appimage）。",
+                    {"file_ids": blocked},
+                )
+            image_files = [file for file in files if self._is_image_attachment(file)]
+            # Only PNG/JPEG/WEBP/GIF can cross the provider boundary as image
+            # bytes. Everything else that looks like an image (TIFF, SVG, BMP,
+            # HEIC, AVIF, ICO) stays attachable: Agent mode hands the original
+            # bytes to sandbox tools, and a non-agent turn asks for Agent mode at
+            # send time instead of rejecting the attachment up front.
+            direct_images = [
+                file for file in image_files if self._is_multimodal_image(file)
+            ]
+            sandbox_images = [
+                file for file in image_files if not self._is_multimodal_image(file)
+            ]
+            if sandbox_images and not payload.agent_mode:
+                raise AppError(
+                    409,
+                    "attachment_requires_agent_mode",
+                    "这些图片格式无法作为直接图片输入（仅支持 PNG/JPEG/WEBP/GIF）。"
+                    "请切换到智能体模式处理，或先转换成受支持的格式。",
+                    {
+                        "file_ids": [file.id for file in sandbox_images],
+                        "supported_mime_types": sorted(MULTIMODAL_IMAGE_MIME_TYPES),
+                        "suggested_response_mode": "agentic",
+                    },
                 )
             unavailable_images = [
-                file.id for file in image_files if file.storage_status != "stored"
+                file.id for file in direct_images if file.storage_status != "stored"
             ]
             if unavailable_images:
                 raise AppError(
@@ -9250,23 +9452,25 @@ class ChatService:
                 )
             oversized_images = [
                 file.id
-                for file in image_files
+                for file in direct_images
                 if file.size_bytes > MULTIMODAL_IMAGE_MAX_BYTES
             ]
             if oversized_images:
                 raise AppError(
                     413,
                     "image_attachment_too_large",
-                    "Image attachments must be 10 MiB or smaller for direct model input",
+                    "图片附件超过直接模型输入上限（32 MiB）。请压缩后重试，"
+                    "或切换到智能体模式用沙箱处理。",
                     {
                         "file_ids": oversized_images,
                         "max_bytes": MULTIMODAL_IMAGE_MAX_BYTES,
+                        "suggested_response_mode": "agentic",
                     },
                 )
-            if image_files:
+            if direct_images:
                 # Resolve native vs external_vision before the stream starts so
                 # the client gets a typed 409 rather than a mid-stream failure.
-                self._require_image_input_path(image_files)
+                self._require_image_input_path(direct_images)
             # Agent mode materializes non-indexed attachments into the session
             # workspace (inputs/) so sandbox tools can read original bytes —
             # including legacy Office files that never get a host-side index.
@@ -9285,14 +9489,18 @@ class ChatService:
                     raise AppError(
                         409,
                         "attachment_not_ready",
-                        "Attachments that are not indexed cannot be silently passed to the model",
-                        {"file_ids": unavailable},
+                        "这些附件既不能直接作为模型输入，也尚未建立文本索引；"
+                        "请切换到智能体模式，或者删除不受支持的文件后再发送。",
+                        {
+                            "file_ids": unavailable,
+                            "suggested_response_mode": "agentic",
+                        },
                     )
             else:
                 missing_storage = [
                     file.id
                     for file in files
-                    if not self._is_image_attachment(file)
+                    if not self._is_multimodal_image(file)
                     and file.storage_status != "stored"
                 ]
                 if missing_storage:
@@ -10220,9 +10428,9 @@ class ChatService:
                 "The selected retry model does not expose structured tool calls",
             )
         attached_files = self._attached_files(file_ids)
-        if any(self._is_image_attachment(file) for file in attached_files):
+        if any(self._is_multimodal_image(file) for file in attached_files):
             image_mode = self._require_image_input_path(
-                [f for f in attached_files if self._is_image_attachment(f)]
+                [f for f in attached_files if self._is_multimodal_image(f)]
             )
             if image_mode == "native" and not structured_chat:
                 raise AppError(
@@ -10375,13 +10583,18 @@ class ChatService:
                 web_search_results_present=bool(source_context),
                 audio_transcripts=retry_audio_transcripts,
             )
-            # Text-only primary path: still allow external_vision captions.
-            if any(self._is_image_attachment(file) for file in attached_files):
-                caption_block, image_input_trace = self._describe_media_via_vision(
-                    [f for f in attached_files if self._is_multimodal_image(f)],
-                    media_kind="image",
+            # Text-only primary path: media travels as vision captions.
+            for media_kind, media_files in self._pending_media_groups(attached_files):
+                caption_block, media_trace = self._describe_media_via_vision(
+                    media_files,
+                    media_kind=media_kind,
                     user_prompt_hint=parent.content,
                 )
+                image_input_trace = {
+                    **image_input_trace,
+                    f"{media_kind}_input_mode": "external_vision",
+                    **media_trace,
+                }
                 if caption_block:
                     provider_prompt = f"{provider_prompt}\n\n{caption_block}"
             provider_billing_input = provider_prompt
@@ -12388,9 +12601,9 @@ class ChatService:
                 {"provider_id": self.model_provider.provider_id},
             )
         attached_files = self._attached_files(payload.file_ids)
-        if any(self._is_image_attachment(file) for file in attached_files):
+        if any(self._is_multimodal_image(file) for file in attached_files):
             image_mode = self._require_image_input_path(
-                [f for f in attached_files if self._is_image_attachment(f)]
+                [f for f in attached_files if self._is_multimodal_image(f)]
             )
             if image_mode == "native" and not structured_chat:
                 raise AppError(
@@ -12705,9 +12918,9 @@ class ChatService:
                 {"provider_id": self.model_provider.provider_id},
             )
         attached_files = self._attached_files(payload.file_ids)
-        if any(self._is_image_attachment(file) for file in attached_files):
+        if any(self._is_multimodal_image(file) for file in attached_files):
             image_mode = self._require_image_input_path(
-                [f for f in attached_files if self._is_image_attachment(f)]
+                [f for f in attached_files if self._is_multimodal_image(f)]
             )
             if image_mode == "native" and not structured_chat:
                 raise AppError(
@@ -12857,12 +13070,17 @@ class ChatService:
                 web_search_results_present=bool(source_context),
                 audio_transcripts=audio_transcripts,
             )
-            if any(self._is_image_attachment(file) for file in attached_files):
-                caption_block, image_input_trace = self._describe_media_via_vision(
-                    [f for f in attached_files if self._is_multimodal_image(f)],
-                    media_kind="image",
+            for media_kind, media_files in self._pending_media_groups(attached_files):
+                caption_block, media_trace = self._describe_media_via_vision(
+                    media_files,
+                    media_kind=media_kind,
                     user_prompt_hint=payload.content,
                 )
+                image_input_trace = {
+                    **image_input_trace,
+                    f"{media_kind}_input_mode": "external_vision",
+                    **media_trace,
+                }
                 if caption_block:
                     provider_prompt = f"{provider_prompt}\n\n{caption_block}"
             provider_billing_input = provider_prompt
@@ -12887,7 +13105,7 @@ class ChatService:
                     "parse_status": file.parse_status,
                     "input_mode": (
                         "multimodal_image"
-                        if self._is_image_attachment(file)
+                        if self._is_multimodal_image(file)
                         else (
                             "indexed_document"
                             if file.parse_status == "indexed"
@@ -14138,7 +14356,24 @@ class ChatService:
                     yield self._encode_event(event)
                 yield from maybe_persist_graph_proposal()
 
-                if image_input_trace.get("external_vision_pending"):
+                pending_media_kinds = [
+                    kind
+                    for kind in list(image_input_trace.get("pending_media_kinds") or [])
+                    if kind in {"image", "video"}
+                ]
+                for media_kind in pending_media_kinds:
+                    kind_is_image = media_kind == "image"
+                    kind_files = [
+                        file
+                        for file in attached_files
+                        if (
+                            self._is_multimodal_image(file)
+                            if kind_is_image
+                            else self._is_video_attachment(file)
+                        )
+                    ]
+                    kind_total = len(kind_files)
+                    kind_label = "图像" if kind_is_image else "视频"
                     vision_record = self.message_parts.add(
                         MessagePartRecord(
                             workspace_id=self.workspace_id,
@@ -14148,13 +14383,13 @@ class ChatService:
                             status="streaming",
                             content=(
                                 f"正在使用 {image_input_trace.get('model_id') or '外挂视觉模型'} "
-                                f"解析图像（0/{image_input_trace.get('image_count') or 0}）"
+                                f"解析{kind_label}（0/{kind_total}）"
                             ),
                             data={
                                 "tool_name": "external_vision_describe",
                                 "provider_id": image_input_trace.get("provider_id"),
                                 "model_id": image_input_trace.get("model_id"),
-                                "media_kind": "image",
+                                "media_kind": media_kind,
                             },
                         )
                     )
@@ -14172,22 +14407,32 @@ class ChatService:
                     sequence += 1
                     yield self._encode_event(started)
 
-                    def vision_progress(file_label: str, index: int, total: int, status: str) -> None:
-                        vision_record.content = (
+                    def vision_progress(
+                        file_label: str,
+                        index: int,
+                        total: int,
+                        status: str,
+                        record: MessagePartRecord = vision_record,
+                    ) -> None:
+                        record.content = (
                             f"{'正在解析' if status == 'started' else '已完成解析'} {file_label} "
                             f"（{index}/{total}）"
                         )
-                        vision_record.data = {**vision_record.data, "completed": index if status == "completed" else max(0, index - 1), "total": total}
+                        record.data = {**record.data, "completed": index if status == "completed" else max(0, index - 1), "total": total}
 
                     caption_block, vision_trace = self._describe_media_via_vision(
-                        [f for f in attached_files if self._is_multimodal_image(f)],
-                        media_kind="image",
+                        kind_files,
+                        media_kind=media_kind,
                         user_prompt_hint=payload.content,
                         progress_callback=vision_progress,
                     )
                     vision_record.status = "completed"
-                    vision_record.content = f"已完成图像解析（{vision_record.data.get('total') or 0}/{vision_record.data.get('total') or 0}）"
-                    image_input_trace = {"image_input_mode": "external_vision", **vision_trace}
+                    vision_record.content = f"已完成{kind_label}解析（{vision_record.data.get('total') or 0}/{vision_record.data.get('total') or 0}）"
+                    image_input_trace = {
+                        **image_input_trace,
+                        f"{media_kind}_input_mode": "external_vision",
+                        **vision_trace,
+                    }
                     provider_trace["image_input"] = {key: value for key, value in image_input_trace.items() if key != "caption_chars"}
                     for index in range(len(provider_messages) - 1, -1, -1):
                         if provider_messages[index].role == "user":

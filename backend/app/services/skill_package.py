@@ -36,6 +36,48 @@ MAX_SKILL_PACKAGE_BYTES = 20 * 1024 * 1024
 MAX_SKILL_FILES = 200
 PATH_RE = re.compile(r"^[A-Za-z0-9._\-]+(?:/[A-Za-z0-9._\-]+)*$")
 RESERVED_NAMES = {".", ".."}
+OFFICIAL_SKILL_FILE_SUFFIXES = frozenset(
+    {
+        ".md",
+        ".py",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".txt",
+        ".sh",
+        ".html",
+        ".css",
+        ".svg",
+    }
+)
+OFFICIAL_SKILL_EXCLUDED_PARTS = frozenset(
+    {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+    }
+)
+
+
+def is_official_skill_package_path(relative_path: str) -> bool:
+    """Return whether a source-relative path belongs in an official package."""
+
+    rel = (relative_path or "").replace("\\", "/").strip("/")
+    is_controlled = rel.startswith(("references/", "scripts/", "examples/"))
+    if not rel or (rel != "SKILL.md" and not is_controlled):
+        return False
+    parts = PurePosixPath(rel).parts
+    if any(part.startswith(".") or part in OFFICIAL_SKILL_EXCLUDED_PARTS for part in parts):
+        return False
+    suffix = PurePosixPath(rel).suffix.lower()
+    return rel == "SKILL.md" or suffix in OFFICIAL_SKILL_FILE_SUFFIXES
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -232,6 +274,9 @@ class OfficialSkillSpec:
     category: str = ""
     capability_ids: tuple[str, ...] = ()
     keywords: tuple[str, ...] = ()
+    trigger_phrases: tuple[str, ...] = ()
+    negative_phrases: tuple[str, ...] = ()
+    precedence: int = 0
     # Runtime prerequisite: "sandbox" for offline scripts, "sandbox+egress"
     # for anything that needs the reviewed outbound proxy (e.g. web fetch).
     requires_runtime: str = ""
@@ -262,6 +307,8 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "goal_draft_editor",
             "question_batch",
         ),
+        trigger_phrases=("交互卡片", "可信组件", "选择题", "填空题", "天气卡", "指标卡"),
+        required_tools=("canvas_get_render_contract", "canvas_emit_trusted_component"),
         fallback_md=_CANVAS_FALLBACK_MD,
     ),
     OfficialSkillSpec(
@@ -275,12 +322,31 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         ),
         grant_reason="system_goal_route_skill_auto_enable",
         contextual_activation="goal_mode+agent_mode",
+        trigger_phrases=("目标模式", "学习目标", "澄清目标", "制定目标"),
+        required_tools=(
+            "lg_goal_read",
+            "lg_goal_create",
+            "lg_goal_confirm",
+            "lg_goal_ask",
+            "lg_goal_ask_batch",
+            "lg_goal_edit_draft",
+            "lg_graph_read",
+            "lg_graph_create",
+            "lg_graph_propose_change",
+            "lg_skill_read",
+            "search_web",
+            "parallel_web_research",
+            "fetch_web_page",
+            "create_chart",
+            "canvas_emit_trusted_component",
+            "canvas_emit_magic_card",
+        ),
         fallback_md=_GOAL_ROUTE_FALLBACK_MD,
     ),
     OfficialSkillSpec(
         key="graph-generation",
         display_name="知识图谱生成",
-        version="1.0.1",
+        version="1.3.1",
         dir_name="graph_generation",
         description=(
             "Generate or update a reviewable knowledge-graph proposal from a "
@@ -288,6 +354,15 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "or lg_graph_propose_change (update)."
         ),
         grant_reason="official_skill_auto_enable",
+        trigger_phrases=("生成知识图谱", "学习地图", "知识地图", "知识树", "更新图谱", "拆分节点"),
+        required_tools=(
+            "lg_goal_ask",
+            "lg_graph_read",
+            "lg_graph_create",
+            "lg_graph_propose_change",
+            "lg_graph_update_candidate_node",
+            "lg_skill_read",
+        ),
     ),
     OfficialSkillSpec(
         key="graph-cover",
@@ -300,6 +375,7 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "refreshes use a default cover on failure."
         ),
         grant_reason="official_skill_auto_enable",
+        trigger_phrases=("更换封面", "替换封面", "生成封面", "图谱封面"),
         required_tools=(
             "lg_graph_read",
             "lg_graph_cover_read",
@@ -316,6 +392,15 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "prerequisites, mastery state, and available time."
         ),
         grant_reason="official_skill_auto_enable",
+        trigger_phrases=("学习计划", "学习路线", "排期", "重排计划", "学习日程"),
+        required_tools=(
+            "lg_roadmap_read",
+            "lg_roadmap_replan",
+            "lg_schedule_list",
+            "lg_schedule_create",
+            "lg_schedule_update",
+            "lg_learning_mastery_read",
+        ),
     ),
     OfficialSkillSpec(
         key="review-coach",
@@ -327,6 +412,15 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "practice and recorded mastery evidence."
         ),
         grant_reason="official_skill_auto_enable",
+        trigger_phrases=("复习", "到期复习", "考前检查", "遗忘风险", "薄弱点", "间隔复习"),
+        negative_phrases=("首次学习", "教教我", "展开讲讲", "图解", "生成图片", "改图"),
+        precedence=10,
+        required_tools=(
+            "lg_review_list_due",
+            "lg_learning_mastery_read",
+            "lg_learning_evidence_record",
+            "canvas_emit_trusted_component",
+        ),
     ),
     OfficialSkillSpec(
         key="node-learning",
@@ -345,6 +439,14 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "图表", "选择题", "自测", "练习", "交互", "动画", "学习卡片", "一页纸",
             "知识点", "教学",
         ),
+        trigger_phrases=(
+            "节点学习", "讲解这个节点", "教教我", "展开讲讲", "图解知识点",
+            "生成练习", "做个练习", "首次学习", "学习卡片",
+        ),
+        negative_phrases=(
+            "到期复习", "考前检查", "遗忘风险", "生成图片", "改图", "图生图", "文生图",
+        ),
+        precedence=5,
         required_tools=(
             "canvas_emit_trusted_component",
             "canvas_emit_magic_card",
@@ -355,7 +457,10 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "lg_graph_read",
             "lg_learning_mastery_read",
             "lg_learning_evidence_record",
+            "list_session_files",
+            "read_session_file",
             "sandbox_publish_file",
+            "lg_skill_read",
         ),
     ),
     # ------------------------------------------------------------------
@@ -380,8 +485,14 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         capability_ids=("docx.read", "doc.read", "rtf.read", "html.read", "document.convert"),
         keywords=(
             "docx", "doc", "rtf", "html", "word", "office", "转换", "文本抽取",
-            "pdf预览", "转word", "正文提取",
+            "转word", "正文提取",
         ),
+        trigger_phrases=(
+            "docx转pdf", "word转pdf", "html转pdf", "html转png", "docx转html",
+            "提取word正文", "读取docx",
+        ),
+        negative_phrases=("合并pdf", "拆分pdf", "pdf转图片", "扫描件"),
+        precedence=5,
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -402,6 +513,11 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "pdf", "合并", "拆分", "提取文本", "页数", "渲染", "pdf转图片",
             "ocr", "扫描件", "扫描", "图片型pdf", "文字识别",
         ),
+        trigger_phrases=(
+            "pdf预览", "pdf转图片", "合并pdf", "拆分pdf", "读取pdf", "提取pdf文本",
+        ),
+        negative_phrases=("docx转pdf", "word转pdf", "html转pdf"),
+        precedence=5,
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -411,13 +527,23 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         version="1.0.1",
         dir_name="pptx_generation",
         description=(
-            "从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览；"
-            "处理演示文稿/幻灯片/slides/deck 相关需求。"
+            "默认 PPT 入口：从结构化大纲 JSON 生成普通 PPTX、抽取已有幻灯片文本、"
+            "读取/检查现有 PPTX，或转换为可打印 HTML 预览。没有明确高端设计、"
+            "逐页 SVG、美化或路演设计需求时，优先使用本 Skill。"
         ),
         grant_reason="official_skill_auto_enable",
         category="pptx",
         capability_ids=("pptx.build", "pptx.read", "pptx.preview"),
-        keywords=("pptx", "ppt", "演示", "幻灯片", "生成", "大纲", "deck", "slides", "演示文稿"),
+        keywords=(
+            "pptx", "ppt", "演示", "幻灯片", "生成", "大纲", "deck", "slides",
+            "演示文稿", "普通ppt", "已有pptx", "读取pptx", "检查pptx",
+        ),
+        trigger_phrases=(
+            "生成ppt", "制作ppt", "做个ppt", "做一份ppt", "生成幻灯片", "制作幻灯片",
+            "读取ppt", "检查ppt", "提取幻灯片文本", "从大纲生成pptx",
+        ),
+        negative_phrases=("高端ppt", "ppt美化", "整页svg", "路演ppt", "答辩ppt"),
+        precedence=10,
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -427,11 +553,9 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         version="1.0.0",
         dir_name="ppt_agent",
         description=(
-            "把\"人类顶级 PPT 团队\"工作流固化为流水线：需求调研→大纲→资料检索→策划稿→"
-            "逐页 1280×720 整页 SVG 设计→网页预览→原生可编辑 .pptx（每个色块/文字/线条都是"
-            "原生 PowerPoint 形状，打开即可改字改色）。配图走 generate_image + base64 内联，"
-            "出片在离线沙箱（build_preview.py / build_pptx.py），视觉 QA 用 document-conversion "
-            "渲染逐页检查。朴素模板生成/读取/检查已有 PPTX 请用 pptx-generation。"
+            "仅用于明确要求高端视觉设计的 PPT 流水线：逐页 1280×720 SVG 设计、"
+            "PPT 美化、路演/答辩设计稿，或用户点名 ppt-agent。普通生成、读取、"
+            "检查已有 PPTX 默认走 pptx-generation，不应触发本 Skill。"
         ),
         grant_reason="official_skill_auto_enable",
         category="pptx",
@@ -440,8 +564,27 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "ppt设计", "幻灯片设计", "整页svg", "演示设计", "设计稿",
             "ppt美化", "deck设计", "答辩ppt", "路演ppt", "高端ppt",
         ),
+        trigger_phrases=(
+            "ppt设计", "幻灯片设计", "整页svg", "演示设计", "设计稿", "ppt美化",
+            "deck设计", "答辩ppt", "路演ppt", "高端ppt", "用ppt-agent",
+        ),
+        negative_phrases=(
+            "普通ppt", "朴素模板", "读取pptx", "检查pptx", "提取幻灯片文本", "已有pptx",
+        ),
         requires_runtime="sandbox",
-        required_tools=("sandbox_exec", "skill.sandbox_run"),
+        required_tools=(
+            "sandbox_exec",
+            "skill.sandbox_run",
+            "fetch_web_page",
+            "search_images",
+            "download_external_image",
+            "canvas_emit_trusted_component",
+            "generate_image",
+            "list_session_files",
+            "read_session_file",
+            "sandbox_write_file",
+            "sandbox_publish_file",
+        ),
     ),
     OfficialSkillSpec(
         key="spreadsheet-analysis",
@@ -460,6 +603,7 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "xlsx", "xls", "csv", "tsv", "ods", "表格", "数据分析", "pandas",
             "openpyxl", "清洗", "探查", "导出",
         ),
+        trigger_phrases=("分析表格", "清洗csv", "汇总表格", "导出xlsx", "探查xlsx"),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -473,6 +617,7 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         category="media",
         capability_ids=("media.probe", "audio.transcode", "video.frames", "media.report"),
         keywords=("ffmpeg", "ffprobe", "音视频", "音频", "视频", "转码", "抽帧", "元数据"),
+        trigger_phrases=("音视频转码", "提取音频", "视频抽帧", "读取媒体元数据", "媒体报告"),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -481,13 +626,33 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         display_name="前端构建与预览",
         version="1.0.0",
         dir_name="frontend_build_preview",
-        description="离线创建 Vite/React/Vue 项目、构建静态产物并渲染 PNG/PDF 预览。",
+        description=(
+            "离线创建 Vite/React/Vue 项目、构建静态产物并渲染 PNG/PDF 预览；"
+            "发布带 __lgSubapp SDK、事件埋点、状态回写与数据分析的双向交互子应用。"
+        ),
         grant_reason="official_skill_auto_enable",
         category="frontend",
         capability_ids=("frontend.scaffold", "frontend.build", "frontend.preview", "frontend.publish"),
-        keywords=("vite", "react", "vue", "前端", "构建", "预览", "spa", "dist"),
+        keywords=(
+            "vite", "react", "vue", "前端", "构建", "预览", "spa", "dist",
+            "双向交互子应用", "表单", "问卷", "埋点", "__lgSubapp", "状态回写",
+        ),
+        trigger_phrases=(
+            "双向交互子应用", "可提交页面", "表单应用", "问卷应用", "数据分析页面",
+            "构建前端", "渲染预览", "发布网页应用",
+        ),
         requires_runtime="sandbox",
-        required_tools=("sandbox_exec", "skill.sandbox_run"),
+        required_tools=(
+            "sandbox_exec",
+            "skill.sandbox_run",
+            "sandbox_validate_web_app",
+            "sandbox_validate_interaction_contract",
+            "sandbox_publish_web_app",
+            "sandbox_publish_file",
+            "subapp_observe",
+            "subapp_patch_state",
+            "subapp_analyze_events",
+        ),
     ),
     OfficialSkillSpec(
         key="data-processing",
@@ -503,6 +668,7 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         category="data",
         capability_ids=("json.transform", "csv.profile", "files.rename", "report.generate"),
         keywords=("json", "csv", "批处理", "转换", "统计", "报告", "rename", "清洗", "格式化"),
+        trigger_phrases=("批量转换", "json转换", "csv批处理", "生成markdown报告", "批量重命名"),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -516,6 +682,7 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         category="archive",
         capability_ids=("archive.create", "archive.extract", "archive.manifest"),
         keywords=("zip", "解压", "压缩", "归档", "7z", "tar", "打包"),
+        trigger_phrases=("打包zip", "解压文件", "生成归档清单", "压缩目录"),
         requires_runtime="sandbox",
         required_tools=("sandbox_exec", "skill.sandbox_run"),
     ),
@@ -532,6 +699,8 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         category="web",
         capability_ids=("web.fetch", "web.render"),
         keywords=("网页", "抓取", "web_fetch", "渲染", "html", "fetch"),
+        trigger_phrases=("抓取网页", "渲染网页", "读取网页正文", "fetch网页"),
+        negative_phrases=("本地html", "html转pdf", "html转png"),
         requires_runtime="sandbox+egress",
         required_tools=("fetch_web_page",),
     ),
@@ -559,8 +728,20 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "编辑图片",
             "source_file_ids",
         ),
+        trigger_phrases=(
+            "生成图片", "生成一张图", "帮我配图", "做一张插画", "改图", "编辑图片",
+            "文生图", "图生图", "search_images", "download_external_image",
+        ),
+        negative_phrases=("节点讲解", "教教我", "展开讲讲", "结构图", "流程图", "知识图谱"),
+        precedence=5,
         requires_runtime="agent",
-        required_tools=("generate_image", "list_session_files", "read_session_file"),
+        required_tools=(
+            "generate_image",
+            "search_images",
+            "download_external_image",
+            "list_session_files",
+            "read_session_file",
+        ),
     ),
     OfficialSkillSpec(
         key="sandbox-files",
@@ -589,6 +770,10 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "read_file",
             "list_files",
         ),
+        trigger_phrases=(
+            "工作区文件", "搜索文件", "读取文件", "编辑文件", "替换文件", "删除文件",
+            "sandbox_read_file", "sandbox_grep", "sandbox_apply_patch",
+        ),
         requires_runtime="sandbox",
         required_tools=(
             "sandbox_read_file",
@@ -598,6 +783,19 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "sandbox_list_files",
             "sandbox_grep",
             "sandbox_delete_file",
+            "sandbox_exec",
+            "sandbox_bash",
+            "sandbox_apply_patch",
+            "sandbox_todo",
+            "sandbox_git",
+            "sandbox_git_clone",
+            "sandbox_search_web",
+            "sandbox_fetch",
+            "sandbox_notebook",
+            "sandbox_skill_list",
+            "sandbox_skill_read",
+            "sandbox_subagent",
+            "sandbox_subagent_status",
         ),
     ),
     OfficialSkillSpec(
@@ -624,6 +822,7 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
             "sandbox_subagent_retry",
             "后台任务",
         ),
+        trigger_phrases=("子代理", "并行委派", "委派任务", "后台子任务", "subagent"),
         requires_runtime="sandbox",
         required_tools=(
             "sandbox_subagent",
@@ -735,10 +934,13 @@ def official_skill_package_files(spec: OfficialSkillSpec) -> dict[str, bytes]:
     if root is None:
         return {"SKILL.md": official_skill_md(spec).encode("utf-8")}
     try:
-        mtime = max(
-            (path.stat().st_mtime_ns for path in root.rglob("*") if path.is_file()),
-            default=0,
-        )
+        source_files = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and is_official_skill_package_path(path.relative_to(root).as_posix())
+        ]
+        mtime = max((path.stat().st_mtime_ns for path in source_files), default=0)
     except OSError:
         mtime = 0
     key = (str(root), mtime)
@@ -746,12 +948,10 @@ def official_skill_package_files(spec: OfficialSkillSpec) -> dict[str, bytes]:
     if cached is not None:
         return dict(cached)
     files: dict[str, bytes] = {}
-    for path in sorted(root.rglob("*")):
+    for path in sorted(source_files):
         if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
-        if rel != "SKILL.md" and not rel.startswith(("references/", "scripts/", "examples/")):
-            continue
         data = path.read_bytes()
         if len(data) > MAX_SKILL_FILE_BYTES:
             raise AppError(
@@ -810,6 +1010,9 @@ def ensure_official_skill_package(
         "category": spec.category,
         "capability_ids": list(spec.capability_ids),
         "keywords": list(spec.keywords),
+        "trigger_phrases": list(spec.trigger_phrases),
+        "negative_phrases": list(spec.negative_phrases),
+        "precedence": spec.precedence,
         "requires_runtime": spec.requires_runtime,
         "required_tools": list(spec.required_tools),
         "scripts": script_basenames,

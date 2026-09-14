@@ -1,16 +1,11 @@
 ---
 name: ppt-agent
 description: >
-  端到端 PPT 生成助手（LearnGraph 官方技能）:把"人类顶级 PPT 团队"的工作流——需求调研→大纲→资料检索→策划稿→整页
-  SVG 设计——固化成流水线,产出可拖进 PowerPoint 编辑的 1280×720 整页 SVG 幻灯片 + 网页预览 + 原生 .pptx。
-  当用户想做/生成/制作一套 PPT、幻灯片、演示文稿、slides、deck,或要为汇报/答辩/路演/组会/
-  课堂/产品介绍准备演示,或说"用 ppt-agent"、"帮我做个关于 X 的 PPT"、"把这个主题做成幻灯片"
-  时触发。全程两道人审关口(需求、大纲,用 canvas 确认卡交互),其余自动;调研走 LearnGraph 门控网页抓取
-  (fetch_web_page / 外部搜索通道)与 search_images,配图/示意图用 generate_image 生成并以 base64 内联,
-  出片在离线沙箱内执行 build_preview.py / build_pptx.py,视觉 QA 用 document-conversion 渲染逐页检查,
-  交付经 sandbox_publish_file 发布 .pptx 与 preview.html。确认后自动产出**每个色块/文字/线条都是原生
-  PowerPoint 形状、打开即可改字改色**的 .pptx;若起点是已有 .pptx 模板、或要做幻灯片级 OOXML 增删/
-  文本提取,请改用 LearnGraph 内置 pptx-generation 技能。
+  高端 PPT 设计流水线（LearnGraph 官方技能）。仅在用户明确要求 PPT 设计、美化妆造、逐页
+  1280×720 SVG、路演/答辩设计稿，或点名 ppt-agent 时使用。普通 PPT 生成、读取、检查已有 PPTX、
+  提取文本或朴素模板需求应使用 pptx-generation，不触发本 Skill。
+  流程为需求调研→大纲→资料检索→策划稿→整页 SVG 设计→预览与原生 .pptx，并在需求、大纲两处
+  等待用户确认；出片与视觉 QA 均在离线沙箱完成。
 ---
 
 # PPT Agent（LearnGraph 官方技能）
@@ -19,6 +14,13 @@ description: >
 把"人类顶级 PPT 团队"的工作流固化成流水线:需求调研 → 大纲 → 资料检索 → 策划稿 → 整页 SVG 设计 → 预览交付。逐页产出 1280×720 的 SVG,再逐元素翻译成由原生形状 / 文本框组成、打开即可改字改色的 .pptx,并生成网页预览。核心信条:**PPT 的灵魂是内容不是皮囊**——先想清楚为谁做、做什么,再谈设计。
 
 本版按 LearnGraph 系统组件做了适配:调研走**门控网页抓取**与**文搜图**,配图走**文生图/图生图**,确认关口用 **canvas 交互卡**,脚本在**离线沙箱**内出片(`skill.sandbox-run` / `sandbox_exec`),视觉 QA 用 **document-conversion** 渲染,交付经 **sandbox_publish_file**。本技能已注册为官方技能(`backend/app/skills/ppt_agent/`),随工作区自动启用、自动获得系统授权。
+
+## Goal 模式输入适配（硬性）
+
+- 当本轮同时启用 Goal 模式与 Agent 模式时，`goal-learning-route` 的输入规则覆盖本 Skill 的非 Goal 交互说明。
+- 阶段 1 的 3～5 个需求问题必须优先用 `lg_goal_ask_batch` 聚合卡片；只有一个问题时用 `lg_goal_ask`。
+- 阶段 2 的大纲确认同样使用 `lg_goal_ask`（`single_choice` + `allow_custom=true`），禁止纯文本询问。
+- 非 Goal 模式才可直接对话询问，或使用 `canvas_emit_trusted_component` 作为确认卡。
 
 ## 工作流总览
 七阶段顺序执行;**只在 ① 需求、② 大纲两处停下等用户确认**,其余自动跑完。
@@ -47,9 +49,10 @@ description: >
 - 调研通道(按可用性依次选择):① 门控网页抓取 `fetch_web_page`(仅当 egress 开启且目标域名在 `web_fetch.policy.allowed_domains`,见 web-fetch-render 技能);② 对话内可用的外部搜索 / FetchProvider 通道;③ 图片调研 `search_images`(文搜图)。
 - 所有通道都不可用、且用户未给足素材时:**如实说明**,基于用户素材 + 模型知识完成需求纪要,并在 `00-research.md` 中标注"事实性数据待用户补充",**不得编造数据与来源**。
 - 提问可直接对话,也可用 `canvas_emit_trusted_component`(`short_answer_table` / `fill_blank`)做一张批量作答卡。
+- 若处于 Goal + Agent 模式：优先用 `lg_goal_ask_batch`（2～5 个相关子问题）或 `lg_goal_ask`（单题），不得再用纯文本提问；非 Goal 模式才可直接对话或使用 canvas 作答卡。
 
 ### 阶段 2 · 大纲 🛑
-读 `references/02-outline-architect.md`,把 `00-research.md` 填入 `{{CONTEXT}}`、目标页数填入 `{{PAGE_REQUIREMENTS}}`,生成 `[PPT_OUTLINE]` JSON 并提取存为 `01-outline.json`。再以"数字便利贴"形式**每页一行**展示给用户(封面 / 目录 / 各章节页 / 结尾),供其增删、改写、调序;随后用 `canvas_emit_trusted_component` 发一张确认卡(`option_group`,选项如「确认,按此开跑」「我要调整」,`allow_custom=true` 接收自由文本意见)。**停下**,等用户确认大纲再继续(卡上提交、对话回复、逐页修改意见均视为确认信号)。
+读 `references/02-outline-architect.md`,把 `00-research.md` 填入 `{{CONTEXT}}`、目标页数填入 `{{PAGE_REQUIREMENTS}}`,生成 `[PPT_OUTLINE]` JSON 并提取存为 `01-outline.json`。再以"数字便利贴"形式**每页一行**展示给用户(封面 / 目录 / 各章节页 / 结尾),供其增删、改写、调序。Goal + Agent 模式用 `lg_goal_ask` 发 `single_choice` 确认卡；非 Goal 模式使用 `canvas_emit_trusted_component`（`option_group` + `allow_custom=true`）。**停下**,等用户确认大纲再继续(卡上提交、对话回复、逐页修改意见均视为确认信号)。
 
 ### 阶段 3 · 资料检索(自动)
 按确认后的大纲**逐页 / 逐节**检索,为每页备齐要点、数据、案例(标注来源),汇总写入 `02-content.md`、按大纲结构组织。

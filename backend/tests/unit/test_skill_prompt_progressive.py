@@ -29,7 +29,13 @@ from app.domain import models as m
 from app.domain.extension_models import ExtensionPermissionGrant, SkillRecord
 from app.domain.models import utc_now
 from app.services.agent_runtime import AgentToolRuntime
-from app.services.mcp_skills import MCPAndSkillService
+from app.services.mcp_skills import MCPAndSkillService, capability_query_tokens
+from app.services.skill_package import (
+    OFFICIAL_SKILLS,
+    OFFICIAL_SKILL_SOURCE,
+    official_skill_package_files,
+    official_skill_spec,
+)
 
 WORKSPACE = "ws-skill-progressive"
 ACTOR = "user-skill-progressive"
@@ -70,18 +76,24 @@ def _add_package_skill(
     *,
     last_used_at=None,
     description: str | None = None,
+    manifest_json: dict | None = None,
+    is_official: bool = False,
 ) -> SkillRecord:
     skill = SkillRecord(
         id=f"sk-{skill_key}",
         workspace_id=WORKSPACE,
         skill_key=skill_key,
         name=skill_key,
-        source="unit-test",
+        source=OFFICIAL_SKILL_SOURCE if is_official else "unit-test",
         version="1.0.0",
         generated_by="user_import",
         kind="agent_skill_package",
         package_format="skill_md_v1",
-        manifest_json={
+        origin_type="system" if is_official else "user_created",
+        is_official=is_official,
+        manifest_json=manifest_json
+        if manifest_json is not None
+        else {
             "description": description if description is not None else f"desc {skill_key}"
         },
         manifest_hash="0" * 64,
@@ -112,6 +124,26 @@ def _grant(db: Session, skill: SkillRecord) -> None:
         )
     )
     db.flush()
+
+
+def _add_official_package_skill(db: Session, skill_key: str) -> SkillRecord:
+    spec = official_skill_spec(skill_key)
+    return _add_package_skill(
+        db,
+        spec.key,
+        f"{spec.display_name} instructions",
+        manifest_json={
+            "description": spec.description,
+            "category": spec.category,
+            "capability_ids": list(spec.capability_ids),
+            "keywords": list(spec.keywords),
+            "trigger_phrases": list(spec.trigger_phrases),
+            "negative_phrases": list(spec.negative_phrases),
+            "precedence": spec.precedence,
+            "required_tools": list(spec.required_tools),
+        },
+        is_official=True,
+    )
 
 
 def _service(db: Session, settings: Settings) -> MCPAndSkillService:
@@ -302,3 +334,42 @@ def test_announce_usage_touches_last_used_at(db: Session) -> None:
     # LRU now puts bravo first
     text1 = service.agent_skill_package_instructions()
     assert text1.index("- `bravo`") < text1.index("- `alpha`")
+
+
+def test_official_package_files_exclude_generated_caches() -> None:
+    for spec in OFFICIAL_SKILLS:
+        files = official_skill_package_files(spec)
+        assert files
+        assert all("__pycache__" not in path for path in files)
+        assert all(not path.endswith((".pyc", ".pyo")) for path in files)
+
+
+def test_capability_query_tokens_split_cjk_and_ascii() -> None:
+    assert capability_query_tokens("生成PPT") == ["生成", "ppt"]
+    assert capability_query_tokens("做个 PPT") == ["做个", "ppt"]
+
+
+def test_overlapping_ppt_skills_use_structured_routing(db: Session) -> None:
+    for key in ("pptx-generation", "ppt-agent"):
+        _grant(db, _add_official_package_skill(db, key))
+    service = _service(db, _settings())
+
+    normal = service.search_capabilities("生成PPT")
+    high_design = service.search_capabilities("高端PPT美化")
+
+    assert normal["results"][0]["descriptor"]["capability_id"] == "skill:pptx-generation"
+    assert high_design["results"][0]["descriptor"]["capability_id"] == "skill:ppt-agent"
+
+
+def test_overlapping_learning_skills_use_structured_routing(db: Session) -> None:
+    for key in ("node-learning", "review-coach", "image-generation"):
+        _grant(db, _add_official_package_skill(db, key))
+    service = _service(db, _settings())
+
+    review = service.search_capabilities("到期复习")
+    exercise = service.search_capabilities("做个练习")
+    image = service.search_capabilities("生成一张图")
+
+    assert review["results"][0]["descriptor"]["capability_id"] == "skill:review-coach"
+    assert exercise["results"][0]["descriptor"]["capability_id"] == "skill:node-learning"
+    assert image["results"][0]["descriptor"]["capability_id"] == "skill:image-generation"

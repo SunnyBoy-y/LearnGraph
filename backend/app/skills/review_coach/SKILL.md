@@ -1,6 +1,6 @@
 ---
 name: review-coach
-description: 当用户要复习、自测或检查遗忘风险时，指导模型用 lg_review_list_due 与掌握度证据工具组织一次证据驱动的间隔复习。
+description: 到期复习、自测、考前查薄弱点或检查遗忘风险时使用；指导模型用 lg_review_list_due 与掌握度证据工具组织证据驱动的间隔复习。首次讲解、教教我、展开讲讲和节点图解走 node-learning。
 license: LearnGraph-Internal
 compatibility: Requires LearnGraph Agent runtime with review/mastery tools authorized
 metadata:
@@ -13,6 +13,7 @@ metadata:
 ## 何时使用
 
 - 用户说"该复习什么 / 帮我复习 / 考前检查薄弱点"，或在长时间未学习后回到工作区。
+- 用户明确要“自测”或“检查遗忘风险”时也走本 Skill；即使选中了节点，只要请求是到期复习而不是首次讲解，仍以本 Skill 为准。
 - 本轮实际提供了复习或掌握度工具。
 
 ## 执行步骤

@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type TouchEvent as ReactTouchEvent,
@@ -39,6 +40,7 @@ import {
   Camera,
   MessageSquareQuote,
   Mic,
+  MoreHorizontal,
   Network,
   Paperclip,
   Pencil,
@@ -1379,11 +1381,40 @@ function findPersistedUserTwin(
  * points at the temp user id, so the chain lands on the real answer bubble
  * even when the temp answer itself has no content yet.
  */
+function findVoiceCounterpart(
+  message: Message,
+  persisted: Message[],
+): Message | undefined {
+  // A voice turn has no optimistic id mapping: the server persists it under its
+  // own message id while the canvas renders a temp-voice row. Identity is the
+  // durable turn id / client message id recorded in provider_trace, so the
+  // overlay survives a history refetch instead of painting a second bubble.
+  const trace = message.provider_trace;
+  if (!trace || trace.voice_turn !== true) return undefined;
+  const turnId = typeof trace.turn_id === "string" ? trace.turn_id : undefined;
+  const clientMessageId =
+    typeof trace.client_message_id === "string" ? trace.client_message_id : undefined;
+  if (!turnId && !clientMessageId) return undefined;
+  return persisted.find((item) => {
+    if (item.session_id !== message.session_id) return false;
+    if (item.role !== message.role) return false;
+    const itemTrace = item.provider_trace;
+    if (!itemTrace || itemTrace.voice !== true) return false;
+    return (
+      (turnId !== undefined && itemTrace.voice_turn_id === turnId) ||
+      (clientMessageId !== undefined &&
+        itemTrace.client_message_id === clientMessageId)
+    );
+  });
+}
+
 function findOptimisticCounterpart(
   message: Message,
   persisted: Message[],
   tempUserToPersisted: Map<string, string>,
 ): Message | undefined {
+  const voiceCounterpart = findVoiceCounterpart(message, persisted);
+  if (voiceCounterpart) return voiceCounterpart;
   if (message.role === "user") {
     return findPersistedUserTwin(message, persisted);
   }
@@ -2396,6 +2427,19 @@ function FollowUpPrompts({
   );
 }
 
+/** 工作台工具栏的一个能力入口；窄屏按 primary 决定是否收进「更多」。 */
+type WorkbenchCapability = {
+  key: string;
+  label: string;
+  ariaLabel?: string;
+  icon: ReactNode;
+  title: string;
+  onClick: () => void;
+  disabled?: boolean;
+  pressed?: boolean;
+  primary?: boolean;
+};
+
 function ConversationQuickActions({
   attachDisabled,
   deepResearchDisabled,
@@ -2439,6 +2483,103 @@ function ConversationQuickActions({
   onPhoto?: () => void;
 }) {
   const dragScroll = useHorizontalDragScroll<HTMLElement>();
+  // 窄屏一次只横向展示高频入口，图谱/绘图/练习等低频能力收进「更多」，
+  // 避免 7 个入口把输入条上方挤成一整行。桌面维持全部平铺。
+  const isCompactToolbar = usePhoneLayout();
+  const capabilities: WorkbenchCapability[] = [
+    {
+      key: "attach",
+      label: "资料",
+      icon: <FilePlus2 aria-hidden="true" />,
+      title: "添加文件或图片，发送时按文件权限和解析状态处理",
+      onClick: onAttach,
+      disabled: attachDisabled,
+      primary: true,
+    },
+    ...(isNativeApp() && onPhoto
+      ? [
+          {
+            key: "photo",
+            label: "拍照",
+            ariaLabel: "现场拍照并作为附件",
+            icon: <Camera aria-hidden="true" />,
+            title: "打开系统相机拍照，照片将作为附件加入本轮对话",
+            onClick: onPhoto,
+            disabled: attachDisabled,
+            primary: true,
+          },
+        ]
+      : []),
+    {
+      key: "goal",
+      label: goalActive ? "目标中" : "目标",
+      icon: <Target aria-hidden="true" />,
+      title: goalActive ? "退出目标设定" : "在当前对话中设定学习目标",
+      onClick: onGoal,
+      disabled: goalDisabled,
+      pressed: goalActive,
+      primary: true,
+    },
+    {
+      key: "search",
+      label: searchActive ? "联网中" : "联网",
+      icon: <Search aria-hidden="true" />,
+      title: searchActive
+        ? "关闭本轮联网搜索"
+        : searchDisabled
+          ? "请先启用 SearchProvider，或确认模型托管联网能力"
+          : "下一条消息使用已授权的联网搜索",
+      onClick: onSearch,
+      disabled: searchDisabled,
+      pressed: searchActive,
+      primary: true,
+    },
+    {
+      key: "deep-research",
+      label: "深度研究",
+      icon: <FileSearch aria-hidden="true" />,
+      title: deepResearchDisabled
+        ? "请先启用 Deep Research Provider，并使用支持工具调用的模型"
+        : "快捷启动深度研究：启用智能体并预填 start_deep_research 任务",
+      onClick: onDeepResearch,
+      disabled: deepResearchDisabled,
+      primary: true,
+    },
+    {
+      key: "graph",
+      label: graphActive ? "图谱变更" : "图谱",
+      icon: <Network aria-hidden="true" />,
+      title: graphActive
+        ? "取消图谱变更：下一条消息将不再生成增量提案"
+        : "图谱变更：围绕当前节点细化/增补子节点（去重后生成需审核的变更提案）",
+      onClick: onGraph,
+      disabled: graphDisabled,
+      pressed: graphActive,
+    },
+    {
+      key: "image",
+      label: imageActive ? "绘图中" : "绘图",
+      icon: <ImageIcon aria-hidden="true" />,
+      title: imageActive ? "退出绘图模式" : "使用已配置的图片生成模型",
+      onClick: onImage,
+      disabled: imageDisabled,
+      pressed: imageActive,
+    },
+    {
+      key: "practice",
+      label: "生成练习",
+      icon: <Sparkles aria-hidden="true" />,
+      title: "基于当前目标、节点和资料，在对话框中预填练习请求",
+      onClick: onPractice,
+      disabled: practiceDisabled,
+    },
+  ];
+  const toolbarCapabilities = isCompactToolbar
+    ? capabilities.filter((capability) => capability.primary)
+    : capabilities;
+  const overflowCapabilities = isCompactToolbar
+    ? capabilities.filter((capability) => !capability.primary)
+    : [];
   return (
     <section
       aria-label="对话工作台功能"
@@ -2446,108 +2587,52 @@ function ConversationQuickActions({
       {...dragScroll}
     >
       <div className="chat-workbench-toolbar__actions">
-        <button
-          aria-label="添加资料到本轮对话"
-          className="chat-workbench-toolbar__action"
-          disabled={attachDisabled}
-          onClick={onAttach}
-          title="添加文件或图片，发送时按文件权限和解析状态处理"
-          type="button"
-        >
-          <FilePlus2 aria-hidden="true" />
-          资料
-        </button>
-        {isNativeApp() && onPhoto ? (
+        {toolbarCapabilities.map((capability) => (
           <button
-            aria-label="现场拍照并作为附件"
+            aria-label={capability.ariaLabel ?? capability.label}
+            aria-pressed={capability.pressed}
             className="chat-workbench-toolbar__action"
-            disabled={attachDisabled}
-            onClick={onPhoto}
-            title="打开系统相机拍照，照片将作为附件加入本轮对话"
+            disabled={capability.disabled}
+            key={capability.key}
+            onClick={capability.onClick}
+            title={capability.title}
             type="button"
           >
-            <Camera aria-hidden="true" />
-            拍照
+            {capability.icon}
+            {capability.label}
           </button>
+        ))}
+        {overflowCapabilities.length ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                aria-label="更多工作台能力"
+                className="chat-workbench-toolbar__action"
+                title="图谱、绘图与生成练习等低频能力"
+                type="button"
+              >
+                <MoreHorizontal aria-hidden="true" />
+                更多
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="w-52">
+              {overflowCapabilities.map((capability) => (
+                <DropdownMenuItem
+                  disabled={capability.disabled}
+                  key={capability.key}
+                  onSelect={capability.onClick}
+                  title={capability.title}
+                >
+                  {capability.icon}
+                  {capability.label}
+                  {capability.pressed ? (
+                    <Check aria-hidden="true" className="ml-auto size-4" />
+                  ) : null}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         ) : null}
-        <button
-          aria-pressed={goalActive}
-          className="chat-workbench-toolbar__action"
-          disabled={goalDisabled}
-          onClick={onGoal}
-          title={goalActive ? "退出目标设定" : "在当前对话中设定学习目标"}
-          type="button"
-        >
-          <Target aria-hidden="true" />
-          {goalActive ? "目标中" : "目标"}
-        </button>
-        <button
-          aria-pressed={searchActive}
-          className="chat-workbench-toolbar__action"
-          disabled={searchDisabled}
-          onClick={onSearch}
-          title={
-            searchActive
-              ? "关闭本轮联网搜索"
-              : searchDisabled
-                ? "请先启用 SearchProvider，或确认模型托管联网能力"
-                : "下一条消息使用已授权的联网搜索"
-          }
-          type="button"
-        >
-          <Search aria-hidden="true" />
-          {searchActive ? "联网中" : "联网"}
-        </button>
-        <button
-          className="chat-workbench-toolbar__action"
-          disabled={deepResearchDisabled}
-          onClick={onDeepResearch}
-          title={
-            deepResearchDisabled
-              ? "请先启用 Deep Research Provider，并使用支持工具调用的模型"
-              : "快捷启动深度研究：启用智能体并预填 start_deep_research 任务"
-          }
-          type="button"
-        >
-          <FileSearch aria-hidden="true" />
-          深度研究
-        </button>
-        <button
-          aria-pressed={graphActive}
-          className="chat-workbench-toolbar__action"
-          disabled={graphDisabled}
-          onClick={onGraph}
-          title={
-            graphActive
-              ? "取消图谱变更：下一条消息将不再生成增量提案"
-              : "图谱变更：围绕当前节点细化/增补子节点（去重后生成需审核的变更提案）"
-          }
-          type="button"
-        >
-          <Network aria-hidden="true" />
-          {graphActive ? "图谱变更" : "图谱"}
-        </button>
-        <button
-          aria-pressed={imageActive}
-          className="chat-workbench-toolbar__action"
-          disabled={imageDisabled}
-          onClick={onImage}
-          title={imageActive ? "退出绘图模式" : "使用已配置的图片生成模型"}
-          type="button"
-        >
-          <ImageIcon aria-hidden="true" />
-          {imageActive ? "绘图中" : "绘图"}
-        </button>
-        <button
-          className="chat-workbench-toolbar__action"
-          disabled={practiceDisabled}
-          onClick={onPractice}
-          title="基于当前目标、节点和资料，在对话框中预填练习请求"
-          type="button"
-        >
-          <Sparkles aria-hidden="true" />
-          生成练习
-        </button>
       </div>
     </section>
   );
@@ -2735,6 +2820,21 @@ export function ChatCanvasPage() {
   const [closeDialogOpen, setCloseDialogOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [voiceModeOpen, setVoiceModeOpen] = useState(false);
+  // Read the voice snapshot without opening a session: the page only needs to
+  // know whether the call can still carry input. Once ASR has exhausted its
+  // retries the audio path cannot carry a question any more, so voice mode must
+  // stop owning the composer instead of locking the user out.
+  const voiceSnapshotForGating = useSyncExternalStore(
+    voiceSessionController.subscribe,
+    voiceSessionController.getSnapshot,
+    voiceSessionController.getSnapshot,
+  );
+  const voiceTextFallback =
+    voiceModeOpen &&
+    voiceSnapshotForGating.sessionId === sessionId &&
+    voiceSnapshotForGating.textFallback;
+  /** Voice mode owns the composer only while its input path still works. */
+  const voiceBlocksComposer = voiceModeOpen && !voiceTextFallback;
   // 语音通话回合 → 聊天消息列表。render 事件使用稳定 turn id，允许同一条
   // 气泡随着 ASR/TTS 进度原地更新；最终事件再把 status 转为 completed。
   useEffect(() => {
@@ -2747,10 +2847,20 @@ export function ChatCanvasPage() {
       if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
       setLocalMessages((current) => {
         const id = `temp-voice-${item.id}`;
-        const status = item.final ? "completed" : "streaming";
-        const existing = current.find((message) => message.id === id);
+      const status = item.deliveryStatus === "failed"
+        ? "failed"
+        : item.pending
+          ? "pending"
+          : item.final
+            ? "completed"
+            : "streaming";
+        const existing = current.find((message) => message.id === id) || current.find((message) =>
+          message.role === item.role &&
+          ((item.turnId && message.provider_trace?.turn_id === item.turnId) ||
+            (item.clientMessageId && message.provider_trace?.client_message_id === item.clientMessageId)),
+        );
         if (existing) {
-          return current.map((message) => message.id === id
+          return current.map((message) => message.id === existing.id
             ? {
                 ...message,
                 content: text,
@@ -2762,6 +2872,11 @@ export function ChatCanvasPage() {
                   ...message.provider_trace,
                   voice_turn: true,
                   interrupted: Boolean(item.interrupted),
+                  event_id: item.eventId,
+                  turn_id: item.turnId,
+                  client_message_id: item.clientMessageId,
+                  authoritative: Boolean(item.authoritative || item.final),
+                  retryable: item.deliveryStatus === "failed",
                 },
               }
             : message);
@@ -2789,6 +2904,11 @@ export function ChatCanvasPage() {
           provider_trace: {
             voice_turn: true,
             interrupted: Boolean(item.interrupted),
+            event_id: item.eventId,
+            turn_id: item.turnId,
+            client_message_id: item.clientMessageId,
+            authoritative: Boolean(item.authoritative || item.final),
+            retryable: item.deliveryStatus === "failed",
           },
           created_at: item.createdAt || new Date().toISOString(),
         };
@@ -2799,7 +2919,7 @@ export function ChatCanvasPage() {
     return () => {
       window.removeEventListener("learngraph:voice-render", onVoiceRender);
     };
-  }, [sessionId, voiceModeOpen, workspaceId]);
+  }, [sessionId, voiceModeOpen, workspaceId, voiceBlocksComposer]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -2899,8 +3019,12 @@ export function ChatCanvasPage() {
     el.style.width = "100%";
 
     const syncHeight = () => {
-      const maxHeight = 210;
-      const minHeight = 52;
+      // 高度预算来自 CSS token，窄屏由堆叠式布局收紧，避免这里写死像素。
+      const composerStyles = window.getComputedStyle(el);
+      const maxHeight =
+        Number.parseFloat(composerStyles.getPropertyValue("--composer-textarea-max")) || 210;
+      const minHeight =
+        Number.parseFloat(composerStyles.getPropertyValue("--composer-textarea-min")) || 52;
       // Collapse first so scrollHeight reflects full content, including soft wraps.
       el.style.height = "0px";
       const contentHeight = el.scrollHeight;
@@ -3889,6 +4013,17 @@ export function ChatCanvasPage() {
             appended.push(message);
           }
         } else if (
+          message.provider_trace?.voice_turn === true &&
+          message.provider_trace?.authoritative === true &&
+          TERMINAL_MESSAGE_STATUSES.includes(
+            confirmed.status as (typeof TERMINAL_MESSAGE_STATUSES)[number],
+          )
+        ) {
+          // Authoritative and already durable: the persisted row is the single
+          // source of truth, so the speculative copy is discarded instead of
+          // overlaying it (that overlay was the second bubble seen after a
+          // refresh).
+        } else if (
           !TERMINAL_MESSAGE_STATUSES.includes(
             confirmed.status as (typeof TERMINAL_MESSAGE_STATUSES)[number],
           )
@@ -4552,8 +4687,13 @@ export function ChatCanvasPage() {
       ...candidates.map((text) => ({ text })),
     ]);
   }, [asrHotwords, saveAsrHotwords]);
+  // 全双工语音模式是一通「通话」：画布里不该再出现「接下来可以问」这种需要点选
+  // 才能继续的提示卡，也不该为它去读/生成提示（生成失败还会弹「问题提示生成失败」）。
+  // 这里把整条提示链路关掉——读、生成、pending、error 全部随之失效；挂断退出语音
+  // 模式后条件恢复，提示会自动回来。
   const canPrepareSuggestedPrompts = Boolean(
     !goalMode &&
+      !voiceBlocksComposer &&
       settings.isSuccess &&
       suggestedPromptsEnabled &&
       sessions.isSuccess &&
@@ -5337,6 +5477,19 @@ export function ChatCanvasPage() {
     ) => {
       const content = contentValue.trim();
       if (!content) return;
+      // Voice mode owns the turn. Any other entry into send() — the selection
+      // menu, learngraph:compose, a route prompt, a retry or the pending-send
+      // queue — would start a second answer over SSE for the question the audio
+      // pipeline is already answering. The voice path uses sendText() and never
+      // routes through here.
+      //
+      // The exception is a degraded call: once ASR is gone the audio path cannot
+      // carry a question at all, so refusing text would leave the user with no
+      // way to be understood. Transcript and tasks stay persisted either way.
+      if (voiceModeOpen && !voiceTextFallback) {
+        toast.message("语音模式下无法发起普通对话请求，请先退出语音模式。");
+        return;
+      }
       // Concurrent sessions: only block while THIS session is generating.
       if (isSessionStreaming(sessionId)) return;
       if (
@@ -6124,6 +6277,8 @@ export function ChatCanvasPage() {
       closeSessionMutation.isPending,
       sessionIsClosed,
       status,
+      voiceModeOpen,
+      voiceBlocksComposer,
       workspaceId,
     ],
   );
@@ -6265,8 +6420,13 @@ export function ChatCanvasPage() {
       // transcript produces, not a second chat request that answers in parallel.
       // Anything with attachments / long-paste still falls through to the normal
       // chat path, which owns uploads and document context.
+      //
+      // When the call is degraded the RTVI channel is no longer a reliable
+      // carrier, so the ordinary chat path is the *correct* one: falling through
+      // is what turns "the mic died" into "you can still type".
       if (
         voiceModeOpen &&
+        !voiceTextFallback &&
         trimmedText &&
         !effectiveFiles.length &&
         effectiveLongPaste === null
@@ -6287,6 +6447,14 @@ export function ChatCanvasPage() {
           toast.message("语音通道尚未就绪，请稍后重试，或退出语音模式后再发送。");
           return false;
         }
+        // Voice mode owns the composer; never let a disconnected call or an
+        // attachment fall through to the ordinary SSE chat sender.
+        toast.message("语音模式下请等待语音通道连接，或先退出语音模式。附件与快捷操作暂不可用。");
+        return false;
+      }
+      if (voiceModeOpen && !voiceTextFallback) {
+        toast.message("语音模式下附件与快捷操作暂不可用，请退出语音模式后再使用。");
+        return false;
       }
       if (generatingNow && trimmedText) {
         const queued: PendingSendItem = {
@@ -6548,6 +6716,7 @@ export function ChatCanvasPage() {
       storedAudioAsrAvailable,
       uploadAndIndex,
       voiceModeOpen,
+      voiceBlocksComposer,
     ],
   );
 
@@ -8269,6 +8438,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     [enableAgentMode, focusComposer],
   );
   const setGraphProposal = useCallback(() => {
+    if (voiceBlocksComposer) return;
     if (!graphCommandAvailable) return;
     prepareTaskPrompt(
       currentSession?.graph_id
@@ -8276,15 +8446,17 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         : "请使用图谱提案工具为当前已确认目标创建候选图谱，生成需要我审核的提案，不要直接发布。",
       { agent: true },
     );
-  }, [currentSession?.graph_id, graphCommandAvailable, prepareTaskPrompt]);
+  }, [currentSession?.graph_id, graphCommandAvailable, prepareTaskPrompt, voiceModeOpen, voiceBlocksComposer]);
   const startDeepResearch = useCallback(() => {
+    if (voiceBlocksComposer) return;
     if (!supportsAgentMode || !hasDeepResearchProvider) return;
     prepareTaskPrompt(
       "请使用 start_deep_research 工具启动深度研究。研究问题请根据当前对话上下文提炼；若用户已给出预算则使用该预算，否则先询问预算（单位：元 / budget_cny）。提交后若返回 user_approval_required=true，请停止并等待用户在界面上确认预算，不要重复调用 get_deep_research。",
       { agent: true },
     );
-  }, [hasDeepResearchProvider, prepareTaskPrompt, supportsAgentMode]);
+  }, [hasDeepResearchProvider, prepareTaskPrompt, supportsAgentMode, voiceModeOpen, voiceBlocksComposer]);
   const toggleNetworkSearch = useCallback(() => {
+    if (voiceBlocksComposer) return;
     setGenerationMode("text");
     setSearchRoute((current) => {
       if (current !== "disabled") return "disabled";
@@ -8313,6 +8485,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     focusComposer,
     hasAuthorizedAgentSearchProvider,
     selectedModel?.capabilities?.hosted_web_search,
+    voiceModeOpen,
+    voiceBlocksComposer,
   ]);
   const toggleAgentMode = useCallback(() => {
     if (responseMode === "agentic") {
@@ -8324,11 +8498,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     focusComposer();
   }, [enableAgentMode, focusComposer, responseMode]);
   const toggleImageMode = useCallback(() => {
+    if (voiceBlocksComposer) return;
     setGenerationMode((current) => (current === "image" ? "text" : "image"));
     setGraphAction("none");
     setSearchRoute("disabled");
     focusComposer();
-  }, [focusComposer]);
+  }, [focusComposer, voiceModeOpen, voiceBlocksComposer]);
   const composerCommands = [
     {
       id: "goal" as const,
@@ -8522,6 +8697,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   );
   const activateComposerCommand = useCallback(
     (action: ComposerCommandId) => {
+      if (voiceBlocksComposer) return;
       if (action === "goal") {
         enterGoalMode();
         return;
@@ -8596,6 +8772,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       prepareTaskPrompt,
       setGraphProposal,
       startDeepResearch,
+      voiceModeOpen,
+      voiceBlocksComposer,
     ],
   );
   const clearSelectedLearningNode = useCallback(() => {
@@ -8622,8 +8800,14 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       leaveGoalMode();
       return;
     }
+    if (voiceBlocksComposer) {
+      // Goal mode submits a normal chat request; allowing it mid-call would
+      // produce a second answer next to the spoken one.
+      toast.message("语音模式下无法切换到目标模式，请先退出语音模式。");
+      return;
+    }
     enterGoalMode();
-  }, [enterGoalMode, goalMode, leaveGoalMode]);
+  }, [enterGoalMode, goalMode, leaveGoalMode, voiceModeOpen, voiceBlocksComposer]);
   const openAttachmentPicker = useCallback(() => {
     openFileDialogRef.current();
   }, []);
@@ -9475,35 +9659,49 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         {/* 语音球定位：悬在工作台功能条（资料/目标/联网/…）上方，
             而不是挤在功能条与输入框之间的那道窄缝里。 */}
         {voiceModeOpen ? (
-          <VoiceOrbDock
-            modelId={selectedModelId}
-            providerId={activeModelProvider?.id}
-            sessionId={sessionId}
-            workspaceId={workspaceId}
-          />
+          <>
+            <VoiceOrbDock
+              modelId={selectedModelId}
+              providerId={activeModelProvider?.id}
+              sessionId={sessionId}
+              workspaceId={workspaceId}
+            />
+            {voiceTextFallback && voiceSnapshotForGating.degradedNotice ? (
+              // The call dropped to text. Say so explicitly, and say that the
+              // record survives: silently accepting typed input while the user
+              // believes they are still speaking is the failure this prevents.
+              <p
+                aria-live="polite"
+                className="chat-voice-degraded-note"
+                role="status"
+              >
+                {voiceSnapshotForGating.degradedNotice}
+              </p>
+            ) : null}
+          </>
         ) : null}
         <ConversationQuickActions
-          attachDisabled={sessionIsClosed || goalFlow.busy}
+          attachDisabled={sessionIsClosed || goalFlow.busy || voiceBlocksComposer}
           onPhoto={handleNativePhoto}
           deepResearchDisabled={
-            sessionIsClosed ||
+            sessionIsClosed || voiceBlocksComposer ||
             goalMode ||
             goalFlow.busy ||
             !supportsAgentMode ||
             !hasDeepResearchProvider
           }
           goalActive={goalMode}
-          goalDisabled={goalFlow.busy || (!goalMode && sessionIsClosed)}
+          goalDisabled={voiceBlocksComposer || goalFlow.busy || (!goalMode && sessionIsClosed)}
           graphActive={graphAction !== "none"}
           graphDisabled={
-            sessionIsClosed ||
+            sessionIsClosed || voiceBlocksComposer ||
             goalMode ||
             goalFlow.busy ||
             !graphCommandAvailable
           }
           imageActive={generationMode === "image"}
           imageDisabled={
-            sessionIsClosed ||
+            sessionIsClosed || voiceBlocksComposer ||
             goalMode ||
             goalFlow.busy ||
             !activeImageProvider ||
@@ -9517,11 +9715,11 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           onPractice={() => activateComposerCommand("practice")}
           onSearch={toggleNetworkSearch}
           practiceDisabled={
-            sessionIsClosed || goalMode || goalFlow.busy || !activeModelProvider
+            sessionIsClosed || voiceBlocksComposer || goalMode || goalFlow.busy || !activeModelProvider
           }
           searchActive={searchRoute !== "disabled"}
           searchDisabled={
-            sessionIsClosed ||
+            sessionIsClosed || voiceBlocksComposer ||
             goalFlow.busy ||
             !canUseNetworkSearch
           }
@@ -9643,6 +9841,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 <PromptInputActionAddAttachments
                   disabled={
                     sessionIsClosed ||
+                    voiceBlocksComposer ||
                     goalFlow.busy ||
                     (generationMode === "image" && !imageEditEnabled)
                   }

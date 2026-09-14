@@ -19,7 +19,7 @@
 
 - `prompt` 去空白后必须 1–2000 字符（`MAX_AGENT_IMAGE_PROMPT_CHARS`）。
 - `size` 必须是上述枚举之一。
-- `source_file_ids` 必须全部是**本工作区、storage_status=stored 的图片文件**；单文件 ≤10 MB（`AGENT_IMAGE_INPUT_MAX_BYTES`）、像素 ≤4000 万；最多 4 张（`MAX_IMAGE_EDIT_SOURCES`）。
+- `source_file_ids` 必须全部是**本工作区、storage_status=stored 的图片文件**；单文件 ≤32 MB（`AGENT_IMAGE_INPUT_MAX_BYTES`）、像素 ≤8000 万；最多 4 张（`MAX_IMAGE_EDIT_SOURCES`）。
 - 图生图时目标模型必须声明 `supports_image_edit`，否则返回 `image_edit_model_unsupported`。
 
 ### 返回（成功）
@@ -59,7 +59,7 @@
 
 - 用途：读取文件内容。图片：模型支持图像输入时把图附加进对话（`image_attached=true`）；否则返回尺寸/类型并提示可用 `generate_image.source_file_ids` 编辑或转 `workspace` 目标给沙箱。
 - 参数 `target`：`context`（默认，回读到对话）/ `workspace`（物化到会话工作区 `inputs/`）。
-- 限制：图片 ≤10 MB、像素 ≤4000 万；文本 ≤40 000 字符。
+- 限制：图片 ≤32 MB、像素 ≤8000 万；文本 ≤40 000 字符。
 
 ## 4. 关联但**不属于**本 Skill 的工具
 

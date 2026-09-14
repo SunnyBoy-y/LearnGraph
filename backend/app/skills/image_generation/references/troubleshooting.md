@@ -34,7 +34,7 @@
 |---|---|
 | 用户说"上面的图"但找不到 | 先 `list_session_files` 核对当前会话；跨会话引用需用户明确指定会话 |
 | `read_session_file` 返回 `image_attached=false`（模型不支持图像输入） | 仍可图生图：用其 `file_id` 传 `source_file_ids`；解释图片内容则用 `analyze_image`（独立视觉模型） |
-| 图片 >10 MB / >4000 万像素 | `read_session_file` 会转 `workspace` 目标或报限制；提示用户压缩后重传 |
+| 图片 >32 MB / >8000 万像素 | `read_session_file` 会转 `workspace` 目标或报限制；提示用户压缩后重传 |
 
 ## 5. 边界与禁止事项
 

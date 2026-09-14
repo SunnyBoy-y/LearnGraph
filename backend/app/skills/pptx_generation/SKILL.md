@@ -1,6 +1,6 @@
 ---
 name: pptx-generation
-description: 从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转换为可打印 HTML 预览；处理演示文稿/幻灯片/slides/deck 相关需求。
+description: 默认 PPT 入口。从结构化大纲 JSON 生成普通 PPTX、抽取已有幻灯片文本、读取/检查现有 PPTX，或转换为可打印 HTML 预览；没有明确高端设计、逐页 SVG、美化或路演设计需求时优先使用本 Skill。
 ---
 
 # PPT 生成与检查
@@ -10,6 +10,8 @@ description: 从结构化大纲 JSON 生成 PPTX、抽取幻灯片文本、转�
 - 用户要生成一份演示文稿（PPTX），已有大纲/要点/结论。
 - 需要读取既有 `.pptx` 的幻灯片文本、统计页数、检查结构。
 - 需要把 PPTX 内容变成可打印/可预览的 HTML（离线无 LibreOffice，不能直接渲染 PPTX 为 PDF/PNG）。
+
+> **路由边界**：普通生成、朴素模板、读取或检查已有 PPTX 都走本 Skill；只有用户明确要求高端视觉设计、PPT 美化、逐页 1280×720 SVG、路演/答辩设计稿，或点名 `ppt-agent` 时，才转 `ppt-agent`。
 
 ## 决策顺序
 

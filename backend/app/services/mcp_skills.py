@@ -99,6 +99,21 @@ from app.services.workflow import WorkflowService
 
 
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+CAPABILITY_QUERY_TOKEN_RE = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+")
+
+
+def capability_query_tokens(text: str) -> list[str]:
+    """Split mixed CJK/ASCII capability queries without merging scripts."""
+
+    return CAPABILITY_QUERY_TOKEN_RE.findall((text or "").casefold())
+
+
+def compact_capability_phrase(text: str) -> str:
+    """Normalize whitespace so phrase matching works across mixed-language input."""
+
+    return re.sub(r"\s+", "", (text or "").casefold())
+
+
 SENSITIVE_KEYS = {
     "api_key",
     "apikey",
@@ -1103,6 +1118,9 @@ class MCPAndSkillService:
         category = ""
         capability_ids: list[str] = []
         extra_keywords: list[str] = []
+        trigger_phrases: list[str] = []
+        negative_phrases: list[str] = []
+        precedence = 0
         if isinstance(skill.manifest_json, dict):
             raw = skill.manifest_json.get("description")
             if isinstance(raw, str):
@@ -1116,6 +1134,16 @@ class MCPAndSkillService:
             raw_kw = skill.manifest_json.get("keywords")
             if isinstance(raw_kw, list):
                 extra_keywords = [str(item) for item in raw_kw if isinstance(item, str)]
+            raw_triggers = skill.manifest_json.get("trigger_phrases")
+            if isinstance(raw_triggers, list):
+                trigger_phrases = [str(item) for item in raw_triggers if isinstance(item, str)]
+            raw_negative = skill.manifest_json.get("negative_phrases")
+            if isinstance(raw_negative, list):
+                negative_phrases = [str(item) for item in raw_negative if isinstance(item, str)]
+            try:
+                precedence = int(skill.manifest_json.get("precedence") or 0)
+            except (TypeError, ValueError):
+                precedence = 0
         # Discovery metadata must never be synthesized from untrusted SKILL.md
         # instructions. Packages without a description remain discoverable by
         # key/name and load their body only after explicit activation/read.
@@ -1130,6 +1158,9 @@ class MCPAndSkillService:
             "summary": _short_summary(description or skill.name),
             "when_to_use": _short_summary(when_to_use),
             "capability_ids": capability_ids,
+            "trigger_phrases": trigger_phrases,
+            "negative_phrases": negative_phrases,
+            "precedence": precedence,
             "keywords": [
                 part
                 for part in re.split(
@@ -1288,6 +1319,8 @@ class MCPAndSkillService:
 
         This is the high-recall floor: capability_id/name/title/summary/
         when_to_use/keywords are token-matched (case-insensitive, CJK-aware).
+        Explicit trigger/negative phrases provide deterministic routing for
+        overlapping skills, while precedence breaks remaining ties.
         An exact capability_id or function name always wins. Semantic ranking
         can be layered on later without changing the contract.
         """
@@ -1312,12 +1345,9 @@ class MCPAndSkillService:
                 ],
                 "total": len(ordered),
             }
-        tokens = [
-            t
-            for t in re.split(r"[^a-z0-9_一-鿿]+", text_query)
-            if t
-        ]
-        scored: list[tuple[int, dict[str, Any], list[str]]] = []
+        tokens = capability_query_tokens(text_query)
+        compact_query = compact_capability_phrase(text_query)
+        scored: list[tuple[int, int, dict[str, Any], list[str]]] = []
         for d in descriptors:
             haystack = " ".join(
                 [
@@ -1327,24 +1357,47 @@ class MCPAndSkillService:
                     d.get("summary", ""),
                     d.get("when_to_use", ""),
                     " ".join(d.get("keywords") or []),
+                    " ".join(d.get("trigger_phrases") or []),
+                    " ".join(d.get("negative_phrases") or []),
                 ]
             ).lower()
+            compact_haystack = compact_capability_phrase(haystack)
             score = 0
             matched: list[str] = []
             if text_query in {d.get("capability_id"), d.get("name"), d.get("function_name")}:
                 score += 100
                 matched.append("exact")
+            for phrase in d.get("trigger_phrases") or []:
+                compact_phrase = compact_capability_phrase(str(phrase))
+                if compact_phrase and compact_phrase in compact_query:
+                    score += 12
+                    matched.append(f"trigger:{phrase}")
+            for phrase in d.get("negative_phrases") or []:
+                compact_phrase = compact_capability_phrase(str(phrase))
+                if compact_phrase and compact_phrase in compact_query:
+                    score -= 16
+                    matched.append(f"negative:{phrase}")
             for token in tokens:
                 if token in haystack:
                     score += 2
                     if token not in matched:
                         matched.append(token)
+            if compact_query and compact_query in compact_haystack:
+                score += 8
+                matched.append("compact-phrase")
             if score > 0:
-                scored.append((score, d, matched))
-        scored.sort(key=lambda item: (-item[0], item[1]["family"], item[1]["name"]))
+                scored.append((score, int(d.get("precedence") or 0), d, matched))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -item[1],
+                item[2]["family"],
+                item[2]["name"],
+            )
+        )
         results = [
             {"descriptor": d, "matched": matched}
-            for _score, d, matched in scored[:limit]
+            for _score, _precedence, d, matched in scored[:limit]
         ]
         return {
             "query": query or "",

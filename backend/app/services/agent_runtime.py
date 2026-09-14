@@ -73,14 +73,19 @@ SESSION_FILE_TEXT_MAX_CHARS = 40_000
 MAX_IMAGE_EDIT_SOURCES = 4
 # Mirrors the multimodal chat attachment limits in ChatService so an image the
 # user could attach directly is also readable/editable through Agent tools.
-AGENT_IMAGE_INPUT_MAX_BYTES = 10 * 1024 * 1024
-AGENT_IMAGE_INPUT_MAX_PIXELS = 40_000_000
+AGENT_IMAGE_INPUT_MAX_BYTES = 32 * 1024 * 1024
+AGENT_IMAGE_INPUT_MAX_PIXELS = 80_000_000
 AGENT_IMAGE_FORMAT_MIME_TYPES = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
     "WEBP": "image/webp",
     "GIF": "image/gif",
 }
+# Formats that can actually become direct model image input. Other image-like
+# attachments (TIFF/SVG/BMP/HEIC/AVIF/ICO) are materialized into the session
+# workspace for sandbox tools instead of failing the tool call.
+AGENT_DIRECT_IMAGE_MIME_TYPES = frozenset(AGENT_IMAGE_FORMAT_MIME_TYPES.values())
+AGENT_DIRECT_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 # subapp_observe (T1.4): read-only observation of SubAppInteractionEvent rows.
 # Hard caps keep the tool pure-observation: bounded row count, bounded
 # per-type map, and a size/field-limited payload digest (payloads are
@@ -221,6 +226,40 @@ class AgentToolRuntime:
         if self.memory_tools is not None and memory_enabled:
             definitions.extend(self._memory_tool_definitions())
         return definitions
+
+    def definitions_for_tools(
+        self,
+        *,
+        tool_names: set[str] | frozenset[str] | None,
+        web_search_enabled: bool = False,
+        memory_enabled: bool = False,
+        capability_families: set[str] | None = None,
+        activated_capabilities: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only the explicitly selected runtime tool definitions.
+
+        ``tool_names=None`` means every tool the runtime would normally
+        disclose.  A set (including an empty set) is an exact filter and never
+        falls back to the broad default tool graph.
+        """
+        definitions = self.definitions(
+            agent_mode_enabled=True,
+            web_search_enabled=web_search_enabled,
+            memory_enabled=memory_enabled,
+            capability_families=capability_families,
+            activated_capabilities=activated_capabilities,
+        )
+        if tool_names is None:
+            return definitions
+        allowed = set(tool_names)
+        return [
+            definition
+            for definition in definitions
+            if isinstance(definition, dict)
+            and isinstance(definition.get("function"), dict)
+            and definition["function"].get("name") in allowed
+        ]
+
 
     @staticmethod
     def _learning_orchestration_tool_definitions() -> list[dict[str, Any]]:
@@ -7784,6 +7823,31 @@ class AgentToolRuntime:
             )
 
         if is_image_attachment(file) or file.mime_type.casefold().startswith("image/"):
+            declared_mime = (file.mime_type or "").casefold().split(";", 1)[0].strip()
+            if (
+                declared_mime not in AGENT_DIRECT_IMAGE_MIME_TYPES
+                and Path(file.original_name).suffix.casefold()
+                not in AGENT_DIRECT_IMAGE_EXTENSIONS
+            ):
+                view = self._materialize_session_file(chat_session_id, file)
+                return self._success(
+                    {
+                        **base_result,
+                        "image_attached": False,
+                        "workspace_path": view.get("path"),
+                        "note": (
+                            "This image format cannot be passed as direct image "
+                            "input; it was materialized into the session workspace "
+                            "instead. Use sandbox_exec to convert or inspect it."
+                        ),
+                    },
+                    {
+                        "tool": "read_session_file",
+                        "file_id": file.id,
+                        "workspace_path": view.get("path"),
+                    },
+                    [],
+                )
             if file.size_bytes > AGENT_IMAGE_INPUT_MAX_BYTES:
                 view = self._materialize_session_file(chat_session_id, file)
                 return self._success(

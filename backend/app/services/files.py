@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 from app.services.chat_attachment_policy import (
     AUDIO_EXTENSIONS as _AUDIO_EXTENSIONS,
     OPTIONAL_IMAGE_EXTENSIONS as _OPTIONAL_IMAGE_EXTENSIONS,
+    SPECIAL_BINARY_EXTENSIONS as _SPECIAL_BINARY_EXTENSIONS,
 )
 
 LOCAL_TEXT_EXTENSIONS = set(_LOCAL_TEXT_EXTENSIONS)
@@ -751,6 +752,19 @@ class FileService:
 
     async def upload(self, upload: UploadFile) -> FileRecord:
         original_name = upload.filename or "upload.bin"
+
+        # Executables, scripts and disk images are rejected before a single byte
+        # is streamed into object storage. The materials library is a learning
+        # library, and these formats are never a legitimate learning resource.
+        uploaded_name = Path(original_name).name[:255]
+        uploaded_extension = Path(original_name).suffix.casefold()
+        if uploaded_extension in _SPECIAL_BINARY_EXTENSIONS:
+            raise AppError(
+                415,
+                "unsupported_file_type",
+                f"「{uploaded_name}」属于不允许上传的可执行文件/脚本/磁盘镜像类型。",
+                {"extension": uploaded_extension},
+            )
 
         # Workspace storage quota (aggregate, not per-file): reject before
         # streaming when the workspace is already at/over budget. The quota
