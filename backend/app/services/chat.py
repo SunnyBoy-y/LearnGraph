@@ -132,6 +132,7 @@ from app.services.chat_attachment_policy import (
     is_audio_attachment,
     is_image_attachment as policy_is_image_attachment,
     is_inline_text_attachment,
+    is_special_binary_attachment,
     is_video_attachment as policy_is_video_attachment,
     non_agent_attachment_error,
 )
