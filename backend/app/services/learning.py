@@ -43,6 +43,7 @@ from app.domain.schemas.learning import (
     ModelGeneratedExerciseSet,
     ModelShortAnswerGrade,
 )
+from app.providers.error_policy import provider_failure_is_transient
 from app.providers.ports.model import ModelProviderPort
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import (
@@ -507,7 +508,10 @@ class ExerciseService:
         )
         errors: list[str] = []
         attempt_prompt = prompt
+        attempts_made = 0
+        failure_error: BaseException | None = None
         for attempt in range(1, 4):
+            attempts_made = attempt
             quote = self.billing.preflight_model_call(
                 provider_id=provider.provider_id,
                 model_id=getattr(provider, "model_id", "unknown"),
@@ -524,12 +528,14 @@ class ExerciseService:
             provider_returned = False
             result: Any = None
             failure = ""
+            failure_error = None
             try:
                 raw = provider.generate_json(attempt_prompt, "exercise_generate", schema)
                 provider_returned = True
                 result = check(raw)
             except Exception as exc:  # noqa: BLE001
                 failure = f"{type(exc).__name__}: {exc}".strip()[:300]
+                failure_error = exc
                 errors.append(failure)
             if provider_returned:
                 usage = dict(getattr(provider, "last_usage", {}) or {})
@@ -547,22 +553,51 @@ class ExerciseService:
             if result is not None:
                 return result
             if failure and attempt < 3:
+                if not provider_failure_is_transient(failure_error):
+                    # The provider rejected the request itself (unknown model,
+                    # revoked key, malformed payload). Repeating it can only
+                    # reproduce the same error and buries the real cause behind
+                    # "failed after 3 attempts", so stop and report it as is.
+                    break
                 attempt_prompt = (
                     f"{prompt}\n\n上一次输出不可用：{failure}\n"
                     "请重新输出一个**完整且严格符合上述 JSON schema** 的对象："
                     "字段齐全、不要附加解释文字、不要使用 Markdown。"
                 )
+        provider_id = getattr(provider, "provider_id", "unknown")
+        model_id = getattr(provider, "model_id", "unknown")
+        last_error = errors[-1] if errors else "未知错误"
+        if failure_error is not None and not provider_failure_is_transient(
+            failure_error
+        ):
+            raise AppError(
+                502,
+                "remote_model_rejected_request",
+                (
+                    f"远程模型（Provider {provider_id} / 模型 {model_id}）拒绝了本次出题请求，"
+                    "重试不会成功：请在「设置 → 功能模型」为练习指定一个可用模型，"
+                    f"或改选该 Provider 的默认模型。原始错误：{last_error}"
+                ),
+                {
+                    "attempts": attempts_made,
+                    "errors": errors,
+                    "feature": "exercise_generate",
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "last_request_id": getattr(provider, "last_request_id", None),
+                },
+            )
         raise AppError(
             502,
             "structured_generation_failed",
             "远程模型连续 3 次都没有返回可用的结果："
-            f"{errors[-1] if errors else '未知错误'}",
+            f"{last_error}",
             {
-                "attempts": 3,
+                "attempts": attempts_made,
                 "errors": errors,
                 "feature": "exercise_generate",
-                "provider_id": getattr(provider, "provider_id", "unknown"),
-                "model_id": getattr(provider, "model_id", "unknown"),
+                "provider_id": provider_id,
+                "model_id": model_id,
                 "last_request_id": getattr(provider, "last_request_id", None),
             },
         )
@@ -1017,6 +1052,7 @@ class ExerciseService:
             self.db.commit()
             provider_returned = False
             result: ModelShortAnswerGrade | None = None
+            failure_error: BaseException | None = None
             try:
                 raw = provider.generate_json(
                     prompt,
@@ -1026,6 +1062,7 @@ class ExerciseService:
                 provider_returned = True
                 result = ModelShortAnswerGrade.model_validate(raw)
             except Exception as exc:  # noqa: BLE001
+                failure_error = exc
                 errors.append(type(exc).__name__)
             if provider_returned:
                 usage = dict(getattr(provider, "last_usage", {}) or {})
@@ -1045,6 +1082,11 @@ class ExerciseService:
                 except Exception as exc:  # noqa: BLE001
                     errors.append(type(exc).__name__)
             if result is None:
+                if not provider_failure_is_transient(failure_error):
+                    # The provider rejected the grading request itself; the
+                    # second attempt would only bill the same rejection before
+                    # the heuristic fallback takes over anyway.
+                    break
                 continue
             return self._normalize_model_short_answer_grade(result, points, exercise)
         return None
