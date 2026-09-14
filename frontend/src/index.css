@@ -1340,13 +1340,30 @@ body.is-resizing .workspace-resizer {
 .dark .chat-composer-dock::before { display: none; }
 /* 消息滚动区动态安全空间：最后一行正文可完整滚出 Composer 覆盖区，
    额外 40px 是正文与输入框之间的呼吸空间，禁止固定 padding-bottom。 */
+/* 消息滚动区动态安全空间：最后一行正文可完整滚出 Composer 覆盖区，
+   额外 40px 是正文与输入框之间的呼吸空间，禁止固定 padding-bottom。
+   `--conversation-tail-space` 是滚动控制器按当前锚点算出的尾部预留，只增不减，
+   且与滚动模式无关。此前 ANSWER_ANCHORED 模式额外加 70dvh 高度，模式切换会
+   直接改变内容滚动高度，是发送瞬间 / 正文起点跳动的来源，已移除。 */
 .chat-messages-content {
-  padding-bottom: calc(var(--composer-height) + 40px + env(safe-area-inset-bottom));
+  padding-bottom: calc(
+    var(--composer-height) + 40px + var(--conversation-tail-space, 0px) +
+      env(safe-area-inset-bottom)
+  );
 }
 /* 「回到底部」按钮跟随 Composer 高度，而不是固定 bottom。 */
 .chat-scroll-to-bottom {
   bottom: calc(var(--composer-height) + 24px);
+  width: auto;
+  max-width: min(280px, calc(100% - 32px));
+  border-color: color-mix(in srgb, var(--border) 85%, transparent);
+  background: color-mix(in srgb, var(--background) 92%, transparent);
+  color: var(--foreground);
+  backdrop-filter: blur(12px);
   z-index: 30;
+}
+.chat-canvas-page [data-conversation-scroll] {
+  overflow-anchor: none;
 }
 .dark .chat-context-bar__item {
   border-color: rgba(255,255,255,.12);
@@ -1510,6 +1527,10 @@ body.is-resizing .workspace-resizer {
 .chat-composer__voice-mode.is-active { color: var(--background) !important; background: var(--foreground) !important; }
 .chat-composer__voice-mode.is-active:hover { color: var(--background) !important; background: color-mix(in srgb, var(--foreground) 86%, transparent) !important; }
 .chat-composer__submit { border-radius: 50% !important; }
+/* 发送按钮常态：纯黑实心 + 白色箭头；hover 用 86% 黑做轻微提亮。生成中（--stop）与禁用态保持各自原有外观。 */
+:root:not(.dark) .chat-composer__submit:not(:disabled):not(.chat-composer__submit--stop) { background: #000; color: #fff; }
+:root:not(.dark) .chat-composer__submit:not(:disabled):not(.chat-composer__submit--stop):hover { background: color-mix(in srgb, #000 86%, #fff); }
+
 .chat-composer__submit--stop { background: #ededed !important; color: #111 !important; }
 .chat-composer__submit--stop:hover { background: #e3e3e3 !important; }
 .chat-composer__submit--stop svg { color: #111 !important; fill: #111 !important; stroke: none !important; }
@@ -1620,6 +1641,38 @@ body.is-resizing .workspace-resizer {
 .chat-voice-orb-dock.is-user-voice .chat-voice-orb__halo { border-color: rgba(38, 190, 150, .35); }
 .chat-voice-orb-dock.is-assistant-voice .chat-voice-orb__halo { border-color: rgba(138, 92, 245, .35); }
 .chat-voice-orb-dock .chat-voice-orb { width: 100%; }
+.chat-composer-dock > .chat-voice-listening-dock {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  z-index: 3;
+  width: min(420px, calc(100% - 24px));
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background) 92%, transparent);
+  padding: 9px 11px;
+  box-shadow: 0 10px 28px rgba(24, 33, 29, .1);
+  backdrop-filter: blur(14px);
+  pointer-events: none;
+}
+.chat-voice-listening-dock__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 600;
+}
+.chat-voice-listening-dock p {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* Model-switch truth: a pin takes effect on the next turn (or the next
    connection), so the UI must never present the requested model as live. */
 .chat-voice-model-note { margin: 6px 0 0; max-width: 320px; text-align: center; font-size: 12px; line-height: 1.5; color: var(--color-muted-foreground); }
@@ -3470,13 +3523,6 @@ body.is-resizing .workspace-resizer {
 }
 .sidebar-session__fold:hover { background: #e8e8e8; color: #222; }
 .sidebar-session__fold-spacer { flex: none; width: 14px; }
-.sidebar-session__child-count {
-  flex: none;
-  color: #999;
-  font-size: 10px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
 .sidebar-project__session-title { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 7px 0; font-size: inherit; font-weight: inherit; color: inherit; }
 .sidebar-session__unread-dot {
   flex: none;
@@ -4050,16 +4096,38 @@ body.is-resizing .workspace-resizer {
 }
 .chat-canvas-page .chat-composer__textarea { font-size: 15px; line-height: 1.5; }
 
+/* 待发送附件条宿主：位于工作台功能条（资料/目标/联网/…）上方，单行横向滚动；
+   无附件时 :empty 命中，不占高度、不留空行。滚动由宿主承担，附件条本身不自建滚动，
+   这样 useHorizontalDragScroll（鼠标拖拽）才有可滚动的元素可用。 */
+.chat-attachment-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.chat-attachment-row:empty { display: none; }
+.chat-attachment-row::-webkit-scrollbar { display: none; }
+.chat-attachment-row[data-draggable='true'] { cursor: grab; }
+.chat-attachment-row[data-draggable='true'].is-drag-scrolling,
+.chat-attachment-row[data-draggable='true'].is-drag-scrolling * { cursor: grabbing !important; user-select: none; -webkit-user-select: none; }
+/* 待发送附件条：始终单行（不再 wrap 成一列把输入区顶高），横向滑动查看全部。 */
 .prompt-attachments {
   display: flex;
-  flex-wrap: wrap;
+  flex: none;
+  flex-wrap: nowrap;
   gap: 9px;
-  padding: 0 8px 9px;
+  /* 纵向留白挂在附件条自身：只有存在附件时才产生间距。 */
+  padding: 0 4px 8px;
   animation: attachment-in .18s ease-out;
 }
 .prompt-attachment {
   position: relative;
   display: grid;
+  flex: none;
   min-width: 190px;
   max-width: 270px;
   grid-template-columns: 42px minmax(0,1fr) auto;
@@ -4412,7 +4480,7 @@ html[data-color-mode='mono'] .topbar-model-status {
 @media (max-width: 1024px) {
   .chat-composer__textarea::placeholder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Right-edge fade signals that the capability/context rows scroll sideways. */
-  .chat-workbench-toolbar, .chat-context-bar {
+  .chat-workbench-toolbar, .chat-context-bar, .chat-attachment-row {
     mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent);
     -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent);
   }
@@ -4421,7 +4489,7 @@ html[data-color-mode='mono'] .topbar-model-status {
 
   html.is-native-app .chat-composer__textarea::placeholder{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Right-edge fade signals that the capability/context rows scroll sideways. */
-  html.is-native-app .chat-workbench-toolbar, html.is-native-app .chat-context-bar{
+  html.is-native-app .chat-workbench-toolbar, html.is-native-app .chat-context-bar, html.is-native-app .chat-attachment-row{
     mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent);
     -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent);
   }
@@ -5138,7 +5206,8 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     pointer-events: none;
     visibility: hidden;
     padding: 16px !important;
-    transform: translateX(105%);
+    /* 位移由进度变量驱动：0 = 完全收起，1 = 完全展开；跟手拖拽只改这个变量。 */
+    transform: translate3d(calc(100% - 100% * var(--lg-right-drawer-progress, 0)), 0, 0);
     transition:
       transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
       visibility 0.34s step-end;
@@ -5146,7 +5215,6 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
   .workspace-shell--graph-open .context-rail {
     pointer-events: auto;
     visibility: visible;
-    transform: translateX(0);
     transition:
       transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
       visibility 0s linear;
@@ -5159,7 +5227,7 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     width: auto;
     height: auto;
     background: rgba(12, 12, 12, 0.38);
-    opacity: 0;
+    opacity: var(--lg-right-drawer-progress, 0);
     pointer-events: none;
     visibility: hidden;
     transition:
@@ -5167,12 +5235,18 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
       visibility 0.28s step-end;
   }
   .workspace-shell--graph-open .graph-drawer-backdrop {
-    opacity: 1;
     pointer-events: auto;
     visibility: visible;
     transition:
       opacity 0.28s ease,
       visibility 0s linear;
+  }
+  /* 跟手拖拽期间禁用过渡：抽屉与遮罩立即跟手，松手后再补间到吸附位置。 */
+  html[data-drawer-dragging="right"] .workspace-shell .context-rail,
+  html[data-drawer-dragging="right"] .workspace-shell .graph-drawer-backdrop {
+    pointer-events: auto;
+    visibility: visible;
+    transition: none !important;
   }
   .graph-drawer-close {
     display: inline-flex;
@@ -5195,6 +5269,72 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
       opacity 0.2s ease 0.08s,
       visibility 0s linear;
   }
+}
+
+/* ===========================================================================
+   移动端左侧导航抽屉（跟手拖拽）
+   ---------------------------------------------------------------------------
+   常驻 DOM：收起时 visibility: hidden，位移与遮罩浓度都由
+   --lg-left-drawer-progress 驱动（0 = 收起，1 = 展开）。手指拖拽期间
+   html[data-drawer-dragging="left"] 关掉过渡让抽屉严格跟手，松手后移除该属性，
+   再由同一个进度变量补间到吸附位置（> 0.5 展开，否则收起）。
+   =========================================================================== */
+html.has-mobile-drawer body { overflow: hidden !important; }
+
+.mobile-nav-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 73;
+  background: rgba(12, 12, 12, 0.38);
+  opacity: var(--lg-left-drawer-progress, 0);
+  pointer-events: none;
+  visibility: hidden;
+  transition:
+    opacity 0.26s ease,
+    visibility 0.26s step-end;
+}
+.mobile-nav-drawer-overlay.is-open {
+  pointer-events: auto;
+  visibility: visible;
+  transition:
+    opacity 0.26s ease,
+    visibility 0s linear;
+}
+
+.mobile-nav-drawer {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 74;
+  display: flex;
+  flex-direction: column;
+  width: 286px;
+  max-width: 86vw;
+  background: var(--popover, #fff);
+  border-right: 1px solid var(--border);
+  box-shadow: 18px 0 44px rgba(0, 0, 0, 0.22);
+  transform: translate3d(calc(-100% + 100% * var(--lg-left-drawer-progress, 0)), 0, 0);
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    transform 0.32s cubic-bezier(0.32, 0.72, 0, 1),
+    visibility 0.32s step-end;
+}
+.mobile-nav-drawer.is-open {
+  pointer-events: auto;
+  visibility: visible;
+  transition:
+    transform 0.32s cubic-bezier(0.32, 0.72, 0, 1),
+    visibility 0s linear;
+}
+.mobile-nav-drawer:focus { outline: none; }
+
+html[data-drawer-dragging="left"] .mobile-nav-drawer,
+html[data-drawer-dragging="left"] .mobile-nav-drawer-overlay {
+  pointer-events: auto;
+  visibility: visible;
+  transition: none !important;
 }
 
 /* ===========================================================================
