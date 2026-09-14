@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -793,6 +794,236 @@ def _run_startup_step_retrying_locked(
             time.sleep(delay)
 
 
+# 迁移前自动备份的等待预算。备份走 SQLite 在线备份 API（分页读取，不拿写锁），
+# 只在"库正被别的进程长时间写"时才可能变慢；超预算就放弃备份继续启动。
+SQLITE_MIGRATION_BACKUP_TIMEOUT_SECONDS = 30.0
+
+
+def _sqlite_database_file() -> Path | None:
+    """Path of the SQLite database file, or ``None`` for memory/non-SQLite."""
+
+    if not is_sqlite:
+        return None
+    database = database_url.database
+    if not database or database == ":memory:":
+        return None
+    return Path(str(database))
+
+
+def describe_pending_sqlite_migrations() -> list[str]:
+    """Read-only dry run of the SQLite startup migrations.
+
+    One human-readable entry per change ``init_database`` would apply; an empty
+    list means the next startup is read-only — it needs neither the single
+    SQLite write lock (a sibling process's sweep may hold it) nor a
+    pre-migration backup. Also used as the operator-facing upgrade check:
+
+        docker compose exec -T app python -c \\
+          "from app.core.database import describe_pending_sqlite_migrations as d; print(d() or 'up to date')"
+
+    Every write performed by the startup path is represented here: ORM
+    tables/columns (which cover the whole additive-column ledger, asserted by
+    ``_verify_sqlite_metadata_shape``), pending versioned migrations, stale FTS
+    trigger definitions, and the legacy backfills. Building a *missing index* is
+    deliberately not reported — it rewrites no row, so it needs no backup.
+    """
+
+    if not is_sqlite:
+        return []
+    from app.domain import (  # noqa: F401
+        extension_models,
+        memory_event_models,
+        migration_models,
+        models,
+    )
+    from app.core.migrations import MIGRATIONS
+
+    pending: list[str] = []
+    with engine.connect() as connection:
+        existing_tables = {
+            str(row[0])
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                pending.append(f"create table {table.name}")
+                continue
+            existing = {
+                str(row[1])
+                for row in connection.exec_driver_sql(
+                    f'PRAGMA table_info("{table.name}")'
+                )
+            }
+            missing = [column.name for column in table.columns if column.name not in existing]
+            if missing:
+                pending.append(f"add column(s) {table.name}.{', '.join(missing)}")
+
+        if "schema_revisions" in existing_tables:
+            applied = {
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    "SELECT revision FROM schema_revisions"
+                ).fetchall()
+            }
+            pending.extend(
+                f"apply migration {migration.revision} ({migration.description})"
+                for migration in MIGRATIONS
+                if migration.revision not in applied
+            )
+
+        for name in _FTS_TRIGGER_NAMES:
+            stored = _sqlite_object_sql(connection, "trigger", name)
+            if stored is None:
+                pending.append(f"create trigger {name}")
+            elif not _sqlite_object_matches_definition(
+                connection, "trigger", name, _fts_trigger_definition(name)
+            ):
+                pending.append(f"rewrite trigger {name}")
+
+        # Projection probes need their tables to exist; a missing table is
+        # already reported as "create table" above.
+        if {"session_messages_fts", "messages", "chat_sessions"} <= existing_tables:
+            if _fts_projection_needs_prune(connection):
+                pending.append("prune rows from session_messages_fts")
+            if _fts_projection_needs_backfill(connection):
+                pending.append("backfill session_messages_fts")
+        if "usage_events" in existing_tables:
+            if _legacy_cny_backfill_needed(connection):
+                pending.append("restore legacy CNY cost on usage_events")
+            if _legacy_local_mock_backfill_needed(connection):
+                pending.append("mark legacy local-mock usage_events as non_billable")
+    return pending
+
+
+def _sqlite_migration_backup_directory() -> Path | None:
+    """Directory for pre-migration snapshots (default: next to the database)."""
+
+    configured = str(settings.sqlite_migration_backup_dir or "").strip()
+    if configured:
+        return Path(configured)
+    database_file = _sqlite_database_file()
+    if database_file is None:
+        return None
+    return database_file.parent / "migration-backups"
+
+
+def _copy_sqlite_database(source: Path, destination: Path) -> None:
+    """Copy a live SQLite database with the backup API (WAL-safe, no write lock)."""
+
+    source_connection = sqlite3.connect(str(source), timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+    try:
+        destination_connection = sqlite3.connect(str(destination))
+        try:
+            # ``pages=-1`` copies everything in one step; ``sleep`` only matters
+            # if a writer holds the database (the API then retries internally).
+            source_connection.backup(destination_connection, pages=-1, sleep=0.05)
+        finally:
+            destination_connection.close()
+    finally:
+        source_connection.close()
+
+
+def _prune_sqlite_migration_backups(directory: Path) -> None:
+    """Keep the newest ``sqlite_migration_backup_keep`` snapshots in ``directory``."""
+
+    keep = int(settings.sqlite_migration_backup_keep)
+    if keep <= 0:
+        return
+    try:
+        snapshots = sorted(
+            directory.glob("learngraph-*.db"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:  # pragma: no cover - defensive
+        return
+    for stale in snapshots[keep:]:
+        try:
+            stale.unlink()
+            logger.info("Pruned old pre-migration backup %s", stale)
+        except OSError:  # pragma: no cover - defensive
+            logger.warning("Could not prune old pre-migration backup %s", stale)
+
+
+def _sqlite_database_has_content(database_file: Path) -> bool:
+    """True when the file already holds at least one object (not a fresh install)."""
+
+    try:
+        if database_file.stat().st_size == 0:
+            return False
+        connection = sqlite3.connect(f"file:{database_file.as_posix()}?mode=ro", uri=True)
+        try:
+            row = connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):  # pragma: no cover - defensive
+        # Unsure → treat as "has data" so an upgrade never runs unprotected.
+        return True
+    return row is not None
+
+
+def backup_sqlite_before_migration(pending: list[str]) -> Path | None:
+    """Snapshot the database before a startup migration that will actually write.
+
+    Returns the snapshot path, or ``None`` when no snapshot was taken (not
+    SQLite, disabled by settings, in-memory database, an empty/fresh database, or
+    a failed copy). A failed copy is logged loudly but never blocks startup: every
+    statement in the migration set is additive and idempotent, so refusing to
+    start would be the worse failure mode — the snapshot only exists to give an
+    operator a one-command rollback point.
+    """
+
+    if not is_sqlite or not settings.sqlite_migration_backup_enabled:
+        return None
+    database_file = _sqlite_database_file()
+    directory = _sqlite_migration_backup_directory()
+    if database_file is None or directory is None:
+        return None
+    if not _sqlite_database_has_content(database_file):
+        logger.info(
+            "Database at %s is still empty (fresh install); skipping pre-migration "
+            "backup — there is nothing to roll back to",
+            database_file,
+        )
+        return None
+    base_name = (
+        f"learngraph-{CURRENT_SCHEMA_REVISION}-"
+        f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+    )
+    destination = directory / f"{base_name}.db"
+    # Two migrations can land inside the same second (a fresh install plus an
+    # immediate upgrade, or app and preview starting together); never overwrite an
+    # existing snapshot.
+    suffix = 2
+    while destination.exists():  # pragma: no cover - rare same-second collision
+        destination = directory / f"{base_name}-{suffix}.db"
+        suffix += 1
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        _run_startup_step_retrying_locked(
+            "pre-migration database backup",
+            lambda: _copy_sqlite_database(database_file, destination),
+            budget_seconds=SQLITE_MIGRATION_BACKUP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.exception(
+            "Could not back up %s before migrating; continuing without a rollback "
+            "point (all startup migrations are additive and idempotent)",
+            database_file,
+        )
+        return None
+    logger.info(
+        "Pre-migration backup: %s (pending: %s)",
+        destination,
+        "; ".join(pending) or "none",
+    )
+    _prune_sqlite_migration_backups(directory)
+    return destination
+
+
 def init_database() -> None:
     from app.domain import (  # noqa: F401
         extension_models,
@@ -810,10 +1041,30 @@ def init_database() -> None:
         _ensure_sqlite_skill_package_columns()
         _verify_schema_revisions()
 
-    if is_sqlite:
-        _run_startup_step_retrying_locked("database initialization", _run_phases)
+    if not is_sqlite:
+        _run_phases()
         return
-    _run_phases()
+
+    # 1) Read-only precheck: what (if anything) would this startup change?
+    # 2) If nothing, the phases are pure reads — no write lock, no snapshot.
+    # 3) Otherwise snapshot first, then migrate under the lock-contention retry.
+    pending = describe_pending_sqlite_migrations()
+    backup: Path | None = None
+    if pending:
+        logger.info(
+            "SQLite schema migration pending (%d change(s)): %s",
+            len(pending),
+            "; ".join(pending),
+        )
+        backup = backup_sqlite_before_migration(pending)
+    _run_startup_step_retrying_locked("database initialization", _run_phases)
+    if pending:
+        logger.info(
+            "SQLite schema migration applied%s",
+            f"; rollback snapshot: {backup}"
+            if backup is not None
+            else " (no rollback snapshot was taken)",
+        )
 
 
 def ensure_voice_event_type_column(connection: Any) -> None:
@@ -965,26 +1216,172 @@ def _sqlite_object_sql(connection: Any, object_type: str, name: str) -> str | No
     return str(row[0])
 
 
-def _sqlite_object_has_fragment(
-    connection: Any, object_type: str, name: str, fragment: str
-) -> bool:
-    """True when the stored DDL of ``name`` already contains ``fragment``.
+def _normalize_sql(definition: str) -> str:
+    """Whitespace- and case-insensitive fingerprint of a DDL statement.
 
-    Startup DDL is the only schema work this process shares with a sibling
-    LearnGraph process (the preview origin starts the moment the app is healthy),
-    and every schema write needs the single SQLite write lock — which an app-side
-    sweep may legitimately hold for seconds. Rewriting a trigger that already has
-    the current shape is therefore pure lock stealing, so the rewrite is gated on
-    a marker fragment that only the current definition contains.
-
-    ``fragment`` is matched case-insensitively. When a trigger body below changes
-    in a way existing databases must adopt, update its marker fragment together
-    with the definition: ``CREATE TRIGGER IF NOT EXISTS`` never replaces an
-    existing trigger, so the marker is what decides whether to rewrite it.
+    ``sqlite_master.sql`` keeps the statement text exactly as it was parsed —
+    including the indentation of the triple-quoted literal that created it — so
+    a definition comparison has to ignore whitespace (SQL is whitespace
+    insensitive anyway).
     """
 
+    return "".join(str(definition).split()).casefold()
+
+
+def _sqlite_object_matches_definition(
+    connection: Any, object_type: str, name: str, definition: str
+) -> bool:
+    """True when ``name`` already exists with exactly this definition."""
+
     sql = _sqlite_object_sql(connection, object_type, name)
-    return sql is not None and fragment.casefold() in sql.casefold()
+    return sql is not None and _normalize_sql(sql) == _normalize_sql(definition)
+
+
+# Definitions of the FTS projection triggers, keyed by trigger name. This table
+# is the single source of truth for their shape: ``CREATE TRIGGER IF NOT EXISTS``
+# never replaces an existing trigger, so ``_ensure_fts_trigger`` compares the
+# stored definition against the text below and rewrites the trigger only when it
+# differs. Editing a definition is therefore all it takes to ship a trigger
+# upgrade to every existing database — and because an identical trigger is never
+# rewritten, an up-to-date database performs no schema write (and needs no SQLite
+# write lock) at startup.
+#
+# Values hold the trigger *body* (everything after ``CREATE TRIGGER <name>``).
+# SQLite stores exactly that form in ``sqlite_master`` — it drops the
+# ``IF NOT EXISTS`` clause even when it was used to create the trigger — so the
+# comparison uses the same text that a fresh create would produce.
+_FTS_TRIGGER_BODIES: dict[str, str] = {
+    "session_messages_fts_insert": """
+        AFTER INSERT ON messages
+        WHEN new.status = 'completed'
+        BEGIN
+          INSERT INTO session_messages_fts(
+            message_id, workspace_id, session_id, title, search_terms, raw_content
+          )
+          SELECT new.id, new.workspace_id, new.session_id, s.title,
+                 coalesce(s.title, '') || ' ' || coalesce(new.role, '') || ' ' ||
+                 coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
+                 coalesce(new.content, ''),
+                 coalesce(new.content, '')
+            FROM chat_sessions AS s
+           WHERE s.id = new.session_id AND s.workspace_id = new.workspace_id;
+        END
+        """,
+    # B1-9-opt: the update trigger must NOT fire on intermediate streaming
+    # content flushes. The stream commits message.content every ~0.5s while
+    # status stays 'streaming'; the old unconditional DELETE rewrote the FTS
+    # index on every flush (pure write amplification, ~2 FTS DELETEs/sec per
+    # active stream). Skip when BOTH old and new status are 'streaming' —
+    # finalization (streaming→completed/failed/cancelled), post-completion
+    # edits, and role/session moves still sync the projection.
+    "session_messages_fts_update": """
+        AFTER UPDATE OF content, status, role, session_id, workspace_id ON messages
+        WHEN old.status <> 'streaming' OR new.status <> 'streaming'
+        BEGIN
+          DELETE FROM session_messages_fts WHERE message_id = old.id;
+          INSERT INTO session_messages_fts(
+            message_id, workspace_id, session_id, title, search_terms, raw_content
+          )
+          SELECT new.id, new.workspace_id, new.session_id, s.title,
+                 coalesce(s.title, '') || ' ' || coalesce(new.role, '') || ' ' ||
+                 coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
+                 coalesce(new.content, ''),
+                 coalesce(new.content, '')
+            FROM chat_sessions AS s
+           WHERE new.status = 'completed'
+             AND s.id = new.session_id
+             AND s.workspace_id = new.workspace_id;
+        END
+        """,
+    "session_messages_fts_delete": """
+        AFTER DELETE ON messages
+        BEGIN
+          DELETE FROM session_messages_fts WHERE message_id = old.id;
+        END
+        """,
+    # B1-9: update only the title-derived columns of the session's existing FTS
+    # rows instead of deleting and re-inserting the whole session (write
+    # amplification on every auto-title change). The WHEN clause additionally
+    # skips no-op updates (SQLite fires AFTER UPDATE even when the values did
+    # not change), so repeated auto-title writes to the same title do not
+    # rewrite every FTS row of a long session.
+    "session_messages_fts_session_update": """
+        AFTER UPDATE OF title, goal_id, graph_id ON chat_sessions
+        WHEN old.title IS NOT new.title
+          OR old.goal_id IS NOT new.goal_id
+          OR old.graph_id IS NOT new.graph_id
+        BEGIN
+          UPDATE session_messages_fts
+             SET title = new.title,
+                 search_terms = coalesce(new.title, '') || ' ' ||
+                                coalesce(m.role, '') || ' ' ||
+                                coalesce(new.goal_id, '') || ' ' ||
+                                coalesce(new.graph_id, '') || ' ' ||
+                                coalesce(m.content, ''),
+                 raw_content = coalesce(m.content, '')
+            FROM messages AS m
+           WHERE session_messages_fts.session_id = new.id
+             AND session_messages_fts.workspace_id = new.workspace_id
+             AND session_messages_fts.message_id = m.id
+             AND m.status = 'completed';
+        END
+        """,
+}
+
+_FTS_TRIGGER_NAMES: tuple[str, ...] = tuple(_FTS_TRIGGER_BODIES)
+
+
+def _fts_trigger_definition(name: str) -> str:
+    """The DDL a fresh ``CREATE`` of ``name`` produces (and SQLite would store)."""
+
+    return f"CREATE TRIGGER {name}{_FTS_TRIGGER_BODIES[name]}"
+
+# Projection predicates shared by the read-only probes and the statements they
+# gate, so a probe can never drift away from what it guards.
+_FTS_PRUNE_CONDITION = (
+    "message_id NOT IN (SELECT id FROM messages WHERE status = 'completed')"
+)
+_FTS_BACKFILL_CONDITION = (
+    "m.status = 'completed' AND NOT EXISTS ("
+    "SELECT 1 FROM session_messages_fts AS f WHERE f.message_id = m.id)"
+)
+_FTS_BACKFILL_FROM = (
+    "FROM messages AS m "
+    "JOIN chat_sessions AS s "
+    "ON s.id = m.session_id AND s.workspace_id = m.workspace_id "
+    f"WHERE {_FTS_BACKFILL_CONDITION}"
+)
+
+
+def _ensure_fts_trigger(connection: Any, name: str) -> None:
+    """Create the FTS trigger, or rewrite it when its stored shape is stale.
+
+    The rewrite is a schema write (it needs the single SQLite write lock and it
+    invalidates every other connection's compiled statements), so it happens only
+    for a database that is genuinely on an older definition.
+    """
+
+    definition = _fts_trigger_definition(name)
+    if _sqlite_object_matches_definition(connection, "trigger", name, definition):
+        return
+    connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {name}")
+    connection.exec_driver_sql(definition)
+
+
+def _fts_projection_needs_prune(connection: Any) -> bool:
+    """True when the projection holds rows for messages that are not completed."""
+
+    return connection.exec_driver_sql(
+        f"SELECT 1 FROM session_messages_fts WHERE {_FTS_PRUNE_CONDITION} LIMIT 1"
+    ).fetchone() is not None
+
+
+def _fts_projection_needs_backfill(connection: Any) -> bool:
+    """True when a completed message is missing from the projection."""
+
+    return connection.exec_driver_sql(
+        f"SELECT 1 {_FTS_BACKFILL_FROM} LIMIT 1"
+    ).fetchone() is not None
 
 
 def ensure_sqlite_session_search_projection(connection: Any) -> None:
@@ -1008,165 +1405,29 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
             "title, search_terms, raw_content)"
         )
 
-    connection.exec_driver_sql(
-        """
-        CREATE TRIGGER IF NOT EXISTS session_messages_fts_insert
-        AFTER INSERT ON messages
-        WHEN new.status = 'completed'
-        BEGIN
-          INSERT INTO session_messages_fts(
-            message_id, workspace_id, session_id, title, search_terms, raw_content
-          )
-          SELECT new.id, new.workspace_id, new.session_id, s.title,
-                 coalesce(s.title, '') || ' ' || coalesce(new.role, '') || ' ' ||
-                 coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
-                 coalesce(new.content, ''),
-                 coalesce(new.content, '')
-            FROM chat_sessions AS s
-           WHERE s.id = new.session_id AND s.workspace_id = new.workspace_id;
-        END
-        """
-    )
-    # B1-9-opt: the update trigger must NOT fire on intermediate streaming
-    # content flushes. The stream commits message.content every ~0.5s while
-    # status stays 'streaming'; the old unconditional DELETE rewrote the FTS
-    # index on every flush (pure write amplification, ~2 FTS DELETEs/sec per
-    # active stream). Skip when BOTH old and new status are 'streaming' — 
-    # finalization (streaming→completed/failed/cancelled), post-completion
-    # edits, and role/session moves still sync the projection. DROP+CREATE
-    # (instead of IF NOT EXISTS) upgrades existing databases to the new shape,
-    # but only when the stored trigger is still the old one: an unconditional
-    # DROP is a schema write that takes the single SQLite write lock at every
-    # single startup.
-    if not _sqlite_object_has_fragment(
-        connection,
-        "trigger",
-        "session_messages_fts_update",
-        "old.status <> 'streaming'",
-    ):
-        connection.exec_driver_sql("DROP TRIGGER IF EXISTS session_messages_fts_update")
-    connection.exec_driver_sql(
-        """
-        CREATE TRIGGER IF NOT EXISTS session_messages_fts_update
-        AFTER UPDATE OF content, status, role, session_id, workspace_id ON messages
-        WHEN old.status <> 'streaming' OR new.status <> 'streaming'
-        BEGIN
-          DELETE FROM session_messages_fts WHERE message_id = old.id;
-          INSERT INTO session_messages_fts(
-            message_id, workspace_id, session_id, title, search_terms, raw_content
-          )
-          SELECT new.id, new.workspace_id, new.session_id, s.title,
-                 coalesce(s.title, '') || ' ' || coalesce(new.role, '') || ' ' ||
-                 coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
-                 coalesce(new.content, ''),
-                 coalesce(new.content, '')
-            FROM chat_sessions AS s
-           WHERE new.status = 'completed'
-             AND s.id = new.session_id
-             AND s.workspace_id = new.workspace_id;
-        END
-        """
-    )
-    connection.exec_driver_sql(
-        """
-        CREATE TRIGGER IF NOT EXISTS session_messages_fts_delete
-        AFTER DELETE ON messages
-        BEGIN
-          DELETE FROM session_messages_fts WHERE message_id = old.id;
-        END
-        """
-    )
-    # B1-9: update only the title-derived columns of the session's existing FTS
-    # rows instead of deleting and re-inserting the whole session (write
-    # amplification on every auto-title change). The WHEN clause additionally
-    # skips no-op updates (SQLite fires AFTER UPDATE even when the values did
-    # not change), so repeated auto-title writes to the same title do not
-    # rewrite every FTS row of a long session. Same marker gate as the update
-    # trigger above: DROP only when the stored trigger is still the old shape.
-    if not _sqlite_object_has_fragment(
-        connection,
-        "trigger",
-        "session_messages_fts_session_update",
-        "old.title IS NOT new.title",
-    ):
-        connection.exec_driver_sql(
-            "DROP TRIGGER IF EXISTS session_messages_fts_session_update"
-        )
-    connection.exec_driver_sql(
-        """
-        CREATE TRIGGER IF NOT EXISTS session_messages_fts_session_update
-        AFTER UPDATE OF title, goal_id, graph_id ON chat_sessions
-        WHEN old.title IS NOT new.title
-          OR old.goal_id IS NOT new.goal_id
-          OR old.graph_id IS NOT new.graph_id
-        BEGIN
-          UPDATE session_messages_fts
-             SET title = new.title,
-                 search_terms = coalesce(new.title, '') || ' ' ||
-                                coalesce(m.role, '') || ' ' ||
-                                coalesce(new.goal_id, '') || ' ' ||
-                                coalesce(new.graph_id, '') || ' ' ||
-                                coalesce(m.content, ''),
-                 raw_content = coalesce(m.content, '')
-            FROM messages AS m
-           WHERE session_messages_fts.session_id = new.id
-             AND session_messages_fts.workspace_id = new.workspace_id
-             AND session_messages_fts.message_id = m.id
-             AND m.status = 'completed';
-        END
-        """
-    )
+    _ensure_fts_trigger(connection, "session_messages_fts_insert")
+    _ensure_fts_trigger(connection, "session_messages_fts_update")
+    _ensure_fts_trigger(connection, "session_messages_fts_delete")
+    _ensure_fts_trigger(connection, "session_messages_fts_session_update")
     # Backfill and repair write to the projection, and a write statement takes
     # the single SQLite write lock even when it matches no row. Probe read-only
-    # first so a database whose projection is already consistent (the normal
-    # startup path) never steals the lock from a sibling process's sweep.
-    if connection.exec_driver_sql(
-        """
-        SELECT 1 FROM session_messages_fts
-         WHERE message_id NOT IN (
-           SELECT id FROM messages WHERE status = 'completed'
-         )
-         LIMIT 1
-        """
-    ).fetchone() is not None:
+    # first (same predicate, see the constants above) so a database whose
+    # projection is already consistent — the normal startup path — never steals
+    # the lock from a sibling process's sweep.
+    if _fts_projection_needs_prune(connection):
         connection.exec_driver_sql(
-            """
-            DELETE FROM session_messages_fts
-             WHERE message_id NOT IN (
-               SELECT id FROM messages WHERE status = 'completed'
-             )
-            """
+            f"DELETE FROM session_messages_fts WHERE {_FTS_PRUNE_CONDITION}"
         )
-    if connection.exec_driver_sql(
-        """
-        SELECT 1 FROM messages AS m
-          JOIN chat_sessions AS s
-            ON s.id = m.session_id AND s.workspace_id = m.workspace_id
-         WHERE m.status = 'completed'
-           AND NOT EXISTS (
-             SELECT 1 FROM session_messages_fts AS f WHERE f.message_id = m.id
-           )
-         LIMIT 1
-        """
-    ).fetchone() is not None:
+    if _fts_projection_needs_backfill(connection):
         connection.exec_driver_sql(
-            """
-            INSERT INTO session_messages_fts(
-              message_id, workspace_id, session_id, title, search_terms, raw_content
-            )
-            SELECT m.id, m.workspace_id, m.session_id, s.title,
-                   coalesce(s.title, '') || ' ' || coalesce(m.role, '') || ' ' ||
-                   coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
-                   coalesce(m.content, ''),
-                   coalesce(m.content, '')
-              FROM messages AS m
-              JOIN chat_sessions AS s
-                ON s.id = m.session_id AND s.workspace_id = m.workspace_id
-             WHERE m.status = 'completed'
-               AND NOT EXISTS (
-                 SELECT 1 FROM session_messages_fts AS f WHERE f.message_id = m.id
-               )
-            """
+            "INSERT INTO session_messages_fts("
+            "message_id, workspace_id, session_id, title, search_terms, raw_content"
+            ") "
+            "SELECT m.id, m.workspace_id, m.session_id, s.title, "
+            "coalesce(s.title, '') || ' ' || coalesce(m.role, '') || ' ' || "
+            "coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' || "
+            "coalesce(m.content, ''), coalesce(m.content, '') "
+            f"{_FTS_BACKFILL_FROM}"
         )
 
 
@@ -1200,6 +1461,33 @@ def _ensure_sqlite_skill_package_columns() -> None:
     if is_sqlite:
         _apply_sqlite_additive_migrations()
         _verify_sqlite_metadata_shape()
+
+
+# Predicates for the legacy one-shot billing backfills inside the additive
+# migration. Shared by the read-only probe and the UPDATE it gates, so a probe
+# can never drift away from the statement it guards.
+_LEGACY_CNY_BACKFILL_CONDITION = (
+    "cost_usd > 0 AND cost_cny = 0 AND cost_status = 'unpriced'"
+)
+_LEGACY_LOCAL_MOCK_BACKFILL_CONDITION = (
+    "provider_id = 'local_mock' AND cost_status = 'unpriced'"
+)
+
+
+def _legacy_cny_backfill_needed(connection: Any) -> bool:
+    """True when a pre-versioned-billing row still needs its CNY cost restored."""
+
+    return connection.exec_driver_sql(
+        f"SELECT 1 FROM usage_events WHERE {_LEGACY_CNY_BACKFILL_CONDITION} LIMIT 1"
+    ).fetchone() is not None
+
+
+def _legacy_local_mock_backfill_needed(connection: Any) -> bool:
+    """True when a local-mock usage row still carries the legacy 'unpriced'."""
+
+    return connection.exec_driver_sql(
+        f"SELECT 1 FROM usage_events WHERE {_LEGACY_LOCAL_MOCK_BACKFILL_CONDITION} LIMIT 1"
+    ).fetchone() is not None
 
 
 def _apply_sqlite_additive_migrations() -> None:
@@ -1728,26 +2016,20 @@ def _apply_sqlite_additive_migrations() -> None:
         # Preserve that historical meaning once, rather than presenting those
         # rows as newly priced or silently leaving their CNY total at zero.
         # These are one-shot legacy backfills: an UPDATE that matches no row
-        # still takes the write lock, so probe read-only first and keep the
-        # already-backfilled startup path free of writes.
-        if connection.exec_driver_sql(
-            "SELECT 1 FROM usage_events "
-            "WHERE cost_usd > 0 AND cost_cny = 0 AND cost_status = 'unpriced' LIMIT 1"
-        ).fetchone() is not None:
+        # still takes the write lock, so a read-only probe (same predicate, see
+        # the constants above the caller) gates each one and an
+        # already-backfilled database performs no write at startup.
+        if _legacy_cny_backfill_needed(connection):
             connection.exec_driver_sql(
                 "UPDATE usage_events "
                 "SET cost_cny = cost_usd * 6.77, "
                 "usd_cny_rate = 6.77, cost_status = 'legacy_snapshot' "
-                "WHERE cost_usd > 0 AND cost_cny = 0 "
-                "AND cost_status = 'unpriced'"
+                f"WHERE {_LEGACY_CNY_BACKFILL_CONDITION}"
             )
-        if connection.exec_driver_sql(
-            "SELECT 1 FROM usage_events "
-            "WHERE provider_id = 'local_mock' AND cost_status = 'unpriced' LIMIT 1"
-        ).fetchone() is not None:
+        if _legacy_local_mock_backfill_needed(connection):
             connection.exec_driver_sql(
                 "UPDATE usage_events SET cost_status = 'non_billable' "
-                "WHERE provider_id = 'local_mock' AND cost_status = 'unpriced'"
+                f"WHERE {_LEGACY_LOCAL_MOCK_BACKFILL_CONDITION}"
             )
 
 
