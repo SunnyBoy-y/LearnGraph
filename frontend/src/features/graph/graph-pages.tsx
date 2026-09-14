@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -13,22 +14,30 @@ import {
   BookOpen,
   BookPlus,
   Brain,
+  CalendarClock,
+  CalendarDays,
   CircleDot,
+  Crosshair,
   Database,
   Download,
   Eye,
   FileText,
   Focus,
   GitCompareArrows,
+  Layers,
   LayoutGrid,
+  Lock,
   ListTree,
   ListChecks,
   MessageCircle,
+  Minus,
   MoreHorizontal,
   MousePointer2,
   Move,
   Network,
   Pencil,
+  Play,
+  Plus,
   RotateCcw,
   Route,
   Save,
@@ -65,9 +74,11 @@ import {
   updateGraphNode,
   updateGraphCover,
 } from "@/api";
+import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { saveBlobViaNative } from "@/lib/native-download";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
+import { GraphLegend } from "@/components/graph/graph-legend";
 import { GraphReviewDialog } from "@/components/graph/graph-review-dialog";
 import {
   getKnowledgeGraphTreeDepth,
@@ -75,6 +86,7 @@ import {
 } from "@/components/graph/knowledge-graph-layout";
 import {
   KnowledgeGraph,
+  type KnowledgeGraphCanvasApi,
   type KnowledgeNode,
 } from "@/components/graph/knowledge-graph";
 import {
@@ -82,6 +94,19 @@ import {
   NodeExploreEmpty,
   RecommendDots,
 } from "@/components/graph/node-explore";
+import {
+  AddToPlanDialog,
+  GraphPlanInspector,
+  PlanScheduleDialog,
+  useGraphPlanController,
+} from "@/features/graph/graph-plan";
+import {
+  buildPlanPathEdges,
+  startPlanPracticeSession,
+  suggestPlanSlot,
+  type PlanItemView,
+  type PlanNodeMarker,
+} from "@/features/graph/graph-plan-model";
 import { useNodeExploreRounds } from "@/components/graph/node-explore-data";
 import {
   importanceToWeight,
@@ -89,6 +114,18 @@ import {
   weightToImportance,
   type MetricLevel,
 } from "@/components/graph/node-metrics";
+import {
+  NODE_STATUS_PROFILES,
+  NODE_TYPE_ORDER,
+  NODE_TYPE_PROFILES,
+  graphLevelLabel,
+  isPrerequisiteSatisfied,
+  masteryLevelLabel,
+  resolveLearningStatus,
+  resolveNodeTypeProfile,
+  type NodeLearningStatusId,
+  type NodeTypeId,
+} from "@/components/graph/node-presentation";
 import {
   ErrorState,
   GrowthStars,
@@ -223,6 +260,37 @@ function graphRelationLabel(value: string) {
   return graphRelationLabels[value] ?? value;
 }
 
+/**
+ * The learning rail remembers the node a learner is working on
+ * (`learngraph:last-learned-nodes`). The graph page only reads it, so the
+ * canvas can mark “我现在在哪” without touching the rail's state.
+ */
+const LAST_LEARNED_NODE_STORAGE_KEY = "learngraph:last-learned-nodes";
+const GRAPH_TYPE_FILTER_STORAGE_KEY = "learngraph:graph-node-type-filter";
+
+function rememberedLearningNodeId(graphId: string): string | undefined {
+  try {
+    const raw = window.sessionStorage.getItem(LAST_LEARNED_NODE_STORAGE_KEY);
+    if (!raw) return undefined;
+    const map = JSON.parse(raw) as Record<string, string>;
+    return map[graphId];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Edge entry used by the node detail panel's relation lists. */
+type NodeRelation = { node: GraphNode; relation: string };
+
+/** Materialised learning status per node id (for the header/legend filters). */
+type GraphNodeStatusView = {
+  id: string;
+  typeId: NodeTypeId;
+  statusId: NodeLearningStatusId;
+  statusLabel: string;
+  blockedByPrerequisite: boolean;
+};
+
 export type OpenLearningProjectDetail = {
   graphId: string;
   title: string;
@@ -313,6 +381,8 @@ function shelfBooks(
 function toWorkbenchKnowledgeGraph(
   graph: Graph,
   exploreCounts: Record<string, number> = {},
+  blockedNodeIds: ReadonlySet<string> = new Set<string>(),
+  planMarkers: ReadonlyMap<string, PlanNodeMarker> = new Map(),
 ) {
   // The containment relation is the reviewable teaching hierarchy. Other
   // relations (especially prerequisite) remain useful visual overlays, but
@@ -343,6 +413,19 @@ function toWorkbenchKnowledgeGraph(
       targetWeight: node.target_weight,
       exploreCount: exploreCounts[node.id] ?? 0,
       mastered: node.attention_state === "mastered",
+      blockedByPrerequisite: blockedNodeIds.has(node.id),
+      // Light secondary metadata only: the plan annotates the map, it never
+      // restates the node's own learning status.
+      planMarker: (() => {
+        const marker = planMarkers.get(node.id);
+        return marker
+          ? {
+              label: marker.label,
+              tone: marker.tone,
+              blocked: marker.blocked,
+            }
+          : undefined;
+      })(),
       root:
         node.node_type === "root" ||
         (!hasDeclaredRoot && !containedNodeIds.has(node.id)),
@@ -778,8 +861,41 @@ function GraphBookshelf({
   );
 }
 
+/**
+ * Desktop docks the node detail next to the canvas (no overlay, canvas stays
+ * interactive); narrow viewports keep the existing drawer. One information
+ * architecture, two containers.
+ */
+function useDockedInspector() {
+  const [docked, setDocked] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(min-width: 1024px)").matches,
+  );
+  useEffect(() => {
+    const query = window.matchMedia("(min-width: 1024px)");
+    const handle = () => setDocked(query.matches);
+    query.addEventListener("change", handle);
+    return () => query.removeEventListener("change", handle);
+  }, []);
+  return docked;
+}
+
+/** Small type chip shared by search results and relation rows. */
+function NodeTypeChip({ typeId }: { typeId: NodeTypeId }) {
+  const profile = NODE_TYPE_PROFILES[typeId];
+  const Icon = profile.icon;
+  return (
+    <span className={`graph-type-chip is-${profile.tone}`} title={profile.hint}>
+      <Icon aria-hidden="true" />
+      {profile.label}
+    </span>
+  );
+}
+
 export function GraphWorkspacePage() {
   const { graphId = "", workspaceId = "" } = useParams();
+  const dockedInspector = useDockedInspector();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -812,10 +928,33 @@ export function GraphWorkspacePage() {
   const [nodeSearch, setNodeSearch] = useState("");
   const [nodeStateFilter, setNodeStateFilter] = useState(() => {
     const saved = window.localStorage.getItem("learngraph:graph-node-filter");
-    return ["all", "due", "relearning", "fresh", "focused"].includes(saved ?? "")
+    return [
+      "all",
+      "unlearned",
+      "learning",
+      "mastered",
+      "due",
+      "locked",
+      "focused",
+    ].includes(saved ?? "")
       ? saved!
       : "all";
   });
+  const [nodeTypeFilter, setNodeTypeFilter] = useState<"all" | NodeTypeId>(() => {
+    const saved = window.localStorage.getItem(GRAPH_TYPE_FILTER_STORAGE_KEY);
+    return NODE_TYPE_ORDER.includes(saved as NodeTypeId)
+      ? (saved as NodeTypeId)
+      : "all";
+  });
+  /** Cursor for Enter-to-jump through search matches. */
+  const [searchCursor, setSearchCursor] = useState(0);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const canvasApiRef = useRef<KnowledgeGraphCanvasApi | undefined>(
+    undefined,
+  );
+  const handleCanvasApi = useCallback((api: KnowledgeGraphCanvasApi) => {
+    canvasApiRef.current = api;
+  }, []);
   const [depthLimit, setDepthLimit] = useState(Number.MAX_SAFE_INTEGER);
   const [editingNode, setEditingNode] = useState(false);
   /** Workbench "edit mode": unlocks manual node edits across the inspector. */
@@ -829,6 +968,14 @@ export function GraphWorkspacePage() {
   const [graphReviewOpen, setGraphReviewOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  /**
+   * One right-hand surface at a time. `node` shows the knowledge-node detail,
+   * `plan` shows the learning plan (the old standalone 路线 page folded in).
+   */
+  const [inspectorMode, setInspectorMode] = useState<"node" | "plan">("node");
+  const [showPlanPath, setShowPlanPath] = useState(false);
+  const [addToPlanNode, setAddToPlanNode] = useState<GraphNode>();
+  const [schedulePlanItem, setSchedulePlanItem] = useState<PlanItemView>();
   const depthStateRef = useRef<{ graphId?: string; maximumDepth: number }>({
     maximumDepth: 0,
   });
@@ -860,6 +1007,12 @@ export function GraphWorkspacePage() {
   useEffect(() => {
     window.localStorage.setItem("learngraph:graph-node-filter", nodeStateFilter);
   }, [nodeStateFilter]);
+  useEffect(() => {
+    window.localStorage.setItem(
+      GRAPH_TYPE_FILTER_STORAGE_KEY,
+      nodeTypeFilter,
+    );
+  }, [nodeTypeFilter]);
   const openedGraph = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
     queryFn: () => getGraph(activeGraphId),
@@ -886,6 +1039,37 @@ export function GraphWorkspacePage() {
     effectiveGraph?.nodes.find((node) => node.id === requestedNodeId) ??
     effectiveGraph?.nodes.find((node) => node.id === graphRootId);
 
+  /**
+   * Learning plan for the opened graph. The plan is a projection of the
+   * graph's goal roadmap; it owns the time/action layer while the canvas keeps
+   * owning knowledge structure and learning state.
+   */
+  const activeGoal = useMemo(
+    () => (goals.data ?? []).find((goal) => goal.id === effectiveGraph?.goal_id),
+    [effectiveGraph?.goal_id, goals.data],
+  );
+  const plan = useGraphPlanController({
+    workspaceId,
+    goal: activeGoal,
+    graph: effectiveGraph,
+  });
+  const planItemsByNode = useMemo(() => {
+    const map = new Map<string, PlanItemView[]>();
+    plan.model.items.forEach((item) => {
+      if (!item.nodeId) return;
+      const list = map.get(item.nodeId) ?? [];
+      list.push(item);
+      map.set(item.nodeId, list);
+    });
+    return map;
+  }, [plan.model.items]);
+  /** Optional execution-order overlay; off by default so the map stays a map. */
+  const planPathEdges = useMemo(
+    () => (showPlanPath ? buildPlanPathEdges(plan.model.sequence) : []),
+    [plan.model.sequence, showPlanPath],
+  );
+  const planPanelOpen = inspectorMode === "plan";
+
   // Preload explore counts for selected node; canvas shows 0 until inspector
   // loads (avoids N parallel questions calls for every card on large graphs).
   // Cache counts across selection so interactive learning updates stick.
@@ -907,30 +1091,120 @@ export function GraphWorkspacePage() {
     );
   }, [selectedExplore.data, selectedNode?.id]);
 
+  /**
+   * Availability (未解锁) comes from the same prerequisite gate the backend
+   * workflow uses: a node whose prerequisite has no verified evidence yet is
+   * flagged, and the UI then leads with “查看前置知识” instead of a learn CTA.
+   */
+  const blockedNodeIds = useMemo(() => {
+    const blocked = new Set<string>();
+    if (!effectiveGraph) return blocked;
+    const byId = new Map(effectiveGraph.nodes.map((node) => [node.id, node]));
+    for (const edge of effectiveGraph.edges) {
+      if (edge.relation !== "prerequisite") continue;
+      const source = byId.get(edge.source_node_id);
+      if (!source || !byId.has(edge.target_node_id)) continue;
+      if (!isPrerequisiteSatisfied(source)) blocked.add(edge.target_node_id);
+    }
+    return blocked;
+  }, [effectiveGraph]);
+
   const workbenchGraph = useMemo(
     () =>
       effectiveGraph
-        ? toWorkbenchKnowledgeGraph(effectiveGraph, exploreCounts)
+        ? toWorkbenchKnowledgeGraph(
+            effectiveGraph,
+            exploreCounts,
+            blockedNodeIds,
+            plan.model.nodeMarkers,
+          )
         : null,
-    [effectiveGraph, exploreCounts],
+    [blockedNodeIds, effectiveGraph, exploreCounts, plan.model.nodeMarkers],
   );
+
+  /** Per-node presentation facts (type + learning status) for header/legend. */
+  const nodeStatusViews = useMemo(() => {
+    const map = new Map<string, GraphNodeStatusView>();
+    effectiveGraph?.nodes.forEach((node) => {
+      const profile = resolveNodeTypeProfile(node.node_type, {
+        root: node.node_type === "root",
+      });
+      const blockedByPrerequisite = blockedNodeIds.has(node.id);
+      const status = resolveLearningStatus({
+        stars: node.mastery_stars,
+        retrievalState: node.retrieval_state,
+        attentionState: node.attention_state,
+        blockedByPrerequisite,
+      });
+      map.set(node.id, {
+        id: node.id,
+        typeId: profile.id,
+        statusId: status.id,
+        statusLabel: status.label,
+        blockedByPrerequisite,
+      });
+    });
+    return map;
+  }, [blockedNodeIds, effectiveGraph]);
+
+  /** Types actually present in this graph — the legend marks the rest as unused. */
+  const nodeTypeCounts = useMemo(() => {
+    const counts = new Map<NodeTypeId, number>();
+    nodeStatusViews.forEach((view) => {
+      counts.set(view.typeId, (counts.get(view.typeId) ?? 0) + 1);
+    });
+    return counts;
+  }, [nodeStatusViews]);
+
+  const learningProgress = useMemo(() => {
+    const nodes =
+      effectiveGraph?.nodes.filter((node) => node.node_type !== "root") ?? [];
+    if (!nodes.length) return { learned: 0, total: 0, percent: 0 };
+    const learned = nodes.filter((node) => (node.mastery_stars ?? 0) >= 1).length;
+    return {
+      learned,
+      total: nodes.length,
+      percent: Math.round((learned / nodes.length) * 100),
+    };
+  }, [effectiveGraph]);
+
+  /** “我正在学什么” — the node the learning rail last worked on. */
+  const currentLearningId = useMemo(() => {
+    if (!effectiveGraph) return undefined;
+    const remembered = rememberedLearningNodeId(effectiveGraph.id);
+    if (remembered && effectiveGraph.nodes.some((node) => node.id === remembered))
+      return remembered;
+    const focused = effectiveGraph.nodes.find(
+      (node) => node.attention_state === "focused",
+    );
+    if (focused) return focused.id;
+    const rootId = effectiveGraph.nodes.find(
+      (node) => node.node_type === "root",
+    )?.id;
+    const firstChildId = effectiveGraph.edges.find(
+      (edge) =>
+        edge.source_node_id === rootId &&
+        (edge.relation === "contains" || edge.relation === "prerequisite"),
+    )?.target_node_id;
+    if (firstChildId) return firstChildId;
+    return effectiveGraph.nodes.find((node) => node.node_type !== "root")?.id;
+  }, [effectiveGraph]);
+
   const filteredWorkbenchGraph = useMemo(() => {
     if (!workbenchGraph || !effectiveGraph) return workbenchGraph;
-    const normalizedSearch = nodeSearch.trim().toLocaleLowerCase();
-    if (!normalizedSearch && nodeStateFilter === "all") return workbenchGraph;
+    if (nodeStateFilter === "all" && nodeTypeFilter === "all") return workbenchGraph;
     const matchedIds = new Set(
       effectiveGraph.nodes
         .filter((node) => {
-          const matchesSearch =
-            !normalizedSearch ||
-            node.label.toLocaleLowerCase().includes(normalizedSearch) ||
-            node.description.toLocaleLowerCase().includes(normalizedSearch);
           const matchesState =
             nodeStateFilter === "all" ||
-            node.retrieval_state === nodeStateFilter ||
+            nodeStatusViews.get(node.id)?.statusId === nodeStateFilter ||
             (nodeStateFilter === "focused" &&
               node.attention_state === "focused");
-          return matchesSearch && matchesState;
+          const matchesType =
+            nodeTypeFilter === "all" ||
+            nodeStatusViews.get(node.id)?.typeId === nodeTypeFilter;
+          return matchesState && matchesType;
         })
         .map((node) => node.id),
     );
@@ -949,7 +1223,79 @@ export function GraphWorkspacePage() {
         (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
       ),
     };
-  }, [effectiveGraph, nodeSearch, nodeStateFilter, workbenchGraph]);
+  }, [
+    effectiveGraph,
+    nodeStateFilter,
+    nodeStatusViews,
+    nodeTypeFilter,
+    workbenchGraph,
+  ]);
+
+  /**
+   * Search highlights instead of hiding: matches ring up on the canvas, and the
+   * result list underneath the box jumps straight to a node.
+   */
+  const searchMatches = useMemo(() => {
+    const query = nodeSearch.trim().toLocaleLowerCase();
+    if (!query || !effectiveGraph) return [];
+    return effectiveGraph.nodes.filter(
+      (node) =>
+        node.label.toLocaleLowerCase().includes(query) ||
+        node.description.toLocaleLowerCase().includes(query),
+    );
+  }, [effectiveGraph, nodeSearch]);
+
+  const searchMatchIds = useMemo(
+    () => searchMatches.map((node) => node.id),
+    [searchMatches],
+  );
+
+  /** Tree depth per node, so the detail panel can show the same L2 metadata. */
+  const nodeDepthById = useMemo(() => {
+    if (!workbenchGraph) return new Map<string, number>();
+    return getKnowledgeGraphTreeDepths(workbenchGraph.nodes, workbenchGraph.edges);
+  }, [workbenchGraph]);
+
+  const nodeStatusCounts = useMemo(() => {
+    const counts = new Map<NodeLearningStatusId, number>();
+    nodeStatusViews.forEach((view) => {
+      counts.set(view.statusId, (counts.get(view.statusId) ?? 0) + 1);
+    });
+    return counts;
+  }, [nodeStatusViews]);
+
+  /** Upstream / downstream / cross relations of the selected node. */
+  const selectedNodeRelations = useMemo(() => {
+    const empty = { upstream: [], downstream: [], related: [] } as {
+      upstream: NodeRelation[];
+      downstream: NodeRelation[];
+      related: NodeRelation[];
+    };
+    if (!effectiveGraph || !selectedNode) return empty;
+    const byId = new Map(effectiveGraph.nodes.map((node) => [node.id, node]));
+    const upstream: NodeRelation[] = [];
+    const downstream: NodeRelation[] = [];
+    const related: NodeRelation[] = [];
+    for (const edge of effectiveGraph.edges) {
+      if (
+        edge.source_node_id !== selectedNode.id &&
+        edge.target_node_id !== selectedNode.id
+      )
+        continue;
+      const outgoing = edge.source_node_id === selectedNode.id;
+      const other = byId.get(
+        outgoing ? edge.target_node_id : edge.source_node_id,
+      );
+      if (!other) continue;
+      const entry = { node: other, relation: edge.relation };
+      if (edge.relation === "contains" || edge.relation === "prerequisite") {
+        (outgoing ? downstream : upstream).push(entry);
+      } else {
+        related.push(entry);
+      }
+    }
+    return { upstream, downstream, related };
+  }, [effectiveGraph, selectedNode]);
   const maximumDepth = workbenchGraph
     ? getKnowledgeGraphTreeDepth(workbenchGraph.nodes, workbenchGraph.edges)
     : 0;
@@ -970,13 +1316,29 @@ export function GraphWorkspacePage() {
         ? requestedNodeId
         : effectiveGraph?.nodes.some((node) => node.id === current)
           ? current
-          : graphRootId,
+          : // Default anchor: the node the learner is working on (「我正在学什么」),
+            // falling back to the goal root only when nothing is known yet.
+            (currentLearningId ?? graphRootId),
     );
-  }, [effectiveGraph?.nodes, graphRootId, requestedNodeId]);
+  }, [currentLearningId, effectiveGraph?.nodes, graphRootId, requestedNodeId]);
 
   useEffect(() => {
     if (requestedNodeId) setInspectorOpen(true);
   }, [requestedNodeId]);
+
+  /**
+   * `?panel=plan` deep link: the folded-in learning plan (also what the legacy
+   * 路线 URL redirects to). Node detail stays the default panel otherwise.
+   */
+  const requestedPanel = searchParams.get("panel");
+  useEffect(() => {
+    if (requestedPanel === "plan") {
+      setInspectorMode("plan");
+      setInspectorOpen(false);
+    } else if (!requestedPanel) {
+      setInspectorMode((current) => (current === "plan" ? "node" : current));
+    }
+  }, [requestedPanel]);
 
   useEffect(() => {
     const validIds = new Set(effectiveGraph?.nodes.map((node) => node.id) ?? []);
@@ -1425,7 +1787,8 @@ export function GraphWorkspacePage() {
     toast.message(`正在对「${selectedNode.label}」发起拆分变更…`);
   }
 
-  function studyFromNode(node: KnowledgeNode["data"] & { id: string }) {
+  /** Shared "start studying this node" entry (node card, plan item, inspector). */
+  function startNodeLearning(node: { id: string; label: string }) {
     if (!activeGraph) return;
     openLearningProject({
       graphId: activeGraph.id,
@@ -1437,11 +1800,66 @@ export function GraphWorkspacePage() {
     toast.message(`正在从「${node.label}」开始学习…`);
   }
 
+  function studyFromNode(node: KnowledgeNode["data"] & { id: string }) {
+    startNodeLearning({ id: node.id, label: node.label });
+  }
+
+  /**
+   * Plan items route by their real action type: `learn` opens the existing node
+   * study flow, `review` / `practice` / `assessment` create a Practice Session
+   * scoped to that node. Nothing here invents a second practice UI.
+   */
+  function startPlanItem(item: PlanItemView) {
+    if (item.routing.route === "learn") {
+      if (!item.nodeId) return;
+      startNodeLearning({ id: item.nodeId, label: item.title });
+      return;
+    }
+    void startPlanPracticeSession(item)
+      .then((sessionId) =>
+        navigate(`${base}/practice/session/${sessionId}`),
+      )
+      .catch((error: Error) => {
+        toast.error(error.message);
+        navigate(`${base}/practice`);
+      });
+  }
+
+  function openPlanPanel() {
+    setInspectorMode("plan");
+    setInspectorOpen(false);
+    const next = new URLSearchParams(searchParams);
+    next.set("panel", "plan");
+    setSearchParams(next, { replace: true });
+    // An empty plan should offer the one action that fixes it.
+    if (plan.state === "empty" && !plan.generating) plan.generate();
+  }
+
+  function closePlanPanel() {
+    setInspectorMode("node");
+    const next = new URLSearchParams(searchParams);
+    next.delete("panel");
+    setSearchParams(next, { replace: true });
+  }
+
   function selectWorkbenchNode(node: KnowledgeNode["data"] & { id: string }) {
     setSelectedNodeId(node.id);
     setInspectorOpen(true);
+    // Clicking a node asks for node detail; the plan stays reachable from the
+    // header button (only one right-hand panel is open at a time).
+    setInspectorMode("node");
     const next = new URLSearchParams(searchParams);
     next.set("node", node.id);
+    next.delete("panel");
+    setSearchParams(next, { replace: true });
+  }
+
+  /** Locate a plan item's node without stealing focus from the plan panel. */
+  function locatePlanNode(nodeId: string) {
+    setSelectedNodeId(nodeId);
+    locateNode(nodeId, true);
+    const next = new URLSearchParams(searchParams);
+    next.set("node", nodeId);
     setSearchParams(next, { replace: true });
   }
 
@@ -1471,6 +1889,133 @@ export function GraphWorkspacePage() {
     });
     navigate(`${base}/learn/joint?${params.toString()}`);
   }
+
+  /** Camera-only focus: never a mode change, just a deliberate framing. */
+  function locateNode(nodeId: string, neighbors = true) {
+    canvasApiRef.current?.focusNode(nodeId, { neighbors });
+  }
+
+  /** Search / relation jumps: select the node, then frame it with relations. */
+  function jumpToNode(nodeId: string) {
+    setSelectedNodeId(nodeId);
+    setInspectorOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.set("node", nodeId);
+    setSearchParams(next, { replace: true });
+    locateNode(nodeId, true);
+  }
+
+  /** Locked nodes lead with their prerequisites instead of a learn CTA. */
+  function openFirstPrerequisite() {
+    if (!selectedNode) return;
+    const blocker = selectedNodeRelations.upstream.find(
+      (entry) =>
+        entry.relation === "prerequisite" && !isPrerequisiteSatisfied(entry.node),
+    );
+    if (blocker) jumpToNode(blocker.node.id);
+  }
+
+  const selectedStatusView = selectedNode
+    ? nodeStatusViews.get(selectedNode.id)
+    : undefined;
+  const selectedLearningStatus = selectedNode
+    ? resolveLearningStatus({
+        stars: selectedNode.mastery_stars,
+        retrievalState: selectedNode.retrieval_state,
+        attentionState: selectedNode.attention_state,
+        blockedByPrerequisite: Boolean(selectedStatusView?.blockedByPrerequisite),
+      })
+    : undefined;
+
+  const nodeInspector = (
+    <GraphNodeInspector
+      currentLearning={selectedNode?.id === currentLearningId}
+      draft={nodeDraft}
+      editMode={editMode}
+      editable={editMode}
+      exploreOpen={explorePanelOpen}
+      exploreRounds={selectedExplore.data ?? []}
+      exploreLoading={selectedExplore.isPending}
+      focusBusy={focus.isPending}
+      focusEditable={focusEditable}
+      levelLabel={graphLevelLabel(
+        selectedNode ? (nodeDepthById.get(selectedNode.id) ?? 0) : 0,
+      )}
+      masteryBusy={focus.isPending}
+      node={selectedNode}
+      onChange={setNodeDraft}
+      onEdit={() => {
+        setEditMode(true);
+        setEditingNode(true);
+      }}
+      onFocus={focusSelectedNode}
+      onLocate={() => selectedNode && locateNode(selectedNode.id, true)}
+      onLocateRelation={(nodeId) => jumpToNode(nodeId)}
+      onMastery={masterySelectedNode}
+      onOpenPrerequisite={openFirstPrerequisite}
+      onSplit={splitSelectedNode}
+      onLearn={() =>
+        selectedNode && studyFromNode({ ...selectedNode, id: selectedNode.id })
+      }
+      onOpenExplore={() => setExplorePanelOpen(true)}
+      onCloseExplore={() => setExplorePanelOpen(false)}
+      onSave={saveSelectedNode}
+      schedule={
+        selectedNode
+          ? {
+              items: planItemsByNode.get(selectedNode.id) ?? [],
+              canAdd: Boolean(plan.roadmap),
+              onAdd: () => setAddToPlanNode(selectedNode),
+              onAdjust: (item) => setSchedulePlanItem(item),
+              onStart: startPlanItem,
+              onOpenPlan: openPlanPanel,
+            }
+          : undefined
+      }
+      onStopEditing={() => {
+        if (selectedNode)
+          setNodeDraft({
+            label: selectedNode.label,
+            description: selectedNode.description,
+            targetWeight: selectedNode.target_weight,
+          });
+        setEditingNode(false);
+      }}
+      relations={selectedNodeRelations}
+      saving={updateNode.isPending}
+      statusLabel={selectedLearningStatus?.label}
+      statusId={selectedLearningStatus?.id}
+      typeLabel={
+        selectedNode
+          ? resolveNodeTypeProfile(selectedNode.node_type, {
+              root: selectedNode.node_type === "root",
+            }).label
+          : undefined
+      }
+      editing={editingNode && editMode}
+    />
+  );
+
+  const planInspector = (
+    <GraphPlanInspector
+      busy={plan.scheduling || plan.adding}
+      controller={plan}
+      onClose={closePlanPanel}
+      onLocateNode={locatePlanNode}
+      onStartLearn={startPlanItem}
+      onStartPractice={startPlanItem}
+      onTogglePath={setShowPlanPath}
+      showPath={showPlanPath}
+    />
+  );
+  const planButtonLabel =
+    plan.state === "no-goal"
+      ? "学习计划"
+      : plan.state === "empty"
+        ? "生成学习计划"
+        : plan.state === "ready"
+          ? `学习计划 · ${plan.model.days.length} 天`
+          : "学习计划";
 
   return (
     <PageFrame className="graph-library-page graph-workbench-page">
@@ -1518,34 +2063,88 @@ export function GraphWorkspacePage() {
       <section className="graph-workbench-canvas" aria-label="图谱工作台画布">
         <header className="graph-workbench-canvas__header">
           <div className="graph-workbench-heading">
-            <Select
-              onValueChange={(bookId) => {
-                const book = books.find((item) => item.id === bookId);
-                if (book) openBook(book);
-              }}
-              value={selectedBook?.id}
-            >
-              <SelectTrigger aria-label="选择学习图谱" className="graph-workbench-book-select">
-                <Network className="size-4" />
-                <SelectValue placeholder="选择学习图谱" />
-              </SelectTrigger>
-              <SelectContent>
-                {books.map((book) => (
-                  <SelectItem key={book.id} value={book.id}>
-                    {book.title} · {book.status}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p>
-              {selectedBook?.isGoalBook
-                ? "完成目标澄清后生成图谱。"
-                : activeGraph
-                  ? `${activeGraph.nodes.length} 个节点 · 点击节点查看详情`
-                  : "选择图谱后开始学习。"}
-            </p>
+            <div className="graph-workbench-heading__title">
+              <Select
+                onValueChange={(bookId) => {
+                  const book = books.find((item) => item.id === bookId);
+                  if (book) openBook(book);
+                }}
+                value={selectedBook?.id}
+              >
+                <SelectTrigger
+                  aria-label="选择学习图谱"
+                  className="graph-workbench-book-select"
+                >
+                  <Network className="size-4" />
+                  <SelectValue placeholder="选择学习图谱">
+                    {selectedBook?.title ?? "选择学习图谱"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {books.map((book) => (
+                    <SelectItem key={book.id} value={book.id}>
+                      {book.title} · {book.status}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {activeGraph ? (
+                <span
+                  className={cn(
+                    "graph-status-pill",
+                    activeGraph.status === "published"
+                      ? "is-live"
+                      : activeGraph.status === "candidate"
+                        ? "is-candidate"
+                        : "is-draft",
+                  )}
+                >
+                  {activeGraph.status === "published"
+                    ? "正在学习"
+                    : activeGraph.status === "candidate"
+                      ? "待审核"
+                      : "草稿"}
+                </span>
+              ) : null}
+            </div>
+            <div className="graph-workbench-heading__meta">
+              {selectedBook?.isGoalBook ? (
+                <span>完成目标澄清后生成图谱。</span>
+              ) : activeGraph ? (
+                <>
+                  <span className="graph-workbench-heading__stats">
+                    {activeGraph.nodes.length} 个节点 · 已学习{" "}
+                    {learningProgress.percent}%
+                  </span>
+                  <Progress
+                    aria-label={`已学习 ${learningProgress.percent}%`}
+                    className="graph-workbench-heading__progress"
+                    value={learningProgress.percent}
+                  />
+                  <span className="graph-workbench-heading__hint">
+                    点击节点查看详情，或直接从节点开始学习
+                  </span>
+                </>
+              ) : (
+                <span>选择图谱后开始学习。</span>
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-2">
+            {activeGraph ? (
+              <Button
+                aria-pressed={planPanelOpen}
+                onClick={() =>
+                  planPanelOpen ? closePlanPanel() : openPlanPanel()
+                }
+                size="sm"
+                title="学习计划：图谱上的时间与行动安排"
+                variant={planPanelOpen ? "secondary" : "outline"}
+              >
+                <CalendarDays className="size-4" />
+                {planButtonLabel}
+              </Button>
+            ) : null}
             <Button
               onClick={returnToBookshelf}
               size="sm"
@@ -1561,7 +2160,33 @@ export function GraphWorkspacePage() {
                   <MoreHorizontal className="size-4" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-48">
+              <DropdownMenuContent align="end" className="w-56">
+                {activeGraph && !selectedBook?.isGoalBook ? (
+                  <DropdownMenuItem
+                    onSelect={() => startBookLearning(books.find((book) => book.graphId === activeGraph.id) ?? {
+                      id: `graph-${activeGraph.id}`,
+                      goalId: activeGraph.goal_id,
+                      graphId: activeGraph.id,
+                      title: activeGraph.title,
+                      summary: "",
+                      status: activeGraph.status,
+                      progress: "",
+                      icon: Database,
+                      isGoalBook: false,
+                      needsReview: false,
+                      masteryProgress: 0,
+                      cover: generatedCover(activeGraph.title, 0),
+                    })}
+                  >
+                    <BookOpen className="size-4" />
+                    开始学习此图谱
+                  </DropdownMenuItem>
+                ) : null}
+                <DropdownMenuItem onSelect={() => navigate(`${base}/capabilities`)}>
+                  <Brain className="size-4" />
+                  能力成长视图
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem onSelect={returnToBookshelf}>
                   <BookOpen className="size-4" />
                   返回图谱书架
@@ -1569,10 +2194,6 @@ export function GraphWorkspacePage() {
                 <DropdownMenuItem onSelect={() => setLibraryOpen(true)}>
                   <LayoutGrid className="size-4" />
                   快速切换图谱
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => navigate(`${base}/capabilities`)}>
-                  <Brain className="size-4" />
-                  能力成长视图
                 </DropdownMenuItem>
                 {activeGraph?.status === "candidate" ? (
                   <DropdownMenuItem
@@ -1619,29 +2240,6 @@ export function GraphWorkspacePage() {
                 <ShieldCheck className="size-4" />
                 去审核
               </Button>
-            ) : activeGraph ? (
-              <Button
-                onClick={() =>
-                  startBookLearning({
-                    id: `graph-${activeGraph.id}`,
-                    goalId: activeGraph.goal_id,
-                    graphId: activeGraph.id,
-                    title: activeGraph.title,
-                    summary: "",
-                    status: activeGraph.status,
-                    progress: "",
-                    icon: Database,
-                    isGoalBook: false,
-                    needsReview: false,
-                    masteryProgress: 0,
-                    cover: generatedCover(activeGraph.title, 0),
-                  })
-                }
-                size="sm"
-              >
-                <BookOpen className="size-4" />
-                开始学习
-              </Button>
             ) : null}
           </div>
         </header>
@@ -1668,45 +2266,166 @@ export function GraphWorkspacePage() {
             onRetry={() => void openedGraph.refetch()}
           />
         ) : activeGraph ? (
-          <div className="graph-workbench-canvas__body graph-workbench-canvas__body--full">
+          <div
+            className={cn(
+              "graph-workbench-canvas__body",
+              dockedInspector && (planPanelOpen || (inspectorOpen && selectedNode))
+                ? "graph-workbench-canvas__body--inspector"
+                : "graph-workbench-canvas__body--full",
+            )}
+          >
             <div className="graph-workbench-canvas__main">
               <div className="graph-workbench-controls" aria-label="图谱视图控制">
                 <div className="graph-workbench-search">
                   <Search className="size-3.5" />
                   <Input
                     aria-label="搜索图谱节点"
-                    onChange={(event) => setNodeSearch(event.target.value)}
+                    onBlur={() =>
+                      window.setTimeout(() => setSearchOpen(false), 140)
+                    }
+                    onChange={(event) => {
+                      setNodeSearch(event.target.value);
+                      setSearchCursor(0);
+                      setSearchOpen(true);
+                    }}
+                    onFocus={() => setSearchOpen(true)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        setNodeSearch("");
+                        setSearchOpen(false);
+                        return;
+                      }
+                      if (event.key === "Enter" && searchMatches.length) {
+                        const match =
+                          searchMatches[
+                            Math.min(searchCursor, searchMatches.length - 1)
+                          ];
+                        setSearchCursor(
+                          (current) => (current + 1) % searchMatches.length,
+                        );
+                        if (match) jumpToNode(match.id);
+                      }
+                    }}
                     placeholder="搜索节点或定义"
                     value={nodeSearch}
                   />
+                  {searchOpen && nodeSearch.trim() ? (
+                    <div
+                      aria-label="搜索结果"
+                      className="graph-search-results"
+                      role="listbox"
+                    >
+                      {searchMatches.length ? (
+                        <>
+                          <p className="graph-search-results__count">
+                             找到 {searchMatches.length} 个节点 · Enter 逐个定位
+                          </p>
+                          <div className="graph-search-results__list">
+                            {searchMatches.slice(0, 8).map((match) => {
+                              const view = nodeStatusViews.get(match.id);
+                              return (
+                                <button
+                                  className="graph-search-result"
+                                  key={match.id}
+                                  onClick={() => jumpToNode(match.id)}
+                                  type="button"
+                                >
+                                  <span className="graph-search-result__label">
+                                    {match.label}
+                                  </span>
+                                  <span className="graph-search-result__meta">
+                                    <NodeTypeChip
+                                      typeId={
+                                        view?.typeId ??
+                                        resolveNodeTypeProfile(match.node_type, {
+                                          root: match.node_type === "root",
+                                        }).id
+                                      }
+                                    />
+                                    <span
+                                      className={cn(
+                                        "graph-search-result__status",
+                                        `is-${view?.statusId ?? "unlearned"}`,
+                                      )}
+                                    >
+                                      {view?.statusLabel ?? "未学习"}
+                                    </span>
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                          {searchMatches.length > 8 ? (
+                            <p className="graph-search-results__more">
+                              还有 {searchMatches.length - 8} 个结果，继续输入可缩小范围
+                            </p>
+                          ) : null}
+                        </>
+                      ) : (
+                        <p className="graph-search-results__empty">
+                          没有匹配的节点
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
-                <Select onValueChange={setNodeStateFilter} value={nodeStateFilter}>
-                  <SelectTrigger aria-label="筛选节点状态" className="w-36">
+                <Select
+                  onValueChange={setNodeStateFilter}
+                  value={nodeStateFilter}
+                >
+                  <SelectTrigger aria-label="筛选节点状态" className="w-32">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">全部状态</SelectItem>
+                    <SelectItem value="unlearned">未学习</SelectItem>
+                    <SelectItem value="learning">学习中</SelectItem>
+                    <SelectItem value="mastered">已掌握</SelectItem>
                     <SelectItem value="due">待复习</SelectItem>
-                    <SelectItem value="relearning">重新学习</SelectItem>
-                    <SelectItem value="fresh">状态新鲜</SelectItem>
+                    <SelectItem value="locked">未解锁</SelectItem>
                     <SelectItem value="focused">重点节点</SelectItem>
                   </SelectContent>
                 </Select>
-                <div className="graph-depth-control" role="group" aria-label="展开层级">
+                <Select
+                  onValueChange={(value) =>
+                    setNodeTypeFilter(value as "all" | NodeTypeId)
+                  }
+                  value={nodeTypeFilter}
+                >
+                  <SelectTrigger aria-label="筛选节点类型" className="w-32">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部类型</SelectItem>
+                    {NODE_TYPE_ORDER.filter((id) => nodeTypeCounts.has(id)).map(
+                      (id) => (
+                        <SelectItem key={id} value={id}>
+                          {NODE_TYPE_PROFILES[id].label} · {nodeTypeCounts.get(id)}
+                        </SelectItem>
+                      ),
+                    )}
+                  </SelectContent>
+                </Select>
+                <div
+                  aria-label="展开层级"
+                  className="graph-depth-control"
+                  role="group"
+                >
                   <Button
                     aria-label="减少展开层级"
                     disabled={effectiveDepthLimit <= 0}
                     onClick={() =>
                       setDepthLimit(Math.max(0, effectiveDepthLimit - 1))
                     }
-                    size="icon-sm"
-                    title="减少展开层级"
+                    size="icon-xs"
+                    title="收起一层"
                     variant="ghost"
                   >
-                    <ZoomOut />
+                    <Minus />
                   </Button>
-                  <span>
-                    {effectiveDepthLimit}/{maximumDepth} 层
+                  <span title="当前展开的图谱层级">
+                    <Layers className="size-3" />
+                    L{effectiveDepthLimit}/{maximumDepth}
                   </span>
                   <Button
                     aria-label="增加展开层级"
@@ -1716,15 +2435,16 @@ export function GraphWorkspacePage() {
                         Math.min(maximumDepth, effectiveDepthLimit + 1),
                       )
                     }
-                    size="icon-sm"
-                    title="增加展开层级"
+                    size="icon-xs"
+                    title="展开一层"
                     variant="ghost"
                   >
-                    <ZoomIn />
+                    <Plus />
                   </Button>
                 </div>
                 <Button
                   aria-pressed={editMode}
+                  className="graph-toolbar-label"
                   onClick={() => {
                     const next = !editMode;
                     setEditMode(next);
@@ -1739,9 +2459,10 @@ export function GraphWorkspacePage() {
                   variant={editMode ? "secondary" : "outline"}
                 >
                   <Pencil className="size-3.5" />
-                  {editMode ? "编辑中" : "编辑模式"}
+                  <span>{editMode ? "编辑中" : "编辑模式"}</span>
                 </Button>
                 <Button
+                  aria-label={multiSelect ? "退出多选" : "进入多选"}
                   aria-pressed={multiSelect}
                   onClick={() => {
                     const nextMultiSelect = !multiSelect;
@@ -1756,17 +2477,23 @@ export function GraphWorkspacePage() {
                           : [],
                     );
                   }}
-                  size="sm"
+                  size="icon-sm"
+                  title={multiSelect ? "退出多选" : "多选多个节点做联合学习"}
                   variant={multiSelect ? "secondary" : "outline"}
                 >
                   <MousePointer2 className="size-3.5" />
-                  {multiSelect ? "多选中" : "多选"}
                 </Button>
               </div>
               <div className="graph-workbench-canvas__graph">
+                <GraphLegend
+                  className="graph-legend--floating"
+                  statusCounts={nodeStatusCounts}
+                  typeCounts={nodeTypeCounts}
+                />
                 {activeGraph.nodes.length === 1 &&
                 !nodeSearch.trim() &&
-                nodeStateFilter === "all" ? (
+                nodeStateFilter === "all" &&
+                nodeTypeFilter === "all" ? (
                   <div className="graph-single-node" role="status">
                     <CircleDot className="size-6" />
                     <div>
@@ -1795,16 +2522,23 @@ export function GraphWorkspacePage() {
                   </div>
                 ) : filteredWorkbenchGraph?.nodes.length ? (
                   <KnowledgeGraph
+                    currentId={currentLearningId}
                     edges={filteredWorkbenchGraph.edges}
                     layout="tree"
+                    matchIds={searchMatchIds}
                     maxDepth={effectiveDepthLimit}
                     multiple={multiSelect}
                     nodes={filteredWorkbenchGraph.nodes}
+                    planEdges={planPathEdges}
+                    initialFit="focus"
+                    onCanvasApi={handleCanvasApi}
                     onSelect={selectWorkbenchNode}
                     onSelectionChange={updateWorkbenchSelection}
+                    onStudy={studyFromNode}
                     rootEmphasis
                     selectedId={selectedNode?.id}
                     selectedIds={selectedNodeIds}
+                    showHeading={false}
                     showZoomControls
                     title={activeGraph.title}
                   />
@@ -1812,11 +2546,12 @@ export function GraphWorkspacePage() {
                   <div className="graph-workbench-filter-empty" role="status">
                     <Search className="size-5" />
                     <strong>没有匹配的节点</strong>
-                    <p>调整关键词或状态筛选后重试。</p>
+                    <p>调整关键词、状态或类型筛选后重试。</p>
                     <Button
                       onClick={() => {
                         setNodeSearch("");
                         setNodeStateFilter("all");
+                        setNodeTypeFilter("all");
                       }}
                       size="xs"
                       variant="outline"
@@ -1825,24 +2560,39 @@ export function GraphWorkspacePage() {
                     </Button>
                   </div>
                 )}
-              </div>
-              {multiSelect ? (
-                <div className="graph-multi-action" role="status">
-                  <div>
-                    <Network className="size-4" />
-                    <span>已选择 {selectedNodeIds.length}/8 个节点</span>
-                  </div>
-                  <Button
-                    disabled={selectedNodeIds.length < 2}
-                    onClick={openJointStudy}
-                    size="sm"
+                {multiSelect ? (
+                  <div
+                    className="graph-multi-action graph-multi-action--floating"
+                    role="status"
                   >
-                    <ListTree className="size-4" />
-                    联合学习
-                  </Button>
-                </div>
-              ) : null}
+                    <div>
+                      <MousePointer2 className="size-4" />
+                      <span>已选择 {selectedNodeIds.length}/8 个节点</span>
+                    </div>
+                    <Button
+                      disabled={selectedNodeIds.length < 2}
+                      onClick={openJointStudy}
+                      size="sm"
+                    >
+                      <ListTree className="size-4" />
+                      联合学习
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
             </div>
+            {dockedInspector &&
+            (planPanelOpen || (inspectorOpen && selectedNode)) ? (
+              <aside
+                aria-label={planPanelOpen ? "学习计划" : "节点详情"}
+                className={cn(
+                  "graph-workbench-inspector",
+                  planPanelOpen && "graph-workbench-inspector--plan",
+                )}
+              >
+                {planPanelOpen ? planInspector : nodeInspector}
+              </aside>
+            ) : null}
           </div>
         ) : (
           <div className="graph-workbench-canvas__empty">
@@ -1858,51 +2608,73 @@ export function GraphWorkspacePage() {
           </div>
         )}
       </section>
-      <Sheet onOpenChange={setInspectorOpen} open={inspectorOpen && Boolean(selectedNode)}>
-        <SheetContent className="graph-node-sheet overflow-y-auto sm:max-w-md">
-          <SheetTitle className="sr-only">节点详情</SheetTitle>
-          <div className="p-5 pt-12">
-            <GraphNodeInspector
-              draft={nodeDraft}
-              editMode={editMode}
-              editable={editMode}
-              exploreOpen={explorePanelOpen}
-              exploreRounds={selectedExplore.data ?? []}
-              exploreLoading={selectedExplore.isPending}
-              focusBusy={focus.isPending}
-              focusEditable={focusEditable}
-              masteryBusy={focus.isPending}
-              node={selectedNode}
-              onChange={setNodeDraft}
-              onEdit={() => {
-                setEditMode(true);
-                setEditingNode(true);
-              }}
-              onFocus={focusSelectedNode}
-              onMastery={masterySelectedNode}
-              onSplit={splitSelectedNode}
-              onLearn={() =>
-                selectedNode &&
-                studyFromNode({ ...selectedNode, id: selectedNode.id })
-              }
-              onOpenExplore={() => setExplorePanelOpen(true)}
-              onCloseExplore={() => setExplorePanelOpen(false)}
-              onSave={saveSelectedNode}
-              onStopEditing={() => {
-                if (selectedNode)
-                  setNodeDraft({
-                    label: selectedNode.label,
-                    description: selectedNode.description,
-                    targetWeight: selectedNode.target_weight,
-                  });
-                setEditingNode(false);
-              }}
-              saving={updateNode.isPending}
-              editing={editingNode && editMode}
-            />
-          </div>
-        </SheetContent>
-      </Sheet>
+      {!dockedInspector ? (
+        <>
+          <Sheet
+            onOpenChange={(open) => {
+              setInspectorOpen(open);
+              if (open) setInspectorMode("node");
+            }}
+            open={!planPanelOpen && inspectorOpen && Boolean(selectedNode)}
+          >
+            <SheetContent className="graph-node-sheet overflow-y-auto sm:max-w-[360px]">
+              <SheetTitle className="sr-only">节点详情</SheetTitle>
+              <div className="p-5 pt-12">{nodeInspector}</div>
+            </SheetContent>
+          </Sheet>
+          <Sheet
+            onOpenChange={(open) => {
+              if (!open) closePlanPanel();
+            }}
+            open={planPanelOpen}
+          >
+            <SheetContent className="graph-node-sheet overflow-y-auto sm:max-w-[400px]">
+              <SheetTitle className="sr-only">学习计划</SheetTitle>
+              <div className="p-5 pt-12">{planInspector}</div>
+            </SheetContent>
+          </Sheet>
+        </>
+      ) : null}
+      {addToPlanNode ? (
+        <AddToPlanDialog
+          available={Boolean(plan.roadmap)}
+          model={plan.model}
+          node={addToPlanNode}
+          onClose={() => setAddToPlanNode(undefined)}
+          onSubmit={(payload) => {
+            void plan
+              .addNode({
+                nodeId: addToPlanNode.id,
+                dayIndex: payload.dayIndex,
+                durationMinutes: payload.durationMinutes,
+                rationale: payload.rationale,
+              })
+              .then(() => {
+                setAddToPlanNode(undefined);
+                openPlanPanel();
+              })
+              .catch(() => undefined);
+          }}
+          pending={plan.adding}
+          suggestion={suggestPlanSlot(plan.model, {
+            blockedByPrerequisite: blockedNodeIds.has(addToPlanNode.id),
+          })}
+        />
+      ) : null}
+      {schedulePlanItem && plan.roadmap ? (
+        <PlanScheduleDialog
+          item={schedulePlanItem}
+          model={plan.model}
+          onClose={() => setSchedulePlanItem(undefined)}
+          onSubmit={(payload) => {
+            void plan
+              .scheduleItem(schedulePlanItem, payload)
+              .then(() => setSchedulePlanItem(undefined))
+              .catch(() => undefined);
+          }}
+          pending={plan.scheduling}
+        />
+      ) : null}
       {activeGraph ? (
         <GraphReviewDialog
           graph={activeGraph}
@@ -1915,6 +2687,14 @@ export function GraphWorkspacePage() {
   );
 }
 
+/**
+ * Node detail surface.
+ *
+ * Desktop renders it docked next to the canvas, narrow viewports render the same
+ * tree inside the drawer — one information architecture, one component.
+ * Content priority: what it is → what state I am in → what it relates to →
+ * what I can do right now.
+ */
 function GraphNodeInspector({
   node,
   draft,
@@ -1927,17 +2707,27 @@ function GraphNodeInspector({
   focusEditable,
   saving,
   focusBusy,
+  typeLabel,
+  levelLabel,
+  statusLabel,
+  statusId,
+  relations,
+  currentLearning = false,
   onChange,
   onEdit,
   onStopEditing,
   onSave,
   onFocus,
   onLearn,
+  onLocate,
+  onLocateRelation,
   onOpenExplore,
   onCloseExplore,
   onMastery,
   masteryBusy = false,
   onSplit,
+  onOpenPrerequisite,
+  schedule,
 }: {
   node?: GraphNode;
   draft: { label: string; description: string; targetWeight: number };
@@ -1950,6 +2740,16 @@ function GraphNodeInspector({
   focusEditable: boolean;
   saving: boolean;
   focusBusy: boolean;
+  typeLabel?: string;
+  levelLabel?: string;
+  statusLabel?: string;
+  statusId?: NodeLearningStatusId;
+  relations?: {
+    upstream: NodeRelation[];
+    downstream: NodeRelation[];
+    related: NodeRelation[];
+  };
+  currentLearning?: boolean;
   onChange: (draft: {
     label: string;
     description: string;
@@ -1960,49 +2760,155 @@ function GraphNodeInspector({
   onSave: () => void;
   onFocus: () => void;
   onLearn: () => void;
+  onLocate?: () => void;
+  onLocateRelation?: (nodeId: string) => void;
   onOpenExplore?: () => void;
   onCloseExplore?: () => void;
   onMastery?: () => void;
   masteryBusy?: boolean;
   onSplit?: () => void;
+  onOpenPrerequisite?: () => void;
+  /**
+   * Learning-plan state for this node. Deliberately small: the plan only says
+   * when the node will be worked on — mastery stays a graph fact.
+   */
+  schedule?: {
+    items: PlanItemView[];
+    canAdd: boolean;
+    onAdd: () => void;
+    onStart: (item: PlanItemView) => void;
+    onAdjust: (item: PlanItemView) => void;
+    onOpenPlan: () => void;
+  };
 }) {
+  const [tab, setTab] = useState<"core" | "relations" | "resources">("core");
   const importance = weightToImportance(draft.targetWeight);
-  return (
-    <Surface className="h-fit p-4 graph-node-inspector">
-      <SectionHeading
-        action={
-          node && !editing ? (
-            <Button
-              disabled={!editable && !editMode}
-              onClick={onEdit}
-              size="xs"
-              title={
-                editMode
-                  ? "编辑节点字段"
-                  : "请先打开工具栏「编辑模式」再手动修订"
-              }
-              variant="outline"
-            >
-              <Pencil className="size-3.5" />
-              {editMode ? "编辑" : "需编辑模式"}
-            </Button>
-          ) : null
-        }
-        description={
-          node?.node_type === "root"
-            ? "目标根节点"
-            : editMode
-              ? "知识点 · 编辑模式已开启"
-              : "知识点 · 点选展开细节"
-        }
-        title={node ? `节点 · ${node.label}` : "节点检查器"}
-      />
-      {!node ? (
-        <p className="mt-4 text-sm text-muted-foreground">
+  const statusProfile = statusId ? NODE_STATUS_PROFILES[statusId] : undefined;
+
+  if (!node) {
+    return (
+      <div className="graph-node-panel">
+        <p className="text-sm text-muted-foreground">
           选择画布中的节点以查看详情。
         </p>
-      ) : editing ? (
-        <div className="mt-4 space-y-3">
+      </div>
+    );
+  }
+
+  const upstream = relations?.upstream ?? [];
+  const downstream = relations?.downstream ?? [];
+  const related = relations?.related ?? [];
+  const relationCount = upstream.length + downstream.length + related.length;
+  const primaryLabel = statusProfile?.ctaLabel ?? "学习此节点";
+  const locked = statusId === "locked";
+
+  return (
+    <div className="graph-node-panel">
+      <header className="graph-node-panel__head">
+        <div className="graph-node-panel__meta">
+          {typeLabel ? (
+            <span className="graph-node-panel__type">{typeLabel}</span>
+          ) : null}
+          {levelLabel ? (
+            <span className="graph-node-panel__level" title="图谱层级">
+              {levelLabel}
+            </span>
+          ) : null}
+          {currentLearning ? (
+            <span className="graph-node-panel__current">当前学习</span>
+          ) : null}
+        </div>
+        <div className="graph-node-panel__title-row">
+          <h2>{node.label}</h2>
+          <div className="graph-node-panel__head-actions">
+            {!editing ? (
+              <Button
+                disabled={!editable && !editMode}
+                onClick={onEdit}
+                size="xs"
+                title={
+                  editMode
+                    ? "编辑节点字段"
+                    : "请先打开工具栏「编辑模式」再手动修订"
+                }
+                variant="outline"
+              >
+                <Pencil className="size-3.5" />
+                {editMode ? "编辑" : "需编辑模式"}
+              </Button>
+            ) : null}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="更多节点操作"
+                  size="icon-xs"
+                  variant="ghost"
+                >
+                  <MoreHorizontal className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-52">
+                {onMastery ? (
+                  <DropdownMenuItem
+                    disabled={masteryBusy || !focusEditable}
+                    onSelect={onMastery}
+                  >
+                    <BadgeCheck className="size-4" />
+                    {node.attention_state === "mastered"
+                      ? "取消已掌握"
+                      : "标记为已掌握"}
+                  </DropdownMenuItem>
+                ) : null}
+                <DropdownMenuItem
+                  disabled={!focusEditable || focusBusy}
+                  onSelect={onFocus}
+                >
+                  <Focus className="size-4" />
+                  {node.attention_state === "focused"
+                    ? "取消重点节点"
+                    : "设为重点节点"}
+                </DropdownMenuItem>
+                {onLocate ? (
+                  <DropdownMenuItem onSelect={onLocate}>
+                    <Crosshair className="size-4" />
+                    聚焦此节点与关联
+                  </DropdownMenuItem>
+                ) : null}
+                {onSplit ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={onSplit}>
+                      <Split className="size-4" />
+                      拆分（提交图谱变更）
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+        {statusLabel ? (
+          <div className="graph-node-panel__status">
+            <span
+              className={cn(
+                "knowledge-node__status",
+                `is-${statusProfile?.tone ?? "neutral"}`,
+              )}
+            >
+              {statusLabel}
+            </span>
+            {node.attention_state === "focused" ? (
+              <span className="graph-node-panel__flag">重点</span>
+            ) : null}
+            {!focusEditable ? (
+              <span className="graph-node-panel__flag is-muted">候选图谱</span>
+            ) : null}
+          </div>
+        ) : null}
+      </header>
+
+      {editing ? (
+        <div className="graph-node-panel__body space-y-3">
           <label className="grid gap-1.5 text-xs font-medium">
             节点名称
             <Input
@@ -2029,10 +2935,12 @@ function GraphNodeInspector({
               <span>重要指数</span>
               <RecommendDots weight={draft.targetWeight} />
             </div>
-            <p className="importance-calibrator__hint">
-              1–3 档：低 / 中 / 高。
-            </p>
-            <div className="importance-calibrator__levels" role="group" aria-label="重要指数">
+            <p className="importance-calibrator__hint">1–3 档：低 / 中 / 高。</p>
+            <div
+              aria-label="重要指数"
+              className="importance-calibrator__levels"
+              role="group"
+            >
               {([1, 2, 3] as MetricLevel[]).map((level) => (
                 <button
                   aria-pressed={importance === level}
@@ -2051,7 +2959,13 @@ function GraphNodeInspector({
                   type="button"
                 >
                   <strong>{metricLabel(level)}</strong>
-                  <span>{level === 3 ? "强烈建议看" : level === 2 ? "可以看看" : "可以跳过"}</span>
+                  <span>
+                    {level === 3
+                      ? "强烈建议看"
+                      : level === 2
+                        ? "可以看看"
+                        : "可以跳过"}
+                  </span>
                 </button>
               ))}
             </div>
@@ -2096,139 +3010,274 @@ function GraphNodeInspector({
           </div>
         </div>
       ) : (
-        <div className="mt-4 space-y-4">
-          <p className="text-sm leading-6 text-muted-foreground">
+        <div className="graph-node-panel__body">
+          <p className="graph-node-panel__intro">
             {node.description || "尚未补充知识点说明。"}
           </p>
-          <div className="graph-node-inspector__facts">
-            <div className="rounded-lg bg-muted/50 p-2">
-              <span className="block text-muted-foreground">掌握度</span>
-              <strong className="mt-1 block">{node.mastery_stars} 星</strong>
-            </div>
-            <div className="rounded-lg bg-muted/50 p-2">
-              <span className="block text-muted-foreground">检索状态</span>
-              <strong className="mt-1 block">
-                {graphStateLabel(node.retrieval_state)}
-              </strong>
-            </div>
-            <div className="rounded-lg bg-muted/50 p-2">
-              <span className="block text-muted-foreground">证据状态</span>
-              <strong className="mt-1 block">
-                {graphStateLabel(node.evidence_state)}
-              </strong>
-            </div>
-            <div className="rounded-lg bg-muted/50 p-2">
-              <span className="block text-muted-foreground">重要指数</span>
-              <div className="mt-1 flex items-center justify-between gap-2">
-                <strong>
-                  {metricLabel(weightToImportance(node.target_weight))}
-                </strong>
-                <RecommendDots weight={node.target_weight} />
-              </div>
-            </div>
+          <div
+            aria-label="节点详情分区"
+            className="graph-node-panel__tabs"
+            role="tablist"
+          >
+            <button
+              aria-selected={tab === "core"}
+              className={tab === "core" ? "is-active" : undefined}
+              onClick={() => setTab("core")}
+              role="tab"
+              type="button"
+            >
+              核心内容
+            </button>
+            <button
+              aria-selected={tab === "relations"}
+              className={tab === "relations" ? "is-active" : undefined}
+              onClick={() => setTab("relations")}
+              role="tab"
+              type="button"
+            >
+              关联节点 · {relationCount}
+            </button>
+            <button
+              aria-selected={tab === "resources"}
+              className={tab === "resources" ? "is-active" : undefined}
+              onClick={() => setTab("resources")}
+              role="tab"
+              type="button"
+            >
+              学习资源
+            </button>
           </div>
 
-          <section className="node-detail-expand" aria-label="深入记录">
-            <div className="node-detail-expand__head">
-              <div>
-                <span>探索链</span>
+          {tab === "core" ? (
+            <div className="graph-node-panel__facts">
+              <div className="graph-node-panel__fact">
+                <span>学习状态</span>
+                <strong>{statusLabel ?? "未学习"}</strong>
+              </div>
+              <div className="graph-node-panel__fact">
+                <span>掌握度</span>
                 <strong>
-                  {exploreLoading
-                    ? "加载中…"
-                    : exploreRounds.length
-                      ? `已深入 ×${exploreRounds.length}`
-                      : "未深入"}
+                  {masteryLevelLabel(node.mastery_stars)} ·{" "}
+                  {Math.max(0, Math.round(node.mastery_stars))}/5
                 </strong>
               </div>
-              {exploreRounds.length ? (
-                <Button
-                  onClick={() =>
-                    exploreOpen ? onCloseExplore?.() : onOpenExplore?.()
-                  }
-                  size="xs"
-                  variant="ghost"
-                >
-                  {exploreOpen ? "收起" : "展开"}
-                </Button>
+              <div className="graph-node-panel__fact">
+                <span>检索状态</span>
+                <strong>{graphStateLabel(node.retrieval_state)}</strong>
+              </div>
+              <div className="graph-node-panel__fact">
+                <span>证据状态</span>
+                <strong>{graphStateLabel(node.evidence_state)}</strong>
+              </div>
+              <div className="graph-node-panel__fact">
+                <span>重要指数</span>
+                <strong className="flex items-center justify-between gap-2">
+                  {metricLabel(weightToImportance(node.target_weight))}
+                  <RecommendDots weight={node.target_weight} />
+                </strong>
+              </div>
+              {locked && upstream.length ? (
+                <div className="graph-node-panel__fact is-warning">
+                  <span>前置未完成</span>
+                  <strong>{upstream.map((entry) => entry.node.label).join("、")}</strong>
+                </div>
               ) : null}
             </div>
-            {exploreOpen && exploreRounds.length ? (
-              <NodeExploreChain
-                onClose={onCloseExplore}
-                rounds={exploreRounds}
-                title={node.label}
-              />
-            ) : null}
-            {!exploreRounds.length && !exploreLoading ? (
-              <NodeExploreEmpty onLearn={onLearn} />
-            ) : null}
-          </section>
+          ) : tab === "relations" ? (
+            <div className="graph-node-panel__relations">
+              {(
+                [
+                  { title: "前置 / 上级", entries: upstream },
+                  { title: "后继 / 下级", entries: downstream },
+                  { title: "横向关联", entries: related },
+                ] as const
+              ).map((group) => (
+                <section key={group.title}>
+                  <h3>
+                    {group.title}
+                    <span>{group.entries.length}</span>
+                  </h3>
+                  {group.entries.length ? (
+                    <ul>
+                      {group.entries.map((entry) => (
+                        <li key={`${group.title}-${entry.node.id}`}>
+                          <button
+                            onClick={() => onLocateRelation?.(entry.node.id)}
+                            type="button"
+                          >
+                            <span className="graph-relation-label">
+                              {entry.node.label}
+                            </span>
+                            <span className="graph-relation-meta">
+                              {graphRelationLabel(entry.relation)}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="graph-relation-empty">暂无</p>
+                  )}
+                </section>
+              ))}
+            </div>
+          ) : (
+            <div className="graph-node-panel__resources">
+              <section className="node-detail-expand" aria-label="深入记录">
+                <div className="node-detail-expand__head">
+                  <div>
+                    <span>探索链</span>
+                    <strong>
+                      {exploreLoading
+                        ? "加载中…"
+                        : exploreRounds.length
+                          ? `已深入 ×${exploreRounds.length}`
+                          : "未深入"}
+                    </strong>
+                  </div>
+                  {exploreRounds.length ? (
+                    <Button
+                      onClick={() =>
+                        exploreOpen ? onCloseExplore?.() : onOpenExplore?.()
+                      }
+                      size="xs"
+                      variant="ghost"
+                    >
+                      {exploreOpen ? "收起" : "展开"}
+                    </Button>
+                  ) : null}
+                </div>
+                {exploreOpen && exploreRounds.length ? (
+                  <NodeExploreChain
+                    onClose={onCloseExplore}
+                    rounds={exploreRounds}
+                    title={node.label}
+                  />
+                ) : null}
+                {!exploreRounds.length && !exploreLoading ? (
+                  <NodeExploreEmpty onLearn={onLearn} />
+                ) : null}
+              </section>
+            </div>
+          )}
+        </div>
+      )}
 
-          <Button className="w-full" onClick={onLearn} size="sm">
-            <MessageCircle className="size-4" />
-            从此概念开始问答
-          </Button>
-          {onMastery ? (
-            <Button
-              className="w-full"
-              disabled={masteryBusy || !focusEditable}
-              onClick={onMastery}
-              size="sm"
-              title={
-                node.attention_state === "mastered"
-                  ? "取消已掌握：节点将移出能力成长图谱"
-                  : "标记已掌握：节点进入能力成长图谱"
-              }
-              variant={
-                node.attention_state === "mastered" ? "secondary" : "outline"
-              }
-            >
-              <BadgeCheck className="size-4" />
-              {masteryBusy
-                ? "更新中…"
-                : node.attention_state === "mastered"
-                  ? "已掌握"
-                  : "标为已掌握"}
-            </Button>
-          ) : null}
-          {onSplit ? (
-            <Button
-              className="w-full"
-              onClick={onSplit}
-              size="sm"
-              title="调用智能体拆分该节点并生成图谱变更提案"
-              variant="outline"
-            >
-              <Split className="size-4" />
-              拆分（图谱变更）
-            </Button>
-          ) : null}
+      {schedule && !editing ? (
+        <section className="graph-node-panel__plan" aria-label="学习计划">
+          <div className="graph-node-panel__plan-head">
+            <span>计划</span>
+            {schedule.items.length ? null : <em>尚未安排</em>}
+          </div>
+          {schedule.items.length ? (
+            (() => {
+              const item = schedule.items[0];
+              return (
+                <>
+                  <p className="graph-node-panel__plan-when">
+                    <strong>
+                      {item.isToday ? "今天" : item.headline} · {item.durationMinutes} 分钟
+                    </strong>
+                    {schedule.items.length > 1 ? (
+                      <span>共 {schedule.items.length} 项安排</span>
+                    ) : (
+                      <span>{item.routing.label.replace(/^开始/, "")}</span>
+                    )}
+                  </p>
+                  {item.blocked ? (
+                    <p className="graph-node-panel__plan-warn">
+                      <Lock className="size-3" />
+                      前置未完成，已记为待解锁
+                    </p>
+                  ) : null}
+                  <div className="graph-node-panel__plan-actions">
+                    {item.done ? (
+                      <Button disabled size="xs" variant="outline">
+                        已完成
+                      </Button>
+                    ) : (
+                      <Button
+                        disabled={item.blocked}
+                        onClick={() => schedule.onStart(item)}
+                        size="xs"
+                      >
+                        <Play className="size-3" />
+                        {item.routing.label}
+                      </Button>
+                    )}
+                    <Button
+                      disabled={item.done || item.blocked}
+                      onClick={() => schedule.onAdjust(item)}
+                      size="xs"
+                      variant="outline"
+                    >
+                      <CalendarClock className="size-3" />
+                      调整
+                    </Button>
+                  </div>
+                </>
+              );
+            })()
+          ) : (
+            <div className="graph-node-panel__plan-actions">
+              <Button
+                disabled={!schedule.canAdd || node.node_type === "root"}
+                onClick={schedule.onAdd}
+                size="xs"
+                title={
+                  node.node_type === "root"
+                    ? "根节点代表整个学习目标，不是可执行任务"
+                    : schedule.canAdd
+                      ? "把这个节点安排进学习计划"
+                      : "先生成学习计划再加入节点"
+                }
+                variant="outline"
+              >
+                <CalendarClock className="size-3" />
+                加入计划
+              </Button>
+              <Button onClick={schedule.onOpenPlan} size="xs" variant="ghost">
+                查看计划
+              </Button>
+            </div>
+          )}
+        </section>
+      ) : null}
+
+      <footer className="graph-node-panel__cta">
+        {locked ? (
           <Button
             className="w-full"
-            disabled={!focusEditable || focusBusy}
-            onClick={onFocus}
+            onClick={onOpenPrerequisite}
             size="sm"
             variant="outline"
           >
-            <Focus className="size-4" />
-            {focusBusy
-              ? "设置中…"
-              : node.attention_state === "focused"
-                ? "取消重点"
-                : "设为重点"}
+            <Lock className="size-4" />
+            查看前置知识
           </Button>
-          {!editMode ? (
-            <p className="text-xs leading-5 text-muted-foreground">
-              手动改名、改定义与重要指数需要先打开工具栏「编辑模式」。
-            </p>
-          ) : !focusEditable ? (
-            <p className="text-xs leading-5 text-muted-foreground">
-              名称和说明会保存为本地工作区编辑；重点状态仍需在候选修订中保存。
-            </p>
-          ) : null}
-        </div>
-      )}
-    </Surface>
+        ) : null}
+        <Button className="w-full" onClick={onLearn} size="sm">
+          <MessageCircle className="size-4" />
+          {locked ? "仍然学习此节点" : primaryLabel}
+        </Button>
+        {onLocate ? (
+          <Button
+            className="w-full"
+            onClick={onLocate}
+            size="sm"
+            variant="outline"
+          >
+            <Crosshair className="size-4" />
+            在图中定位
+          </Button>
+        ) : null}
+        {!editMode ? (
+          <p className="graph-node-panel__hint">
+            改名、改定义与重要指数需要先打开工具栏「编辑模式」。
+          </p>
+        ) : null}
+      </footer>
+    </div>
   );
 }
 

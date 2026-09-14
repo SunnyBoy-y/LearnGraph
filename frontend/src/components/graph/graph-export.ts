@@ -20,15 +20,17 @@ export type GraphExportNode = {
   label: string;
   description?: string;
   nodeType?: string;
+  /** Learner-facing type label resolved by the canvas (概念 / 原理 / …). */
+  typeLabel?: string;
   kind?: string;
   depth?: number;
   root?: boolean;
   rootEmphasis?: boolean;
   tree?: boolean;
-  /** Mastery/evidence label rendered as a status chip. */
+  /** Learning status id (unlearned / learning / mastered / due / locked). */
+  statusId?: string;
+  /** Learning status label rendered as a chip. */
   statusLabel?: string;
-  step?: number;
-  stepTotal?: number;
   collapsed?: boolean;
   hiddenCount?: number;
 };
@@ -149,12 +151,36 @@ function renderEdge(edge: GraphExportEdge, arrow: boolean): string {
 const TYPE_LABELS: Record<string, string> = {
   root: "目标",
   concept: "概念",
-  practice: "练习",
-  assessment: "测评",
+  practice: "实验 / 测验",
+  assessment: "实验 / 测验",
 };
 
 function typeLabel(node: GraphExportNode): string {
-  return TYPE_LABELS[node.nodeType ?? (node.root ? "root" : "concept")] ?? node.nodeType ?? "概念";
+  return (
+    node.typeLabel ??
+    TYPE_LABELS[node.nodeType ?? (node.root ? "root" : "concept")] ??
+    node.nodeType ??
+    "概念"
+  );
+}
+
+/** Status chip colors, kept in step with the canvas card tones. */
+const STATUS_CHIP_TONES: Record<string, { bg: string; fg: string }> = {
+  unlearned: { bg: "#eef2ef", fg: "#4a554e" },
+  learning: { bg: "#e8f1fb", fg: "#2b6ca3" },
+  mastered: { bg: "#e6f6ef", fg: "#0b8f70" },
+  due: { bg: "#fff0cf", fg: "#9a6200" },
+  locked: { bg: "#f1f1ee", fg: "#8a8f8a" },
+};
+
+function statusChipTone(node: GraphExportNode) {
+  const byId = node.statusId ? STATUS_CHIP_TONES[node.statusId] : undefined;
+  if (byId) return byId;
+  const text = node.statusLabel ?? "";
+  if (text.includes("掌握")) return STATUS_CHIP_TONES.mastered;
+  if (text.includes("复习") || text.includes("待")) return STATUS_CHIP_TONES.due;
+  if (text.includes("学习")) return STATUS_CHIP_TONES.learning;
+  return STATUS_CHIP_TONES.unlearned;
 }
 
 function renderNode(node: GraphExportNode): string {
@@ -204,22 +230,12 @@ function renderNode(node: GraphExportNode): string {
     parts.push(
       `<rect x="${round(x)}" y="${round(y)}" width="${round(width)}" height="${round(height)}" rx="14" fill="rgba(255,255,255,0.98)" stroke="${main ? "#b8c4bb" : "#c9d1c9"}" stroke-width="1.4"/>`,
     );
-    // Step chip (main spine cards only).
-    if (main && typeof node.step === "number") {
-      const text = `第 ${node.step}${node.stepTotal && node.stepTotal > 1 ? ` / ${node.stepTotal}` : ""} 步`;
-      const chipW = text.length * 10 + 16;
-      parts.push(
-        `<rect x="${round(x + 12)}" y="${round(y - 11)}" width="${round(chipW)}" height="19" rx="9.5" fill="#173d31"/>` +
-          `<text x="${round(x + 12 + chipW / 2)}" y="${round(y + 0.5)}" text-anchor="middle" dominant-baseline="central" font-size="10" font-weight="700" fill="#f4fbf7">${esc(text)}</text>`,
-      );
-    }
-    // Meta row: type label (+ depth).
-    const levelText = (node.depth ?? 0) >= 2 ? `第 ${node.depth} 层` : "";
+    // Meta row: type label + graph level (the trunk order is no longer drawn as
+    // a “第 x / N 步” path — the graph is explored, not marched through).
+    const levelText = `L${node.depth ?? 0}`;
     parts.push(
       `<text x="${round(x + px)}" y="${round(top + 2)}" font-size="8" letter-spacing="1" fill="#929692">${esc(typeLabel(node))}</text>` +
-        (levelText
-          ? `<text x="${round(x + width - px)}" y="${round(top + 2)}" text-anchor="end" font-size="8" font-weight="700" fill="#68716b">${esc(levelText)}</text>`
-          : ""),
+        `<text x="${round(x + width - px)}" y="${round(top + 2)}" text-anchor="end" font-size="8" font-weight="700" fill="#68716b">${esc(levelText)}</text>`,
     );
     // Label rows.
     labelRows.forEach((row, index) => {
@@ -233,17 +249,15 @@ function renderNode(node: GraphExportNode): string {
         `<text x="${round(x + px)}" y="${round(descTop + index * 15.4 + 11)}" font-size="11" fill="#6f766f">${esc(row)}</text>`,
       );
     });
-    // Status chip.
+    // Status chip: dot + label, matching the canvas card.
     if (node.statusLabel) {
       const chipText = node.statusLabel;
-      const chipW = chipText.length * 9 + 16;
-      const due = chipText.includes("复习") || chipText.includes("待");
-      const mastered = chipText.includes("掌握稳定");
-      const chipBg = mastered ? "#e6f6ef" : due ? "#fff0cf" : "#eef2ef";
-      const chipFg = mastered ? "#0b8f70" : due ? "#9a6200" : "#4a554e";
+      const chipW = chipText.length * 9 + 26;
+      const tone = statusChipTone(node);
       parts.push(
-        `<rect x="${round(x + px)}" y="${round(chipY)}" width="${round(chipW)}" height="17" rx="8.5" fill="${chipBg}"/>` +
-          `<text x="${round(x + px + chipW / 2)}" y="${round(chipY + 9)}" text-anchor="middle" dominant-baseline="central" font-size="9" font-weight="700" fill="${chipFg}">${esc(chipText)}</text>`,
+        `<rect x="${round(x + px)}" y="${round(chipY)}" width="${round(chipW)}" height="17" rx="8.5" fill="${tone.bg}"/>` +
+          `<circle cx="${round(x + px + 9)}" cy="${round(chipY + 8.5)}" r="3" fill="${tone.fg}"/>` +
+          `<text x="${round(x + px + (16 + chipW) / 2)}" y="${round(chipY + 9)}" text-anchor="middle" dominant-baseline="central" font-size="9" font-weight="700" fill="${tone.fg}">${esc(chipText)}</text>`,
       );
     }
     // Collapsed count badge.

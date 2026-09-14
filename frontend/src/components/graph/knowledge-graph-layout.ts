@@ -3,14 +3,14 @@ import type { Edge } from "@xyflow/react";
 import type { KnowledgeNode } from "./knowledge-graph";
 
 /** Knowledge-tree geometry (px). */
-export const TREE_CARD_W = 230;
-export const TREE_MAIN_W = 250;
+export const TREE_CARD_W = 220;
+export const TREE_MAIN_W = 236;
 export const TREE_ROOT_SIZE = 64;
-export const TREE_NODE_H = 148;
-export const TREE_ROW_GAP = 34;
-export const TREE_LEVEL_GAP = 370;
-export const TREE_MAIN_GAP = 96;
-export const TREE_MAIN_BAND_FLOOR = 170;
+export const TREE_NODE_H = 172;
+export const TREE_ROW_GAP = 42;
+export const TREE_LEVEL_GAP = 396;
+export const TREE_MAIN_GAP = 118;
+export const TREE_MAIN_BAND_FLOOR = 196;
 
 export type TreeNodeKind = "root" | "main" | "branch-left" | "branch-right";
 

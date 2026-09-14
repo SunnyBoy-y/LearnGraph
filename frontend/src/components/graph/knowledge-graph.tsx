@@ -32,6 +32,7 @@ import {
   Download,
   GitFork,
   LayoutDashboard,
+  Lock,
   Minus,
   MoreHorizontal,
   Plus,
@@ -49,7 +50,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { StarRating } from "@/components/common/primitives";
 import { toast } from "sonner";
 import {
   TREE_CARD_W,
@@ -60,10 +60,14 @@ import {
   buildKnowledgeTreeLayout,
   buildSpatialLayout,
   countTreeDescendants,
-  getTreeActivePath,
   type TreeNodeKind,
 } from "./knowledge-graph-layout";
-import { NodeExploreChip, RecommendDots } from "./node-explore";
+import { NodeExploreChip } from "./node-explore";
+import {
+  graphLevelLabel,
+  resolveLearningStatus,
+  resolveNodeTypeProfile,
+} from "./node-presentation";
 import {
   buildGraphSvg,
   downloadPngFile,
@@ -96,8 +100,24 @@ export type KnowledgeNodeData = {
   exploreCount?: number;
   /** User-declared mastery; only these enter the capability graph. */
   mastered?: boolean;
+  /** Node availability: an unsatisfied prerequisite blocks this node. */
+  blockedByPrerequisite?: boolean;
+  /** Selected-node neighbourhood pass: focus / neighbour / dimmed. */
+  highlight?: "none" | "focus" | "neighbor" | "dim";
+  /** Search hit: ringed so the learner can find it without losing context. */
+  matched?: boolean;
+  /**
+   * Learning-plan marker (今天 / 明天 / 周三 / 计划中). Light secondary
+   * metadata: the canvas stays a knowledge map, the plan only annotates it.
+   */
+  planMarker?: {
+    label: string;
+    tone: "today" | "soon" | "later";
+    blocked?: boolean;
+  };
   onToggleCollapse?: (nodeId: string) => void;
   onOpenExplore?: (nodeId: string) => void;
+  onStudy?: (nodeId: string) => void;
   [key: string]: unknown;
 };
 export type KnowledgeNode = Node<KnowledgeNodeData, "knowledge">;
@@ -131,16 +151,36 @@ export interface KnowledgeGraphProps {
   selectedIds?: string[];
   multiple?: boolean;
   title?: string;
+  /** Node the learner is currently working on — marked on the canvas. */
+  currentId?: string;
+  /** Search hits: ringed on the canvas without hiding anything. */
+  matchIds?: string[];
+  /**
+   * Learning-plan execution order (dashed,极淡) — deliberately a different
+   * visual language from the knowledge edges: solid = dependency, dashed =
+   * "I plan to do this next". Empty unless the learner turns it on.
+   */
+  planEdges?: Edge[];
+  /** Hide the built-in canvas heading (host renders its own title/legend). */
+  showHeading?: boolean;
+  /** Imperative camera API so a host toolbar can locate / focus a node. */
+  onCanvasApi?: (api: KnowledgeGraphCanvasApi) => void;
+  /**
+   * Initial camera: `view` fits the whole graph (legacy behaviour, used by the
+   * rails), `focus` centers the selected node at 100% so card text stays
+   * readable on large graphs.
+   */
+  initialFit?: "view" | "focus";
   /** Persist collapse across remounts (e.g. workbench). */
   collapsedIds?: string[];
   onCollapsedIdsChange?: (ids: string[]) => void;
 }
 
-const knowledgeNodeTypeLabels: Record<string, string> = {
-  root: "目标",
-  concept: "概念",
-  practice: "练习",
-  assessment: "测评",
+export type KnowledgeGraphCanvasApi = {
+  /** Center the node; `neighbors` also frames its first-degree relations. */
+  focusNode: (nodeId: string, options?: { neighbors?: boolean }) => void;
+  /** Fit the whole graph back into the viewport. */
+  fit: () => void;
 };
 
 const knowledgeStateLabels: Record<string, string> = {
@@ -160,18 +200,10 @@ const knowledgeStateLabels: Record<string, string> = {
 };
 
 /**
- * The green stars are the learner-facing progression, independent of the
- * review scheduler's internal retrieval state. A first learning interaction
- * earns the first star; only a full five-star progression is stable mastery.
+ * Legacy 0–5 star ladder. The canvas card no longer renders stars: mastery is
+ * communicated by the learning status (未学习 / 学习中 / 已掌握 / 待复习), and
+ * the numeric ladder lives in the detail surface (`masteryLevelLabel`).
  */
-function masteryProgressLabel(stars: number | undefined, state?: string) {
-  if (state === "relearning" || state === "due" || state === "due_soon") {
-    return knowledgeStateLabel(state, "unverified");
-  }
-  const level = Math.max(0, Math.min(5, Math.round(Number(stars) || 0)));
-  return ["未学习", "已学习", "初步理解", "能够应用", "熟练掌握", "掌握稳定"][level];
-}
-
 function knowledgeStateLabel(value: string | undefined, fallback: string) {
   const state = value ?? fallback;
   return knowledgeStateLabels[state] ?? state;
@@ -213,7 +245,17 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
       : kind === "branch-left"
         ? Position.Right
         : Position.Left;
-  const masteredByProgress = Math.max(0, Number(data.stars) || 0) >= 5;
+
+  const typeProfile = resolveNodeTypeProfile(data.nodeType, { root: isRoot });
+  const TypeIcon = typeProfile.icon;
+  const learningStatus = resolveLearningStatus({
+    stars: data.stars,
+    retrievalState: data.state,
+    attentionState: data.attention_state as string | undefined,
+    blockedByPrerequisite: Boolean(data.blockedByPrerequisite),
+  });
+  const isCurrent = Boolean(data.current);
+  const exploreCount = Number(data.exploreCount ?? 0);
 
   const handleCollapse = (event: ReactMouseEvent) => {
     event.stopPropagation();
@@ -221,16 +263,28 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
     data.onToggleCollapse?.(id);
   };
 
+  const handleStudy = (event: ReactMouseEvent) => {
+    event.stopPropagation();
+    event.preventDefault();
+    data.onStudy?.(id);
+  };
+
   return (
     <div
       className={cn(
         "knowledge-node",
         selected && "is-selected",
-        data.state?.includes("due") && "is-due",
         isRoot && "is-root",
         data.rootEmphasis && "is-root-emphasis",
         Boolean(data.focused) && "is-focused",
-        masteredByProgress && "is-mastered",
+        learningStatus.id === "mastered" && "is-mastered",
+        learningStatus.id === "due" && "is-due",
+        learningStatus.id === "learning" && "is-learning",
+        learningStatus.id === "locked" && "is-locked",
+        isCurrent && "is-current",
+        data.highlight === "dim" && "is-dimmed",
+        data.highlight === "neighbor" && "is-neighbor",
+        Boolean(data.matched) && "is-match",
         tree && "is-tree-card",
         tree && kind === "main" && "is-tree-main",
         tree && kind === "branch-left" && "is-tree-branch-left",
@@ -240,6 +294,7 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
       )}
       data-kind={kind}
       data-depth={data.depth ?? 0}
+      data-status={learningStatus.id}
       data-collapsed-count={
         collapsed && hiddenCount > 0 ? `+${hiddenCount}` : undefined
       }
@@ -249,30 +304,33 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
         position={targetPosition}
         type="target"
       />
-      {tree && kind === "main" && data.step ? (
-        <div className="knowledge-node__step-chip">
-          第 {data.step}
-          {data.stepTotal && data.stepTotal > 1 ? (
-            <span className="knowledge-node__step-total">
-              {" "}
-              / {data.stepTotal}
-            </span>
-          ) : null}{" "}
-          步
-        </div>
-      ) : null}
       {!isRoot || !tree ? (
         <div className="knowledge-node__meta">
-          <span className="knowledge-node__type">
-            {knowledgeNodeTypeLabels[
-              data.nodeType ?? (data.root ? "root" : "concept")
-            ] ??
-              data.nodeType ??
-              "概念"}
+          <span
+            className={cn(
+              "knowledge-node__type",
+              `knowledge-node__type--${typeProfile.tone}`,
+            )}
+            title={typeProfile.hint}
+          >
+            <TypeIcon aria-hidden="true" className="knowledge-node__type-icon" />
+            {typeProfile.label}
           </span>
-          {tree && (data.depth ?? 0) >= 2 ? (
-            <span className="knowledge-node__level">
-              第 {data.depth ?? 0} 层
+          {tree ? (
+            <span className="knowledge-node__level" title="图谱层级">
+              {graphLevelLabel(data.depth)}
+            </span>
+          ) : null}
+          {data.planMarker ? (
+            <span
+              className={cn(
+                "knowledge-node__plan",
+                `is-${data.planMarker.tone}`,
+                data.planMarker.blocked && "is-blocked",
+              )}
+              title={`学习计划：${data.planMarker.label}`}
+            >
+              {data.planMarker.label}
             </span>
           ) : null}
         </div>
@@ -285,49 +343,54 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
         <div className="knowledge-node__status-row">
           <span
             className={cn(
-              "knowledge-node__status-chip",
-              data.state?.includes("due") && "is-due",
-              masteredByProgress && "is-mastered",
+              "knowledge-node__status",
+              `is-${learningStatus.tone}`,
             )}
+            title={
+              learningStatus.id === "locked"
+                ? "前置知识尚未完成；仍可直接学习该节点"
+                : learningStatus.label
+            }
           >
-            {masteryProgressLabel(data.stars, data.state)}
+            {learningStatus.id === "locked" ? (
+              <Lock aria-hidden="true" className="knowledge-node__status-glyph" />
+            ) : (
+              <i aria-hidden="true" className="knowledge-node__status-dot" />
+            )}
+            <span>{learningStatus.label}</span>
           </span>
-          {typeof data.targetWeight === "number" ? (
-            <span className="knowledge-node__importance">
-              <RecommendDots weight={data.targetWeight} />
+          {exploreCount > 0 ? (
+            <span className="knowledge-node__explore">
+              <NodeExploreChip
+                count={exploreCount}
+                onOpen={() => data.onOpenExplore?.(id)}
+              />
             </span>
           ) : null}
         </div>
       ) : null}
-      {typeof data.stars === "number" && (!tree || isRoot) ? (
-        <StarRating value={data.stars} />
+      {tree && !isRoot ? (
+        <button
+          className="knowledge-node__cta nodrag"
+          onClick={handleStudy}
+          onPointerDown={(event) => event.stopPropagation()}
+          tabIndex={-1}
+          title={learningStatus.ctaLabel}
+          type="button"
+        >
+          {learningStatus.ctaLabel}
+        </button>
       ) : null}
-      {!isRoot || !tree ? (
-        tree ? (
-          <div className="knowledge-node__toolbar">
-            <NodeExploreChip
-              count={Number(data.exploreCount ?? 0)}
-              onOpen={() => data.onOpenExplore?.(id)}
-            />
-            {typeof data.stars === "number" ? (
-              <span className="knowledge-node__stars-inline">
-                <StarRating
-                  label={`${masteryProgressLabel(data.stars, data.state)}：${Math.max(0, Math.min(5, Math.round(data.stars)))}/5 成长星`}
-                  value={data.stars}
-                />
-              </span>
-            ) : null}
-          </div>
-        ) : (
-          <small>
-            {data.focused ? "重点关注 · " : ""}
-            {masteryProgressLabel(data.stars, data.state)} ·{" "}
-            {knowledgeStateLabel(data.evidence, "unverified")}
-          </small>
-        )
-      ) : (
-        <span className="knowledge-node__root-dot" aria-hidden="true" />
-      )}
+      {isCurrent && tree && !isRoot ? (
+        <span className="knowledge-node__current-badge">当前学习</span>
+      ) : null}
+      {!tree && !isRoot ? (
+        <small>
+          {data.focused ? "重点关注 · " : ""}
+          {learningStatus.label} · {knowledgeStateLabel(data.evidence, "unverified")}
+        </small>
+      ) : null}
+      {isRoot && !tree ? <span className="knowledge-node__root-dot" aria-hidden="true" /> : null}
       {tree && hasChildren ? (
         <button
           aria-label={
@@ -405,8 +468,31 @@ function KnowledgeTreeEdge({
   );
 }
 
+function KnowledgePlanEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  markerEnd,
+  selected,
+}: EdgeProps) {
+  // Plan order is a projection, not a fact: the same soft curve as a branch,
+  // but dashed and dim so it can never be mistaken for a knowledge edge.
+  const midX = sourceX + (targetX - sourceX) * 0.5;
+  const path = `M ${sourceX} ${sourceY} C ${midX} ${sourceY}, ${midX} ${targetY}, ${targetX} ${targetY}`;
+  return (
+    <BaseEdge
+      id={id}
+      markerEnd={markerEnd}
+      path={path}
+      className={cn("knowledge-plan-edge", selected && "is-selected")}
+    />
+  );
+}
+
 const nodeTypes = { knowledge: KnowledgeNodeView };
-const edgeTypes = { knowledgeTree: KnowledgeTreeEdge };
+const edgeTypes = { knowledgeTree: KnowledgeTreeEdge, planSequence: KnowledgePlanEdge };
 const emptyNodes: KnowledgeNode[] = [];
 const emptyEdges: Edge[] = [];
 
@@ -432,6 +518,12 @@ export function KnowledgeGraph({
   selectedIds,
   multiple = false,
   title = "学习图谱",
+  currentId,
+  matchIds,
+  planEdges = emptyEdges,
+  showHeading = true,
+  initialFit = "view",
+  onCanvasApi,
   collapsedIds: collapsedIdsProp,
   onCollapsedIdsChange,
 }: KnowledgeGraphProps) {
@@ -458,6 +550,10 @@ export function KnowledgeGraph({
   const canvasRef = useRef<HTMLDivElement>(null);
   const lastFocusedId = useRef<string | null>(null);
   const suppressAutoFit = useRef(false);
+  /** Set by the host camera API so the auto-center effect yields to fitBounds. */
+  const skipAutoCenter = useRef(false);
+  /** True once the learner pans/zooms themselves: stop re-framing on resize. */
+  const userInteracted = useRef(false);
   const resizeViewport = useRef<{
     width: number;
     height: number;
@@ -552,8 +648,12 @@ export function KnowledgeGraph({
             previous && previous.width > 0 ? width / previous.width : 1,
             previous && previous.height > 0 ? height / previous.height : 1,
           );
+          // Focus mode keeps the reading zoom the learner chose; only the
+          // framing follows the viewport (a settle must not shrink the cards).
           const targetZoom = clampGraphZoom(
-            (previous?.zoom ?? flowInstance.getZoom()) * ratio,
+            initialFit === "focus"
+              ? (previous?.zoom ?? flowInstance.getZoom())
+              : (previous?.zoom ?? flowInstance.getZoom()) * ratio,
             minimumZoom,
             maximumZoom,
           );
@@ -597,7 +697,15 @@ export function KnowledgeGraph({
       window.cancelAnimationFrame(frame);
       window.clearTimeout(timer);
     };
-  }, [compact, flowInstance, focusId, maximumZoom, minimumZoom, view]);
+  }, [
+    compact,
+    flowInstance,
+    focusId,
+    initialFit,
+    maximumZoom,
+    minimumZoom,
+    view,
+  ]);
 
   const collapsedIds = internalCollapsed;
 
@@ -605,20 +713,69 @@ export function KnowledgeGraph({
   const zoomLevel: "low" | "mid" | "high" =
     zoom < 0.4 ? "low" : zoom < 0.8 ? "mid" : "high";
 
+  /**
+   * Neighbourhood pass: selecting a node highlights the node, its ancestors and
+   * its direct (first-degree) relations; everything else keeps its place but
+   * recedes. Selecting the goal root is the "whole graph" state, so nothing is
+   * dimmed there — the canvas then reads as the full map.
+   */
+  const structureSkeleton = useMemo(
+    () =>
+      view === "tree"
+        ? buildKnowledgeTreeLayout(nodes, edges, { collapsedIds })
+        : buildKnowledgeTreeLayout([], []),
+    [collapsedIds, edges, nodes, view],
+  );
+
+  const focusIsRoot = useMemo(() => {
+    if (!focusId) return false;
+    const item = structureSkeleton.items.find((entry) => entry.id === focusId);
+    if (item) return item.kind === "root";
+    return Boolean(nodes.find((node) => node.id === focusId)?.data.root);
+  }, [focusId, nodes, structureSkeleton.items]);
+
+  const neighborhoodHighlight = Boolean(focusId) && !focusIsRoot;
+
+  const highlightIds = useMemo(() => {
+    const set = new Set<string>();
+    if (!neighborhoodHighlight || !focusId) return set;
+    set.add(focusId);
+    // Ancestors (where the learner came from).
+    let cursor = structureSkeleton.parentByChild.get(focusId);
+    while (cursor) {
+      set.add(cursor);
+      cursor = structureSkeleton.parentByChild.get(cursor);
+    }
+    // Direct successors (where to go next).
+    for (const childId of structureSkeleton.childrenByParent.get(focusId) ?? []) {
+      set.add(childId);
+    }
+    // Cross relations (prerequisite / related) stay visible too.
+    for (const edge of edges) {
+      if (edge.source === focusId) set.add(edge.target);
+      else if (edge.target === focusId) set.add(edge.source);
+    }
+    return set;
+  }, [edges, focusId, neighborhoodHighlight, structureSkeleton]);
+
+  const highlightStateOf = useCallback(
+    (nodeId: string): "none" | "focus" | "neighbor" | "dim" => {
+      if (!neighborhoodHighlight) return "none";
+      if (nodeId === focusId) return "focus";
+      return highlightIds.has(nodeId) ? "neighbor" : "dim";
+    },
+    [focusId, highlightIds, neighborhoodHighlight],
+  );
+
   const structuredTree = useMemo(() => {
     if (view !== "tree") {
       return buildKnowledgeTreeLayout([], []);
     }
-    // Build a temporary parent map first so active path can dim inactive edges.
-    const skeleton = buildKnowledgeTreeLayout(nodes, edges, {
-      collapsedIds,
-    });
-    const activePath = getTreeActivePath(focusId, skeleton.parentByChild);
     return buildKnowledgeTreeLayout(nodes, edges, {
       collapsedIds,
-      activePathIds: activePath,
+      activePathIds: highlightIds,
     });
-  }, [collapsedIds, edges, focusId, nodes, view]);
+  }, [collapsedIds, edges, highlightIds, nodes, view]);
 
   const freeLayoutPositions = useMemo(() => {
     if (view === "spatial") return buildSpatialLayout(nodes, edges);
@@ -693,6 +850,7 @@ export function KnowledgeGraph({
   type LaidOutCacheEntry = {
     source: KnowledgeNode;
     openExplore: KnowledgeGraphProps["onOpenExplore"];
+    study: KnowledgeGraphProps["onStudy"];
     built: KnowledgeNode;
   };
 
@@ -725,6 +883,10 @@ export function KnowledgeGraph({
       prev.data.collapsed === next.data.collapsed &&
       prev.data.hasChildren === next.data.hasChildren &&
       prev.data.hiddenCount === next.data.hiddenCount &&
+      prev.data.current === next.data.current &&
+      prev.data.matched === next.data.matched &&
+      prev.data.highlight === next.data.highlight &&
+      prev.data.blockedByPrerequisite === next.data.blockedByPrerequisite &&
       prev.data.onToggleCollapse === next.data.onToggleCollapse
     );
   }
@@ -774,11 +936,19 @@ export function KnowledgeGraph({
             collapsed,
             hasChildren,
             hiddenCount,
+            current: currentId ? node.id === currentId : false,
+            matched: matchIds ? matchIds.includes(node.id) : false,
+            highlight: highlightStateOf(node.id),
             onToggleCollapse: toggleCollapse,
             onOpenExplore: (nodeId: string) => {
               const selected = { ...node.data, id: nodeId };
               if (onOpenExplore) onOpenExplore(selected);
               else node.data.onOpenExplore?.(nodeId);
+            },
+            onStudy: (nodeId: string) => {
+              const selected = { ...node.data, id: nodeId };
+              if (onStudy) onStudy(selected);
+              else node.data.onStudy?.(nodeId);
             },
           },
           className: "graph-node-enter",
@@ -808,6 +978,7 @@ export function KnowledgeGraph({
           prior &&
           prior.source === node &&
           prior.openExplore === onOpenExplore &&
+          prior.study === onStudy &&
           sameLaidOutNode(prior.built, candidate)
         ) {
           next.set(node.id, prior);
@@ -816,6 +987,7 @@ export function KnowledgeGraph({
         next.set(node.id, {
           source: node,
           openExplore: onOpenExplore,
+          study: onStudy,
           built: candidate,
         });
         return candidate;
@@ -823,11 +995,14 @@ export function KnowledgeGraph({
     },
     [
       collapsedIds,
+      currentId,
       freeLayoutPositions,
       grow,
+      highlightStateOf,
       interactive,
       internalSelectedIds,
       layoutItemById,
+      matchIds,
       positionOverrides,
       rootEmphasis,
       structuredTree.childrenByParent,
@@ -835,6 +1010,7 @@ export function KnowledgeGraph({
       structuredTree.positions,
       toggleCollapse,
       onOpenExplore,
+      onStudy,
       view,
       visibleCount,
       visibleSourceNodes,
@@ -852,10 +1028,24 @@ export function KnowledgeGraph({
   );
 
   const visibleEdges = useMemo(() => {
-    if (view !== "tree") {
-      return edges.filter(
+    // Plan sequence edges are appended in every layout: they carry the optional
+    // "执行顺序" overlay and must never replace the knowledge hierarchy.
+    const planOverlay = planEdges
+      .filter(
         (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
-      );
+      )
+      .map((edge) => ({
+        ...edge,
+        type: "planSequence" as const,
+        animated: false,
+      }));
+    if (view !== "tree") {
+      return [
+        ...edges.filter(
+          (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
+        ),
+        ...planOverlay,
+      ];
     }
     // Prefer layout-derived tree edges (spine + branch) so geometry matches.
     const treeEdges = structuredTree.edges
@@ -870,6 +1060,7 @@ export function KnowledgeGraph({
         data: {
           spine: edge.spine,
           active: edge.active,
+          dim: !edge.active && neighborhoodHighlight,
           relation: "contains",
         },
         className: cn(
@@ -882,12 +1073,13 @@ export function KnowledgeGraph({
     // The tree already communicates the learnable containment hierarchy.
     // Rendering every additional semantic relation here made the canvas noisy
     // and produced long, dashed lines with no clear action for the learner.
-    return treeEdges;
-  }, [structuredTree.edges, view, visibleIds]);
+    return [...treeEdges, ...planOverlay];
+  }, [neighborhoodHighlight, planEdges, structuredTree.edges, view, visibleIds]);
 
   // Initial / structure fit — skip while the user is mid-focus or collapsing.
   useEffect(() => {
     if (!flowInstance || suppressAutoFit.current) return;
+    if (initialFit === "focus" && !userInteracted.current) return;
     const timer = window.setTimeout(() => {
       if (suppressAutoFit.current) return;
       void flowInstance.fitView({
@@ -896,11 +1088,18 @@ export function KnowledgeGraph({
       });
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [compact, flowInstance, laidOutNodes.length, maxDepth, view]);
+  }, [compact, flowInstance, initialFit, laidOutNodes.length, maxDepth, view]);
 
   // Focus the selected learning node at its actual center and 100% scale.
   useEffect(() => {
     if (!flowInstance || view !== "tree" || !focusId) return;
+    if (skipAutoCenter.current) {
+      // A host camera request (search locate / 聚焦此节点) already framed the
+      // node together with its relations — do not fight it.
+      skipAutoCenter.current = false;
+      lastFocusedId.current = focusId;
+      return;
+    }
     if (lastFocusedId.current === focusId) return;
     lastFocusedId.current = focusId;
     const pos = structuredTree.positions[focusId];
@@ -922,6 +1121,106 @@ export function KnowledgeGraph({
     structuredTree.positions,
     view,
   ]);
+
+  /** Camera helper shared by the host API: frame a node (+ its relations). */
+  const frameNode = useCallback(
+    (nodeId: string, options: { neighbors?: boolean } = {}) => {
+      if (!flowInstance) return;
+      const target = flowInstance.getNode(nodeId);
+      const positions = structuredTree.positions[nodeId];
+      const nodeWidth = target?.measured?.width ?? target?.width ?? TREE_CARD_W;
+      const nodeHeight = target?.measured?.height ?? target?.height ?? TREE_NODE_H;
+      const center = target
+        ? {
+            x: target.position.x + nodeWidth / 2,
+            y: target.position.y + nodeHeight / 2,
+          }
+        : positions
+          ? { x: positions.x, y: positions.y }
+          : undefined;
+      if (!center) return;
+      if (!options.neighbors) {
+        // Plain locate: recenter at the current reading zoom.
+        suppressAutoFit.current = true;
+        void flowInstance.setCenter(center.x, center.y, {
+          zoom: flowInstance.getZoom(),
+          duration: 420,
+        });
+        window.setTimeout(() => {
+          suppressAutoFit.current = false;
+        }, 460);
+        return;
+      }
+      // Neighborhood framing: the node plus its first-degree relations.
+      const ids = new Set<string>([nodeId]);
+      for (const childId of structuredTree.childrenByParent.get(nodeId) ?? []) {
+        ids.add(childId);
+      }
+      const parentId = structuredTree.parentByChild.get(nodeId);
+      if (parentId) ids.add(parentId);
+      for (const edge of edges) {
+        if (edge.source === nodeId) ids.add(edge.target);
+        else if (edge.target === nodeId) ids.add(edge.source);
+      }
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      ids.forEach((id) => {
+        const flowNode = flowInstance.getNode(id);
+        const fallback = structuredTree.positions[id];
+        const x = flowNode ? flowNode.position.x : fallback ? fallback.x - TREE_CARD_W / 2 : undefined;
+        const y = flowNode ? flowNode.position.y : fallback ? fallback.y - TREE_NODE_H / 2 : undefined;
+        if (x === undefined || y === undefined) return;
+        const width = flowNode?.measured?.width ?? flowNode?.width ?? TREE_CARD_W;
+        const height = flowNode?.measured?.height ?? flowNode?.height ?? TREE_NODE_H;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + width);
+        maxY = Math.max(maxY, y + height);
+      });
+      if (!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+      suppressAutoFit.current = true;
+      void flowInstance.fitBounds(
+        {
+          x: minX,
+          y: minY,
+          width: Math.max(1, maxX - minX),
+          height: Math.max(1, maxY - minY),
+        },
+        { duration: 460, padding: compact ? 0.3 : 0.22 },
+      );
+      window.setTimeout(() => {
+        suppressAutoFit.current = false;
+      }, 520);
+    },
+    [compact, edges, flowInstance, structuredTree.childrenByParent, structuredTree.parentByChild, structuredTree.positions],
+  );
+
+  const fitAll = useCallback(() => {
+    if (!flowInstance) return;
+    lastFocusedId.current = null;
+    suppressAutoFit.current = true;
+    void flowInstance.fitView({
+      padding: compact ? 0.25 : view === "tree" ? 0.2 : 0.18,
+      duration: 320,
+    });
+    window.setTimeout(() => {
+      suppressAutoFit.current = false;
+    }, 380);
+  }, [compact, flowInstance, view]);
+
+  // Publish the camera API so host toolbars can locate / focus a node.
+  useEffect(() => {
+    if (!onCanvasApi) return;
+    onCanvasApi({
+      focusNode: (nodeId, options) => {
+        skipAutoCenter.current = true;
+        frameNode(nodeId, options);
+      },
+      fit: fitAll,
+    });
+  }, [fitAll, frameNode, onCanvasApi]);
 
   const activateNode = (node: KnowledgeNode) => {
     if (!interactive) return;
@@ -962,12 +1261,7 @@ export function KnowledgeGraph({
   };
 
   const resetView = () => {
-    if (!flowInstance) return;
-    lastFocusedId.current = null;
-    void flowInstance.fitView({
-      padding: compact ? 0.25 : view === "tree" ? 0.2 : 0.18,
-      duration: 280,
-    });
+    fitAll();
   };
 
   /** Serialize the current visible graph into a standalone SVG/PNG file. */
@@ -1002,6 +1296,12 @@ export function KnowledgeGraph({
             : node.data.rootEmphasis
               ? 154
               : 90);
+        const status = resolveLearningStatus({
+          stars: node.data.stars,
+          retrievalState: node.data.state,
+          attentionState: node.data.attention_state as string | undefined,
+          blockedByPrerequisite: Boolean(node.data.blockedByPrerequisite),
+        });
         return {
           id: node.id,
           x: node.position.x,
@@ -1011,14 +1311,16 @@ export function KnowledgeGraph({
           label: node.data.label ?? "",
           description: node.data.description,
           nodeType: node.data.nodeType,
+          typeLabel: resolveNodeTypeProfile(node.data.nodeType, {
+            root: isRoot,
+          }).label,
           kind: node.data.kind,
           depth: node.data.depth,
           root: isRoot,
           rootEmphasis: Boolean(node.data.rootEmphasis),
           tree: view === "tree",
-          statusLabel: masteryProgressLabel(node.data.stars, node.data.state),
-          step: node.data.step,
-          stepTotal: node.data.stepTotal,
+          statusId: status.id,
+          statusLabel: status.label,
           collapsed: Boolean(node.data.collapsed),
           hiddenCount: node.data.hiddenCount,
         };
@@ -1094,6 +1396,7 @@ export function KnowledgeGraph({
         "graph-canvas relative",
         compact && "graph-canvas--compact",
         view === "tree" && "graph-canvas--tree",
+        neighborhoodHighlight && "graph-canvas--highlighting",
         className,
       )}
       data-zoom-level={zoomLevel}
@@ -1103,16 +1406,20 @@ export function KnowledgeGraph({
       tabIndex={interactive ? 0 : undefined}
     >
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 p-4">
-        <div className="pointer-events-auto min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold">{title}</p>
-          <p className="truncate text-[11px] text-muted-foreground">
-            {view === "tree"
-              ? `知识树 · 主干 + 左右分支 · 0–${Math.min(maxDepth ?? structuredTree.maxDepth, structuredTree.maxDepth)} 层`
-              : view === "spatial"
-                ? "空间布局 · 以根为中心的关系辐射图"
-                : "平铺布局 · 按层级排列的紧凑网格"}
-          </p>
-        </div>
+        {showHeading ? (
+          <div className="pointer-events-auto min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold">{title}</p>
+            <p className="truncate text-[11px] text-muted-foreground">
+              {view === "tree"
+                ? `知识树 · 主干 + 左右分支 · 0–${Math.min(maxDepth ?? structuredTree.maxDepth, structuredTree.maxDepth)} 层`
+                : view === "spatial"
+                  ? "空间布局 · 以根为中心的关系辐射图"
+                  : "平铺布局 · 按层级排列的紧凑网格"}
+            </p>
+          </div>
+        ) : (
+          <span />
+        )}
         {interactive &&
           (toolbarNarrow ? (
             <div className="nodrag nopan nowheel pointer-events-auto shrink-0 rounded-xl border bg-card/90 p-1">
@@ -1333,7 +1640,7 @@ export function KnowledgeGraph({
         edges={visibleEdges}
         edgeTypes={edgeTypes}
         elementsSelectable={interactive}
-        fitView
+        fitView={initialFit === "view"}
         fitViewOptions={{
           padding: compact ? 0.16 : view === "tree" ? 0.24 : 0.12,
         }}
@@ -1344,7 +1651,8 @@ export function KnowledgeGraph({
         nodesDraggable={interactive && view !== "tree"}
         nodeTypes={nodeTypes}
         onInit={setFlowInstance}
-        onMove={(_, viewport) =>
+        onMove={(event, viewport) => {
+          if (event) userInteracted.current = true;
           setZoom((current) => {
             // F4.2/U1-1: commit zoom state only when the LOD tier changes so
             // pan/zoom frames do not re-render the whole tree every frame.
@@ -1353,8 +1661,8 @@ export function KnowledgeGraph({
             const nextTier =
               viewport.zoom < 0.4 ? "low" : viewport.zoom < 0.8 ? "mid" : "high";
             return currentTier === nextTier ? current : viewport.zoom;
-          })
-        }
+          });
+        }}
         onNodeClick={handleNodeClick}
         onNodeDragStop={(_, node) =>
           setPositionOverrides((current) => ({
