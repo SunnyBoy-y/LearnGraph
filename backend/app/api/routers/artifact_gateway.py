@@ -119,13 +119,19 @@ def list_artifact_cards(
     context: CurrentWorkspace,
     status: str | None = None,
     card_type: str | None = None,
+    exclude_card_type: str | None = None,
     interactive: bool | None = None,
     sort: str = "updated_at",
     order: str = "desc",
     limit: int = 100,
     offset: int = 0,
 ) -> list[ArtifactCardView]:
-    """List indexed interactive HTML cards emitted in chat sessions."""
+    """List indexed interactive HTML cards emitted in chat sessions.
+
+    ``exclude_card_type`` is applied server-side before the limit so the page can
+    drop a whole card type (the artifacts page excludes ``component``) without
+    that type crowding real pages out of the result window.
+    """
     context.require_permission("workspace.read")
     from app.services.artifact_cards import ArtifactCardService
 
@@ -134,6 +140,7 @@ def list_artifact_cards(
     ).list_cards(
         status=status,
         card_type=card_type,
+        exclude_card_type=exclude_card_type,
         interactive=interactive,
         sort=sort,
         order=order,
@@ -176,14 +183,19 @@ def publish_artifact_card_version(
 def list_all_artifact_card_share_tokens(
     db: DB,
     context: CurrentWorkspace,
+    exclude_card_type: str | None = None,
 ) -> list[ArtifactCardShareManagementView]:
-    """List all published card shares for the workspace management view."""
+    """List all published card shares for the workspace management view.
+
+    ``exclude_card_type`` lets the management page hide one card type
+    (``component`` on the artifacts page) while the share records stay intact.
+    """
     context.require_permission("workspace.read")
     from app.services.artifact_cards import ArtifactCardService
 
     rows = ArtifactCardService(
         db, context.workspace_id, context.principal.tenant_id
-    ).list_all_share_tokens()
+    ).list_all_share_tokens(exclude_card_type=exclude_card_type)
     return [ArtifactCardShareManagementView.model_validate(row) for row in rows]
 
 

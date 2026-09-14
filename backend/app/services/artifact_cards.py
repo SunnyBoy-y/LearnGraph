@@ -41,7 +41,11 @@ logger = logging.getLogger(__name__)
 BIDIRECTIONAL_RUNTIMES = frozenset({"react-sandbox-v1", "opaque-origin-subapp-v1"})
 
 # Part types indexed as cards.
-INDEXED_PART_TYPES = frozenset({"magic_card", "component"})
+CARD_TYPE_MAGIC_CARD = "magic_card"
+# 声明式组件（会话里的问答/选择题控件）仍然照常索引、版本与分享记录也照常保留，
+# 但它按产品口径不算「页面」：产物与分享页的列表查询一律把它排除掉。
+CARD_TYPE_COMPONENT = "component"
+INDEXED_PART_TYPES = frozenset({CARD_TYPE_MAGIC_CARD, CARD_TYPE_COMPONENT})
 
 # Card lifecycle states.
 CARD_STATUS_DRAFT = "draft"
@@ -280,21 +284,29 @@ class ArtifactCardService:
         *,
         status: str | None = None,
         card_type: str | None = None,
+        exclude_card_type: str | None = None,
         interactive: bool | None = None,
         sort: str = "updated_at",
         order: str = "desc",
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """Return card views with version stats, newest version first."""
+        """Return card views with version stats, newest version first.
+
+        ``exclude_card_type`` drops one card type from the result set *before*
+        the limit applies, so a workspace full of declarative components cannot
+        crowd real pages out of the page.
+        """
         query = select(ArtifactCard).where(
             ArtifactCard.workspace_id == self.workspace_id,
             ArtifactCard.status != CARD_STATUS_DELETED,
         )
         if status in {CARD_STATUS_DRAFT, CARD_STATUS_PUBLISHED}:
             query = query.where(ArtifactCard.status == status)
-        if card_type in {"magic_card", "component"}:
+        if card_type in INDEXED_PART_TYPES:
             query = query.where(ArtifactCard.card_type == card_type)
+        if exclude_card_type in INDEXED_PART_TYPES:
+            query = query.where(ArtifactCard.card_type != exclude_card_type)
         if interactive is not None:
             query = query.where(ArtifactCard.interactive == interactive)
         sort_column = (
@@ -513,9 +525,11 @@ class ArtifactCardService:
             )
         )
 
-    def list_all_share_tokens(self) -> list[dict[str, Any]]:
+    def list_all_share_tokens(
+        self, *, exclude_card_type: str | None = None
+    ) -> list[dict[str, Any]]:
         """Return every share in this workspace with card/version context."""
-        rows = self.db.execute(
+        query = (
             select(ArtifactCardShareToken, ArtifactCardVersion, ArtifactCard)
             .join(ArtifactCardVersion, ArtifactCardVersion.id == ArtifactCardShareToken.artifact_card_version_id)
             .join(ArtifactCard, ArtifactCard.id == ArtifactCardVersion.card_id)
@@ -524,7 +538,11 @@ class ArtifactCardService:
                 ArtifactCardShareToken.tenant_id == self.tenant_id,
                 ArtifactCard.status != CARD_STATUS_DELETED,
             )
-            .order_by(ArtifactCardShareToken.created_at.desc())
+        )
+        if exclude_card_type in INDEXED_PART_TYPES:
+            query = query.where(ArtifactCard.card_type != exclude_card_type)
+        rows = self.db.execute(
+            query.order_by(ArtifactCardShareToken.created_at.desc())
         ).all()
         return [
             {

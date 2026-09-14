@@ -60,6 +60,7 @@ export function deleteArtifactVersion(versionId: string): Promise<ArtifactVersio
 export function listArtifactCards(params?: {
   status?: string;
   card_type?: string;
+  exclude_card_type?: string;
   interactive?: boolean;
   sort?: string;
   order?: string;
@@ -117,8 +118,12 @@ export function listArtifactCardShareTokens(
   );
 }
 
-export function listAllArtifactCardShares(): Promise<ArtifactCardShareManagement[]> {
-  return apiClient.get<ArtifactCardShareManagement[]>("/artifacts/cards/share-tokens");
+export function listAllArtifactCardShares(params?: {
+  exclude_card_type?: string;
+}): Promise<ArtifactCardShareManagement[]> {
+  return apiClient.get<ArtifactCardShareManagement[]>("/artifacts/cards/share-tokens", {
+    query: params,
+  });
 }
 
 export function createArtifactCardShareToken(

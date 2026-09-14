@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -9,6 +9,7 @@ import {
   Link2,
   LoaderCircle,
   MessageSquare,
+  Play,
   RefreshCw,
   Rocket,
   Trash2,
@@ -62,6 +63,12 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { DECLARATIVE_COMPONENT_CARD_TYPE } from "@/features/artifacts/card-types";
+import {
+  PreviewPauseScopeContext,
+  resumeAllPreviews,
+  type PreviewPauseScope,
+} from "@/lib/preview-pause-controller";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type {
   ArtifactCard,
@@ -110,10 +117,24 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   const [visibleCount, setVisibleCount] = useState(24);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
 
+  // Playback authority for the wall: every card starts paused and exactly one
+  // card runs at a time, chosen by the user clicking it. Page-level controls (the
+  // top-bar "pause every preview" switch, tab visibility) stay independent — each
+  // control owns its own channel in the pause controller.
+  const [activeCardId, setActiveCardId] = useState<string | null>(null);
+  const activateCard = useCallback((cardId: string) => {
+    // A page-level "pause every preview" would otherwise keep holding the card
+    // the user just asked to play, making the click look dead.
+    resumeAllPreviews();
+    setActiveCardId(cardId);
+  }, []);
+
   const params = useMemo(
     () => ({
       status: statusFilter === "all" ? undefined : statusFilter,
-      card_type: typeFilter === "magic_card" || typeFilter === "component" ? typeFilter : undefined,
+      card_type: typeFilter === "magic_card" ? "magic_card" : undefined,
+      // 组件卡不算页面：服务端排除，避免它挤占 limit 把页面卡挤出结果集。
+      exclude_card_type: DECLARATIVE_COMPONENT_CARD_TYPE,
       interactive:
         typeFilter === "interactive" ? true : typeFilter === "static" ? false : undefined,
       sort: sortOrder,
@@ -201,8 +222,8 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
               <SelectItem value="all">全部</SelectItem>
               <SelectItem value="interactive">双向交互卡</SelectItem>
               <SelectItem value="static">静态页面卡</SelectItem>
+              {/* 「声明式组件」不再是可筛选项：组件卡按产品口径不算页面，一律不出现在本页。 */}
               <SelectItem value="magic_card">HTML 页面</SelectItem>
-              <SelectItem value="component">声明式组件</SelectItem>
             </SelectContent>
           </Select>
         </span>
@@ -248,7 +269,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
             <LayoutGrid className="size-6 text-muted-foreground" />
             <p className="text-sm font-medium">还没有卡片</p>
             <p className="text-xs text-muted-foreground">
-              在会话中让智能体生成交互 HTML 页面（magic card / 学习控件），会自动出现在这里。
+              在会话中让智能体生成交互 HTML 页面（magic card），会自动出现在这里。
             </p>
           </div>
         ) : (
@@ -258,6 +279,12 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                 aria-label={card.title}
                 className="flex min-w-0 flex-col rounded-xl border bg-background p-3"
                 key={card.id}
+                onClick={(event) => {
+                  // Clicking the card (title, body, padding) means "play this one";
+                  // its own controls keep their own jobs.
+                  if (isCardControl(event.target)) return;
+                  activateCard(card.id);
+                }}
                 style={{ contentVisibility: "auto", containIntrinsicSize: "520px" }}
               >
                 <div className="flex min-w-0 flex-col items-start gap-2">
@@ -273,7 +300,12 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                     更新于 {formatDate(card.updated_at)}
                   </span>
                 </div>
-                <CardInlinePreview card={card} workspaceId={workspaceId} />
+                <CardInlinePreview
+                  active={activeCardId === card.id}
+                  card={card}
+                  onActivate={activateCard}
+                  workspaceId={workspaceId}
+                />
                 <div className="mt-3 flex items-center gap-1 border-t pt-2">
                   <Button
                     disabled={!card.chat_session_id}
@@ -361,9 +393,35 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   );
 }
 
-function CardInlinePreview({ card, workspaceId }: { card: ArtifactCard; workspaceId: string }) {
+/** Cards keep their own controls: clicks on them must not be read as "play". */
+function isCardControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    Boolean(
+      target.closest(
+        'button, a, input, select, textarea, [role="button"], [data-preview-control]',
+      ),
+    )
+  );
+}
+
+function CardInlinePreview({
+  active,
+  card,
+  onActivate,
+  workspaceId,
+}: {
+  active: boolean;
+  card: ArtifactCard;
+  onActivate: (cardId: string) => void;
+  workspaceId: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
+  // True while this preview is expanded (top layer) or natively fullscreen: the
+  // expanded overlay keeps covering the canvas even when the card's own box has
+  // been scrolled out of the lazy-mount band, so it must stay mounted and running.
+  const [pinned, setPinned] = useState(false);
 
   // Keep only nearby previews running so long libraries do not start dozens
   // of iframe runtimes at once. React Query retains the fetched snapshots.
@@ -389,23 +447,60 @@ function CardInlinePreview({ card, workspaceId }: { card: ArtifactCard; workspac
     staleTime: 60_000,
   });
 
+  const activate = useCallback(() => onActivate(card.id), [card.id, onActivate]);
+  // Off-viewport previews are suspended by the scope instead of being unmounted:
+  // unmounting throws the iframe away, so scrolling back restarts the card from
+  // zero. Only a preview that was never activated and left the band is still
+  // reclaimed, which keeps the number of live iframes bounded.
+  const live = visible || active || pinned;
+  const suspended = !pinned && (!active || !visible);
+  const scope = useMemo<PreviewPauseScope>(
+    () => ({ suspended, activate, pin: setPinned }),
+    [suspended, activate],
+  );
+  const showPreview = live && !preview.isPending && !preview.isError;
+
   return (
-    <div className="mt-3 min-h-80 max-h-[520px] min-w-0 overflow-hidden rounded-xl border border-border/60 bg-muted/20" ref={containerRef}>
-      {!visible || preview.isPending ? (
+    <div
+      className="relative mt-3 min-h-80 max-h-[520px] min-w-0 overflow-hidden rounded-xl border border-border/60 bg-muted/20"
+      data-preview-suspended={suspended ? "true" : "false"}
+      ref={containerRef}
+    >
+      {!live || preview.isPending ? (
         <Skeleton aria-label={`正在加载 ${card.title} 的预览`} className="h-80 w-full" />
       ) : preview.isError ? (
         <div className="flex h-80 flex-col items-center justify-center gap-3 p-4 text-center">
           <p className="text-sm text-destructive">{preview.error.message || "加载预览失败"}</p>
           <Button onClick={() => void preview.refetch()} size="sm" type="button" variant="outline">重新加载预览</Button>
         </div>
-      ) : card.card_type === "component" ? (
-        /* 组件预览融进外层卡片，不再自带第二层 border + radius + 背景。 */
-        <div className="max-h-[520px] overflow-auto p-4">
-          <TrustedComponentRenderer data={preview.data.preview_snapshot} fallbackId={card.card_id} interactive={false} />
-        </div>
       ) : (
-        <MagicCardHost key={card.updated_at} data={preview.data.preview_snapshot} />
+        <PreviewPauseScopeContext.Provider value={scope}>
+          {card.card_type === DECLARATIVE_COMPONENT_CARD_TYPE ? (
+            /* 组件卡已不再进入本页列表（见 card-types.ts），这里保留渲染分支：
+               将来若恢复入口，或接口在别处返回组件卡，预览能力不丢。 */
+            <div className="max-h-[520px] overflow-auto p-4">
+              <TrustedComponentRenderer data={preview.data.preview_snapshot} fallbackId={card.card_id} interactive={false} />
+            </div>
+          ) : (
+            <MagicCardHost key={card.updated_at} data={preview.data.preview_snapshot} />
+          )}
+        </PreviewPauseScopeContext.Provider>
       )}
+      {showPreview && suspended ? (
+        /* A paused card must say so and offer the one action it accepts. Without
+           this the wall looks broken: frozen mid-animation with no explanation. */
+        <button
+          className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-background/45 transition-colors hover:bg-background/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          onClick={activate}
+          title={`播放 ${card.title}`}
+          type="button"
+        >
+          <span className="flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-3 py-1.5 text-xs font-medium shadow-sm">
+            <Play className="size-3.5" />
+            点击播放
+          </span>
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -468,7 +563,7 @@ function CardPreviewDialog({
   });
 
   const snapshot = preview.data?.preview_snapshot ?? {};
-  const isComponent = card?.card_type === "component";
+  const isComponent = card?.card_type === DECLARATIVE_COMPONENT_CARD_TYPE;
   const title = card?.title ?? "卡片预览";
   const selectedVersionId =
     selectedVersion !== "draft"

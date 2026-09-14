@@ -78,6 +78,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { CardArtifactsPanel } from "@/features/artifacts/card-artifacts-panel";
+import { DECLARATIVE_COMPONENT_CARD_TYPE } from "@/features/artifacts/card-types";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { FileRecord } from "@/types/files";
 import type {
@@ -398,7 +399,9 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const shares = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", "all"),
-    queryFn: listAllArtifactCardShares,
+    // 组件卡的分享记录同样不在本页显示：服务端按 card_type 排除，记录本身保留。
+    queryFn: () =>
+      listAllArtifactCardShares({ exclude_card_type: DECLARATIVE_COMPONENT_CARD_TYPE }),
   });
 
   // 选择集只保存 id：列表刷新后自动收敛，不留幽灵选中项。
