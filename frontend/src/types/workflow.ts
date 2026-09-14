@@ -11,4 +11,6 @@ export interface CompositeDraft { id: string; target_message_id: string; source_
 export interface Roadmap { id: string; goal_id: string; graph_id: string | null; graph_revision: number | null; title: string; version: number; status: string; rationale: string; planning_snapshot: UnknownRecord; published_at: IsoDateTime | null; items: ActionItem[]; created_at: IsoDateTime; updated_at: IsoDateTime }
 export type RoadmapVersion = Omit<Roadmap, 'planning_snapshot' | 'items'>
 export interface RoadmapItemRescheduleRequest { base_version: number; day_index: number; position: number; duration_minutes?: number; rationale: string }
+/** 手动把一个图谱节点加入当前生效的学习计划（Graph「加入计划」的最小必要能力）。 */
+export interface RoadmapItemInsertRequest { base_version: number; node_id: string; day_index?: number | null; position?: number | null; duration_minutes?: number | null; rationale?: string }
 export interface RoadmapRejectRequest { base_version: number; rationale: string }

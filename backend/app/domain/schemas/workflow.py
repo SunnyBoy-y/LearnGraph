@@ -221,6 +221,23 @@ class RoadmapItemReschedule(BaseModel):
         return normalized
 
 
+class RoadmapItemInsert(BaseModel):
+    """Manually add one graph node to the active plan.
+
+    Only the two facts a learner can honestly choose are accepted: which
+    learning day the item should land on and how long it should take.  Title,
+    action type, priority and prerequisite state are derived from the same graph
+    facts the planner reads, so a manual insert cannot invent plan data.
+    """
+
+    base_version: int = Field(ge=1)
+    node_id: str = Field(min_length=1, max_length=36)
+    day_index: int | None = Field(default=None, ge=1, le=365)
+    position: int | None = Field(default=None, ge=0, le=500)
+    duration_minutes: int | None = Field(default=None, ge=15, le=1_440)
+    rationale: str = Field(default="", max_length=2_000)
+
+
 class RoadmapReject(BaseModel):
     base_version: int = Field(ge=1)
     rationale: str = Field(min_length=1, max_length=2_000)

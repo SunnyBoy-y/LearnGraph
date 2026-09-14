@@ -19,6 +19,7 @@ from app.domain.schemas.workflow import (
     ProjectCreate,
     ProjectUpdate,
     ProjectView,
+    RoadmapItemInsert,
     RoadmapItemReschedule,
     RoadmapReject,
     RoadmapVersionView,
@@ -231,6 +232,24 @@ def replan_roadmap(goal_id: str, db: DB, context: CurrentWorkspace):
 def publish_roadmap(roadmap_id: str, db: DB, context: CurrentWorkspace):
     assert_roadmap_access(roadmap_id, "write", db, context)
     item = service(db, context).publish_roadmap(roadmap_id)
+    return service(db, context).roadmap_by_id(item.id)
+
+
+@router.post(
+    "/roadmaps/{roadmap_id}/items",
+    response_model=RoadmapView,
+    status_code=status.HTTP_201_CREATED,
+)
+def insert_roadmap_item(
+    roadmap_id: str,
+    payload: RoadmapItemInsert,
+    db: DB,
+    context: CurrentWorkspace,
+):
+    """Manually schedule one graph node into the active plan."""
+
+    assert_roadmap_access(roadmap_id, "write", db, context)
+    item = service(db, context).insert_roadmap_item(roadmap_id, payload)
     return service(db, context).roadmap_by_id(item.id)
 
 

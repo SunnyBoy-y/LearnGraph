@@ -1,5 +1,5 @@
 import { apiClient } from './client'
-import type { ActionItem, CompositeDraft, DeleteImpact, Project, ProjectCreate, Roadmap, RoadmapItemRescheduleRequest, RoadmapRejectRequest, RoadmapVersion, SourceLink, SourceRecord, SourceTargetType } from '@/types/workflow'
+import type { ActionItem, CompositeDraft, DeleteImpact, Project, ProjectCreate, Roadmap, RoadmapItemInsertRequest, RoadmapItemRescheduleRequest, RoadmapRejectRequest, RoadmapVersion, SourceLink, SourceRecord, SourceTargetType } from '@/types/workflow'
 import type { ActionResponse } from '@/types/common'
 import type { Session } from '@/types/sessions'
 
@@ -33,4 +33,6 @@ export const getRoadmapVersion = (id: string) => apiClient.get<Roadmap>(`/roadma
 export const replanRoadmap = (goalId: string) => apiClient.post<Roadmap>(`/goals/${encodeURIComponent(goalId)}/roadmap/replan`)
 export const publishRoadmap = (id: string) => apiClient.post<Roadmap>(`/roadmaps/${encodeURIComponent(id)}/publish`)
 export const rescheduleRoadmapItem = (roadmapId: string, actionId: string, payload: RoadmapItemRescheduleRequest) => apiClient.post<Roadmap, RoadmapItemRescheduleRequest>(`/roadmaps/${encodeURIComponent(roadmapId)}/items/${encodeURIComponent(actionId)}/reschedule`, payload)
+/** 手动把一个图谱节点加入当前生效的学习计划（Graph 的「加入计划」）。 */
+export const insertRoadmapItem = (roadmapId: string, payload: RoadmapItemInsertRequest) => apiClient.post<Roadmap, RoadmapItemInsertRequest>(`/roadmaps/${encodeURIComponent(roadmapId)}/items`, payload)
 export const rejectRoadmap = (id: string, payload: RoadmapRejectRequest) => apiClient.post<Roadmap, RoadmapRejectRequest>(`/roadmaps/${encodeURIComponent(id)}/reject`, payload)
