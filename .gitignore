@@ -200,7 +200,6 @@ Desktop.ini
 /backend/scripts/run_*_tests*.*
 /backend/scripts/verify-*.ps1
 /backend/scripts/verify_sandbox*.py
-/backend/scripts/verify_skill_packages.py
 /backend/scripts/verify_*_web_fetch_e2e.py
 /backend/scripts/run_sandbox_egress_proxy.py
 backend/sandbox/.spec-test.json

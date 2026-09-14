@@ -229,6 +229,20 @@ async function main() {
 
     if (
       !(await runCommand(
+        'Official Skill package verification',
+        {
+          command: 'uv',
+          args: ['run', '--locked', 'python', 'scripts/verify_skill_packages.py'],
+        },
+        backendDir,
+        pythonEnv,
+      ))
+    ) {
+      failures.push('Official Skill package verification')
+    }
+
+    if (
+      !(await runCommand(
         'Stored audio transcription regression',
         {
           command: 'uv',

@@ -77,5 +77,7 @@ jobs:
           print(f'Syntax checked {len(files)} Python files.')"
       - name: Import application
         run: uv run --locked python -c "from app.main import app; assert app.title"
+      - name: Verify official Skill packages
+        run: uv run --locked python scripts/verify_skill_packages.py
       - name: Unit and API tests
         run: uv run --locked --extra test pytest tests -q
