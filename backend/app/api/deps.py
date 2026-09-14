@@ -172,7 +172,15 @@ def workspace_context(
     # workspace_id), so the generic chat-session ACL gate below would otherwise
     # 404 every session-scoped subapp call before it reaches the service.
     is_subapp_session_path = request.url.path.startswith("/api/v1/subapps/sessions/")
-    if path_resource is not None and not is_subapp_session_path:
+    is_voice_signaling_path = (
+        request.url.path.startswith("/api/v1/voice/sessions/")
+        and request.url.path.endswith("/api/offer")
+    )
+    if (
+        path_resource is not None
+        and not is_subapp_session_path
+        and not is_voice_signaling_path
+    ):
         resource_type, resource_id = path_resource
         resource_permission = (
             "read"
@@ -192,3 +200,19 @@ DB = Annotated[Session, Depends(get_db)]
 CurrentPrincipal = Annotated[Principal, Depends(current_principal)]
 CurrentWorkspace = Annotated[WorkspaceContext, Depends(workspace_context)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
+
+
+def voice_workspace_context(
+    request: Request,
+    workspace_id: Annotated[
+        str, Header(alias="X-Workspace-ID", min_length=1, max_length=64)
+    ],
+    principal: Annotated[Principal, Depends(current_principal)],
+    db: Annotated[Session, Depends(get_db)],
+) -> WorkspaceContext:
+    return workspace_context(request, workspace_id, principal, db)
+
+
+VoiceWorkspaceContext = Annotated[
+    WorkspaceContext, Depends(voice_workspace_context)
+]

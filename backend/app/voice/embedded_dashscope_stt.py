@@ -29,6 +29,7 @@ import base64
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
@@ -65,6 +66,17 @@ class DashScopeSTTSettings(STTSettings):
     api_key: str = ""
 
 
+@dataclass(slots=True)
+class _PendingCommit:
+    """One client commit awaiting exactly one provider final."""
+
+    event_id: str
+    trigger: str
+    sent_at: float
+    connection_generation: int
+    utterance_generation: int
+
+
 class DashScopeSTTService(STTService):
     """DashScope Qwen 实时 ASR（qwen3-asr-flash-realtime）服务。"""
 
@@ -77,6 +89,7 @@ class DashScopeSTTService(STTService):
         api_key: str = "",
         settings: DashScopeSTTSettings | None = None,
         ttfs_p99_latency: float | None = DEFAULT_TTFS_P99,
+        journal: Any = None,
         **kwargs,
     ):
         if settings is None:
@@ -117,7 +130,11 @@ class DashScopeSTTService(STTService):
         # 用户发言，形成「EOU→commit→幻觉→新回合→EOU」自激循环。因此
         # commit 与 final 都必须以"本机确实听到语音"为前提。
         self._speech_seen = False
-        self._commit_in_flight = False
+        # 一个布尔量无法表达两个合法 commit 同时在途，也无法区分迟到 final
+        # 属于哪一个连接/utterance。 使用 FIFO 队列保存 commit 身份。
+        self._pending_commits: deque[_PendingCommit] = deque()
+        self._connection_generation = 0
+        self._utterance_generation = 0
         # commit 的触发点（2026-09-12 单点计时定位后修正）：
         #   "1"（默认）→ 本机 VAD 判定停止（VADUserStoppedSpeakingFrame）即 commit；
         #   "0"        → 等聚合器广播 UserStoppedSpeakingFrame 再 commit（旧行为）。
@@ -132,8 +149,12 @@ class DashScopeSTTService(STTService):
         self._commit_on_vad_stop = os.getenv(
             "DASHSCOPE_ASR_COMMIT_ON_VAD_STOP", "1"
         ).lower() not in ("0", "false", "no", "off")
-        # 单点计时：记录 commit 发出的时刻，用于算 commit→final 的往返。
-        self._commit_sent_at: float | None = None
+        # Optional durable journal (ASR-stage errors are reported through it) and
+        # bounded reconnect bookkeeping for the upstream websocket.
+        self._journal = journal
+        self._reconnect_attempt = 0
+        self._reconnect_lock = asyncio.Lock()
+        self._closed = False
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -141,6 +162,56 @@ class DashScopeSTTService(STTService):
     async def setup(self, setup: FrameProcessorSetup):
         await super().setup(setup)
         await self._connect()
+
+    async def _ensure_upstream(self) -> bool:
+        """Reuse the live ASR websocket, or rebuild it with bounded backoff.
+
+        In Manual mode ``commit`` is the only way to obtain a final transcript,
+        so a dead socket does not merely lose audio: the current turn can never
+        close.  The socket is therefore rebuilt rather than abandoned, and the
+        session keeps running if the rebuild fails.
+        """
+        if self._closed:
+            return False
+        ws = self._ws
+        if ws is not None and not getattr(ws, "closed", False):
+            return True
+        async with self._reconnect_lock:
+            ws = self._ws
+            if ws is not None and not getattr(ws, "closed", False):
+                return True
+            from app.voice.journal import backoff_delay
+
+            attempts = 4
+            for attempt in range(1, attempts + 1):
+                try:
+                    await self._connect()
+                    self._reconnect_attempt = 0
+                    logger.info(f"{self}: ASR upstream reconnected")
+                    return True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    delay = backoff_delay(attempt, base=0.5, cap=8.0)
+                    self._reconnect_attempt = attempt
+                    if self._journal is not None:
+                        await self._journal.retry_scheduled(
+                            "asr",
+                            attempt=attempt,
+                            delay_ms=int(delay * 1000),
+                            reason=str(exc)[:200],
+                        )
+                    logger.warning(f"{self}: ASR 上游重连第 {attempt} 次失败: {exc}")
+                    await asyncio.sleep(delay)
+            self._ws = None
+            if self._journal is not None:
+                await self._journal.processor_error(
+                    "asr",
+                    "ASR 上游连接无法恢复，已降级为文本模式",
+                    retryable=False,
+                    degraded=True,
+                )
+            return False
 
     async def _connect(self) -> None:
         url = f"{self._settings.ws_url}?model={self._settings.model}"
@@ -155,6 +226,8 @@ class DashScopeSTTService(STTService):
             open_timeout=15,
         )
         self._event_id = 0
+        self._connection_generation += 1
+        self._session_finished.clear()
         await self._ws.send(json.dumps(self._build_session_update(), ensure_ascii=False))
         self._reader_task = asyncio.create_task(self._read_loop())
         logger.info(f"{self}: connected to {self._settings.ws_url}")
@@ -191,6 +264,10 @@ class DashScopeSTTService(STTService):
         return f"evt_{kind}_{self._event_id}"
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        if self._ws is None:
+            # A dropped socket must not silently stop transcription: the current
+            # turn could never be finalized.  Rebuild in the background.
+            await self._ensure_upstream()
         if self._ws is not None:
             try:
                 await self._ws.send(
@@ -204,6 +281,7 @@ class DashScopeSTTService(STTService):
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"{self}: send audio failed: {exc}")
+                self._ws = None
         yield None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -218,6 +296,11 @@ class DashScopeSTTService(STTService):
         await super().process_frame(frame, direction)
         # 本机 VAD 判定用户开口：标记"这一轮确实有语音"，供 commit 门闩使用。
         if isinstance(frame, VADUserStartedSpeakingFrame):
+            # A new VAD onset starts a new utterance. Any old commit whose
+            # final has not arrived is late evidence and must not be attached
+            # to the new turn.
+            self._utterance_generation += 1
+            self._pending_commits.clear()
             self._speech_seen = True
         # commit 触发点：默认在 VAD 判定停止时（最早的可提交时刻），旧行为则
         # 等聚合器广播 UserStoppedSpeakingFrame（回合已经结束之后）。
@@ -235,27 +318,35 @@ class DashScopeSTTService(STTService):
         会拿到幻觉 final（见 ``__init__`` 的说明），进而自激出无限空回合。
         ``trigger`` 仅用于单点计时日志，标明这次 commit 是被谁触发的。
         """
-        if self._ws is None:
+        if self._ws is None or self._closed:
             return
         if not self._commit_on_eou:
             return
         if not self._speech_seen:
             logger.debug(f"{self}: skipped commit on EOU (no local speech this turn)")
             return
+        event_id = self._next_event_id("commit")
         try:
             await self._ws.send(
                 json.dumps(
                     {
-                        "event_id": self._next_event_id("commit"),
+                        "event_id": event_id,
                         "type": "input_audio_buffer.commit",
                     }
                 )
             )
-            self._commit_sent_at = time.time()
+            self._pending_commits.append(
+                _PendingCommit(
+                    event_id=event_id,
+                    trigger=trigger,
+                    sent_at=time.time(),
+                    connection_generation=self._connection_generation,
+                    utterance_generation=self._utterance_generation,
+                )
+            )
             logger.debug(f"{self}: committed audio buffer on EOU")
             timeline_mark("stt", "commit 已发出", f"trigger={trigger}")
             self._speech_seen = False
-            self._commit_in_flight = True
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{self}: commit failed: {exc}")
 
@@ -289,44 +380,83 @@ class DashScopeSTTService(STTService):
                             )
                         )
                 elif etype == "conversation.item.input_audio_transcription.completed":
-                    text = str(
-                        payload.get("transcript") or payload.get("text") or ""
-                    ).strip()
-                    if not self._commit_in_flight:
-                        # Manual 模式下 final 只可能由本服务的 commit 触发；
-                        # 没有在途 commit 的 final 是服务端对静音的无源幻觉，
-                        # 丢弃以免污染回合层（曾导致无限空回合自激）。
-                        logger.debug(
-                            "[DashScopeEvt] dropping unsolicited final (text_len={})",
-                            len(text),
-                        )
-                        continue
-                    self._commit_in_flight = False
-                    if self._commit_sent_at is not None:
-                        timeline_mark(
-                            "stt",
-                            "commit→final 往返",
-                            f"{time.time() - self._commit_sent_at:.3f}s text_len={len(text)}",
-                        )
-                        self._commit_sent_at = None
-                    if text:
-                        await self.emit_stt_usage_metrics()
-                        await self.push_frame(
-                            TranscriptionFrame(
-                                text,
-                                self._user_id,
-                                time_now_iso8601(),
-                                finalized=True,
-                            )
-                        )
+                    await self._handle_final(payload)
                 elif etype in ("error", "asr.error"):
-                    logger.warning(
-                        f"{self}: asr error: {payload.get('message') or payload.get('error')}"
+                    message = str(
+                        payload.get("message") or payload.get("error") or "asr error"
                     )
+                    logger.warning(f"{self}: asr error: {message}")
+                    if self._journal is not None:
+                        # Surface the stage failure instead of logging only: a
+                        # silent ASR error is indistinguishable from "the user
+                        # said nothing", which is the worst failure mode for a
+                        # voice UI.
+                        await self._journal.processor_error(
+                            "asr",
+                            message,
+                            retryable=True,
+                            attempt=self._reconnect_attempt,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{self}: reader ended: {exc}")
+            self._ws = None
+            if self._journal is not None:
+                await self._journal.processor_error(
+                    "asr",
+                    f"ASR 读取循环中断: {exc}",
+                    retryable=True,
+                    attempt=self._reconnect_attempt,
+                )
+
+    async def _handle_final(self, payload: dict) -> None:
+        """Accept one final per outstanding commit, in FIFO order.
+
+        A boolean in-flight flag loses the second of two legal commits and can
+        attach a late final to a newer utterance. Pending commits therefore
+        carry both connection and utterance generations.
+        """
+        text = str(payload.get("transcript") or payload.get("text") or "").strip()
+        if not self._pending_commits:
+            logger.debug(
+                "[DashScopeEvt] dropping unsolicited final (text_len={})",
+                len(text),
+            )
+            return
+        commit = self._pending_commits.popleft()
+        if (
+            commit.connection_generation != self._connection_generation
+            or commit.utterance_generation != self._utterance_generation
+        ):
+            logger.debug(
+                "[DashScopeEvt] dropping stale final (connection={}, utterance={})",
+                commit.connection_generation,
+                commit.utterance_generation,
+            )
+            return
+        timeline_mark(
+            "stt",
+            "commit→final 往返",
+            f"{time.time() - commit.sent_at:.3f}s text_len={len(text)}",
+        )
+        if not text:
+            return
+        await self.emit_stt_usage_metrics()
+        await self.push_frame(
+            TranscriptionFrame(
+                text,
+                self._user_id,
+                time_now_iso8601(),
+                result={
+                    "commit_id": commit.event_id,
+                    "commit_trigger": commit.trigger,
+                    "connection_generation": commit.connection_generation,
+                    "utterance_generation": commit.utterance_generation,
+                },
+                finalized=True,
+            )
+        )
 
     @staticmethod
     def _parse(raw: Any) -> dict:
@@ -341,6 +471,9 @@ class DashScopeSTTService(STTService):
         # 优雅收尾：先发 session.finish 并等尾部 final（此刻管线仍在运行，
         # 最后一条 TranscriptionFrame 还能正常推送出去），再拆 reader 与连接，
         # 最后交给基类收尾。顺序颠倒会丢掉尾句的 final。
+        self._closed = True
+        self._connection_generation += 1
+        self._pending_commits.clear()
         await self._send_session_finish()
         if self._reader_task:
             self._reader_task.cancel()

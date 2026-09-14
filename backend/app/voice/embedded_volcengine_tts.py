@@ -238,6 +238,7 @@ class VolcengineTTSService(TTSService):
         *,
         api_key: str = "",
         settings: VolcengineTTSSettings | None = None,
+        journal: Any = None,
         **kwargs,
     ):
         if settings is None:
@@ -283,6 +284,15 @@ class VolcengineTTSService(TTSService):
         self._active_sentence_text = ""
         self._active_sentence_marker_sent = False
         self._sentence_sequence = 0
+        self._audio_cursor_ms = 0
+        # Optional durable journal.  When present, every caption marker is also
+        # written to the append-only event log, which is what lets a client that
+        # missed data-channel frames reconcile by ``(turn_id, sentence_seq)``
+        # instead of by text.
+        self._journal = journal
+        # Bounded upstream reconnect bookkeeping (TTS websocket).
+        self._reconnect_attempt = 0
+        self._reconnect_lock = asyncio.Lock()
 
     async def setup(self, setup: FrameProcessorSetup):
         await super().setup(setup)
@@ -434,9 +444,60 @@ class VolcengineTTSService(TTSService):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{self}: FinishSession 发送失败: {exc}")
 
+    async def _ensure_upstream(self) -> bool:
+        """Reuse the live TTS websocket, or rebuild it with bounded backoff.
+
+        An upstream drop used to silently end caption and audio production for
+        the rest of the call.  The websocket is rebuildable, so it is retried;
+        only an exhausted budget is reported as degraded, and the voice session
+        itself stays alive either way.
+        """
+        ws = self._ws
+        if ws is not None and not getattr(ws, "closed", False):
+            return True
+        async with self._reconnect_lock:
+            ws = self._ws
+            if ws is not None and not getattr(ws, "closed", False):
+                return True
+            from app.voice.journal import backoff_delay
+
+            attempts = 4
+            for attempt in range(1, attempts + 1):
+                try:
+                    await self._connect_bidirectional()
+                    self._reconnect_attempt = 0
+                    return True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    delay = backoff_delay(attempt, base=0.5, cap=8.0)
+                    self._reconnect_attempt = attempt
+                    if self._journal is not None:
+                        await self._journal.retry_scheduled(
+                            "tts",
+                            attempt=attempt,
+                            delay_ms=int(delay * 1000),
+                            reason=str(exc)[:200],
+                        )
+                    logger.warning(
+                        f"{self}: TTS 上游重连第 {attempt} 次失败: {exc}"
+                    )
+                    await asyncio.sleep(delay)
+            self._ws = None
+            if self._journal is not None:
+                await self._journal.processor_error(
+                    "tts",
+                    "TTS 上游连接无法恢复，已降级为文本模式",
+                    retryable=False,
+                    degraded=True,
+                )
+            return False
+
     async def _start_streaming_session(self, context_id: str) -> None:
         """开一个火山 session 并把它的音频接收任务挂起来。"""
         await self._stop_streaming_session("restart")
+        if not await self._ensure_upstream():
+            raise RuntimeError("TTS upstream is unavailable")
         session_id = str(uuid.uuid4())
         options = self._options
         self._streaming_context_id = context_id
@@ -446,6 +507,7 @@ class VolcengineTTSService(TTSService):
         self._active_sentence_text = ""
         self._active_sentence_marker_sent = False
         self._sentence_sequence = 0
+        self._audio_cursor_ms = 0
         await self._send_event(
             EventType.StartSession,
             session_id,
@@ -509,10 +571,20 @@ class VolcengineTTSService(TTSService):
                                     "type": "voice-sentence-start",
                                     "text": self._active_sentence_text,
                                     "sequence": self._sentence_sequence,
+                                    "sentence_seq": self._sentence_sequence,
+                                    "audio_cursor_ms": int(self._audio_cursor_ms),
+                                    "event_id": f"tts_{uuid.uuid4().hex[:20]}",
+                                    "turn_id": context_id,
                                 }
                             ),
                         )
                         self._active_sentence_marker_sent = True
+                        if self._journal is not None:
+                            await self._journal.sentence_queued(
+                                self._active_sentence_text,
+                                audio_cursor_ms=int(self._audio_cursor_ms),
+                            )
+                    self._audio_cursor_ms += int(len(msg.payload) / 2 / self.sample_rate * 1000)
                 elif msg.type == MsgType.FullServerResponse:
                     data = decode_payload(msg.payload)
                     if msg.event == EventType.SessionFailed:
@@ -563,6 +635,15 @@ class VolcengineTTSService(TTSService):
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{self}: TTS 接收循环结束: {exc}")
+            if self._journal is not None:
+                # Report the stage failure but do not end the call: the next
+                # sentence will rebuild the upstream session.
+                await self._journal.processor_error(
+                    "tts",
+                    f"TTS 接收循环中断: {exc}",
+                    retryable=True,
+                    attempt=self._reconnect_attempt,
+                )
         finally:
             self._pending_sentence_texts.clear()
             self._active_sentence_text = ""

@@ -3,11 +3,11 @@
 #
 # 拓扑（对齐官方 examples/multi-worker/local-handoff）：
 #   主 worker "learngraph"：transport.input → STT → 用户聚合器 → BusBridgeProcessor
-#                            → TTS → transport.output → 助手聚合器
+#                            → TTS → generation gate → transport.output → 助手聚合器
 #   子 worker "tutor"     ：LLMWorker（Pipeline([llm])，bridged=()），只跑 LLM；
 #                            用户侧上下文经总线送进去，生成文本经总线送回来交主 worker 的 TTS 朗读。
 # 好处：把「谁在说话 / 何时打断 / 音频进出」与「谁生成内容」解耦，
-#       后续加检索或长任务 sidecar worker 只需 add_workers + @tool，不必碰音频管线。
+#       后台任务只通过 delegation port 产生结构化结果，不能接入 TTS。
 #
 # STT : 阿里 DashScope 实时 ASR（qwen3-asr-flash-realtime，Manual 模式）— 自研适配层
 # LLM : 会话当前配置的模型（OpenAI 兼容通道）
@@ -15,8 +15,10 @@
 # 传输: SmallWebRTC（免 Daily key）
 #
 
+import asyncio
 import os
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -26,10 +28,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.bus import BusBridgeProcessor
-from pipecat.frames.frames import (
-    Frame,
-    MetricsFrame,
-)
+from pipecat.frames.frames import Frame, LLMRunFrame, MetricsFrame
 from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import (
@@ -44,39 +43,71 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIObserverParams
+from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.llm import LLMWorker
+from pipecat.workers.llm.tool_decorator import tool
 from pipecat.workers.runner import WorkerRunner
-
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
-from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
+from app.voice.embedded_context import VoiceContextAdapter, VoiceContextState
+from app.voice.coordinator_adapter import ensure_coordinator_delegation_port_factory
 from app.voice.embedded_dashscope_stt import DashScopeSTTService
+from app.voice.embedded_delegation import (
+    DelegationKind,
+    DelegationRequest,
+    TaskControlRequest,
+    VoiceDelegationPort,
+    dispatch_delegation,
+    dispatch_task_control,
+    resolve_delegation_port,
+)
+from app.voice.embedded_generation import VoiceGenerationGate
+from app.voice.embedded_result_bridge import VoiceResultDeliveryProcessor
 from app.voice.embedded_timeline import insert_timeline_probes, timeline_enabled
+from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
 from app.voice.embedded_volcengine_tts import VolcengineTTSService
+from app.voice.journal import (
+    STAGE_LLM,
+    VoiceControlWatchdog,
+    VoiceJournalProcessor,
+    VoiceTurnJournal,
+    _stage_for_processor,
+)
+from app.voice.runner_registry import (
+    VoiceRunnerHandle,
+    get_runner,
+    register_runner,
+    unregister_runner,
+)
 
 load_dotenv(override=True)
 
-# 主 worker 名：BusBridgeProcessor 靠它把总线上的帧流与这条管线对上。
 MAIN_WORKER_NAME = "learngraph"
-# 子 agent 名：将来加检索/任务 worker 时，用 activate_worker(name, ...) 做交接。
 TUTOR_WORKER_NAME = "tutor"
-# 前端手动打断用的 RTVI 自定义消息类型（须与
-# frontend/src/features/voice/voice-session-controller.tsx 的
-# VOICE_INTERRUPT_MESSAGE 保持一致）。
 VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt"
 
 SYSTEM_INSTRUCTION = (
-    "你是一个友好的中文语音助手。你的回答会被直接朗读出来，"
-    "所以请使用自然、口语化的中文，避免 emoji、特殊符号、列表、Markdown 等无法朗读的内容。"
-    "回答要简洁、亲切，像真人对话一样。"
+    "你是一个友好的中文语音导师。你的回答会被直接朗读出来，所以请使用自然、"
+    "口语化的中文，避免 emoji、特殊符号、列表、Markdown 等无法朗读的内容。"
+    "回答要简洁、亲切，像真人对话一样。遇到需要联网研究、深度分析或工具执行的"
+    "请求时，调用相应的后台任务工具，先快速确认受理，然后继续和用户实时对话；"
+    "不要等待后台任务完成，也不要把后台原始结果逐字念出。"
 )
+
+
+def load_session_row(voice_session_id: str):
+    """Read durable session state for the control watchdog."""
+    from app.voice.events import load_session
+
+    return load_session(voice_session_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,18 +117,11 @@ class _VoiceProviderConfig:
     asr: object | None = None
     llm: object | None = None
     tts: object | None = None
+    session: object | None = None
 
 
 def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
-    """Resolve the same workspace Providers used by the normal chat API.
-
-    The embedded runner is launched as a background task, so it cannot rely on
-    the request-scoped dependency objects from the HTTP route.  Resolve the
-    in-memory voice session to its workspace, then use the normal factory
-    selectors.  The returned adapter objects contain decrypted secrets only in
-    process memory and are never serialized to the browser or logs.
-    """
-
+    """Resolve same workspace providers without request-scoped objects."""
     if not session_id:
         return _VoiceProviderConfig()
     try:
@@ -108,48 +132,52 @@ def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
             realtime_asr_provider_for_workspace,
             tts_provider_for_workspace,
         )
-        from app.voice.service import VoiceSessionService
+        from app.voice.events import load_session as load_voice_session
 
-        with VoiceSessionService._lock:
-            session = VoiceSessionService._sessions.get(session_id)
-        if session is None:
-            logger.warning("Voice session {} was not found while resolving Providers", session_id)
+        handle = load_voice_session(session_id)
+        if handle is None:
+            logger.warning(
+                "Voice session {} was not found while resolving Providers", session_id
+            )
             return _VoiceProviderConfig()
         with SessionLocal() as db:
             settings = get_settings()
-            return _VoiceProviderConfig(
-                # Pin every adapter to the selection captured when the voice
-                # session was created.  Falling back to the workspace default
-                # here made a voice call silently use a different model than
-                # the chat session requested.
-                asr=realtime_asr_provider_for_workspace(
-                    db, session.workspace_id, settings,
-                ),
-                llm=model_provider_for_workspace(
-                    db, session.workspace_id, settings,
-                    model_id=session.model_id,
-                    provider_id=session.provider_id,
-                ),
-                tts=tts_provider_for_workspace(db, session.workspace_id, settings),
+            asr = realtime_asr_provider_for_workspace(
+                db, handle.workspace_id, settings
             )
+            tts = tts_provider_for_workspace(db, handle.workspace_id, settings)
+            llm = model_provider_for_workspace(
+                db,
+                handle.workspace_id,
+                settings,
+                model_id=handle.model_id,
+                provider_id=handle.provider_id,
+                thinking_mode=handle.max_thinking_mode,
+            )
+        logger.info(
+            "Voice providers: llm={}/{} thinking={} asr={} tts={}",
+            getattr(llm, "provider_id", None),
+            getattr(llm, "model_id", None),
+            handle.max_thinking_mode,
+            getattr(asr, "model_id", None),
+            getattr(tts, "model_id", None),
+        )
+        return _VoiceProviderConfig(asr=asr, llm=llm, tts=tts, session=handle)
     except Exception:
-        logger.exception("Failed to resolve workspace Providers for voice session %s", session_id)
+        logger.exception(
+            "Failed to resolve workspace Providers for voice session %s", session_id
+        )
         return _VoiceProviderConfig()
 
 
 class LatencyPercentileProcessor(FrameProcessor):
-    """滚动收集每轮 LLM 的 TTFB（首字节延迟），计算 p90 / p95 / p99 并打印到日志。
+    """Rolling LLM TTFB percentile logger."""
 
-    挂载在 pipeline 中，监听 MetricsFrame，从中取出 TTFBMetricsData 的 value（秒）。
-    按最近 WINDOW 条样本滚动计算百分位，阈值不满足时打印仅样本数提示。
-    非 MetricsFrame 原样透传。
-    """
-
-    WINDOW = 50  # 滚动窗口：最近 50 条 TTFB 样本
+    WINDOW = 50
 
     def __init__(self):
         super().__init__()
-        self._samples: list[float] = []  # 秒
+        self._samples: list[float] = []
 
     def _percentile(self, sorted_vals: list[float], p: float) -> float:
         if not sorted_vals:
@@ -167,7 +195,8 @@ class LatencyPercentileProcessor(FrameProcessor):
         p95_ms = self._percentile(sv, 0.95) * 1000
         p99_ms = self._percentile(sv, 0.99) * 1000
         logger.info(
-            "TTFB latency (window={}): p90={:.0f}ms p95={:.0f}ms p99={:.0f}ms (min={:.0f}ms max={:.0f}ms)",
+            "TTFB latency (window={}): p90={:.0f}ms p95={:.0f}ms "
+            "p99={:.0f}ms (min={:.0f}ms max={:.0f}ms)",
             len(window),
             p90_ms,
             p95_ms,
@@ -178,9 +207,7 @@ class LatencyPercentileProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-
         if isinstance(frame, MetricsFrame):
-            # 每轮可能有多条 TTFB（多服务），全部收集
             got_ttfb = False
             for data in frame.data:
                 if isinstance(data, TTFBMetricsData) and data.value is not None:
@@ -194,30 +221,207 @@ class LatencyPercentileProcessor(FrameProcessor):
                         "TTFB samples so far: {} (need >=3 to compute p90/p95/p99)",
                         len(self._samples),
                     )
-
         await self.push_frame(frame, direction)
 
 
 class TutorAgent(LLMWorker):
-    """语音导师 agent —— 只跑 LLM，音频进出全部交给主 worker。
+    """Foreground tutor: the only agent allowed to write to TTS.
 
-    - ``bridged=()``：让 PipelineWorker 用总线边缘处理器包住这条管线；用户侧
-      上下文从主 worker 经总线进来，生成的文本帧再回主 worker 由 TTS 朗读。
-    - ``active=True``：单 agent 场景常驻待命。（官方 local-handoff 是多 agent
-      轮值，故默认 ``active=False``，由 ``activate_worker`` 接管；我们不轮值。）
-    - `@tool` 装饰的方法会被自动收集并注册给 LLM（沿 MRO 收集，子类覆盖优先）；
-      长任务工具用 ``@tool(cancel_on_interruption=False)``，避免被用户插话打断，
-      这也正是后续「派子代理跑搜索」要挂的钩子。
-    - ``defer_tool_frames`` 保持默认 True：工具执行期间入队的帧延后到工具全部
-      结束再放行，避免 TTS 在工具还没返回时就开始念陈旧内容。
+    Delegation tools enqueue work through a narrow port and return a receipt.
+    They are registered as asynchronous, non-interruption-cancelled tools so a
+    user barge-in never cancels the durable background task itself.
     """
 
-    def __init__(self, *, llm: OpenAILLMService, name: str = TUTOR_WORKER_NAME):
-        super().__init__(
-            name,
-            llm=llm,
-            bridged=(),
-            active=True,
+    def __init__(
+        self,
+        *,
+        llm: OpenAILLMService,
+        name: str = TUTOR_WORKER_NAME,
+        voice_session_id: str = "",
+        delegation_port: VoiceDelegationPort | None = None,
+    ):
+        self._voice_session_id = voice_session_id
+        self._delegation_port = delegation_port
+        super().__init__(name, llm=llm, bridged=(), active=True)
+
+    def build_tools(self) -> list:
+        # Do not advertise delegation tools when no coordinator is installed.
+        # This prevents a model from appearing to accept work that has no
+        # durable backend.
+        if self._delegation_port is None:
+            return []
+        return super().build_tools()
+
+    async def _delegate(
+        self,
+        params: FunctionCallParams,
+        *,
+        kind: DelegationKind,
+        query: str,
+        purpose: str = "",
+        context: str = "",
+    ) -> None:
+        result = await dispatch_delegation(
+            self._delegation_port,
+            DelegationRequest(
+                kind=kind,
+                query=str(query or "").strip(),
+                purpose=str(purpose or "").strip(),
+                context=str(context or "").strip(),
+                voice_session_id=self._voice_session_id,
+            ),
+        )
+        await params.result_callback(result)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def delegate_research(
+        self,
+        params: FunctionCallParams,
+        query: str,
+        purpose: str = "",
+        context: str = "",
+    ) -> None:
+        """Queue a web research task and return immediately with a task receipt."""
+        await self._delegate(
+            params,
+            kind=DelegationKind.RESEARCH,
+            query=query,
+            purpose=purpose,
+            context=context,
+        )
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def delegate_reasoning(
+        self,
+        params: FunctionCallParams,
+        query: str,
+        purpose: str = "",
+        context: str = "",
+    ) -> None:
+        """Queue deep reasoning and return immediately with a task receipt."""
+        await self._delegate(
+            params,
+            kind=DelegationKind.REASONING,
+            query=query,
+            purpose=purpose,
+            context=context,
+        )
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def delegate_tool_task(
+        self,
+        params: FunctionCallParams,
+        query: str,
+        purpose: str = "",
+        context: str = "",
+    ) -> None:
+        """Queue an authorized tool task and return immediately."""
+        await self._delegate(
+            params,
+            kind=DelegationKind.TOOL,
+            query=query,
+            purpose=purpose,
+            context=context,
+        )
+
+    async def _control(
+        self,
+        params: FunctionCallParams,
+        *,
+        operation: str,
+        task_id: str,
+        instruction: str = "",
+    ) -> None:
+        result = await dispatch_task_control(
+            self._delegation_port,
+            operation=operation,
+            request=TaskControlRequest(
+                task_id=str(task_id or "").strip(),
+                instruction=str(instruction or "").strip(),
+            ),
+        )
+        await params.result_callback(result)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def get_background_task(self, params: FunctionCallParams, task_id: str) -> None:
+        """Read a task brief without waiting for task completion."""
+        await self._control(params, operation="status", task_id=task_id)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def get_ready_results(
+        self, params: FunctionCallParams, limit: int = 5
+    ) -> None:
+        """Read completed background results when the user asks to hear them."""
+        if self._delegation_port is None:
+            await params.result_callback({"results": []})
+            return
+        rows = await self._delegation_port.ready_results(
+            limit=max(1, min(int(limit), 10))
+        )
+        results: list[dict[str, Any]] = []
+        task_ids: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").casefold()
+            if status == "stale":
+                continue
+            task_id = str(row.get("task_id") or row.get("subagent_id") or "")
+            if not task_id:
+                continue
+            task_ids.append(task_id)
+            results.append(
+                {
+                    "task_id": task_id,
+                    "title": str(row.get("title") or ""),
+                    "status": status,
+                    "summary": str(row.get("summary") or row.get("safe_error") or ""),
+                    "source_count": int(row.get("source_count") or 0),
+                    "agent_result": row.get("agent_result") or {},
+                }
+            )
+        await params.result_callback({"results": results})
+        for task_id in task_ids:
+            try:
+                await self._delegation_port.acknowledge_result(
+                    task_id,
+                    delivery_state="delivered",
+                )
+            except Exception:
+                logger.debug("manual voice result acknowledgement failed", exc_info=True)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def cancel_background_task(
+        self, params: FunctionCallParams, task_id: str
+    ) -> None:
+        """Request cancellation of a specific background task."""
+        await self._control(params, operation="cancel", task_id=task_id)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def set_background_delivery(
+        self, params: FunctionCallParams, task_id: str, auto_report: bool
+    ) -> None:
+        """Pause or resume automatic spoken reporting for one task."""
+        await self._control(
+            params,
+            operation="delivery",
+            task_id=task_id,
+            instruction="auto" if auto_report else "manual",
+        )
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def revise_background_task(
+        self,
+        params: FunctionCallParams,
+        task_id: str,
+        instruction: str,
+    ) -> None:
+        """Create a new requirement revision for a specific task."""
+        await self._control(
+            params,
+            operation="revise",
+            task_id=task_id,
+            instruction=instruction,
         )
 
 
@@ -229,6 +433,106 @@ transport_params = {
 }
 
 
+def _apply_context_state(
+    context: LLMContext,
+    adapter: VoiceContextAdapter,
+    state: VoiceContextState,
+) -> None:
+    adapter.apply(context, state)
+
+
+def build_pipeline_steps(
+    *,
+    transport_input: FrameProcessor,
+    stt: FrameProcessor,
+    user_journal: FrameProcessor | None,
+    user_aggregator: FrameProcessor,
+    bridge: FrameProcessor,
+    assistant_journal: FrameProcessor | None,
+    tts: FrameProcessor,
+    latency: FrameProcessor,
+    transport_output: FrameProcessor,
+    assistant_aggregator: FrameProcessor,
+    result_delivery: FrameProcessor | None = None,
+    generation_gate: FrameProcessor | None = None,
+) -> list[FrameProcessor]:
+    """Assemble the main worker's pipeline in one testable place."""
+    steps: list[FrameProcessor] = [transport_input, stt]
+    if user_journal is not None:
+        steps.append(user_journal)
+    steps.extend([user_aggregator, bridge])
+    if result_delivery is not None:
+        steps.append(result_delivery)
+    if assistant_journal is not None:
+        steps.append(assistant_journal)
+    steps.append(tts)
+    if generation_gate is not None:
+        steps.append(generation_gate)
+    steps.extend([latency, transport_output, assistant_aggregator])
+    return steps
+
+
+def bind_journal_to_tap(
+    journal: VoiceTurnJournal, assistant_journal: FrameProcessor
+) -> None:
+    """Attach the journal's outbound channel to the assistant observation tap.
+
+    Two things hang off this one binding, and both are silent when missing -- the
+    call is a plain attribute assignment, so nothing fails until a call is due:
+
+    * ``_publish`` forwards every durable envelope to the client over RTVI, which
+      is what turns a persisted event into a live subtitle.
+    * ``_retry_hook`` re-runs a generation that produced no text. It pushes
+      ``LLMRunFrame`` **upstream** from the assistant tap, which sits immediately
+      downstream of the bus bridge, so the frame walks back to the bridge and on
+      to the tutor worker's LLM. Without the hook ``llm_failed`` can only give up:
+      a provider hiccup ends the turn instead of retrying it.
+
+    Kept as a named function so the wiring itself is assertable -- it was once
+    dropped by an unrelated rewrite of this module and no test noticed, because
+    every existing test exercised the journal, not the binding.
+    """
+
+    async def _publish(envelope: dict[str, Any]) -> None:
+        try:
+            await assistant_journal.push_frame(
+                RTVIServerMessageFrame(
+                    data={"type": "voice-event", "event": envelope}
+                ),
+                FrameDirection.DOWNSTREAM,
+            )
+        except Exception:
+            logger.debug("voice event publish failed", exc_info=True)
+
+    async def _rerun_generation() -> None:
+        """Re-run the LLM on the existing context after a failed attempt."""
+        await assistant_journal.push_frame(LLMRunFrame(), FrameDirection.UPSTREAM)
+
+    journal._publish = _publish
+    journal._retry_hook = _rerun_generation
+
+
+async def route_pipeline_error(journal: VoiceTurnJournal, frame: Any) -> None:
+    """Send one failed pipeline frame to the recovery path that owns its stage.
+
+    An LLM failure is not merely reported: the turn is still open and still has
+    no answer, so it takes the retry/failure path, which either re-runs the
+    generation or finalizes the turn with a retryable reason. Every other stage
+    is a plain report -- ASR and TTS own their own reconnect and retry loops and
+    must not be double-driven from here.
+    """
+    stage = _stage_for_processor(getattr(frame, "processor", None))
+    message = str(getattr(frame, "error", "") or "pipeline error")
+    if stage == STAGE_LLM:
+        await journal.llm_failed(message)
+        return
+    await journal.processor_error(
+        stage,
+        message,
+        retryable=not bool(getattr(frame, "fatal", False)),
+    )
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting ChatGPT-style CN bot")
     if timeline_enabled():
@@ -237,18 +541,42 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             "（锚点=VAD 判定用户开口）"
         )
 
-    providers = _resolve_voice_provider_config(
-        str(getattr(runner_args, "session_id", "") or "")
-    )
+    session_id = str(getattr(runner_args, "session_id", "") or "")
+    providers = _resolve_voice_provider_config(session_id)
     asr_provider = providers.asr if getattr(providers.asr, "available", False) else None
     llm_provider = providers.llm if getattr(providers.llm, "available", False) else None
     tts_provider = providers.tts if getattr(providers.tts, "available", False) else None
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    journal = (
+        VoiceTurnJournal(
+            session_id,
+            idle_timeout_secs=settings.voice_turn_idle_timeout,
+            retry_attempts=settings.voice_llm_retry_attempts,
+            retry_base_delay=settings.voice_llm_retry_base_delay,
+            retry_max_delay=settings.voice_llm_retry_max_delay,
+        )
+        if session_id
+        else None
+    )
+    context_adapter = (
+        VoiceContextAdapter(session_id, SYSTEM_INSTRUCTION) if session_id else None
+    )
+    context_state = (
+        await asyncio.to_thread(context_adapter.load)
+        if context_adapter is not None
+        else VoiceContextState(None, ({"role": "system", "content": SYSTEM_INSTRUCTION},))
+    )
+    last_context_version = context_state.version
 
     stt = DashScopeSTTService(
         api_key=str(
             getattr(asr_provider, "api_key", None)
             or os.getenv("DASHSCOPE_API_KEY", "")
         ),
+        journal=journal,
         settings=DashScopeSTTService.Settings(
             model=str(
                 getattr(asr_provider, "model_id", None)
@@ -256,7 +584,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             ),
             ws_url=str(
                 getattr(asr_provider, "base_url", None)
-                or os.getenv("DASHSCOPE_ASR_WS_URL", "wss://dashscope.aliyuncs.com/api-ws/v1/realtime")
+                or os.getenv(
+                    "DASHSCOPE_ASR_WS_URL",
+                    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+                )
             ),
             silence_ms=int(
                 getattr(asr_provider, "silence_ms", None)
@@ -265,9 +596,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    # 会话当前配置的模型 → 统一走 OpenAI 兼容通道（2026-09-11 拍板）。
-    # base_url / api_key / model 三项全部取自 workspace Provider 解析结果
-    # （已按会话创建时钉住的 provider_id/model_id 解析），环境变量仅作本地直连兜底。
     llm = OpenAILLMService(
         api_key=str(
             getattr(llm_provider, "api_key", None)
@@ -294,10 +622,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             getattr(tts_provider, "api_key", None)
             or os.getenv("VOLC_TTS_API_KEY", "")
         ),
+        journal=journal,
         settings=VolcengineTTSService.Settings(
             voice_type=str(
                 getattr(getattr(tts_provider, "options", None), "voice_type", None)
-                or os.getenv("VOLC_TTS_VOICE_TYPE", "ICL_uranus_zh_female_heainainai_tob")
+                or os.getenv(
+                    "VOLC_TTS_VOICE_TYPE",
+                    "ICL_uranus_zh_female_heainainai_tob",
+                )
             ),
             model=str(
                 getattr(tts_provider, "model_id", None)
@@ -309,7 +641,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             ),
             endpoint=str(
                 getattr(tts_provider, "base_url", None)
-                or os.getenv("VOLC_TTS_ENDPOINT", "wss://openspeech.bytedance.com/api/v3/tts/bidirection")
+                or os.getenv(
+                    "VOLC_TTS_ENDPOINT",
+                    "wss://openspeech.bytedance.com/api/v3/tts/bidirection",
+                )
             ),
             resource_id=str(
                 getattr(tts_provider, "resource_id", None)
@@ -318,14 +653,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    # runner 必须先建：BusBridgeProcessor 需要 runner.bus（进程内 AsyncQueueBus）。
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-
-    # 回合边界参数（A1 拍板纳入 Settings，2026-09-12 起真正生效）：
-    # 三个 Smart Turn / VAD 旋钮默认 None = 交给 Pipecat 常量（库是唯一真源，
-    # 且 core/config.py 不得 import 可选的 pipecat extra）；显式设值才覆盖。
-    # 它们直接决定 §6.5.2 里"闭嘴 → 回合边界"的耗时，因此必须可调，
-    # 否则用户报的 EOU 延迟只能靠改代码收敛。
     from app.core.config import get_settings
 
     settings = get_settings()
@@ -361,85 +689,110 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             settings.voice_turn_stop_timeout,
         )
 
-    context = LLMContext()
+    initial_messages = [dict(message) for message in context_state.messages]
+    if not initial_messages:
+        initial_messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+    context = LLMContext(messages=initial_messages)
+    turn_strategy = AdaptiveUserTurnStartStrategy()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(params=vad_params),
-            # 硬上限：没有任何 stop 策略命中时，回合最多开多久。
             user_turn_stop_timeout=settings.voice_turn_stop_timeout,
-            # 保留既有回合策略：start 仍是自研策略（附和词过滤 + 真实打断），
-            # stop 缺省时 —— UserTurnStrategies.__post_init__ 会回填
-            # TurnAnalyzerUserTurnStopStrategy(LocalSmartTurnAnalyzerV3())，
-            # 即 Smart Turn v3 端点检测（实测确认，见设计文档 §4.1/§6.3）；
-            # 只有在设置里显式给了 Smart Turn 参数时才换成显式实例。
             user_turn_strategies=UserTurnStrategies(
-                start=[AdaptiveUserTurnStartStrategy()],
+                start=[turn_strategy],
                 stop=stop_strategies,
             ),
         ),
     )
 
     latency = LatencyPercentileProcessor()
-
-    # 主 worker 与子 agent 之间的帧通道：用户侧上下文下行给子 worker，
-    # 子 worker 生成的文本上行回来，交给这里的 TTS 朗读。
+    generation_gate = VoiceGenerationGate()
     bridge = BusBridgeProcessor(
         bus=runner.bus,
         worker_name=MAIN_WORKER_NAME,
         name=f"{MAIN_WORKER_NAME}::BusBridge",
     )
 
-    # 排障用单点计时（VOICE_TIMELINE_DEBUG=1）：把「用户闭嘴 → 出文字 → 出
-    # 声音」拆成可分段的日志时间线；关闭时原样返回，不额外挂处理器。
-    pipeline_steps = [
-        transport.input(),
-        stt,
-        user_aggregator,
-        bridge,
-        tts,
-        latency,
-        transport.output(),
-        assistant_aggregator,
-    ]
+    user_journal = VoiceJournalProcessor(journal, role="user") if journal else None
+    assistant_journal = (
+        VoiceJournalProcessor(journal, role="assistant") if journal else None
+    )
+
+    ensure_coordinator_delegation_port_factory()
+    delegation_port = resolve_delegation_port(session_id) if session_id else None
+    agent = TutorAgent(
+        llm=llm,
+        voice_session_id=session_id,
+        delegation_port=delegation_port,
+    )
+    result_delivery = (
+        VoiceResultDeliveryProcessor(agent=agent, result_port=delegation_port)
+        if delegation_port is not None
+        else None
+    )
+
+    pipeline_steps = build_pipeline_steps(
+        transport_input=transport.input(),
+        stt=stt,
+        user_journal=user_journal,
+        user_aggregator=user_aggregator,
+        bridge=bridge,
+        assistant_journal=assistant_journal,
+        tts=tts,
+        result_delivery=result_delivery,
+        generation_gate=generation_gate,
+        latency=latency,
+        transport_output=transport.output(),
+        assistant_aggregator=assistant_aggregator,
+    )
     pipeline = Pipeline(insert_timeline_probes(pipeline_steps))
 
     worker = PipelineWorker(
         pipeline,
         name=MAIN_WORKER_NAME,
-        # The default RTVI observer queues and flushes every bot-output segment
-        # when the first audio frame starts. That makes a fast LLM response appear
-        # in full before the browser has played it. Sentence markers emitted by
-        # VolcengineTTSService are the sole assistant caption source instead.
         rtvi_observer_params=RTVIObserverParams(
             bot_output_enabled=False,
             bot_tts_enabled=False,
         ),
         params=PipelineParams(
-            # 显式声明，与 DashScope ASR(16k) / 火山 TTS(24k) 对齐，
-            # 不依赖 Pipecat 默认值将来是否变化。
             audio_in_sample_rate=16000,
             audio_out_sample_rate=24000,
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        # 官方范例的取值：某个 processor 变为不可用时直接收束管线，
-        # 而不是留在半死不活的状态继续跑。
-        processor_unusable_policy=ProcessorUnusablePolicy.END,
+        processor_unusable_policy=ProcessorUnusablePolicy.CONTINUE,
     )
 
-    agent = TutorAgent(llm=llm)
+    if journal is not None and assistant_journal is not None:
+        bind_journal_to_tap(journal, assistant_journal)
 
-    # 子 agent 先注册、主 worker 后注册（与官方 local-handoff 同序）。
     await runner.add_workers(agent, worker)
 
-    # 客户端手动打断：走同一条 RTVI data channel，把一键打断落到这条管线自己的
-    # 打断路径上（与 VAD 自动打断完全同路），不依赖 HTTP 路由与进程内注册表。
-    # 浏览器在 data channel 上发 RTVI client-message：
-    #   {label:"rtvi-ai", type:"client-message", data:{t:VOICE_INTERRUPT_MESSAGE}}
+    current_task = asyncio.current_task()
+    handle = VoiceRunnerHandle(
+        voice_session_id=session_id,
+        chat_session_id=str(getattr(providers.session, "chat_session_id", "") or ""),
+        owner_user_id=str(getattr(providers.session, "owner_user_id", "") or ""),
+        processors=[stt, tts, generation_gate, worker, agent] + ([result_delivery] if result_delivery is not None else []),
+        transports=[transport],
+        task=current_task,
+    )
+
+    async def _stop_runner(reason: str) -> None:
+        await runner.cancel(reason)
+
+    handle.stop = _stop_runner
+    if session_id:
+        register_runner(handle)
+
+    close_reason = "runner_finished"
+    disconnect_emitted = False
+    watchdog: VoiceControlWatchdog | None = None
+
     try:
         rtvi = worker.rtvi
-    except Exception:  # RTVI 被显式关闭时访问器会抛错；此时没有手动打断通道
+    except Exception:
         rtvi = None
 
     if rtvi is not None:
@@ -449,20 +802,132 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             if getattr(message, "type", "") != VOICE_INTERRUPT_MESSAGE:
                 return
             logger.info("Client requested barge-in over RTVI; interrupting the bot")
+            generation_gate.invalidate()
             await rtvi_processor.interrupt_bot()
+
+        async def _fast_interrupt() -> None:
+            generation_gate.invalidate()
+            await rtvi.interrupt_bot()
+
+        turn_strategy.set_interrupt_callback(_fast_interrupt)
+
+    if journal is not None and session_id:
+
+        async def _on_interrupt(_event: Mapping[str, Any]) -> None:
+            generation_gate.invalidate()
+            if rtvi is not None:
+                await rtvi.interrupt_bot()
+
+        async def _on_model_changed(event: Mapping[str, Any]) -> None:
+            nonlocal context_state, last_context_version
+            if context_adapter is None:
+                return
+            handle_now = await asyncio.to_thread(load_session_row, session_id)
+            if handle_now is None or handle_now.status != "active":
+                return
+
+            refreshed = await asyncio.to_thread(context_adapter.load)
+            if refreshed.version != last_context_version:
+                _apply_context_state(context, context_adapter, refreshed)
+                context_state = refreshed
+                last_context_version = refreshed.version
+                logger.info(
+                    "Voice context applied at next turn boundary: version={} source={}",
+                    refreshed.version,
+                    refreshed.source,
+                )
+
+            repointed = False
+            llm_service = getattr(agent, "llm", None)
+            model = handle_now.model_id or getattr(llm_provider, "model_id", None)
+            if llm_service is not None and model:
+                try:
+                    settings_obj = getattr(llm_service, "_settings", None)
+                    if settings_obj is not None and hasattr(settings_obj, "model"):
+                        settings_obj.model = str(model)
+                        repointed = True
+                except Exception:
+                    logger.debug("voice model re-pin failed", exc_info=True)
+            await journal.context_updated({
+                **dict(event.get("payload") or {}),
+                "repointed": repointed,
+                "applied_epoch": handle_now.session_epoch,
+                "effective_model_id": model,
+                "applies_to": "next_turn",
+                "certainty": "repointed" if repointed else "next_connection",
+            })
+
+
+        async def _on_close(reason: str) -> None:
+            nonlocal close_reason
+            close_reason = reason or "session_closed"
+            logger.info("voice session %s closing: %s", session_id, close_reason)
+            generation_gate.invalidate()
+            await runner.cancel(close_reason)
+
+        watchdog = VoiceControlWatchdog(
+            voice_session_id=session_id,
+            on_interrupt=_on_interrupt,
+            on_model_changed=_on_model_changed,
+            on_close=_on_close,
+        )
+
+        async def _cleanup_watchdog() -> None:
+            await watchdog.stop()
+
+        watchdog.cleanup = _cleanup_watchdog  # type: ignore[method-assign]
+        handle.register_processor(watchdog)
+        watchdog.start()
+
+    @worker.event_handler("on_pipeline_error")
+    async def on_pipeline_error(worker_ref, frame):
+        if journal is None:
+            return
+        await route_pipeline_error(journal, frame)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        # 不自动打招呼：保持「用户先开口」的既有交互。
-        # 子 agent 常驻 active=True，桥接帧一到即可作答。
         logger.info("Client connected")
+        if result_delivery is not None:
+            await result_delivery.start()
+        if journal is not None:
+            epoch = getattr(providers.session, "session_epoch", None)
+            await journal.session_ready(epoch=epoch)
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
+        nonlocal disconnect_emitted
         logger.info("Client disconnected")
-        await runner.cancel()
+        if disconnect_emitted:
+            return
+        disconnect_emitted = True
+        if session_id and journal is not None:
+            try:
+                from app.voice.events import mark_session_reconnecting
 
-    await runner.run()
+                await asyncio.to_thread(mark_session_reconnecting, session_id)
+                await journal.session_reconnecting(attempt=1, delay_ms=0)
+            except Exception:
+                logger.debug("voice reconnect marker failed", exc_info=True)
+        if result_delivery is not None:
+            await result_delivery.stop()
+        await runner.cancel("client_disconnected")
+
+    try:
+        await runner.run()
+    finally:
+        if result_delivery is not None:
+            await result_delivery.stop()
+        if watchdog is not None:
+            await watchdog.stop()
+        if session_id and get_runner(session_id) is handle:
+            unregister_runner(session_id)
+        if journal is not None and session_id:
+            state = await asyncio.to_thread(load_session_row, session_id)
+            if state is not None and not state.active:
+                await journal.session_closed(reason=close_reason)
+            elif state is not None and not disconnect_emitted:
+                await journal.session_reconnecting(attempt=1, delay_ms=0)
 
 
 async def bot(runner_args: RunnerArguments):

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
+import { VoiceTaskChip } from "./voice-task-chip";
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { AudioWaveform, LoaderCircle, Mic, MicOff, PhoneOff } from "lucide-react";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { cn } from "@/lib/utils";
@@ -53,6 +54,8 @@ export interface VoiceOrbProps {
   muted?: boolean;
   audioLevel?: number;
   audioSource?: VoiceAudioSource;
+  /** Rendered inside the dock so it inherits its centered flex layout. */
+  note?: ReactNode;
 }
 
 /**
@@ -61,7 +64,7 @@ export interface VoiceOrbProps {
  * purely visual and the composer buttons remain the source of truth for mute
  * and hang-up.
  */
-export function VoiceOrb({ transport, state, error, muted, audioLevel = 0, audioSource = "idle" }: VoiceOrbProps) {
+export function VoiceOrb({ transport, state, error, muted, audioLevel = 0, audioSource = "idle", note }: VoiceOrbProps) {
   const isListening = state === "listening";
   const isSpeaking = state === "speaking";
   const status = voiceStatusText(transport, state, error);
@@ -127,6 +130,7 @@ export function VoiceOrb({ transport, state, error, muted, audioLevel = 0, audio
       <span aria-live="polite" className="sr-only-voice-status" role="status">
         {status}
       </span>
+      {note}
     </div>
   );
 }
@@ -172,7 +176,10 @@ export function VoiceOrbDock({
     };
   }, [workspaceId, sessionId]);
 
+  const pin = voice.modelPin;
+
   return (
+    <>
     <VoiceOrb
       error={voice.error}
       muted={voice.muted}
@@ -180,7 +187,29 @@ export function VoiceOrbDock({
       audioSource={voice.audioSource}
       state={voice.state}
       transport={voice.transport}
+      note={
+        // A model switch is pinned as "next turn takes effect", so until the
+        // pipeline confirms it, the requested model is *not* what the user is
+        // talking to. Saying so is the point: silently showing the new model
+        // while the old one answers is the failure this prevents.
+        pin ? (
+          <p
+            aria-live="polite"
+            className={cn("chat-voice-model-note", pin.repointed && "is-applied")}
+            role="status"
+          >
+            {pin.repointed
+              ? `已切换到「${pin.effectiveModelId ?? pin.requestedModelId}」，下一轮生效`
+              : `本次通话仍在使用「${pin.effectiveModelId ?? "当前模型"}」，「${pin.requestedModelId ?? "新模型"}」将在下次接通后生效`}
+          </p>
+        ) : null
+      }
     />
+      <VoiceTaskChip
+        onCancel={(taskId) => void voice.cancelTask(taskId)}
+        tasks={voice.tasks}
+      />
+    </>
   );
 }
 
@@ -221,11 +250,15 @@ export function VoiceCaptionStream({
           <p
             className={cn(
               "leading-snug",
-              item.role === "user" ? "text-muted-foreground" : "text-foreground",
+              item.role === "user" && "text-muted-foreground",
+              item.role === "assistant" && "text-foreground",
+              item.role === "background" && "border-l border-border/70 pl-2 text-muted-foreground",
             )}
             key={item.id}
           >
-            <span className="mr-1 font-medium">{item.role === "user" ? "我：" : "导师："}</span>
+            <span className="mr-1 font-medium">
+              {item.role === "user" ? "我：" : item.role === "background" ? "系统：" : "导师："}
+            </span>
             {item.text}
             {item.interrupted ? <span className="text-muted-foreground">（被打断）</span> : null}
           </p>
