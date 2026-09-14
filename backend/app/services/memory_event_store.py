@@ -24,6 +24,13 @@ from app.services.memory_sensitive_filter import SensitiveDataFilter
 from app.services.memory_upcasters import EventUpcasterRegistry, upcasters
 
 
+class _Unset:
+    """Sentinel type for "argument not supplied" (``None`` is a real value here)."""
+
+
+_UNSET = _Unset()
+
+
 @dataclass(frozen=True, slots=True)
 class AppendEvent:
     event_type: str
@@ -73,7 +80,18 @@ class MemoryEventStore:
         expected_version: int | None,
         event: AppendEvent,
         outbox_kinds: tuple[str, ...] = (),
+        stream_subject_user_id: str | None | _Unset = _UNSET,
     ) -> AppendResult:
+        """Append an event to the aggregate's stream, creating it when needed.
+
+        ``stream_subject_user_id`` overrides the ownership recorded on a *newly
+        created* stream. The default (the caller's principal) is right for
+        aggregates owned by the acting principal, but a memory atom mirror must
+        pass the record's own ``subject_user_id``: a workspace-owned record has no
+        subject while the ``system:memory-extraction`` sweep is not the record's
+        owner, and recording the actor there makes the stream unfindable for the
+        next writer (see ``MemoryEventRepository._stream_by_identity``).
+        """
         current_schema = CURRENT_EVENT_SCHEMA_VERSIONS.get(event.event_type)
         if current_schema is not None and event.event_schema_version != current_schema:
             raise AppError(
@@ -105,7 +123,11 @@ class MemoryEventStore:
                 aggregate_id=aggregate_id,
                 current_version=0,
                 tenant_id=scope.tenant_id,
-                subject_user_id=scope.principal_user_id,
+                subject_user_id=(
+                    scope.principal_user_id
+                    if isinstance(stream_subject_user_id, _Unset)
+                    else stream_subject_user_id
+                ),
                 workspace_id=scope.workspace_id,
                 task_id=scope.task_id,
             )
@@ -117,6 +139,9 @@ class MemoryEventStore:
                     self.db.add(stream)
                     self.db.flush()
             except IntegrityError:
+                # The aggregate key is taken: adopt the row that owns it (the
+                # lookup resolves it even when the recorded subject differs, see
+                # MemoryEventRepository._stream_by_identity) instead of failing.
                 stream = self.events.stream_for_aggregate(scope, aggregate_type, aggregate_id)
                 if stream is None:
                     raise

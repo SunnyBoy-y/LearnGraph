@@ -66,6 +66,12 @@ class MemoryCommandService:
             aggregate_type="memory_atom",
             aggregate_id=record.id,
             expected_version=None,
+            # The stream belongs to the *record's* owner, not to whoever happens
+            # to write: a workspace-owned atom (subject NULL) must stay findable
+            # for every principal that may update it, otherwise the next writer
+            # (for example the system:memory-extraction sweep) collides with the
+            # aggregate unique key instead of adopting the stream.
+            stream_subject_user_id=record.subject_user_id,
             event=AppendEvent(
                 event_type=event_type,
                 payload=self._payload(record, content),
