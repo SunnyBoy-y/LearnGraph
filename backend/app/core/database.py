@@ -737,6 +737,62 @@ def get_db() -> Generator[Session, None, None]:
         yield session
 
 
+# Startup schema work is idempotent by construction (``create_all`` plus additive
+# ``IF NOT EXISTS`` migrations), but it is the one moment when two LearnGraph
+# processes touch the same SQLite file: ``docker compose`` starts the preview
+# origin the instant the app reports healthy, which is also the instant every
+# embedded scheduler fires its first sweep. A sweep holds the single SQLite write
+# lock for as long as its transaction lives (it may keep its Session dirty across
+# a model call), so the 2s busy timeout is not enough for a DDL statement: it
+# raises "database is locked", uvicorn exits with code 3 and the container
+# restart-loops. Retry the initialization instead of dying on it.
+SQLITE_STARTUP_LOCK_RETRY_SECONDS = 120.0
+
+
+def _run_startup_step_retrying_locked(
+    label: str,
+    fn: Callable[[], None],
+    *,
+    budget_seconds: float = SQLITE_STARTUP_LOCK_RETRY_SECONDS,
+) -> None:
+    """Run one idempotent startup step, retrying SQLite write-lock contention.
+
+    ``fn`` must be safe to re-run: the steps guarded by this helper are
+    ``checkfirst`` creates and additive ``IF NOT EXISTS`` migrations, and SQLite
+    rolls back the failed transaction before the retry. Anything that is not
+    write-lock contention (a schema/checksum mismatch, a missing column) still
+    raises immediately.
+    """
+
+    deadline = time.monotonic() + max(0.0, budget_seconds)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            fn()
+            return
+        except OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                logger.error(
+                    "SQLite stayed locked for %.0fs during %s; giving up after %d attempt(s)",
+                    budget_seconds,
+                    label,
+                    attempt,
+                )
+                raise
+            record_sqlite_locked_retry()
+            delay = min(0.25 * (2 ** (attempt - 1)), 5.0)
+            logger.warning(
+                "SQLite database is locked during %s (attempt %d); retrying in %.2fs",
+                label,
+                attempt,
+                delay,
+            )
+            time.sleep(delay)
+
+
 def init_database() -> None:
     from app.domain import (  # noqa: F401
         extension_models,
@@ -746,12 +802,18 @@ def init_database() -> None:
     )
     from app.core.migrations import apply_schema_migrations
 
-    Base.metadata.create_all(bind=engine)
-    _apply_sqlite_subapp_persistence_migration()
-    with engine.begin() as connection:
-        apply_schema_migrations(connection)
-    _ensure_sqlite_skill_package_columns()
-    _verify_schema_revisions()
+    def _run_phases() -> None:
+        Base.metadata.create_all(bind=engine)
+        _apply_sqlite_subapp_persistence_migration()
+        with engine.begin() as connection:
+            apply_schema_migrations(connection)
+        _ensure_sqlite_skill_package_columns()
+        _verify_schema_revisions()
+
+    if is_sqlite:
+        _run_startup_step_retrying_locked("database initialization", _run_phases)
+        return
+    _run_phases()
 
 
 def ensure_voice_event_type_column(connection: Any) -> None:
@@ -891,6 +953,40 @@ def _verify_schema_revisions() -> None:
             )
 
 
+def _sqlite_object_sql(connection: Any, object_type: str, name: str) -> str | None:
+    """Return the stored DDL of a SQLite schema object, or ``None`` when absent."""
+
+    # ``object_type``/``name`` are module-local constants, never user input.
+    row = connection.exec_driver_sql(
+        f"SELECT sql FROM sqlite_master WHERE type = '{object_type}' AND name = '{name}'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def _sqlite_object_has_fragment(
+    connection: Any, object_type: str, name: str, fragment: str
+) -> bool:
+    """True when the stored DDL of ``name`` already contains ``fragment``.
+
+    Startup DDL is the only schema work this process shares with a sibling
+    LearnGraph process (the preview origin starts the moment the app is healthy),
+    and every schema write needs the single SQLite write lock — which an app-side
+    sweep may legitimately hold for seconds. Rewriting a trigger that already has
+    the current shape is therefore pure lock stealing, so the rewrite is gated on
+    a marker fragment that only the current definition contains.
+
+    ``fragment`` is matched case-insensitively. When a trigger body below changes
+    in a way existing databases must adopt, update its marker fragment together
+    with the definition: ``CREATE TRIGGER IF NOT EXISTS`` never replaces an
+    existing trigger, so the marker is what decides whether to rewrite it.
+    """
+
+    sql = _sqlite_object_sql(connection, object_type, name)
+    return sql is not None and fragment.casefold() in sql.casefold()
+
+
 def ensure_sqlite_session_search_projection(connection: Any) -> None:
     """Create and repair the SQLite FTS5 projection for persisted chat messages.
 
@@ -935,11 +1031,20 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
     # content flushes. The stream commits message.content every ~0.5s while
     # status stays 'streaming'; the old unconditional DELETE rewrote the FTS
     # index on every flush (pure write amplification, ~2 FTS DELETEs/sec per
-    # active stream). Skip when BOTH old and new status are 'streaming' —
+    # active stream). Skip when BOTH old and new status are 'streaming' — 
     # finalization (streaming→completed/failed/cancelled), post-completion
     # edits, and role/session moves still sync the projection. DROP+CREATE
-    # (instead of IF NOT EXISTS) upgrades existing databases to the new shape.
-    connection.exec_driver_sql("DROP TRIGGER IF EXISTS session_messages_fts_update")
+    # (instead of IF NOT EXISTS) upgrades existing databases to the new shape,
+    # but only when the stored trigger is still the old one: an unconditional
+    # DROP is a schema write that takes the single SQLite write lock at every
+    # single startup.
+    if not _sqlite_object_has_fragment(
+        connection,
+        "trigger",
+        "session_messages_fts_update",
+        "old.status <> 'streaming'",
+    ):
+        connection.exec_driver_sql("DROP TRIGGER IF EXISTS session_messages_fts_update")
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS session_messages_fts_update
@@ -976,10 +1081,17 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
     # amplification on every auto-title change). The WHEN clause additionally
     # skips no-op updates (SQLite fires AFTER UPDATE even when the values did
     # not change), so repeated auto-title writes to the same title do not
-    # rewrite every FTS row of a long session.
-    connection.exec_driver_sql(
-        "DROP TRIGGER IF EXISTS session_messages_fts_session_update"
-    )
+    # rewrite every FTS row of a long session. Same marker gate as the update
+    # trigger above: DROP only when the stored trigger is still the old shape.
+    if not _sqlite_object_has_fragment(
+        connection,
+        "trigger",
+        "session_messages_fts_session_update",
+        "old.title IS NOT new.title",
+    ):
+        connection.exec_driver_sql(
+            "DROP TRIGGER IF EXISTS session_messages_fts_session_update"
+        )
     connection.exec_driver_sql(
         """
         CREATE TRIGGER IF NOT EXISTS session_messages_fts_session_update
@@ -1004,33 +1116,58 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
         END
         """
     )
-    connection.exec_driver_sql(
+    # Backfill and repair write to the projection, and a write statement takes
+    # the single SQLite write lock even when it matches no row. Probe read-only
+    # first so a database whose projection is already consistent (the normal
+    # startup path) never steals the lock from a sibling process's sweep.
+    if connection.exec_driver_sql(
         """
-        DELETE FROM session_messages_fts
+        SELECT 1 FROM session_messages_fts
          WHERE message_id NOT IN (
            SELECT id FROM messages WHERE status = 'completed'
          )
+         LIMIT 1
         """
-    )
-    connection.exec_driver_sql(
-        """
-        INSERT INTO session_messages_fts(
-          message_id, workspace_id, session_id, title, search_terms, raw_content
+    ).fetchone() is not None:
+        connection.exec_driver_sql(
+            """
+            DELETE FROM session_messages_fts
+             WHERE message_id NOT IN (
+               SELECT id FROM messages WHERE status = 'completed'
+             )
+            """
         )
-        SELECT m.id, m.workspace_id, m.session_id, s.title,
-               coalesce(s.title, '') || ' ' || coalesce(m.role, '') || ' ' ||
-               coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
-               coalesce(m.content, ''),
-               coalesce(m.content, '')
-          FROM messages AS m
+    if connection.exec_driver_sql(
+        """
+        SELECT 1 FROM messages AS m
           JOIN chat_sessions AS s
             ON s.id = m.session_id AND s.workspace_id = m.workspace_id
          WHERE m.status = 'completed'
            AND NOT EXISTS (
              SELECT 1 FROM session_messages_fts AS f WHERE f.message_id = m.id
            )
+         LIMIT 1
         """
-    )
+    ).fetchone() is not None:
+        connection.exec_driver_sql(
+            """
+            INSERT INTO session_messages_fts(
+              message_id, workspace_id, session_id, title, search_terms, raw_content
+            )
+            SELECT m.id, m.workspace_id, m.session_id, s.title,
+                   coalesce(s.title, '') || ' ' || coalesce(m.role, '') || ' ' ||
+                   coalesce(s.goal_id, '') || ' ' || coalesce(s.graph_id, '') || ' ' ||
+                   coalesce(m.content, ''),
+                   coalesce(m.content, '')
+              FROM messages AS m
+              JOIN chat_sessions AS s
+                ON s.id = m.session_id AND s.workspace_id = m.workspace_id
+             WHERE m.status = 'completed'
+               AND NOT EXISTS (
+                 SELECT 1 FROM session_messages_fts AS f WHERE f.message_id = m.id
+               )
+            """
+        )
 
 
 def _ensure_sqlite_skill_package_columns() -> None:
@@ -1590,17 +1727,28 @@ def _apply_sqlite_additive_migrations() -> None:
         # Deep Research's explicit CNY amount divided by the agreed 6.77 rate.
         # Preserve that historical meaning once, rather than presenting those
         # rows as newly priced or silently leaving their CNY total at zero.
-        connection.exec_driver_sql(
-            "UPDATE usage_events "
-            "SET cost_cny = cost_usd * 6.77, "
-            "usd_cny_rate = 6.77, cost_status = 'legacy_snapshot' "
-            "WHERE cost_usd > 0 AND cost_cny = 0 "
-            "AND cost_status = 'unpriced'"
-        )
-        connection.exec_driver_sql(
-            "UPDATE usage_events SET cost_status = 'non_billable' "
-            "WHERE provider_id = 'local_mock' AND cost_status = 'unpriced'"
-        )
+        # These are one-shot legacy backfills: an UPDATE that matches no row
+        # still takes the write lock, so probe read-only first and keep the
+        # already-backfilled startup path free of writes.
+        if connection.exec_driver_sql(
+            "SELECT 1 FROM usage_events "
+            "WHERE cost_usd > 0 AND cost_cny = 0 AND cost_status = 'unpriced' LIMIT 1"
+        ).fetchone() is not None:
+            connection.exec_driver_sql(
+                "UPDATE usage_events "
+                "SET cost_cny = cost_usd * 6.77, "
+                "usd_cny_rate = 6.77, cost_status = 'legacy_snapshot' "
+                "WHERE cost_usd > 0 AND cost_cny = 0 "
+                "AND cost_status = 'unpriced'"
+            )
+        if connection.exec_driver_sql(
+            "SELECT 1 FROM usage_events "
+            "WHERE provider_id = 'local_mock' AND cost_status = 'unpriced' LIMIT 1"
+        ).fetchone() is not None:
+            connection.exec_driver_sql(
+                "UPDATE usage_events SET cost_status = 'non_billable' "
+                "WHERE provider_id = 'local_mock' AND cost_status = 'unpriced'"
+            )
 
 
 def _verify_sqlite_metadata_shape() -> None:
