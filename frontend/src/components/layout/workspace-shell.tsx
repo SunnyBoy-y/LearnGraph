@@ -7,7 +7,6 @@ import {
   useSyncExternalStore,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
-  type TouchEvent as ReactTouchEvent,
 } from "react"
 import { lazy, Suspense } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -84,7 +83,6 @@ import {
   Sheet,
   SheetContent,
   SheetTitle,
-  SheetTrigger,
 } from "@/components/ui/sheet";
 import {
   Tooltip,
@@ -96,7 +94,13 @@ import { workspaceQueryKey } from "@/lib/query-keys";
 import { SettingsModal } from "@/components/layout/settings-modal";
 import { NativeActions } from "@/features/mobile/NativeActions";
 import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
-import { OPEN_GRAPH_EVENT, OPEN_SIDEBAR_EVENT } from "@/lib/mobile-shell";
+import {
+  setDrawerProgress,
+  setDrawerScrollLock,
+  useDraggingDrawer,
+  useMobileDrawerDrag,
+  type DrawerSide,
+} from "@/lib/mobile-shell";
 import {
   pauseAllPreviews,
   resumeAllPreviews,
@@ -385,6 +389,36 @@ function flattenSidebarSessions(sessions: SidebarSession[]): SidebarSession[] {
     if (session.children?.length) out.push(...flattenSidebarSessions(session.children));
   }
   return out;
+}
+
+/**
+ * 1-based position among the row's legacy 「分支.」 siblings, or undefined
+ * when nothing in the group carries a legacy prefix.
+ */
+function legacyBranchSiblingIndex(
+  siblings: SidebarSession[],
+  index: number,
+): number | undefined {
+  let count = 0;
+  for (let cursor = 0; cursor <= index && cursor < siblings.length; cursor += 1) {
+    if (/^(?:分支\.)+/.test(siblings[cursor].title.trim())) count += 1;
+  }
+  return count || undefined;
+}
+
+/**
+ * Branches created before the backend switched to 「原会话名（n）」 titles still
+ * carry a 「分支.」 prefix. Sidebar rows are no longer indented, so legacy rows
+ * are displayed with the sibling index instead of the old prefix.
+ */
+function branchRowDisplayTitle(
+  title: string,
+  legacyBranchIndex?: number,
+): string {
+  const match = /^(?:分支\.)+(.*)$/.exec(title.trim());
+  if (!match) return title;
+  const base = match[1].trim() || "未命名会话";
+  return legacyBranchIndex ? `${base}（${legacyBranchIndex}）` : base;
 }
 
 /**
@@ -2100,9 +2134,18 @@ function SessionProjects({
       project?: SidebarProject;
       ungrouped?: boolean;
       depth?: number;
+      /** 1-based index among legacy 「分支.」 siblings; display only. */
+      legacyBranchIndex?: number;
     } = {},
   ) {
     const depth = options.depth ?? 0;
+    // Nested rows share their parent's indent, so branches created before
+    // the backend wrote 「原会话名（n）」 titles are shown with the sibling
+    // index instead of the legacy 「分支.」 prefix.
+    const displayTitle = branchRowDisplayTitle(
+      session.title,
+      options.legacyBranchIndex,
+    );
     const children = session.children ?? [];
     const hasChildren = children.length > 0;
     const open = expandedSessions[session.id] ?? true;
@@ -2129,11 +2172,10 @@ function SessionProjects({
             activeSessionId === session.id && "is-active",
             selectionMode && "is-selecting",
           )}
-          style={depth > 0 ? { paddingLeft: 26 + depth * 14 } : undefined}
         >
           {selectionMode ? (
             <Checkbox
-              aria-label={`选择会话 ${session.title}`}
+              aria-label={`选择会话 ${displayTitle}`}
               checked={selectedSessionIds.has(session.id)}
               onCheckedChange={() => toggleSessionSelection(session.id)}
             />
@@ -2143,8 +2185,8 @@ function SessionProjects({
               aria-expanded={effectivelyOpen}
               aria-label={
                 effectivelyOpen
-                  ? `折叠 ${session.title} 的附属会话`
-                  : `展开 ${session.title} 的附属会话`
+                  ? `折叠 ${displayTitle} 的附属会话`
+                  : `展开 ${displayTitle} 的附属会话`
               }
               className="sidebar-session__fold"
               onClick={(event) => {
@@ -2172,7 +2214,7 @@ function SessionProjects({
               }}
             >
               <Input
-                aria-label={`编辑会话名称 ${session.title}`}
+                aria-label={`编辑会话名称 ${displayTitle}`}
                 autoFocus
                 disabled={renamePending}
                 maxLength={200}
@@ -2231,13 +2273,8 @@ function SessionProjects({
                   title="模型回复已完成"
                 />
               ) : null}
-              <span className="min-w-0 flex-1 truncate">{session.title}</span>
+              <span className="min-w-0 flex-1 truncate">{displayTitle}</span>
               {voiceActive ? <span aria-label="语音导师已开启" className="sidebar-session__voice" title="语音导师已开启">◉</span> : null}
-              {hasChildren ? (
-                <small className="sidebar-session__child-count">
-                  {children.length}
-                </small>
-              ) : null}
               {getSessionActivity(session.id).running ? (
                 <LoaderCircle
                   aria-label="生成中"
@@ -2253,8 +2290,8 @@ function SessionProjects({
                   <Button
                     aria-label={
                       session.pinned
-                        ? `取消置顶 ${session.title}`
-                        : `置顶 ${session.title}`
+                        ? `取消置顶 ${displayTitle}`
+                        : `置顶 ${displayTitle}`
                     }
                     className={cn(
                       "sidebar-project__pin",
@@ -2280,7 +2317,7 @@ function SessionProjects({
               >
                 <DropdownMenuTrigger asChild>
                   <Button
-                    aria-label={`更多会话操作 ${session.title}`}
+                    aria-label={`更多会话操作 ${displayTitle}`}
                     className="sidebar-project__more"
                     size="icon-xs"
                     variant="ghost"
@@ -2370,11 +2407,12 @@ function SessionProjects({
           ) : null}
         </div>
         {hasChildren && effectivelyOpen
-          ? children.map((child) =>
+          ? children.map((child, index) =>
               renderSessionRow(child, {
                 project: options.project,
                 ungrouped: options.ungrouped,
                 depth: depth + 1,
+                legacyBranchIndex: legacyBranchSiblingIndex(children, index),
               }),
             )
           : null}
@@ -2789,60 +2827,85 @@ function UserMenu({
   );
 }
 
-function MobileNavigation() {
-  const [open, setOpen] = useState(false);
-  const swipeRef = useRef<{ x: number; y: number } | null>(null);
+/** 顶栏 / 阅读页头的导航按钮：只负责请求打开抽屉，状态由外壳持有。 */
+function MobileNavTrigger({ onOpen }: { onOpen: () => void }) {
+  return (
+    <Button
+      aria-label="打开导航"
+      className="topbar-menu-trigger lg:hidden"
+      onClick={onOpen}
+      size="icon"
+      variant="ghost"
+    >
+      <Menu className="size-5" />
+    </Button>
+  );
+}
 
-  // 画布右滑手势 → 打开左侧栏（跨组件经 window 事件触发）
+/**
+ * 左侧导航抽屉：常驻 DOM（收起时 visibility: hidden），位移由 CSS 变量
+ * `--lg-left-drawer-progress` 驱动 —— 展开/收起补间、跟手拖拽、遮罩浓度共用
+ * 同一个进度值。内容按需挂载，并在收起动画播完后延迟卸载。
+ */
+function MobileNavDrawer({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const dragging = useDraggingDrawer("left");
+  const [contentMounted, setContentMounted] = useState(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
   useEffect(() => {
-    const openNav = () => setOpen(true);
-    window.addEventListener(OPEN_SIDEBAR_EVENT, openNav);
-    return () => window.removeEventListener(OPEN_SIDEBAR_EVENT, openNav);
-  }, []);
-
-  const handleTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
-    if (event.touches.length !== 1) {
-      swipeRef.current = null;
+    if (open || dragging) {
+      setContentMounted(true);
       return;
     }
-    const touch = event.touches[0];
-    swipeRef.current = { x: touch.clientX, y: touch.clientY };
-  };
+    // 收起动画约 320ms：播完再卸载，避免抽屉滑出时内容先消失。
+    const timer = window.setTimeout(() => setContentMounted(false), 360);
+    return () => window.clearTimeout(timer);
+  }, [open, dragging]);
 
-  // 左侧栏已打开时，左滑关闭
-  const handleTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
-    const start = swipeRef.current;
-    swipeRef.current = null;
-    if (!start) return;
-    const touch = event.changedTouches[0];
-    if (!touch) return;
-    const dx = touch.clientX - start.x;
-    const dy = touch.clientY - start.y;
-    if (dx < -60 && Math.abs(dx) > Math.abs(dy) * 1.5) setOpen(false);
-  };
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement;
+    panelRef.current?.focus({ preventScroll: true });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onOpenChange(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      if (previous instanceof HTMLElement) {
+        previous.focus({ preventScroll: true });
+      }
+    };
+  }, [open, onOpenChange]);
 
   return (
-    <Sheet onOpenChange={setOpen} open={open}>
-      <SheetTrigger asChild>
-        <Button
-          aria-label="打开导航"
-          className="topbar-menu-trigger lg:hidden"
-          size="icon"
-          variant="ghost"
-        >
-          <Menu className="size-5" />
-        </Button>
-      </SheetTrigger>
-      <SheetContent
-        className="w-[286px] p-0"
-        onTouchEnd={handleTouchEnd}
-        onTouchStart={handleTouchStart}
-        side="left"
+    <>
+      <div
+        aria-hidden="true"
+        className={cn("mobile-nav-drawer-overlay", open && "is-open")}
+        data-drawer-surface="nav"
+        onClick={() => onOpenChange(false)}
+      />
+      <div
+        aria-label="LearnGraph 导航"
+        aria-modal={open ? true : undefined}
+        className={cn("mobile-nav-drawer", open && "is-open")}
+        data-drawer-surface="nav"
+        ref={panelRef}
+        role="dialog"
+        tabIndex={-1}
       >
-        <SheetTitle className="sr-only">LearnGraph 导航</SheetTitle>
-        <SidebarNav mobile onNavigate={() => setOpen(false)} />
-      </SheetContent>
-    </Sheet>
+        {contentMounted ? (
+          <SidebarNav mobile onNavigate={() => onOpenChange(false)} />
+        ) : null}
+      </div>
+    </>
   );
 }
 
@@ -2966,12 +3029,14 @@ function TopBarStatusMenuBody({
 function TopBar({
   graphOpen,
   onOpenActivity,
+  onOpenNav,
   onToggleGraph,
   railCollapsed,
   onToggleRail,
 }: {
   graphOpen?: boolean;
   onOpenActivity: () => void;
+  onOpenNav: () => void;
   onToggleGraph?: () => void;
   railCollapsed?: boolean;
   onToggleRail?: () => void;
@@ -3024,7 +3089,7 @@ function TopBar({
   return (
     <header className="workspace-topbar">
       <div className="workspace-topbar__left">
-        <MobileNavigation />
+        <MobileNavTrigger onOpen={onOpenNav} />
         {isChat ? (
           // The chat page portals its model picker in here on phone widths.
           <div className="topbar-model-slot" id="topbar-model-slot" />
@@ -3324,6 +3389,7 @@ function ContextRail({
     <aside
       aria-hidden={collapsed || undefined}
       className="context-rail min-h-svh bg-card px-4 py-5"
+      data-drawer-swipe="ignore"
       // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
       inert={collapsed || undefined}
     >
@@ -4092,7 +4158,11 @@ function BoundGraphRail({
                   toast.message("这条历史问话不在当前会话中。");
                   return;
                 }
-                message.scrollIntoView({ behavior: "smooth", block: "center" });
+                window.dispatchEvent(
+                  new CustomEvent("learngraph:conversation-jump", {
+                    detail: { block: "center", messageId: round.id },
+                  }),
+                );
                 setExplorePanelOpen(false);
               }}
               rounds={questions}
@@ -4727,29 +4797,8 @@ export function WorkspaceShell() {
   const [activityOpen, setActivityOpen] = useState(false);
   // Narrow screens hide the context rail; this re-opens it as a right drawer.
   const [graphDrawerOpen, setGraphDrawerOpen] = useState(false);
-  // 图谱抽屉打开时，在其外部区域右滑收起
-  const graphBackdropSwipeRef = useRef<{ x: number; y: number } | null>(null);
-  const handleGraphBackdropTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
-    if (event.touches.length !== 1) {
-      graphBackdropSwipeRef.current = null;
-      return;
-    }
-    const touch = event.touches[0];
-    graphBackdropSwipeRef.current = { x: touch.clientX, y: touch.clientY };
-  };
-  const handleGraphBackdropTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
-    const start = graphBackdropSwipeRef.current;
-    graphBackdropSwipeRef.current = null;
-    if (!start) return;
-    const touch = event.changedTouches[0];
-    if (!touch) return;
-    const dx = touch.clientX - start.x;
-    const dy = touch.clientY - start.y;
-    if (dx > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-      setGraphDrawerOpen(false);
-      setSelectionExplanationOpen(false);
-    }
-  };
+  // 窄屏左侧导航抽屉：常驻 DOM，位移由 CSS 进度变量驱动。
+  const [navOpen, setNavOpen] = useState(false);
   // Keep the inspector mounted while 划词解释 is open, even if the graph rail
   // was folded — otherwise the independent canvas cannot appear.
   const [selectionExplanationOpen, setSelectionExplanationOpen] = useState(false);
@@ -4781,12 +4830,6 @@ export function WorkspaceShell() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [graphDrawerOpen]);
-  // 画布左滑手势 → 打开右侧图谱抽屉
-  useEffect(() => {
-    const openGraph = () => setGraphDrawerOpen(true);
-    window.addEventListener(OPEN_GRAPH_EVENT, openGraph);
-    return () => window.removeEventListener(OPEN_GRAPH_EVENT, openGraph);
-  }, []);
   useEffect(() => {
     // Listen at the shell level so a collapsed rail can re-open before ContextRail mounts.
     const forceOpen = (event: Event) => {
@@ -4870,6 +4913,32 @@ export function WorkspaceShell() {
       // Leave graph drawer state alone on desktop; only clear the forced-open flag.
     }
   }, []);
+  const openNavDrawer = useCallback(() => setNavOpen(true), []);
+  // 抽屉位移统一由 CSS 变量承载：展开/收起补间、跟手拖拽、遮罩浓度共用一个进度。
+  useEffect(() => {
+    setDrawerProgress("left", navOpen ? 1 : 0);
+  }, [navOpen]);
+  useEffect(() => {
+    setDrawerProgress("right", graphDrawerOpen ? 1 : 0);
+  }, [graphDrawerOpen]);
+  useEffect(() => {
+    setDrawerScrollLock(navOpen);
+    return () => setDrawerScrollLock(false);
+  }, [navOpen]);
+  const commitDrawerDrag = useCallback((side: DrawerSide, open: boolean) => {
+    if (side === "left") {
+      setNavOpen(open);
+      return;
+    }
+    setGraphDrawerOpen(open);
+    if (!open) setSelectionExplanationOpen(false);
+  }, []);
+  // 全屏手势：右滑拉出左侧导航，左滑拉出右侧图谱抽屉；在面板/遮罩上反向拖拽收起。
+  useMobileDrawerDrag({
+    leftAvailable: true,
+    onCommit: commitDrawerDrag,
+    rightAvailable: railAvailable,
+  });
   return (
     <div
       className={cn(
@@ -4910,13 +4979,14 @@ export function WorkspaceShell() {
           <>
             {isDocumentReader ? (
               <header className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b bg-background/92 px-3 backdrop-blur-xl lg:hidden">
-                <MobileNavigation />
+                <MobileNavTrigger onOpen={openNavDrawer} />
                 <span className="text-sm font-semibold">LearnGraph</span>
               </header>
             ) : (
               <TopBar
                 graphOpen={graphDrawerOpen}
                 onOpenActivity={() => setActivityOpen(true)}
+                onOpenNav={openNavDrawer}
                 onToggleGraph={
                   showContextRail
                     ? () => setGraphDrawerOpen((current) => !current)
@@ -4930,6 +5000,8 @@ export function WorkspaceShell() {
           </>
         )}
       </main>
+      {/* 左侧导航抽屉：常驻 DOM，位移由 --lg-left-drawer-progress 驱动 */}
+      <MobileNavDrawer onOpenChange={setNavOpen} open={navOpen} />
       {railAvailable ? (
         <>
           <div
@@ -4944,12 +5016,11 @@ export function WorkspaceShell() {
           <div
             aria-hidden="true"
             className="graph-drawer-backdrop"
+            data-drawer-surface="graph"
             onClick={() => {
               setGraphDrawerOpen(false);
               setSelectionExplanationOpen(false);
             }}
-            onTouchEnd={handleGraphBackdropTouchEnd}
-            onTouchStart={handleGraphBackdropTouchStart}
           />
           <ContextRail
             // Desktop fold, or narrow drawer closed: keep mounted for CSS but not interactive.
