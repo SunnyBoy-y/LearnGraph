@@ -12,6 +12,7 @@ VOICE_EVENT_TYPES = (
     "turn.interrupted", "assistant.llm.delta", "assistant.sentence.queued",
     "assistant.sentence.playback_started", "assistant.sentence.playback_ended",
     "processor.error", "processor.retry_scheduled", "context.updated",
+    "session.ice",
 )
 
 class RTVIEventEnvelope(BaseModel):

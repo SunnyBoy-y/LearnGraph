@@ -7,6 +7,7 @@ import {
   Globe,
   Info,
   Palette,
+  RadioTower,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -25,6 +26,7 @@ export type SettingsNavItem = {
 export const settingsNav: SettingsNavItem[] = [
   { label: "工作区设置", icon: SlidersHorizontal, path: "settings/workspace" },
   { label: "模型 Provider", icon: Bot, path: "settings/providers" },
+  { label: "语音中继", icon: RadioTower, path: "settings/voice-relay" },
   { label: "用量与预算", icon: CircleDollarSign, path: "settings/usage" },
   { label: "个性化", icon: Palette, path: "settings/personalization" },
   { label: "扩展中心", icon: Sparkles, path: "settings/extensions" },

@@ -3620,3 +3620,61 @@ class VoiceSpeechDeliveryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     playback_cursor_ms: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class VoiceRelayConfig(Base, TimestampMixin):
+    """Deployment-wide TURN/STUN relay for realtime voice (A2-1).
+
+    Deliberately **not** ``WorkspaceScopedMixin``: the deployment administrator
+    configures one relay and every workspace's calls use it, so the row has no
+    owning workspace.  The credential never lands here -- only a mask and a
+    fingerprint, mirroring ``ProviderConfig``; the ciphertext lives in
+    ``VoiceRelaySecret``.
+    """
+
+    __tablename__ = "voice_relay_configs"
+    __table_args__ = (UniqueConstraint("scope", name="uq_voice_relay_scope"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    # Reserved for a future per-workspace override; today only "deployment".
+    scope: Mapped[str] = mapped_column(String(32), default="deployment")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Both modes go through Cloudflare's ephemeral-credential API today; the
+    # column stays explicit so a static-credential provider can be added later
+    # without another schema change.
+    mode: Mapped[str] = mapped_column(String(24), default="cloudflare")
+    # Ordered ICE server URLs.  aiortc honours only the first STUN/TURN entry, so
+    # the runtime picks its transport from position 0 while browsers receive all
+    # of them and fall back on their own.
+    urls: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    # Cloudflare TURN Key ID (not secret); the API token is sealed separately.
+    key_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    api_base: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    credential_ttl_seconds: Mapped[int] = mapped_column(Integer, default=86400)
+    secret_masked: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    secret_fingerprint: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="unconfigured")
+    status_detail: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_by_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class VoiceRelaySecret(Base, TimestampMixin):
+    """Sealed credential for the deployment relay (shape mirrors ProviderSecret)."""
+
+    __tablename__ = "voice_relay_secrets"
+    config_id: Mapped[str] = mapped_column(
+        ForeignKey("voice_relay_configs.id", ondelete="CASCADE"), primary_key=True
+    )
+    ciphertext: Mapped[str] = mapped_column(Text)
+    algorithm: Mapped[str] = mapped_column(String(40), default="fernet_sha256_v1")
+    key_provider: Mapped[str] = mapped_column(String(32), default="environment")
+    key_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    secret_version: Mapped[int] = mapped_column(Integer, default=1)
+    rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )

@@ -9,6 +9,7 @@ import {
 import { apiClient, ApiError } from "@/api/client";
 import {
   cancelVoiceTask as requestVoiceTaskCancel,
+  getVoiceIceServers,
   getVoiceSession as requestVoiceSession,
   getVoiceTask as requestVoiceTask,
   startVoiceTask as requestVoiceTaskStart,
@@ -111,10 +112,61 @@ export interface VoiceSessionSnapshot {
   degradedNotice: string | null;
   /** True when ordinary text chat must be allowed even though voice mode is on. */
   textFallback: boolean;
+  /**
+   * The ICE path this call settled on, as reported by the server once the
+   * candidate pair is nominated. Null until that event arrives.
+   */
+  icePath: VoiceIcePath | null;
+}
+
+/** Which ICE candidate pair a live call is using (from the ``session.ice`` event). */
+export interface VoiceIcePath {
+  /** Local and remote candidate types, e.g. "host↔prflx" or "relay↔relay". */
+  label: string;
+  /** True when either end of the pair is a TURN relay (i.e. it costs relay traffic). */
+  relayed: boolean;
+  protocol: string;
 }
 
 const STORAGE_KEY = "learngraph.voice.preferences.v1";
 const REMOTE_SESSION_STORAGE_KEY = "learngraph.voice.remote-sessions.v1";
+
+/**
+ * Deployment-wide ICE servers (STUN/TURN) configured by the instance
+ * administrator.
+ *
+ * Cached for a few minutes rather than per dial: the credential the server hands
+ * out lives for hours, and a call must not wait on a settings round-trip. Any
+ * failure -- offline, expired session, relay misconfigured -- degrades to an
+ * empty list, i.e. exactly the behaviour of a deployment that never configured a
+ * relay, so a broken relay can never make calling impossible.
+ */
+const ICE_SERVERS_TTL_MS = 5 * 60_000;
+let iceServersCache: { at: number; servers: RTCIceServer[] } | null = null;
+
+async function loadIceServers(): Promise<RTCIceServer[]> {
+  const now = Date.now();
+  if (iceServersCache && now - iceServersCache.at < ICE_SERVERS_TTL_MS) {
+    return iceServersCache.servers;
+  }
+  try {
+    const config = await getVoiceIceServers();
+    const servers = (config.iceServers ?? [])
+      .filter((item) =>
+        Array.isArray(item.urls) ? item.urls.length > 0 : Boolean(item.urls),
+      )
+      .map((item) => ({
+        urls: item.urls,
+        username: item.username ?? undefined,
+        credential: item.credential ?? undefined,
+      })) as RTCIceServer[];
+    iceServersCache = { at: now, servers };
+    return servers;
+  } catch {
+    iceServersCache = { at: now, servers: [] };
+    return [];
+  }
+}
 
 function readPersistedRemoteSession(workspaceId: string, sessionId: string): string | null {
   if (!workspaceId || !sessionId || typeof window === "undefined") return null;
@@ -146,7 +198,7 @@ function forgetRemoteSession(workspaceId: string, sessionId: string) {
     window.localStorage.setItem(REMOTE_SESSION_STORAGE_KEY, JSON.stringify(stored));
   } catch { /* storage is optional */ }
 }
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, textFallback: false };
+const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, textFallback: false, icePath: null };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
@@ -647,12 +699,28 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       return;
     case "session.ready":
       // A rebuilt pipeline re-resolves every stage, so a previous degradation is
-      // no longer a statement about the current one.
+      // no longer a statement about the current one.  The ICE path belongs to the
+      // *connection*, not the pipeline, so it survives a pipeline rebuild.
       update({
         transport: "connected", state: "listening", error: null,
         degradedStages: [], degradedNotice: null, textFallback: false,
       });
       return;
+    case "session.ice": {
+      // Which candidate pair the connection settled on. Kept in the snapshot so
+      // the call can say "relayed" or "direct" out loud -- otherwise a deployment
+      // that configured a relay has no way to confirm it is actually in use.
+      const localType = String(payload.local_type ?? "");
+      const remoteType = String(payload.remote_type ?? "");
+      update({
+        icePath: {
+          label: String(payload.label ?? `${localType || "?"}↔${remoteType || "?"}`),
+          relayed: payload.relayed === true,
+          protocol: String(payload.protocol ?? ""),
+        },
+      });
+      return;
+    }
     case "session.reconnecting":
       update({ transport: "reconnecting", error: null });
       return;
@@ -1249,7 +1317,11 @@ export const voiceSessionController = {
       if (!offerPath || typeof RTCPeerConnection === "undefined" || !navigator.mediaDevices?.getUserMedia) {
         throw new Error("当前浏览器或内置语音运行时不支持 WebRTC。");
       }
-      peerConnection = new RTCPeerConnection();
+      // Deployment-wide ICE servers (STUN/TURN) from the instance administrator.
+      // Resolved before the peer connection exists; failures degrade to an empty
+      // list so a broken relay cannot stop a call that could still go direct.
+      const iceServers = await loadIceServers();
+      peerConnection = new RTCPeerConnection({ iceServers });
       iceRestartAttempted = false;
       const handleTransportDrop = () => {
         const state = peerConnection?.connectionState;

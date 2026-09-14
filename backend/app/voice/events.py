@@ -63,6 +63,7 @@ VOICE_EVENT_TYPES: tuple[str, ...] = (
     "processor.error",
     "processor.retry_scheduled",
     "context.updated",
+    "session.ice",
 )
 
 PHASE_SPECULATIVE = "speculative"

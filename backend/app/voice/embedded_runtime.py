@@ -4,10 +4,14 @@ This is the demo-voice2o2 runner reduced to a router: the same API process owns
 the offer endpoint and starts the Pipecat pipeline per peer connection.
 """
 
+import asyncio
 import importlib.util
 import json
+import logging
 import uuid
 from typing import Annotated, Any
+
+logger = logging.getLogger(__name__)
 
 
 def install_embedded_runtime(app: Any) -> bool:
@@ -19,6 +23,7 @@ def install_embedded_runtime(app: Any) -> bool:
         from pipecat.runner.types import SmallWebRTCRunnerArguments
         from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
         from pipecat.transports.smallwebrtc.request_handler import (
+            IceCandidate,
             SmallWebRTCPatchRequest,
             SmallWebRTCRequest,
             SmallWebRTCRequestHandler,
@@ -72,6 +77,26 @@ def install_embedded_runtime(app: Any) -> bool:
         if request_voice_session_id and request_voice_session_id != session_id:
             raise HTTPException(status_code=409, detail="Voice session mismatch")
 
+        # Deployment-wide TURN/STUN, configured by the instance administrator.
+        # It is applied to the *handler*, not to this connection, because pipecat
+        # reads it while building each new peer connection: a saved change takes
+        # effect on the next call with no restart, and peers already up are left
+        # alone.  Resolution never raises -- any failure degrades to host-only
+        # ICE, i.e. exactly the behaviour of a deployment with no relay at all.
+        try:
+            from app.services.voice_relay import resolve_for_runtime
+
+            resolved = await asyncio.to_thread(resolve_for_runtime)
+            handler.update_ice_servers(resolved.as_aiortc_servers())
+            if resolved.configured:
+                logger.debug(
+                    "Voice relay applied (%s URLs, source=%s)",
+                    len(resolved.urls),
+                    resolved.source,
+                )
+        except Exception:
+            logger.debug("voice relay injection failed", exc_info=True)
+
         async def on_connection(connection: SmallWebRTCConnection):
             args = SmallWebRTCRunnerArguments(
                 webrtc_connection=connection,
@@ -101,7 +126,29 @@ def install_embedded_runtime(app: Any) -> bool:
         settings: AppSettings,
     ):
         try:
-            parsed_request = SmallWebRTCPatchRequest(**dict(request))
+            # ``SmallWebRTCPatchRequest`` and ``IceCandidate`` are plain dataclasses
+            # in pipecat 1.9 (see ``pipecat/runner/run.py``), so unpacking the JSON
+            # body directly would leave ``candidates`` as raw dicts and
+            # ``handle_patch_request`` would blow up on ``candidate.candidate``
+            # with a 500.  That failure is fatal, not cosmetic: the candidates in
+            # this PATCH are the *only* place the server learns the browser's
+            # addresses (the offer SDP carries none), so without them ICE never
+            # completes and every call dies on "Timeout establishing the
+            # connection to the remote peer" while the pipeline itself looks
+            # healthy.  Map them explicitly, exactly like the reference runner.
+            candidates = [
+                IceCandidate(
+                    candidate=str(item.get("candidate") or ""),
+                    sdp_mid=str(item.get("sdp_mid") or "0"),
+                    sdp_mline_index=int(item.get("sdp_mline_index") or 0),
+                )
+                for item in (request.get("candidates") or [])
+                if isinstance(item, dict)
+            ]
+            parsed_request = SmallWebRTCPatchRequest(
+                pc_id=str(request.get("pc_id") or ""),
+                candidates=candidates,
+            )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="Invalid ICE patch") from exc
         VoiceSessionService(db, context, settings).require_runtime_access(

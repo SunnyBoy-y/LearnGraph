@@ -216,3 +216,23 @@ def voice_workspace_context(
 VoiceWorkspaceContext = Annotated[
     WorkspaceContext, Depends(voice_workspace_context)
 ]
+
+
+def require_system_admin(context: CurrentWorkspace) -> WorkspaceContext:
+    """Deployment-administrator gate for instance-wide configuration.
+
+    Exists as a reusable dependency because the same check was previously
+    inlined in each router; a new instance-wide surface should not have to
+    re-derive it (and get it subtly wrong).
+    """
+
+    if not context.principal.is_system_admin:
+        raise AppError(
+            403,
+            "deployment_admin_required",
+            "仅终端管理员（系统管理员）可修改全系统配置",
+        )
+    return context
+
+
+SystemAdminContext = Annotated[WorkspaceContext, Depends(require_system_admin)]

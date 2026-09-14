@@ -36,6 +36,7 @@ const SourcesPage = lazy(() => import('@/features/resources/resource-pages').the
 const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
 const MemoryPage = lazy(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
 const ProvidersPage = lazy(() => import('@/features/settings/provider-pages').then((module) => ({ default: module.ProvidersPage })))
+const VoiceRelayPage = lazy(() => import('@/features/settings/voice-relay-page').then((module) => ({ default: module.VoiceRelayPage })))
 const UsagePage = lazy(() => import('@/features/settings/usage-pages').then((module) => ({ default: module.UsagePage })))
 const ExtensionsPage = lazy(() => import('@/features/settings/extension-pages').then((module) => ({ default: module.ExtensionsPage })))
 const SearchFetchPage = lazy(() => import('@/features/settings/search-fetch-page').then((module) => ({ default: module.SearchFetchPage })))
@@ -181,6 +182,7 @@ function AppRoutes() {
         <Route element={<MemoryPage />} path="memory" />
         <Route element={<Navigate replace to="../settings/workspace" />} path="memory/settings" />
         <Route element={<ProvidersPage />} path="settings/providers" />
+        <Route element={<VoiceRelayPage />} path="settings/voice-relay" />
         <Route element={<UsagePage />} path="settings/usage" />
         <Route element={<ExtensionsPage />} path="settings/extensions" />
         <Route element={<SearchFetchPage />} path="settings/search-fetch" />

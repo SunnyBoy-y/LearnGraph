@@ -37,6 +37,7 @@ from app.api.routers import (
     usage,
     workflow,
     voice,
+    voice_relay,
     sandbox,
     session_sharing,
 )
@@ -80,6 +81,7 @@ for router in (
     audit_settings.router,
     workflow.router,
     voice.router,
+    voice_relay.router,
     sandbox.router,
     session_sharing.router,
 ):
