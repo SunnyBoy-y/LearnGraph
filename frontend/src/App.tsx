@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { LoaderCircle, Network } from 'lucide-react'
 import { Toaster } from 'sonner'
@@ -7,6 +7,8 @@ import { Toaster } from 'sonner'
 import { WorkspaceShell } from '@/components/layout/workspace-shell'
 import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { listGraphs } from '@/api'
+import { workspaceQueryKey } from '@/lib/query-keys'
 import { AuthProvider, RequireAuth } from '@/features/auth/auth-context'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { registerAuthQueryClient } from '@/lib/auth-query-cache'
@@ -24,11 +26,12 @@ const ChatCanvasPage = lazy(() => import('@/features/chat/chat-pages').then((mod
 const VersionsPage = lazy(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.VersionsPage })))
 const EvidenceReviewPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.EvidenceReviewPage })))
 const ExerciseAnswerPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.ExerciseAnswerPage })))
-const PracticePage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.PracticePage })))
+const PracticeCenterPage = lazy(() => import('@/features/practice/practice-center-page').then((module) => ({ default: module.PracticeCenterPage })))
+const PracticeSessionPage = lazy(() => import('@/features/practice/practice-session-page').then((module) => ({ default: module.PracticeSessionPage })))
+const PracticeReportPage = lazy(() => import('@/features/practice/practice-report-page').then((module) => ({ default: module.PracticeReportPage })))
 const RoadmapPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.RoadmapPage })))
 const ResearchPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.ResearchPage })))
 const ResearchNewTaskPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.ResearchNewTaskPage })))
-const SearchPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SearchPage })))
 const SourcesPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SourcesPage })))
 const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
 const MemoryPage = lazy(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
@@ -78,6 +81,14 @@ function GoalModeRedirect() {
   return <Navigate replace to={`/w/${workspaceId}/chat/new?mode=goal`} />
 }
 
+/** 联网搜索与网页获取页（SearchPage）对全部用户下线：入口与页面同时撤下，
+ *  老书签或手输的 /w/:id/research/search 统一回工作台首页。
+ *  只动前端 UI，聊天内的联网搜索与网页抓取能力不受影响。 */
+function SearchFetchRemovedRedirect() {
+  const { workspaceId = '' } = useParams()
+  return <Navigate replace to={`/w/${workspaceId}/home`} />
+}
+
 function NotFound() {
   const auth = useAuth()
   const location = useLocation()
@@ -88,6 +99,29 @@ function NotFound() {
 
 function RouteLoading() {
   return <main aria-live="polite" className="grid min-h-svh place-items-center bg-background"><div className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在载入工作区…</div></main>
+}
+
+/**
+ * 旧「路线」一级页已收敛为图谱里的「学习计划」面板。
+ *
+ * 老链接（书签 / 历史会话）先尝试把 goalId 解析成本工作区里的对应图谱，再跳到
+ * `/w/:id/graphs/:graphId?panel=plan`。如果数据不足以确定图谱（例如目标还没有图
+ * 谱），继续渲染原路线页——只做入口收敛，绝不制造 404。
+ */
+function LegacyRoadmapRoute() {
+  const { workspaceId = '', goalId = '' } = useParams()
+  const graphs = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'graphs'),
+    queryFn: listGraphs,
+    enabled: Boolean(workspaceId),
+    staleTime: 30_000,
+  })
+  if (graphs.isPending) return <RouteLoading />
+  const graph = graphs.data?.find((item) => item.goal_id === goalId)
+  if (graph) {
+    return <Navigate replace to={`/w/${workspaceId}/graphs/${graph.id}?panel=plan`} />
+  }
+  return <RoadmapPage />
 }
 
 function WorkspaceRouteGuard({ children }: { children: ReactNode }) {
@@ -123,7 +157,7 @@ function AppRoutes() {
         <Route element={<GoalModeRedirect />} path="goals/new/clarify" />
         <Route element={<GoalConfirmPage />} path="goals/:goalId/confirm" />
         <Route element={<GraphReviewPage />} path="goals/:goalId/graph-review" />
-        <Route element={<RoadmapPage />} path="goals/:goalId/roadmap" />
+        <Route element={<LegacyRoadmapRoute />} path="goals/:goalId/roadmap" />
         <Route element={<GraphWorkspacePage />} path="graphs" />
         <Route element={<GraphWorkspacePage />} path="graphs/:graphId" />
         <Route element={<CapabilityGraphPage />} path="capabilities" />
@@ -132,11 +166,17 @@ function AppRoutes() {
         <Route element={<VersionsPage />} path="chat/:sessionId/versions" />
         <Route element={<SourcesPage />} path="sources" />
         <Route element={<DocumentLearningPage />} path="documents/:fileId" />
-        <Route element={<SearchPage />} path="research/search" />
+        <Route
+          // 联网搜索与网页获取（Search & fetch）页面已下线：入口与页面同时撤下。
+          element={<SearchFetchRemovedRedirect />}
+          path="research/search"
+        />
         <Route element={<ResearchNewTaskPage />} path="research/tasks/new" />
         <Route element={<ResearchPage />} path="research/tasks/:taskId" />
         <Route element={<EvidenceReviewPage />} path="evidence/review" />
-        <Route element={<PracticePage />} path="practice" />
+        <Route element={<PracticeCenterPage />} path="practice" />
+        <Route element={<PracticeSessionPage />} path="practice/session/:practiceSessionId" />
+        <Route element={<PracticeReportPage />} path="practice/report/:practiceSessionId" />
         <Route element={<ExerciseAnswerPage />} path="practice/:setId/:questionId" />
         <Route element={<MemoryPage />} path="memory" />
         <Route element={<Navigate replace to="../settings/workspace" />} path="memory/settings" />

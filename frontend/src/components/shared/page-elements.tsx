@@ -10,7 +10,7 @@ export function PageFrame({ children, className }: { children: ReactNode; classN
   return (
     <div
       className={cn(
-        'animate-in fade-in slide-in-from-bottom-1 duration-300 mx-auto flex w-full max-w-[1180px] flex-col gap-5 px-5 pb-32 pt-5 sm:px-7',
+        'animate-in fade-in slide-in-from-bottom-1 duration-300 mx-auto flex w-full max-w-[1180px] flex-col gap-5 px-5 pb-32 pt-14 sm:px-7 lg:pt-5',
         className,
       )}
     >

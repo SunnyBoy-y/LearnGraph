@@ -30,7 +30,6 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
-  FileSearch,
   Files,
   Focus,
   Folder,
@@ -52,7 +51,6 @@ import {
   Pin,
   Play,
   Plus,
-  Route,
   Save,
   Search,
   Share2,
@@ -148,7 +146,6 @@ import {
   getSessionDeleteImpact,
   getSessionBatchDeleteImpact,
   listGraphs,
-  listGoals,
   listNodeQuestions,
   listProjects,
   listSessions,
@@ -206,23 +203,17 @@ const primaryNav: NavItem[] = [
     path: "chat/new?mode=goal",
     aliases: ["/graphs/", "/capabilities"],
   },
-  {
-    label: "路线",
-    icon: Route,
-    path: "chat/new?mode=goal",
-    aliases: ["/roadmap"],
-  },
+  // 「路线」不再是一级入口：Roadmap 收敛为图谱内的「学习计划」时间行动层
+  // （见 GraphWorkspacePage 的 plan 面板）。旧 /goals/:goalId/roadmap 仍可打开，
+  // 会重定向到对应图谱的 ?panel=plan。
   { label: "资料", icon: Files, path: "sources" },
   { label: "产物", icon: Package, path: "artifacts", aliases: ["/artifacts"] },
 ];
 
 const primaryMoreNav: NavItem[] = [
-  {
-    label: "研究",
-    icon: FileSearch,
-    path: "research/search",
-    aliases: ["/research/"],
-  },
+  // 「研究」入口已移除：联网搜索与网页获取页（research/search）对全部用户下线，
+  // 直接访问该地址会被重定向到工作台首页（见 App.tsx 的 research/search 路由）。
+  // 聊天内的联网搜索 / 网页抓取能力不受影响。
   {
     label: "练习",
     icon: GraduationCap,
@@ -572,40 +563,6 @@ function SidebarNav({
   const [deleteImpactLoading, setDeleteImpactLoading] = useState(false);
   const [deleteConfirming, setDeleteConfirming] = useState(false);
   const base = `/w/${workspaceId}`;
-  const isSettings = pathname.includes("/settings/");
-  const graphsQuery = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "graphs"),
-    queryFn: listGraphs,
-    staleTime: 30_000,
-    enabled: !isSettings,
-  });
-  const goalsQuery = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "goals"),
-    queryFn: listGoals,
-    staleTime: 30_000,
-    enabled: !isSettings,
-  });
-  const firstProject = projectsQuery.data?.find(
-    (item) =>
-      item.status !== "archived" &&
-      (item.primary_graph_id || item.primary_goal_id),
-  );
-  const routeGraphId = pathname.match(/\/graphs\/([^/]+)/)?.[1];
-  const routeGoalId = pathname.match(/\/goals\/([^/]+)/)?.[1];
-  const lastGraphId = window.localStorage.getItem("learngraph:last-graph-id");
-  const contextGraph =
-    graphsQuery.data?.find((graph) => graph.id === routeGraphId) ??
-    graphsQuery.data?.find((graph) => graph.goal_id === routeGoalId) ??
-    graphsQuery.data?.find((graph) => graph.id === lastGraphId) ??
-    graphsQuery.data?.find(
-      (graph) => graph.id === firstProject?.primary_graph_id,
-    ) ??
-    graphsQuery.data?.[0];
-  const contextGoalId =
-    routeGoalId ??
-    contextGraph?.goal_id ??
-    firstProject?.primary_goal_id ??
-    goalsQuery.data?.[0]?.id;
   const runtimePrimaryNav = primaryNav.map((item) =>
     item.label === "新对话"
       ? {
@@ -618,13 +575,6 @@ function SidebarNav({
             // 图谱工作台默认进入书架；单开某本图谱后再进入画布。
             path: "graphs",
           }
-        : item.label === "路线"
-          ? {
-              ...item,
-            path: contextGoalId
-              ? `goals/${contextGoalId}/roadmap`
-              : "chat/new?mode=goal",
-            }
           : item,
   );
   const nav = runtimePrimaryNav.slice(0, 5);
@@ -3249,7 +3199,6 @@ function ContextRail({
   const showActivity = [
     "/home",
     "/sources",
-    "/roadmap",
     "/evidence/",
     "/research/",
     "/practice",
