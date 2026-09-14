@@ -562,6 +562,22 @@ def run_sandbox_cleanup_sweep(*, now: datetime | None = None) -> dict[str, int]:
     except Exception:
         logger.exception("Web fetch container pool prune failed")
 
+    # Derived egress-policy snapshots have no other owner; reclaim only the
+    # provably dead ones (expired beyond grace + no live session + all
+    # authorization gone). Best-effort, and never a workspace-data operation.
+    try:
+        from app.services.egress_policy_maintenance import prune_derived_egress_policies
+
+        with SessionLocal() as policy_db:
+            policy_totals = prune_derived_egress_policies(policy_db, settings, now=current)
+        if policy_totals.get("pruned"):
+            logger.info(
+                "Egress policy snapshot prune removed %s file(s)",
+                policy_totals["pruned"],
+            )
+    except Exception:
+        logger.exception("Egress policy snapshot prune failed")
+
     snapshot_grace_seconds = max(
         settings.sandbox_snapshot_cleanup_grace_seconds,
         settings.sandbox_wall_time_seconds + 120,

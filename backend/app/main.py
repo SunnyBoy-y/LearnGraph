@@ -37,6 +37,30 @@ from app.services.chat_durable import enqueue_interrupted_chat_resumes
 from app.voice.embedded_runtime import close_embedded_runtime, install_embedded_runtime
 
 
+def _prune_dead_egress_policy_snapshots() -> None:
+    """Reclaim derived egress-policy snapshots that can authorize nothing anymore.
+
+    Startup is the safest moment to do this: no sandbox container is created yet,
+    and the same gates as the periodic sweep apply (expired beyond a grace period,
+    no live sandbox session, no remaining authorization). Best-effort by design —
+    housekeeping must never block the API from starting.
+    """
+    import logging
+
+    try:
+        from app.core.database import SessionLocal
+        from app.services.egress_policy_maintenance import prune_derived_egress_policies
+
+        with SessionLocal() as db:
+            totals = prune_derived_egress_policies(db, get_settings())
+        if totals.get("pruned"):
+            logging.getLogger(__name__).info(
+                "Startup egress policy prune removed %s file(s)", totals["pruned"]
+            )
+    except Exception:
+        logging.getLogger(__name__).exception("Startup egress policy prune failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -53,6 +77,7 @@ async def lifespan(app: FastAPI):
     ensure_demo_data()
     mark_interrupted_document_jobs()
     mark_interrupted_message_streams()
+    _prune_dead_egress_policy_snapshots()
     durable_queue_stop: asyncio.Event | None = None
     durable_queue_task: asyncio.Task[None] | None = None
     if settings.durable_queue_enabled:

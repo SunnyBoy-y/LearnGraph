@@ -122,9 +122,8 @@ class EgressApprovalService:
             sandbox_egress_allow_public,
         )
         from app.services.sandbox_network_policy import (
-            AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
             AGENT_EGRESS_POLICY_ISSUER,
-            AGENT_EGRESS_POLICY_MAX_TTL_SECONDS,
+            agent_egress_policy_ttl_seconds,
             derive_egress_policy_for_agent,
             load_workspace_policy_file,
             store_workspace_policy_file,
@@ -190,10 +189,13 @@ class EgressApprovalService:
                 if isinstance(raw, dict) and raw.get("issuer") == AGENT_EGRESS_POLICY_ISSUER:
                     path.unlink(missing_ok=True)
             return None
-        ttl = AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS
+        ttl = agent_egress_policy_ttl_seconds(
+            getattr(self.settings, "sandbox_workspace_absolute_ttl_seconds", None),
+            getattr(self.settings, "sandbox_container_absolute_ttl_seconds", None),
+        )
         if expirations:
             remaining = int((min(expirations) - current).total_seconds())
-            ttl = max(60, min(AGENT_EGRESS_POLICY_MAX_TTL_SECONDS, remaining))
+            ttl = max(60, min(ttl, remaining))
         try:
             policy = derive_egress_policy_for_agent(
                 workspace_id=self.workspace_id,

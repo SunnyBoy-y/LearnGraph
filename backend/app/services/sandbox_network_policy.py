@@ -93,8 +93,14 @@ WEB_FETCH_POLICY_FILE_SUFFIX = ".web_fetch.json"
 # approval-derived policy from a deployment-reviewed baseline.
 AGENT_EGRESS_POLICY_ISSUER = "agent_egress_authorization"
 AGENT_EGRESS_POLICY_APPROVAL_ID = "agent_egress_authorization"
+# Fallback when the sandbox session lifetime is unknown to the caller; the
+# effective default is derived from the session's absolute TTL by
+# ``agent_egress_policy_ttl_seconds``.
 AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS = 86400
 AGENT_EGRESS_POLICY_MAX_TTL_SECONDS = 7 * 86400
+# Margin added on top of the session's absolute TTL so a snapshot cannot expire
+# while the container it authorizes is still legally alive.
+AGENT_EGRESS_POLICY_TTL_MARGIN_SECONDS = 1800
 
 # RFC 5737 documentation ranges and RFC 3849 IPv6 documentation range are not
 # reachable on the public internet; treating them as unreachable keeps the
@@ -756,6 +762,47 @@ def store_workspace_policy_file(policy_dir: str | Path, policy: EgressPolicy) ->
     finally:
         temporary.unlink(missing_ok=True)
     return policy_path
+
+
+def agent_egress_policy_ttl_seconds(
+    absolute_session_ttl_seconds: int | None,
+    container_ttl_seconds: int | None = None,
+) -> int:
+    """Default lifetime for a derived generic Agent egress policy snapshot.
+
+    A snapshot is only rewritten when a sandbox container is created
+    (``_egress_envelope``), so it has to outlive every container that can hold
+    its digest. Two independent knobs bound such a container: the execution
+    container's absolute TTL (``sandbox_container_absolute_ttl_seconds``, used by
+    both the per-chat sweep and the pooled instance) and the session's workspace
+    TTL (``sandbox_workspace_absolute_ttl_seconds``, clamped by
+    ``_touch_session``). The snapshot lifetime is derived from the larger of the
+    two plus a margin, so raising either knob cannot silently make a live
+    container's permission expire first.
+
+    This does not widen the authorization window: the digest is only ever handed
+    to containers this API creates, and their lifetime stays bounded by those
+    same knobs, so nothing else can reach a longer-lived snapshot.
+    Deployment-reviewed baselines and ``allow_once`` leases still clamp the
+    result to their own earlier expiry (see
+    ``EgressApprovalService.ensure_agent_egress_policy``).
+    """
+    bounds: list[int] = []
+    for value in (absolute_session_ttl_seconds, container_ttl_seconds):
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            bounds.append(parsed)
+    base = max(bounds) if bounds else AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS
+    return max(
+        60,
+        min(
+            AGENT_EGRESS_POLICY_MAX_TTL_SECONDS,
+            base + AGENT_EGRESS_POLICY_TTL_MARGIN_SECONDS,
+        ),
+    )
 
 
 def derive_egress_policy_for_agent(
