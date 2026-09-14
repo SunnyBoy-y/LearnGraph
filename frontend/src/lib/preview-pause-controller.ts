@@ -1,6 +1,37 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type RefObject,
+} from "react";
 
 export type PreviewPauseAction = "pause" | "resume";
+
+/**
+ * Why a preview is currently held paused.
+ *
+ * Channels are independent: a preview runs only while *no* channel holds it,
+ * and releasing one channel never overrides another. That separation is what
+ * keeps two competing controls from fighting: resuming the page-level "pause
+ * every preview" switch must not start a card the artifact wall itself keeps
+ * paused (and vice versa).
+ */
+export type PreviewPauseReason =
+  /** The preview's own play/pause control, or an imperative caller. */
+  | "manual"
+  /** `pauseAllPreviews()` — the page-level "pause every preview" switch. */
+  | "global"
+  /** The document went hidden. */
+  | "visibility"
+  /** The owning group (the artifact card wall) keeps this preview paused. */
+  | "scope";
+
+/** Reason used by `PreviewPauseScope` consumers; one scope per preview. */
+const SCOPE_REASON: PreviewPauseReason = "scope";
 
 export interface PreviewPauseController {
   /** Whether the controller is currently holding playback paused. */
@@ -8,30 +39,36 @@ export interface PreviewPauseController {
   pause(): void;
   resume(): void;
   toggle(): void;
+  /** Hold playback for one reason; every other channel keeps its own state. */
+  suspend(reason: PreviewPauseReason): void;
+  /** Release one reason; playback resumes only when no channel is left. */
+  release(reason: PreviewPauseReason): void;
   destroy(): void;
 }
 
 const CONTROLLERS = new Set<PreviewPauseController>();
-const GLOBAL_PAUSED_CONTROLLERS = new Set<PreviewPauseController>();
 const GLOBAL_EVENT = "learngraph:preview-global-control";
 let globalPaused = false;
 const globalListeners = new Set<() => void>();
 
-/** Pause/resume every mounted preview in the current application shell. */
+/**
+ * Pause/resume every mounted preview in the current application shell.
+ *
+ * The `global` channel is applied to every controller — including ones that are
+ * already paused for their own reasons — so releasing it restores exactly the
+ * previews that should be running again (the active card on the artifact wall)
+ * and leaves the rest paused.
+ */
 export function pauseAllPreviews(): void {
   globalPaused = true;
   globalListeners.forEach((listener) => listener());
-  CONTROLLERS.forEach((controller) => {
-    if (!controller.paused) GLOBAL_PAUSED_CONTROLLERS.add(controller);
-    controller.pause();
-  });
+  CONTROLLERS.forEach((controller) => controller.suspend("global"));
 }
 
 export function resumeAllPreviews(): void {
   globalPaused = false;
   globalListeners.forEach((listener) => listener());
-  GLOBAL_PAUSED_CONTROLLERS.forEach((controller) => controller.resume());
-  GLOBAL_PAUSED_CONTROLLERS.clear();
+  CONTROLLERS.forEach((controller) => controller.release("global"));
 }
 
 export function toggleAllPreviews(): void {
@@ -64,6 +101,33 @@ function resolveRoot(root: RootResolver): HTMLElement | null {
 }
 
 /**
+ * Playback authority for one preview group (the artifact card wall).
+ *
+ * A group owns *when* its previews may run; each preview owns *how* it pauses.
+ * The wall renders one provider per card, so `activate` already knows which card
+ * the user engaged with.
+ */
+export interface PreviewPauseScope {
+  /** True while this group keeps the previews inside it paused. */
+  suspended: boolean;
+  /** The user engaged with this group: make it the playing one. */
+  activate: () => void;
+  /** A preview inside the group took over the viewport (expanded/fullscreen). */
+  pin: (pinned: boolean) => void;
+}
+
+/**
+ * Absent provider means "no group authority": previews inside run unless a
+ * `manual`/`global`/`visibility` channel says otherwise. The chat canvas mounts
+ * no provider, so chat cards keep their existing playback behaviour.
+ */
+export const PreviewPauseScopeContext = createContext<PreviewPauseScope | null>(null);
+
+export function usePreviewPauseScope(): PreviewPauseScope | null {
+  return useContext(PreviewPauseScopeContext);
+}
+
+/**
  * Coordinates playback for a preview region.
  *
  * Native media descendants are paused directly. Embedded sandbox previews are
@@ -80,15 +144,10 @@ export function createPreviewPauseController(
   let visibilityPaused = false;
   let destroyed = false;
   let requestId = 0;
+  const reasons = new Set<PreviewPauseReason>();
   const activeMedia = new Set<HTMLMediaElement>();
   const suspendedFrames = new Map<HTMLIFrameElement, { src: string | null; srcdoc: string | null }>();
   const fallbackTimers = new Map<HTMLIFrameElement, number>();
-
-  function setPaused(next: boolean): void {
-    if (paused === next) return;
-    paused = next;
-    options.onStateChange?.(paused);
-  }
 
   function post(action: PreviewPauseAction): void {
     const element = resolveRoot(root);
@@ -133,9 +192,8 @@ export function createPreviewPauseController(
     });
   }
 
-  function pause(): void {
-    if (destroyed) return;
-    if (paused) return;
+  /** Apply the pause transition itself (media, embedded previews). */
+  function applyPause(): void {
     const element = resolveRoot(root);
     activeMedia.clear();
     element?.querySelectorAll<HTMLMediaElement>("audio,video").forEach((media) => {
@@ -143,17 +201,45 @@ export function createPreviewPauseController(
       media.pause();
     });
     post("pause");
-    setPaused(true);
   }
 
-  function resume(): void {
-    if (destroyed) return;
+  function applyResume(): void {
     post("resume");
     activeMedia.forEach((media) => {
       void media.play().catch(() => undefined);
     });
     activeMedia.clear();
-    setPaused(false);
+  }
+
+  /** Recompute the effective state from every channel; act only on a change. */
+  function sync(): void {
+    if (destroyed) return;
+    const next = reasons.size > 0;
+    if (paused === next) return;
+    if (next) applyPause();
+    else applyResume();
+    paused = next;
+    options.onStateChange?.(paused);
+  }
+
+  function suspend(reason: PreviewPauseReason): void {
+    if (destroyed) return;
+    reasons.add(reason);
+    sync();
+  }
+
+  function release(reason: PreviewPauseReason): void {
+    if (destroyed) return;
+    reasons.delete(reason);
+    sync();
+  }
+
+  function pause(): void {
+    suspend("manual");
+  }
+
+  function resume(): void {
+    release("manual");
   }
 
   const onFrameAck = (event: MessageEvent) => {
@@ -175,13 +261,11 @@ export function createPreviewPauseController(
 
   const onVisibilityChange = () => {
     if (document.visibilityState === "hidden") {
-      if (!paused) {
-        visibilityPaused = true;
-        pause();
-      }
+      visibilityPaused = true;
+      suspend("visibility");
     } else if (visibilityPaused && !globalPaused) {
       visibilityPaused = false;
-      resume();
+      release("visibility");
     }
   };
 
@@ -204,12 +288,15 @@ export function createPreviewPauseController(
     },
     pause,
     resume,
-    toggle: () => (paused ? resume() : pause()),
+    // The preview's own control owns the `manual` channel only; a preview held
+    // by another channel (e.g. its group) is started through that channel.
+    toggle: () => (reasons.has("manual") ? resume() : pause()),
+    suspend,
+    release,
     destroy: () => {
       if (destroyed) return;
       destroyed = true;
       CONTROLLERS.delete(controller);
-      GLOBAL_PAUSED_CONTROLLERS.delete(controller);
       if (typeof window !== "undefined") window.removeEventListener(GLOBAL_EVENT, onGlobalControl);
       if (typeof window !== "undefined") window.removeEventListener("message", onFrameAck);
       resolvedRoot?.removeEventListener("load", onFrameLoad, true);
@@ -220,13 +307,11 @@ export function createPreviewPauseController(
         document.removeEventListener("visibilitychange", onVisibilityChange);
       }
       activeMedia.clear();
+      reasons.clear();
     },
   };
   CONTROLLERS.add(controller);
-  if (globalPaused) {
-    GLOBAL_PAUSED_CONTROLLERS.add(controller);
-    controller.pause();
-  }
+  if (globalPaused) controller.suspend("global");
 
   return controller;
 }
@@ -236,9 +321,15 @@ export function usePreviewPause(
   rootRef: RefObject<HTMLElement | null>,
   options: Omit<PreviewPauseOptions, "onStateChange"> = {},
 ) {
-  const [paused, setPaused] = useState(false);
+  const scope = usePreviewPauseScope();
+  const scopeSuspended = scope?.suspended === true;
+  const [paused, setPaused] = useState(scopeSuspended);
   const controllerRef = useRef<PreviewPauseController | null>(null);
   const autoVisibility = options.autoVisibility !== false;
+  // Read at controller creation so a preview mounted into an already-suspended
+  // group never runs (and never flashes) before the scope effect below lands.
+  const scopeSuspendedRef = useRef(scopeSuspended);
+  scopeSuspendedRef.current = scopeSuspended;
 
   useEffect(() => {
     const controller = createPreviewPauseController(() => rootRef.current, {
@@ -246,11 +337,19 @@ export function usePreviewPause(
       onStateChange: setPaused,
     });
     controllerRef.current = controller;
+    if (scopeSuspendedRef.current) controller.suspend(SCOPE_REASON);
     return () => {
       controller.destroy();
       controllerRef.current = null;
     };
   }, [rootRef, autoVisibility]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller) return;
+    if (scopeSuspended) controller.suspend(SCOPE_REASON);
+    else controller.release(SCOPE_REASON);
+  }, [scopeSuspended]);
 
   const pause = useCallback(() => controllerRef.current?.pause(), []);
   const resume = useCallback(() => controllerRef.current?.resume(), []);
