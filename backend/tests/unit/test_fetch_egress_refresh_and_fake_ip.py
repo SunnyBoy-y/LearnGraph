@@ -30,10 +30,16 @@ from app.providers.remote.fetch import (
 from app.services.sandbox_network_policy import (
     WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS,
     EgressPolicyInvalid,
+    NetworkCapability,
     classify_ip_address,
     derive_egress_policy_for_fetch,
     refresh_workspace_fetch_policy_file,
     store_workspace_fetch_policy_file,
+    validate_egress_policy,
+)
+from app.services.agent_execution_profiles import (
+    clamp_network_capability,
+    resolve_agent_execution_profile,
 )
 
 WORKSPACE = "ws-web-fetch-refresh"
@@ -157,10 +163,10 @@ def test_fake_ip_config_does_not_weaken_private_block(monkeypatch):
 # ── ssrf_fake_ip_ranges: egress proxy address classifier ──────────────────────
 
 
-def test_classify_fake_ip_public_by_default():
-    # 198.18.0.0/15 is not in FORBIDDEN_FAMILIES, so it already classifies
-    # as public; the fake-ip override must not change that.
-    assert classify_ip_address("198.18.0.5") == "public"
+def test_classify_fake_ip_is_non_public_without_override():
+    # Without an explicit trusted local-proxy range, benchmarking space is
+    # not a legitimate public web destination.
+    assert classify_ip_address("198.18.0.5") == "benchmarking"
     assert classify_ip_address("10.0.0.1") == "private"
     assert classify_ip_address("127.0.0.1") == "loopback"
 
@@ -172,3 +178,35 @@ def test_classify_fake_ip_override_keeps_private_denied(monkeypatch):
     )
     assert classify_ip_address("198.18.0.5") == "public"
     assert classify_ip_address("10.0.0.1") == "private"
+
+
+def test_fetch_policy_carries_fetch_capability_and_http_https_ports():
+    policy = derive_egress_policy_for_fetch(
+        workspace_id=WORKSPACE,
+        allowed_domains=["example.com"],
+    )
+    assert policy.capability is NetworkCapability.FETCH
+    assert policy.hosts[0].ports == (80, 443)
+    assert policy.hosts[0].protocols == ("http", "https")
+
+
+def test_policy_rejects_protocol_port_mismatch_without_key_error():
+    policy = derive_egress_policy_for_fetch(
+        workspace_id=WORKSPACE,
+        allowed_domains=["example.com"],
+    )
+    raw = dict(policy.raw)
+    raw["hosts"] = [{"host": "example.com", "ports": [443], "protocols": ["http"]}]
+    with pytest.raises(EgressPolicyInvalid, match="policy_protocol_port_mismatch"):
+        validate_egress_policy(raw)
+
+
+def test_client_network_intent_can_only_narrow_the_profile():
+    research = resolve_agent_execution_profile("research", tools=None)
+    assert research.network_capability is NetworkCapability.FETCH
+    assert clamp_network_capability(
+        research.network_capability, "RESTRICTED_EGRESS"
+    ) is NetworkCapability.FETCH
+    assert clamp_network_capability(
+        research.network_capability, "OFFLINE"
+    ) is NetworkCapability.OFFLINE

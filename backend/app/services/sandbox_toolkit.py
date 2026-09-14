@@ -40,6 +40,7 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileDeleteRequest,
     SandboxAgentFileReadRequest,
     SandboxAgentFileWriteRequest,
+    SandboxAgentDownloadRequest,
     SandboxAgentFetchRequest,
     SandboxAgentGitCloneRequest,
     SandboxAgentGitRequest,
@@ -62,6 +63,11 @@ from app.providers.remote.sandbox import (
 )
 from app.providers.remote.search import SearchProviderError, SearchProviderTimeout
 from app.services.sandbox_diff import DiffApplyError, DiffParseError, apply_hunks, parse_unified_diff
+from app.services.agent_execution_profiles import (
+    AgentProfileError,
+    resolve_agent_execution_profile,
+    clamp_network_capability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -601,6 +607,146 @@ class SandboxToolkitMixin:
             },
         }
 
+    def toolkit_download(self, payload: SandboxAgentDownloadRequest) -> dict[str, Any]:
+        if not self.settings.sandbox_network_tools_enabled:
+            raise AppError(503, "sandbox_network_tools_disabled", "Sandbox network tools are disabled by configuration")
+        from app.domain.models import EgressAuthorizationRequest, HostAuthorizationGrant
+        from app.services.egress_approvals import EgressApprovalService
+        from app.services.external_acquisition import (
+            AcquisitionApprovalRequired,
+            ExternalAcquisitionService,
+        )
+
+        acquisition = ExternalAcquisitionService(
+            self.db, self.workspace_id, self.actor_id, self.settings
+        )
+        normalized: dict[str, Any] = {
+            "url": payload.url.strip(),
+            "destination_path": payload.destination_path.strip() if payload.destination_path else None,
+        }
+        if payload.expected_sha256:
+            normalized["expected_sha256"] = payload.expected_sha256.casefold()
+        _spec, spec_sha = acquisition.canonical_spec("file", normalized)
+        approval_service = EgressApprovalService(
+            self.db,
+            self.workspace_id,
+            self.settings,
+            capability=EXTERNAL_ACQUISITION_CAPABILITY,
+        )
+        allowed_hosts = set(approval_service.effective_allowed_hosts(actor_id=self.actor_id))
+        approval_by_host: dict[str, str] = {}
+        grants = self.db.scalars(
+            select(HostAuthorizationGrant).where(
+                HostAuthorizationGrant.workspace_id == self.workspace_id,
+                HostAuthorizationGrant.capability == EXTERNAL_ACQUISITION_CAPABILITY,
+                HostAuthorizationGrant.revoked_at.is_(None),
+            )
+        ).all()
+        for grant in grants:
+            if grant.hostname in allowed_hosts and grant.source_request_id:
+                approval_by_host[grant.hostname] = grant.source_request_id
+
+        matching_once: list[EgressAuthorizationRequest] = []
+        related_requests = self.db.scalars(
+            select(EgressAuthorizationRequest).where(
+                EgressAuthorizationRequest.workspace_id == self.workspace_id,
+                EgressAuthorizationRequest.capability == EXTERNAL_ACQUISITION_CAPABILITY,
+                EgressAuthorizationRequest.requested_by == self.actor_id,
+                EgressAuthorizationRequest.chat_session_id == payload.chat_session_id,
+                EgressAuthorizationRequest.status == "approved",
+                EgressAuthorizationRequest.decision == "allow_once",
+                EgressAuthorizationRequest.expires_at > utc_now(),
+            )
+        ).all()
+        for request in related_requests:
+            context = request.request_context if isinstance(request.request_context, dict) else {}
+            if context.get("request_spec_sha256") != spec_sha:
+                continue
+            matching_once.append(request)
+            approval_by_host[request.hostname] = request.id
+
+        claimed: list[EgressAuthorizationRequest] = []
+
+        def release_claimed() -> None:
+            for request in claimed:
+                try:
+                    approval_service.release_once(request_id=request.id)
+                except Exception:
+                    logger.exception("failed to release download approval %s", request.id)
+
+        try:
+            for request in list(matching_once):
+                claim = approval_service.claim_once(request_id=request.id, actor_id=self.actor_id)
+                if claim is None:
+                    continue
+                claimed.append(claim)
+                allowed_hosts.add(request.hostname)
+            result = acquisition.download_file(
+                chat_session_id=payload.chat_session_id,
+                allowed_hosts=allowed_hosts,
+                request_spec_sha256=spec_sha,
+                approval_by_host=approval_by_host,
+                destination_path=normalized.get("destination_path"),
+                url=normalized["url"],
+                expected_sha256=normalized.get("expected_sha256"),
+            )
+        except AcquisitionApprovalRequired as exc:
+            release_claimed()
+            purpose = f"下载公开文件 {normalized['url']}"
+            request = approval_service.create_request(
+                hostname=exc.hostname,
+                requested_by=self.actor_id,
+                chat_session_id=payload.chat_session_id,
+                purpose=purpose,
+                request_context={
+                    "tool_name": "sandbox_download",
+                    "tool_label": "沙箱文件下载工具",
+                    "origin": "sandbox_toolkit",
+                    "request_spec_sha256": spec_sha,
+                    "resource_summary": purpose,
+                    "destination_path": normalized.get("destination_path"),
+                },
+                dedupe_key=f"acquire:{spec_sha[:32]}:{exc.hostname}"[:80],
+            )
+            if request.status == "approved":
+                return self.toolkit_download(payload)
+            raise AppError(
+                403,
+                "egress_authorization_required",
+                "沙箱文件下载需要用户授权",
+                details={
+                    "authorization_request_id": request.id,
+                    "tool_name": "sandbox_download",
+                    "tool_label": "沙箱文件下载工具",
+                    "hostname": request.hostname,
+                    "requested_url": normalized["url"],
+                    "request_spec_sha256": spec_sha,
+                    "resource_summary": purpose,
+                    "destination_path": normalized.get("destination_path"),
+                    "message_zh": f"{purpose}，需要访问主机 {request.hostname}，是否批准？",
+                },
+            )
+        except Exception:
+            release_claimed()
+            raise
+        for request in claimed:
+            approval_service.consume_once(request_id=request.id)
+
+        return {
+            "sandbox_session_id": payload.sandbox_session_id,
+            **result,
+            "summary": {
+                "type": "sandbox_status",
+                "status": "completed",
+                "data": {
+                    "phase": "completed",
+                    "kind": "file_download",
+                    "path": result.get("path"),
+                    "size_bytes": result.get("size_bytes"),
+                },
+            },
+        }
+
     # ── sandbox_subagent (v2: durable tasks via the unified scheduler) ───────
 
     def _load_agent_task(self, subagent_id: str):
@@ -628,12 +774,22 @@ class SandboxToolkitMixin:
             "role_key": task.role_key,
             "status": task.status.lower(),
             "status_reason": task.status_reason,
+            "network_policy": (
+                (task.spec_json or {}).get("network_policy")
+                if isinstance(task.spec_json, dict)
+                else None
+            ),
             "error_class": latest.get("error_class"),
             "error_message": latest.get("error_message"),
             "rounds": latest.get("rounds", 0),
             "tool_calls": latest.get("tool_calls", 0),
             "result": task.result_text,
             "deliverables": task.deliverables_json,
+            "agent_result": (
+                (task.deliverables_json or {}).get("agent_result")
+                if isinstance(task.deliverables_json, dict)
+                else None
+            ),
             "event_seq": task.event_seq,
             "latest_job_id": task.latest_job_id,
         }
@@ -685,23 +841,81 @@ class SandboxToolkitMixin:
         from app.domain.models import SandboxAgentTask
         from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
+        try:
+            profile = resolve_agent_execution_profile(payload.role_key, tools=payload.tools)
+        except AgentProfileError as exc:
+            raise AppError(422, "invalid_agent_profile", str(exc)) from exc
+        effective_network = clamp_network_capability(
+            profile.network_capability,
+            payload.network_capability,
+        )
+        network_policy = {
+            **profile.network_policy_payload(),
+            "mode": effective_network.value,
+            "requested_mode": payload.network_capability,
+        }
+        requested_thinking = payload.thinking_mode or profile.default_thinking_mode
+        idempotency_key = (payload.idempotency_key or "").strip()
+        task_id = (
+            f"sa_{hashlib.sha256(idempotency_key.encode('utf-8')).hexdigest()[:16]}"
+            if idempotency_key
+            else f"sa_{new_id()[:16]}"
+        )
+        if idempotency_key:
+            existing = self.db.scalar(
+                select(SandboxAgentTask).where(
+                    SandboxAgentTask.workspace_id == self.workspace_id,
+                    SandboxAgentTask.owner_user_id == self.actor_id,
+                    SandboxAgentTask.task_id == task_id,
+                )
+            )
+            if existing is not None:
+                snapshot = self._agent_task_snapshot(existing)
+                snapshot["job_id"] = existing.latest_job_id
+                snapshot["idempotent_replay"] = True
+                return snapshot
         title = payload.title or "子代理任务"
+        requirement_group_id = payload.requirement_group_id or task_id
+        context_snapshot = {
+            "workspace_id": self.workspace_id,
+            "user_id": self.actor_id,
+            "chat_session_id": payload.chat_session_id,
+            "voice_session_id": payload.voice_session_id,
+            "turn_id": payload.turn_id,
+            "requirement_group_id": requirement_group_id,
+            "requirement_version": payload.requirement_version,
+            **(payload.context_snapshot or {}),
+        }
         task = SandboxAgentTask(
             workspace_id=self.workspace_id,
             owner_user_id=self.actor_id,
-            task_id=f"sa_{new_id()[:16]}",
+            task_id=task_id,
             chat_session_id=payload.chat_session_id,
             sandbox_session_id=payload.sandbox_session_id,
             title=title,
-            role_key=payload.role_key or "generic",
+            role_key=profile.role.value,
             status="QUEUED",
             spec_json={
                 "objective": payload.prompt,
-                "input_snapshot": None,
+                "input_snapshot": context_snapshot,
                 "constraints": [],
                 "read_set": [],
                 "write_set": payload.write_set or [],
-                "tool_profile": payload.tools or [],
+                "tool_profile": payload.tools,
+                "tool_mode": profile.tool_mode.value,
+                "execution_lane": profile.execution_lane,
+                "read_only": profile.read_only,
+                "network_policy": network_policy,
+                "thinking_mode_requested": requested_thinking,
+                "thinking_mode_effective": None,
+                "requirement_group_id": requirement_group_id,
+                "requirement_version": payload.requirement_version,
+                "current_requirement_version": payload.requirement_version,
+                "origin": "voice" if payload.voice_session_id else "chat",
+                "association": {
+                    "voice_session_id": payload.voice_session_id,
+                    "turn_id": payload.turn_id,
+                },
                 "skill_profile": payload.skills or [],
                 "budget": self._subagent_budget_payload(payload),
                 "output_contract": payload.output_contract or {},
@@ -716,12 +930,21 @@ class SandboxToolkitMixin:
             owner_user_id=self.actor_id,
             chat_session_id=payload.chat_session_id,
             kind="subagent",
+            workload_class=profile.execution_lane,
             payload={
                 "task_id": task.id,
                 "task_title": title,
                 "role_key": task.role_key,
                 "prompt": payload.prompt,
                 "tools": payload.tools,
+                "tool_mode": profile.tool_mode.value,
+                "execution_lane": profile.execution_lane,
+                "read_only": profile.read_only,
+                "network_policy": network_policy,
+                "thinking_mode": requested_thinking,
+                "requirement_version": payload.requirement_version,
+                "requirement_group_id": requirement_group_id,
+                "context_snapshot": context_snapshot,
                 "write_set": payload.write_set,
                 "budget": self._subagent_budget_payload(payload),
                 "sandbox_session_id": payload.sandbox_session_id,
@@ -739,6 +962,11 @@ class SandboxToolkitMixin:
                 "title": title,
                 "role_key": task.role_key,
                 "chat_session_id": task.chat_session_id,
+                "voice_session_id": payload.voice_session_id,
+                "turn_id": payload.turn_id,
+                "requirement_version": payload.requirement_version,
+                "execution_lane": profile.execution_lane,
+                "network_policy": network_policy,
             },
         )
         append_agent_event(self.db, task, "queued", {"job_id": job.id})
@@ -749,6 +977,11 @@ class SandboxToolkitMixin:
             "job_id": job.id,
             "status": "queued",
             "sandbox_session_id": payload.sandbox_session_id,
+            "thinking_mode_requested": requested_thinking,
+            "thinking_mode_effective": None,
+            "requirement_version": payload.requirement_version,
+            "execution_lane": profile.execution_lane,
+            "network_policy": network_policy,
             "summary": {
                 "type": "subagent_task",
                 "status": "queued",
@@ -802,7 +1035,7 @@ class SandboxToolkitMixin:
         Returns task snapshots plus ``retry_after_ms`` — never busy-polls the
         model, never blocks beyond ``timeout_ms``.
         """
-        terminal = {"SUCCEEDED", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"}
+        terminal = {"SUCCEEDED", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "STALE", "INTERRUPTED"}
         deadline = time.monotonic() + (payload.timeout_ms / 1000)
         while True:
             tasks = []
@@ -833,11 +1066,14 @@ class SandboxToolkitMixin:
             time.sleep(0.4)
 
     def toolkit_subagent_cancel(self, payload: SandboxAgentSubagentCancelRequest) -> dict[str, Any]:
-        from app.services.sandbox_scheduler import SandboxSchedulerService
+        from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
         task = self._load_agent_task(payload.subagent_id)
         if task is None:
             raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
+        if task.status in {"SUCCEEDED", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "STALE", "INTERRUPTED"}:
+            return self._agent_task_snapshot(task)
+        terminal_job = None
         if task.latest_job_id:
             scheduler = SandboxSchedulerService(self.db, self.settings)
             try:
@@ -847,8 +1083,29 @@ class SandboxToolkitMixin:
                     owner_user_id=self.actor_id,
                 )
                 scheduler.cancel_job(job)
+                terminal_job = job
             except AppError:
                 pass  # job already gone; the task snapshot carries the outcome
+        if terminal_job is not None and terminal_job.status == "CANCELLED":
+            task.status = "CANCELLED"
+            task.status_reason = "cancelled_by_user"
+            task.finished_at = utc_now()
+        else:
+            task.status_reason = "cancel_requested"
+            spec_json = dict(task.spec_json or {})
+            spec_json["cancel_requested"] = True
+            task.spec_json = spec_json
+        append_agent_event(
+            self.db,
+            task,
+            "cancel_requested",
+            {
+                "job_id": task.latest_job_id,
+                "status": task.status,
+            },
+        )
+        self.db.commit()
+        self.db.refresh(task)
         return self._agent_task_snapshot(task)
 
     def toolkit_subagent_retry(self, payload: SandboxAgentSubagentRetryRequest) -> dict[str, Any]:
@@ -867,12 +1124,20 @@ class SandboxToolkitMixin:
             owner_user_id=self.actor_id,
             chat_session_id=task.chat_session_id,
             kind="subagent",
+            workload_class=str(spec.get("execution_lane") or "sandbox"),
             payload={
                 "task_id": task.id,
                 "task_title": task.title,
                 "role_key": task.role_key,
                 "prompt": prompt,
                 "tools": spec.get("tool_profile"),
+                "execution_lane": spec.get("execution_lane"),
+                "read_only": spec.get("read_only"),
+                "network_policy": spec.get("network_policy"),
+                "thinking_mode": spec.get("thinking_mode_requested"),
+                "requirement_version": spec.get("requirement_version") or 1,
+                "requirement_group_id": spec.get("requirement_group_id"),
+                "context_snapshot": spec.get("input_snapshot"),
                 "write_set": spec.get("write_set"),
                 "budget": budget,
                 "sandbox_session_id": task.sandbox_session_id,

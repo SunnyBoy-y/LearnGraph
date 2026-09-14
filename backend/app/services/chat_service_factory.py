@@ -162,6 +162,117 @@ def build_agent_tool_worker_runtime(
     return build_agent_tool_runtime(db, context, settings)
 
 
+def build_background_agent_tool_runtime(
+    db: Session,
+    *,
+    workspace_id: str,
+    actor_id: str,
+    settings: Settings,
+) -> AgentToolRuntime:
+    """Build the ordinary authorized tool graph for a durable worker.
+
+    The worker has no HTTP principal, so this reloads the workspace/user from
+    the caller's session and recomputes permissions with the same rules as a
+    request.  The returned runtime is still subject to the caller's explicit
+    tool allow-list; this function does not widen that selection.
+    """
+    workspace = db.scalar(select(Workspace).where(Workspace.id == workspace_id))
+    if workspace is None:
+        raise LookupError(f"Workspace {workspace_id} no longer exists")
+    user = db.scalar(select(User).where(User.id == actor_id))
+    if user is None or user.status != "active":
+        raise LookupError(f"Identity {actor_id} is no longer active")
+    if user.tenant_id != workspace.tenant_id:
+        raise LookupError(
+            f"Identity {actor_id} does not belong to workspace {workspace_id}"
+        )
+    principal = Principal(
+        user_id=user.id,
+        username=user.username,
+        tenant_id=user.tenant_id,
+        session_id="background-agent",
+        display_name=user.display_name or user.username,
+        is_system_admin=user.is_system_admin,
+        must_change_password=user.must_change_password,
+    )
+    permissions = AuthorizationService(db, principal).workspace_permissions(workspace)
+    context = WorkspaceContext(
+        principal=principal,
+        workspace=workspace,
+        permissions=frozenset(permissions),
+    )
+    return build_agent_tool_runtime(db, context, settings)
+
+
+def build_background_workspace_context(
+    db: Session,
+    *,
+    workspace_id: str,
+    actor_id: str,
+) -> WorkspaceContext:
+    """Rebuild a request-equivalent workspace identity without a request.
+
+    Background work (durable queue jobs, the voice audio worker) must run the
+    ordinary authorization and memory policy but has no HTTP principal.  This
+    reloads the workspace/user from the caller's session and recomputes the
+    permission set with the exact same rules as the request dependency, so a
+    background job can never observe a wider scope than its user.
+    """
+    workspace = db.scalar(select(Workspace).where(Workspace.id == workspace_id))
+    if workspace is None:
+        raise LookupError(f"Workspace {workspace_id} no longer exists")
+    user = db.scalar(select(User).where(User.id == actor_id))
+    if user is None or user.status != "active":
+        raise LookupError(f"Identity {actor_id} is no longer active")
+    if user.tenant_id != workspace.tenant_id:
+        raise LookupError(f"Identity {actor_id} does not belong to workspace {workspace_id}")
+    principal = Principal(
+        user_id=user.id,
+        username=user.username,
+        tenant_id=user.tenant_id,
+        session_id="voice-worker",
+        display_name=user.display_name or user.username,
+        is_system_admin=user.is_system_admin,
+        must_change_password=user.must_change_password,
+    )
+    permissions = AuthorizationService(db, principal).workspace_permissions(workspace)
+    return WorkspaceContext(
+        principal=principal,
+        workspace=workspace,
+        permissions=frozenset(permissions),
+    )
+
+
+def build_voice_chat_service(
+    db: Session,
+    *,
+    workspace_id: str,
+    actor_id: str,
+    settings: Settings,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    thinking_mode: str | None = None,
+) -> ChatService:
+    """ChatService for a durable voice turn, built from persisted identity.
+
+    Used by ``AppVoiceTurnLifecycle`` so a finalized voice turn reaches the same
+    Message/Memory pipeline as text chat, whether the call originates from the
+    HTTP control plane or from the audio worker process.
+    """
+    context = build_background_workspace_context(
+        db, workspace_id=workspace_id, actor_id=actor_id
+    )
+    return build_chat_service(
+        db,
+        workspace_context=context,
+        settings=settings,
+        model_id=model_id,
+        provider_id=provider_id,
+        thinking_mode=thinking_mode,
+        agent_mode=False,
+    )
+
+
 def build_chat_service(
     db: Session,
     *,

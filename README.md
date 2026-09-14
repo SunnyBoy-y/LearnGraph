@@ -443,6 +443,7 @@ LearnGraph/
 
 - `X-Workspace-ID` 是作用域提示；后端会重新校验 Membership、权限与资源范围。
 - 沙箱默认拒绝网络；联网必须通过 Egress 审批链（域名白名单、连接时地址重分类、审计）。
+- 完整的任务级网络能力、Fetch/Browser/Download Broker、Restricted Egress 与残余风险说明见 [Sandbox Network Security Model](docs/README.md#sandbox-network-security-model)。
 - 外部图片和 GitHub 源码由宿主侧可信下载器获取，沙箱不会临时联网；下载逐主机审批、逐次 DNS 公网分类，图片重编码净化，GitHub ref 固定为 commit，并持久化 SHA-256 与来源凭据。
 - Provider Secret 由后端版本化加密保存，不进入浏览器、日志、SSE、审计或导出。
 - 模型、搜索、研究和沙箱能力均采用显式可用性状态，调用结果与失败边界可以追踪。

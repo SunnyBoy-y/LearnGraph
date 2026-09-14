@@ -2,10 +2,77 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.domain.schemas.common import ORMModel
+
+
+AgentRoleKey = Literal["research", "reason", "tool", "generic"]
+ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
+NetworkCapabilityKey = Literal["OFFLINE", "FETCH", "BROWSER", "RESTRICTED_EGRESS"]
+AgentTaskStatus = Literal[
+    "succeeded",
+    "partial",
+    "failed",
+    "timed_out",
+    "cancelled",
+    "stale",
+    "interrupted",
+]
+
+
+class AgentTaskSource(BaseModel):
+    """One source actually returned by an authorized Search/Fetch tool."""
+
+    title: str = ""
+    url: str = Field(min_length=1, max_length=2_000)
+    snippet: str = ""
+    provider_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_web_url(self) -> "AgentTaskSource":
+        parsed = urlparse(self.url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("AgentTaskSource.url must be an absolute http(s) URL")
+        return self
+
+
+class AgentTaskArtifact(BaseModel):
+    """A machine-verifiable artifact handoff (never a model claim alone)."""
+
+    path: str = Field(min_length=1, max_length=1_000)
+    change: str = ""
+    sha256: str | None = None
+    file_id: str | None = None
+    exists: bool = False
+
+
+class AgentTaskResult(BaseModel):
+    """Typed result returned by the durable sub-agent executor.
+
+    The executor builds this from machine-observed tool outcomes and the
+    final model answer.  Tool traces and private reasoning are not exposed as
+    user-facing content.
+    """
+
+    task_id: str
+    task_type: AgentRoleKey
+    status: AgentTaskStatus
+    short_answer: str = ""
+    findings: list[str] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    sources: list[AgentTaskSource] = Field(default_factory=list)
+    artifacts: list[AgentTaskArtifact] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    completed_at: datetime
+    requirement_version: int = Field(ge=1)
+    thinking_mode_requested: ThinkingMode | None = None
+    thinking_mode_effective: ThinkingMode | None = None
+    reasoning_effort_effective: Any = None
+    error: dict[str, str] | None = None
 
 
 class SandboxProfileView(BaseModel):
@@ -660,6 +727,21 @@ class SandboxAgentFetchRequest(BaseModel):
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
+class SandboxAgentDownloadRequest(BaseModel):
+    """Download a public file through the reviewed host-side acquisition broker.
+
+    The sandbox container itself remains offline. The broker validates every
+    DNS answer and redirect, bounds the response size, sanitizes the filename,
+    and writes only inert bytes into the session workspace.
+    """
+
+    chat_session_id: str = Field(min_length=1, max_length=36)
+    url: str = Field(min_length=1, max_length=2000)
+    destination_path: str | None = Field(default=None, min_length=1, max_length=1000)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
 class SandboxAgentSubagentRequest(BaseModel):
     """Spawn a durable sandbox sub-agent task (v2: unified scheduler)."""
 
@@ -668,6 +750,14 @@ class SandboxAgentSubagentRequest(BaseModel):
     title: str = Field(default="", max_length=200)
     role_key: str = Field(default="generic", max_length=40)
     tools: list[str] | None = Field(default=None, max_length=16)
+    network_capability: NetworkCapabilityKey | None = Field(
+        default=None,
+        description=(
+            "Optional client intent. The server clamps this against the role/tool "
+            "profile, so it can only narrow capability and never grant direct sandbox "
+            "internet access."
+        ),
+    )
     skills: list[str] | None = Field(default=None, max_length=8)
     max_rounds: int = Field(default=6, ge=1, le=12)
     max_seconds: int | None = Field(default=None, ge=30, le=900)
@@ -685,6 +775,19 @@ class SandboxAgentSubagentRequest(BaseModel):
     )
     output_contract: dict[str, Any] | None = Field(default=None)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+    thinking_mode: ThinkingMode | None = Field(
+        default=None,
+        description=(
+            "Requested reasoning tier. None selects the role's server-side "
+            "default; the executor records the effective/fallback tier."
+        ),
+    )
+    voice_session_id: str | None = Field(default=None, min_length=1, max_length=64)
+    turn_id: str | None = Field(default=None, min_length=1, max_length=64)
+    requirement_group_id: str | None = Field(default=None, min_length=1, max_length=64)
+    requirement_version: int = Field(default=1, ge=1, le=1_000_000)
+    context_snapshot: dict[str, Any] | None = Field(default=None)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=200)
 
 
 class SandboxAgentSubagentStatusRequest(BaseModel):
@@ -736,6 +839,7 @@ class SandboxAgentTaskView(BaseModel):
     latest_job_id: str | None = None
     attempts: list[dict[str, Any]] = []
     deliverables: dict[str, Any] | None = None
+    agent_result: AgentTaskResult | None = None
     result_text: str | None = None
     event_seq: int = 0
     started_at: datetime | None = None

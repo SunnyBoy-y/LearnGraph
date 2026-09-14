@@ -48,6 +48,7 @@ from app.domain.schemas.sandbox import (
     SandboxAgentFileEditRequest,
     SandboxAgentFileAppendRequest,
     SandboxAgentEnvironmentRequest,
+    SandboxAgentDownloadRequest,
     SandboxAgentFetchRequest,
     SandboxAgentGitCloneRequest,
     SandboxAgentGitRequest,
@@ -355,6 +356,9 @@ def web_fetch_egress_envelope(
             workspace_id,
             allowed_domains,
             allow_all_public=allow_all,
+            max_requests=int(getattr(settings, "sandbox_web_fetch_max_requests", 1000) or 1000),
+            max_bytes=int(getattr(settings, "sandbox_web_fetch_total_bytes", 1024 * 1024 * 1024) or 1024 * 1024 * 1024),
+            max_concurrency=max(1, int(getattr(settings, "sandbox_web_fetch_pool_size", 4) or 4)),
         )
     except EgressPolicyInvalid:
         logger.exception("Web fetch egress policy could not be derived; fetch stays offline")
@@ -376,6 +380,7 @@ def web_fetch_egress_envelope(
         return None
     return {
         "policy_digest": policy.digest,
+        "capability": policy.capability.value,
         "network": settings.sandbox_egress_network,
         "proxy_url": settings.sandbox_egress_proxy_url,
     }
@@ -392,9 +397,11 @@ def _effective_network_policy(
     credentials or raw allow-lists.
     """
     if not envelope:
-        return {"mode": "none", "allowed_hosts": []}
+        return {"capability": "OFFLINE", "mode": "OFFLINE", "allowed_hosts": []}
+    capability = str(envelope.get("capability") or "RESTRICTED_EGRESS")
     return {
-        "mode": "egress",
+        "capability": capability,
+        "mode": capability,
         "policy_digest": str(envelope.get("policy_digest") or ""),
         "allowed_hosts": [],
     }
@@ -568,6 +575,7 @@ class SandboxTaskService:
             return None
         return {
             "policy_digest": policy.digest,
+            "capability": policy.capability.value,
             "network": self.settings.sandbox_egress_network,
             "proxy_url": self.settings.sandbox_egress_proxy_url,
         }
@@ -722,7 +730,7 @@ class SandboxTaskService:
                 "disk_bytes": self.settings.sandbox_disk_bytes,
                 "output_bytes": self.settings.sandbox_output_bytes,
             },
-            network_policy={"mode": "none", "allowed_hosts": []},
+            network_policy={"capability": "OFFLINE", "mode": "OFFLINE", "allowed_hosts": []},
             last_used_at=now,
             expires_at=workspace_expires_at,
             workspace_expires_at=workspace_expires_at,
@@ -1266,6 +1274,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             return None
         return {
             "policy_digest": policy.digest,
+            "capability": policy.capability.value,
             "network": self.settings.sandbox_egress_network,
             "proxy_url": self.settings.sandbox_egress_proxy_url,
         }
@@ -1363,7 +1372,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "output_bytes": self.settings.sandbox_output_bytes,
                 "agent_file_bytes": self.settings.sandbox_agent_file_bytes,
             },
-            network_policy={"mode": "none", "allowed_hosts": []},
+            network_policy={"capability": "OFFLINE", "mode": "OFFLINE", "allowed_hosts": []},
             last_used_at=now,
             expires_at=workspace_expires_at,
             workspace_expires_at=workspace_expires_at,
@@ -2252,7 +2261,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             "file_limit_bytes": self.settings.sandbox_agent_file_bytes,
             "workspace_limit_bytes": self.settings.sandbox_disk_bytes,
             "output_limit_bytes": self.settings.sandbox_output_bytes,
-            "network": session.network_policy.get("mode", "none"),
+            "network": session.network_policy.get("capability")
+            or session.network_policy.get("mode", "OFFLINE"),
             "image_pinned": _runtime_image_pinned(
                 backend,
                 self.settings,
@@ -4042,6 +4052,40 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             {
                 "type": "function",
                 "function": {
+                    "name": "sandbox_download",
+                    "description": (
+                        "Download one public HTTPS file through the reviewed host-side "
+                        "acquisition broker. The sandbox container stays offline: the broker "
+                        "revalidates DNS/redirects, blocks private and metadata addresses, "
+                        "bounds the response size, sanitizes the filename, and writes inert "
+                        "bytes into the session workspace. The first host requires user "
+                        "authorization; this tool never performs POST/PUT or arbitrary uploads."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "format": "uri", "description": "Public HTTPS file URL."},
+                            "destination_path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                                "description": "Optional workspace-relative destination, normally inputs/downloads/<safe-name>."
+                            },
+                            "expected_sha256": {
+                                "type": "string",
+                                "pattern": "^[0-9a-fA-F]{64}$",
+                                "description": "Optional expected SHA-256 of the downloaded bytes."
+                            },
+                            "sandbox_session_id": session_property,
+                        },
+                        "required": ["url"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "sandbox_subagent",
                     "description": (
                         "Spawn a nested sandbox sub-agent: it runs its own agent loop in the "
@@ -4058,6 +4102,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                         "properties": {
                             "prompt": {"type": "string", "description": "Self-contained task description for the sub-agent."},
                             "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional sandbox tool-name subset; defaults to the offline tool set."},
+                            "network_capability": {
+                                "type": "string",
+                                "enum": ["OFFLINE", "FETCH", "BROWSER", "RESTRICTED_EGRESS"],
+                                "description": "Optional client intent. The server clamps it to the role/tool profile and may lower it; it never grants direct sandbox networking."
+                            },
                             "max_rounds": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Tool round cap (default 6)."},
                             "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Optional cap on total tool executions."},
                             "write_set": {"type": "array", "items": {"type": "string"}, "description": "Optional writable workspace path prefixes, e.g. [\"work/subagents/task_a\"]. File writes outside these prefixes are rejected."},
@@ -4485,6 +4534,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 return self.toolkit_search_web(SandboxAgentSearchRequest.model_validate(payload))
             if name == "sandbox_fetch":
                 return self.toolkit_fetch(SandboxAgentFetchRequest.model_validate(payload))
+            if name == "sandbox_download":
+                return self.toolkit_download(SandboxAgentDownloadRequest.model_validate(payload))
             if name == "sandbox_subagent":
                 return self.toolkit_subagent(SandboxAgentSubagentRequest.model_validate(payload))
             if name == "sandbox_subagent_status":

@@ -140,6 +140,9 @@ class SandboxFetchProvider:
                 self.workspace_id,
                 self.allowed_domains,
                 allow_all_public=self.allow_all,
+                max_requests=int(getattr(self.settings, "sandbox_web_fetch_max_requests", 1000) or 1000),
+                max_bytes=int(getattr(self.settings, "sandbox_web_fetch_total_bytes", 1024 * 1024 * 1024) or 1024 * 1024 * 1024),
+                max_concurrency=max(1, int(getattr(self.settings, "sandbox_web_fetch_pool_size", 4) or 4)),
             )
         except EgressPolicyInvalid:
             # A policy that cannot be derived means fetch egress stays offline;

@@ -99,6 +99,9 @@ def _settings_fingerprint(
         "egress_network": settings.sandbox_egress_network,
         "egress_proxy_url": settings.sandbox_egress_proxy_url,
         "egress_policy_dir": settings.sandbox_egress_policy_dir,
+        "web_fetch_max_requests": getattr(settings, "sandbox_web_fetch_max_requests", None),
+        "web_fetch_total_bytes": getattr(settings, "sandbox_web_fetch_total_bytes", None),
+        "web_fetch_pool_size": settings.sandbox_web_fetch_pool_size,
     }
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 

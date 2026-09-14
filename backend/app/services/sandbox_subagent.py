@@ -66,6 +66,7 @@ _WRITE_TOOL_PATH_ARG = {
     "sandbox_append_file": "path",
     "sandbox_edit_file": "path",
     "sandbox_delete_file": "path",
+    "sandbox_download": "destination_path",
 }
 
 # Terminal statuses kept by the bounded registry.

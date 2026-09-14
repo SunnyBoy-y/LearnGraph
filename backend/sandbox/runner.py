@@ -95,16 +95,18 @@ def _validated_fetch_url(
     if not isinstance(url, str) or not url.strip():
         raise WebFetchError("web fetch URL is required")
     parsed = urlparse(url.strip())
-    if parsed.scheme != "https" or not parsed.hostname:
-        raise WebFetchError("web fetch only permits absolute HTTPS URLs")
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise WebFetchError("web fetch only permits absolute HTTP(S) URLs")
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise WebFetchError("web fetch URLs must not contain userinfo")
     try:
         port = parsed.port
     except ValueError as exc:
         raise WebFetchError("web fetch URL port is invalid") from exc
-    if port not in {None, 443}:
-        raise WebFetchError("web fetch only permits HTTPS port 443")
+    expected_port = 443 if scheme == "https" else 80
+    if port not in {None, expected_port}:
+        raise WebFetchError("web fetch URL uses a forbidden port")
     hostname = parsed.hostname.casefold().rstrip(".")
     try:
         ipaddress.ip_address(hostname)
@@ -327,7 +329,11 @@ def web_fetch(
                         raise WebFetchError("web fetch redirect has no location")
                     if redirect_count >= spec.max_redirects:
                         raise WebFetchError("web fetch exceeded the redirect limit")
-                    current_url = _validated_fetch_url(urljoin(current_url, location), spec.allowed_domains)
+                    current_url = _validated_fetch_url(
+                        urljoin(current_url, location),
+                        spec.allowed_domains,
+                        allow_all=spec.allow_all,
+                    )
                     continue
                 if not response.is_success:
                     raise WebFetchError(f"web fetch upstream returned HTTP {response.status_code}")

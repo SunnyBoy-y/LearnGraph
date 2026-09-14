@@ -3,16 +3,20 @@ from __future__ import annotations
 """Executable outbound egress proxy for sandboxes.
 
 Sandboxes have no direct egress. A deployment that enables reviewed outbound
-access routes sandbox traffic through this proxy; every CONNECT is authorized
-against a validated ``EgressPolicy`` and the resolved address is re-classified
-at connection time. Uncertain, unapproved, private, or expired targets are
-refused with an auditable reason.
+access routes sandbox traffic through this proxy; every HTTPS CONNECT or
+bounded HTTP GET/HEAD is authorized against a validated ``EgressPolicy`` and
+the resolved address is re-classified at connection time. Uncertain,
+unapproved, private, or expired targets are refused with an auditable reason.
 
 The proxy is pure ``asyncio`` so it runs on any host (including inside a small
 non-root container that is the only component with internet egress).
 """
 
 import asyncio
+import threading
+import time
+import uuid
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from app.services.sandbox_network_policy import (
@@ -61,6 +65,13 @@ DEFAULT_MAX_TUNNEL_BYTES = 256 * 1024 * 1024
 DEFAULT_TUNNEL_CHUNK = 64 * 1024
 
 
+@dataclass(slots=True)
+class _PolicyUsage:
+    requests: int = 0
+    bytes_total: int = 0
+    active: int = 0
+
+
 class SandboxEgressProxy:
     """HTTP CONNECT proxy that enforces one reviewed policy per connection.
 
@@ -101,6 +112,8 @@ class SandboxEgressProxy:
         self.max_tunnel_bytes = max_tunnel_bytes
         self._server: asyncio.AbstractServer | None = None
         self._bound_port: int | None = None
+        self._usage_lock = threading.Lock()
+        self._usage: dict[str, _PolicyUsage] = {}
 
     @property
     def port(self) -> int | None:
@@ -143,6 +156,270 @@ class SandboxEgressProxy:
             return self.policy_provider()
         return self.policy
 
+    def _reserve_policy_attempt(
+        self, policy: EgressPolicy
+    ) -> tuple[str | None, int | None]:
+        """Reserve one attempt and return ``(blocked_reason, remaining_bytes)``.
+
+        Callers MUST pair a successful reservation with
+        ``_finish_policy_attempt`` in ``finally``.
+        """
+        if policy.max_bytes is not None and policy.max_bytes <= 0:
+            return "byte_quota_exceeded", None
+        with self._usage_lock:
+            # Drop inactive entries whose immutable revision is no longer in
+            # the registry (normal policy rotation). Active tunnels retain
+            # their state until they finish.
+            if self.policy_registry is not None:
+                live = set(self.policy_registry)
+                for digest in list(self._usage):
+                    if digest not in live and self._usage[digest].active == 0:
+                        del self._usage[digest]
+            usage = self._usage.setdefault(policy.digest, _PolicyUsage())
+            if policy.max_requests is not None and usage.requests >= policy.max_requests:
+                return "request_quota_exceeded", None
+            if policy.max_bytes is not None and usage.bytes_total >= policy.max_bytes:
+                return "byte_quota_exceeded", None
+            if policy.max_concurrency is not None and usage.active >= policy.max_concurrency:
+                return "concurrency_quota_exceeded", None
+            usage.requests += 1
+            usage.active += 1
+            remaining_bytes = (
+                policy.max_bytes - usage.bytes_total
+                if policy.max_bytes is not None
+                else None
+            )
+        return None, remaining_bytes
+
+    def _finish_policy_attempt(
+        self,
+        policy: EgressPolicy,
+        *,
+        bytes_in: int,
+        bytes_out: int,
+    ) -> None:
+        with self._usage_lock:
+            usage = self._usage.setdefault(policy.digest, _PolicyUsage())
+            usage.active = max(0, usage.active - 1)
+            usage.bytes_total += max(0, int(bytes_in)) + max(0, int(bytes_out))
+
+    @staticmethod
+    def _safe_forward_headers(lines: list[bytes], *, host: str) -> list[bytes]:
+        allowed = {"accept", "accept-language", "cache-control", "pragma", "user-agent"}
+        forwarded: list[bytes] = [f"Host: {host}".encode("latin-1")]
+        for line in lines:
+            if b":" not in line:
+                continue
+            name, _, value = line.partition(b":")
+            if name.strip().lower().decode("latin-1") not in allowed:
+                continue
+            forwarded.append(name.strip() + b": " + value.strip())
+        forwarded.append(b"Connection: close")
+        forwarded.append(b"Accept-Encoding: identity")
+        return forwarded
+
+    async def _handle_http_proxy_request(
+        self,
+        method: str,
+        target: str,
+        header_lines: list[bytes],
+        writer: asyncio.StreamWriter,
+        policy_digest: str | None,
+        peer_address: str,
+    ) -> None:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(target)
+        if (
+            parsed.scheme.casefold() != "http"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            self._audit(
+                {
+                    "decision": "denied",
+                    "method": method,
+                    "reason": "http_proxy_target_invalid",
+                    "target": "<redacted>",
+                    "peer": peer_address,
+                }
+            )
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            return
+        try:
+            port = parsed.port or 80
+        except ValueError:
+            port = -1
+        host = parsed.hostname.casefold().rstrip(".")
+        audit_target = f"http://{host}:{port}"
+
+        policy = self._resolve_policy(policy_digest)
+        if policy is None:
+            self._audit(
+                {
+                    "decision": "denied",
+                    "reason": "policy_unavailable",
+                    "method": method,
+                    "target": audit_target,
+                    "peer": peer_address,
+                }
+            )
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            return
+
+        quota_block, remaining_bytes = self._reserve_policy_attempt(policy)
+        if quota_block is not None:
+            self._audit(
+                {
+                    "decision": "denied",
+                    "reason": quota_block,
+                    "method": method,
+                    "target": audit_target,
+                    "capability": policy.capability.value,
+                    "workspace_id": policy.workspace_id,
+                    "policy_digest": policy.digest,
+                    "peer": peer_address,
+                }
+            )
+            writer.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            return
+
+        request_id = uuid.uuid4().hex
+        started = time.monotonic()
+        bytes_in = 0
+        bytes_out = 0
+        upstream_writer: asyncio.StreamWriter | None = None
+        try:
+            try:
+                target_ip, audit = authorize_connect(
+                    policy,
+                    host,
+                    port,
+                    protocol="http",
+                    resolver=self.resolver,
+                )
+            except EgressPolicyDenied as exc:
+                self._audit(
+                    {
+                        "request_id": request_id,
+                        "decision": "denied",
+                        "method": method,
+                        "target": audit_target,
+                        **(exc.details or {}),
+                        "reason": exc.reason,
+                        "peer": peer_address,
+                    }
+                )
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+
+            self._audit(
+                {
+                    "request_id": request_id,
+                    "decision": "allowed",
+                    "method": method,
+                    "target": audit_target,
+                    "resolved_ip": target_ip,
+                    **audit,
+                    "peer": peer_address,
+                }
+            )
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(target_ip, port),
+                    timeout=self.max_idle_seconds,
+                )
+            except Exception:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            try:
+                request_line = f"{method} {path} HTTP/1.1".encode("latin-1")
+            except UnicodeEncodeError:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+            request_head = (
+                b"\r\n".join(
+                    [
+                        request_line,
+                        *self._safe_forward_headers(
+                            header_lines,
+                            host=str(audit.get("host") or host),
+                        ),
+                    ]
+                )
+                + b"\r\n\r\n"
+            )
+            upstream_writer.write(request_head)
+            await upstream_writer.drain()
+            bytes_in = len(request_head)
+
+            limit = (
+                min(self.max_tunnel_bytes, remaining_bytes)
+                if remaining_bytes is not None
+                else self.max_tunnel_bytes
+            )
+            byte_limit_exceeded = False
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        upstream_reader.read(DEFAULT_TUNNEL_CHUNK),
+                        timeout=self.max_idle_seconds,
+                    )
+                except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError):
+                    break
+                if not chunk:
+                    break
+                bytes_out += len(chunk)
+                if bytes_in + bytes_out > limit:
+                    byte_limit_exceeded = True
+                    break
+                writer.write(chunk)
+                await writer.drain()
+            self._audit(
+                {
+                    "request_id": request_id,
+                    "decision": "completed",
+                    "method": method,
+                    "capability": policy.capability.value,
+                    "workspace_id": policy.workspace_id,
+                    "policy_digest": policy.digest,
+                    "target": audit_target,
+                    "resolved_ip": target_ip,
+                    "bytes_in": bytes_in,
+                    "bytes_out": bytes_out,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "blocked_reason": ("byte_quota_exceeded" if byte_limit_exceeded else None),
+                }
+            )
+        finally:
+            self._finish_policy_attempt(policy, bytes_in=bytes_in, bytes_out=bytes_out)
+            if upstream_writer is not None:
+                upstream_writer.close()
+                try:
+                    await upstream_writer.wait_closed()
+                except Exception:
+                    pass
+            try:
+                writer.close()
+            except Exception:
+                pass
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         peer_address = f"{peer[0]}:{peer[1]}" if peer else "unknown"
@@ -159,8 +436,12 @@ class SandboxEgressProxy:
 
         first_line, *rest_lines = header.split(b"\r\n")
         parts = first_line.decode("latin-1").split()
-        if len(parts) != 3 or parts[0] != "CONNECT" or parts[2] != "HTTP/1.1":
-            self._audit({"decision": "denied", "reason": "non_connect_method", "peer": peer_address})
+        if (
+            len(parts) != 3
+            or parts[0] not in {"CONNECT", "GET", "HEAD"}
+            or parts[2] != "HTTP/1.1"
+        ):
+            self._audit({"decision": "denied", "reason": "method_not_allowed", "peer": peer_address})
             writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
             await writer.drain()
             writer.close()
@@ -185,6 +466,16 @@ class SandboxEgressProxy:
                     policy_digest = auth_digest
                 break
 
+        if parts[0] in {"GET", "HEAD"}:
+            await self._handle_http_proxy_request(
+                parts[0],
+                parts[1],
+                rest_lines,
+                writer,
+                policy_digest,
+                peer_address,
+            )
+            return
         authority = parts[1]
         try:
             host, port_text = authority.rsplit(":", 1)
@@ -212,59 +503,129 @@ class SandboxEgressProxy:
             writer.close()
             return
 
-        try:
-            target_ip, audit = authorize_connect(
-                resolved_policy,
-                host,
-                port,
-                resolver=self.resolver,
-            )
-        except EgressPolicyDenied as exc:
+        quota_block, remaining_bytes = self._reserve_policy_attempt(resolved_policy)
+        if quota_block is not None:
             self._audit(
                 {
                     "decision": "denied",
+                    "reason": quota_block,
                     "target": authority,
-                    **(exc.details or {}),
-                    "reason": exc.reason,
+                    "capability": resolved_policy.capability.value,
+                    "workspace_id": resolved_policy.workspace_id,
+                    "policy_digest": resolved_policy.digest,
                     "peer": peer_address,
                 }
             )
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            writer.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
             await writer.drain()
             writer.close()
             return
 
-        self._audit(
-            {
-                "decision": "allowed",
-                "target": authority,
-                "resolved_ip": target_ip,
-                **audit,
-                "peer": peer_address,
-            }
-        )
+        request_id = uuid.uuid4().hex
+        started = time.monotonic()
+        bytes_in = 0
+        bytes_out = 0
         try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(target_ip, port),
-                timeout=self.max_idle_seconds,
-            )
-        except Exception:
-            self._audit({"decision": "denied", "reason": "upstream_connect_failed", "target": authority})
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
-        try:
-            await self._pump_tunnel(reader, writer, upstream_reader, upstream_writer)
-        finally:
-            upstream_writer.close()
             try:
-                await upstream_writer.wait_closed()
+                target_ip, audit = authorize_connect(
+                    resolved_policy,
+                    host,
+                    port,
+                    resolver=self.resolver,
+                )
+            except EgressPolicyDenied as exc:
+                self._audit(
+                    {
+                        "request_id": request_id,
+                        "decision": "denied",
+                        "method": "CONNECT",
+                        "target": authority,
+                        **(exc.details or {}),
+                        "reason": exc.reason,
+                        "peer": peer_address,
+                    }
+                )
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+
+            self._audit(
+                {
+                    "request_id": request_id,
+                    "decision": "allowed",
+                    "method": "CONNECT",
+                    "target": authority,
+                    "resolved_ip": target_ip,
+                    **audit,
+                    "peer": peer_address,
+                }
+            )
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(target_ip, port),
+                    timeout=self.max_idle_seconds,
+                )
             except Exception:
-                pass
+                self._audit(
+                    {
+                        "request_id": request_id,
+                        "decision": "denied",
+                        "method": "CONNECT",
+                        "reason": "upstream_connect_failed",
+                        "capability": resolved_policy.capability.value,
+                        "workspace_id": resolved_policy.workspace_id,
+                        "policy_digest": resolved_policy.digest,
+                        "target": authority,
+                    }
+                )
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+                return
+
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            try:
+                bytes_in, bytes_out, byte_limit_exceeded = await self._pump_tunnel(
+                    reader,
+                    writer,
+                    upstream_reader,
+                    upstream_writer,
+                    max_bytes=(
+                        min(self.max_tunnel_bytes, remaining_bytes)
+                        if remaining_bytes is not None
+                        else self.max_tunnel_bytes
+                    ),
+                )
+            finally:
+                upstream_writer.close()
+                try:
+                    await upstream_writer.wait_closed()
+                except Exception:
+                    pass
+            self._audit(
+                {
+                    "request_id": request_id,
+                    "decision": "completed",
+                    "method": "CONNECT",
+                    "capability": resolved_policy.capability.value,
+                    "workspace_id": resolved_policy.workspace_id,
+                    "policy_digest": resolved_policy.digest,
+                    "target": authority,
+                    "resolved_ip": target_ip,
+                    "bytes_in": bytes_in,
+                    "bytes_out": bytes_out,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "blocked_reason": ("byte_quota_exceeded" if byte_limit_exceeded else None),
+                }
+            )
+        finally:
+            self._finish_policy_attempt(
+                resolved_policy,
+                bytes_in=bytes_in,
+                bytes_out=bytes_out,
+            )
 
     async def _pump_tunnel(
         self,
@@ -272,29 +633,39 @@ class SandboxEgressProxy:
         client_writer: asyncio.StreamWriter,
         upstream_reader: asyncio.StreamReader,
         upstream_writer: asyncio.StreamWriter,
-    ) -> None:
-        total = 0
+        *,
+        max_bytes: int,
+    ) -> tuple[int, int, bool]:
+        bytes_in = 0
+        bytes_out = 0
+        byte_limit_exceeded = False
 
         async def client_to_upstream() -> None:
-            nonlocal total
+            nonlocal bytes_in, byte_limit_exceeded
             while True:
                 chunk = await client_reader.read(DEFAULT_TUNNEL_CHUNK)
                 if not chunk:
                     break
-                total += len(chunk)
-                if total > self.max_tunnel_bytes:
+                bytes_in += len(chunk)
+                if bytes_in + bytes_out > max_bytes:
+                    byte_limit_exceeded = True
+                    client_writer.close()
+                    upstream_writer.close()
                     return
                 upstream_writer.write(chunk)
                 await upstream_writer.drain()
 
         async def upstream_to_client() -> None:
-            nonlocal total
+            nonlocal bytes_out, byte_limit_exceeded
             while True:
                 chunk = await upstream_reader.read(DEFAULT_TUNNEL_CHUNK)
                 if not chunk:
                     break
-                total += len(chunk)
-                if total > self.max_tunnel_bytes:
+                bytes_out += len(chunk)
+                if bytes_in + bytes_out > max_bytes:
+                    byte_limit_exceeded = True
+                    client_writer.close()
+                    upstream_writer.close()
                     return
                 client_writer.write(chunk)
                 await client_writer.drain()
@@ -305,9 +676,10 @@ class SandboxEgressProxy:
                 timeout=self.max_idle_seconds,
             )
         except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError):
-            return
+            pass
         finally:
             try:
                 client_writer.close()
             except Exception:
                 pass
+        return bytes_in, bytes_out, byte_limit_exceeded

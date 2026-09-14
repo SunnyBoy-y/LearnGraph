@@ -32,6 +32,7 @@ from app.domain.models import (
     utc_now,
 )
 from app.providers.remote.sandbox import SandboxBackendUnavailable
+from app.services.agent_execution_profiles import task_requires_sandbox_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -490,28 +491,41 @@ class SandboxSchedulerService:
         if job.attempt > MAX_JOB_ATTEMPTS:
             self._finish(job, "FAILED", "max_attempts_reached")
             return "failed"
-        ok, reason, retry_after = evaluate_capacity(
-            self.db,
-            self.settings,
-            job.owner_user_id,
-            exclude_session_id=None,
-        )
-        if not ok:
-            if reason == "sandbox_queue_depth_exceeded":
-                self._finish(job, "FAILED", reason)
-                return "failed"
-            job.status = "QUEUED"
-            job.reason = reason
-            job.available_at = utc_now() + timedelta(seconds=retry_after)
-            self.db.commit()
-            return "requeued"
-        reservation = self._reserve(job)
-        if reservation is None:
-            job.status = "QUEUED"
-            job.reason = "waiting_capacity"
-            job.available_at = utc_now() + timedelta(seconds=5)
-            self.db.commit()
-            return "requeued"
+        payload = job.payload_json if isinstance(job.payload_json, dict) else {}
+        requires_container = True
+        if job.kind == "subagent":
+            try:
+                requires_container = task_requires_sandbox_capacity(
+                    payload.get("role_key"),
+                    tools=payload.get("tools"),
+                    execution_lane=payload.get("execution_lane"),
+                )
+            except (TypeError, ValueError):
+                requires_container = True
+        reservation = None
+        if requires_container:
+            ok, reason, retry_after = evaluate_capacity(
+                self.db,
+                self.settings,
+                job.owner_user_id,
+                exclude_session_id=None,
+            )
+            if not ok:
+                if reason == "sandbox_queue_depth_exceeded":
+                    self._finish(job, "FAILED", reason)
+                    return "failed"
+                job.status = "QUEUED"
+                job.reason = reason
+                job.available_at = utc_now() + timedelta(seconds=retry_after)
+                self.db.commit()
+                return "requeued"
+            reservation = self._reserve(job)
+            if reservation is None:
+                job.status = "QUEUED"
+                job.reason = "waiting_capacity"
+                job.available_at = utc_now() + timedelta(seconds=5)
+                self.db.commit()
+                return "requeued"
         try:
             self._execute_job(job)
             return "started"
@@ -541,7 +555,8 @@ class SandboxSchedulerService:
             self._finish(job, "FAILED", "sandbox_job_failed", " ".join(str(exc).split())[:300])
             return "failed"
         finally:
-            self._release_reservation(reservation.id)
+            if reservation is not None:
+                self._release_reservation(reservation.id)
 
     def _reserve(self, job: SandboxJob) -> SandboxReservation | None:
         """Create a bounded capacity reservation for a claimed job.
@@ -695,6 +710,14 @@ class SandboxSchedulerService:
         task.attempts_json = attempts
         task.finished_at = utc_now()
         self.db.commit()
+        try:
+            from app.voice.coordinator import capture_voice_task_outcome
+
+            capture_voice_task_outcome(self.db, task)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.exception("failed to capture voice result for task %s", task.id)
         self._finish(job, outcome.status, outcome.error_class, outcome.error_message)
 
     def _execute_agent_command(self, job: SandboxJob) -> None:

@@ -286,6 +286,8 @@ class Settings(BaseSettings):
     external_image_download_max_bytes: int = 20 * 1024 * 1024
     external_image_download_max_pixels: int = 40_000_000
     external_image_download_max_parallel: int = 4
+    # Generic public-file download broker (never an arbitrary upload/proxy lane).
+    external_file_download_max_bytes: int = 50 * 1024 * 1024
     external_github_metadata_max_bytes: int = 8 * 1024 * 1024
     external_github_file_max_bytes: int = 10 * 1024 * 1024
     external_github_total_max_bytes: int = 100 * 1024 * 1024
@@ -546,6 +548,10 @@ class Settings(BaseSettings):
     sandbox_egress_network: str = "learngraph-egress"
     sandbox_egress_proxy_host: str = "127.0.0.1"
     sandbox_egress_proxy_port: int = 8888
+    # Additional deployment-specific deny CIDRs (VPC, Pod, Service, Docker
+    # bridge, database/Redis subnets). Standard loopback/private/link-local
+    # ranges are always denied by the classifier, even when this is empty.
+    sandbox_deny_cidrs: str = ""
     # Sandbox-visible proxy endpoint on the internal egress network.
     sandbox_egress_proxy_url: str = "http://egress-proxy:8888"
     # Generic Agent egress approval channel (D2.1). On by default so users can
@@ -575,6 +581,11 @@ class Settings(BaseSettings):
     # generic sandbox resource limits).
     sandbox_web_fetch_timeout_seconds: float = 30.0
     sandbox_web_fetch_max_bytes: int = 2 * 1024 * 1024
+    # Budget for the derived FETCH policy revision. The revision is shared by
+    # the warm fixed-runner pool and expires with the policy, so these caps
+    # bound abusive loops without changing per-response limits or pool size.
+    sandbox_web_fetch_max_requests: int = 1_000
+    sandbox_web_fetch_total_bytes: int = 1024 * 1024 * 1024
     # Warm web_fetch container pool: containers are created once per
     # workspace/allowlist and reused across fetches, skipping the per-fetch
     # create/delete cost (~1-3s each), and up to ``pool_size`` fetches run
@@ -583,6 +594,11 @@ class Settings(BaseSettings):
     # ``pool_idle_seconds`` of inactivity (lazy + periodic sweep).
     sandbox_web_fetch_pool_size: int = 4
     sandbox_web_fetch_pool_idle_seconds: int = 600
+    # Budget for generic RESTRICTED_EGRESS policy revisions. Exact-host
+    # approvals remain the authorization source; these are abuse ceilings.
+    sandbox_agent_egress_max_requests: int = 2_000
+    sandbox_agent_egress_max_bytes: int = 2 * 1024 * 1024 * 1024
+    sandbox_agent_egress_max_concurrency: int = 8
     # --- Isolated component renderer (P2-A) --------------------------------
     # Third-party component data is rendered into a server-owned, inert HTML
     # template with a strict CSP and delivered through the existing opaque-origin
@@ -693,6 +709,21 @@ class Settings(BaseSettings):
     # default (5.0s): the hard ceiling on how long a user turn may stay open
     # when no stop strategy fires.
     voice_turn_stop_timeout: float = 5.0
+    # Idle ceiling for the *assistant* half of a turn. A turn is finalized when
+    # playback ends, but a provider error or a hang can leave it open forever:
+    # no text frame, no TTS, therefore no ``BotStoppedSpeakingFrame`` and no
+    # ``LLMFullResponseEndFrame`` to arm the grace timer. The deadline is
+    # refreshed by every sign of progress (text, queued sentence, playback), so
+    # it measures "stuck", not "slow". When it fires with no text the turn is
+    # finalized as failed and the user's question is still persisted.
+    voice_turn_idle_timeout: float = 20.0
+    # LLM-stage retry budget. Only a generation that produced *no* text is
+    # retried (see ``VoiceTurnJournal.llm_failed``), which keeps the retry
+    # idempotent: there is no partial answer to duplicate and the voice pipeline
+    # runs no tools, so re-running the request has no external side effect.
+    voice_llm_retry_attempts: int = 3
+    voice_llm_retry_base_delay: float = 1.0
+    voice_llm_retry_max_delay: float = 8.0
 
     @property
     def resolved_sandbox_workspace_root(self) -> Path:

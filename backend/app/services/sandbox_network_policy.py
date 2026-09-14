@@ -23,6 +23,7 @@ import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -34,6 +35,38 @@ HOSTNAME_MAX_LENGTH = 253
 LABEL_MAX_LENGTH = 63
 PROTOCOL_HTTPS = "https"
 DEFAULT_PORT = 443
+PROTOCOL_HTTP = "http"
+DEFAULT_HTTP_PORT = 80
+ALLOWED_PROTOCOL_PORTS = {
+    PROTOCOL_HTTP: DEFAULT_HTTP_PORT,
+    PROTOCOL_HTTPS: DEFAULT_PORT,
+}
+ALLOWED_PORT_PROTOCOLS = {port: protocol for protocol, port in ALLOWED_PROTOCOL_PORTS.items()}
+
+
+class NetworkCapability(str, Enum):
+    """Task-scoped network capability granted to one sandbox execution.
+
+    ``OFFLINE`` is the default and has no policy file. The other values are
+    enforced by the host-side broker/proxy, never by prompt instructions.
+    """
+
+    OFFLINE = "OFFLINE"
+    FETCH = "FETCH"
+    BROWSER = "BROWSER"
+    RESTRICTED_EGRESS = "RESTRICTED_EGRESS"
+
+
+def normalize_network_capability(value: Any) -> NetworkCapability:
+    if isinstance(value, NetworkCapability):
+        return value
+    if not isinstance(value, str):
+        raise EgressPolicyInvalid("policy_capability_invalid")
+    candidate = value.strip().upper()
+    try:
+        return NetworkCapability(candidate)
+    except ValueError as exc:
+        raise EgressPolicyInvalid("policy_capability_invalid") from exc
 
 # Derived fetch egress: the unified ``web_fetch.policy`` allowlist is the single
 # source of truth, and fetch egress is derived from it into a *separate* policy
@@ -102,6 +135,16 @@ FORBIDDEN_FAMILIES: tuple[tuple[str, tuple[ipaddress.IPv4Network | ipaddress.IPv
     ("broadcast", (ipaddress.ip_network("255.255.255.255/32"),)),
 )
 
+# Ranges that Python may expose as ordinary addresses but that are never
+# valid destinations for a public-web fetch. ``is_global`` below is the final
+# fail-closed gate; these named ranges keep audit reasons actionable.
+NON_PUBLIC_RANGES = (
+    ("benchmarking", (ipaddress.ip_network("198.18.0.0/15"),)),
+    ("ietf_reserved", (ipaddress.ip_network("192.0.0.0/24"),)),
+    ("protocol_assignment", (ipaddress.ip_network("192.88.99.0/24"),)),
+    ("reserved", (ipaddress.ip_network("240.0.0.0/4"), ipaddress.ip_network("2001:10::/28"))),
+)
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -154,7 +197,9 @@ def normalize_hostname(host: str) -> str:
     - validates label lengths and characters;
     - **rejects IP literals** — a reviewed policy names domains, not addresses.
     """
-    value = host.strip().strip(".")
+    value = host.strip()
+    if value.endswith("."):
+        value = value[:-1]
     if not value or len(value) > HOSTNAME_MAX_LENGTH:
         raise EgressPolicyInvalid("hostname_out_of_range")
     lowered = value.casefold()
@@ -203,22 +248,54 @@ def _is_fake_ip_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) 
     return False
 
 
+def _is_configured_deny_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    raw = getattr(get_settings(), "sandbox_deny_cidrs", "") or ""
+    for item in raw.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            network = ipaddress.ip_network(candidate, strict=False)
+        except ValueError:
+            logger.warning("Ignoring invalid SANDBOX_DENY_CIDRS entry %r", candidate)
+            continue
+        if address.version == network.version and address in network:
+            return True
+    return False
+
+
 def classify_ip_address(value: str) -> str:
     """Return a coarse classification: 'public' or a forbidden category name."""
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
         return "invalid"
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        # IPv4-mapped IPv6 is just another spelling of an IPv4 destination.
+        # Normalizing it closes bypasses such as ::ffff:127.0.0.1.
+        address = address.ipv4_mapped
     normalized = str(address)
     if normalized in KNOWN_METADATA_ADDRESSES:
         return "metadata"
-    if _is_fake_ip_address(address):
-        return "public"
+    if _is_configured_deny_address(address):
+        return "deployment_denied"
     for category, networks in FORBIDDEN_FAMILIES:
         if any(address in network for network in networks):
             return category
+    # Fake-IP TUN ranges are an explicit local-proxy compatibility escape
+    # hatch. They can never override loopback/private/link-local/metadata
+    # classifications above.
+    if _is_fake_ip_address(address):
+        return "public"
     if any(address in network for network in DOCUMENTATION_RANGES):
         return "documentation"
+    for category, networks in NON_PUBLIC_RANGES:
+        if any(address in network for network in networks):
+            return category
+    # The standard-library global flag is the final fail-closed gate. It
+    # catches reserved/future-use ranges that are not worth enumerating.
+    if not address.is_global:
+        return "non_global"
     return "public"
 
 
@@ -273,6 +350,10 @@ class EgressPolicy:
     digest: str
     raw: dict[str, Any]
     allow_all_public: bool = False
+    capability: NetworkCapability = NetworkCapability.RESTRICTED_EGRESS
+    max_requests: int | None = None
+    max_bytes: int | None = None
+    max_concurrency: int | None = None
 
     def is_expired(self, *, now: datetime | None = None) -> bool:
         current = now or _utc_now()
@@ -306,6 +387,9 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
     approval_id = data.get("approval_id")
     issuer = data.get("issuer")
     allow_all_public = data.get("allow_all_public") is True
+    capability = normalize_network_capability(
+        data.get("capability", NetworkCapability.RESTRICTED_EGRESS.value)
+    )
     issued_at = parse_policy_datetime(data.get("issued_at"))
     expires_at = parse_policy_datetime(data.get("expires_at"))
     if not isinstance(workspace_id, str) or not workspace_id:
@@ -319,11 +403,27 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
     if expires_at <= (now or _utc_now()):
         raise EgressPolicyInvalid("policy_expired")
 
+    limits: dict[str, int | None] = {}
+    for field_name in ("max_requests", "max_bytes", "max_concurrency"):
+        raw_limit = data.get(field_name)
+        if raw_limit is None:
+            limits[field_name] = None
+            continue
+        if (
+            not isinstance(raw_limit, int)
+            or isinstance(raw_limit, bool)
+            or raw_limit <= 0
+        ):
+            raise EgressPolicyInvalid(f"policy_{field_name}_invalid")
+        limits[field_name] = raw_limit
+
     raw_hosts = data.get("hosts")
     if not isinstance(raw_hosts, list):
         raise EgressPolicyInvalid("policy_hosts_must_be_list")
     if not raw_hosts and not allow_all_public:
         raise EgressPolicyInvalid("policy_empty_hosts")
+    if capability is NetworkCapability.OFFLINE and (raw_hosts or allow_all_public):
+        raise EgressPolicyInvalid("policy_offline_has_hosts")
 
     hosts: list[PolicyHost] = []
     seen_hosts: set[str] = set()
@@ -341,15 +441,21 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
         for port in raw_ports:
             if not isinstance(port, int) or not (1 <= port <= 65535):
                 raise EgressPolicyInvalid("policy_port_invalid")
+            if port not in {DEFAULT_HTTP_PORT, DEFAULT_PORT}:
+                raise EgressPolicyInvalid("policy_port_must_be_http_https")
             ports.append(port)
         raw_protocols = entry.get("protocols", [PROTOCOL_HTTPS])
         if not isinstance(raw_protocols, list) or not raw_protocols:
             raise EgressPolicyInvalid("policy_host_no_protocols")
         protocols: list[str] = []
         for protocol in raw_protocols:
-            if protocol != PROTOCOL_HTTPS:
-                raise EgressPolicyInvalid("policy_non_https_protocol")
+            if protocol not in ALLOWED_PROTOCOL_PORTS:
+                raise EgressPolicyInvalid("policy_protocol_not_http_https")
             protocols.append(protocol)
+        if any(ALLOWED_PROTOCOL_PORTS[protocol] not in ports for protocol in protocols):
+            raise EgressPolicyInvalid("policy_protocol_port_mismatch")
+        if any(ALLOWED_PORT_PROTOCOLS[port] not in protocols for port in ports):
+            raise EgressPolicyInvalid("policy_protocol_port_mismatch")
         hosts.append(
             PolicyHost(host=host, ports=tuple(sorted(set(ports))), protocols=tuple(protocols))
         )
@@ -365,6 +471,10 @@ def validate_egress_policy(data: Any, *, now: datetime | None = None) -> EgressP
         digest=digest,
         raw=dict(data),
         allow_all_public=allow_all_public,
+        capability=capability,
+        max_requests=limits["max_requests"],
+        max_bytes=limits["max_bytes"],
+        max_concurrency=limits["max_concurrency"],
     )
 
 
@@ -373,6 +483,7 @@ def authorize_connect(
     host: str,
     port: int,
     *,
+    protocol: str = PROTOCOL_HTTPS,
     resolver: AddressResolver = system_resolver,
     now: datetime | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -386,10 +497,20 @@ def authorize_connect(
         "policy_digest": policy.digest,
         "approval_id": policy.approval_id,
         "workspace_id": policy.workspace_id,
+        "capability": policy.capability.value,
+        "protocol": protocol,
     }
     if policy.is_expired(now=now):
         raise EgressPolicyDenied("policy_expired", details=audit)
 
+    if policy.capability is NetworkCapability.OFFLINE:
+        raise EgressPolicyDenied("capability_offline", details=audit)
+    expected_port = ALLOWED_PROTOCOL_PORTS.get(protocol)
+    if expected_port is None or port != expected_port:
+        raise EgressPolicyDenied(
+            "port_protocol_not_allowed",
+            details={**audit, "requested_port": port, "allowed_ports": [expected_port] if expected_port else []},
+        )
     try:
         normalized = normalize_hostname(host)
     except EgressPolicyInvalid as exc:
@@ -413,8 +534,18 @@ def authorize_connect(
         # link-local, multicast and cloud-metadata targets stay denied.
         rule = None
 
-    if rule is not None and port not in rule.ports:
-        raise EgressPolicyDenied("port_not_allowed", details={**audit, "requested_port": port, "allowed_ports": list(rule.ports)})
+    if rule is not None and (
+        port not in rule.ports or protocol not in rule.protocols
+    ):
+        raise EgressPolicyDenied(
+            "port_protocol_not_allowed",
+            details={
+                **audit,
+                "requested_port": port,
+                "allowed_ports": list(rule.ports),
+                "allowed_protocols": list(rule.protocols),
+            },
+        )
 
     addresses = resolver(normalized)
     classified = _classify_all(addresses)
@@ -445,7 +576,7 @@ def load_workspace_policy_file(policy_dir: str | Path, workspace_id: str, *, now
         )
         return None
     try:
-        return validate_egress_policy(raw, now=now)
+        policy = validate_egress_policy(raw, now=now)
     except EgressPolicyInvalid as exc:
         logger.error(
             "Sandbox egress policy %s is invalid; egress denied for workspace %s: %s",
@@ -454,6 +585,14 @@ def load_workspace_policy_file(policy_dir: str | Path, workspace_id: str, *, now
             exc.reason,
         )
         return None
+    if policy.capability is NetworkCapability.OFFLINE:
+        logger.error(
+            "Sandbox egress policy %s is OFFLINE; generic egress denied for workspace %s",
+            policy_path,
+            workspace_id,
+        )
+        return None
+    return policy
 
 
 def derive_egress_policy_for_fetch(
@@ -462,17 +601,20 @@ def derive_egress_policy_for_fetch(
     allowed_domains: Iterable[str],
     ttl_seconds: int = WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS,
     allow_all_public: bool = False,
+    max_requests: int | None = None,
+    max_bytes: int | None = None,
+    max_concurrency: int | None = None,
     now: datetime | None = None,
 ) -> EgressPolicy:
     """Derive a narrow, short-lived egress policy from the unified fetch allowlist.
 
     The shared ``access.allowlist.allowed_domains`` list is the single source of
-    truth; this function turns it into an ``EgressPolicy`` that is HTTPS-443-only,
-    expires quickly (so a stale derivation cannot outlive an allowlist change),
-    and records ``issuer=web_fetch_policy`` so the egress proxy and audit trail
-    can distinguish it from a separately-reviewed generic policy. An empty or
-    invalid allowlist fails closed unless ``allow_all_public`` opts into
-    no-interception mode.
+    truth; this function turns it into an ``EgressPolicy`` limited to public
+    HTTP/HTTPS ports 80/443, records ``issuer=web_fetch_policy`` so the egress
+    proxy and audit trail can distinguish it from a separately-reviewed generic
+    policy, and carries its request/byte/concurrency budget. An empty or invalid
+    allowlist fails closed unless ``allow_all_public`` opts into no-interception
+    mode.
     """
     if not isinstance(workspace_id, str) or not workspace_id:
         raise EgressPolicyInvalid("policy_missing_workspace")
@@ -492,13 +634,25 @@ def derive_egress_policy_for_fetch(
         "workspace_id": workspace_id,
         "approval_id": WEB_FETCH_POLICY_APPROVAL_ID,
         "issuer": WEB_FETCH_POLICY_ISSUER,
+        "capability": NetworkCapability.FETCH.value,
         "issued_at": issued.isoformat(),
         "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
         "hosts": [
-            {"host": domain, "ports": [DEFAULT_PORT], "protocols": [PROTOCOL_HTTPS]}
+            {
+                "host": domain,
+                "ports": [DEFAULT_HTTP_PORT, DEFAULT_PORT],
+                "protocols": [PROTOCOL_HTTP, PROTOCOL_HTTPS],
+            }
             for domain in domains
         ],
     }
+    for name, value in (
+        ("max_requests", max_requests),
+        ("max_bytes", max_bytes),
+        ("max_concurrency", max_concurrency),
+    ):
+        if value is not None:
+            data[name] = value
     if allow_all_public:
         data["allow_all_public"] = True
     return validate_egress_policy(data, now=now)
@@ -532,6 +686,9 @@ def refresh_workspace_fetch_policy_file(
     *,
     allow_all_public: bool = False,
     ttl_seconds: int = WEB_FETCH_POLICY_DEFAULT_TTL_SECONDS,
+    max_requests: int | None = None,
+    max_bytes: int | None = None,
+    max_concurrency: int | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Idempotently refresh the derived fetch egress policy file.
@@ -550,6 +707,9 @@ def refresh_workspace_fetch_policy_file(
         allowed_domains=allowed_domains,
         ttl_seconds=ttl_seconds,
         allow_all_public=allow_all_public,
+        max_requests=max_requests,
+        max_bytes=max_bytes,
+        max_concurrency=max_concurrency,
         now=now,
     )
     policy_path = Path(policy_dir) / f"{workspace_id}{WEB_FETCH_POLICY_FILE_SUFFIX}"
@@ -562,6 +722,10 @@ def refresh_workspace_fetch_policy_file(
         existing is not None
         and existing.allow_all_public == policy.allow_all_public
         and set(existing.hosts) == set(policy.hosts)
+        and existing.capability is policy.capability
+        and existing.max_requests == policy.max_requests
+        and existing.max_bytes == policy.max_bytes
+        and existing.max_concurrency == policy.max_concurrency
     ):
         return False
     store_workspace_fetch_policy_file(policy_dir, policy)
@@ -600,6 +764,9 @@ def derive_egress_policy_for_agent(
     allowed_hosts: Iterable[str],
     ttl_seconds: int = AGENT_EGRESS_POLICY_DEFAULT_TTL_SECONDS,
     allow_all_public: bool = False,
+    max_requests: int | None = None,
+    max_bytes: int | None = None,
+    max_concurrency: int | None = None,
     now: datetime | None = None,
 ) -> EgressPolicy:
     """Derive a generic Agent egress policy from the durable approval allowlist.
@@ -630,6 +797,7 @@ def derive_egress_policy_for_agent(
         "workspace_id": workspace_id,
         "approval_id": AGENT_EGRESS_POLICY_APPROVAL_ID,
         "issuer": AGENT_EGRESS_POLICY_ISSUER,
+        "capability": NetworkCapability.RESTRICTED_EGRESS.value,
         "issued_at": issued.isoformat(),
         "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
         "hosts": [
@@ -637,6 +805,13 @@ def derive_egress_policy_for_agent(
             for host in hosts
         ],
     }
+    for name, value in (
+        ("max_requests", max_requests),
+        ("max_bytes", max_bytes),
+        ("max_concurrency", max_concurrency),
+    ):
+        if value is not None:
+            data[name] = value
     if allow_all_public:
         data["allow_all_public"] = True
     return validate_egress_policy(data, now=now)
@@ -677,6 +852,14 @@ def load_workspace_fetch_policy_file(
             policy_path,
             workspace_id,
             exc.reason,
+        )
+        return None
+    if policy.capability is not NetworkCapability.FETCH:
+        logger.error(
+            "Sandbox web_fetch policy %s has unexpected capability %r; fetch egress denied for workspace %s",
+            policy_path,
+            policy.capability.value,
+            workspace_id,
         )
         return None
     if policy.issuer != WEB_FETCH_POLICY_ISSUER:

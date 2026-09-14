@@ -8,20 +8,23 @@ content-addressed files into the durable session workspace.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from email.message import Message
 import hashlib
 import http.client
 from io import BytesIO
 import json
+import mimetypes
 from pathlib import PurePosixPath
 import re
 import ssl
 import threading
 import time
-from typing import Any
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from typing import Any, Protocol
+import unicodedata
+from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, select
@@ -55,8 +58,6 @@ class AcquisitionApprovalRequired(Exception):
     def __init__(self, hostname: str) -> None:
         self.hostname = hostname
         super().__init__(hostname)
-
-
 @dataclass(frozen=True)
 class DownloadedResponse:
     requested_url: str
@@ -66,7 +67,21 @@ class DownloadedResponse:
     status: int
     declared_mime: str
     data: bytes
+    headers: dict[str, str] = field(default_factory=dict)
 
+
+class ExternalFileScanner(Protocol):
+    """Optional malware scanner seam for downloaded non-image files.
+
+    A configured scanner must return ``{"status": "clean", ...}``. Any other
+    status is treated as a failure; when no scanner is configured the receipt
+    explicitly records ``not_configured`` instead of pretending the file was
+    scanned.
+    """
+
+    name: str
+
+    def scan(self, data: bytes, *, filename: str, mime_type: str) -> dict[str, Any]: ...
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS connection whose TCP destination is a pre-classified public IP."""
@@ -306,6 +321,114 @@ class ExternalAcquisitionService:
         self.db.refresh(receipt)
         return {**view, "receipt_id": receipt.id, "width": width, "height": height, "sanitized": True}
 
+    def download_file(
+        self,
+        *,
+        chat_session_id: str,
+        url: str,
+        destination_path: str | None,
+        allowed_hosts: set[str],
+        request_spec_sha256: str,
+        approval_by_host: dict[str, str] | None = None,
+        expected_sha256: str | None = None,
+        scanner: ExternalFileScanner | None = None,
+    ) -> dict[str, Any]:
+        """Download one inert public file through the trusted host broker.
+
+        The response is bounded before persistence, redirects and DNS answers are
+        revalidated by ``_download``, and the server-controlled filename is the
+        only value allowed into the workspace path. Downloaded bytes are never
+        executed by this method.
+        """
+        response = self._download(
+            url,
+            allowed_hosts=allowed_hosts,
+            max_bytes=self.settings.external_file_download_max_bytes,
+        )
+        wire_sha = hashlib.sha256(response.data).hexdigest()
+        if expected_sha256 and wire_sha != expected_sha256.casefold():
+            raise AppError(422, "external_download_hash_mismatch", "Downloaded file did not match expected SHA-256")
+
+        safe_name = self._safe_download_filename(
+            response.final_url or url,
+            response.headers.get("content-disposition"),
+            response.declared_mime,
+        )
+        requested_path = destination_path or f"inputs/downloads/{safe_name}"
+        safe_path = validate_agent_workspace_path(requested_path)
+        guessed, _ = mimetypes.guess_type(safe_path)
+        mime = (
+            response.declared_mime
+            if response.declared_mime and response.declared_mime != "application/octet-stream"
+            else (guessed or "application/octet-stream")
+        )
+
+        scan_record: dict[str, Any] = {
+            "status": "not_configured",
+            "scanner": None,
+        }
+        if scanner is not None:
+            scan_result = scanner.scan(
+                response.data,
+                filename=safe_name,
+                mime_type=mime,
+            )
+            if not isinstance(scan_result, dict):
+                raise AppError(500, "external_download_scanner_invalid", "Download scanner returned an invalid result")
+            scan_record = {**scan_result, "scanner": scanner.name}
+            if str(scan_result.get("status") or "").casefold() != "clean":
+                raise AppError(422, "external_download_scan_failed", "Downloaded file did not pass the configured scanner")
+
+        self._check_workspace_quota(len(response.data))
+        self._ensure_destination_available(chat_session_id, safe_path, wire_sha)
+        view = self.workspace.put_bytes(
+            chat_session_id=chat_session_id,
+            path=safe_path,
+            data=response.data,
+            role="input",
+            source="external_download",
+            mime_type=mime,
+            publish_file=True,
+            commit=False,
+        )
+        receipt = self._receipt(
+            kind="file",
+            request_spec_sha256=request_spec_sha256,
+            requested_url=response.requested_url,
+            final_url=response.final_url,
+            redirect_chain=response.redirect_chain,
+            resolved_addresses=response.resolved_addresses,
+            declared_mime=response.declared_mime,
+            detected_mime=mime,
+            wire_bytes=len(response.data),
+            stored_bytes=len(response.data),
+            sha256=view["blob_sha256"],
+            file_id=view.get("file_id"),
+            destination_path=safe_path,
+            files=[{
+                "path": safe_path,
+                "sha256": view["blob_sha256"],
+                "size_bytes": view["size_bytes"],
+                "file_id": view.get("file_id"),
+                "mime_type": mime,
+            }],
+            commit=False,
+            provenance={
+                "wire_sha256": wire_sha,
+                "safe_filename": safe_name,
+                "scan": scan_record,
+                "approval_by_host": dict(approval_by_host or {}),
+            },
+        )
+        self.db.commit()
+        self.db.refresh(receipt)
+        return {
+            **view,
+            "receipt_id": receipt.id,
+            "url": response.final_url,
+            "scanner": scan_record,
+        }
+
     def download_images(
         self,
         *,
@@ -468,6 +591,44 @@ class ExternalAcquisitionService:
             extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "img")
             name = f"image_{index}.{extension}"
         return name
+
+    @staticmethod
+    def _safe_download_filename(
+        url: str,
+        content_disposition: str | None,
+        declared_mime: str | None,
+    ) -> str:
+        """Return a basename that cannot escape the sandbox workspace.
+
+        Content-Disposition is parsed with ``email.message.Message`` (including
+        RFC 2231 continuations); raw path separators are never trusted. The URL
+        path is the fallback source.
+        """
+        candidate = ""
+        if content_disposition:
+            message = Message()
+            message["content-disposition"] = content_disposition
+            candidate = str(message.get_filename() or "")
+        if not candidate:
+            candidate = unquote(PurePosixPath(urlsplit(url).path).name)
+        candidate = unicodedata.normalize("NFKC", candidate)
+        candidate = candidate.replace("\\", "/").rsplit("/", 1)[-1]
+        candidate = re.sub(r"[\x00-\x1f\x7f]+", "", candidate)
+        candidate = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate)
+        candidate = candidate.replace("..", "_").strip(" ._")
+        if not candidate:
+            extension = mimetypes.guess_extension(str(declared_mime or "")) or ".bin"
+            candidate = f"download{extension}"
+        stem = PurePosixPath(candidate).stem[:120] or "download"
+        suffix = PurePosixPath(candidate).suffix[:20]
+        reserved = {
+            "con", "prn", "aux", "nul",
+            *(f"com{index}" for index in range(1, 10)),
+            *(f"lpt{index}" for index in range(1, 10)),
+        }
+        if stem.casefold() in reserved:
+            stem = f"file_{stem}"
+        return f"{stem}{suffix}"
 
     def download_github_source(
         self,
@@ -833,6 +994,7 @@ class ExternalAcquisitionService:
                 status=status,
                 declared_mime=(headers.get("content-type") or "application/octet-stream").split(";", 1)[0].strip().casefold(),
                 data=data,
+                headers=dict(headers),
             )
         raise AppError(422, "external_download_too_many_redirects", "Remote download exceeded the redirect limit")
 

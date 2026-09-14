@@ -46,8 +46,33 @@ function egressDigest() {
 function startLocalForwarder(upstreamUrl, digest) {
   const upstream = new URL(upstreamUrl);
   const server = http.createServer((req, res) => {
-    res.writeHead(405);
-    res.end("only CONNECT is supported");
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(405);
+      res.end("only GET, HEAD and CONNECT are supported");
+      return;
+    }
+    if (!/^https?:\/\//i.test(req.url || "")) {
+      res.writeHead(400);
+      res.end("absolute proxy URL required");
+      return;
+    }
+    const headers = { ...req.headers, host: new URL(req.url).host };
+    if (digest) headers["x-learngraph-policy-digest"] = digest;
+    const upstreamReq = http.request({
+      hostname: upstream.hostname,
+      port: Number(upstream.port),
+      method: req.method,
+      path: req.url,
+      headers,
+    }, (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
+      upstreamRes.pipe(res);
+    });
+    upstreamReq.on("error", (error) => {
+      if (!res.headersSent) res.writeHead(502);
+      res.end(String(error && error.message ? error.message : error));
+    });
+    req.pipe(upstreamReq);
   });
   server.on("connect", (req, clientSocket, head) => {
     const upstreamSocket = net.connect(Number(upstream.port), upstream.hostname, () => {

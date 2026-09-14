@@ -200,6 +200,9 @@ class EgressApprovalService:
                 allowed_hosts=hosts,
                 ttl_seconds=ttl,
                 allow_all_public=allow_all,
+                max_requests=int(getattr(self.settings, "sandbox_agent_egress_max_requests", 2000) or 2000),
+                max_bytes=int(getattr(self.settings, "sandbox_agent_egress_max_bytes", 2 * 1024 * 1024 * 1024) or 2 * 1024 * 1024 * 1024),
+                max_concurrency=max(1, int(getattr(self.settings, "sandbox_agent_egress_max_concurrency", 8) or 8)),
                 now=current,
             )
             store_workspace_policy_file(policy_dir, policy)
