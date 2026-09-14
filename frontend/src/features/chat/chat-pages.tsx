@@ -10,7 +10,6 @@ import {
   useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
-  type TouchEvent as ReactTouchEvent,
 } from "react";
 import { createPortal } from "react-dom";
 import { createUuid } from "@/lib/uuid";
@@ -117,7 +116,6 @@ import { VoiceCallControl, VoiceComposerActions, VoiceOrbDock } from "@/features
 import { voiceSessionController } from "@/features/voice/voice-session-controller";
 import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
-import { dispatchOpenGraph, dispatchOpenSidebar } from "@/lib/mobile-shell";
 import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
 import { ThinkingSlider, THINKING_STOPS, thinkingStopIndex } from "@/components/chat/thinking-slider";
 import { providerDictationSupported } from "@/lib/provider-dictation";
@@ -140,6 +138,8 @@ import {
   ConversationEmptyState,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
+import { useConversationScrollController } from "@/features/chat/use-conversation-scroll-controller";
+import { shouldCommitVoiceRender } from "@/features/voice/voice-render-policy";
 import {
   Message as AiMessage,
   MessageAction,
@@ -185,7 +185,6 @@ import {
   chime as nativeChime,
 } from "@/lib/native-bridge";
 import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
-import { MiddleEllipsis } from "@/components/shared/middle-ellipsis";
 import {
   groupAnswerParts,
   QuestionSetPager,
@@ -855,13 +854,6 @@ const TERMINAL_MESSAGE_STATUSES = [
   "interrupted",
 ] as const;
 const IN_FLIGHT_MESSAGE_STATUSES = ["pending", "submitted", "streaming"] as const;
-
-/** Sidebar/top-bar title for sessions created by edit/branch. */
-function branchSessionTitle(sourceTitle: string | null | undefined): string {
-  const base = (sourceTitle ?? "").trim() || "未命名会话";
-  const stripped = base.replace(/^(分支\.)+/, "").trim() || "未命名会话";
-  return `分支.${stripped}`;
-}
 
 /** Default composer draft when a learning node becomes the active context. */
 function learningNodeComposerDraft(nodeLabel: string): string {
@@ -1588,41 +1580,6 @@ function MessageVersionNavigator({
   );
 }
 
-/**
- * 用户发出新消息后，把该消息滚动到可视区顶端向下 1/5 处（上限位置），
- * 使其不被底部悬浮输入框盖住；同时离开底部锁定，允许用户继续滚动画布。
- */
-function scrollNewUserMessageToFifthLine(userMessageId: string) {
-  const scrollElement = document.querySelector<HTMLElement>(
-    ".chat-canvas-page [role='log']",
-  );
-  window.dispatchEvent(
-    new CustomEvent("learngraph:manual-scroll", {
-      detail: { scrollElement },
-    }),
-  );
-  const attempt = () => {
-    const scroller = document.querySelector<HTMLElement>(
-      ".chat-canvas-page [role='log'] > div",
-    );
-    const el = document.getElementById(`conversation-jump-${userMessageId}`);
-    if (!scroller || !el) return false;
-    const targetTop =
-      scroller.getBoundingClientRect().top + scroller.clientHeight * 0.2;
-    const delta = el.getBoundingClientRect().top - targetTop;
-    const maxScroll = Math.max(
-      0,
-      scroller.scrollHeight - scroller.clientHeight,
-    );
-    const nextTop = Math.min(Math.max(0, scroller.scrollTop + delta), maxScroll);
-    scroller.scrollTo({ top: nextTop, behavior: "smooth" });
-    return true;
-  };
-  window.requestAnimationFrame(() => {
-    if (!attempt()) window.setTimeout(attempt, 120);
-  });
-}
-
 function UserMessage({
   message,
   editing,
@@ -1788,10 +1745,13 @@ function UserMessage({
 function LazyMessageMount({
   children,
   eager = false,
+  messageId,
   minHeight = 96,
 }: {
   children: ReactNode;
   eager?: boolean;
+  /** 稳定行标识：懒挂载卸载子内容后，宿主仍留在 DOM 中，可继续充当阅读锚点。 */
+  messageId?: string;
   minHeight?: number;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1844,6 +1804,7 @@ function LazyMessageMount({
     <div
       ref={hostRef}
       className="chat-message-mount"
+      data-message-mount-id={messageId}
       style={
         visible
           ? undefined
@@ -2052,6 +2013,21 @@ function AssistantMessageInner({
     selectionMarks,
     shown.status,
   ]);
+  // 分支创建与「消息 ID 复制」都已并入「更多」二级菜单：原先挂在操作行上的
+  // ID 徽标（长按/右键复制）被移除，改为菜单项 + 头尾截断展示。
+  const copyMessageId = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(message.id);
+      toast.success("消息 ID 已复制");
+    } catch {
+      toast.error("复制失败");
+    }
+  }, [message.id]);
+
+  const shortMessageId =
+    message.id.length > 14
+      ? `${message.id.slice(0, 7)}…${message.id.slice(-4)}`
+      : message.id;
 
   return (
     <AiMessage
@@ -2142,6 +2118,12 @@ function AssistantMessageInner({
           ) : (
             <div
               className="message-answer-segment"
+              data-conversation-answer-anchor={
+                finalAnswerStarted &&
+                (shown.status === "streaming" || shown.status === "pending")
+                  ? message.id
+                  : undefined
+              }
               key={`parts-${message.id}-${index}`}
             >
               {renderAnswerParts(segment.parts)}
@@ -2184,24 +2166,49 @@ function AssistantMessageInner({
         >
           <RefreshCcw className="size-3.5" />
         </MessageAction>
-        <MessageAction
-          disabled={branchDisabled}
-          label="从此创建分支"
-          onClick={onBranch}
-          tooltip={branchDisabledReason ?? "从此创建分支"}
-        >
-          <GitBranch className="size-3.5" />
-        </MessageAction>
-        {sessionId ? (
-          <Badge className="ml-1 font-mono text-[10px]" variant="secondary">
-            <MiddleEllipsis
-              className="chat-message-id"
-              copyToast="消息 ID 已复制"
-              text={message.id}
-            />
-            {" · "}v{shown.version}
-          </Badge>
-        ) : null}
+        {/* 低频动作（创建分支 / 复制消息 ID）收进「更多」二级菜单，操作行只留高频按钮。 */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <MessageAction label="更多操作" title="更多操作">
+              <MoreHorizontal className="size-3.5" />
+            </MessageAction>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-64">
+            <DropdownMenuItem
+              className={
+                branchDisabled && branchDisabledReason
+                  ? "flex-col items-start gap-0.5"
+                  : undefined
+              }
+              disabled={branchDisabled}
+              onSelect={onBranch}
+              title={branchDisabledReason ?? "从此创建分支"}
+            >
+              <span className="flex items-center gap-1.5">
+                <GitBranch className="size-3.5" />
+                从此创建分支
+              </span>
+              {branchDisabled && branchDisabledReason ? (
+                <span className="pl-5 text-[10px] text-muted-foreground">
+                  {branchDisabledReason}
+                </span>
+              ) : null}
+            </DropdownMenuItem>
+            {sessionId ? (
+              <DropdownMenuItem
+                onSelect={() => void copyMessageId()}
+                title={`复制消息 ID：${message.id}`}
+              >
+                <Copy className="size-3.5" />
+                复制消息 ID
+                <span className="ml-auto font-mono text-[10px] text-muted-foreground">
+                  {shortMessageId}
+                  {" · "}v{shown.version}
+                </span>
+              </DropdownMenuItem>
+            ) : null}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </MessageActions>
     </AiMessage>
   );
@@ -2675,6 +2682,15 @@ export function ChatCanvasPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const conversationScroll = useConversationScrollController();
+  const {
+    captureScrollSnapshot,
+    notifyCommittedAnswerStarted,
+    notifyUserTurnStarted,
+    resetTailSpace,
+    restoreScrollSnapshot,
+    scrollMessageIntoView,
+  } = conversationScroll;
   const goalMode = new URLSearchParams(location.search).get("mode") === "goal";
   /** True when this session should restore goal mode after a session switch. */
   const sessionGoalModeStored = hasSessionGoalMode(workspaceId, sessionId);
@@ -2700,33 +2716,6 @@ export function ChatCanvasPage() {
   const [activeConversationQuestionId, setActiveConversationQuestionId] =
     useState<string | null>(null);
   const [longPaste, setLongPaste] = useState<string | null>(null);
-  // 画布左右滑手势（右滑开左侧栏 / 左滑开右侧图谱）
-  const canvasSwipeRef = useRef<{ x: number; y: number; id: number } | null>(null);
-  const handleCanvasTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
-    if (event.touches.length !== 1) {
-      canvasSwipeRef.current = null;
-      return;
-    }
-    const touch = event.touches[0];
-    canvasSwipeRef.current = { x: touch.clientX, y: touch.clientY, id: touch.identifier };
-  };
-  const handleCanvasTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
-    const start = canvasSwipeRef.current;
-    canvasSwipeRef.current = null;
-    if (!start) return;
-    let touch = null;
-    for (let i = 0; i < event.changedTouches.length; i += 1) {
-      const item = event.changedTouches[i];
-      if (item && item.identifier === start.id) { touch = item; break; }
-    }
-    if (!touch) return;
-    const dx = touch.clientX - start.x;
-    const dy = touch.clientY - start.y;
-    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
-    if (dx > 0) dispatchOpenSidebar();
-    else dispatchOpenGraph();
-  };
-
   useEffect(() => {
     setSelectionExplanationMarks(listSelectionExplanations(sessionId));
     const refresh = (event: Event) => {
@@ -2806,7 +2795,9 @@ export function ChatCanvasPage() {
   const [imageSize, setImageSize] = useState<ImageSize>("auto");
   useEffect(() => {
     setStreamConnectionNotice(null);
-  }, [conversationResetKey]);
+    // 会话切换时释放上一段会话留下的尾部预留：否则新会话末尾会凭空多出一段空白。
+    resetTailSpace();
+  }, [conversationResetKey, resetTailSpace]);
   const [modelSearch, setModelSearch] = useState("");
   // Collapsed = icon + chevron, open = current mode word + chevron, matching
   // the ChatGPT composer trigger. Drives the chip content and Ctrl+Shift+M.
@@ -2835,14 +2826,15 @@ export function ChatCanvasPage() {
     voiceSnapshotForGating.textFallback;
   /** Voice mode owns the composer only while its input path still works. */
   const voiceBlocksComposer = voiceModeOpen && !voiceTextFallback;
-  // 语音通话回合 → 聊天消息列表。render 事件使用稳定 turn id，允许同一条
-  // 气泡随着 ASR/TTS 进度原地更新；最终事件再把 status 转为 completed。
+  // 语音通话回合 → 聊天消息列表。partial/speculative 只留在 Composer 上方
+  // 的 Listening Dock；只有 authoritative/final 事件才允许创建或更新消息。
   useEffect(() => {
     if (!voiceModeOpen) return;
     const onVoiceRender = (event: Event) => {
       const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
       const text = item?.text?.trim() || "";
       if (!item?.id || !item?.role) return;
+      if (!shouldCommitVoiceRender(item)) return;
       // 只接受当前会话的语音回合，避免切换会话后残留的回调写进别的会话。
       if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
       setLocalMessages((current) => {
@@ -2919,7 +2911,7 @@ export function ChatCanvasPage() {
     return () => {
       window.removeEventListener("learngraph:voice-render", onVoiceRender);
     };
-  }, [sessionId, voiceModeOpen, workspaceId, voiceBlocksComposer]);
+  }, [sessionId, voiceModeOpen, workspaceId]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -2967,6 +2959,23 @@ export function ChatCanvasPage() {
   /** 底部 Composer 整体（快捷栏 + 状态条 + 输入框）高度写入 --composer-height，
       驱动正文动态安全区 / 底部淡出 / 悬浮按钮位置，禁止固定像素值。 */
   const composerDockRef = useRef<HTMLDivElement | null>(null);
+  /** 已写入 --composer-height 的高度，以及回合进行中被推迟的收缩值。 */
+  const composerHeightRef = useRef(0);
+  const composerPendingShrinkRef = useRef<number | null>(null);
+  const composerHeightLockedRef = useRef(false);
+  /** 待发送附件条（PromptInputAttachments）的 DOM 宿主：附件条由 portal 挂到这里，
+      使其位于工作台功能条（资料/目标/联网）上方；附件状态仍归 PromptInput 所有。 */
+  const [attachmentRowHost, setAttachmentRowHost] =
+    useState<HTMLDivElement | null>(null);
+  const attachmentRowDrag = useHorizontalDragScroll<HTMLDivElement>();
+  // 同一个节点要同时被拖拽滚动 hook（读 ref.current）和 portal 宿主（state）持有。
+  const setAttachmentRowNode = useCallback(
+    (node: HTMLDivElement | null) => {
+      attachmentRowDrag.ref.current = node;
+      setAttachmentRowHost(node);
+    },
+    [attachmentRowDrag.ref],
+  );
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const openFileDialogRef = useRef<() => void>(() => undefined);
@@ -3051,19 +3060,45 @@ export function ChatCanvasPage() {
 
   // 底部 Composer 高度变化时写入 --composer-height：正文动态安全区、底部
   // 淡出区域与「回到底部」按钮统一依赖该变量，而不是各自的固定像素值。
+  // 回合进行中只允许变高：正文的 padding-bottom 依赖该变量，收缩会直接改变
+  // 内容滚动高度（被当成「内容变多」，并让滚动位置被重新钳位）。收缩值先
+  // 记账，回合结束后补写。
   useEffect(() => {
     const element = composerDockRef.current;
     if (!element) return;
     const observer = new ResizeObserver(([entry]) => {
       if (!entry) return;
+      const next = Math.round(entry.contentRect.height);
+      if (composerHeightLockedRef.current && next < composerHeightRef.current) {
+        composerPendingShrinkRef.current = next;
+        return;
+      }
+      composerPendingShrinkRef.current = null;
+      if (next === composerHeightRef.current) return;
+      composerHeightRef.current = next;
       document.documentElement.style.setProperty(
         "--composer-height",
-        `${entry.contentRect.height}px`,
+        `${next}px`,
       );
     });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+
+  // 回合结束（空闲）后解除收缩抑制，并补写被推迟的收缩值。
+  useEffect(() => {
+    const busy = status === "submitted" || status === "streaming";
+    composerHeightLockedRef.current = busy;
+    if (busy) return;
+    const pending = composerPendingShrinkRef.current;
+    if (pending === null) return;
+    composerPendingShrinkRef.current = null;
+    composerHeightRef.current = pending;
+    document.documentElement.style.setProperty(
+      "--composer-height",
+      `${pending}px`,
+    );
+  }, [status]);
 
   useEffect(() => {
     if (!selectionMenu) return;
@@ -3196,12 +3231,7 @@ export function ChatCanvasPage() {
       setHistoryTotalCount(page.total_count);
       if (page.items.length) {
         // Preserve scroll position when prepending older turns.
-        const scroller =
-          document.querySelector<HTMLElement>(
-            ".chat-canvas-page [role='log'] > div",
-          ) ?? null;
-        const previousHeight = scroller?.scrollHeight ?? 0;
-        const previousTop = scroller?.scrollTop ?? 0;
+        const snapshot = captureScrollSnapshot();
         queryClient.setQueryData<Message[]>(
           workspaceQueryKey(workspaceId, "messages", sessionId),
           (current) => {
@@ -3211,12 +3241,9 @@ export function ChatCanvasPage() {
             return older.length ? [...older, ...existing] : existing;
           },
         );
-        if (scroller) {
-          requestAnimationFrame(() => {
-            const delta = scroller.scrollHeight - previousHeight;
-            scroller.scrollTop = previousTop + delta;
-          });
-        }
+        requestAnimationFrame(() =>
+          restoreScrollSnapshot(snapshot),
+        );
       }
     } catch (error) {
       toast.error(
@@ -3226,7 +3253,15 @@ export function ChatCanvasPage() {
       loadingOlderRef.current = false;
       setLoadingOlderMessages(false);
     }
-  }, [history.data, historyHasMoreBefore, queryClient, sessionId, workspaceId]);
+  }, [
+    captureScrollSnapshot,
+    history.data,
+    historyHasMoreBefore,
+    queryClient,
+    restoreScrollSnapshot,
+    sessionId,
+    workspaceId,
+  ]);
 
   // Near the top of the conversation scroller, pull older turns automatically.
   useEffect(() => {
@@ -4041,6 +4076,28 @@ export function ChatCanvasPage() {
       ...appended,
     ];
   }, [history.data, localMessages, sessionId]);
+  const activeCommittedAnswerTurnId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message.role === "assistant" &&
+        (message.status === "streaming" || message.status === "pending") &&
+        message.finalAnswerStarted
+      ) {
+        return message.id;
+      }
+    }
+    return null;
+  }, [messages]);
+  useLayoutEffect(() => {
+    if (!activeCommittedAnswerTurnId) return;
+    notifyCommittedAnswerStarted(
+      activeCommittedAnswerTurnId,
+    );
+  }, [
+    activeCommittedAnswerTurnId,
+    notifyCommittedAnswerStarted,
+  ]);
   const conversationJumpItems = useMemo(() => {
     const activeSession = (sessions.data ?? []).find(
       (session) => session.id === sessionId,
@@ -5623,9 +5680,8 @@ export function ChatCanvasPage() {
         created_at: new Date().toISOString(),
       };
       setLocalMessages((current) => [...current, user, assistant]);
-      // 用户发出新消息后：把消息滚动到距顶部 1/5 处（上限），避免被底部
-      // 悬浮输入框盖住；同时解除 stick-to-bottom 锁定，允许继续下拉画布。
-      scrollNewUserMessageToFifthLine(user.id);
+      // 新用户回合由滚动控制器做一次定位，之后 activity 阶段才允许跟随。
+      notifyUserTurnStarted(user.id);
       setSelectionMenu(null);
       setStreamConnectionNotice(null);
       setStatus("submitted");
@@ -6279,6 +6335,8 @@ export function ChatCanvasPage() {
       status,
       voiceModeOpen,
       voiceBlocksComposer,
+      voiceTextFallback,
+      notifyUserTurnStarted,
       workspaceId,
     ],
   );
@@ -7199,7 +7257,7 @@ export function ChatCanvasPage() {
       const timer = window.setInterval(() => {
         const target = document.getElementById(`conversation-jump-${targetMessageId}`);
         if (target) {
-          target.scrollIntoView({ behavior: "smooth", block: "center" });
+          scrollMessageIntoView(targetMessageId, "center");
           target.classList.add("ring-2", "ring-primary", "ring-offset-2");
           window.setTimeout(() => target.classList.remove("ring-2", "ring-primary", "ring-offset-2"), 1800);
           window.clearInterval(timer);
@@ -7243,6 +7301,7 @@ export function ChatCanvasPage() {
     history.isSuccess,
     historyHasMoreBefore,
     loadOlderMessages,
+    scrollMessageIntoView,
   ]);
 
   useEffect(() => {
@@ -7962,14 +8021,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   }, [dictationEngine]);
 
   const branch = useMutation({
-    mutationFn: (messageId: string) => {
-      const sourceTitle =
-        currentSession?.title ??
-        sessions.data?.find((item) => item.id === sessionId)?.title;
-      return branchSession(sessionId, messageId, {
-        title: branchSessionTitle(sourceTitle),
-      });
-    },
+    // 标题交给后端：只有后端能看到该会话下已有多少兄弟分支，才能算出「原会话名（n）」。
+    mutationFn: (messageId: string) => branchSession(sessionId, messageId),
     onSuccess: (session) => {
       inheritSessionComposerPrefs(sessionId, session.id);
       rememberCreatedSession(session);
@@ -7982,14 +8035,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     Error,
     { content: string; messageId: string; sourceSessionId: string }
   >({
-    mutationFn: ({ messageId, sourceSessionId }) => {
-      const sourceTitle =
-        sessions.data?.find((item) => item.id === sourceSessionId)?.title ??
-        currentSession?.title;
-      return branchSession(sourceSessionId, messageId, {
-        title: branchSessionTitle(sourceTitle),
-      });
-    },
+    mutationFn: ({ messageId, sourceSessionId }) =>
+      branchSession(sourceSessionId, messageId),
     onSuccess: (session, variables) => {
       inheritSessionComposerPrefs(variables.sourceSessionId, session.id);
       rememberCreatedSession(session);
@@ -8957,15 +9004,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         }}
         onJump={(messageId) => {
           setActiveConversationQuestionId(messageId);
-          document
-            .getElementById(`conversation-jump-${messageId}`)
-            ?.scrollIntoView({ behavior: "smooth", block: "center" });
+          scrollMessageIntoView(messageId, "center");
         }}
       />
       <Conversation
         className="min-h-0 flex-1"
-        onTouchEnd={handleCanvasTouchEnd}
-        onTouchStart={handleCanvasTouchStart}
+        controller={conversationScroll}
       >
         <ConversationContent
           className="chat-messages-content mx-auto w-full max-w-4xl gap-7 px-4 py-6 sm:px-7 sm:py-7"
@@ -9113,6 +9157,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     <LazyMessageMount
                       eager={eagerMount}
                       key={message.id}
+                      messageId={message.id}
                       minHeight={72}
                     >
                       <UserMessage
@@ -9156,6 +9201,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   <LazyMessageMount
                     eager={eagerMount}
                     key={message.id}
+                    messageId={message.id}
                     minHeight={140}
                   >
                     <AssistantMessage
@@ -9680,6 +9726,14 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             ) : null}
           </>
         ) : null}
+        {/* 待发送附件条宿主：附件条由 PromptInputAttachments portal 到这里，
+            单行横向滚动（触屏左右滑动 / 鼠标拖拽）；无附件时 :empty 命中，不占位。 */}
+        <div
+          className="chat-attachment-row"
+          onClickCapture={attachmentRowDrag.onClickCapture}
+          onPointerDown={attachmentRowDrag.onPointerDown}
+          ref={setAttachmentRowNode}
+        />
         <ConversationQuickActions
           attachDisabled={sessionIsClosed || goalFlow.busy || voiceBlocksComposer}
           onPhoto={handleNativePhoto}
@@ -9825,7 +9879,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           onFileDialogReady={registerFileDialog}
           onSubmit={submitPrompt}
         >
-          <PromptInputAttachments />
+          <PromptInputAttachments portalTarget={attachmentRowHost} />
           <InputGroupAddon
             align="inline-start"
             className="chat-composer__start"
@@ -10288,7 +10342,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 onClick={toggleDictation}
                 tooltip={isListening ? "停止语音输入" : "语音输入"}
               >
-                <Mic className="size-4" />
+                <Mic className="size-[18px]" />
               </PromptInputButton> : <VoiceComposerActions
                   modelId={selectedModelId}
                   providerId={activeModelProvider?.id}

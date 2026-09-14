@@ -808,6 +808,33 @@ def compatibility_event_type(event_type: str) -> str:
     return event_type
 
 
+# Branch sessions used to be titled 「分支.{原会话名}」. The sidebar renders every
+# nested session at one indent level now, so the trailing 「（n）」 index — not a
+# leading prefix — is what keeps sibling branches distinguishable at a glance.
+_LEGACY_BRANCH_TITLE_PREFIX = "分支."
+_BRANCH_TITLE_SUFFIX_PATTERN = re.compile(r"^(?P<base>.+?)（(?P<index>\d+)）$")
+
+
+def strip_legacy_branch_prefix(title: str | None) -> str:
+    """Drop historical 「分支.」 prefixes so re-branching never stacks them."""
+
+    base = (title or "").strip()
+    while base.startswith(_LEGACY_BRANCH_TITLE_PREFIX):
+        base = base[len(_LEGACY_BRANCH_TITLE_PREFIX) :].strip()
+    return base or "未命名会话"
+
+
+def next_branch_title(base: str, sibling_titles: Iterable[str | None]) -> str:
+    """Return 「{base}（n）」, one past the highest sibling index already in use."""
+
+    highest = 0
+    for sibling_title in sibling_titles:
+        match = _BRANCH_TITLE_SUFFIX_PATTERN.match((sibling_title or "").strip())
+        if match and match.group("base") == base:
+            highest = max(highest, int(match.group("index")))
+    return f"{base}（{highest + 1}）"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -16038,17 +16065,22 @@ class ChatService:
                 "Message does not belong to this session",
             )
         # Prefer an explicit title from the client; otherwise derive
-        # 「分支.{原会话名}」 so sidebar entries stay identifiable.
+        # 「{原会话名}（n）」. The sidebar renders branches without indentation, so
+        # the trailing index is what keeps sibling branches identifiable.
         requested_title = (payload.title or "").strip()
         if not requested_title or requested_title in {
             "分支会话",
             "编辑消息后的分支",
             "从学习回答创建的分支",
         }:
-            base = (source_session.title or "").strip() or "未命名会话"
-            while base.startswith("分支."):
-                base = base[len("分支.") :].strip() or "未命名会话"
-            branch_title = f"分支.{base}"
+            base = strip_legacy_branch_prefix(source_session.title)
+            sibling_titles = self.db.scalars(
+                select(ChatSession.title).where(
+                    ChatSession.workspace_id == self.workspace_id,
+                    ChatSession.parent_session_id == source_session.id,
+                )
+            ).all()
+            branch_title = next_branch_title(base, sibling_titles)
         else:
             branch_title = requested_title
         # Inherit the full model/composer snapshot so the branch keeps the

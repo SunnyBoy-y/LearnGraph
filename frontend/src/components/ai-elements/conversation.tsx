@@ -6,55 +6,117 @@ import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import type { ComponentProps } from "react";
-import { useCallback, useEffect } from "react";
-import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useMemo,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import {
+  useConversationScrollController,
+  type ConversationScrollController,
+} from "@/features/chat/use-conversation-scroll-controller";
 
-export type ConversationProps = ComponentProps<typeof StickToBottom>;
+interface ConversationContextValue {
+  controller: ConversationScrollController;
+}
 
-const ManualScrollBridge = () => {
-  const { stopScroll, scrollRef } = useStickToBottomContext();
-  useEffect(() => {
-    const stop = (event: Event) => {
-      const target = (event as CustomEvent<{ scrollElement?: Element }>).detail?.scrollElement;
-      if (!target || target !== scrollRef.current) return;
-      stopScroll();
-    };
-    window.addEventListener("learngraph:manual-scroll", stop);
-    return () => window.removeEventListener("learngraph:manual-scroll", stop);
-  }, [scrollRef, stopScroll]);
-  return null;
-};
-
-export const Conversation = ({ className, children, ...props }: ConversationProps) => (
-  <StickToBottom
-    className={cn("relative flex-1 overflow-y-hidden", className)}
-    initial="smooth"
-    resize="instant"
-    role="log"
-    {...props}
-  >
-    {(context) => (
-      <>
-        <ManualScrollBridge />
-        {typeof children === "function" ? children(context) : children}
-      </>
-    )}
-  </StickToBottom>
+const ConversationContext = createContext<ConversationContextValue | null>(
+  null,
 );
 
-export type ConversationContentProps = ComponentProps<
-  typeof StickToBottom.Content
->;
+interface ConversationProps extends Omit<ComponentProps<"div">, "children"> {
+  children?: ReactNode | ((context: ConversationContextValue) => ReactNode);
+  controller?: ConversationScrollController;
+}
+
+export const Conversation = ({
+  className,
+  children,
+  controller: suppliedController,
+  ...props
+}: ConversationProps) => {
+  const internalController = useConversationScrollController();
+  const controller = suppliedController ?? internalController;
+  const context = useMemo(() => ({ controller }), [controller]);
+
+  return (
+    <ConversationContext.Provider value={context}>
+      <div
+        className={cn("relative flex-1 overflow-y-hidden", className)}
+        data-scroll-mode={controller.mode}
+        role="log"
+        {...props}
+      >
+        {typeof children === "function" ? children(context) : children}
+      </div>
+    </ConversationContext.Provider>
+  );
+};
+
+function useConversationScrollContext() {
+  const context = useContext(ConversationContext);
+  if (!context) {
+    throw new Error(
+      "useConversationScrollContext must be used inside Conversation",
+    );
+  }
+  return context;
+}
+
+export type ConversationContentProps = ComponentProps<"div"> & {
+  scrollClassName?: string;
+};
 
 export const ConversationContent = ({
   className,
+  scrollClassName,
+  style,
   ...props
-}: ConversationContentProps) => (
-  <StickToBottom.Content
-    className={cn("flex flex-col gap-8 p-4", className)}
-    {...props}
-  />
-);
+}: ConversationContentProps) => {
+  const { controller } = useConversationScrollContext();
+  return (
+    <div
+      className={scrollClassName}
+      data-conversation-scroll
+      // 页面级滚动容器：这里起手仍然允许抽屉手势（内部横向可滚动控件不受影响，
+      // 它们在向上查找时先命中，依旧会拦掉手势）。
+      data-drawer-swipe="allow"
+      onKeyDown={controller.handleKeyDown}
+      onPointerDown={controller.handlePointerDown}
+      onScroll={controller.handleScroll}
+      onTouchEnd={controller.handleTouchEnd}
+      onTouchStart={controller.handleTouchStart}
+      onWheel={controller.handleWheel}
+      ref={controller.scrollRef}
+      style={{
+        height: "100%",
+        overflow: "auto",
+        overflowAnchor: "none",
+        scrollbarGutter: "stable both-edges",
+        width: "100%",
+      }}
+    >
+      <div
+        className={cn("flex flex-col gap-8 p-4", className)}
+        ref={controller.contentRef}
+        style={
+          {
+            ...style,
+            // Tail space reserved by the scroll controller so the active turn
+            // anchor stays reachable. Owned by the controller (mode-independent),
+            // never by a scroll-mode-scoped CSS rule: that rule moved the content
+            // height by ~70dvh on every mode change and jumped the canvas.
+            "--conversation-tail-space": `${controller.tailSpace}px`,
+          } as CSSProperties
+        }
+        {...props}
+      />
+    </div>
+  );
+};
 
 export type ConversationEmptyStateProps = ComponentProps<"div"> & {
   title?: string;
@@ -95,30 +157,54 @@ export type ConversationScrollButtonProps = ComponentProps<typeof Button>;
 
 export const ConversationScrollButton = ({
   className,
+  children,
   ...props
 }: ConversationScrollButtonProps) => {
-  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
+  const { controller } = useConversationScrollContext();
+  const {
+    hasCommittedAnswer,
+    hasNewContent,
+    isAtBottom,
+    mode,
+    returnToLatest,
+  } = controller;
 
   const handleScrollToBottom = useCallback(() => {
-    scrollToBottom();
-  }, [scrollToBottom]);
+    returnToLatest();
+  }, [returnToLatest]);
+
+  const visible =
+    hasNewContent || (!isAtBottom && mode === "MANUAL_READING");
+  if (!visible) return null;
+
+  // 「回到最新」态不再显示文案，向下箭头本身已经足够表意；
+  // 生成中的两种状态仍保留提示文案。
+  const label = hasNewContent
+    ? hasCommittedAnswer
+      ? "正文仍在生成"
+      : "还有新内容"
+    : null;
 
   return (
-    !isAtBottom && (
-      <Button
-        className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
-          className
-        )}
-        onClick={handleScrollToBottom}
-        size="icon"
-        type="button"
-        variant="outline"
-        {...props}
-      >
-        <ArrowDownIcon className="size-4" />
-      </Button>
-    )
+    <Button
+      aria-label={label ?? "回到最新"}
+      className={cn(
+        "chat-scroll-to-bottom absolute bottom-4 left-[50%] h-8 translate-x-[-50%] gap-1.5 rounded-full px-3 text-xs shadow-none dark:bg-background dark:hover:bg-muted",
+        className
+      )}
+      onClick={handleScrollToBottom}
+      size="sm"
+      type="button"
+      variant="outline"
+      {...props}
+    >
+      {children ?? (
+        <>
+          <ArrowDownIcon className="size-3.5" />
+          {label ? <span>{label}</span> : null}
+        </>
+      )}
+    </Button>
   );
 };
 

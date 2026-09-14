@@ -79,6 +79,7 @@ import {
   useState,
   isValidElement,
 } from "react";
+import { createPortal } from "react-dom";
 
 // ============================================================================
 // Helpers
@@ -954,11 +955,27 @@ function attachmentPresentation(file: FileUIPart) {
   };
 }
 
-export const PromptInputAttachments = ({ className, ...props }: HTMLAttributes<HTMLDivElement>) => {
+export interface PromptInputAttachmentsProps
+  extends HTMLAttributes<HTMLDivElement> {
+  /**
+   * Optional host node (e.g. a slot rendered by the page) to portal the pending
+   * attachment row into. The row keeps living inside PromptInput's React tree,
+   * so the attachment state stays where the upload logic lives — only the DOM
+   * position moves. Used by the chat canvas to hang the row above the workbench
+   * toolbar (资料/目标/联网/…) instead of between that bar and the input box.
+   */
+  portalTarget?: HTMLElement | null;
+}
+
+export const PromptInputAttachments = ({
+  className,
+  portalTarget,
+  ...props
+}: PromptInputAttachmentsProps) => {
   const attachments = usePromptInputAttachments();
   const [preview, setPreview] = useState<FileUIPart | null>(null);
   if (!attachments.files.length) return null;
-  return (
+  const row = (
     <div
       aria-label="待发送附件"
       className={cn("prompt-attachments", className)}
@@ -1015,6 +1032,7 @@ export const PromptInputAttachments = ({ className, ...props }: HTMLAttributes<H
       </Dialog>
     </div>
   );
+  return portalTarget ? createPortal(row, portalTarget) : row;
 };
 
 export const PromptInputBody = ({
