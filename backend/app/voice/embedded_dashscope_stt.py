@@ -75,6 +75,11 @@ class _PendingCommit:
     sent_at: float
     connection_generation: int
     utterance_generation: int
+    # A pause followed by more speech is not the end of the user's turn.  The
+    # provider final for this commit must still contribute text, but it must not
+    # be marked finalized or the Smart Turn strategy can release the turn before
+    # the continuation has even been committed.
+    superseded: bool = False
 
 
 class DashScopeSTTService(STTService):
@@ -287,29 +292,41 @@ class DashScopeSTTService(STTService):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """在基类 STT 逻辑之上，监听本机 EOU 信号主动 commit。
 
-        ``UserStoppedSpeakingFrame`` 是本机 Silero VAD + Smart Turn v3 判定
-        "用户说完"的信号（由 LLMUserAggregator 广播）。Manual 模式下服务端
-        不会自行断句，因此这个 commit 是**产生 final 转录的唯一触发点**：
-        此时语音音频必然已全部 append 到 DashScope，commit 后服务端立即返回
-        ``conversation.item.input_audio_transcription.completed``。
+        默认在 ``VADUserStoppedSpeakingFrame``（本机 Silero 的静音判定）到达时
+        提前 commit，让 DashScope 的识别往返与 Smart Turn 推理并行；只有在
+        ``DASHSCOPE_ASR_COMMIT_ON_VAD_STOP=0`` 时才退回等待
+        ``UserStoppedSpeakingFrame``（Silero + Smart Turn 的完整回合边界）。
+        Manual 模式下服务端不会自行断句，因此 commit 是产生 final 转录的唯一
+        触发点。
         """
         await super().process_frame(frame, direction)
         # 本机 VAD 判定用户开口：标记"这一轮确实有语音"，供 commit 门闩使用。
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            # A new VAD onset starts a new utterance. Any old commit whose
-            # final has not arrived is late evidence and must not be attached
-            # to the new turn.
-            self._utterance_generation += 1
-            self._pending_commits.clear()
             self._speech_seen = True
+            # A short pause followed by more speech is still one user turn.
+            # Keep the old commit so its text is not lost, but mark it as
+            # superseded: its final may be appended to the current context, yet
+            # it must not satisfy TurnAnalyzer's "finalized transcript" gate.
+            self._mark_pending_commits_superseded()
         # commit 触发点：默认在 VAD 判定停止时（最早的可提交时刻），旧行为则
         # 等聚合器广播 UserStoppedSpeakingFrame（回合已经结束之后）。
         if isinstance(frame, VADUserStoppedSpeakingFrame) and self._commit_on_vad_stop:
             timeline_mark("stt", "收到 VAD 停止帧")
             await self._send_commit("vad-stop")
-        if isinstance(frame, UserStoppedSpeakingFrame) and not self._commit_on_vad_stop:
-            timeline_mark("stt", "收到回合结束帧")
-            await self._send_commit("turn-stopped")
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            # This is a real turn boundary, unlike VADUserStoppedSpeakingFrame:
+            # Smart Turn has decided that the user is done. Any still-unresolved
+            # commit from the previous turn must not consume the next turn's
+            # final, and its late final must not reopen the turn.
+            self._utterance_generation += 1
+            self._pending_commits.clear()
+            if not self._commit_on_vad_stop:
+                timeline_mark("stt", "收到回合结束帧")
+                await self._send_commit("turn-stopped")
+
+    def _mark_pending_commits_superseded(self) -> None:
+        for commit in self._pending_commits:
+            commit.superseded = True
 
     async def _send_commit(self, trigger: str) -> None:
         """向 DashScope 发送 input_audio_buffer.commit，强制立即出 final。
@@ -418,21 +435,25 @@ class DashScopeSTTService(STTService):
         carry both connection and utterance generations.
         """
         text = str(payload.get("transcript") or payload.get("text") or "").strip()
-        if not self._pending_commits:
+        commit: _PendingCommit | None = None
+        while self._pending_commits:
+            candidate = self._pending_commits.popleft()
+            if (
+                candidate.connection_generation != self._connection_generation
+                or candidate.utterance_generation != self._utterance_generation
+            ):
+                logger.debug(
+                    "[DashScopeEvt] dropping stale final (connection={}, utterance={})",
+                    candidate.connection_generation,
+                    candidate.utterance_generation,
+                )
+                continue
+            commit = candidate
+            break
+        if commit is None:
             logger.debug(
                 "[DashScopeEvt] dropping unsolicited final (text_len={})",
                 len(text),
-            )
-            return
-        commit = self._pending_commits.popleft()
-        if (
-            commit.connection_generation != self._connection_generation
-            or commit.utterance_generation != self._utterance_generation
-        ):
-            logger.debug(
-                "[DashScopeEvt] dropping stale final (connection={}, utterance={})",
-                commit.connection_generation,
-                commit.utterance_generation,
             )
             return
         timeline_mark(
@@ -453,8 +474,11 @@ class DashScopeSTTService(STTService):
                     "commit_trigger": commit.trigger,
                     "connection_generation": commit.connection_generation,
                     "utterance_generation": commit.utterance_generation,
+                    "superseded": commit.superseded,
                 },
-                finalized=True,
+                # A superseded final belongs to an earlier pause in the same
+                # turn: keep its text, but do not let it trigger end-of-turn.
+                finalized=not commit.superseded,
             )
         )
 

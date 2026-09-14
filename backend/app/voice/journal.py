@@ -93,6 +93,10 @@ class _TurnState:
     user_text: str = ""
     assistant_text: str = ""
     sentence_seq: int = 0
+    sentence_texts: dict[int, str] = field(default_factory=dict)
+    played_sentence_seq: int = 0
+    playback_observed: bool = False
+    playback_start_pending: bool = False
     audio_cursor_ms: int = 0
     llm_closed: bool = False
     finalized: bool = False
@@ -410,6 +414,13 @@ class VoiceTurnJournal:
             return
         state = self._turn
         state.sentence_seq += 1
+        state.sentence_texts[state.sentence_seq] = str(text or "").strip()
+        if state.playback_start_pending:
+            # BotStartedSpeakingFrame can race the first caption marker. The
+            # first queued sentence is the one playback started for, not every
+            # sentence whose marker happened to arrive before the frame.
+            state.played_sentence_seq = max(state.played_sentence_seq, 1)
+            state.playback_start_pending = False
         if audio_cursor_ms is not None:
             state.audio_cursor_ms = max(state.audio_cursor_ms, int(audio_cursor_ms))
         self._touch_turn()
@@ -422,6 +433,16 @@ class VoiceTurnJournal:
         )
 
     async def playback_started(self) -> None:
+        state = self._turn
+        if state is not None and not state.finalized:
+            state.playback_observed = True
+            if state.sentence_seq > 0:
+                # Playback begins with the first queued sentence. Later markers
+                # may already be queued for synthesis, but they are not evidence
+                # that the user heard them.
+                state.played_sentence_seq = max(state.played_sentence_seq, 1)
+            else:
+                state.playback_start_pending = True
         self._touch_turn()
         await self._emit(
             "assistant.sentence.playback_started",
@@ -483,13 +504,16 @@ class VoiceTurnJournal:
         outcome: str = turn_api.TURN_FINALIZED,
         failure_reason: str | None = None,
         degraded_reason: str | None = None,
+        memory: bool | None = None,
     ) -> None:
         """Finalize the open turn exactly once, from the authoritative text.
 
         ``outcome="failed"`` is the "no answer" path: the provider errored or the
         turn went idle with nothing to say. The user's question is still
         persisted (an unanswered turn must not vanish on refresh), no assistant
-        message is written, and nothing reaches long-term memory.
+        message is written, and nothing reaches long-term memory. ``memory`` may
+        be passed explicitly; by default only a successful turn with observed
+        playback is memory-eligible.
         """
         async with self._lock:
             state = self._turn
@@ -497,6 +521,12 @@ class VoiceTurnJournal:
                 return
             state.finalized = True
             self._cancel_recovery_timers()
+        if memory is None:
+            memory = (
+                outcome == turn_api.TURN_FINALIZED
+                and state.playback_observed
+                and degraded_reason is None
+            )
         if degraded_reason:
             await self._emit(
                 "processor.error",
@@ -522,9 +552,11 @@ class VoiceTurnJournal:
                 audio_cursor_ms=state.audio_cursor_ms or None,
                 outcome=outcome,
                 failure_reason=failure_reason,
-                # A failed turn has no answer: nothing to remember, and the user
-                # never heard the text that was never produced.
-                memory=outcome == turn_api.TURN_FINALIZED,
+                # A failed turn has no answer. A finalized turn is memory-eligible
+                # only when the transport actually observed playback; text that
+                # stayed in the queue or was lost with TTS must remain visible
+                # for audit without becoming long-term memory.
+                memory=memory,
             )
         except Exception:
             logger.warning("voice turn finalize failed", exc_info=True)
@@ -613,9 +645,10 @@ class VoiceTurnJournal:
     async def turn_interrupted(self, *, reason: str = "barge_in") -> None:
         """Abandon the open turn, keeping only what the user actually heard.
 
-        The partial assistant text is written to the transcript so a refresh
-        still shows what was said, but it is explicitly *not* offered to
-        long-term memory: the user never heard the rest of it.
+        The portion of the assistant text whose playback was observed is written
+        to the transcript so a refresh still shows what was said, but it is
+        explicitly *not* offered to long-term memory: the user never heard the
+        rest of it.
         """
         async with self._lock:
             state = self._turn
@@ -629,18 +662,38 @@ class VoiceTurnJournal:
             turn_id=state.turn_id,
             reason=reason,
         )
-        if state.assistant_text.strip():
+        heard_text = self._heard_assistant_text(state)
+        if heard_text.strip():
             try:
                 await asyncio.to_thread(
                     turn_api.finalize_turn,
                     self.voice_session_id,
                     state.turn_id,
-                    state.assistant_text,
+                    heard_text,
                     memory=False,
                     audio_cursor_ms=state.audio_cursor_ms or None,
                 )
             except Exception:
                 logger.warning("interrupted voice turn persist failed", exc_info=True)
+
+    @staticmethod
+    def _heard_assistant_text(state: _TurnState) -> str:
+        """Best-effort text the transport actually reached during playback.
+
+        Sentence markers are emitted when audio enters the TTS context; only
+        sentences at or before the first observed playback are considered
+        heard. If a provider omitted markers but the transport still confirmed
+        playback, the authoritative LLM text is the only available fallback.
+        """
+        if not state.playback_observed:
+            return ""
+        if not state.sentence_texts:
+            return state.assistant_text
+        heard = "".join(
+            state.sentence_texts.get(seq, "")
+            for seq in range(1, state.played_sentence_seq + 1)
+        )
+        return heard or state.assistant_text
 
     # ------------------------------------------------------- errors/lifecycle
 
@@ -681,6 +734,18 @@ class VoiceTurnJournal:
             },
             turn_id=self._turn.turn_id if self._turn else None,
         )
+
+    async def session_ice(self, payload: dict[str, Any]) -> None:
+        """Report which ICE path this call actually settled on.
+
+        Recorded once per connection (and again if the path changes), because
+        "did this call go direct, through a NAT hole, or through the relay?" is
+        the first question whenever voice quality or connectivity is disputed --
+        and it is invisible from both the browser console and the server log
+        once the call is up.
+        """
+
+        await self._emit("session.ice", payload=dict(payload))
 
     async def session_ready(self, *, epoch: int | None = None) -> None:
         await self._emit(

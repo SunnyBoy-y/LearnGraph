@@ -533,6 +533,94 @@ async def route_pipeline_error(journal: VoiceTurnJournal, frame: Any) -> None:
     )
 
 
+def _voice_peer_connection(runner_args: Any) -> Any:
+    """Return the aiortc peer connection behind the runner arguments."""
+
+    connection = getattr(runner_args, "webrtc_connection", None)
+    return getattr(connection, "pc", None)
+
+
+def _candidate_address(candidate: Any) -> str | None:
+    host = getattr(candidate, "host", None)
+    if not host:
+        return None
+    port = getattr(candidate, "port", None)
+    return f"{host}:{port}" if port else str(host)
+
+
+def describe_ice_path(pc: Any) -> dict[str, Any] | None:
+    """Describe the ICE candidate pair a connected peer actually settled on.
+
+    Walks aiortc -> aioice internals deliberately: neither layer exposes the
+    selected pair, and without it there is no way to answer "did this call go
+    direct or through the relay?" after the fact.  Returns ``None`` while the
+    pair is still undecided.
+    """
+
+    if pc is None:
+        return None
+    try:
+        connection = pc.sctp.transport.transport._connection
+    except Exception:
+        return None
+    pairs = list(getattr(connection, "_check_list", None) or [])
+    if not pairs:
+        return None
+    selected = next((item for item in pairs if getattr(item, "nominated", False)), None)
+    if selected is None:
+        selected = next(
+            (
+                item
+                for item in pairs
+                if str(getattr(item, "state", "")).upper().endswith("SUCCEEDED")
+            ),
+            None,
+        )
+    if selected is None:
+        return None
+    local = getattr(selected, "local_candidate", None)
+    remote = getattr(selected, "remote_candidate", None)
+    local_type = str(getattr(local, "type", "") or "")
+    remote_type = str(getattr(remote, "type", "") or "")
+    # The candidate's own ``transport`` is the SDP string ("udp"); the pair's
+    # ``protocol`` is an aioice enum whose repr is worthless in an event payload.
+    protocol = str(getattr(local, "transport", "") or "").strip()
+    if protocol not in {"udp", "tcp"}:
+        protocol = "udp"
+    return {
+        "local_type": local_type or None,
+        "remote_type": remote_type or None,
+        "local_address": _candidate_address(local),
+        "remote_address": _candidate_address(remote),
+        "protocol": protocol,
+        # "relayed" is the one bit that matters to an operator: a relayed call
+        # costs TURN bandwidth, an unrelayed one does not.
+        "relayed": "relay" in {local_type, remote_type},
+        "label": f"{local_type or '?'}↔{remote_type or '?'}",
+    }
+
+
+async def report_ice_path(
+    journal: VoiceTurnJournal,
+    pc: Any,
+    *,
+    attempts: int = 10,
+    interval: float = 0.5,
+) -> dict[str, Any] | None:
+    """Emit ``session.ice`` as soon as the selected pair is known."""
+
+    for _ in range(max(1, attempts)):
+        path = describe_ice_path(pc)
+        if path is not None:
+            try:
+                await journal.session_ice(path)
+            except Exception:
+                logger.debug("session.ice emit failed", exc_info=True)
+            return path
+        await asyncio.sleep(interval)
+    return None
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info("Starting ChatGPT-style CN bot")
     if timeline_enabled():
@@ -596,12 +684,34 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
+    llm_api_key = str(
+        getattr(llm_provider, "api_key", None)
+        or os.getenv("VOICE_LLM_API_KEY", "")
+        or os.getenv("DEEPSEEK_API_KEY", "")
+    )
+    if not llm_api_key.strip():
+        # ``_resolve_voice_provider_config`` returns an unusable Provider object
+        # (rather than raising) when the session's pinned model is gone from the
+        # Provider catalog or the Provider was disabled.  Collapsing that into
+        # ``llm_provider = None`` used to hand an empty key to the OpenAI client,
+        # which then failed deep inside the SDK with a misleading "Missing
+        # credentials" -- and because that happened before the runner started, the
+        # whole pipeline (ASR + LLM + TTS) never came up.  The user saw a call that
+        # "connected" and then stayed silent forever.  Report the real reason on
+        # the durable channel and fail loudly instead.
+        reason = (
+            str(getattr(providers.llm, "reason", "") or "").strip()
+            or "语音会话没有解析到可用的模型 Provider"
+        )
+        logger.error("Voice pipeline cannot start: {}", reason)
+        if journal is not None:
+            await journal.processor_error(
+                STAGE_LLM, reason, retryable=False, degraded=True
+            )
+        raise RuntimeError(f"Voice LLM provider unavailable: {reason}")
+
     llm = OpenAILLMService(
-        api_key=str(
-            getattr(llm_provider, "api_key", None)
-            or os.getenv("VOICE_LLM_API_KEY", "")
-            or os.getenv("DEEPSEEK_API_KEY", "")
-        ),
+        api_key=llm_api_key,
         base_url=str(
             getattr(llm_provider, "base_url", None)
             or os.getenv("VOICE_LLM_BASE_URL", "")
@@ -789,6 +899,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     close_reason = "runner_finished"
     disconnect_emitted = False
     watchdog: VoiceControlWatchdog | None = None
+    ice_path_task: asyncio.Task[Any] | None = None
 
     try:
         rtvi = worker.rtvi
@@ -887,12 +998,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
+        nonlocal ice_path_task
         logger.info("Client connected")
         if result_delivery is not None:
             await result_delivery.start()
         if journal is not None:
             epoch = getattr(providers.session, "session_epoch", None)
             await journal.session_ready(epoch=epoch)
+            # The selected candidate pair is only decided a moment after the
+            # transport reports the peer as connected, so this is a bounded
+            # background poll rather than a read at connect time.
+            ice_path_task = asyncio.create_task(
+                report_ice_path(journal, _voice_peer_connection(runner_args))
+            )
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -916,6 +1034,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     try:
         await runner.run()
     finally:
+        if ice_path_task is not None and not ice_path_task.done():
+            ice_path_task.cancel()
         if result_delivery is not None:
             await result_delivery.stop()
         if watchdog is not None:

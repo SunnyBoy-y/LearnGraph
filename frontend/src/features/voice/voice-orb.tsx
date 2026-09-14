@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { VoiceTaskChip } from "./voice-task-chip";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
-import { AudioWaveform, LoaderCircle, Mic, MicOff, PhoneOff } from "lucide-react";
+import { LoaderCircle, Mic, MicOff, PhoneOff } from "lucide-react";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { cn } from "@/lib/utils";
 import {
@@ -177,34 +177,73 @@ export function VoiceOrbDock({
   }, [workspaceId, sessionId]);
 
   const pin = voice.modelPin;
+  const interimUserText = voice.interimUserText.trim();
+  const streamingAssistantText = voice.streamingAssistantText.trim();
 
   return (
     <>
-    <VoiceOrb
-      error={voice.error}
-      muted={voice.muted}
-      audioLevel={voice.audioLevel}
-      audioSource={voice.audioSource}
-      state={voice.state}
-      transport={voice.transport}
-      note={
-        // A model switch is pinned as "next turn takes effect", so until the
-        // pipeline confirms it, the requested model is *not* what the user is
-        // talking to. Saying so is the point: silently showing the new model
-        // while the old one answers is the failure this prevents.
-        pin ? (
-          <p
-            aria-live="polite"
-            className={cn("chat-voice-model-note", pin.repointed && "is-applied")}
-            role="status"
-          >
-            {pin.repointed
-              ? `已切换到「${pin.effectiveModelId ?? pin.requestedModelId}」，下一轮生效`
-              : `本次通话仍在使用「${pin.effectiveModelId ?? "当前模型"}」，「${pin.requestedModelId ?? "新模型"}」将在下次接通后生效`}
+      {interimUserText || streamingAssistantText ? (
+        <div
+          aria-live="polite"
+          className="chat-voice-listening-dock"
+          role="status"
+        >
+          <div className="chat-voice-listening-dock__head">
+            {streamingAssistantText ? (
+              <LoaderCircle className="size-3.5 animate-spin" />
+            ) : (
+              <Mic className="size-3.5" />
+            )}
+            <span>
+              {streamingAssistantText ? "导师正在回答" : "正在听你说"}
+            </span>
+          </div>
+          <p>
+            {interimUserText
+              ? `我：${interimUserText}`
+              : `导师：${streamingAssistantText}`}
           </p>
-        ) : null
-      }
-    />
+        </div>
+      ) : null}
+      <VoiceOrb
+        error={voice.error}
+        muted={voice.muted}
+        audioLevel={voice.audioLevel}
+        audioSource={voice.audioSource}
+        state={voice.state}
+        transport={voice.transport}
+        note={
+          // A model switch is pinned as "next turn takes effect", so until the
+          // pipeline confirms it, the requested model is *not* what the user is
+          // talking to. Saying so is the point: silently showing the new model
+          // while the old one answers is the failure this prevents.
+          pin || voice.icePath ? (
+            <>
+              {pin ? (
+                <p
+                  aria-live="polite"
+                  className={cn("chat-voice-model-note", pin.repointed && "is-applied")}
+                  role="status"
+                >
+                  {pin.repointed
+                    ? `已切换到「${pin.effectiveModelId ?? pin.requestedModelId}」，下一轮生效`
+                    : `本次通话仍在使用「${pin.effectiveModelId ?? "当前模型"}」，「${pin.requestedModelId ?? "新模型"}」将在下次接通后生效`}
+                </p>
+              ) : null}
+              {voice.icePath ? (
+                // Which ICE path the call actually settled on. Without it "voice
+                // sounds bad" is unactionable: relayed calls pay a TURN hop, and
+                // a deployment that believes its relay is in use needs to see it.
+                <p aria-live="polite" className="chat-voice-model-note" role="status">
+                  {voice.icePath.relayed
+                    ? `已通过中继建立连接（${voice.icePath.label}）`
+                    : `已直连建立连接（${voice.icePath.label}）`}
+                </p>
+              ) : null}
+            </>
+          ) : null
+        }
+      />
       <VoiceTaskChip
         onCancel={(taskId) => void voice.cancelTask(taskId)}
         tasks={voice.tasks}
@@ -309,6 +348,45 @@ export function VoiceComposerActions({
   );
 }
 
+/**
+ * 全双工语音入口字形：五根圆头实心竖条（中间最高，向两侧对称递减）。
+ *
+ * 用代码绘制，不引位图。几何取自设计稿：条宽 : 条间距 = 1 : 1，
+ * 三档高度比（中 : 次 : 外）= 4.45 : 2.90 : 1.45；
+ * 五根条共宽 19.8，在 24×24 里左右各留 2.1 边距，并共用同一条水平中线（y = 12）。
+ */
+const VOICE_WAVE_BAR_WIDTH = 2.2;
+const VOICE_WAVE_CENTER = 12;
+const VOICE_WAVE_BARS = [
+  { height: 6.4, x: 2.1 },
+  { height: 12.8, x: 6.5 },
+  { height: 19.8, x: 10.9 },
+  { height: 12.8, x: 15.3 },
+  { height: 6.4, x: 19.7 },
+] as const;
+
+function VoiceWaveGlyph({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={cn("size-4", className)}
+      viewBox="0 0 24 24"
+    >
+      {VOICE_WAVE_BARS.map((bar) => (
+        <rect
+          fill="currentColor"
+          height={bar.height}
+          key={bar.x}
+          rx={VOICE_WAVE_BAR_WIDTH / 2}
+          width={VOICE_WAVE_BAR_WIDTH}
+          x={bar.x}
+          y={VOICE_WAVE_CENTER - bar.height / 2}
+        />
+      ))}
+    </svg>
+  );
+}
+
 export interface VoiceCallControlProps extends VoiceScopeProps {
   active: boolean;
   onStart: () => void;
@@ -348,7 +426,7 @@ export function VoiceCallControl({
       }}
       tooltip={label}
     >
-      {active && connected ? <PhoneOff className="size-4" /> : active && connecting ? <LoaderCircle className="size-4 animate-spin" /> : <AudioWaveform className="size-4" />}
+      {active && connected ? <PhoneOff className="size-4" /> : active && connecting ? <LoaderCircle className="size-4 animate-spin" /> : <VoiceWaveGlyph />}
     </PromptInputButton>
   );
 }
