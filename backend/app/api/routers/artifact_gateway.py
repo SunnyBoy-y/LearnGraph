@@ -12,9 +12,12 @@ from app.domain.models import ArtifactVersion, FileRecord
 from app.domain.schemas.artifacts import (
     ArtifactCardPreviewView,
     ArtifactCardPublish,
+    ArtifactCardShareBatchAction,
+    ArtifactCardShareBatchResult,
     ArtifactCardShareTokenCreate,
     ArtifactCardShareTokenCreated,
     ArtifactCardShareManagementView,
+    ArtifactCardShareTokenRevealed,
     ArtifactCardShareTokenView,
     ArtifactCardVersionView,
     ArtifactCardView,
@@ -185,6 +188,53 @@ def list_all_artifact_card_share_tokens(
 
 
 @router.get(
+    "/artifacts/cards/share-tokens/{token_id}/token",
+    response_model=ArtifactCardShareTokenRevealed,
+)
+def reveal_artifact_card_share_token(
+    token_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactCardShareTokenRevealed:
+    """Return the raw token of one share so its link can be copied again.
+
+    Requires ``workspace.write``: the raw token is the bearer credential behind
+    the public viewer, so it is handed out on explicit request only — never as
+    part of the share list payload.
+    """
+    context.require_permission("workspace.write")
+    from app.services.artifact_cards import ArtifactCardService
+
+    raw = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).reveal_share_token(token_id)
+    return ArtifactCardShareTokenRevealed(token=raw)
+
+
+@router.post(
+    "/artifacts/cards/share-tokens/batch",
+    response_model=ArtifactCardShareBatchResult,
+)
+def batch_artifact_card_share_tokens(
+    payload: ArtifactCardShareBatchAction,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactCardShareBatchResult:
+    """Revoke or purge several shares in one request.
+
+    Ineligible rows are skipped (never fatal): already-revoked links for
+    ``revoke``, still-usable links for ``purge``, unknown IDs for both.
+    """
+    context.require_permission("workspace.write")
+    from app.services.artifact_cards import ArtifactCardService
+
+    result = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).batch_share_token_action(payload.token_ids, action=payload.action)
+    return ArtifactCardShareBatchResult.model_validate(result)
+
+
+@router.get(
     "/artifacts/cards/{card_id}/versions",
     response_model=list[ArtifactCardVersionView],
 )
@@ -313,13 +363,20 @@ def revoke_artifact_card_share_token(
     token_id: str,
     db: DB,
     context: CurrentWorkspace,
+    purge: bool = False,
 ) -> ArtifactCardShareTokenView:
+    """Revoke a share link; ``purge=true`` permanently drops its record instead.
+
+    Purging is limited to already-invalid rows (revoked / expired / view-capped)
+    so an active link is always revoked explicitly before it disappears.
+    """
     context.require_permission("workspace.write")
     from app.services.artifact_cards import ArtifactCardService
 
-    token = ArtifactCardService(
-        db, context.workspace_id, context.principal.tenant_id
-    ).revoke_share_token(token_id)
+    service = ArtifactCardService(db, context.workspace_id, context.principal.tenant_id)
+    if purge:
+        return ArtifactCardShareTokenView.model_validate(service.delete_share_token(token_id))
+    token = service.revoke_share_token(token_id)
     return ArtifactCardShareTokenView.model_validate(token)
 
 

@@ -30,7 +30,7 @@ import {
 } from "@/api/artifacts";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
 import { TrustedComponentRenderer } from "@/components/chat/trusted-component-renderer";
-import { SectionHeading, Surface } from "@/components/shared/page-elements";
+import { SectionHeading } from "@/components/shared/page-elements";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -171,80 +171,80 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
 
   return (
     <div className="grid gap-4">
-      <Surface className="p-4">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="grid gap-1.5">
-            <span className="text-xs text-muted-foreground">状态</span>
-            <Select onValueChange={setStatusFilter} value={statusFilter}>
-              <SelectTrigger className="w-32">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部</SelectItem>
-                <SelectItem value="draft">草稿</SelectItem>
-                <SelectItem value="published">已发布</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid gap-1.5">
-            <span className="text-xs text-muted-foreground">类型</span>
-            <Select onValueChange={setTypeFilter} value={typeFilter}>
-              <SelectTrigger className="w-36">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部</SelectItem>
-                <SelectItem value="interactive">双向交互卡</SelectItem>
-                <SelectItem value="static">静态页面卡</SelectItem>
-                <SelectItem value="magic_card">HTML 页面</SelectItem>
-                <SelectItem value="component">声明式组件</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid gap-1.5">
-            <span className="text-xs text-muted-foreground">排序</span>
-            <Select onValueChange={setSortOrder} value={sortOrder}>
-              <SelectTrigger className="w-36">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="updated_at">最近更新</SelectItem>
-                <SelectItem value="created_at">最近创建</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <Button
-            disabled={cards.isFetching}
-            className="ml-auto"
-            onClick={() => void cards.refetch()}
-            size="sm"
-            type="button"
-            variant="ghost"
-          >
-            <RefreshCw className={`size-4 ${cards.isFetching ? "animate-spin" : ""}`} />
-            刷新
-          </Button>
-        </div>
-      </Surface>
+      {/* Tab 已经叫「会话卡片」，这里只留一行很弱的说明，不再套第二层 section。 */}
+      <p className="text-xs leading-5 text-muted-foreground">
+        卡片内容直接显示在下方，可操作或放大查看；通过“版本与分享”发布草稿、切换版本和分享。
+      </p>
 
-      <Surface className="p-5">
-        <SectionHeading
-          description="卡片内容直接显示在下方，可操作或放大查看；通过“版本与分享”发布草稿、切换版本和分享。"
-          title="会话卡片"
-        />
+      {/* 扁平筛选行：控件排成一行，外层没有 Card，也不再为每个控件叠一行小标题。 */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <span className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">状态</span>
+          <Select onValueChange={setStatusFilter} value={statusFilter}>
+            <SelectTrigger aria-label="按发布状态筛选" className="h-9 w-28">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部</SelectItem>
+              <SelectItem value="draft">草稿</SelectItem>
+              <SelectItem value="published">已发布</SelectItem>
+            </SelectContent>
+          </Select>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">类型</span>
+          <Select onValueChange={setTypeFilter} value={typeFilter}>
+            <SelectTrigger aria-label="按卡片类型筛选" className="h-9 w-36">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部</SelectItem>
+              <SelectItem value="interactive">双向交互卡</SelectItem>
+              <SelectItem value="static">静态页面卡</SelectItem>
+              <SelectItem value="magic_card">HTML 页面</SelectItem>
+              <SelectItem value="component">声明式组件</SelectItem>
+            </SelectContent>
+          </Select>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">排序</span>
+          <Select onValueChange={setSortOrder} value={sortOrder}>
+            <SelectTrigger aria-label="排序方式" className="h-9 w-32">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="updated_at">最近更新</SelectItem>
+              <SelectItem value="created_at">最近创建</SelectItem>
+            </SelectContent>
+          </Select>
+        </span>
+        <Button
+          disabled={cards.isFetching}
+          className="ml-auto"
+          onClick={() => void cards.refetch()}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
+          <RefreshCw className={`size-4 ${cards.isFetching ? "animate-spin" : ""}`} />
+          刷新
+        </Button>
+      </div>
+
+      <div>
         {cards.isPending ? (
-          <div className="artifact-card-grid mt-4">
+          <div className="artifact-card-grid">
             <Skeleton className="h-[480px] w-full" />
             <Skeleton className="h-[480px] w-full" />
             <Skeleton className="h-[480px] w-full" />
             <Skeleton className="h-[480px] w-full" />
           </div>
         ) : cards.isError ? (
-          <p className="mt-4 text-sm text-destructive">
+          <p className="text-sm text-destructive">
             {cards.error instanceof Error ? cards.error.message : "加载卡片失败"}
           </p>
         ) : cards.data?.length === 0 ? (
-          <div className="mt-4 flex flex-col items-center gap-2 rounded-xl border border-dashed p-10 text-center">
+          <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed p-10 text-center">
             <LayoutGrid className="size-6 text-muted-foreground" />
             <p className="text-sm font-medium">还没有卡片</p>
             <p className="text-xs text-muted-foreground">
@@ -252,7 +252,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
             </p>
           </div>
         ) : (
-          <div className="artifact-card-grid mt-4">
+          <div className="artifact-card-grid">
             {cards.data?.slice(0, visibleCount).map((card) => (
               <article
                 aria-label={card.title}
@@ -321,7 +321,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
             ) : null}
           </div>
         )}
-      </Surface>
+      </div>
 
       <CardPreviewDialog
         card={previewCard}
@@ -390,7 +390,7 @@ function CardInlinePreview({ card, workspaceId }: { card: ArtifactCard; workspac
   });
 
   return (
-    <div className="mt-3 min-h-80 min-w-0 rounded-lg bg-muted/20" ref={containerRef}>
+    <div className="mt-3 min-h-80 max-h-[520px] min-w-0 overflow-hidden rounded-xl border border-border/60 bg-muted/20" ref={containerRef}>
       {!visible || preview.isPending ? (
         <Skeleton aria-label={`正在加载 ${card.title} 的预览`} className="h-80 w-full" />
       ) : preview.isError ? (
@@ -399,7 +399,8 @@ function CardInlinePreview({ card, workspaceId }: { card: ArtifactCard; workspac
           <Button onClick={() => void preview.refetch()} size="sm" type="button" variant="outline">重新加载预览</Button>
         </div>
       ) : card.card_type === "component" ? (
-        <div className="max-h-[420px] overflow-auto rounded-lg border bg-background p-4">
+        /* 组件预览融进外层卡片，不再自带第二层 border + radius + 背景。 */
+        <div className="max-h-[520px] overflow-auto p-4">
           <TrustedComponentRenderer data={preview.data.preview_snapshot} fallbackId={card.card_id} interactive={false} />
         </div>
       ) : (

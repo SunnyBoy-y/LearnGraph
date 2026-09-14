@@ -2,6 +2,8 @@ import type {
   Artifact,
   ArtifactCard,
   ArtifactCardPreview,
+  ArtifactCardShareBatchAction,
+  ArtifactCardShareBatchResult,
   ArtifactCardShareToken,
   ArtifactCardShareManagement,
   ArtifactCardShareTokenCreated,
@@ -137,6 +139,34 @@ export function revokeArtifactCardShareToken(tokenId: string): Promise<ArtifactC
   return apiClient.delete<ArtifactCardShareToken>(
     `/artifacts/cards/share-tokens/${encodeURIComponent(tokenId)}`,
   );
+}
+
+/** Reveal the raw token of one share so its link can be copied again. */
+export function revealArtifactCardShareToken(tokenId: string): Promise<{ token: string }> {
+  return apiClient.get<{ token: string }>(
+    `/artifacts/cards/share-tokens/${encodeURIComponent(tokenId)}/token`,
+  );
+}
+
+/** Permanently drop a share record (only valid for revoked/expired shares). */
+export function deleteArtifactCardShareTokenRecord(
+  tokenId: string,
+): Promise<ArtifactCardShareToken> {
+  return apiClient.delete<ArtifactCardShareToken>(
+    `/artifacts/cards/share-tokens/${encodeURIComponent(tokenId)}`,
+    { query: { purge: true } },
+  );
+}
+
+/** Revoke or purge many shares at once; ineligible rows come back as skipped. */
+export function batchArtifactCardShareTokens(
+  tokenIds: string[],
+  action: ArtifactCardShareBatchAction,
+): Promise<ArtifactCardShareBatchResult> {
+  return apiClient.post<
+    ArtifactCardShareBatchResult,
+    { token_ids: string[]; action: ArtifactCardShareBatchAction }
+  >("/artifacts/cards/share-tokens/batch", { token_ids: tokenIds, action });
 }
 
 export function cardShareUrl(rawToken: string): string {

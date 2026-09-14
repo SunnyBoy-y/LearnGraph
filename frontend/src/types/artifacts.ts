@@ -106,4 +106,22 @@ export interface ArtifactCardShareManagement extends ArtifactCardShareToken {
   card_title: string;
   card_version: number;
   card_type: string;
+  /** False for rows created before the raw token was stored encrypted. */
+  share_token_available: boolean;
+}
+
+/** Batch action over the share management view. */
+export type ArtifactCardShareBatchAction = "revoke" | "purge";
+
+/** Why one selected share was left untouched by a batch action. */
+export interface ArtifactCardShareBatchSkipped {
+  id: string;
+  reason: "not_found" | "already_revoked" | "still_active";
+}
+
+export interface ArtifactCardShareBatchResult {
+  action: ArtifactCardShareBatchAction;
+  requested_count: number;
+  affected_count: number;
+  skipped: ArtifactCardShareBatchSkipped[];
 }

@@ -18,15 +18,19 @@ import { toast } from "sonner";
 
 import {
   artifactShareUrl,
+  batchArtifactCardShareTokens,
+  cardShareUrl,
   createArtifact,
   createArtifactShareToken,
   deleteArtifact,
+  deleteArtifactCardShareTokenRecord,
   deleteArtifactVersion,
   listArtifactShareTokens,
   listAllArtifactCardShares,
   listArtifactVersions,
   listArtifacts,
   publishArtifactVersion,
+  revealArtifactCardShareToken,
   revokeArtifactShareToken,
   revokeArtifactCardShareToken,
   updateArtifact,
@@ -51,6 +55,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -202,7 +207,7 @@ export function ArtifactsPage() {
   return (
     <PageFrame className="artifacts-page-flush max-w-[1720px]">
       <PageIntro
-        description="会话中生成的交互 HTML 卡片自动聚合为草稿，可预览、跳转会话与删除；文件产物支持发布不可变版本与分享链接。"
+        description="会话中生成的交互 HTML 卡片自动聚合为草稿，可预览、跳转会话与删除。"
         eyebrow="Artifacts"
         title="产物与分享"
       />
@@ -210,7 +215,10 @@ export function ArtifactsPage() {
       <Tabs defaultValue="cards">
         <TabsList>
           <TabsTrigger value="cards">会话卡片</TabsTrigger>
-          <TabsTrigger value="files">文件产物</TabsTrigger>
+          {/* 「文件产物」入口已永久下线：不再提供 tab 触发器，页面内无法进入该视图。
+              仅断入口——后端 /artifacts 系列接口、Artifact / ArtifactVersion 数据与
+              已发出的分享链接原样保留；实现（含下方 value="files" 的 TabsContent）
+              也一并保留，后续若需恢复只需把触发器加回此处。 */}
           <TabsTrigger value="shared">已分享页面</TabsTrigger>
         </TabsList>
 
@@ -218,6 +226,8 @@ export function ArtifactsPage() {
           <CardArtifactsPanel workspaceId={workspaceId} />
         </TabsContent>
 
+        {/* 已下线保留：value="files" 已无对应触发器，Tabs 为受控于 defaultValue="cards"
+            的非受控组件，该视图永远不会被激活，仅作实现留存。 */}
         <TabsContent className="mt-3 grid gap-4" value="files">
           <CreateArtifactDialog
             busy={createMutation.isPending}
@@ -226,70 +236,68 @@ export function ArtifactsPage() {
             onSubmit={(payload) => createMutation.mutate(payload)}
           />
 
-          <Surface className="p-5">
-            <SectionHeading
-              action={
-                <div className="flex items-center gap-2">
-                  <Button onClick={() => setCreateOpen(true)} size="sm" type="button" variant="outline">
-                    <Plus className="size-4" />
-                    新建产物
-                  </Button>
-                  <Button
-                    disabled={artifacts.isFetching}
-                    onClick={() => void artifacts.refetch()}
-                    size="sm"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <RefreshCw className={`size-4 ${artifacts.isFetching ? "animate-spin" : ""}`} />
-                    刷新
-                  </Button>
-                </div>
-              }
-              description="每个产物可以发布多个不可变版本，分享令牌只作用于单个版本。"
-              title="工作区产物"
-            />
-
-        {artifacts.isPending ? (
-          <div className="mt-4 grid gap-3">
-            <Skeleton className="h-20 w-full" />
-            <Skeleton className="h-20 w-full" />
-          </div>
-        ) : artifacts.isError ? (
-          <p className="mt-4 text-sm text-destructive">
-            {artifacts.error instanceof Error ? artifacts.error.message : "加载产物失败"}
-          </p>
-        ) : artifacts.data?.length === 0 ? (
-          <div className="mt-4 flex flex-col items-center gap-2 rounded-xl border border-dashed p-8 text-center">
-            <Package className="size-6 text-muted-foreground" />
-            <p className="text-sm font-medium">还没有产物</p>
-            <p className="text-xs text-muted-foreground">
-              创建产物后，可以从工作区文件发布不可变版本。
+          {/* 扁平化：Tab 已表达「文件产物」，不再叠一层 section card 与重复标题。 */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs leading-5 text-muted-foreground">
+              每个产物可以发布多个不可变版本，分享令牌只作用于单个版本。
             </p>
+            <div className="flex items-center gap-2">
+              <Button onClick={() => setCreateOpen(true)} size="sm" type="button" variant="outline">
+                <Plus className="size-4" />
+                新建产物
+              </Button>
+              <Button
+                disabled={artifacts.isFetching}
+                onClick={() => void artifacts.refetch()}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                <RefreshCw className={`size-4 ${artifacts.isFetching ? "animate-spin" : ""}`} />
+                刷新
+              </Button>
+            </div>
           </div>
-        ) : (
-          <div className="mt-4 flex flex-col divide-y rounded-xl border">
-            {artifacts.data?.map((artifact) => (
-              <ArtifactRow
-                artifact={artifact}
-                expanded={expandedId === artifact.id}
-                key={artifact.id}
-                onExpand={() =>
-                  setExpandedId((current) => (current === artifact.id ? null : artifact.id))
-                }
-                onPublish={() => setPublishTarget(artifact)}
-                versions={versions.data}
-                versionsPending={versions.isPending && expandedId === artifact.id}
-                onShare={setShareVersion}
-                onEdit={() => setEditArtifactTarget(artifact)}
-                onDelete={() => setDeleteArtifactTarget(artifact)}
-                onEditVersion={setEditVersionTarget}
-                onDeleteVersion={setDeleteVersionTarget}
-              />
-            ))}
-          </div>
-        )}
-      </Surface>
+
+          {artifacts.isPending ? (
+            <div className="grid gap-3">
+              <Skeleton className="h-20 w-full" />
+              <Skeleton className="h-20 w-full" />
+            </div>
+          ) : artifacts.isError ? (
+            <p className="text-sm text-destructive">
+              {artifacts.error instanceof Error ? artifacts.error.message : "加载产物失败"}
+            </p>
+          ) : artifacts.data?.length === 0 ? (
+            <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed p-8 text-center">
+              <Package className="size-6 text-muted-foreground" />
+              <p className="text-sm font-medium">还没有产物</p>
+              <p className="text-xs text-muted-foreground">
+                创建产物后，可以从工作区文件发布不可变版本。
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-col divide-y rounded-xl border">
+              {artifacts.data?.map((artifact) => (
+                <ArtifactRow
+                  artifact={artifact}
+                  expanded={expandedId === artifact.id}
+                  key={artifact.id}
+                  onExpand={() =>
+                    setExpandedId((current) => (current === artifact.id ? null : artifact.id))
+                  }
+                  onPublish={() => setPublishTarget(artifact)}
+                  versions={versions.data}
+                  versionsPending={versions.isPending && expandedId === artifact.id}
+                  onShare={setShareVersion}
+                  onEdit={() => setEditArtifactTarget(artifact)}
+                  onDelete={() => setDeleteArtifactTarget(artifact)}
+                  onEditVersion={setEditVersionTarget}
+                  onDeleteVersion={setDeleteVersionTarget}
+                />
+              ))}
+            </div>
+          )}
 
       <EditArtifactDialog
         artifact={editArtifactTarget}
@@ -368,49 +376,361 @@ export function ArtifactsPage() {
   );
 }
 
-function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
+/** 「已分享页面」行状态：失效的链接才允许删除记录。 */
+function cardShareStatus(share: ArtifactCardShareManagement): {
+  label: string;
+  usable: boolean;
+} {
+  if (share.revoked_at) return { label: "已撤销", usable: false };
+  if (share.expires_at && new Date(share.expires_at).getTime() <= Date.now()) {
+    return { label: "已到期", usable: false };
+  }
+  if (share.max_views && share.view_count >= share.max_views) {
+    return { label: "次数已用完", usable: false };
+  }
+  return { label: "有效", usable: true };
+}
+
+export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
   const queryClient = useQueryClient();
+  const [deleteTarget, setDeleteTarget] = useState<ArtifactCardShareManagement | null>(null);
+  const [batchTarget, setBatchTarget] = useState<"revoke" | "purge" | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const shares = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", "all"),
     queryFn: listAllArtifactCardShares,
   });
+
+  // 选择集只保存 id：列表刷新后自动收敛，不留幽灵选中项。
+  const rows = shares.data ?? [];
+  const selectedShares = rows.filter((share) => selectedIds.has(share.id));
+  const copyableShares = selectedShares.filter((share) => share.share_token_available);
+  const revocableShares = selectedShares.filter((share) => !share.revoked_at);
+  const purgeableShares = selectedShares.filter((share) => !cardShareStatus(share).usable);
+  const allSelected = rows.length > 0 && selectedShares.length >= rows.length;
+  const someSelected = selectedShares.length > 0 && !allSelected;
+
+  const toggleSelected = (id: string, checked: boolean) =>
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+
+  const invalidateShares = () =>
+    queryClient.invalidateQueries({
+      queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens"),
+    });
+
   const revoke = useMutation({
     mutationFn: revokeArtifactCardShareToken,
     onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens"),
-      });
+      await invalidateShares();
       toast.success("分享已撤销");
     },
     onError: (error: Error) => toast.error(error.message),
   });
+
+  const copyLink = useMutation({
+    mutationFn: async (share: ArtifactCardShareManagement) => {
+      const revealed = await revealArtifactCardShareToken(share.id);
+      const shareUrl = window.location.origin + cardShareUrl(revealed.token);
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+      } catch {
+        throw new Error(`浏览器拒绝了剪贴板写入，请手动复制：${shareUrl}`);
+      }
+    },
+    onSuccess: () => toast.success("分享链接已复制"),
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  /** 批量复制：逐条 reveal（顺序请求保持行序），合并成多行文本写入剪贴板。 */
+  const copySelected = useMutation({
+    mutationFn: async (targets: ArtifactCardShareManagement[]) => {
+      const urls: string[] = [];
+      for (const share of targets) {
+        if (!share.share_token_available) continue;
+        const revealed = await revealArtifactCardShareToken(share.id);
+        urls.push(window.location.origin + cardShareUrl(revealed.token));
+      }
+      if (!urls.length) throw new Error("选中的分享都没有留存完整令牌，无法复制；请重新生成分享链接");
+      try {
+        await navigator.clipboard.writeText(urls.join("\n"));
+      } catch {
+        throw new Error(`浏览器拒绝了剪贴板写入，请手动复制：\n${urls.join("\n")}`);
+      }
+      return { copied: urls.length, skipped: targets.length - urls.length };
+    },
+    onSuccess: ({ copied, skipped }) =>
+      skipped
+        ? toast.success(`已复制 ${copied} 条分享链接，${skipped} 条未留存完整令牌已跳过`)
+        : toast.success(`已复制 ${copied} 条分享链接`),
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const deleteRecord = useMutation({
+    mutationFn: deleteArtifactCardShareTokenRecord,
+    onSuccess: async () => {
+      await invalidateShares();
+      toast.success("分享记录已删除");
+      setDeleteTarget(null);
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const batchAction = useMutation({
+    mutationFn: ({ ids, action }: { ids: string[]; action: "revoke" | "purge" }) =>
+      batchArtifactCardShareTokens(ids, action),
+    onSuccess: async (result) => {
+      await invalidateShares();
+      setSelectedIds(new Set());
+      setBatchTarget(null);
+      const skippedNote = result.skipped.length ? `，跳过 ${result.skipped.length} 条` : "";
+      if (result.action === "revoke") {
+        toast.success(`已撤销 ${result.affected_count} 条分享链接${skippedNote}`);
+      } else if (result.affected_count) {
+        toast.success(`已删除 ${result.affected_count} 条分享记录${skippedNote}`);
+      } else {
+        toast.warning(`没有可删除的记录${skippedNote}：选中项里仍有效或已不存在`);
+      }
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const batchSkipNote = (mode: "revoke" | "purge") => {
+    const rest = selectedShares.length - (mode === "purge" ? purgeableShares.length : revocableShares.length);
+    if (!rest) return "";
+    return mode === "purge"
+      ? ` 选中项里另有 ${rest} 条仍有效或已不存在，不会被删除。`
+      : ` 选中项里另有 ${rest} 条已撤销或已不存在，会跳过。`;
+  };
+
   return (
     <Surface className="p-5">
       <SectionHeading
-        description="集中查看所有已发布卡片的分享状态。撤销后链接立即失效；这里只显示令牌前缀。"
+        description="集中查看所有已发布卡片的分享状态。可勾选后批量复制链接、撤销分享或删除失效记录；删除记录会永久移除该行，因此仅对已撤销、已到期或次数用完的链接开放。"
         title="已分享页面"
       />
       {shares.isPending ? <Skeleton className="mt-4 h-24 w-full" /> : null}
       {shares.isError ? <p className="mt-4 text-sm text-destructive">{shares.error.message}</p> : null}
-      {shares.isSuccess && !shares.data.length ? (
+      {!shares.isSuccess ? null : !rows.length ? (
         <p className="mt-4 rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">还没有分享页面</p>
       ) : (
-        <div className="mt-4 grid gap-3">
-          {shares.data?.map((share: ArtifactCardShareManagement) => (
-            <div className="flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center" key={share.id}>
-              <div className="min-w-0 flex-1">
-                <p className="truncate font-medium">{share.card_title}</p>
-                <p className="mt-1 text-xs text-muted-foreground">v{share.card_version} · {share.card_type} · {share.label || "未命名分享"}</p>
-                <p className="mt-1 font-mono text-[11px] text-muted-foreground">令牌 {share.token_prefix}… · 查看 {share.view_count}{share.max_views ? ` / ${share.max_views}` : ""}</p>
-              </div>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {share.revoked_at ? <Badge variant="secondary">已撤销</Badge> : share.expires_at && new Date(share.expires_at).getTime() <= Date.now() ? <Badge variant="secondary">已到期</Badge> : share.max_views && share.view_count >= share.max_views ? <Badge variant="secondary">次数已用完</Badge> : <Badge variant="outline">有效</Badge>}
-                {!share.revoked_at ? <Button disabled={revoke.isPending} onClick={() => revoke.mutate(share.id)} size="sm" variant="outline">撤销分享</Button> : null}
-              </div>
+        <>
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+            <div className="flex items-center gap-2">
+              <Checkbox
+                aria-label="全选已分享页面"
+                checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                disabled={!rows.length}
+                onCheckedChange={(value) =>
+                  setSelectedIds(value === true ? new Set(rows.map((share) => share.id)) : new Set())
+                }
+              />
+              <p className="text-[13px] text-muted-foreground">
+                共 <strong className="font-semibold tabular-nums text-foreground">{rows.length}</strong> 条分享
+                {selectedShares.length ? (
+                  <>
+                    {" · 已选 "}
+                    <strong className="font-semibold tabular-nums text-foreground">
+                      {selectedShares.length}
+                    </strong>
+                    {" 项"}
+                  </>
+                ) : null}
+              </p>
             </div>
-          ))}
-        </div>
+            {selectedShares.length ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  disabled={!copyableShares.length || copySelected.isPending}
+                  onClick={() => copySelected.mutate(selectedShares)}
+                  size="xs"
+                  title={
+                    copyableShares.length
+                      ? "把选中链接合并复制（每行一条）"
+                      : "选中的分享都没有留存完整令牌，无法复制"
+                  }
+                  variant="outline"
+                >
+                  {copySelected.isPending ? (
+                    <LoaderCircle className="size-3.5 animate-spin" />
+                  ) : (
+                    <Copy className="size-3.5" />
+                  )}
+                  批量复制链接
+                </Button>
+                <Button
+                  disabled={!revocableShares.length || batchAction.isPending}
+                  onClick={() => setBatchTarget("revoke")}
+                  size="xs"
+                  title={revocableShares.length ? "批量撤销选中的分享链接" : "选中的分享都已撤销"}
+                  variant="outline"
+                >
+                  批量撤销分享
+                </Button>
+                <Button
+                  disabled={!purgeableShares.length || batchAction.isPending}
+                  onClick={() => setBatchTarget("purge")}
+                  size="xs"
+                  title={
+                    purgeableShares.length
+                      ? "批量删除选中的失效记录"
+                      : "选中项里没有失效记录；有效链接需先撤销"
+                  }
+                  variant="destructive"
+                >
+                  <Trash2 className="size-3.5" />
+                  批量删除记录
+                </Button>
+                <Button onClick={() => setSelectedIds(new Set())} size="xs" variant="ghost">
+                  取消选择
+                </Button>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="mt-3 grid gap-3">
+            {rows.map((share: ArtifactCardShareManagement) => {
+              const status = cardShareStatus(share);
+              const selected = selectedIds.has(share.id);
+              return (
+                <div
+                  className={`flex flex-col gap-3 rounded-xl border p-4 sm:flex-row sm:items-center ${selected ? "border-ring bg-muted/40" : ""}`}
+                  key={share.id}
+                >
+                  <Checkbox
+                    aria-label={`选择 ${share.card_title} 的分享`}
+                    checked={selected}
+                    className="sm:mr-1"
+                    onCheckedChange={(value) => toggleSelected(share.id, value === true)}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-medium">{share.card_title}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">v{share.card_version} · {share.card_type} · {share.label || "未命名分享"}</p>
+                    <p className="mt-1 font-mono text-[11px] text-muted-foreground">令牌 {share.token_prefix}… · 查看 {share.view_count}{share.max_views ? ` / ${share.max_views}` : ""}</p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <Badge variant={status.usable ? "outline" : "secondary"}>{status.label}</Badge>
+                    <Button
+                      disabled={!share.share_token_available || copyLink.isPending}
+                      onClick={() => copyLink.mutate(share)}
+                      size="sm"
+                      title={
+                        !share.share_token_available
+                          ? "该链接生成时未留存完整令牌，无法复制；请重新生成分享链接"
+                          : status.usable
+                            ? "复制该分享的完整链接"
+                            : "复制链接（该链接已失效，打开会提示不存在）"
+                      }
+                      type="button"
+                      variant="outline"
+                    >
+                      <Copy className="size-4" />
+                      复制链接
+                    </Button>
+                    {!share.revoked_at ? (
+                      <Button
+                        disabled={revoke.isPending}
+                        onClick={() => revoke.mutate(share.id)}
+                        size="sm"
+                        title="立即让该链接失效"
+                        type="button"
+                        variant="outline"
+                      >
+                        撤销分享
+                      </Button>
+                    ) : null}
+                    <Button
+                      disabled={status.usable || deleteRecord.isPending}
+                      onClick={() => setDeleteTarget(share)}
+                      size="sm"
+                      title={status.usable ? "请先撤销分享，再删除记录" : "从列表中永久移除这条分享记录"}
+                      type="button"
+                      variant="outline"
+                    >
+                      <Trash2 className="size-4" />
+                      删除记录
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
       )}
+
+      <AlertDialog
+        onOpenChange={(next) => {
+          if (!next) setBatchTarget(null);
+        }}
+        open={Boolean(batchTarget)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {batchTarget === "purge"
+                ? `删除选中的 ${purgeableShares.length} 条分享记录？`
+                : `撤销选中的 ${revocableShares.length} 条分享链接？`}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {batchTarget === "purge"
+                ? "这些记录将从「已分享页面」永久移除，令牌前缀、查看次数等历史一并丢失，不可恢复。"
+                : "这些链接会立即失效；它们仍留在列表中，之后可以删除记录。"}
+              {batchSkipNote(batchTarget ?? "revoke")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchAction.isPending}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={batchAction.isPending}
+              onClick={() =>
+                batchAction.mutate({
+                  action: batchTarget ?? "revoke",
+                  ids: (batchTarget === "purge" ? purgeableShares : revocableShares).map(
+                    (share) => share.id,
+                  ),
+                })
+              }
+              variant={batchTarget === "purge" ? "destructive" : "default"}
+            >
+              {batchAction.isPending ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              {batchTarget === "purge" ? "确认删除" : "确认撤销"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        onOpenChange={(next) => {
+          if (!next) setDeleteTarget(null);
+        }}
+        open={Boolean(deleteTarget)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除“{deleteTarget?.card_title ?? ""}”的分享记录？</AlertDialogTitle>
+            <AlertDialogDescription>
+              该记录将从「已分享页面」永久移除，令牌前缀、查看次数等历史一并丢失。链接已失效，删除后不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteRecord.isPending}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleteRecord.isPending}
+              onClick={() => {
+                if (deleteTarget) deleteRecord.mutate(deleteTarget.id);
+              }}
+              variant="destructive"
+            >
+              {deleteRecord.isPending ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Surface>
   );
 }

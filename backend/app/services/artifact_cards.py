@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.errors import AppError
 from app.domain.models import (
     ArtifactCard,
@@ -26,6 +28,14 @@ from app.domain.models import (
     ArtifactCardVersion,
     utc_now,
 )
+from app.services.provider_secrets import (
+    PROVIDER_SECRET_ALGORITHM,
+    ProviderSecretUnavailable,
+    decrypt_secret_fields,
+    encrypt_provider_secret,
+)
+
+logger = logging.getLogger(__name__)
 
 # Runtimes that round-trip user events back to the agent (bidirectional card).
 BIDIRECTIONAL_RUNTIMES = frozenset({"react-sandbox-v1", "opaque-origin-subapp-v1"})
@@ -44,6 +54,60 @@ def _clean_title(value: Any, fallback: str = "交互卡片") -> str:
         return fallback
     title = " ".join(value.split())
     return title[:240] or fallback
+
+
+def _aware(value: datetime) -> datetime:
+    """SQLite drops tzinfo on storage; treat stored timestamps as UTC."""
+
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _share_token_columns(token: ArtifactCardShareToken) -> dict[str, Any]:
+    """Detached snapshot of a share row so it survives a hard delete."""
+
+    return {
+        column.name: getattr(token, column.name)
+        for column in ArtifactCardShareToken.__table__.columns
+    }
+
+
+def _share_token_expired(token: ArtifactCardShareToken) -> bool:
+    """True when the link can no longer grant a view (revoked / expired / capped)."""
+
+    if token.revoked_at is not None:
+        return True
+    if token.expires_at is not None and _aware(token.expires_at) <= utc_now():
+        return True
+    return token.max_views is not None and token.view_count >= token.max_views
+
+
+def _encrypted_share_token_columns(raw_token: str) -> dict[str, Any]:
+    """Best-effort encrypted copy of the raw token for 「已分享页面」 re-copy.
+
+    Encryption is metadata, not the resolution path (``token_hash`` is), so a
+    missing master key must never fail share creation: the row is then simply
+    not re-copyable from the management view.
+    """
+
+    try:
+        encrypted = encrypt_provider_secret(get_settings(), raw_token)
+    except Exception:  # noqa: BLE001 - optional metadata, never block sharing
+        logger.warning(
+            "Card share token encryption unavailable; the link cannot be re-copied later",
+            exc_info=True,
+        )
+        return {
+            "token_ciphertext": None,
+            "token_algorithm": None,
+            "token_key_provider": None,
+            "token_key_version": None,
+        }
+    return {
+        "token_ciphertext": encrypted.ciphertext,
+        "token_algorithm": encrypted.algorithm,
+        "token_key_provider": encrypted.key_provider,
+        "token_key_version": encrypted.key_version,
+    }
 
 
 def _card_identity(part_type: str, data: dict[str, Any]) -> tuple[str, str] | None:
@@ -432,6 +496,7 @@ class ArtifactCardService:
             label=label[:120],
             expires_at=expires_at,
             max_views=max_views if max_views and max_views > 0 else None,
+            **_encrypted_share_token_columns(raw_token),
         )
         self.db.add(record)
         self.db.commit()
@@ -468,12 +533,14 @@ class ArtifactCardService:
                 "card_title": card.title,
                 "card_version": version.version,
                 "card_type": card.card_type,
+                # Legacy rows carry no encrypted token, so 「复制链接」 stays off.
+                "share_token_available": bool(token.token_ciphertext),
             }
             for token, version, card in rows
         ]
 
-    def revoke_share_token(self, token_id: str) -> ArtifactCardShareToken:
-        token = self.db.scalar(
+    def _find_share_token(self, token_id: str) -> ArtifactCardShareToken | None:
+        return self.db.scalar(
             select(ArtifactCardShareToken)
             .join(
                 ArtifactCardVersion,
@@ -486,12 +553,107 @@ class ArtifactCardService:
                 ArtifactCard.tenant_id == self.tenant_id,
             )
         )
+
+    def _share_token_for_workspace(self, token_id: str) -> ArtifactCardShareToken:
+        token = self._find_share_token(token_id)
         if token is None:
             raise AppError(404, "artifact_card_share_not_found", "Artifact card share was not found")
+        return token
+
+    def revoke_share_token(self, token_id: str) -> ArtifactCardShareToken:
+        token = self._share_token_for_workspace(token_id)
         token.revoked_at = utc_now()
         self.db.commit()
         self.db.refresh(token)
         return token
+
+    def reveal_share_token(self, token_id: str) -> str:
+        """Open the encrypted raw token so its share link can be copied again."""
+
+        token = self._share_token_for_workspace(token_id)
+        if not token.token_ciphertext:
+            raise AppError(
+                409,
+                "artifact_card_share_token_unavailable",
+                "This share link was created before raw tokens were stored; generate a new link instead",
+            )
+        try:
+            return decrypt_secret_fields(
+                get_settings(),
+                ciphertext=token.token_ciphertext,
+                algorithm=token.token_algorithm or PROVIDER_SECRET_ALGORITHM,
+                key_provider=token.token_key_provider or "",
+                key_version=token.token_key_version or 1,
+            )
+        except (ProviderSecretUnavailable, ValueError) as exc:
+            raise AppError(
+                409,
+                "artifact_card_share_token_unavailable",
+                "This share link cannot be decrypted with the current master key",
+            ) from exc
+
+    def delete_share_token(self, token_id: str) -> dict[str, Any]:
+        """Permanently drop one share record from the management view.
+
+        Only already-invalid rows can be removed: a live link must be revoked
+        first so deleting a record can never silently break an active share.
+        """
+
+        token = self._share_token_for_workspace(token_id)
+        if not _share_token_expired(token):
+            raise AppError(
+                409,
+                "artifact_card_share_token_active",
+                "Revoke this share before deleting its record",
+            )
+        snapshot = _share_token_columns(token)
+        self.db.delete(token)
+        self.db.commit()
+        return snapshot
+
+    def batch_share_token_action(
+        self, token_ids: list[str], *, action: str
+    ) -> dict[str, Any]:
+        """Revoke or purge many shares in a single transaction.
+
+        Per-item guards mirror the single-row endpoints, but an ineligible row
+        never fails the batch — it is reported in ``skipped`` so the UI can say
+        exactly what happened. ``revoke`` skips links already revoked;
+        ``purge`` skips anything still usable (an active link must be revoked
+        before its record can be dropped).
+        """
+
+        if action not in {"revoke", "purge"}:
+            raise AppError(422, "artifact_card_share_batch_action", "Unsupported batch action")
+
+        affected: list[str] = []
+        skipped: list[dict[str, str]] = []
+        revoked_at = utc_now()
+        for token_id in dict.fromkeys(token_ids):
+            token = self._find_share_token(token_id)
+            if token is None:
+                skipped.append({"id": token_id, "reason": "not_found"})
+                continue
+            if action == "revoke":
+                if token.revoked_at is not None:
+                    skipped.append({"id": token_id, "reason": "already_revoked"})
+                    continue
+                token.revoked_at = revoked_at
+            else:
+                if not _share_token_expired(token):
+                    skipped.append({"id": token_id, "reason": "still_active"})
+                    continue
+                self.db.delete(token)
+            affected.append(token_id)
+        # A batch that changes nothing still committed nothing, so skip the commit.
+        if affected:
+            self.db.commit()
+        return {
+            "action": action,
+            "requested_count": len(set(token_ids)),
+            "affected_count": len(affected),
+            "skipped": skipped,
+        }
 
     def resolve_card_share(
         self, raw_token: str
