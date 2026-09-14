@@ -130,6 +130,8 @@ class ModelGeneratedExerciseItem(BaseModel):
     answer_key: str | list[str] = Field(min_length=1)
     explanation: str = Field(default="", max_length=4_000)
     rubric_points: list[str] = Field(default_factory=list, max_length=12)
+    # A non-revealing nudge shown only after the learner asks for help.
+    hint: str = Field(default="", max_length=600)
     source_chunk_ids: list[str] = Field(default_factory=list, max_length=12)
 
     @field_validator("options")
@@ -149,6 +151,11 @@ class ModelGeneratedExerciseItem(BaseModel):
         if not text:
             raise ValueError("answer_key must not be empty")
         return text
+
+    @field_validator("hint")
+    @classmethod
+    def normalize_hint(cls, value: str) -> str:
+        return (value or "").strip()[:600]
 
 
 class ModelGeneratedExerciseSet(BaseModel):
@@ -212,6 +219,17 @@ class AnswerResult(BaseModel):
     feedback: str
     evidence_signal_id: str
     mastery_star_awarded: bool = False
+    # Practice feedback surface. Optional so the legacy answer endpoint contract
+    # stays backwards compatible.
+    score_ratio: float = 1.0
+    covered_points: list[str] = Field(default_factory=list)
+    missing_points: list[str] = Field(default_factory=list)
+    error_type: str | None = None
+    attempt_index: int = 1
+    hint_count: int = 0
+    node_id: str | None = None
+    next_review_at: datetime | None = None
+    schedule_reason: str = ""
 
 
 class MasteryScheduleView(ORMModel):

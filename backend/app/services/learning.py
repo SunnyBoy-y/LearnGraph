@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import case, exists, func, or_, select
 from sqlalchemy.orm import Session
@@ -67,6 +68,25 @@ ALL_ITEM_TYPES = (
     "fill_blank",
     "short_answer",
 )
+
+
+@dataclass(slots=True)
+class Evaluation:
+    """One graded submission.
+
+    ``score_ratio`` / ``covered_points`` / ``missing_points`` are the real
+    short-answer grading output; objective question types fill them so the
+    Practice feedback surface and the session report never have to guess.
+    """
+
+    is_correct: bool
+    stored_answer: str
+    feedback: str
+    score_ratio: float = 1.0
+    covered_points: list[str] = field(default_factory=list)
+    missing_points: list[str] = field(default_factory=list)
+    error_type: str | None = None
+
 
 
 class EvidenceService:
@@ -466,9 +486,27 @@ class ExerciseService:
             )
         return hits, preview.trace_id
 
-    def _structured_generate(self, prompt: str) -> ModelGeneratedExerciseSet:
+    def _structured_generate(
+        self,
+        prompt: str,
+        *,
+        validate: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        """Ask the remote model for schema-conformant JSON, with repair retries.
+
+        Three attempts, and every rejected attempt feeds the concrete reason
+        back into the next prompt. Without that feedback a prompted/json_object
+        model simply repeats the same deviation three times, and the caller can
+        only report an opaque "failed after 3 attempts".
+        """
+
         provider = self._ensure_remote_model()
+        schema = ModelGeneratedExerciseSet.model_json_schema()
+        check: Callable[[dict[str, Any]], Any] = (
+            validate or ModelGeneratedExerciseSet.model_validate
+        )
         errors: list[str] = []
+        attempt_prompt = prompt
         for attempt in range(1, 4):
             quote = self.billing.preflight_model_call(
                 provider_id=provider.provider_id,
@@ -484,17 +522,15 @@ class ExerciseService:
             # Release preflight writes BEFORE the long generate_json call.
             self.db.commit()
             provider_returned = False
-            result: ModelGeneratedExerciseSet | None = None
+            result: Any = None
+            failure = ""
             try:
-                raw = provider.generate_json(
-                    prompt,
-                    "exercise_generate",
-                    ModelGeneratedExerciseSet.model_json_schema(),
-                )
+                raw = provider.generate_json(attempt_prompt, "exercise_generate", schema)
                 provider_returned = True
-                result = ModelGeneratedExerciseSet.model_validate(raw)
+                result = check(raw)
             except Exception as exc:  # noqa: BLE001
-                errors.append(type(exc).__name__)
+                failure = f"{type(exc).__name__}: {exc}".strip()[:300]
+                errors.append(failure)
             if provider_returned:
                 usage = dict(getattr(provider, "last_usage", {}) or {})
                 self.billing.record_usage(
@@ -510,11 +546,25 @@ class ExerciseService:
                 self.db.commit()
             if result is not None:
                 return result
+            if failure and attempt < 3:
+                attempt_prompt = (
+                    f"{prompt}\n\n上一次输出不可用：{failure}\n"
+                    "请重新输出一个**完整且严格符合上述 JSON schema** 的对象："
+                    "字段齐全、不要附加解释文字、不要使用 Markdown。"
+                )
         raise AppError(
             502,
             "structured_generation_failed",
-            "Model structured generation failed after 3 attempts",
-            {"attempts": 3, "errors": errors, "feature": "exercise_generate"},
+            "远程模型连续 3 次都没有返回可用的结果："
+            f"{errors[-1] if errors else '未知错误'}",
+            {
+                "attempts": 3,
+                "errors": errors,
+                "feature": "exercise_generate",
+                "provider_id": getattr(provider, "provider_id", "unknown"),
+                "model_id": getattr(provider, "model_id", "unknown"),
+                "last_request_id": getattr(provider, "last_request_id", None),
+            },
         )
 
     def _build_generation_prompt(
@@ -554,6 +604,8 @@ class ExerciseService:
             "6. short_answer：options 为空，answer_key 为参考要点摘要，rubric_points 为 2～5 条可判分要点。\n"
             "7. source_chunk_ids 只能引用下方资料中的 chunk_id；无资料时返回空数组。\n"
             "8. explanation 用中文给出简短讲解，不要包含未必要的标准答案抄写。\n"
+            "9. hint 是不泄露答案的启发式提示（1～2 句，指向关键概念、易混点或回忆线索），"
+            "禁止直接写出 answer_key 的内容。\n"
             f"知识点：label={node.label}\n"
             f"描述：{(node.description or '')[:1200]}\n"
             f"教学策略：{(node.teaching_strategy or '')[:800]}\n"
@@ -680,32 +732,41 @@ class ExerciseService:
         )
         snippets, retrieval_trace_id = self._grounding_snippets(node, file_ids)
         prompt = self._build_generation_prompt(node, payload, snippets, grounding)
-        model_set = self._structured_generate(prompt)
-        items = list(model_set.items)[: payload.count]
-        if not items:
-            raise AppError(
-                502,
-                "structured_generation_failed",
-                "Model returned no exercise items",
-            )
-        if payload.question_type != "mixed":
-            mismatched = [item for item in items if item.question_type != payload.question_type]
-            if mismatched:
-                raise AppError(
-                    502,
-                    "structured_generation_failed",
-                    "Model returned question types that do not match the request",
-                    {
-                        "expected": payload.question_type,
-                        "got": [item.question_type for item in items],
-                    },
+        wanted_type = payload.question_type
+
+        def validate(raw: dict[str, Any]) -> list[tuple[ModelGeneratedExerciseItem, Any]]:
+            """Turn "is this model output usable?" into a retryable check.
+
+            Empty item lists, mismatched question types and unusable answer keys
+            used to be hard 502s raised *after* the model call, so the model was
+            never told what was wrong and never got a chance to fix it.
+            """
+
+            model_set = ModelGeneratedExerciseSet.model_validate(raw)
+            items = list(model_set.items)[: payload.count]
+            if not items:
+                raise ValueError("模型没有返回任何题目")
+            if wanted_type != "mixed":
+                mismatched = sorted(
+                    {item.question_type for item in items if item.question_type != wanted_type}
                 )
+                if mismatched:
+                    raise ValueError(
+                        f"题型必须全部为 {wanted_type}，但收到了 {', '.join(mismatched)}"
+                    )
+            prepared: list[tuple[ModelGeneratedExerciseItem, Any]] = []
+            for item in items:
+                try:
+                    normalized = self._normalize_item(item, snippets)
+                except AppError as exc:  # unusable item → let the model repair it
+                    raise ValueError(str(exc.message)) from exc
+                prepared.append((item, normalized))
+            return prepared
+
+        prepared = self._structured_generate(prompt, validate=validate)
         batch_id = new_id()
         generated: list[Exercise] = []
-        for item in items:
-            qtype, options, answer_key, rubric, source_refs = self._normalize_item(
-                item, snippets
-            )
+        for item, (qtype, options, answer_key, rubric, source_refs) in prepared:
             generated.append(
                 self.exercises.add(
                     Exercise(
@@ -727,6 +788,7 @@ class ExerciseService:
                             "grounding": grounding,
                             "requested_question_type": payload.question_type,
                             "file_ids": file_ids,
+                            "hint": (item.hint or "").strip()[:600],
                         },
                     )
                 )
@@ -751,9 +813,7 @@ class ExerciseService:
             self.db.refresh(item)
         return generated
 
-    def _grade(
-        self, exercise: Exercise, payload: AnswerRequest
-    ) -> tuple[bool, str, str]:
+    def _grade(self, exercise: Exercise, payload: AnswerRequest) -> Evaluation:
         qtype = exercise.question_type
         if qtype == "multiple_choice":
             if isinstance(payload.answer, str):
@@ -784,14 +844,27 @@ class ExerciseService:
                     "invalid_answer_option",
                     "At least one answer is not an option for this exercise",
                 )
-            correct = submitted == {item.strip().casefold() for item in expected}
+            expected_folded = {item.strip().casefold(): item for item in expected}
+            correct = submitted == set(expected_folded)
             stored_answer = json.dumps(payload.answer, ensure_ascii=False)
             feedback = (
                 (exercise.explanation or "回答正确。")
                 if correct
                 else (exercise.explanation or "多选答案未完全匹配，请复习相关知识点。")
             )
-            return correct, stored_answer, feedback
+            hit = [expected_folded[item] for item in expected_folded if item in submitted]
+            missing = [expected_folded[item] for item in expected_folded if item not in submitted]
+            union = len(set(expected_folded) | submitted)
+            ratio = (len(hit) / union) if union else 0.0
+            return Evaluation(
+                is_correct=correct,
+                stored_answer=stored_answer,
+                feedback=feedback,
+                score_ratio=1.0 if correct else round(ratio, 4),
+                covered_points=hit,
+                missing_points=missing,
+                error_type=None if correct else ("incomplete_selection" if hit else "incorrect_selection"),
+            )
 
         if isinstance(payload.answer, list):
             raise AppError(
@@ -819,7 +892,13 @@ class ExerciseService:
                 if correct
                 else (exercise.explanation or "判断有误，请结合知识点再看一眼。")
             )
-            return correct, answer_text, feedback
+            return Evaluation(
+                is_correct=correct,
+                stored_answer=answer_text,
+                feedback=feedback,
+                score_ratio=1.0 if correct else 0.0,
+                error_type=None if correct else "wrong_judgement",
+            )
 
         if qtype in {"single_choice", "fill_blank"}:
             if qtype == "single_choice" and exercise.options:
@@ -836,13 +915,17 @@ class ExerciseService:
                 if correct
                 else (exercise.explanation or "答案未命中标准选项/填空，请复习后重试。")
             )
-            return correct, answer_text, feedback
+            return Evaluation(
+                is_correct=correct,
+                stored_answer=answer_text,
+                feedback=feedback,
+                score_ratio=1.0 if correct else 0.0,
+                error_type=None if correct else "wrong_answer",
+            )
 
         return self._grade_short_answer(exercise, answer_text)
 
-    def _grade_short_answer(
-        self, exercise: Exercise, answer_text: str
-    ) -> tuple[bool, str, str]:
+    def _grade_short_answer(self, exercise: Exercise, answer_text: str) -> Evaluation:
         rubric = dict(exercise.rubric_json or {})
         points = [
             str(point).strip()
@@ -851,9 +934,32 @@ class ExerciseService:
         ]
         model_grade = self._model_grade_short_answer(exercise, answer_text, points)
         if model_grade is not None:
-            return model_grade.is_correct, answer_text, model_grade.feedback
-
+            return self._short_answer_evaluation(exercise, answer_text, model_grade, points)
         return self._heuristic_grade_short_answer(exercise, answer_text, points)
+
+    @staticmethod
+    def _short_answer_evaluation(
+        exercise: Exercise,
+        answer_text: str,
+        grade: ModelShortAnswerGrade,
+        points: list[str],
+    ) -> Evaluation:
+        if grade.is_correct:
+            error_type = None
+        elif not grade.covered_points:
+            error_type = "off_target"
+        else:
+            error_type = "missing_points"
+        return Evaluation(
+            is_correct=grade.is_correct,
+            stored_answer=answer_text,
+            feedback=grade.feedback,
+            score_ratio=max(0.0, min(1.0, float(grade.score_ratio))),
+            covered_points=list(grade.covered_points),
+            missing_points=list(grade.missing_points),
+            error_type=error_type,
+        )
+
 
     def _model_grade_short_answer(
         self,
@@ -1146,7 +1252,7 @@ class ExerciseService:
         exercise: Exercise,
         answer_text: str,
         points: list[str],
-    ) -> tuple[bool, str, str]:
+    ) -> Evaluation:
         answer_folded = answer_text.casefold()
         refusal = re.fullmatch(
             r"(不知道|不太清楚|不会|无|无解|不会做|skip|n/?a|idk|i\s*don'?t\s*know)[。.!！?？]*",
@@ -1159,10 +1265,19 @@ class ExerciseService:
                 exercise.explanation
                 or f"仅覆盖 0/{total} 个要点，请补充关键概念后再答。"
             )
-            return False, answer_text, feedback
+            return Evaluation(
+                is_correct=False,
+                stored_answer=answer_text,
+                feedback=feedback,
+                score_ratio=0.0,
+                covered_points=[],
+                missing_points=list(points),
+                error_type="no_attempt",
+            )
 
         if points:
             hits = 0
+            covered: list[str] = []
             missing: list[str] = []
             for point in points:
                 ratio = self._point_match_ratio(point, answer_folded)
@@ -1170,6 +1285,7 @@ class ExerciseService:
                 # the bar low enough that common paraphrases still hit.
                 if ratio >= 0.25:
                     hits += 1
+                    covered.append(point)
                 else:
                     missing.append(point)
             ratio = hits / max(1, len(points))
@@ -1184,13 +1300,32 @@ class ExerciseService:
             )
             if missing and not correct and not exercise.explanation:
                 feedback = f"{feedback.rstrip('。')}；可补充：{'；'.join(missing[:3])}。"
-            return correct, answer_text, feedback
+            return Evaluation(
+                is_correct=correct,
+                stored_answer=answer_text,
+                feedback=feedback,
+                score_ratio=round(ratio, 4),
+                covered_points=covered,
+                missing_points=missing,
+                error_type=None if correct else ("missing_points" if covered else "off_target"),
+            )
 
         key = exercise.answer_key.strip()
         if not key:
-            return False, answer_text, exercise.explanation or "缺少参考答案，无法自动批改。"
+            return Evaluation(
+                is_correct=False,
+                stored_answer=answer_text,
+                feedback=exercise.explanation or "缺少参考答案，无法自动批改。",
+                score_ratio=0.0,
+                error_type="missing_answer_key",
+            )
         if key.casefold() in answer_folded or answer_folded in key.casefold():
-            return True, answer_text, exercise.explanation or "回答正确。"
+            return Evaluation(
+                is_correct=True,
+                stored_answer=answer_text,
+                feedback=exercise.explanation or "回答正确。",
+                score_ratio=1.0,
+            )
         ratio = self._point_match_ratio(key, answer_folded)
         correct = ratio >= 0.25
         feedback = (
@@ -1198,7 +1333,67 @@ class ExerciseService:
             if correct
             else (exercise.explanation or "回答未覆盖参考要点，请结合资料再组织答案。")
         )
-        return correct, answer_text, feedback
+        return Evaluation(
+            is_correct=correct,
+            stored_answer=answer_text,
+            feedback=feedback,
+            score_ratio=round(ratio, 4),
+            error_type=None if correct else "off_target",
+        )
+
+
+    DIFFICULTY_WEIGHTS = {"easy": 0.3, "medium": 0.5, "hard": 0.7}
+
+    def hint_for_exercise(self, exercise: Exercise) -> tuple[str, str]:
+        """Return ``(hint_text, source)`` without ever leaking the answer key.
+
+        Order: the hint the generator wrote for this exercise, then the first
+        sentence of the real node description, then a node-level recall prompt.
+        When none of these exist the caller must surface an honest empty state
+        instead of inventing content.
+        """
+
+        metadata = dict(exercise.metadata_json or {})
+        generated = str(metadata.get("hint") or "").strip()
+        if generated:
+            return generated[:600], "generated"
+        node = self.nodes.get(exercise.node_id)
+        description = ((node.description if node is not None else "") or "").strip()
+        if description:
+            sentence = re.split(r"(?<=[。！？.!?])\s*", description)[0].strip()
+            label = node.label if node is not None else "该知识点"
+            return (
+                f"先回忆「{label}」的关键描述，再对照问题定位考点：{sentence[:200]}",
+                "node_description",
+            )
+        return "", "node_description"
+
+    def _difficulty_weight(self, exercise: Exercise) -> float:
+        return self.DIFFICULTY_WEIGHTS.get(
+            (exercise.difficulty or "medium").strip().lower(), 0.5
+        )
+
+    @staticmethod
+    def _assistance_level(*, attempt_index: int, hint_count: int) -> float:
+        """How much help the learner needed on this attempt (0 = independent)."""
+
+        if hint_count > 0:
+            return min(0.9, 0.4 + 0.2 * max(0, hint_count - 1))
+        if attempt_index > 1:
+            return 0.25
+        return 0.0
+
+    @classmethod
+    def _evidence_confidence(
+        cls, evaluation: Evaluation, *, attempt_index: int, hint_count: int
+    ) -> float:
+        """Assisted recall must never look like an independent first-try recall."""
+
+        if not evaluation.is_correct:
+            return 0.35
+        if attempt_index == 1 and hint_count == 0:
+            return 0.9
+        return 0.7
 
     def _append_learning_evidence(
         self,
@@ -1209,6 +1404,10 @@ class ExerciseService:
         correct: bool,
         stored_answer: str,
         feedback: str,
+        evaluation: Evaluation | None = None,
+        attempt_index: int = 1,
+        hint_count: int = 0,
+        practice_session_id: str | None = None,
     ) -> None:
         """Publish the unique domain event for a submitted exercise answer.
 
@@ -1224,13 +1423,14 @@ class ExerciseService:
             store = MemoryEventStore(
                 self.db, event_cipher_from_settings(self.settings)
             )
-            MemoryEventIngestor(store).ingest(
-                MemoryScopeContext(
-                    tenant_id=tenant_id,
-                    principal_user_id=self.actor_id,
-                    workspace_id=self.workspace_id,
-                    conversation_id=None,
-                ),
+            scope = MemoryScopeContext(
+                tenant_id=tenant_id,
+                principal_user_id=self.actor_id,
+                workspace_id=self.workspace_id,
+                conversation_id=None,
+            )
+            result = MemoryEventIngestor(store).ingest(
+                scope,
                 EventActor("user", self.actor_id),
                 MemoryEventAppendRequest(
                     aggregate_type="learning_node",
@@ -1251,11 +1451,28 @@ class ExerciseService:
                         "answer": stored_answer[:4_000],
                         "feedback": feedback[:2_000],
                         "question_type": exercise.question_type,
-                        "confidence": 0.9 if correct else 0.35,
+                        "confidence": signal.confidence,
                         "summary_eligibility": "excluded",
                     },
                 ),
             )
+            # Project the same evidence into the unified learning state so the
+            # Practice report can show real mastery movement instead of a
+            # front-end guess. A projection failure must never lose the answer.
+            try:
+                from app.services.learning_state import LearningStateProjector
+
+                LearningStateProjector(self.db).rebuild_node(
+                    scope,
+                    exercise.node_id,
+                    head_event_id=result.event.event_id,
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "learning state projection failed for answer %s", answer.id
+                )
         except Exception:
             # Exercise grading/learning state must not fail because memory
             # event telemetry is unavailable; the durable queue outbox is the
@@ -1267,9 +1484,31 @@ class ExerciseService:
                 answer.id,
             )
 
-    def answer(self, exercise_id: str, payload: AnswerRequest) -> AnswerResult:
+    def submit_answer(
+        self,
+        exercise_id: str,
+        payload: AnswerRequest,
+        *,
+        practice_session_id: str | None = None,
+        duration_ms: int = 0,
+        hint_count: int = 0,
+        attempt_index: int = 1,
+    ) -> AnswerResult:
+        """Grade one submission and run it through the shared Evidence pipeline.
+
+        Both the Practice session runner and the legacy single-question answer
+        endpoint call this method, so Attempt → Evaluation → Evidence → Mastery
+        stays a single path.
+        """
+
         exercise = self.exercises.require(exercise_id, "exercise")
-        correct, stored_answer, feedback = self._grade(exercise, payload)
+        evaluation = self._grade(exercise, payload)
+        correct = evaluation.is_correct
+        stored_answer = evaluation.stored_answer
+        feedback = evaluation.feedback
+        confidence = self._evidence_confidence(
+            evaluation, attempt_index=attempt_index, hint_count=hint_count
+        )
         answer = self.answers.add(
             AnswerRecord(
                 workspace_id=self.workspace_id,
@@ -1278,26 +1517,70 @@ class ExerciseService:
                 is_correct=correct,
                 feedback=feedback,
                 actor_id=self.actor_id,
+                practice_session_id=practice_session_id,
+                attempt_index=max(1, int(attempt_index)),
+                duration_ms=max(0, int(duration_ms)),
+                hint_count=max(0, int(hint_count)),
+                score_ratio=evaluation.score_ratio,
+                evaluation_json={
+                    "covered_points": evaluation.covered_points,
+                    "missing_points": evaluation.missing_points,
+                    "error_type": evaluation.error_type,
+                    "score_ratio": evaluation.score_ratio,
+                    "question_type": exercise.question_type,
+                },
             )
+        )
+        misconception_summary = "；".join(
+            part
+            for part in (
+                f"答错：{exercise.prompt.strip()[:120]}",
+                (
+                    "遗漏要点：" + "、".join(evaluation.missing_points[:3])
+                    if evaluation.missing_points
+                    else ""
+                ),
+            )
+            if part
         )
         signal = self.evidence.add(
             Evidence(
                 workspace_id=self.workspace_id,
                 node_id=exercise.node_id,
                 source_type="exercise",
-                summary=f"练习作答：{'正确' if correct else '待改进'}",
-                confidence=0.9 if correct else 0.35,
+                summary=(
+                    "练习作答：正确"
+                    if correct
+                    else (misconception_summary or "练习作答：待改进")
+                ),
+                confidence=confidence,
                 status="accepted" if correct else "pending",
+                result="correct" if correct else "incorrect",
+                difficulty=self._difficulty_weight(exercise),
+                assistance_level=self._assistance_level(
+                    attempt_index=attempt_index, hint_count=hint_count
+                ),
+                score=max(0.0, min(1.0, float(evaluation.score_ratio))),
                 metadata_json={
                     "answer_record_id": answer.id,
                     "exercise_id": exercise.id,
                     "question_type": exercise.question_type,
                     "generation_batch_id": exercise.generation_batch_id,
+                    "practice_session_id": practice_session_id,
+                    "attempt_index": attempt_index,
+                    "hint_count": hint_count,
+                    "score_ratio": evaluation.score_ratio,
+                    # 只有"首次、无提示、答对"才算独立回忆；答错不构成回忆。
+                    "independent_recall": (
+                        correct and attempt_index <= 1 and hint_count == 0
+                    ),
                 },
             )
         )
         node = self.nodes.require(exercise.node_id, "graph node")
-        awarded = self.mastery_scheduler.record_exercise_result(signal, node)
+        awarded = self.mastery_scheduler.record_exercise_result(
+            signal, node, attempt_index=attempt_index, hint_count=hint_count
+        )
         self._append_learning_evidence(
             exercise,
             answer,
@@ -1305,6 +1588,10 @@ class ExerciseService:
             correct=correct,
             stored_answer=stored_answer,
             feedback=feedback,
+            evaluation=evaluation,
+            attempt_index=attempt_index,
+            hint_count=hint_count,
+            practice_session_id=practice_session_id,
         )
         self.audit.record(
             actor_id=self.actor_id,
@@ -1315,13 +1602,35 @@ class ExerciseService:
                 "mastery_star_awarded": awarded,
                 "is_correct": correct,
                 "question_type": exercise.question_type,
+                "practice_session_id": practice_session_id,
+                "attempt_index": attempt_index,
+                "hint_count": hint_count,
+                "score_ratio": evaluation.score_ratio,
             },
         )
         self.db.commit()
+        schedule = self.mastery_scheduler.schedule_for_node(node.id)
         return AnswerResult(
             answer_record_id=answer.id,
             is_correct=correct,
             feedback=feedback,
             evidence_signal_id=signal.id,
             mastery_star_awarded=bool(awarded),
+            score_ratio=evaluation.score_ratio,
+            covered_points=evaluation.covered_points,
+            missing_points=evaluation.missing_points,
+            error_type=evaluation.error_type,
+            attempt_index=max(1, int(attempt_index)),
+            hint_count=max(0, int(hint_count)),
+            node_id=node.id,
+            next_review_at=schedule.next_review_at if schedule is not None else None,
+            schedule_reason=str(
+                (signal.metadata_json or {}).get("schedule_reason") or ""
+            ),
         )
+
+    def answer(self, exercise_id: str, payload: AnswerRequest) -> AnswerResult:
+        """Legacy single-question answer endpoint (no Practice session binding)."""
+
+        return self.submit_answer(exercise_id, payload)
+

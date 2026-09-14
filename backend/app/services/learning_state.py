@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.domain.memory_event_models import LearningNodeState, MemoryScopeContext, utc_now
 from app.domain.models import Evidence
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """SQLite hands back naive datetimes while freshly created rows are aware."""
+
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +38,16 @@ class LearningStateProjector:
                 Evidence.workspace_id == scope.workspace_id,
                 Evidence.node_id == knowledge_node_id,
                 Evidence.validity_status == "active",
-                Evidence.status.in_(("accepted", "approved", "active")),
+                or_(
+                    Evidence.status.in_(("accepted", "approved", "active")),
+                    # 练习错答是系统自动判分的结果，不需要人工确认，必须计入掌握
+                    # 投影：否则答错既不拉低掌握分、也不进 misconceptions，只在会话
+                    # 报告里体现，掌握状态会明显偏乐观。
+                    and_(
+                        Evidence.source_type == "exercise",
+                        Evidence.result == "incorrect",
+                    ),
+                ),
             )
         ).all()
         weighted = 0.0
@@ -50,7 +67,9 @@ class LearningStateProjector:
             source_ids.append(item.id)
             if item.result in {"incorrect", "failed", "misconception"}:
                 misconceptions.append({"evidence_id": item.id, "summary": item.summary[:240]})
-            if last_assessed is None or item.updated_at > last_assessed:
+            if last_assessed is None or (_as_utc(item.updated_at) or utc_now()) > (
+                _as_utc(last_assessed) or utc_now()
+            ):
                 last_assessed = item.updated_at
         score = weighted / total_weight if total_weight else 0.0
         confidence = min(1.0, total_weight / 5.0)
@@ -65,7 +84,12 @@ class LearningStateProjector:
         else:
             status = "learning"
         now = utc_now()
-        if last_assessed is not None and (now - last_assessed.replace(tzinfo=timezone.utc)).days >= 14 and status in {"mastered", "familiar"}:
+        last_assessed_utc = _as_utc(last_assessed)
+        if (
+            last_assessed_utc is not None
+            and (now - last_assessed_utc).days >= 14
+            and status in {"mastered", "familiar"}
+        ):
             status = "needs_review"
         state = self.db.scalar(
             select(LearningNodeState).where(

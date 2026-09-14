@@ -182,6 +182,16 @@ export interface AnswerResult {
   feedback: string;
   evidence_signal_id: string;
   mastery_star_awarded?: boolean;
+  /** 练习反馈面：部分正确评分与要点覆盖，来自后端真实评价结果。 */
+  score_ratio?: number;
+  covered_points?: string[];
+  missing_points?: string[];
+  error_type?: string | null;
+  attempt_index?: number;
+  hint_count?: number;
+  node_id?: string | null;
+  next_review_at?: IsoDateTime | null;
+  schedule_reason?: string;
 }
 
 /**

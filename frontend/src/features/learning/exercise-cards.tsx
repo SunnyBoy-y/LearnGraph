@@ -29,7 +29,141 @@ export function QuestionTypeBadge({ type }: { type: string }) {
   );
 }
 
-type AnswerValue = string | string[];
+export type AnswerValue = string | string[];
+
+/**
+ * 所有题型共用的作答控件（单选 / 多选 / 判断 / 填空 / 简答）。
+ * 题库卡片与练习 Session 运行器都渲染这一个实现，避免为不同页面重做一套题型 UI。
+ */
+export function ExerciseResponseInput({
+  questionType,
+  options,
+  answer,
+  onAnswerChange,
+  disabled,
+  idPrefix,
+  className,
+}: {
+  questionType: string;
+  options: string[];
+  answer: AnswerValue;
+  onAnswerChange: (value: AnswerValue) => void;
+  disabled?: boolean;
+  idPrefix: string;
+  className?: string;
+}) {
+  const isMultiple = questionType === "multiple_choice";
+  const isChoice =
+    questionType === "single_choice" ||
+    questionType === "true_false" ||
+    (Boolean(options?.length) && !isMultiple && questionType !== "short_answer");
+  const isShort = questionType === "short_answer";
+  const isFill = questionType === "fill_blank" || (!isChoice && !isMultiple && !isShort);
+  const choiceOptions = options?.length
+    ? options
+    : questionType === "true_false"
+      ? ["正确", "错误"]
+      : [];
+
+  if (isMultiple) {
+    const selected = Array.isArray(answer) ? answer : [];
+    return (
+      <div className={cn("space-y-2", className)}>
+        {options.map((option, index) => {
+          const checked = selected.includes(option);
+          return (
+            <Label
+              className="flex items-center gap-3 rounded-xl border p-3 text-sm"
+              htmlFor={`${idPrefix}-mc-${index}`}
+              key={option}
+            >
+              <Checkbox
+                checked={checked}
+                disabled={disabled}
+                id={`${idPrefix}-mc-${index}`}
+                onCheckedChange={(next) =>
+                  onAnswerChange(
+                    next
+                      ? [...selected, option]
+                      : selected.filter((item) => item !== option),
+                  )
+                }
+              />
+              <span className="flex-1 font-normal">
+                {String.fromCharCode(65 + index)}. {option}
+              </span>
+            </Label>
+          );
+        })}
+      </div>
+    );
+  }
+
+  if (isChoice) {
+    return (
+      <RadioGroup
+        className={cn("space-y-2", className)}
+        disabled={disabled}
+        onValueChange={onAnswerChange}
+        value={typeof answer === "string" ? answer : ""}
+      >
+        {choiceOptions.map((option, index) => (
+          <div
+            className="flex items-center gap-3 rounded-xl border p-3 text-sm focus-within:border-primary"
+            key={option}
+          >
+            <RadioGroupItem id={`${idPrefix}-sc-${index}`} value={option} />
+            <Label
+              className="flex-1 cursor-pointer font-normal"
+              htmlFor={`${idPrefix}-sc-${index}`}
+            >
+              {questionType === "true_false"
+                ? option
+                : `${String.fromCharCode(65 + index)}. ${option}`}
+            </Label>
+          </div>
+        ))}
+        {!choiceOptions.length ? (
+          <p className="text-xs text-muted-foreground">该题缺少选项，无法作答。</p>
+        ) : null}
+      </RadioGroup>
+    );
+  }
+
+  if (isShort) {
+    return (
+      <Textarea
+        className={cn("min-h-28", className)}
+        disabled={disabled}
+        onChange={(event) => onAnswerChange(event.currentTarget.value)}
+        placeholder="用自己的话组织答案，覆盖关键要点"
+        value={typeof answer === "string" ? answer : ""}
+      />
+    );
+  }
+
+  if (isFill) {
+    return (
+      <Input
+        className={className}
+        disabled={disabled}
+        onChange={(event) => onAnswerChange(event.currentTarget.value)}
+        placeholder="填写答案"
+        value={typeof answer === "string" ? answer : ""}
+      />
+    );
+  }
+
+  return (
+    <Textarea
+      className={cn("min-h-24", className)}
+      disabled={disabled}
+      onChange={(event) => onAnswerChange(event.currentTarget.value)}
+      placeholder="输入你的回答"
+      value={typeof answer === "string" ? answer : ""}
+    />
+  );
+}
 
 export function ExerciseAnswerCard({
   exercise,
@@ -52,8 +186,6 @@ export function ExerciseAnswerCard({
     qtype === "single_choice" ||
     qtype === "true_false" ||
     (Boolean(exercise.options?.length) && !isMultiple && qtype !== "short_answer");
-  const isShort = qtype === "short_answer";
-  const isFill = qtype === "fill_blank" || (!isChoice && !isMultiple && !isShort);
 
   return (
     <Surface className={cn("p-5", className)}>
@@ -81,109 +213,41 @@ export function ExerciseAnswerCard({
       </div>
 
       <div className="mt-4">
-        {isMultiple ? (
-          <div className="space-y-2">
-            {exercise.options.map((option, index) => {
-              const selected = Array.isArray(answer) ? answer : [];
-              const checked = selected.includes(option);
-              return (
-                <Label
-                  className="flex items-center gap-3 rounded-xl border p-3 text-sm"
-                  htmlFor={`${exercise.id}-mc-${index}`}
-                  key={option}
-                >
-                  <Checkbox
-                    checked={checked}
-                    disabled={disabled}
-                    id={`${exercise.id}-mc-${index}`}
-                    onCheckedChange={(next) =>
-                      onAnswerChange(
-                        next
-                          ? [...selected, option]
-                          : selected.filter((item) => item !== option),
-                      )
-                    }
-                  />
-                  <span className="flex-1 font-normal">
-                    {String.fromCharCode(65 + index)}. {option}
-                  </span>
-                </Label>
-              );
-            })}
-          </div>
-        ) : isChoice ? (
-          <RadioGroup
-            className="space-y-2"
-            disabled={disabled}
-            onValueChange={onAnswerChange}
-            value={typeof answer === "string" ? answer : ""}
-          >
-            {(exercise.options?.length
-              ? exercise.options
-              : qtype === "true_false"
-                ? ["正确", "错误"]
-                : []
-            ).map((option, index) => {
-              const selected =
-                typeof answer === "string" && answer === option && result?.is_correct;
-              return (
-                <div
-                  className={
-                    selected
-                      ? "flex items-center gap-3 rounded-xl border border-primary bg-primary/5 p-3 text-sm"
-                      : "flex items-center gap-3 rounded-xl border p-3 text-sm"
-                  }
-                  key={option}
-                >
-                  <RadioGroupItem
-                    id={`${exercise.id}-sc-${index}`}
-                    value={option}
-                  />
-                  <Label
-                    className="flex-1 cursor-pointer font-normal"
-                    htmlFor={`${exercise.id}-sc-${index}`}
-                  >
-                    {qtype === "true_false"
-                      ? option
-                      : `${String.fromCharCode(65 + index)}. ${option}`}
-                  </Label>
-                  {selected ? (
-                    <CheckCircle2 className="size-4 text-primary" />
-                  ) : null}
-                </div>
-              );
-            })}
-          </RadioGroup>
-        ) : isShort ? (
-          <Textarea
-            className="min-h-28"
-            disabled={disabled}
-            onChange={(event) => onAnswerChange(event.currentTarget.value)}
-            placeholder="用自己的话组织答案，覆盖关键要点"
-            value={typeof answer === "string" ? answer : ""}
-          />
-        ) : isFill ? (
-          <Input
-            disabled={disabled}
-            onChange={(event) => onAnswerChange(event.currentTarget.value)}
-            placeholder="填写答案"
-            value={typeof answer === "string" ? answer : ""}
-          />
-        ) : (
-          <Textarea
-            className="min-h-24"
-            disabled={disabled}
-            onChange={(event) => onAnswerChange(event.currentTarget.value)}
-            placeholder="输入你的回答"
-            value={typeof answer === "string" ? answer : ""}
-          />
-        )}
+        <ExerciseResponseInput
+          answer={answer}
+          disabled={disabled}
+          idPrefix={exercise.id}
+          onAnswerChange={onAnswerChange}
+          options={exercise.options ?? []}
+          questionType={qtype}
+        />
+        {isChoice && result?.is_correct && typeof answer === "string" ? (
+          <p className="mt-2 flex items-center gap-1 text-xs text-primary">
+            <CheckCircle2 className="size-3.5" />
+            已选择：{answer}
+          </p>
+        ) : null}
       </div>
 
       {result ? (
         <div className="mt-4 rounded-xl border bg-muted/25 p-4">
           <p className="text-sm font-semibold">批改结果</p>
           <p className="mt-2 text-sm leading-6">{result.feedback}</p>
+          {result.covered_points?.length ? (
+            <p className="mt-2 text-xs leading-5 text-primary">
+              已覆盖：{result.covered_points.join("、")}
+            </p>
+          ) : null}
+          {result.missing_points?.length ? (
+            <p className="mt-1 text-xs leading-5 text-amber-600 dark:text-amber-400">
+              尚未覆盖：{result.missing_points.join("、")}
+            </p>
+          ) : null}
+          {typeof result.score_ratio === "number" ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              得分比例 {Math.round(result.score_ratio * 100)}%
+            </p>
+          ) : null}
           {exercise.explanation ? (
             <p className="mt-2 text-xs leading-5 text-muted-foreground">
               {exercise.explanation}
@@ -192,6 +256,7 @@ export function ExerciseAnswerCard({
           <p className="mt-2 text-xs text-muted-foreground">
             Evidence · {result.evidence_signal_id}
             {result.mastery_star_awarded ? " · 成长星 +1" : ""}
+            {result.schedule_reason ? ` · ${result.schedule_reason}` : ""}
           </p>
         </div>
       ) : null}

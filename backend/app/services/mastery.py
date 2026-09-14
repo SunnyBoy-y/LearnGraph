@@ -97,11 +97,25 @@ class MasteryService:
             )
         return state
 
-    def apply_evidence(self, evidence: Evidence, node: GraphNode) -> bool:
-        """Apply one accepted evidence item once; growth stars never decrease."""
+    def apply_evidence(
+        self,
+        evidence: Evidence,
+        node: GraphNode,
+        *,
+        attempt_index: int = 1,
+        hint_count: int = 0,
+    ) -> bool:
+        """Apply one accepted evidence item once; growth stars never decrease.
+
+        ``attempt_index`` / ``hint_count`` let the scheduler distinguish an
+        independent first-try recall from a retry or hint-assisted recall: both
+        count as success, but only the independent one extends the interval at
+        the full rate.
+        """
 
         schedule = self.ensure_schedule(node)
         metadata = dict(evidence.metadata_json or {})
+        assisted = attempt_index > 1 or hint_count > 0
         if metadata.get("mastery_event_applied"):
             return False
         old_rank = max(0, min(15, int(node.mastery_stars)))
@@ -118,17 +132,25 @@ class MasteryService:
             candidate_rank = min(15, old_rank + 1) if high_quality else old_rank
             node.mastery_stars = max(old_rank, candidate_rank)
             awarded = node.mastery_stars > old_rank
-            self._mark_success(node, schedule)
+            metadata["schedule_reason"] = self._mark_success(
+                node, schedule, assisted=assisted
+            )
             metadata["mastery_event_applied"] = True
             metadata["mastery_awarded_star"] = awarded
         elif evidence.source_type == "exercise" and evidence.confidence < 0.5:
             node.mastery_stars = old_rank
-            self._mark_conflict(node, schedule)
+            metadata["schedule_reason"] = self._mark_conflict(node, schedule)
             metadata["mastery_event_applied"] = True
         else:
             node.mastery_stars = old_rank
         evidence.metadata_json = metadata
         return awarded
+
+    def schedule_for_node(self, node_id: str) -> MasterySchedule | None:
+        return self.db.scalar(
+            self.schedules.query().where(MasterySchedule.node_id == node_id)
+        )
+
 
     def record_message(
         self,
@@ -213,8 +235,17 @@ class MasteryService:
             )
         return awarded_nodes
 
-    def record_exercise_result(self, evidence: Evidence, node: GraphNode) -> bool:
-        return self.apply_evidence(evidence, node)
+    def record_exercise_result(
+        self,
+        evidence: Evidence,
+        node: GraphNode,
+        *,
+        attempt_index: int = 1,
+        hint_count: int = 0,
+    ) -> bool:
+        return self.apply_evidence(
+            evidence, node, attempt_index=attempt_index, hint_count=hint_count
+        )
 
     def run_review(
         self,
@@ -705,12 +736,23 @@ class MasteryService:
                 snapshot[node.id] = self._as_utc(schedule.next_review_at).isoformat()
         return snapshot
 
-    def _mark_success(self, node: GraphNode, schedule: MasterySchedule) -> None:
+    def _mark_success(
+        self,
+        node: GraphNode,
+        schedule: MasterySchedule,
+        *,
+        assisted: bool = False,
+    ) -> str:
         now = utc_now()
         interval_index = min(
             max(node.mastery_stars - 1, 0),
             len(REVIEW_INTERVAL_DAYS) - 1,
         )
+        # Assisted recall (retry or hint) proves less than an independent
+        # first-try recall: it can only use the two shortest intervals, and which
+        # of them applies still follows the node's stars (0 星 → 1 天，≥2 星 → 3 天).
+        if assisted:
+            interval_index = min(interval_index, 1)
         node.retrieval_state = "fresh"
         accepted_count = len(
             list(
@@ -730,12 +772,17 @@ class MasteryService:
         schedule.next_review_at = now + timedelta(
             days=REVIEW_INTERVAL_DAYS[interval_index]
         )
+        return (
+            f"{'提示/重试后' if assisted else '首次独立'}答对，"
+            f"下次复习间隔 {REVIEW_INTERVAL_DAYS[interval_index]} 天"
+        )
 
     @staticmethod
-    def _mark_conflict(node: GraphNode, schedule: MasterySchedule) -> None:
+    def _mark_conflict(node: GraphNode, schedule: MasterySchedule) -> str:
         node.retrieval_state = "relearning"
         node.evidence_state = "conflicted"
         schedule.next_review_at = utc_now()
+        return "答错进入重新学习，下次复习立即到期"
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:
