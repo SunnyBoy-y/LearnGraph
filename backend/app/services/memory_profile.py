@@ -93,6 +93,16 @@ def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def _rejected_request_shape(error: Exception | None) -> bool:
+    """True when the provider refused the request body itself (HTTP 400)."""
+
+    if error is None:
+        return False
+    from app.providers.remote.openai import ProviderHTTPError
+
+    return isinstance(error, ProviderHTTPError) and error.status_code == 400
+
+
 def _parse_iso(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -434,6 +444,38 @@ class MemoryProfileService:
             summarization["model_id"] or extraction["model_id"],
         )
 
+    def _profile_model(self, model_id: str, provider_id: str) -> tuple[Any, bool]:
+        """Resolve the model used by one background memory-profile call.
+
+        Profile generation is a batch task fed with every eligible atom, so the
+        model's *default* thinking mode is not affordable here: on reasoning
+        models it can burn minutes before the first answer token, which no
+        interactive request budget can absorb. Ask for fast mode first, and fall
+        back to the model's own default when thinking cannot be disabled at all.
+        """
+
+        fast = model_provider_for_workspace(
+            self.db,
+            self.workspace_id,
+            self.settings,
+            model_id=model_id,
+            provider_id=provider_id,
+            thinking_mode="off",
+            disable_thinking_fallback=True,
+        )
+        if getattr(fast, "available", False):
+            return fast, True
+        return (
+            model_provider_for_workspace(
+                self.db,
+                self.workspace_id,
+                self.settings,
+                model_id=model_id,
+                provider_id=provider_id,
+            ),
+            False,
+        )
+
     def _model_json(
         self,
         *,
@@ -450,13 +492,7 @@ class MemoryProfileService:
                 "memory_profile_model_unconfigured",
                 "Configure a memory extraction or summarization model first",
             )
-        model = model_provider_for_workspace(
-            self.db,
-            self.workspace_id,
-            self.settings,
-            model_id=model_id,
-            provider_id=provider_id,
-        )
+        model, fast_mode = self._profile_model(model_id, provider_id)
         if not getattr(model, "available", False):
             raise AppError(
                 503,
@@ -482,6 +518,25 @@ class MemoryProfileService:
             payload = model.generate_json(prompt, schema_name, schema)
         except Exception as exc:  # noqa: BLE001 - normalized after usage capture
             error = exc
+        if error is not None and fast_mode and _rejected_request_shape(error):
+            # Some gateways reject the extra "stop thinking" switch with a 400.
+            # Retry once at the model's own default thinking behaviour instead of
+            # failing the whole refresh: a correct slow answer beats a fast error.
+            fallback = model_provider_for_workspace(
+                self.db,
+                self.workspace_id,
+                self.settings,
+                model_id=model_id,
+                provider_id=provider_id,
+            )
+            if getattr(fallback, "available", False):
+                model = fallback
+                started_at = time.monotonic()
+                error = None
+                try:
+                    payload = model.generate_json(prompt, schema_name, schema)
+                except Exception as exc:  # noqa: BLE001 - normalized after usage capture
+                    error = exc
         usage = dict(getattr(model, "last_usage", {}) or {})
         billing.record_usage(
             quote,
@@ -769,6 +824,31 @@ class MemoryProfileService:
         allowed = {item["id"] for item in payloads}
         return [record for record in records if record.id in allowed], payloads
 
+    def _note_refresh_failure(self, error: Exception) -> None:
+        """Remember why a rebuild failed, keeping the previous report intact.
+
+        ``refresh_profile`` never mutates the stored snapshot before it
+        succeeds, so the last good report survives on its own; this only makes
+        the reason visible on the report page instead of a bare 502.
+        """
+
+        reason = str(getattr(error, "message", "") or error).strip() or "unknown"
+        snapshot = self.db.scalar(
+            select(MemoryProfileSnapshot)
+            .where(
+                MemoryProfileSnapshot.workspace_id == self.workspace_id,
+                MemoryProfileSnapshot.owner_subject_id == self.actor_id,
+            )
+            .order_by(MemoryProfileSnapshot.version.desc())
+            .limit(1)
+        )
+        if snapshot is None:
+            return
+        snapshot.stale_reason = (
+            f"refresh_failed|{reason[:120]}|{utc_now().isoformat()}"
+        )[:240]
+        self.db.commit()
+
     def refresh_profile(self, *, force: bool = False) -> MemoryProfileView:
         records, atoms = self._atom_payloads()
         if not atoms:
@@ -816,13 +896,17 @@ class MemoryProfileService:
             "7. atom_ids 必须逐字来自输入。\n\n"
             f"ATOMS JSON:\n{json.dumps(atoms, ensure_ascii=False)}"
         )
-        payload, model_id = self._model_json(
-            prompt=prompt,
-            schema_name="memory_profile",
-            schema=_profile_schema(),
-            feature="memory_profile_summary",
-            estimated_output_tokens=2_400,
-        )
+        try:
+            payload, model_id = self._model_json(
+                prompt=prompt,
+                schema_name="memory_profile",
+                schema=_profile_schema(),
+                feature="memory_profile_summary",
+                estimated_output_tokens=2_400,
+            )
+        except AppError as exc:
+            self._note_refresh_failure(exc)
+            raise
         allowed_ids = {item["id"] for item in atoms}
         sections: list[dict[str, Any]] = []
         claim_map: dict[str, list[str]] = {}
@@ -901,20 +985,31 @@ class MemoryProfileService:
             for paragraph in section["paragraphs"]
         ]
         verification_prompt = (
-            "你是记忆摘要事实校验器。逐条判断 CLAIMS 是否完全由其 atom_ids "
-            "对应的 ATOMS 直接支持。任何扩写、身份猜测、因果推断、把一次事件"
-            "概括为习惯、或时态不一致，都必须判为无效。只返回可保留的 "
-            "valid_claim_ids 和违规原因。\n\n"
+            "你是记忆摘要事实校验器。逐条判断 CLAIMS 是否由其 atom_ids "
+            "对应的 ATOMS 支持。摘要本身是高层综合，因此：\n"
+            "必须判为**有效**：\n"
+            "1. 把多个原子合并、并列、归类、去重，或按维度归纳成一条陈述；\n"
+            "2. 用原子中出现过的信息作概括性表达，不改变原子所述内容；\n"
+            "3. 省略原子中的细节——摘要不必包含全部原子。\n"
+            "必须判为**无效**：\n"
+            "1. 出现任何原子中不存在的事实、数字、时间、身份或动机推测；\n"
+            "2. 把一次事件写成习惯，或把「尚未确定」写成「已经确定」；\n"
+            "3. 时态不一致，或放大/缩小原子表达的确定性、范围与适用条件。\n"
+            "只返回可保留的 valid_claim_ids 和违规原因。\n\n"
             f"ATOMS:\n{json.dumps(atoms, ensure_ascii=False)}\n\n"
             f"CLAIMS:\n{json.dumps(claims, ensure_ascii=False)}"
         )
-        verification, _ = self._model_json(
-            prompt=verification_prompt,
-            schema_name="memory_profile_verification",
-            schema=_profile_verification_schema(),
-            feature="memory_profile_verification",
-            estimated_output_tokens=800,
-        )
+        try:
+            verification, _ = self._model_json(
+                prompt=verification_prompt,
+                schema_name="memory_profile_verification",
+                schema=_profile_verification_schema(),
+                feature="memory_profile_verification",
+                estimated_output_tokens=800,
+            )
+        except AppError as exc:
+            self._note_refresh_failure(exc)
+            raise
         valid_claim_ids = {
             str(value)
             for value in verification.get("valid_claim_ids") or []

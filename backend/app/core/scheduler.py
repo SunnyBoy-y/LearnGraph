@@ -354,6 +354,14 @@ async def memory_retention_scheduler(
             continue
 
 
+PROFILE_REFRESH_BACKOFF_SECONDS = 1800
+# ``(workspace_id, owner_id) -> monotonic deadline``. A profile rewrite that
+# fails costs a full model round-trip inside the shared sweep loop, so a broken
+# provider must not be retried every 120s forever. In-process on purpose: only
+# the process holding the ``sweep.extraction`` advisory lock runs this loop.
+_profile_refresh_blocked_until: dict[tuple[str, str], float] = {}
+
+
 def run_memory_extraction_sweeps() -> dict[str, int]:
     """ChatGPT-dreaming-style pass over quiet sessions.
 
@@ -451,6 +459,11 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
                     ):
                         owner_ids.insert(0, workspace.owner_user_id)
                     for owner_id in owner_ids:
+                        backoff_key = (workspace.id, owner_id)
+                        if time.monotonic() < _profile_refresh_blocked_until.get(
+                            backoff_key, 0.0
+                        ):
+                            continue
                         try:
                             view = MemoryProfileService(
                                 db,
@@ -459,7 +472,11 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
                                 settings,
                             ).refresh_profile()
                             profiles_rewritten += int(view.status == "ready")
+                            _profile_refresh_blocked_until.pop(backoff_key, None)
                         except Exception:
+                            _profile_refresh_blocked_until[backoff_key] = (
+                                time.monotonic() + PROFILE_REFRESH_BACKOFF_SECONDS
+                            )
                             logger.exception(
                                 "Memory profile rewrite failed for workspace %s owner %s",
                                 workspace.id,

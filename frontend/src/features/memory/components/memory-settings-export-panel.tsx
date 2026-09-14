@@ -50,7 +50,7 @@ function PolicyRow({
   )
 }
 
-export function MemorySettingsExportPanel() {
+export function MemorySettingsExportPanel({ showPolicy = true }: { showPolicy?: boolean } = {}) {
   const queryClient = useQueryClient()
   const policy = useQuery({ queryKey: ['memory-policy'], queryFn: () => getMemoryPolicy() })
   const enhancement = useQuery({ queryKey: ['memory-enhancement'], queryFn: getMemoryEnhancement })
@@ -105,6 +105,7 @@ export function MemorySettingsExportPanel() {
 
   return (
     <div className="space-y-4">
+      {showPolicy ? (
       <Surface className="p-5">
         <SectionHeading
           description="控制自动召回与学习状态投影。关闭后旧记忆仍保留，只是不再注入对话。"
@@ -148,6 +149,7 @@ export function MemorySettingsExportPanel() {
           ) : null}
         </div>
       </Surface>
+      ) : null}
 
       <Surface className="p-5">
         <SectionHeading
