@@ -88,6 +88,13 @@ STALE_RECALL_DAYS = 7
 DELAYED_RECALL_MIN_SAMPLE = 5
 DELAYED_RECALL_WINDOWS_HOURS = (24, 24 * 7)
 
+# 这两类 AppError 都是「模型选择/可用性」问题，用户能在「设置 → 功能模型」
+# 换模型或改掉 Provider 的默认模型后重试成功；其它错误（网络、超时、schema
+# 不合法）不归这里，不能把人误导到设置页。
+MODEL_SETTING_ERROR_CODES = frozenset(
+    {"remote_model_required", "remote_model_rejected_request"}
+)
+
 REASON_LABELS = {
     "overdue": "到期",
     "due_today": "今天到期",
@@ -594,6 +601,9 @@ class PracticeService:
             node_ids=[item.node_id for item in items],
             question_types=sorted(set(planned_question_types)),
             provider_available=provider_available,
+            # 走到这里的 skipped 只可能是「没有题库 + 模型不可用」，也就是模型侧
+            # 的阻塞；UI 需要据此提供「去设置换模型」的出口。
+            model_setting_required=not provider_available,
             items=items,
             skipped_nodes=skipped,
         )
@@ -1032,10 +1042,14 @@ class PracticeService:
         hints: dict[str, list[str]] = {}
         warnings: list[str] = []
         node_ids: list[str] = []
+        # 本场组卷是否被模型侧问题挡住（换了模型就能重试成功），随 session 落库，
+        # 这样详情页刷新后仍能给出「去设置」入口。
+        model_setting_required = False
 
         if payload.mode == "scheduled":
             plan = self.build_today_plan(tz_offset_minutes=tz_offset_minutes)
             provider_available = self._provider_available()
+            model_setting_required = not provider_available
             generation_error: AppError | None = None
             for item in plan.items:
                 available = exercises_by_node.get(item.node_id, [])
@@ -1062,6 +1076,8 @@ class PracticeService:
                         # 错误重新抛出，绝不降级成假题。
                         generation_error = generation_error or exc
                         generation_failed = True
+                        if exc.code in MODEL_SETTING_ERROR_CODES:
+                            model_setting_required = True
                         warnings.append(f"「{item.label}」出题失败：{exc.message}")
                         generated = []
                     picked = list(picked) + list(generated)
@@ -1089,6 +1105,7 @@ class PracticeService:
                     {
                         "skipped_nodes": [item.node_id for item in plan.skipped_nodes],
                         "provider_available": provider_available,
+                        "model_setting_required": model_setting_required,
                         "warnings": warnings,
                     },
                 )
@@ -1103,6 +1120,7 @@ class PracticeService:
             wanted = payload.count or 5
             per_node = max(1, min(MAX_QUESTIONS_PER_NODE, -(-wanted // max(1, len(node_ids)))))
             provider_available = self._provider_available()
+            model_setting_required = not provider_available
             generation_error: AppError | None = None
             for node_id in node_ids:
                 available = exercises_by_node.get(node_id, [])
@@ -1152,6 +1170,8 @@ class PracticeService:
                             # 多知识点自由练习：一个节点出题失败时保留其它节点的题目，
                             # 并把模型侧的真实原因带回去（而不是笼统的"没有可用题目"）。
                             generation_error = generation_error or exc
+                            if exc.code in MODEL_SETTING_ERROR_CODES:
+                                model_setting_required = True
                             warnings.append(f"「{self._node_label(node_id)}」出题失败：{exc.message}")
                             generated = []
                         picked = list(picked) + list(generated)
@@ -1169,7 +1189,7 @@ class PracticeService:
                     "所选知识点没有可用题目，且当前没有可用的远程模型可以出题。"
                     if not self._provider_available()
                     else "所选知识点没有可用题目。",
-                    {"warnings": warnings},
+                    {"warnings": warnings, "model_setting_required": model_setting_required},
                 )
 
         # Order: round-robin across nodes so a wrong answer meets the same
@@ -1202,6 +1222,7 @@ class PracticeService:
                         item.node_id for item in ordered
                     ),
                     "warnings": warnings,
+                    "model_setting_required": model_setting_required,
                     "tz_offset_minutes": tz_offset_minutes,
                     "requested": payload.model_dump(mode="json"),
                 },
@@ -1310,6 +1331,9 @@ class PracticeService:
                 str(item)
                 for item in (session.source_metadata or {}).get("warnings") or []
             ],
+            model_setting_required=bool(
+                (session.source_metadata or {}).get("model_setting_required")
+            ),
         )
 
     def list_sessions(

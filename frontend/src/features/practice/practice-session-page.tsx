@@ -36,7 +36,7 @@ import { questionTypeLabel } from "@/features/learning/exercise-labels";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { PracticeAnswerResult, PracticeReveal } from "@/types/practice";
-import { GraphNodeLink } from "./practice-shared";
+import { GraphNodeLink, PracticeModelSettingLink } from "./practice-shared";
 import { formatDay } from "./practice-format";
 
 export function PracticeSessionPage() {
@@ -247,6 +247,9 @@ export function PracticeSessionPage() {
               <li key={warning}>{warning}</li>
             ))}
           </ul>
+          {session.data.model_setting_required ? (
+            <PracticeModelSettingLink className="mt-3" workspaceId={workspaceId} />
+          ) : null}
         </div>
       ) : null}
 

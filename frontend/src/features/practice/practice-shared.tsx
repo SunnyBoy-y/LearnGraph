@@ -298,3 +298,35 @@ export function PracticeCalendarDialog({
     </>
   );
 }
+
+/**
+ * 模型侧失败码（后端 ``AppError.code``）：换模型 / 改 Provider 默认模型后重试
+ * 就可能成功，所以 UI 要给出直达设置的出口；其它错误码换模型没有用。
+ */
+export const PRACTICE_MODEL_ERROR_CODES = new Set([
+  "remote_model_required",
+  "remote_model_rejected_request",
+]);
+
+/**
+ * 模型侧错误（没有可用模型 / 选中的模型被 Provider 拒绝）的统一出口。
+ *
+ * 这里必须跳到「工作区设置」页的「功能模型」卡片：那才是有「练习出题与判分模型」
+ * 这个可改选项的地方。Provider 页只能改 Provider 自己的默认模型，把人送错页面
+ * 等于让人继续猜。
+ */
+export function PracticeModelSettingLink({
+  workspaceId,
+  label = "去设置出题模型",
+  className,
+}: {
+  workspaceId: string;
+  label?: string;
+  className?: string;
+}) {
+  return (
+    <Button asChild className={className} size="sm" variant="outline">
+      <Link to={`/w/${workspaceId}/settings/workspace`}>{label}</Link>
+    </Button>
+  );
+}

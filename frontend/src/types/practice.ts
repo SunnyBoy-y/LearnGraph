@@ -45,6 +45,8 @@ export interface PracticeTodayPlan {
   items: PracticePlanItem[];
   /** 缺少题库时能否现场出题（工作区有可用的远程结构化模型）。 */
   provider_available?: boolean;
+  /** 计划被模型侧问题挡住：UI 给出直达「设置 → 功能模型」的出口。 */
+  model_setting_required?: boolean;
   skipped_nodes: PracticePlanItem[];
 }
 
@@ -128,6 +130,8 @@ export interface PracticeSessionView {
   plan?: PracticeTodayPlan | null;
   /** 组卷时遇到的问题（某个知识点出题失败等），必须展示，避免静默少题。 */
   warnings?: string[];
+  /** 少题的原因在模型侧（换模型就能重试）：UI 给出直达设置的出口。 */
+  model_setting_required?: boolean;
 }
 
 export interface PracticeSessionCreateRequest {

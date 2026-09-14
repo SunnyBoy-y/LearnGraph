@@ -10,6 +10,7 @@ import {
   getMastery,
   listFiles,
 } from "@/api";
+import { ApiError } from "@/api/client";
 import {
   ErrorState,
   SectionHeading,
@@ -31,6 +32,10 @@ import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { PracticeSessionMode } from "@/types/practice";
 import { evidenceStateLabel, retrievalStateLabel } from "./practice-format";
+import {
+  PRACTICE_MODEL_ERROR_CODES,
+  PracticeModelSettingLink,
+} from "./practice-shared";
 
 const QUESTION_TYPES = [
   { value: "mixed", label: "混合" },
@@ -62,6 +67,9 @@ export function PracticeFreeTab() {
   const [count, setCount] = useState(5);
   const [fileIds, setFileIds] = useState<string[]>([]);
   const [batchId, setBatchId] = useState<string | null>(null);
+  // 模型侧失败（没有可用模型 / 模型被 Provider 拒绝）时，光弹一个 toast 用户
+  // 不知道该改哪里：把原因留在页面上，并给出直达「设置 → 功能模型」的入口。
+  const [modelError, setModelError] = useState<string | null>(null);
 
   useEffect(() => {
     if (presetNode) setNodeId(presetNode);
@@ -95,13 +103,21 @@ export function PracticeFreeTab() {
         generation_batch_id: mode === "material" ? batchId : null,
       }),
     onSuccess: (view) => {
+      setModelError(null);
       void queryClient.invalidateQueries({
         queryKey: workspaceQueryKey(workspaceId, "practice-overview"),
       });
       navigate(`/w/${workspaceId}/practice/session/${view.session.id}`);
     },
-    onError: (error) =>
-      toast.error(error instanceof Error ? error.message : "无法开始练习"),
+    onError: (error) => {
+      const message = error instanceof Error ? error.message : "无法开始练习";
+      setModelError(
+        error instanceof ApiError && PRACTICE_MODEL_ERROR_CODES.has(error.code)
+          ? message
+          : null,
+      );
+      toast.error(message);
+    },
   });
 
   const generateOnly = useMutation({
@@ -122,13 +138,21 @@ export function PracticeFreeTab() {
     onSuccess: (items) => {
       const batch = items[0]?.generation_batch_id ?? null;
       setBatchId(batch);
+      setModelError(null);
       toast.success(`已生成 ${items.length} 道题目，可以直接开始练习`);
       void queryClient.invalidateQueries({
         queryKey: workspaceQueryKey(workspaceId, "exercises"),
       });
     },
-    onError: (error) =>
-      toast.error(error instanceof Error ? error.message : "题目生成失败"),
+    onError: (error) => {
+      const message = error instanceof Error ? error.message : "题目生成失败";
+      setModelError(
+        error instanceof ApiError && PRACTICE_MODEL_ERROR_CODES.has(error.code)
+          ? message
+          : null,
+      );
+      toast.error(message);
+    },
   });
 
   if (mastery.isPending) {
@@ -311,6 +335,17 @@ export function PracticeFreeTab() {
               <Badge variant="secondary">已生成题目，可直接开始练习</Badge>
             ) : null}
           </div>
+          {modelError ? (
+            <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-3">
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
+                出题被模型挡住，暂时无法生成题目
+              </p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                {modelError}
+              </p>
+              <PracticeModelSettingLink className="mt-3" workspaceId={workspaceId} />
+            </div>
+          ) : null}
           <p className="text-xs leading-5 text-muted-foreground">
             远程模型不可用时，出题会明确失败并给出原因，不会用本地演示题代替。
           </p>

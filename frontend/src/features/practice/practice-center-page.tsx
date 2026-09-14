@@ -15,6 +15,7 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import { createPracticeSession, getPracticeOverview } from "@/api";
+import { ApiError } from "@/api/client";
 import {
   EmptyState,
   ErrorState,
@@ -36,8 +37,10 @@ import { PracticeReportTab } from "./practice-report-tab";
 import { PracticeWrongBookTab } from "./practice-wrong-book-tab";
 import {
   GraphNodeLink,
+  PRACTICE_MODEL_ERROR_CODES,
   PracticeCalendarDialog,
   PracticeDeltaBadge,
+  PracticeModelSettingLink,
   PracticeTrendChart,
 } from "./practice-shared";
 import {
@@ -83,12 +86,17 @@ function TodayPlanCard({
   pending,
   onStart,
   starting,
+  workspaceId,
 }: {
   plan: PracticeOverview["today_plan"];
   pending: boolean;
   onStart: () => void;
   starting: boolean;
+  workspaceId: string;
 }) {
+  // 计划被模型挡住时（没有可用模型，或选中的模型被拒）才有换模型这个出口。
+  const modelBlocked =
+    plan.model_setting_required === true || plan.provider_available === false;
   if (pending) {
     return (
       <Surface className="space-y-3 p-5">
@@ -145,6 +153,9 @@ function TodayPlanCard({
             <Button asChild size="sm" variant="outline">
               <Link to="?tab=free">去自由练习</Link>
             </Button>
+            {modelBlocked ? (
+              <PracticeModelSettingLink workspaceId={workspaceId} />
+            ) : null}
             {plan.provider_available === false ? (
               <Button asChild size="sm" variant="outline">
                 <Link to="../settings/providers">配置远程模型</Link>
@@ -218,6 +229,9 @@ function TodayPlanCard({
               </li>
             ))}
           </ul>
+          {modelBlocked ? (
+            <PracticeModelSettingLink className="mt-3" workspaceId={workspaceId} />
+          ) : null}
         </div>
       ) : null}
     </Surface>
@@ -280,6 +294,8 @@ export function PracticeCenterPage() {
   const tabParam = (searchParams.get("tab") ?? "today") as TabId;
   const tab: TabId = TABS.some((item) => item.id === tabParam) ? tabParam : "today";
   const [startError, setStartError] = useState<string | null>(null);
+  // 失败原因是否落在模型侧：只有这一种才给「去设置换模型」按钮。
+  const [startErrorNeedsModel, setStartErrorNeedsModel] = useState(false);
 
   const overview = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "practice-overview"),
@@ -291,6 +307,7 @@ export function PracticeCenterPage() {
       createPracticeSession({ mode: "scheduled", question_type: "mixed" }),
     onSuccess: (view) => {
       setStartError(null);
+      setStartErrorNeedsModel(false);
       void queryClient.invalidateQueries({
         queryKey: workspaceQueryKey(workspaceId, "practice-overview"),
       });
@@ -299,6 +316,9 @@ export function PracticeCenterPage() {
     onError: (error) => {
       const message = error instanceof Error ? error.message : "无法开始练习";
       setStartError(message);
+      setStartErrorNeedsModel(
+        error instanceof ApiError && PRACTICE_MODEL_ERROR_CODES.has(error.code),
+      );
       toast.error(message);
     },
   });
@@ -446,6 +466,12 @@ export function PracticeCenterPage() {
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
                 {startError}
               </p>
+              {startErrorNeedsModel ? (
+                <PracticeModelSettingLink
+                  className="mt-3"
+                  workspaceId={workspaceId}
+                />
+              ) : null}
             </Surface>
           ) : null}
 
@@ -456,6 +482,7 @@ export function PracticeCenterPage() {
                 pending={false}
                 plan={data.today_plan}
                 starting={start.isPending}
+                workspaceId={workspaceId}
               />
             </div>
             <div className="flex flex-col gap-5 xl:col-span-4">

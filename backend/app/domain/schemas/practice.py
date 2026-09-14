@@ -58,6 +58,9 @@ class PracticeTodayPlanView(BaseModel):
     items: list[PracticePlanItemView] = Field(default_factory=list)
     # 缺少题库时是否可以现场出题（工作区已有可用的远程结构化模型）。
     provider_available: bool = False
+    # 计划被模型侧问题挡住（没有可用模型，或选中的模型不可用）。UI 据此给出
+    # 直达「设置 → 功能模型」的入口，而不是只留一句错误文案让用户自己找。
+    model_setting_required: bool = False
     # Nodes the scheduler wanted to include but cannot practise right now
     # (no exercise and no remote model to generate one).
     skipped_nodes: list[PracticePlanItemView] = Field(default_factory=list)
@@ -147,6 +150,9 @@ class PracticeSessionView(BaseModel):
     plan: PracticeTodayPlanView | None = None
     # 组卷时遇到的问题（例如某个知识点出题失败）。必须回传，否则少题会变成静默行为。
     warnings: list[str] = Field(default_factory=list)
+    # 本场组卷是否因模型侧问题少题（换了模型就能重试成功）：UI 用它在
+    # 警告块旁给出直达「设置 → 功能模型」的入口。
+    model_setting_required: bool = False
 
 
 class PracticeSessionCreateRequest(BaseModel):

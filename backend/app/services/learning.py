@@ -284,6 +284,14 @@ class EvidenceService:
         return report
 
 
+# 出题/判分拿不到可用模型时的统一出口：把用户直接引到真正能改的地方，
+# 而不是只丢一句「模型不可用」，让用户在设置里自己找。
+PRACTICE_MODEL_SETTING_HINT = (
+    "请在「设置 → 功能模型 → 练习出题与判分模型」指定一个可用模型，"
+    "或在「设置 → 模型 Provider」改选该 Provider 的默认模型。"
+)
+
+
 class ExerciseService:
     def __init__(
         self,
@@ -391,10 +399,12 @@ class ExerciseService:
             raise AppError(
                 503,
                 "remote_model_required",
-                getattr(
-                    provider,
-                    "reason",
-                    "Exercise generation requires a configured remote model provider",
+                (
+                    (
+                        getattr(provider, "reason", "")
+                        or "Exercise generation requires a configured remote model provider"
+                    )
+                    + f"；{PRACTICE_MODEL_SETTING_HINT}"
                 ),
                 {
                     "provider_id": getattr(provider, "provider_id", "unavailable"),
@@ -575,8 +585,8 @@ class ExerciseService:
                 "remote_model_rejected_request",
                 (
                     f"远程模型（Provider {provider_id} / 模型 {model_id}）拒绝了本次出题请求，"
-                    "重试不会成功：请在「设置 → 功能模型」为练习指定一个可用模型，"
-                    f"或改选该 Provider 的默认模型。原始错误：{last_error}"
+                    f"重试不会成功：{PRACTICE_MODEL_SETTING_HINT}"
+                    f"原始错误：{last_error}"
                 ),
                 {
                     "attempts": attempts_made,
