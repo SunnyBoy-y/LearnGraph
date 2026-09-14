@@ -4091,14 +4091,17 @@ function ModelCapabilitiesDialog({
   return (
     <Dialog onOpenChange={(open) => !open && !saveModelStates.isPending && onClose()} open>
       <DialogContent className="h-[min(88dvh,860px)] overflow-hidden p-0 sm:max-w-3xl">
-        <form className="flex min-h-0 flex-1 flex-col" onSubmit={submit}>
+        {/* min-w-0：DialogContent 是 grid 容器，子项默认 min-width:auto，会被内容的
+            min-content 撑到超过弹窗宽度；窄屏下即表现为「配置溢出窗口」——右侧内容
+            被 overflow-hidden 直接裁掉。form 与滚动层都必须能收缩。 */}
+        <form className="flex min-h-0 min-w-0 flex-1 flex-col" onSubmit={submit}>
           <DialogHeader className="shrink-0 border-b px-5 py-5 pr-14">
             <DialogTitle>供应商配置</DialogTitle>
           </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-5">
             <div className="space-y-5 py-5">
               <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
                 <div className="flex items-center gap-2">
                   <Input
                     aria-label="手动添加模型"
@@ -4129,7 +4132,13 @@ function ModelCapabilitiesDialog({
                   厂商未在列表暴露的模型（新发布型号 / 私有模型 / 中继别名）可手动添加，随后点击「编辑」设置上下文窗口。
                 </p>
                 <Input aria-label="搜索模型" onChange={(event) => setModelSearch(event.target.value)} placeholder="模糊搜索模型名称…" value={modelSearch} />
-                <ScrollArea className="rounded-lg border [&>[data-slot=scroll-area-viewport]]:max-h-48" type="always">
+                {/* Radix ScrollArea 视口内层是 display:table（为横向滚动而设），会把行撑到
+                    max-content，令 truncate 失效、行溢出视口被裁。这里只做纵向滚动，
+                    因此压成 block，让行按可用宽度收缩与换行。 */}
+                <ScrollArea
+                  className="rounded-lg border [&>[data-slot=scroll-area-viewport]]:max-h-48 [&>[data-slot=scroll-area-viewport]>div]:block!"
+                  type="always"
+                >
                   <div className="divide-y">
                     {modelsList.models.length === 0 ? (
                       <p className="px-3 py-4 text-xs text-muted-foreground">尚未发现模型。可先在上方手动添加模型名称，或返回列表「发现模型」。</p>
@@ -4138,10 +4147,12 @@ function ModelCapabilitiesDialog({
                     ) : null}
                     {visibleModels.map((model) => (
                     <div
-                      className="flex items-center gap-3 px-3 py-2 text-xs"
+                      className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 text-xs"
                       key={model.id}
                     >
-                      <span className="min-w-0 flex-1 truncate font-mono">{model.id}</span>
+                      {/* 窄屏：模型名独占一行（省略号截断），操作按钮整体换到下一行；
+                          宽屏（sm+）：回到 flex-1 的单行布局。 */}
+                      <span className="w-full min-w-0 truncate font-mono sm:w-auto sm:flex-1">{model.id}</span>
                       {overrideModelIds.includes(model.id) ? (
                         <span
                           className="rounded border px-1 py-0.5 text-[10px] text-muted-foreground"
@@ -4201,10 +4212,10 @@ function ModelCapabilitiesDialog({
                   <p className="text-sm font-semibold">连接配置</p>
                   <p className="mt-1 text-xs text-muted-foreground">URL、请求头和 Secret 统一在这里维护。</p>
                 </div>
-                <Label>
+                <Label className="max-sm:flex-col max-sm:items-stretch max-sm:gap-1">
                   协议类型
                   <Select onValueChange={setProtocolType} value={protocolType}>
-                    <SelectTrigger className="mt-2"><SelectValue /></SelectTrigger>
+                    <SelectTrigger className="mt-2 max-sm:w-full"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       {protocolOptions.map((item) => (
                         <SelectItem key={item.provider_type} value={item.provider_type}>
@@ -4214,7 +4225,7 @@ function ModelCapabilitiesDialog({
                     </SelectContent>
                   </Select>
                 </Label>
-                <Label>
+                <Label className="max-sm:flex-col max-sm:items-stretch max-sm:gap-1">
                   Base URL
                   <Input className="mt-2" onChange={(event) => setBaseUrl(event.target.value)} value={baseUrl} />
                   {(() => {
@@ -4237,9 +4248,9 @@ function ModelCapabilitiesDialog({
                     return null;
                   })()}
                 </Label>
-                <Label>请求头（JSON 对象）<Textarea className="mt-2 min-h-20 font-mono text-xs" onChange={(event) => setHeaders(event.target.value)} value={headers} /></Label>
+                <Label className="max-sm:flex-col max-sm:items-stretch max-sm:gap-1">请求头（JSON 对象）<Textarea className="mt-2 min-h-20 min-w-0 font-mono text-xs" onChange={(event) => setHeaders(event.target.value)} value={headers} /></Label>
                 <div className="flex flex-wrap items-end gap-2">
-                  <Label className="min-w-52 flex-1">替换 Secret<Input className="mt-2" onChange={(event) => setSecret(event.target.value)} placeholder="输入新 Secret" type="password" value={secret} /></Label>
+                  <Label className="min-w-0 flex-1 basis-52 sm:min-w-52">替换 Secret<Input className="mt-2" onChange={(event) => setSecret(event.target.value)} placeholder="输入新 Secret" type="password" value={secret} /></Label>
                   <Button
                     disabled={updateConnection.isPending}
                     onClick={() => {
@@ -4956,14 +4967,15 @@ function ModelOverrideDialog({
   return (
     <Dialog onOpenChange={(open) => !open && !save.isPending && onClose()} open>
       <DialogContent className="h-[min(84dvh,780px)] overflow-hidden p-0 sm:max-w-2xl">
-        <form className="flex min-h-0 flex-1 flex-col" onSubmit={submit}>
+        {/* 与「供应商配置」同因：两层 min-w-0 防止窄屏下内容被撑出弹窗后裁掉。 */}
+        <form className="flex min-h-0 min-w-0 flex-1 flex-col" onSubmit={submit}>
           <DialogHeader className="shrink-0 border-b px-5 py-5 pr-14">
-            <DialogTitle className="font-mono text-base">{modelId}</DialogTitle>
+            <DialogTitle className="min-w-0 break-all font-mono text-base">{modelId}</DialogTitle>
             <DialogDescription>
               单模型参数配置，保存后仅对该模型生效。
             </DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-5">
             {capabilitiesQuery.isPending ? (
               <div className="py-10">
                 <LoadingState label="正在读取已保存的能力快照…" />
