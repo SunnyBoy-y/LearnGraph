@@ -203,6 +203,26 @@ _MODEL_MANAGEMENT_PROVIDER_TYPES = frozenset(
     }
 )
 
+# ASR 行的「用途」由能力快照里的用途键决定，与 app/providers/factory.py
+# 的解析分支一一对应：文件/分段转写、实时听写（全双工）、异步文件识别是
+# 三条彼此独立的链路，可以各自有一个生效的 Provider 行。
+_ASR_PURPOSE_KEYS: tuple[tuple[str, str], ...] = (
+    ("stored", "default_transcription_model_id"),
+    ("realtime", "default_realtime_transcription_model_id"),
+    ("stored_async", "default_async_transcription_model_id"),
+)
+
+
+def _asr_purposes(capabilities: dict[str, object]) -> set[str]:
+    """Purposes an ASR Provider row is actually wired to serve."""
+
+    return {
+        purpose
+        for purpose, key in _ASR_PURPOSE_KEYS
+        if str(capabilities.get(key) or "").strip()
+    }
+
+
 # DashScope official hosts.  API keys cannot read account balance there; a
 # workspace-configured Aliyun AccessKey (secret reference, purpose
 # ``aliyun_access_key``) is required for the BSS RPC.
@@ -1500,6 +1520,8 @@ class ProviderService:
             capabilities["default_realtime_transcription_model_id"] = (
                 payload.default_realtime_transcription_model_id
             )
+        if payload.realtime_ws_url is not None:
+            capabilities["realtime_ws_url"] = payload.realtime_ws_url.strip()
         if payload.tested_modes is not None:
             capabilities["tested_modes"] = payload.tested_modes
         if payload.untested_modes is not None:
@@ -1759,11 +1781,20 @@ class ProviderService:
                     "provider_transcription_model_required",
                     "A stored-file, asynchronous, or realtime transcription model is required before enabling",
                 )
+            # 只让「用途重叠」的行互斥。实时听写与文件/分段转写是两条独立
+            # 链路，factory 侧按用途键逐行解析并跳过不匹配的行，因此它们
+            # 可以各自有一个生效的 Provider；把互斥放宽到整个 transcription
+            # 角色会让另一条链路被无故踢下线。
             for current in self.providers.list():
                 if (
                     current.id != provider.id
                     and current.provider_type in TRANSCRIPTION_PROVIDER_TYPES
                 ):
+                    if not (
+                        _asr_purposes(dict(current.capabilities or {}))
+                        & _asr_purposes(capabilities)
+                    ):
+                        continue
                     current.enabled = False
                     current.remote_capability = False
                     current.status = "disabled"

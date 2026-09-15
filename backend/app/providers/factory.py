@@ -1449,6 +1449,13 @@ def realtime_asr_provider_for_workspace(
     selector is for Pipecat/voice runtimes that need to feed PCM frames and
     consume normalized partial/final events directly.
     """
+    # 语音服务专用绑定优先。实时 ASR 与文件/分段转写是两条独立链路，
+    # 通用 `transcription` 绑定仍然由文件转写路径消费；没有专用绑定时
+    # 才回落到旧语义。
+    if provider_id is None and model_id is None:
+        provider_id, model_id = _functional_model_target(
+            db, workspace_id, "realtime_transcription"
+        )
     if provider_id is None and model_id is None:
         provider_id, model_id = _functional_model_target(db, workspace_id, "transcription")
     rows = cached_provider_rows(

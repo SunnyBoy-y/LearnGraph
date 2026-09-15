@@ -5668,7 +5668,11 @@ class AgentToolRuntime:
                         "The selected Provider is not configured and enabled",
                     )
                 spec = provider_type_spec(provider.provider_type)
-                expected_role = "model" if capability == "chat" else capability
+                if capability == "realtime_transcription":
+                    # 语音服务专用实时 ASR 落在 transcription 角色的 Provider 上。
+                    expected_role = "transcription"
+                else:
+                    expected_role = "model" if capability == "chat" else capability
                 declared_role = (
                     (provider.capabilities or {}).get("provider_role")
                     or (spec.role if spec is not None else None)

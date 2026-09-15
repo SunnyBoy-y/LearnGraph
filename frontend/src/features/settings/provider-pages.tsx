@@ -172,6 +172,7 @@ import {
   speechModelsForRole,
   type SpeechProviderDraft,
 } from "./speech-provider-config";
+import { ResidentAsrSection } from "./resident-asr-section";
 import { Textarea } from "@/components/ui/textarea";
 import { isRealtimeTranscriptionModel } from "@/lib/model-choices";
 
@@ -879,6 +880,16 @@ export function ProvidersPage() {
         title="Provider 管理"
       />
       <HostBridgeHint status={hostBridge.data} />
+      {roleFilter === "transcription" ? (
+        <ResidentAsrSection
+          catalog={providerCatalog.data ?? []}
+          providers={providers.data ?? []}
+          providersPending={providers.isPending}
+          secretStoreAvailable={
+            !secretStore.isPending && Boolean(secretStore.data?.available)
+          }
+        />
+      ) : null}
       <Surface className="overflow-hidden">
         <div className="provider-list-heading border-b p-5">
           <SectionHeading title="服务与模型" />

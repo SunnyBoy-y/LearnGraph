@@ -149,6 +149,8 @@ export interface ProviderUpdateRequest {
   default_image_generation_model_id?: string | null;
   default_transcription_model_id?: string | null;
   default_realtime_transcription_model_id?: string | null;
+  /** Realtime（全双工）ASR 的 WebSocket 端点，与 base_url 分开保存。 */
+  realtime_ws_url?: string | null;
   /** ASR/转写通道「已测试支持」标注：tested = 已实测验证，untested = 代码已实现未实测。
    *  模式枚举：realtime_ws / http_segments / async_file / openai_multipart。 */
   tested_modes?: string[] | null;

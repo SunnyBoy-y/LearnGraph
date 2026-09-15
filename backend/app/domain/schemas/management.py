@@ -823,6 +823,9 @@ class ProviderUpdateRequest(BaseModel):
     default_realtime_transcription_model_id: str | None = Field(
         default=None, min_length=1, max_length=160
     )
+    # Realtime（全双工）ASR 的 WebSocket 端点。与 base_url 分开，因为同一行可以
+    # 同时承载兼容模式 HTTP 地址与实时 WS 地址。
+    realtime_ws_url: str | None = Field(default=None, max_length=500)
     # ASR/转写通道「已测试支持」标注：tested = 已实测验证的模式，untested =
     # 代码路径已实现但未经真实网关验收的模式。模式枚举：realtime_ws /
     # http_segments / async_file / openai_multipart。仅供展示与验收追踪，
@@ -1406,6 +1409,9 @@ class FunctionalModelDefaultsSettingValue(BaseModel):
     chat: FunctionalModelTarget | None = None
     vision: FunctionalModelTarget | None = None
     transcription: FunctionalModelTarget | None = None
+    # 语音服务（全双工通话）专用的实时 ASR。与通用 `transcription` 分开，
+    # 这样实时听写和文件/分段转写各自有自己的 Provider，不会互相顶掉。
+    realtime_transcription: FunctionalModelTarget | None = None
     image_generation: FunctionalModelTarget | None = None
     search: FunctionalModelTarget | None = None
     fetch: FunctionalModelTarget | None = None
