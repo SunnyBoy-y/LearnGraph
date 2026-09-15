@@ -836,7 +836,9 @@ export function SelectionExplanationPanel({
             <button
               aria-label="选择响应模式、思考力度和模型"
               className="chat-mode-chip"
-              disabled={!modelProviders.length || busy}
+              // 回复途中同样允许切换：本次回答沿用发送时锁定的模型，改动只对
+              // 下一条消息生效。
+              disabled={!modelProviders.length}
               title="响应模式与模型"
               type="button"
             >

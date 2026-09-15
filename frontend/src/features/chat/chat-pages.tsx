@@ -5363,12 +5363,15 @@ export function ChatCanvasPage() {
   });
   // Shared gate for the composer's mode/model trigger: the phone button, the
   // desktop pill, and the Ctrl+Shift+M shortcut all respect it.
+  //
+  // 有意不依赖 status：回复途中切换模式/模型只影响「下一条」请求。正在跑的
+  // SSE 请求体在发送那一刻就按当时的 provider/model/思考力度构建完毕，事后改
+  // state 不会回写到它，因此这里不再把入口灰掉（浅灰胶囊不再出现）。
   const modelTriggerDisabled =
     !activeGenerationProvider ||
     sessionIsClosed ||
     closeSessionMutation.isPending ||
-    goalFlow.busy ||
-    status !== "ready";
+    goalFlow.busy;
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
