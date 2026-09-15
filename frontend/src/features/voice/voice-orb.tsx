@@ -1,316 +1,32 @@
-import { useEffect, useRef, useState } from "react";
-import { VoiceTaskChip } from "./voice-task-chip";
-import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
-import { LoaderCircle, Mic, MicOff, PhoneOff } from "lucide-react";
+import { Mic, MicOff, LoaderCircle, PhoneOff } from "lucide-react";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { cn } from "@/lib/utils";
-import {
-  useVoiceSession,
-  voiceSessionController,
-  type VoiceSessionState,
-  type VoiceTranscript,
-  type VoiceTransportState,
-  type VoiceAudioSource,
-} from "./voice-session-controller";
+import { useVoiceSession } from "./voice-session-controller";
 
 /**
- * Full-duplex voice surface, inline rather than modal.
+ * The composer's voice controls -- and the only place a call's connection state
+ * is presented (2026-09-14 revision).
  *
- * The transport, session lifecycle and speech state all live in
- * `voice-session-controller`; these components only map that state onto the orb
- * and the two composer controls, and report the user's intent back. Nothing here
- * touches the conversation canvas, which is what lets the messages stay visible
- * while a call is running.
+ * The voice-tutor button is the dial key: entering voice mode starts the call,
+ * so the control has to answer "is this thing actually connected?" by itself.
+ * Right-hand slot:
  *
- * 交互约定（2026-09-12 修订）：语音导师按钮即"拨号键"——进入语音模式（本组件
- * 挂载）就自动接线麦克风并开始通话，不再需要先点悬浮球连接；悬浮球退化为
- * 状态指示器（听到/思考/说话）；球体可轻微点击/拖动产生反馈，但不承担挂断或
- * 打断操作（打断由本机 VAD 自动处理，挂断由右侧通话按钮处理）。
+ *   connecting / reconnecting -> grey + spinner
+ *   connected                 -> coloured, and the connect cue plays right then
+ *   error                     -> grey
  *
- * 位置约定（2026-09-12）：悬浮球由 chat 页面挂在工作台功能条（资料/目标/联网/…）
- * 的**上方**，而不是塞在功能条与输入框之间的窄缝里；组件本身只负责居中与自身
- * 高度，落点由挂载位置和 `.chat-voice-orb-dock` 的样式决定。
+ * There is deliberately no floating orb and no floating caption card any more.
+ * Live transcript and the tutor's answer belong to the conversation itself, and
+ * the call's incidental status (model pin, ICE path, degradation) is a single
+ * in-flow line above the composer -- see `VoiceStatusLine`'s host in the chat
+ * page. A floating layer used to sit on top of the messages it was describing.
  */
-
-function voiceStatusText(
-  transport: VoiceTransportState,
-  state: VoiceSessionState,
-  error?: string | null,
-): string {
-  if (transport === "connecting") return "正在接通语音导师…";
-  if (transport === "reconnecting") return "语音连接中断，正在重连…";
-  if (transport === "error") return error || "语音连接失败";
-  if (state === "speaking") return "导师正在回答，你随时可以插话";
-  if (state === "thinking") return "导师正在思考，你随时可以插话";
-  if (state === "listening") return "正在聆听，请直接说话";
-  if (transport === "connected") return "语音导师已连接，请直接说话";
-  return "语音导师未连接";
-}
-
-export interface VoiceOrbProps {
-  transport: VoiceTransportState;
-  state: VoiceSessionState;
-  error?: string | null;
-  muted?: boolean;
-  audioLevel?: number;
-  audioSource?: VoiceAudioSource;
-  /** Rendered inside the dock so it inherits its centered flex layout. */
-  note?: ReactNode;
-}
-
-/**
- * The orb is a visual meter for both sides of the conversation. It accepts a
- * small drag so it feels alive without taking over call controls; dragging is
- * purely visual and the composer buttons remain the source of truth for mute
- * and hang-up.
- */
-export function VoiceOrb({ transport, state, error, muted, audioLevel = 0, audioSource = "idle", note }: VoiceOrbProps) {
-  const isListening = state === "listening";
-  const isSpeaking = state === "speaking";
-  const status = voiceStatusText(transport, state, error);
-  const [drag, setDrag] = useState({ x: 0, y: 0 });
-  const [pressed, setPressed] = useState(false);
-  const dragStart = useRef<{ x: number; y: number } | null>(null);
-  const dragDistance = Math.min(1, Math.hypot(drag.x, drag.y) / 42);
-  const visualStyle = {
-    ["--voice-level" as string]: audioLevel,
-    ["--orb-drag" as string]: dragDistance,
-    transform: `translate3d(${drag.x}px, ${drag.y}px, 0) rotate(${drag.x / 10}deg) scale(${pressed ? 0.94 : 1})`,
-  } as CSSProperties;
-  const releasePointer = (event: ReactPointerEvent<HTMLSpanElement>) => {
-    if (dragStart.current) event.currentTarget.releasePointerCapture?.(event.pointerId);
-    dragStart.current = null;
-    setDrag({ x: 0, y: 0 });
-    setPressed(false);
-  };
-
-  return (
-    <div
-      className={cn(
-        "chat-voice-orb-dock",
-        muted && "is-muted",
-        transport === "error" && "is-error",
-        audioSource === "user" && "is-user-voice",
-        audioSource === "assistant" && "is-assistant-voice",
-      )}
-    >
-      <span
-        aria-label={`语音球：${status}`}
-        className="chat-voice-orb-dock__visual"
-        role="img"
-        style={visualStyle}
-        onPointerDown={(event) => {
-          if (!event.isPrimary) return;
-          dragStart.current = { x: event.clientX - drag.x, y: event.clientY - drag.y };
-          event.currentTarget.setPointerCapture?.(event.pointerId);
-          setPressed(true);
-        }}
-        onPointerMove={(event) => {
-          if (!dragStart.current) return;
-          setDrag({
-            x: Math.max(-32, Math.min(32, event.clientX - dragStart.current.x)),
-            y: Math.max(-20, Math.min(20, event.clientY - dragStart.current.y)),
-          });
-        }}
-        onPointerUp={releasePointer}
-        onPointerCancel={releasePointer}
-      >
-        <span
-          className={cn(
-            "chat-voice-orb",
-            isListening && "is-listening",
-            isSpeaking && "is-speaking",
-          )}
-        >
-          <span className="chat-voice-orb__core" />
-          <span className="chat-voice-orb__halo chat-voice-orb__halo--one" />
-          <span className="chat-voice-orb__halo chat-voice-orb__halo--two" />
-        </span>
-      </span>
-      <span aria-live="polite" className="sr-only-voice-status" role="status">
-        {status}
-      </span>
-      {note}
-    </div>
-  );
-}
 
 interface VoiceScopeProps {
   workspaceId: string;
   sessionId: string;
   modelId?: string | null;
   providerId?: string | null;
-}
-
-/**
- * Owns the lifetime of the voice surface. It is mounted only while voice mode is
- * on, so unmounting it (mode toggled off, session switched, navigating away) ends
- * the call: the mic must never stay open with no visible control. This is also
- * what makes a page reload end the session, since the whole tree is torn down.
- *
- * Mounting also *starts* the call (see the module docstring): the composer's
- * voice-tutor button is the only thing the user has to press.
- */
-export function VoiceOrbDock({
-  workspaceId,
-  sessionId,
-  modelId,
-  providerId,
-}: VoiceScopeProps) {
-  const voice = useVoiceSession(workspaceId, sessionId, modelId, providerId);
-  const { connect } = voice;
-  // 每个挂载只自动拨号一次：失败不自动重试（避免"错误↔重连"死循环），
-  // 退出再进入语音模式即可重试；挂断后本组件随模式关闭而卸载，不会重连。
-  const autoDialed = useRef(false);
-
-  useEffect(() => {
-    if (autoDialed.current) return;
-    if (!workspaceId || !sessionId) return;
-    autoDialed.current = true;
-    void connect();
-  }, [connect, sessionId, workspaceId]);
-
-  useEffect(() => {
-    return () => {
-      voiceSessionController.disconnect();
-    };
-  }, [workspaceId, sessionId]);
-
-  const pin = voice.modelPin;
-  const interimUserText = voice.interimUserText.trim();
-  const streamingAssistantText = voice.streamingAssistantText.trim();
-
-  return (
-    <>
-      {interimUserText || streamingAssistantText ? (
-        <div
-          aria-live="polite"
-          className="chat-voice-listening-dock"
-          role="status"
-        >
-          <div className="chat-voice-listening-dock__head">
-            {streamingAssistantText ? (
-              <LoaderCircle className="size-3.5 animate-spin" />
-            ) : (
-              <Mic className="size-3.5" />
-            )}
-            <span>
-              {streamingAssistantText ? "导师正在回答" : "正在听你说"}
-            </span>
-          </div>
-          <p>
-            {interimUserText
-              ? `我：${interimUserText}`
-              : `导师：${streamingAssistantText}`}
-          </p>
-        </div>
-      ) : null}
-      <VoiceOrb
-        error={voice.error}
-        muted={voice.muted}
-        audioLevel={voice.audioLevel}
-        audioSource={voice.audioSource}
-        state={voice.state}
-        transport={voice.transport}
-        note={
-          // A model switch is pinned as "next turn takes effect", so until the
-          // pipeline confirms it, the requested model is *not* what the user is
-          // talking to. Saying so is the point: silently showing the new model
-          // while the old one answers is the failure this prevents.
-          pin || voice.icePath ? (
-            <>
-              {pin ? (
-                <p
-                  aria-live="polite"
-                  className={cn("chat-voice-model-note", pin.repointed && "is-applied")}
-                  role="status"
-                >
-                  {pin.repointed
-                    ? `已切换到「${pin.effectiveModelId ?? pin.requestedModelId}」，下一轮生效`
-                    : `本次通话仍在使用「${pin.effectiveModelId ?? "当前模型"}」，「${pin.requestedModelId ?? "新模型"}」将在下次接通后生效`}
-                </p>
-              ) : null}
-              {voice.icePath ? (
-                // Which ICE path the call actually settled on. Without it "voice
-                // sounds bad" is unactionable: relayed calls pay a TURN hop, and
-                // a deployment that believes its relay is in use needs to see it.
-                <p aria-live="polite" className="chat-voice-model-note" role="status">
-                  {voice.icePath.relayed
-                    ? `已通过中继建立连接（${voice.icePath.label}）`
-                    : `已直连建立连接（${voice.icePath.label}）`}
-                </p>
-              ) : null}
-            </>
-          ) : null
-        }
-      />
-      <VoiceTaskChip
-        onCancel={(taskId) => void voice.cancelTask(taskId)}
-        tasks={voice.tasks}
-      />
-    </>
-  );
-}
-
-export interface VoiceCaptionStreamProps {
-  transport: VoiceTransportState;
-  state: VoiceSessionState;
-  transcript: VoiceTranscript[];
-  interimUserText: string;
-  streamingAssistantText: string;
-}
-
-/**
- * The page-side view of what the call is actually hearing and answering.
- *
- * Everything here comes from the pipeline's RTVI channel (interim hypothesis,
- * finalized user turns, assistant text as it streams). Without it a voice call
- * is a black box: the mic goes up and audio comes back, but the user cannot see
- * the transcript that is driving the turn.
- */
-export function VoiceCaptionStream({
-  transport,
-  state,
-  transcript,
-  interimUserText,
-  streamingAssistantText,
-}: VoiceCaptionStreamProps) {
-  const recent = transcript.slice(-6);
-  if (transport !== "connected" && recent.length === 0 && !interimUserText) return null;
-  const status = voiceStatusText(transport, state);
-  return (
-    <div
-      aria-live="polite"
-      className="pointer-events-none absolute bottom-24 left-1/2 z-30 w-[min(30rem,calc(100vw-2rem))] -translate-x-1/2 rounded-xl border border-border/60 bg-background/85 p-3 text-xs shadow-lg backdrop-blur"
-    >
-      <p className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">{status}</p>
-      <div className="flex max-h-40 flex-col gap-1 overflow-y-auto">
-        {recent.map((item) => (
-          <p
-            className={cn(
-              "leading-snug",
-              item.role === "user" && "text-muted-foreground",
-              item.role === "assistant" && "text-foreground",
-              item.role === "background" && "border-l border-border/70 pl-2 text-muted-foreground",
-            )}
-            key={item.id}
-          >
-            <span className="mr-1 font-medium">
-              {item.role === "user" ? "我：" : item.role === "background" ? "系统：" : "导师："}
-            </span>
-            {item.text}
-            {item.interrupted ? <span className="text-muted-foreground">（被打断）</span> : null}
-          </p>
-        ))}
-        {interimUserText ? (
-          <p className="italic leading-snug text-muted-foreground">我：{interimUserText}</p>
-        ) : null}
-        {streamingAssistantText ? (
-          <p className="leading-snug text-foreground">导师：{streamingAssistantText}</p>
-        ) : null}
-      </div>
-    </div>
-  );
 }
 
 export interface VoiceComposerActionsProps extends VoiceScopeProps {
@@ -393,7 +109,14 @@ export interface VoiceCallControlProps extends VoiceScopeProps {
   onExit: () => void;
 }
 
-/** The single right-hand slot: dial while idle, hang up after WebRTC connects. */
+/**
+ * The single right-hand slot: dial while idle, hang up after WebRTC connects.
+ *
+ * It is also the connection indicator: nothing about the call may look "live"
+ * before the transport is up, and `reconnecting` must not look identical to
+ * idle (it used to, which is what made a stalled call indistinguishable from a
+ * call that had not started).
+ */
 export function VoiceCallControl({
   workspaceId,
   sessionId,
@@ -405,7 +128,8 @@ export function VoiceCallControl({
 }: VoiceCallControlProps) {
   const voice = useVoiceSession(workspaceId, sessionId, modelId, providerId);
   const connected = voice.transport === "connected";
-  const connecting = voice.transport === "connecting";
+  const connecting =
+    voice.transport === "connecting" || voice.transport === "reconnecting";
   const label = active
     ? connected
       ? "挂断全双工语音"
@@ -417,16 +141,30 @@ export function VoiceCallControl({
     <PromptInputButton
       aria-label={label}
       aria-pressed={active}
-      className={cn("chat-composer__voice-mode", active && "is-active")}
+      className={cn(
+        "chat-composer__voice-mode",
+        active && "is-active",
+        // Grey + spinner until the peer connection is actually up: "connected"
+        // is a fact about the transport, not an intention.
+        active && connecting && "is-connecting",
+        active && connected && "is-live",
+        active && voice.transport === "error" && "is-error",
+      )}
       disabled={!active && (!workspaceId || !sessionId)}
       onClick={() => {
         if (!active) return onStart();
         voice.disconnect();
         onExit();
       }}
-      tooltip={label}
+      tooltip={active && !connected && !connecting ? "结束语音导师通话" : label}
     >
-      {active && connected ? <PhoneOff className="size-4" /> : active && connecting ? <LoaderCircle className="size-4 animate-spin" /> : <VoiceWaveGlyph />}
+      {active && connected ? (
+        <PhoneOff className="size-4" />
+      ) : active && connecting ? (
+        <LoaderCircle className="size-4 animate-spin" />
+      ) : (
+        <VoiceWaveGlyph />
+      )}
     </PromptInputButton>
   );
 }

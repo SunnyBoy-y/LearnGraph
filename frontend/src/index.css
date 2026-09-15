@@ -1619,62 +1619,20 @@ body.is-resizing .workspace-resizer {
   outline-offset: 1px;
 }
 
-/* Full-duplex voice surface: the orb sits inline above the composer so the
-   conversation underneath stays visible, instead of a modal layer over it. */
-.chat-voice-orb { position: relative; width: 112px; aspect-ratio: 1; margin: 0; display: grid; place-items: center; }
-.chat-voice-orb__core { position: relative; z-index: 2; width: 68%; aspect-ratio: 1; border-radius: 50%; background: radial-gradient(circle at 32% 24%, #fff 0 8%, hsl(calc(var(--voice-hue, 225) + var(--voice-level, 0) * 55) 90% 90%) 25%, hsl(calc(var(--voice-hue, 225) + var(--voice-level, 0) * 65) 75% 65%) 54%, hsl(calc(var(--voice-hue, 225) + var(--voice-level, 0) * 80) 70% 48%) 100%); box-shadow: 0 12px 38px rgba(70,99,231,.28), inset -10px -12px 18px rgba(34,52,165,.18); animation: chat-voice-orb-breathe 3.8s ease-in-out infinite; transition: filter .2s ease, box-shadow .2s ease; }
-.chat-voice-orb__halo { position: absolute; border: 1px solid rgba(94,122,245,.18); border-radius: 50%; transform: scale(.7); animation: chat-voice-orb-ring 3.8s ease-out infinite; }
-.chat-voice-orb__halo--one { width: 74%; height: 74%; }
-.chat-voice-orb__halo--two { width: 100%; height: 100%; animation-delay: 1.2s; }
-.chat-voice-orb.is-listening .chat-voice-orb__core, .chat-voice-orb.is-speaking .chat-voice-orb__core { animation-duration: calc(2.2s - var(--voice-level, 0) * 1.1s); box-shadow: 0 18px calc(42px + var(--voice-level, 0) * 40px) rgba(70,99,231,.5), inset -12px -16px 22px rgba(34,52,165,.22); }
-@keyframes chat-voice-orb-breathe { 0%,100% { transform: scale(.94); } 50% { transform: scale(1.06); } }
-@keyframes chat-voice-orb-ring { 0% { opacity: .65; transform: scale(.58); } 100% { opacity: 0; transform: scale(1); } }
-@media (prefers-reduced-motion: reduce) { .chat-voice-orb__core, .chat-voice-orb__halo { animation: none; } }
-/* Inline voice orb. It is a direct child of `.chat-composer-dock`, rendered
-   *above* the workbench toolbar row (资料/目标/联网/…) instead of inside
-   `.chat-composer-anchor`, so it no longer shares the narrow gap between that row
-   and the input box. The ResizeObserver-driven `--composer-height` still keeps the
-   message list clear of it, so no extra avoidance rule is needed. */
-.chat-voice-orb-dock { align-self: center; display: flex; flex-direction: column; align-items: center; margin: 2px 0 10px; pointer-events: auto; }
-.chat-voice-orb-dock__visual { width: 84px; aspect-ratio: 1; display: grid; place-items: center; border-radius: 50%; pointer-events: auto; cursor: grab; touch-action: none; transition: transform .2s cubic-bezier(.2,.8,.2,1); }
-.chat-voice-orb-dock__visual:active { cursor: grabbing; }
-.chat-voice-orb-dock.is-user-voice { --voice-hue: 160; }
-.chat-voice-orb-dock.is-assistant-voice { --voice-hue: 270; }
-.chat-voice-orb-dock.is-user-voice .chat-voice-orb__halo { border-color: rgba(38, 190, 150, .35); }
-.chat-voice-orb-dock.is-assistant-voice .chat-voice-orb__halo { border-color: rgba(138, 92, 245, .35); }
-.chat-voice-orb-dock .chat-voice-orb { width: 100%; }
-.chat-composer-dock > .chat-voice-listening-dock {
-  position: absolute;
-  bottom: calc(100% + 10px);
-  left: 50%;
-  z-index: 3;
-  width: min(420px, calc(100% - 24px));
-  transform: translateX(-50%);
-  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--background) 92%, transparent);
-  padding: 9px 11px;
-  box-shadow: 0 10px 28px rgba(24, 33, 29, .1);
-  backdrop-filter: blur(14px);
-  pointer-events: none;
-}
-.chat-voice-listening-dock__head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted-foreground);
-  font-size: 11px;
-  font-weight: 600;
-}
-.chat-voice-listening-dock p {
-  margin: 4px 0 0;
-  overflow: hidden;
-  color: var(--foreground);
-  font-size: 13px;
+/* Full-duplex voice surface.
+   2026-09-14: the floating orb and the absolutely-positioned caption card were
+   removed. Live transcript and the tutor's answer belong to the conversation
+   itself, and the call's status is one in-flow line above the composer. */
+.chat-voice-status-line {
+  align-self: center;
+  max-width: min(560px, calc(100% - 24px));
+  margin: 2px 0 8px;
+  text-align: center;
+  font-size: 12px;
   line-height: 1.5;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  color: var(--color-muted-foreground);
 }
+.chat-voice-status-line.is-error { color: #d9483f; }
 /* Model-switch truth: a pin takes effect on the next turn (or the next
    connection), so the UI must never present the requested model as live. */
 .chat-voice-model-note { margin: 6px 0 0; max-width: 320px; text-align: center; font-size: 12px; line-height: 1.5; color: var(--color-muted-foreground); }
@@ -1683,17 +1641,31 @@ body.is-resizing .workspace-resizer {
    text. The banner must be unmissable -- the user is otherwise still
    talking into a microphone nothing is listening to. */
 .chat-voice-degraded-note { align-self: center; margin: 2px 0 8px; max-width: 460px; padding: 6px 12px; border: 1px solid rgba(214, 148, 40, .45); border-radius: 8px; background: rgba(214, 148, 40, .12); text-align: center; font-size: 12px; line-height: 1.5; }
-.chat-voice-orb-dock.is-muted .chat-voice-orb__core { filter: saturate(.3); }
-.chat-voice-orb-dock.is-muted .chat-voice-orb__halo { animation: none; opacity: 0; }
-.chat-voice-orb-dock.is-error .chat-voice-orb__core { animation: none; filter: grayscale(.75); }
-.sr-only-voice-status { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+/* The sentence being read aloud right now. A voice answer appears sentence by
+   sentence -- the text follows the audio, not the LLM stream -- so the last
+   block is the one the user is hearing at this moment. */
+.chat-voice-sentence.is-speaking {
+  border-radius: 6px;
+  background: rgba(94, 122, 245, .12);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+.dark .chat-voice-sentence.is-speaking { background: rgba(138, 156, 255, .16); }
 .chat-composer .chat-composer__mute.is-active { color: #d9483f; }
 .chat-composer .chat-composer__mute.is-active:hover { color: #b8352d; }
+/* Connection state lives on this button: grey + spinner until the peer
+   connection is up, coloured only once it is, and never "idle-looking" while
+   reconnecting -- that ambiguity is what made a stalled call look unstarted. */
+.chat-composer .chat-composer__voice-mode.is-connecting { color: var(--muted-foreground); }
+.chat-composer .chat-composer__voice-mode.is-live { color: #fff; background: #111315; border-radius: 999px; }
+.chat-composer .chat-composer__voice-mode.is-live:hover { color: #fff; background: #33383d; }
+.dark .chat-composer .chat-composer__voice-mode.is-live { color: #12160f; background: #eef2ee; }
+.dark .chat-composer .chat-composer__voice-mode.is-live:hover { color: #12160f; background: #d5dcd5; }
+.chat-composer .chat-composer__voice-mode.is-error { color: var(--muted-foreground); }
 .chat-composer .chat-composer__hangup { color: #fff; background: #111315; border-radius: 999px; }
 .chat-composer .chat-composer__hangup:hover { color: #fff; background: #33383d; }
 .dark .chat-composer .chat-composer__hangup { color: #12160f; background: #eef2ee; }
 .dark .chat-composer .chat-composer__hangup:hover { color: #12160f; background: #d5dcd5; }
-@media (max-width: 640px) { .chat-voice-orb-dock { margin: 2px 0 8px; } .chat-voice-orb-dock__visual { width: 72px; } }
 .chat-empty-state { min-height: 100%; padding: 48px 20px 72px; }
 .chat-empty-state__content { width: min(100%, 620px); text-align: left; }
 /* 空会话标题区：层级交给字号与字重，不用边框。 */

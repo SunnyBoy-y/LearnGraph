@@ -112,7 +112,9 @@ import {
   transcribeAudioFile,
   transcribeDictationSegment,
 } from "@/api";
-import { VoiceCallControl, VoiceComposerActions, VoiceOrbDock } from "@/features/voice/voice-orb";
+import { VoiceCallControl, VoiceComposerActions } from "@/features/voice/voice-orb";
+import { voiceStatusText } from "@/features/voice/voice-status";
+import { VoiceTaskChip } from "@/features/voice/voice-task-chip";
 import { voiceSessionController } from "@/features/voice/voice-session-controller";
 import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
@@ -1910,7 +1912,8 @@ function AssistantMessageInner({
     .map((part) => part.content ?? "")
     .filter((content) => content && content.trim() !== "正在思考")
     .join("\n");
-    const renderPart = (part: MessagePart) => (
+    const renderPart = (part: MessagePart) => {
+    const rendered = (
     <ChatStreamPartRenderer
       interactive={componentsInteractive}
       key={part.id}
@@ -1923,6 +1926,21 @@ function AssistantMessageInner({
       }
     />
   );
+    // A voice answer is rendered one block per spoken sentence, so the streaming
+    // part is precisely the sentence whose audio is playing right now.
+    if (
+      shown.provider_trace?.voice_turn === true &&
+      shown.role === "assistant" &&
+      part.status === "streaming"
+    ) {
+      return (
+        <div className="chat-voice-sentence is-speaking" key={part.id}>
+          {rendered}
+        </div>
+      );
+    }
+    return rendered;
+  };
   const renderAnswerParts = (parts: MessagePart[]) =>
     groupAnswerParts(parts).map((group) => {
       if (group.kind === "question_set") {
@@ -2826,19 +2844,52 @@ export function ChatCanvasPage() {
     voiceSnapshotForGating.textFallback;
   /** Voice mode owns the composer only while its input path still works. */
   const voiceBlocksComposer = voiceModeOpen && !voiceTextFallback;
-  // 语音通话回合 → 聊天消息列表。partial/speculative 只留在 Composer 上方
-  // 的 Listening Dock；只有 authoritative/final 事件才允许创建或更新消息。
+  // 进入语音模式即自动拨号一次（2026-09-14 修订）。
+  //
+  // 这根线原来住在 `VoiceOrbDock`：那个组件只在语音模式打开期间挂载，挂载即
+  // `connect()`、卸载即 `disconnect()`。悬浮球与字幕卡删除后宿主没了，按钮只剩
+  // `setVoiceModeOpen(true)`，transport 于是永远停在 `idle`，状态行只能落到兜底
+  // 文案「语音导师未连接」——麦克风从未被打开，服务端也从未收到建会话请求。
+  //
+  // ref 放在页面组件而不是子组件里：`VoiceCallControl` 在语音模式之外也渲染，
+  // 它一旦重挂载就会二次拨号；而本组件在整通电话期间不卸载。key 记「已为哪个
+  // 会话拨过号」，于是退出再进、或通话中换会话都会重新拨一次；同一次通话里
+  // 失败（例如拒绝麦克风）不会自动重试，避免"错误↔重连"死循环。
+  const voiceAutoDialedForRef = useRef<string | null>(null);
+  // 必须等 `useVoiceSession().open(...)` 把快照写成本会话之后再拨：connect() 在
+  // `snapshot.sessionId` 为空时会直接返回，而那时链路仍然是 idle。
+  const voiceReadyToDial =
+    voiceModeOpen && voiceSnapshotForGating.sessionId === sessionId;
+  useEffect(() => {
+    if (!voiceModeOpen) {
+      voiceAutoDialedForRef.current = null;
+      return;
+    }
+    if (!voiceReadyToDial) return;
+    const key = `${workspaceId}:${sessionId}`;
+    if (voiceAutoDialedForRef.current === key) return;
+    voiceAutoDialedForRef.current = key;
+    void voiceSessionController.connect();
+  }, [voiceModeOpen, voiceReadyToDial, workspaceId, sessionId]);
+  // Voice turns → the conversation canvas.
+  //
+  // Interim speech and the tutor's answer are rendered live now: they used to be
+  // confined to a floating caption card that no longer exists. Two details make
+  // that safe -- text parts carry `kind: "final_answer"` (without it a streaming
+  // assistant message is folded into the collapsed thinking chain and never
+  // shows), and `removes` retires the per-segment bubbles of a settled turn,
+  // since nothing else can take a row back off the canvas.
   useEffect(() => {
     if (!voiceModeOpen) return;
     const onVoiceRender = (event: Event) => {
       const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
       const text = item?.text?.trim() || "";
+      const removals = item?.removes ?? [];
       if (!item?.id || !item?.role) return;
       if (!shouldCommitVoiceRender(item)) return;
       // 只接受当前会话的语音回合，避免切换会话后残留的回调写进别的会话。
       if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
-      setLocalMessages((current) => {
-        const id = `temp-voice-${item.id}`;
+      const id = `temp-voice-${item.id}`;
       const status = item.deliveryStatus === "failed"
         ? "failed"
         : item.pending
@@ -2846,35 +2897,70 @@ export function ChatCanvasPage() {
           : item.final
             ? "completed"
             : "streaming";
-        const existing = current.find((message) => message.id === id) || current.find((message) =>
-          message.role === item.role &&
-          ((item.turnId && message.provider_trace?.turn_id === item.turnId) ||
-            (item.clientMessageId && message.provider_trace?.client_message_id === item.clientMessageId)),
-        );
+      // Every sentence already spoken, in order; the last one is being read aloud
+      // right now and is the only part marked `streaming`.
+      const spoken = item.role === "assistant" ? (item.spokenSegments ?? []) : [];
+      const parts: MessagePart[] = spoken.length
+        ? spoken.map((sentence, index) => ({
+            id: `temp-voice-part-${item.id}-s${index}`,
+            type: "text" as const,
+            status: (index === spoken.length - 1 && !item.final
+              ? "streaming"
+              : "completed") as MessagePart["status"],
+            content: sentence,
+            sequence: index,
+            data: { kind: "final_answer" },
+          }))
+        : [
+            {
+              id: `temp-voice-part-${item.id}`,
+              type: "text" as const,
+              status,
+              content: text,
+              sequence: 0,
+              data: { kind: "final_answer" },
+            },
+          ];
+      const trace: Record<string, unknown> = {
+        voice_turn: true,
+        voice_segment: Boolean(item.voiceSegment),
+        interrupted: Boolean(item.interrupted),
+        event_id: item.eventId,
+        turn_id: item.turnId,
+        client_message_id: item.clientMessageId,
+        authoritative: Boolean(item.authoritative || item.final),
+        retryable: item.deliveryStatus === "failed",
+      };
+      setLocalMessages((current) => {
+        const kept = removals.length
+          ? current.filter((message) =>
+              !removals.some((retired) => message.id === `temp-voice-${retired}`),
+            )
+          : current;
+        // A per-segment row is matched by its own id only: every segment of a
+        // turn shares the turn id, so a turn-id match would rewrite one segment
+        // with another segment's text.
+        const existing = kept.find((message) => message.id === id) ?? (item.voiceSegment
+          ? undefined
+          : kept.find((message) =>
+              message.role === item.role &&
+              message.provider_trace?.voice_segment !== true &&
+              ((item.turnId && message.provider_trace?.turn_id === item.turnId) ||
+                (item.clientMessageId && message.provider_trace?.client_message_id === item.clientMessageId)),
+            ));
         if (existing) {
-          return current.map((message) => message.id === existing.id
+          if (!text) return kept;
+          return kept.map((message) => message.id === existing.id
             ? {
                 ...message,
                 content: text,
                 status,
-                parts: message.parts.map((part, index) => index === 0
-                  ? { ...part, status, content: text }
-                  : part),
-                provider_trace: {
-                  ...message.provider_trace,
-                  voice_turn: true,
-                  interrupted: Boolean(item.interrupted),
-                  event_id: item.eventId,
-                  turn_id: item.turnId,
-                  client_message_id: item.clientMessageId,
-                  authoritative: Boolean(item.authoritative || item.final),
-                  retryable: item.deliveryStatus === "failed",
-                },
+                parts,
+                provider_trace: { ...message.provider_trace, ...trace },
               }
             : message);
         }
-        if (!text) return current;
-        if (current.some((message) => message.id === id)) return current;
+        if (!text) return kept;
         const voiceMessage: Message = {
           id,
           workspace_id: workspaceId,
@@ -2884,27 +2970,11 @@ export function ChatCanvasPage() {
           version: 1,
           status,
           content: text,
-          parts: [
-            {
-              id: `temp-voice-part-${item.id}`,
-              type: "text",
-              status,
-              content: text,
-              sequence: 0,
-            },
-          ],
-          provider_trace: {
-            voice_turn: true,
-            interrupted: Boolean(item.interrupted),
-            event_id: item.eventId,
-            turn_id: item.turnId,
-            client_message_id: item.clientMessageId,
-            authoritative: Boolean(item.authoritative || item.final),
-            retryable: item.deliveryStatus === "failed",
-          },
+          parts,
+          provider_trace: trace,
           created_at: item.createdAt || new Date().toISOString(),
         };
-        return [...current, voiceMessage];
+        return [...kept, voiceMessage];
       });
     };
     window.addEventListener("learngraph:voice-render", onVoiceRender);
@@ -4041,7 +4111,13 @@ export function ChatCanvasPage() {
             persisted,
             tempUserToPersisted,
           );
-          if (counterpart && !retryOverlays.has(counterpart.id)) {
+          if (counterpart && message.provider_trace?.voice_segment === true) {
+            // A per-segment user bubble has no durable twin of its own -- every
+            // segment of a turn maps to that turn's single persisted message.
+            // Overlaying would replace the merged text with whichever segment
+            // arrived last (the refresh bug this exists to prevent), so the row
+            // is dropped instead.
+          } else if (counterpart && !retryOverlays.has(counterpart.id)) {
             normalOverlays.set(counterpart.id, message);
           } else if (!appendedIds.has(message.id)) {
             appendedIds.add(message.id);
@@ -9705,15 +9781,37 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             })}
           </div>
         ) : null}
-        {/* 语音球定位：悬在工作台功能条（资料/目标/联网/…）上方，
-            而不是挤在功能条与输入框之间的那道窄缝里。 */}
+        {/* 语音状态：连接/聆听/思考/说话 + 模型 pin + ICE 路径，一行小字随输入区
+            排布。这里曾经挂着一个悬浮球和一块绝对定位的字幕卡（2026-09-14 删除）：
+            实时转录与导师回答现在直接进对话流，状态不再需要浮在对话之上。 */}
         {voiceModeOpen ? (
           <>
-            <VoiceOrbDock
-              modelId={selectedModelId}
-              providerId={activeModelProvider?.id}
-              sessionId={sessionId}
-              workspaceId={workspaceId}
+            <p
+              aria-live="polite"
+              className={cn(
+                "chat-voice-status-line",
+                voiceSnapshotForGating.transport === "error" && "is-error",
+                voiceSnapshotForGating.transport === "connecting" && "is-connecting",
+              )}
+              role="status"
+            >
+              {voiceStatusText(
+                voiceSnapshotForGating.transport,
+                voiceSnapshotForGating.state,
+                voiceSnapshotForGating.error,
+              )}
+              {voiceSnapshotForGating.modelPin
+                ? voiceSnapshotForGating.modelPin.repointed
+                  ? ` · 已切换到「${voiceSnapshotForGating.modelPin.effectiveModelId ?? voiceSnapshotForGating.modelPin.requestedModelId}」，下一轮生效`
+                  : ` · 本次通话仍在使用「${voiceSnapshotForGating.modelPin.effectiveModelId ?? "当前模型"}」，「${voiceSnapshotForGating.modelPin.requestedModelId ?? "新模型"}」将在下次接通后生效`
+                : ""}
+              {voiceSnapshotForGating.icePath
+                ? ` · ${voiceSnapshotForGating.icePath.relayed ? "中继连接" : "直连"}（${voiceSnapshotForGating.icePath.label}）`
+                : ""}
+            </p>
+            <VoiceTaskChip
+              onCancel={(taskId) => void voiceSessionController.cancelTask(taskId)}
+              tasks={voiceSnapshotForGating.tasks}
             />
             {voiceTextFallback && voiceSnapshotForGating.degradedNotice ? (
               // The call dropped to text. Say so explicitly, and say that the
