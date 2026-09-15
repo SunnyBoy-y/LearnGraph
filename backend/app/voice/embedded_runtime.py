@@ -81,19 +81,35 @@ def install_embedded_runtime(app: Any) -> bool:
         # It is applied to the *handler*, not to this connection, because pipecat
         # reads it while building each new peer connection: a saved change takes
         # effect on the next call with no restart, and peers already up are left
-        # alone.  Resolution never raises -- any failure degrades to host-only
-        # ICE, i.e. exactly the behaviour of a deployment with no relay at all.
+        # alone.  Resolution never raises -- a relay that is genuinely off or
+        # broken degrades to host-only ICE, i.e. exactly the behaviour of a
+        # deployment with no relay at all.
+        #
+        # A *transient* upstream failure is not "off": the resolver keeps serving
+        # the last minted credential while it is still valid, so a credential
+        # refresh that times out no longer clears a working relay for the next
+        # peer connection (that used to leave the browser with relay candidates
+        # and the server with none, i.e. a call that can never connect).
         try:
             from app.services.voice_relay import resolve_for_runtime
 
             resolved = await asyncio.to_thread(resolve_for_runtime)
-            handler.update_ice_servers(resolved.as_aiortc_servers())
             if resolved.configured:
-                logger.debug(
-                    "Voice relay applied (%s URLs, source=%s)",
-                    len(resolved.urls),
-                    resolved.source,
-                )
+                handler.update_ice_servers(resolved.as_aiortc_servers())
+                if resolved.source == "stale":
+                    logger.warning(
+                        "Voice relay credential is stale (%s); reusing the last one",
+                        resolved.detail,
+                    )
+                else:
+                    logger.debug(
+                        "Voice relay applied (%s URLs, source=%s)",
+                        len(resolved.urls),
+                        resolved.source,
+                    )
+            else:
+                handler.update_ice_servers([])
+                logger.debug("Voice relay not configured (%s)", resolved.detail)
         except Exception:
             logger.debug("voice relay injection failed", exc_info=True)
 

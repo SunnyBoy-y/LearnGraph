@@ -14,10 +14,15 @@ minted on demand and cached in-process until shortly before they expire.
 
 Two invariants matter more than the feature itself:
 
-* **Every failure degrades to "no ICE servers".** A broken relay configuration
-  must never make voice calls impossible, only unrelayed -- the previous state
-  of this deployment was exactly "no ICE servers", so degrading there is always
-  safe.
+* **A relay that is still usable is never dropped.**  Every *permanent* failure
+  degrades to "no ICE servers" -- a deployment that never configured a relay,
+  or one the administrator switched off, must behave exactly like the previous
+  state of this deployment, which was "no ICE servers".  A *transient* failure
+  (the upstream credential mint timing out) must not: the credential already
+  handed out stays valid for hours, so it is served until it expires while the
+  failure is recorded on the config row.  Clearing it used to disable the relay
+  for the next call while browsers kept using a credential they had fetched
+  earlier, which made cross-network calls fail as "ICE never leaves checking".
 * **The credential never leaves the server.** The admin API returns a mask and a
   fingerprint only; the minted short-lived credential is what clients receive.
 """
@@ -151,12 +156,43 @@ class _CacheEntry:
 
 _CACHE: _CacheEntry | None = None
 
+# The last resolution that actually minted a credential, kept across failures.
+#
+# Minting is an *upstream* call and this deployment's egress to
+# ``rtc.live.cloudflare.com`` is flaky in a way that is easy to mistake for a
+# broken relay: TLS handshakes to that host (and to ``1.1.1.1``) time out for
+# minutes at a time while ``turn.cloudflare.com:3478`` itself keeps answering,
+# so credentials cannot be *refreshed* even though the ones already handed out
+# are valid for hours.  Treating that as "relay unusable" used to clear the ICE
+# servers of every *new* peer connection, which silently killed cross-network
+# calls: the browser still held a valid credential from its last fetch, so its
+# ICE kept advertising relay candidates while the server had none -- ICE then
+# sat in "checking" until the client gave up.  The previous credential is
+# therefore served until it really expires, while the config row keeps
+# recording the failure so the admin page still shows it.
+_LAST_GOOD: _CacheEntry | None = None
+
 
 def invalidate_cache() -> None:
     """Drop the process-local cache (called after any config write)."""
 
-    global _CACHE
+    global _CACHE, _LAST_GOOD
     _CACHE = None
+    # A config write (new key, new API token, disabled) must also retire the
+    # credential minted for the *previous* configuration: it is still valid as a
+    # credential, but it no longer belongs to what the administrator asked for.
+    _LAST_GOOD = None
+
+
+def _usable_last_good(now: float) -> _CacheEntry | None:
+    """The last minted credential, if it is still inside its own lifetime."""
+
+    entry = _LAST_GOOD
+    if entry is None or not entry.resolved.configured:
+        return None
+    if entry.credential_expires_at <= now:
+        return None
+    return entry
 
 
 def _mask(secret: str) -> str:
@@ -379,7 +415,7 @@ class VoiceRelayService:
     def resolve(self, *, force: bool = False) -> ResolvedIce:
         """Return the ICE configuration to use right now (never raises)."""
 
-        global _CACHE
+        global _CACHE, _LAST_GOOD
         now = time.monotonic()
         if not force and _CACHE is not None and now < _CACHE.expires_at:
             return _CACHE.resolved
@@ -388,9 +424,12 @@ class VoiceRelayService:
             config = self.get_config()
         except Exception:
             logger.debug("voice relay config read failed", exc_info=True)
-            return ResolvedIce(source="none", detail="配置读取失败")
+            return self._serve_or_degrade("配置读取失败", now=now)
 
         if config is None or not config.enabled or not config.secret_fingerprint:
+            # Explicitly off (or never configured): nothing may be served, not even
+            # the credential minted for the configuration that just went away.
+            _LAST_GOOD = None
             _CACHE = _CacheEntry(
                 resolved=ResolvedIce(source="none"),
                 expires_at=now + CACHE_TTL_SECONDS,
@@ -412,14 +451,14 @@ class VoiceRelayService:
         except ProviderSecretUnavailable as exc:
             self.db.rollback()
             _CACHE = _CacheEntry(
-                resolved=self._degrade(f"密钥不可用：{exc}", now=now),
+                resolved=self._serve_or_degrade(f"密钥不可用：{exc}", now=now),
                 expires_at=now + CACHE_TTL_SECONDS,
             )
             return _CACHE.resolved
         except AppError as exc:
             self.db.rollback()
             _CACHE = _CacheEntry(
-                resolved=self._degrade(exc.message, now=now),
+                resolved=self._serve_or_degrade(exc.message, now=now),
                 expires_at=now + CACHE_TTL_SECONDS,
             )
             return _CACHE.resolved
@@ -447,6 +486,18 @@ class VoiceRelayService:
                 expires_at=now + _cache_lifetime(lifetime),
                 credential_expires_at=now + max(lifetime - RENEW_MARGIN_SECONDS, 1.0),
             )
+            _LAST_GOOD = _CACHE
+            # Recovery is a fact too: without this the config row would keep showing
+            # the last transient failure forever (the admin page has no other way to
+            # learn that minting works again).  Written only on the transition, so a
+            # healthy deployment does not re-commit every 60s.
+            if config.status != "configured" or config.status_detail:
+                config.status = "configured"
+                config.status_detail = None
+                try:
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
             return resolved
         except ProviderSecretUnavailable as exc:
             detail = f"密钥不可用：{exc}"
@@ -456,21 +507,48 @@ class VoiceRelayService:
             detail = f"{type(exc).__name__}: {exc}"
             logger.warning("voice relay credential mint failed", exc_info=True)
 
-        # Degrade: no ICE servers, exactly like an unconfigured deployment.
         _CACHE = _CacheEntry(
-            resolved=self._degrade(detail, now=now),
+            resolved=self._serve_or_degrade(detail, now=now),
             expires_at=now + CACHE_TTL_SECONDS,
+            credential_expires_at=(
+                _LAST_GOOD.credential_expires_at if _LAST_GOOD is not None else 0.0
+            ),
         )
         return _CACHE.resolved
 
-    def _degrade(self, detail: str, *, now: float) -> ResolvedIce:
-        """Record the failure on the config row and return "no ICE servers".
+    def _serve_or_degrade(self, detail: str, *, now: float) -> ResolvedIce:
+        """Keep relaying with the last minted credential, or degrade for real.
 
-        Written in its own short transaction: the failure path is reached *after*
-        an upstream call, so it must never be the tail of a long-open one.
+        A refresh failure is not evidence that the relay is unusable -- the
+        credential already handed out stays valid for the rest of its TTL (a
+        whole day by default).  So the previous one is served, marked
+        ``source="stale"`` so callers can tell it apart from a fresh mint, while
+        the failure is still recorded on the config row (and logged) so it does
+        not go unnoticed.
         """
 
-        logger.warning("Voice relay unavailable, falling back to host-only ICE: %s", detail)
+        entry = _usable_last_good(now)
+        if entry is not None:
+            remaining = int(max(0.0, entry.credential_expires_at - now))
+            logger.warning(
+                "Voice relay credential refresh failed (%s); keeping the credential "
+                "minted earlier, valid for another %ss",
+                detail,
+                remaining,
+            )
+            self._record_failure(detail)
+            return ResolvedIce(
+                urls=entry.resolved.urls,
+                username=entry.resolved.username,
+                credential=entry.resolved.credential,
+                source="stale",
+                detail=detail,
+            )
+        return self._degrade(detail, now=now)
+
+    def _record_failure(self, detail: str) -> None:
+        """Write "error" + the reason on the config row (own short transaction)."""
+
         try:
             fresh = self.get_config()
             if fresh is not None:
@@ -481,6 +559,16 @@ class VoiceRelayService:
                 self.db.rollback()
         except Exception:
             self.db.rollback()
+
+    def _degrade(self, detail: str, *, now: float) -> ResolvedIce:
+        """Record the failure on the config row and return "no ICE servers".
+
+        Written in its own short transaction: the failure path is reached *after*
+        an upstream call, so it must never be the tail of a long-open one.
+        """
+
+        logger.warning("Voice relay unavailable, falling back to host-only ICE: %s", detail)
+        self._record_failure(detail)
         del now
         return ResolvedIce(source="none", detail=detail)
 
@@ -818,4 +906,15 @@ def resolve_for_runtime() -> ResolvedIce:
             return VoiceRelayService(db, get_settings()).resolve()
     except Exception:
         logger.debug("voice relay runtime resolve failed", exc_info=True)
+        # Even a database hiccup (SQLite lock contention is a known failure mode
+        # here) must not drop a relay that is still usable.
+        entry = _usable_last_good(time.monotonic())
+        if entry is not None:
+            return ResolvedIce(
+                urls=entry.resolved.urls,
+                username=entry.resolved.username,
+                credential=entry.resolved.credential,
+                source="stale",
+                detail="解析失败",
+            )
         return ResolvedIce(source="none", detail="解析失败")
