@@ -55,6 +55,25 @@ export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"
   text: string;
   final: boolean;
   createdAt: string;
+  /**
+   * Row ids this update retires from the conversation.
+   *
+   * A user turn is rendered as one bubble per ASR segment while it is still
+   * open (the pauses are visible) and collapses into the single authoritative
+   * bubble the server persisted for that turn. Nothing in the canvas can retire
+   * a row on its own, so the collapse has to be stated explicitly here.
+   */
+  removes?: string[];
+  /**
+   * Assistant sentences whose audio has already started, in order.
+   *
+   * Text follows the audio, not the LLM stream: the last entry is the sentence
+   * being spoken right now, which the canvas highlights. Empty means "one
+   * undivided message" (a settled turn).
+   */
+  spokenSegments?: string[];
+  /** Marks an ephemeral per-segment user row (see `removes`). */
+  voiceSegment?: boolean;
 }
 /**
  * What the call is actually using, versus what the user asked for.
@@ -243,9 +262,27 @@ function appendTranscriptItem(role: VoiceRenderUpdate["role"], text: string, int
 let pendingUserFinal = "";
 let activeUserTurnId = "";
 let lastCommittedUserTurnId = "";
+/**
+ * Row key for the live user bubbles of the open turn.
+ *
+ * `activeUserTurnId` is the *server* turn id once the worker opens the turn, so
+ * it cannot key the rows: rows created before that point (the first segment's
+ * interim hypothesis) would have to be renamed mid-turn. This key is
+ * client-only and fixed for the whole turn, which is what makes "one row per
+ * ASR segment" stable.
+ */
+let userRowKey = "";
+/** Committed ASR segment texts of the open turn, in order. */
+let userSegments: string[] = [];
+/** Index of the in-flight (not yet finalized) segment row, -1 when none. */
+let userLiveRowIndex = -1;
+/** Server turn id the segment accumulator belongs to ("" until it is known). */
+let userSegmentsTurnId = "";
 let activeAssistantTurnId = "";
 let assistantLlmText = "";
 let assistantSpokenText = "";
+/** Sentences whose audio has started; the last one is being spoken right now. */
+let assistantSpokenSentences: string[] = [];
 let assistantSentenceSequence = 0;
 let assistantLlmComplete = false;
 let assistantFinalized = false;
@@ -596,29 +633,155 @@ function ensureUserTurnId() {
   return activeUserTurnId;
 }
 
-function dispatchUserDraft(text: string, final = false) {
-  if (!text.trim()) return;
+function ensureUserRowKey(): string {
+  if (!userRowKey) userRowKey = crypto.randomUUID();
+  return userRowKey;
+}
+
+function userSegmentRowId(index: number): string {
+  return `user-turn-${ensureUserRowKey()}-seg${index}`;
+}
+
+/** Every row the open turn currently owns (committed segments + the live one). */
+function currentUserSegmentRowIds(): string[] {
+  if (!userRowKey) return [];
+  const ids = userSegments.map((_, index) => userSegmentRowId(index));
+  if (userLiveRowIndex >= 0) ids.push(userSegmentRowId(userLiveRowIndex));
+  return [...new Set(ids)];
+}
+
+function resetUserSegments() {
+  userSegments = [];
+  userLiveRowIndex = -1;
+  userRowKey = "";
+  userSegmentsTurnId = "";
+}
+
+/**
+ * Retires the per-segment bubbles of the open turn.
+ *
+ * From here on the single authoritative row for that turn is the only one that
+ * should be on screen: the pauses are a mid-turn detail, not a permanent shape
+ * of the conversation.
+ */
+function retireUserSegments(turnId?: string) {
+  const removes = currentUserSegmentRowIds();
+  if (removes.length) {
+    dispatchVoiceRender({
+      id: `user-turn-${userRowKey}-settle`,
+      role: "user",
+      text: "",
+      final: true,
+      createdAt: new Date().toISOString(),
+      turnId,
+      removes,
+    });
+  }
+  resetUserSegments();
+}
+
+/**
+ * Renders the ASR segment being spoken now, or the one that just settled.
+ *
+ * The row id is derived from how many segments this turn already committed, so
+ * the live hypothesis and its finalized text share one row: text is replaced in
+ * place instead of a second bubble appearing next to it.
+ */
+function renderUserSegment(text: string, committed: boolean, turnId?: string) {
+  const clean = String(text || "").trim();
+  if (!clean) return;
+  ensureUserRowKey();
+  const index = committed ? Math.max(0, userSegments.length - 1) : userSegments.length;
+  userLiveRowIndex = committed ? -1 : index;
   dispatchVoiceRender({
-    id: ensureUserTurnId(), role: "user", text, final,
+    id: userSegmentRowId(index),
+    role: "user",
+    text: clean,
+    final: committed,
+    pending: !committed,
+    voiceSegment: true,
+    turnId,
     createdAt: new Date().toISOString(),
   });
+}
+
+/** Commits one ASR segment of the open turn as its own bubble. */
+function commitUserSegment(segment: string, turnId?: string) {
+  const clean = String(segment || "").trim();
+  if (!clean) return;
+  // A segment repeated verbatim back-to-back is a re-delivery of the same
+  // provider final, not a second utterance of the same words.
+  if (userSegments[userSegments.length - 1] !== clean) userSegments.push(clean);
+  renderUserSegment(clean, true, turnId);
+}
+
+/**
+ * Notes which server turn the segment accumulator belongs to.
+ *
+ * A different turn id means the previous turn never settled (degraded call) or
+ * a fresh turn started: its rows would otherwise be orphaned on screen, so they
+ * are retired before the new turn allocates segment slots.
+ */
+function noteUserSegmentsTurn(turnId?: string) {
+  const next = String(turnId || "");
+  if (!next || next === userSegmentsTurnId) return;
+  if (userSegmentsTurnId) retireUserSegments(userSegmentsTurnId);
+  userSegmentsTurnId = next;
+}
+
+/**
+ * The segment text carried by one `user.final`.
+ *
+ * A merged final carries both the whole turn (`text`) and this segment
+ * (`segment`). The first segment of a turn opens it via `turns.accept_turn`,
+ * which emits `text` only, so the fallback takes the tail of the merged text.
+ */
+function segmentOfUserFinal(
+  payload: Record<string, unknown>,
+  merged: string,
+  committed: string[],
+): string {
+  const explicit = String(payload.segment ?? "").trim();
+  if (explicit) return explicit;
+  const full = String(merged || "").trim();
+  const joined = committed.join("");
+  if (joined && full.startsWith(joined)) return full.slice(joined.length).trim();
+  return full;
 }
 
 /** 把一个用户回合的（可能多段）final 合成一条记录并广播出去。 */
 function flushPendingUserFinal() {
   const text = pendingUserFinal;
   pendingUserFinal = "";
-  const turnId = ensureUserTurnId();
   if (text.trim()) {
+    const turnId = ensureUserTurnId();
     // Audio turns are owned by the worker: it opens the durable turn and emits
     // `user.final`/`turn.accepted`, which is what becomes the authoritative
     // transcript entry. Creating a turn here as well would produce two turns
     // (and two chat messages) for one utterance, so the client only renders.
+    //
+    // Whatever the segment bubbles showed while the turn was open is superseded
+    // by this one row, hence the explicit `removes`: nothing else can retire a
+    // row once it is on the canvas.
+    const removes = currentUserSegmentRowIds();
     if (durableEventCount === 0) appendTranscriptItem("user", text, false, turnId, { turnId });
-    else dispatchVoiceRender({ id: userEntryId(turnId, undefined), role: "user", text, final: true, turnId, createdAt: new Date().toISOString() });
+    dispatchVoiceRender({
+      id: userEntryId(turnId, undefined),
+      role: "user",
+      text,
+      final: true,
+      turnId,
+      removes,
+      createdAt: new Date().toISOString(),
+    });
+    lastCommittedUserTurnId = turnId;
+    activeUserTurnId = "";
   }
-  lastCommittedUserTurnId = turnId;
-  activeUserTurnId = "";
+  // An empty flush (both the aggregator's turn boundary and the durable
+  // `turn.finalized` fire for one turn) must not mint a fresh turn id: that id
+  // becomes the assistant turn's key, and a random one would leave the assistant
+  // live bubble and its settled row under two different ids.
+  resetUserSegments();
 }
 
 function beginAssistantTurn() {
@@ -627,6 +790,7 @@ function beginAssistantTurn() {
   try { localStorage.setItem(`learngraph.voice.turn.${snapshot.sessionId}`, activeAssistantTurnId); } catch { /* optional */ }
   assistantLlmText = "";
   assistantSpokenText = "";
+  assistantSpokenSentences = [];
   assistantSentenceSequence = 0;
   lastAudioCursorMs = 0;
   assistantLlmComplete = false;
@@ -734,13 +898,27 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       return;
     case "user.interim":
       activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
+      noteUserSegmentsTurn(turnId);
       update({ interimUserText: text });
-      dispatchVoiceRender({ id: activeUserTurnId, role: "user", text, final: false, pending: true, turnId: activeUserTurnId, createdAt: new Date().toISOString(), eventId: event.event_id });
+      // The live hypothesis of the segment being spoken. Its row keeps the id it
+      // will have once this segment is finalized, so finalizing replaces the text
+      // in place rather than adding a second bubble. Before the worker opens the
+      // turn there is no durable turn id yet, and the row is deliberately left
+      // without one instead of borrowing the client key (a fake id would make the
+      // row look like the durable twin of some other message).
+      renderUserSegment(text, false, turnId);
       return;
     case "user.final":
       activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
-      pendingUserFinal = joinTranscriptSegment(pendingUserFinal, text);
+      noteUserSegmentsTurn(turnId);
+      // `payload.text` is already the merged turn text, so it replaces rather
+      // than accumulates; joining it would duplicate every earlier segment.
+      pendingUserFinal = text;
       update({ interimUserText: "" });
+      commitUserSegment(
+        segmentOfUserFinal(payload, text, userSegments),
+        turnId || activeUserTurnId,
+      );
       return;
     case "turn.accepted": {
       const clientId = String(payload.client_message_id ?? payload.clientMessageId ?? "");
@@ -762,15 +940,17 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
     }
     case "turn.finalized":
       if (String(payload.role ?? "") === "user") {
-        pendingUserFinal = joinTranscriptSegment(pendingUserFinal, text);
+        pendingUserFinal = text;
         activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
+        noteUserSegmentsTurn(turnId);
         flushPendingUserFinal();
       } else {
         if (pendingUserFinal.trim()) flushPendingUserFinal();
         if (text.trim()) {
+          const removes = assistantLiveRemovalIds(turnId);
           dispatchVoiceRender({
             id: `assistant-final-${turnId ?? "unknown"}`, role: "assistant", text,
-            final: true, turnId, createdAt: new Date().toISOString(), eventId: event.event_id,
+            final: true, turnId, removes, createdAt: new Date().toISOString(), eventId: event.event_id,
           });
         } else {
           finalizeAssistantTurn(false);
@@ -784,11 +964,18 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       if (!activeAssistantTurnId || (turnId && activeAssistantTurnId !== turnId)) beginAssistantTurn();
       assistantLlmText += text;
       update({ state: "thinking", streamingAssistantText: assistantLlmText });
-      dispatchVoiceRender({ id: activeAssistantTurnId, role: "assistant", text: assistantLlmText, final: false, turnId, createdAt: new Date().toISOString(), eventId: event.event_id });
+      // Deliberately NOT rendered: the assistant's on-screen text follows the
+      // audio sentence by sentence (see appendAssistantSentence), not the LLM
+      // stream. Showing the draft here would put words on screen the user has
+      // not heard yet. `assistantLlmText` remains the finalize fallback.
       return;
     case "assistant.sentence.queued":
     case "assistant.sentence.playback_started":
-      appendAssistantSentence(text, Number(payload.sentence_seq ?? payload.sentenceSeq));
+      // Durable sentence events are not the playback anchor: `queued` fires when
+      // a sentence is handed to synthesis (before it is heard) and
+      // `playback_started` carries no sentence text. The audio-anchored marker
+      // is the TTS adapter's `voice-sentence-start` server message, which is what
+      // drives the live bubble.
       return;
     case "assistant.sentence.playback_ended":
       if (payload.final === true || payload.turn_final === true) finalizeAssistantTurn(false);
@@ -837,16 +1024,37 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
   }
 }
 
+/** Row id of the live (still-speaking) assistant bubble of one turn. */
+function assistantLiveRowId(turnId: string): string {
+  return `assistant-live-${turnId}`;
+}
+
+/**
+ * Live assistant rows a settled answer supersedes.
+ *
+ * Both ids are covered because the durable turn id and the client-side turn key
+ * can differ (the live bubble may have been opened before the turn id was known).
+ */
+function assistantLiveRemovalIds(turnId?: string): string[] {
+  const ids = new Set<string>();
+  if (turnId) ids.add(assistantLiveRowId(turnId));
+  if (activeAssistantTurnId) ids.add(assistantLiveRowId(activeAssistantTurnId));
+  return [...ids];
+}
+
 function emitAssistantSpoken() {
   update({ streamingAssistantText: assistantSpokenText });
-  if (assistantSpokenText.trim()) {
-    dispatchVoiceRender({
-      id: activeAssistantTurnId, role: "assistant", text: assistantSpokenText,
-      final: false, createdAt: new Date().toISOString(), turnId: activeAssistantTurnId,
-      sentenceSeq: assistantSentenceSequence,
-      audioCursorMs: lastAudioCursorMs,
-    });
-  }
+  if (!assistantSpokenText.trim() || !activeAssistantTurnId) return;
+  dispatchVoiceRender({
+    id: assistantLiveRowId(activeAssistantTurnId), role: "assistant", text: assistantSpokenText,
+    final: false, createdAt: new Date().toISOString(), turnId: activeAssistantTurnId,
+    sentenceSeq: assistantSentenceSequence,
+    audioCursorMs: lastAudioCursorMs,
+    // Sentence granularity is what makes the text correspond to the audio: the
+    // canvas renders one block per spoken sentence and highlights the last one,
+    // which is the sentence whose audio is playing right now.
+    spokenSegments: [...assistantSpokenSentences],
+  });
 }
 
 function appendAssistantSentence(text: string, sequence?: number, audioCursorMs?: number) {
@@ -864,6 +1072,7 @@ function appendAssistantSentence(text: string, sequence?: number, audioCursorMs?
   }
   // Preserve the original spacing between sentences.
   assistantSpokenText = assistantSpokenText ? `${assistantSpokenText}${text}` : text;
+  assistantSpokenSentences.push(clean);
   emitAssistantSpoken();
 }
 
@@ -872,6 +1081,11 @@ function finalizeAssistantTurn(interrupted: boolean) {
   assistantFinalized = true;
   const text = (interrupted ? assistantSpokenText : (assistantLlmText || assistantSpokenText)).trim();
   const turnId = activeAssistantTurnId;
+  // The live bubble is replaced by the settled one; leaving both would show the
+  // answer twice (they have different row ids on purpose, see emitAssistantSpoken).
+  const removes = assistantSpokenSentences.length
+    ? assistantLiveRemovalIds(turnId)
+    : [];
   turnAudioCursors.delete(turnId);
   if (text) {
     // The durable `turn.finalized` event is the authoritative source and the
@@ -882,7 +1096,7 @@ function finalizeAssistantTurn(interrupted: boolean) {
       if (!interrupted) persistFinalizedTurn(turnId, text);
       appendTranscriptItem("assistant", text, interrupted, turnId, { turnId });
     } else {
-      dispatchVoiceRender({ id: `assistant-final-${turnId}`, role: "assistant", text, final: true, interrupted, turnId, createdAt: new Date().toISOString() });
+      dispatchVoiceRender({ id: `assistant-final-${turnId}`, role: "assistant", text, final: true, interrupted, turnId, removes, createdAt: new Date().toISOString() });
     }
   }
   update({ streamingAssistantText: "" });
@@ -938,17 +1152,22 @@ function handleRtviMessage(raw: string) {
   switch (payload.type) {
     case "user-transcription": {
       const text = String(data.text ?? "");
+      // Single writer per row: when the journal is running, the durable
+      // `user.interim` / `user.final` events own the user bubbles (they carry the
+      // segment split and the turn id). This observer channel then only feeds the
+      // state field, so the two channels can never create two rows for one
+      // utterance or drift apart on segment numbering.
+      const observerOwnsRows = durableEventCount === 0;
       if (data.final) {
         // 一个「用户回合」可能产生多段 final：本机 VAD 判定停止即 commit
         // （见 §6.5.2 的延迟修复），所以说话中途的停顿也会各出一段 final。
-        // 这里只暂存，等聚合器广播回合边界（user-stopped-speaking）时再落
-        // 一条记录，避免中途停顿被拆成两个气泡/两条字幕。
+        // 每段各自成气泡，等聚合器广播回合边界（user-stopped-speaking）时再合并成一条。
         pendingUserFinal = joinTranscriptSegment(pendingUserFinal, text);
         update({ interimUserText: "" });
-        dispatchUserDraft(pendingUserFinal);
+        if (observerOwnsRows) commitUserSegment(text);
       } else {
         update({ interimUserText: text });
-        dispatchUserDraft(text);
+        if (observerOwnsRows) renderUserSegment(text, false);
       }
       return;
     }
@@ -1250,9 +1469,11 @@ export const voiceSessionController = {
     if (!reconnectingExistingSession) {
       pendingUserFinal = "";
       activeUserTurnId = "";
+      resetUserSegments();
       activeAssistantTurnId = "";
       assistantLlmText = "";
       assistantSpokenText = "";
+      assistantSpokenSentences = [];
       assistantSentenceSequence = 0;
       assistantLlmComplete = false;
       assistantFinalized = false;
@@ -1443,7 +1664,7 @@ export const voiceSessionController = {
       update({ transport: "error", state: "error", error: message });
     }
   },
-  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; lastCommittedUserTurnId = ""; activeAssistantTurnId = ""; assistantLlmText = ""; assistantSpokenText = ""; assistantSentenceSequence = 0; assistantLlmComplete = false; assistantFinalized = false; for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
+  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; lastCommittedUserTurnId = ""; resetUserSegments(); activeAssistantTurnId = ""; assistantLlmText = ""; assistantSpokenText = ""; assistantSpokenSentences = []; assistantSentenceSequence = 0; assistantLlmComplete = false; assistantFinalized = false; for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
   async interrupt() {
     // Durable first: the interrupt must reach the worker even when this page is
     // the one that lost its data channel. The RTVI path stays as a faster copy
