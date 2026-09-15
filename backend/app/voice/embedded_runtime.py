@@ -31,9 +31,18 @@ def install_embedded_runtime(app: Any) -> bool:
 
         from app.api.deps import AppSettings, DB, VoiceWorkspaceContext
         from app.voice import embedded_bot
+        from app.voice.embedded_ice import install_ice_compat
         from app.voice.service import VoiceSessionService
     except (ImportError, ModuleNotFoundError):
         return False
+
+    # ICE/TURN 的可观测性与兼容层：aioice 的 TURN 绑定失败要变成一条带地址的
+    # warning（而不是无人取用的任务堆栈），且 aioice/aiortc 的 ICE 决策要能进
+    # 日志 —— 否则「通话一直停在 checking」在日志里没有任何可用线索。
+    try:
+        install_ice_compat()
+    except Exception:
+        logger.debug("voice ICE instrumentation failed", exc_info=True)
 
     handler = SmallWebRTCRequestHandler(ice_servers=None, host="0.0.0.0")
 

@@ -80,6 +80,10 @@ x-app-environment: &app-environment
   # 每句一个 TaskRequest，并以首个音频包发送字幕进度标记）；0 = 旧的"每次调用一个
   # session、整段一次投喂"。
   VOLC_TTS_STREAMING: ${VOLC_TTS_STREAMING:-1}
+  # aioice/aiortc 的 ICE/TURN 日志级别：info（默认，能看出哪条候选对失败、中继到底
+  # 有没有建起来、TURN 通道绑定被谁拒了）| debug（含每条 STUN 消息）| 0/off（关闭）。
+  # 见 backend/app/voice/embedded_ice.py。
+  VOICE_ICE_DEBUG: ${VOICE_ICE_DEBUG:-info}
 
   LEARNGRAPH_MAX_DOCUMENT_PARSE_BYTES: ${LEARNGRAPH_MAX_DOCUMENT_PARSE_BYTES:-209715200}
   LEARNGRAPH_SANDBOX_WORKSPACE_ROOT: /data/sandbox-workspaces
