@@ -107,6 +107,23 @@ function memoryTitleFromText(text: string): string {
   return cleaned.slice(0, 240) || '用户记忆'
 }
 
+/**
+ * `memory_profile_*` 错误码的中文口径。
+ *
+ * 后端这些 AppError 的 message 全是英文（例如刷新报告时的
+ * "The configured memory profile model is unavailable"），页面必须在弹出前
+ * 统一翻译，否则用户会看到裸英文。返回 null 表示不属于这一类，调用方回落到
+ * 原始 message。
+ */
+function memoryProfileErrorText(error: unknown, fallback: string): string | null {
+  if (!(error instanceof ApiError)) return null
+  if (error.code === 'memory_profile_model_unavailable') {
+    return '记忆模型当前不可用，请到「记忆设置」检查模型配置后重试'
+  }
+  if (error.code.startsWith('memory_profile_')) return fallback
+  return null
+}
+
 function downloadBlob(blob: Blob): void {
   const name = `learngraph-memory-${new Date().toISOString().slice(0, 10)}.zip`
   // 移动端 WebView：纯 blob（后端导出 zip）交给原生 base64 通道
@@ -235,9 +252,12 @@ export function MemoryPage() {
     },
     onError: (error) => {
       // 未配置记忆模型时 quickAdd 会降级为直接创建普通记忆并给出中文提示，
-      // 这里不再重复弹出英文错误。
+      // 这里不再重复弹出英文错误。其余 memory_profile_* 错误统一翻成中文。
       if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') return
-      toast.error(error.message)
+      toast.error(
+        memoryProfileErrorText(error, '整理这次没能完成，输入内容已保留，可稍后重试')
+          ?? error.message,
+      )
     },
   })
   const regenerateProfile = useMutation({
@@ -258,16 +278,11 @@ export function MemoryPage() {
       if (error instanceof ApiError) {
         // 未配置模型时页面会显示原子快照提示，这里不再重复弹窗。
         if (error.code === 'memory_profile_model_unconfigured') return
-        if (error.code === 'memory_profile_model_unavailable') {
-          toast.error('记忆模型当前不可用，请到「记忆设置」检查模型配置后重试')
-          return
-        }
-        if (error.code.startsWith('memory_profile_')) {
-          toast.error('刷新失败：模型这次没能完成整理，已保留上一版报告，可稍后再试')
-          return
-        }
       }
-      toast.error(error.message)
+      toast.error(
+        memoryProfileErrorText(error, '刷新失败：模型这次没能完成整理，已保留上一版报告，可稍后再试')
+          ?? error.message,
+      )
     },
   })
   const migrateAtoms = useMutation({
@@ -286,7 +301,10 @@ export function MemoryPage() {
         toast.info('未配置记忆提取模型，旧记忆整理暂不可用；配置模型后可迁移为原子记忆')
         return
       }
-      toast.error(error.message)
+      toast.error(
+        memoryProfileErrorText(error, '旧记忆整理失败：模型这次没能完成整理，可稍后重试')
+          ?? error.message,
+      )
     },
   })
   // 报告正文“忘记这件事”的软删除：逐条删除后统一刷新，失败直接提示。

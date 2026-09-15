@@ -110,18 +110,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
-  Command,
-  CommandEmpty,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import {
   Select,
   SelectContent,
   SelectItem,
@@ -170,65 +158,19 @@ import type {
   MigrationJob,
   MigrationResourceKind,
 } from "@/types/migrations";
-import type { Provider, ProviderModel } from "@/types/providers";
 import type { WorkspaceSetting } from "@/types/settings";
 import { currentWorkspaceQueryKey } from "@/lib/query-keys";
-import { fuzzyModelMatch } from "@/lib/model-choices";
+import {
+  FEATURE_MODEL_DEFAULT,
+  FEATURE_MODEL_FOLLOW_CONVERSATION,
+  SearchableFeatureModelSelect,
+  featureModelValue,
+  parseFeatureModelValue,
+  useFeatureModelChoices,
+  withConfiguredModelChoice,
+} from "@/components/shared/feature-model-select";
 
-function SearchableFeatureModelSelect({
-  ariaLabel,
-  disabled,
-  onValueChange,
-  options,
-  placeholder,
-  value,
-}: {
-  ariaLabel: string;
-  disabled?: boolean;
-  onValueChange: (value: string) => void;
-  options: Array<{ value: string; label: string }>;
-  placeholder: string;
-  value: string;
-}) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const selected = options.find((option) => option.value === value);
-  const visible = options.filter((option) => fuzzyModelMatch(`${option.label} ${option.value}`, query));
-  return (
-    <Popover onOpenChange={(next) => { setOpen(next); if (!next) setQuery(""); }} open={open}>
-      <PopoverTrigger asChild>
-        <button aria-expanded={open} aria-label={ariaLabel} className="mt-3 flex h-9 w-full items-center justify-between rounded-md border bg-background px-3 text-left text-sm outline-none transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-50" disabled={disabled} type="button">
-          <span className={selected ? "truncate" : "truncate text-muted-foreground"}>{selected?.label ?? placeholder}</span>
-          <Search className="ml-2 size-4 shrink-0 text-muted-foreground" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-[min(28rem,calc(100vw-3rem))] p-0">
-        <Command shouldFilter={false}>
-          <CommandInput onValueChange={setQuery} placeholder="模糊搜索模型或供应商…" value={query} />
-          <CommandList className="max-h-72">
-            <CommandEmpty>没有匹配的模型</CommandEmpty>
-            {visible.map((option) => (
-              <CommandItem key={option.value} onSelect={() => { onValueChange(option.value); setOpen(false); }} value={option.value}>
-                <span className="truncate">{option.label}</span>
-                {option.value === value ? <span className="ml-auto">✓</span> : null}
-              </CommandItem>
-            ))}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
 const AUDIT_PAGE_SIZE = 20;
-const MODEL_PROVIDER_TYPES = new Set([
-  "openai_responses",
-  "openai_compatible_chat",
-  "qwen",
-  "codex_chatgpt",
-  "deepseek_chat",
-  "anthropic_messages",
-  "ollama",
-]);
 
 const migrationTargetOptions: Record<
   MigrationResourceKind,
@@ -276,48 +218,6 @@ const adapterDetailValueLabels: Record<string, string> = {
   driver_missing: "缺少驱动",
   connection_failed: "连接失败",
 };
-
-function providerCapabilityString(provider: Provider | undefined, key: string) {
-  const value = provider?.capabilities[key];
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function featureModelOptions(
-  provider: Provider | undefined,
-  discovered: ProviderModel[] | undefined,
-) {
-  if (!provider) return [] as ProviderModel[];
-  const byId = new Map((discovered ?? []).map((model) => [model.id, model]));
-  const configured = providerCapabilityString(provider, "default_model");
-  if (configured && !byId.has(configured)) {
-    byId.set(configured, {
-      id: configured,
-      roles: ["llm"],
-      streaming: true,
-      remote: true,
-    });
-  }
-  return [...byId.values()];
-}
-
-function featureModelValue(providerId: string | null, modelId: string | null) {
-  if (!providerId || !modelId) return "default";
-  return `${providerId}::${modelId}`;
-}
-
-function parseFeatureModelValue(value: string): {
-  provider_id: string | null;
-  model_id: string | null;
-} {
-  if (!value || value === "default") {
-    return { provider_id: null, model_id: null };
-  }
-  const [providerId, modelId] = value.split("::");
-  if (!providerId || !modelId) {
-    return { provider_id: null, model_id: null };
-  }
-  return { provider_id: providerId, model_id: modelId };
-}
 
 /** Session key used to group related audit events for the same conversation. */
 function auditSessionKey(event: AuditEvent): string {
@@ -2231,59 +2131,9 @@ export function WorkspaceSettingsPage() {
     queryFn: listProviders,
     staleTime: 30_000,
   });
-  const modelProviders = useMemo(
-    () =>
-      (providers.data ?? []).filter(
-        (provider) =>
-          provider.enabled &&
-          provider.remote_capability &&
-          MODEL_PROVIDER_TYPES.has(provider.provider_type),
-      ),
-    [providers.data],
-  );
-  const discoveredByProvider = useQuery({
-    queryKey: [
-      "settings-feature-models",
-      modelProviders.map((item) => item.id).join(","),
-    ],
-    queryFn: async () => {
-      const entries = await Promise.all(
-        modelProviders.map(async (provider) => {
-          try {
-            const models = await discoverProviderModels(provider.id);
-            return [provider.id, models.models] as const;
-          } catch {
-            return [provider.id, [] as ProviderModel[]] as const;
-          }
-        }),
-      );
-      return Object.fromEntries(entries) as Record<string, ProviderModel[]>;
-    },
-    enabled: modelProviders.length > 0,
-  });
-  const featureModelChoices = useMemo(() => {
-    const choices: Array<{
-      value: string;
-      label: string;
-      providerId: string;
-      modelId: string;
-    }> = [];
-    for (const provider of modelProviders) {
-      const models = featureModelOptions(
-        provider,
-        discoveredByProvider.data?.[provider.id],
-      );
-      for (const model of models) {
-        choices.push({
-          value: featureModelValue(provider.id, model.id),
-          label: `${provider.display_name} · ${model.id}`,
-          providerId: provider.id,
-          modelId: model.id,
-        });
-      }
-    }
-    return choices;
-  }, [discoveredByProvider.data, modelProviders]);
+  // Provider/model options live in the shared picker module so the memory
+  // settings dialog offers byte-identical choices without a second fetch.
+  const { choices: featureModelChoices } = useFeatureModelChoices();
   const [dark, setDark] = useState(() =>
     document.documentElement.classList.contains("dark"),
   );
@@ -2703,31 +2553,21 @@ export function WorkspaceSettingsPage() {
   const memoryExtractionCfg = memoryEnhancement.data?.extraction;
   const memoryFollowsConversation = memoryExtractionCfg?.follow_conversation === true;
   const memoryModelValue = memoryFollowsConversation
-    ? "follow-conversation"
+    ? FEATURE_MODEL_FOLLOW_CONVERSATION
     : featureModelValue(
         memoryExtractionCfg?.provider_id || null,
         memoryExtractionCfg?.model_id || null,
       );
   // A configured extraction model that discovery no longer lists must stay
   // visible in the select instead of silently falling back to "未配置".
-  const memoryModelChoices =
-    memoryModelValue !== "default" &&
-    memoryExtractionCfg &&
-    !featureModelChoices.some((choice) => choice.value === memoryModelValue)
-      ? [
-          ...featureModelChoices,
-          {
-            value: memoryModelValue,
-            label: `${
-              (providers.data ?? []).find(
-                (item) => item.id === memoryExtractionCfg.provider_id,
-              )?.display_name ?? memoryExtractionCfg.provider_id
-            } · ${memoryExtractionCfg.model_id}`,
-            providerId: memoryExtractionCfg.provider_id,
-            modelId: memoryExtractionCfg.model_id,
-          },
-        ]
-      : featureModelChoices;
+  const memoryModelChoices = withConfiguredModelChoice(
+    featureModelChoices,
+    memoryExtractionCfg?.provider_id ?? "",
+    memoryExtractionCfg?.model_id ?? "",
+    (providers.data ?? []).find(
+      (item) => item.id === memoryExtractionCfg?.provider_id,
+    )?.display_name,
+  );
 
   return (
     <PageFrame>
@@ -3383,12 +3223,12 @@ export function WorkspaceSettingsPage() {
               ariaLabel="记忆整理模型"
               disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || providers.isPending}
               onValueChange={(value) => {
-                const follow_conversation = value === "follow-conversation";
+                const follow_conversation = value === FEATURE_MODEL_FOLLOW_CONVERSATION;
                 const parsed = parseFeatureModelValue(value);
                 const patch = { provider_id: follow_conversation ? "" : (parsed.provider_id ?? ""), model_id: follow_conversation ? "" : (parsed.model_id ?? ""), follow_conversation };
                 saveMemoryEnhancement.mutate({ extraction: patch, summarization: patch });
               }}
-              options={[{ value: "default", label: "未配置" }, { value: "follow-conversation", label: "跟随对话模型" }, ...memoryModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
+              options={[{ value: FEATURE_MODEL_DEFAULT, label: "未配置" }, { value: FEATURE_MODEL_FOLLOW_CONVERSATION, label: "跟随对话模型" }, ...memoryModelChoices.map((choice) => ({ value: choice.value, label: choice.label }))]}
               placeholder="未配置"
               value={memoryModelValue}
             />

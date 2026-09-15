@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
+import { MemoryModelSelect } from './memory-model-select'
 import { MemorySettingsExportPanel } from './memory-settings-export-panel'
 
 function SettingRow({
@@ -116,6 +117,24 @@ export function MemorySettingsDialog({
                 label="自动发现值得记住的信息"
                 onToggle={(value) => updateEnhancement.mutate({ extraction: { enabled: value } })}
               />
+            </Surface>
+
+            <Surface className="overflow-hidden p-0">
+              <div className="border-b px-4 py-3">
+                <p className="text-sm font-semibold">记忆整理模型</p>
+              </div>
+              <div className="px-4 py-3.5">
+                <MemoryModelSelect
+                  config={enhancementData?.extraction}
+                  disabled={updateEnhancement.isPending || !enhancementData}
+                  onChange={(patch) => updateEnhancement.mutate(patch)}
+                />
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  自动发现长期记忆、会话摘要，以及「我的学习记忆报告」的整篇重写都用这个模型。
+                  选择「跟随对话模型」时会话级的对话模型无法用于后台整理，报告只会保持原子快照；
+                  要生成正式报告，请在这里指定一个具体模型。
+                </p>
+              </div>
             </Surface>
 
             <Surface className="overflow-hidden p-0">
