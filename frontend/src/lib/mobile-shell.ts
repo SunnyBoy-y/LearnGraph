@@ -4,13 +4,17 @@
  * 现状与职责：
  *  - 左侧导航抽屉与右侧图谱抽屉都是常驻 DOM，位移由 CSS 变量
  *    `--lg-left-drawer-progress` / `--lg-right-drawer-progress`（0 = 收起，
- *    1 = 展开）驱动；抽屉的开合状态仍由 React 持有，本模块只搬运「手指进度」。
+ *    1 = 展开，写在使用者元素自身而非根节点）驱动；抽屉的开合状态仍由 React
+ *    持有，本模块只搬运「手指进度」。
  *  - 全屏任意位置起手都能拖拽：监听装在 window 上（capture 阶段），
  *    手指滑多少就拉出多少，松手时进度 > 0.5 视为展开，否则收起。
  *  - 不做逐帧 React 更新：touchmove 只写 CSS 变量，React 仅在拖拽开始/结束时
- *    被唤醒一次（用于按需挂载抽屉内容、保持可见性）。
+ *    被唤醒一次（用于按需挂载抽屉内容、保持可见性）。松手时的状态提交会推到
+ *    下一个宏任务，避免整棵工作区的重渲染顶住松手那一帧。
+ *  - touchstart 只登记坐标，方向锁定之后才做排除判定（祖先样式查询会强制布局，
+ *    放在起手阶段会让手指动起来的前几帧变慢）。
  *
- * 不判定条件（起手点满足任一条即不识别为抽屉手势）：
+ * 不判定条件（方向锁定、确认是横向抽屉手势后，起手点满足任一条即放弃）：
  *  - 祖先带 `data-drawer-swipe="ignore"`（显式豁免；`"allow"` 则显式放行并终止向上查找）；
  *  - 祖先横向可滚动（overflow-x: auto/scroll 且确实溢出）：表格、代码块、Tab 条、
  *    热力图、概念分支条等控件内左右滑动不该唤起侧栏；
@@ -29,6 +33,33 @@ const PROGRESS_VAR: Record<DrawerSide, string> = {
   left: "--lg-left-drawer-progress",
   right: "--lg-right-drawer-progress",
 };
+
+/**
+ * 进度变量写在使用者自己身上（抽屉 + 它的遮罩），不写 `<html>`：
+ * 自定义属性是继承属性，写在根节点上意味着每一帧都让整篇文档的样式失效，
+ * 手机上的重页面（几百上千个节点）会因此掉帧；写在这两个盒子上只影响它们。
+ */
+const PROGRESS_TARGETS: Record<DrawerSide, string[]> = {
+  left: [".mobile-nav-drawer", ".mobile-nav-drawer-overlay"],
+  right: [".context-rail", ".graph-drawer-backdrop"],
+};
+
+const progressTargetCache: Record<DrawerSide, HTMLElement[]> = {
+  left: [],
+  right: [],
+};
+
+function progressTargets(side: DrawerSide): HTMLElement[] {
+  const cached = progressTargetCache[side];
+  if (cached.length && cached.every((node) => node.isConnected)) return cached;
+  const found: HTMLElement[] = [];
+  for (const selector of PROGRESS_TARGETS[side]) {
+    const node = document.querySelector(selector);
+    if (node instanceof HTMLElement) found.push(node);
+  }
+  progressTargetCache[side] = found;
+  return found;
+}
 
 /** 量不到抽屉实际宽度时的兜底（左：导航 286px；右：min(420px, 94vw)）。 */
 function fallbackDrawerWidth(side: DrawerSide): number {
@@ -62,17 +93,24 @@ function clamp01(value: number): number {
 
 /** 写入抽屉进度（0 = 完全收起，1 = 完全展开）。 */
 export function setDrawerProgress(side: DrawerSide, progress: number): void {
-  document.documentElement.style.setProperty(
-    PROGRESS_VAR[side],
-    String(clamp01(progress)),
-  );
+  const value = String(clamp01(progress));
+  const targets = progressTargets(side);
+  if (!targets.length) {
+    // 抽屉还没挂载（例如别的路由）：退回根节点，保证读得到同一个值。
+    document.documentElement.style.setProperty(PROGRESS_VAR[side], value);
+    return;
+  }
+  for (const node of targets) node.style.setProperty(PROGRESS_VAR[side], value);
 }
 
 /** 读取当前抽屉进度（跟手过程中即为手指位置）。 */
 export function readDrawerProgress(side: DrawerSide): number {
-  const raw = document.documentElement.style.getPropertyValue(
-    PROGRESS_VAR[side],
-  );
+  const [node] = progressTargets(side);
+  const raw = (
+    node
+      ? node.style.getPropertyValue(PROGRESS_VAR[side])
+      : document.documentElement.style.getPropertyValue(PROGRESS_VAR[side])
+  ).trim();
   const value = Number.parseFloat(raw);
   return Number.isFinite(value) ? clamp01(value) : 0;
 }
@@ -172,13 +210,10 @@ function blocksDrawerSwipe(element: Element): boolean {
   const style = window.getComputedStyle(element);
   const touchAction = style.touchAction ?? "";
   if (touchAction === "none" || touchAction.includes("pan-x")) return true;
-  if (
-    element.scrollWidth - element.clientWidth > HORIZONTAL_OVERFLOW_SLOP &&
-    HORIZONTAL_SCROLL_VALUES.has(style.overflowX)
-  ) {
-    return true;
-  }
-  return false;
+  // 先看 overflow-x 再看是否真的溢出：读 scrollWidth/clientWidth 会强制布局，
+  // 放在后面可以让绝大多数（overflow-x: visible）祖先完全不触发重排。
+  if (!HORIZONTAL_SCROLL_VALUES.has(style.overflowX)) return false;
+  return element.scrollWidth - element.clientWidth > HORIZONTAL_OVERFLOW_SLOP;
 }
 
 /** 起手点是否落在「不该唤起侧栏」的区域里。 */
@@ -205,7 +240,8 @@ type GestureTrack = {
   identifier: number;
   startX: number;
   startY: number;
-  surface: DrawerSurface;
+  /** 起手元素：方向锁定后才用它判排除（touchstart 阶段一律不做样式查询）。 */
+  target: Element;
   axis: "pending" | "horizontal" | "dead";
   side: DrawerSide;
   base: number;
@@ -221,6 +257,53 @@ export type MobileDrawerDragOptions = {
   /** 松手吸附结果：open=true 展开，false 收起。 */
   onCommit: (side: DrawerSide, open: boolean) => void;
 };
+
+/* -------------------------------------------------------------------------- *
+ * 松手提交：React 的开合状态变化会重渲染整棵工作区（含当前页面），首页图表 /
+ * 会话列表这一下要 100~150ms。吸附补间跑在合成器上，把这笔开销推到补间开始
+ * 之后（下一个宏任务）就看不见了；同步做则会顶住松手那一帧 —— 表现就是
+ * 「手指抬起来后抽屉先僵住，再补间」。
+ * -------------------------------------------------------------------------- */
+
+type PendingCommit = {
+  side: DrawerSide;
+  open: boolean;
+  timer: number;
+  commit: (side: DrawerSide, open: boolean) => void;
+};
+
+let pendingCommit: PendingCommit | null = null;
+
+function takePendingCommit(): PendingCommit | null {
+  const pending = pendingCommit;
+  pendingCommit = null;
+  if (pending) window.clearTimeout(pending.timer);
+  return pending;
+}
+
+/** 立刻执行尚未落地的提交（新手势起手时保证状态顺序）。 */
+function flushPendingCommit(): void {
+  const pending = takePendingCommit();
+  if (pending) pending.commit(pending.side, pending.open);
+}
+
+function cancelPendingCommit(): void {
+  void takePendingCommit();
+}
+
+/** 把提交排到下一个宏任务，并保证同一时刻只有一个待执行提交。 */
+function scheduleCommit(
+  side: DrawerSide,
+  open: boolean,
+  commit: (side: DrawerSide, open: boolean) => void,
+): void {
+  flushPendingCommit();
+  const timer = window.setTimeout(() => {
+    const pending = takePendingCommit();
+    if (pending) pending.commit(pending.side, pending.open);
+  }, 0);
+  pendingCommit = { side, open, timer, commit };
+}
 
 /**
  * 在 window 上装一次抽屉拖拽手势。
@@ -274,30 +357,33 @@ export function useMobileDrawerDrag(options: MobileDrawerDragOptions): void {
         if (findTouch(event.touches, track.identifier)) return;
         track = null;
       }
-      // 其它 Radix 弹层（设置、活动抽屉、附件诊断…）打开时让位。
-      if (document.body.hasAttribute("data-scroll-locked")) return;
-      // 正在调整已选中的文本（拖选 / 拖拽选择手柄）时不抢手势。
-      const selection = window.getSelection();
-      if (selection && !selection.isCollapsed) return;
       const target = event.target;
-      if (!(target instanceof Element)) return;
-      if (shouldIgnoreDrawerSwipe(target)) return;
       const touch = event.touches[0];
-      if (!touch) return;
-      const surfaceElement = target.closest(`[${SURFACE_ATTR}]`);
-      const surface = (surfaceElement?.getAttribute(SURFACE_ATTR) ??
-        "canvas") as DrawerSurface;
+      if (!touch || !(target instanceof Element)) return;
+      // 起手只登记坐标，不做任何样式/排除查询：touchstart 阶段越干净，手指动起来
+      // 的第一帧就越顺。排除判定放到方向锁定那一刻（见 onTouchMove）。
+      flushPendingCommit();
       track = {
         identifier: touch.identifier,
         startX: touch.clientX,
         startY: touch.clientY,
-        surface,
+        target,
         axis: "pending",
         side: "left",
         base: 0,
         width: 0,
         progress: 0,
       };
+    };
+
+    /** 方向锁定那一刻才做的排除判定（只在真的开始拖时才付这笔查询成本）。 */
+    const shouldSkipGesture = (target: Element): boolean => {
+      // 其它 Radix 弹层（设置、活动抽屉、附件诊断…）打开时让位。
+      if (document.body.hasAttribute("data-scroll-locked")) return true;
+      // 正在调整已选中的文本（拖选 / 拖拽选择手柄）时不抢手势。
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return true;
+      return shouldIgnoreDrawerSwipe(target);
     };
 
     const onTouchMove = (event: TouchEvent) => {
@@ -318,7 +404,15 @@ export function useMobileDrawerDrag(options: MobileDrawerDragOptions): void {
         }
         if (Math.abs(dx) < LOCK_DISTANCE) return;
         if (Math.abs(dx) < Math.abs(dy) * LOCK_SLOPE) return;
-        const resolved = resolveDrag(track.surface, dx);
+        if (shouldSkipGesture(track.target)) {
+          // 判定为不抢手势：直接作废，也不 preventDefault，让原生滚动/拖选照常。
+          track.axis = "dead";
+          return;
+        }
+        const surfaceElement = track.target.closest(`[${SURFACE_ATTR}]`);
+        const surface = (surfaceElement?.getAttribute(SURFACE_ATTR) ??
+          "canvas") as DrawerSurface;
+        const resolved = resolveDrag(surface, dx);
         if (!resolved) {
           track.axis = "dead";
           return;
@@ -352,7 +446,10 @@ export function useMobileDrawerDrag(options: MobileDrawerDragOptions): void {
       // 先解除「跟手免过渡」，再落到吸附位置：CSS 会从当前位置补间过去。
       endDrawerDrag();
       setDrawerProgress(gesture.side, open ? 1 : 0);
-      latest.current.onCommit(gesture.side, open);
+      // 状态提交推到下一个宏任务：补间期间做重渲染，松手那一帧才不卡。
+      scheduleCommit(gesture.side, open, (side, nextOpen) =>
+        latest.current.onCommit(side, nextOpen),
+      );
     };
 
     window.addEventListener("touchstart", onTouchStart, {
@@ -385,6 +482,7 @@ export function useMobileDrawerDrag(options: MobileDrawerDragOptions): void {
         capture: true,
       });
       endDrawerDrag();
+      cancelPendingCommit();
     };
   }, []);
 }

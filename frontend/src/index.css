@@ -5184,7 +5184,7 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     transform: translate3d(calc(100% - 100% * var(--lg-right-drawer-progress, 0)), 0, 0);
     transition:
       transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
-      visibility 0.34s step-end;
+      visibility 0s linear 0.34s;
   }
   .workspace-shell--graph-open .context-rail {
     pointer-events: auto;
@@ -5206,7 +5206,7 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     visibility: hidden;
     transition:
       opacity 0.28s ease,
-      visibility 0.28s step-end;
+      visibility 0s linear 0.28s;
   }
   .workspace-shell--graph-open .graph-drawer-backdrop {
     pointer-events: auto;
@@ -5233,7 +5233,7 @@ html.dark[data-color-mode='mono'] .topbar-model-status {
     visibility: hidden;
     transition:
       opacity 0.2s ease,
-      visibility 0.2s step-end;
+      visibility 0s linear 0.2s;
   }
   .workspace-shell--graph-open .graph-drawer-close {
     opacity: 1;
@@ -5263,9 +5263,10 @@ html.has-mobile-drawer body { overflow: hidden !important; }
   opacity: var(--lg-left-drawer-progress, 0);
   pointer-events: none;
   visibility: hidden;
+  /* 收起时延迟到补间结束再隐藏（延迟后瞬间生效，比 step-end 更抗「提交晚到」）。 */
   transition:
     opacity 0.26s ease,
-    visibility 0.26s step-end;
+    visibility 0s linear 0.26s;
 }
 .mobile-nav-drawer-overlay.is-open {
   pointer-events: auto;
@@ -5291,9 +5292,12 @@ html.has-mobile-drawer body { overflow: hidden !important; }
   transform: translate3d(calc(-100% + 100% * var(--lg-left-drawer-progress, 0)), 0, 0);
   visibility: hidden;
   pointer-events: none;
+  /* 面板自己可以纵向滚，横向拖拽（推回收起）必须留给 JS：声明 pan-y 后浏览器
+     不会把横向手势当成滚动接管；内层横向滚动容器自身是滚动容器，不受影响。 */
+  touch-action: pan-y pinch-zoom;
   transition:
     transform 0.32s cubic-bezier(0.32, 0.72, 0, 1),
-    visibility 0.32s step-end;
+    visibility 0s linear 0.32s;
 }
 .mobile-nav-drawer.is-open {
   pointer-events: auto;
@@ -5303,6 +5307,25 @@ html.has-mobile-drawer body { overflow: hidden !important; }
     visibility 0s linear;
 }
 .mobile-nav-drawer:focus { outline: none; }
+
+/* 合成层提示（手机端掉帧的关键，2026-09-14 实测）：
+   抽屉/遮罩的位移与浓度靠 CSS 变量逐帧改写，而 transform 里含百分比（calc(-100% + …)）
+ + 常驻 fixed 元素时，Chrome 不会把它当成「只需移动、无需重铺」的层 —— 手指每移动
+   一下就把整块面板 + 44px 模糊阴影重新栅格化。实测同一个触摸手势：
+     · 左抽屉（无提示）189 个 RasterTask，右抽屉（被判定为 trivial 3d transform）70 个；
+     · 显式 will-change 后左抽屉降到 13 个（3 轮冷启动交替 A/B 均一致）。
+   不加这条时手机上就是「左边一卡一卡、右边很丝滑」。 */
+@media (max-width: 1120px) {
+  .mobile-nav-drawer,
+  .workspace-shell .context-rail {
+    will-change: transform;
+  }
+  .mobile-nav-drawer-overlay,
+  .graph-drawer-backdrop,
+  .graph-drawer-close {
+    will-change: opacity;
+  }
+}
 
 html[data-drawer-dragging="left"] .mobile-nav-drawer,
 html[data-drawer-dragging="left"] .mobile-nav-drawer-overlay {

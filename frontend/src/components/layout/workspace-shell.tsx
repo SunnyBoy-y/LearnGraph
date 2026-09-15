@@ -8,7 +8,7 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react"
-import { lazy, Suspense } from "react";
+import { lazy, memo, Suspense } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Link,
@@ -1837,6 +1837,12 @@ function SidebarNav({
   );
 }
 
+/**
+ * 侧栏是一棵重树（项目 / 会话树 + 各自查询）。抽屉开合这类外壳状态变化不该让
+ * 它整棵重渲染 —— 手机上它甚至是隐藏的，却要为此花掉几十毫秒。
+ */
+const MemoSidebarNav = memo(SidebarNav);
+
 function SessionProjects({
   workspaceId,
   activeSessionId,
@@ -2845,7 +2851,8 @@ function MobileNavTrigger({ onOpen }: { onOpen: () => void }) {
 /**
  * 左侧导航抽屉：常驻 DOM（收起时 visibility: hidden），位移由 CSS 变量
  * `--lg-left-drawer-progress` 驱动 —— 展开/收起补间、跟手拖拽、遮罩浓度共用
- * 同一个进度值。内容按需挂载，并在收起动画播完后延迟卸载。
+ * 同一个进度值。内容趁空闲预热后一直保留：现挂载一次要 100ms+（会话列表 +
+ * 其查询），如果发生在跟手第一帧，抽屉会先空着、卡住，再突然跳出内容。
  */
 function MobileNavDrawer({
   open,
@@ -2857,16 +2864,34 @@ function MobileNavDrawer({
   const dragging = useDraggingDrawer("left");
   const [contentMounted, setContentMounted] = useState(false);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const handleNavigate = useCallback(() => onOpenChange(false), [onOpenChange]);
 
   useEffect(() => {
-    if (open || dragging) {
-      setContentMounted(true);
-      return;
+    if (contentMounted) return;
+    // 抽屉只在窄屏用得上；宽屏桌面侧栏常驻，不必再多挂一份。
+    if (!window.matchMedia("(max-width: 1024px)").matches) return;
+    const windowWithIdle = window as Window & {
+      requestIdleCallback?: (
+        callback: () => void,
+        options?: { timeout: number },
+      ) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    if (typeof windowWithIdle.requestIdleCallback === "function") {
+      const handle = windowWithIdle.requestIdleCallback(
+        () => setContentMounted(true),
+        { timeout: 1500 },
+      );
+      return () => windowWithIdle.cancelIdleCallback?.(handle);
     }
-    // 收起动画约 320ms：播完再卸载，避免抽屉滑出时内容先消失。
-    const timer = window.setTimeout(() => setContentMounted(false), 360);
+    const timer = window.setTimeout(() => setContentMounted(true), 600);
     return () => window.clearTimeout(timer);
-  }, [open, dragging]);
+  }, [contentMounted]);
+
+  useEffect(() => {
+    // 预热还没轮到时就被拉起：宁可卡一帧，也不能是空面板。
+    if (open || dragging) setContentMounted(true);
+  }, [dragging, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -2902,7 +2927,7 @@ function MobileNavDrawer({
         tabIndex={-1}
       >
         {contentMounted ? (
-          <SidebarNav mobile onNavigate={() => onOpenChange(false)} />
+          <MemoSidebarNav mobile onNavigate={handleNavigate} />
         ) : null}
       </div>
     </>
@@ -3450,6 +3475,9 @@ function ContextRail({
     </aside>
   );
 }
+
+/** 图谱 / 上下文侧栏同样是重树：只在自身数据或抽屉开合相关 props 变化时更新。 */
+const MemoContextRail = memo(ContextRail);
 
 function ActivityRail() {
   return (
@@ -4778,6 +4806,15 @@ function GraphWorkspaceRail() {
   );
 }
 
+/**
+ * 路由内容（当前页面）单独隔一层：抽屉开合、活动抽屉这类外壳状态变化时，
+ * 当前页面不该跟着重渲染（首页 dashboard 的图表重渲染一次就是几十毫秒）。
+ * 路由变化仍会经 RouteContext 让这里重新渲染。
+ */
+const ShellOutlet = memo(function ShellOutlet() {
+  return <Outlet />;
+});
+
 export function WorkspaceShell() {
   const { pathname, search } = useLocation();
   const navigate = useNavigate();
@@ -4866,12 +4903,12 @@ export function WorkspaceShell() {
       // Tab still keeps the applied class when storage is unavailable.
     }
   }, [settings.data]);
-  function toggleSidebar() {
+  const toggleSidebar = useCallback(() => {
     setCollapsed((current) => {
       window.localStorage.setItem("lg-sidebar-collapsed", String(!current));
       return !current;
     });
-  }
+  }, []);
   function toggleRail() {
     setRailCollapsed((current) => {
       const next = !current;
@@ -4954,7 +4991,7 @@ export function WorkspaceShell() {
     >
       <aside className="workspace-sidebar min-h-svh overflow-hidden bg-sidebar">
         <div className="sticky top-0 h-svh w-full">
-          <SidebarNav collapsed={collapsed} onCollapse={toggleSidebar} />
+          <MemoSidebarNav collapsed={collapsed} onCollapse={toggleSidebar} />
         </div>
       </aside>
       <main
@@ -4973,7 +5010,7 @@ export function WorkspaceShell() {
               );
             }}
           >
-            <Outlet />
+            <ShellOutlet />
           </SettingsModal>
         ) : (
           <>
@@ -4996,7 +5033,7 @@ export function WorkspaceShell() {
                 railCollapsed={showRailToggle ? railCollapsed : undefined}
               />
             )}
-            <Outlet />
+            <ShellOutlet />
           </>
         )}
       </main>
@@ -5022,7 +5059,7 @@ export function WorkspaceShell() {
               setSelectionExplanationOpen(false);
             }}
           />
-          <ContextRail
+          <MemoContextRail
             // Desktop fold, or narrow drawer closed: keep mounted for CSS but not interactive.
             collapsed={railCollapsedEffective && !graphDrawerOpen}
             onSelectionExplanationChange={handleSelectionExplanationChange}
