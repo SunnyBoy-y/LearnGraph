@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { postLoginPath } from "./post-login-redirect";
 import { authErrorMessage, SESSION_EXPIRED_MESSAGE } from "./auth-messages";
 import { ConnectQrCode } from "@/features/mobile/ConnectQrCode";
 import { isNativeApp } from "@/lib/native-bridge";
@@ -46,10 +47,9 @@ export function LoginPage() {
 
   function returnToAfterLogin(workspaceId: string): string {
     const from = (location.state as { from?: string } | null)?.from;
-    if (from && from.startsWith("/") && !from.startsWith("/auth/")) {
-      return from;
-    }
-    return `/w/${workspaceId}`;
+    // App.tsx 的守卫在登出时会把上一个账户的工作区路径写进 state.from；
+    // 换账户登录后必须忽略它，否则会先跳进对方工作区再被 403 弹回。
+    return postLoginPath(from, workspaceId);
   }
 
   useEffect(() => {

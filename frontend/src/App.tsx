@@ -1,7 +1,7 @@
-import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
+import { lazy, Suspense } from 'react'
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
-import { LoaderCircle, Network } from 'lucide-react'
+import { Network } from 'lucide-react'
 import { Toaster } from 'sonner'
 
 import { WorkspaceShell } from '@/components/layout/workspace-shell'
@@ -10,6 +10,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { listGraphs } from '@/api'
 import { workspaceQueryKey } from '@/lib/query-keys'
 import { AuthProvider, RequireAuth } from '@/features/auth/auth-context'
+import { RouteLoading, WorkspaceRouteGuard } from '@/features/auth/workspace-route-guard'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { registerAuthQueryClient } from '@/lib/auth-query-cache'
 import { VoiceSessionProvider } from '@/features/voice/voice-session-controller'
@@ -98,10 +99,6 @@ function NotFound() {
   )
 }
 
-function RouteLoading() {
-  return <main aria-live="polite" className="grid min-h-svh place-items-center bg-background"><div className="flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在载入工作区…</div></main>
-}
-
 /**
  * 旧「路线」一级页已收敛为图谱里的「学习计划」面板。
  *
@@ -123,23 +120,6 @@ function LegacyRoadmapRoute() {
     return <Navigate replace to={`/w/${workspaceId}/graphs/${graph.id}?panel=plan`} />
   }
   return <RoadmapPage />
-}
-
-function WorkspaceRouteGuard({ children }: { children: ReactNode }) {
-  const { workspaceId: activeWorkspaceId, setWorkspaceId } = useAuth()
-  const { workspaceId = '' } = useParams()
-  const [denied, setDenied] = useState(false)
-  useEffect(() => {
-    setDenied(false)
-    if (workspaceId && workspaceId !== activeWorkspaceId) {
-      void setWorkspaceId(workspaceId).catch(() => setDenied(true))
-    }
-  }, [activeWorkspaceId, setWorkspaceId, workspaceId])
-  if (!workspaceId || denied) {
-    return <Navigate replace to={`/w/${activeWorkspaceId}/home`} />
-  }
-  if (workspaceId !== activeWorkspaceId) return <RouteLoading />
-  return children
 }
 
 function AppRoutes() {
