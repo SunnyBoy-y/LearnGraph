@@ -1351,11 +1351,13 @@ body.is-resizing .workspace-resizer {
       env(safe-area-inset-bottom)
   );
 }
-/* 「回到底部」按钮跟随 Composer 高度，而不是固定 bottom。 */
+/* 「回到底部」按钮跟随 Composer 高度，而不是固定 bottom。
+   圆形图标按钮：宽高固定，避免悬浮文案/状态变化导致按钮宽度跳动。 */
 .chat-scroll-to-bottom {
   bottom: calc(var(--composer-height) + 24px);
-  width: auto;
-  max-width: min(280px, calc(100% - 32px));
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
   border-color: color-mix(in srgb, var(--border) 85%, transparent);
   background: color-mix(in srgb, var(--background) 92%, transparent);
   color: var(--foreground);

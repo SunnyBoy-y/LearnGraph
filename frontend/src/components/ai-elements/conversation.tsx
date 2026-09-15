@@ -177,19 +177,19 @@ export const ConversationScrollButton = ({
     hasNewContent || (!isAtBottom && mode === "MANUAL_READING");
   if (!visible) return null;
 
-  // 「回到最新」态不再显示文案，向下箭头本身已经足够表意；
-  // 生成中的两种状态仍保留提示文案。
+  // 按钮只保留向下箭头（悬浮态文案会让按钮宽度随状态跳动）；
+  // 状态语义仍通过 aria-label 暴露给读屏与测试。
   const label = hasNewContent
     ? hasCommittedAnswer
       ? "正文仍在生成"
       : "还有新内容"
-    : null;
+    : "回到最新";
 
   return (
     <Button
-      aria-label={label ?? "回到最新"}
+      aria-label={label}
       className={cn(
-        "chat-scroll-to-bottom absolute bottom-4 left-[50%] h-8 translate-x-[-50%] gap-1.5 rounded-full px-3 text-xs shadow-none dark:bg-background dark:hover:bg-muted",
+        "chat-scroll-to-bottom absolute bottom-4 left-[50%] size-8 shrink-0 translate-x-[-50%] rounded-full p-0 shadow-none dark:bg-background dark:hover:bg-muted",
         className
       )}
       onClick={handleScrollToBottom}
@@ -198,12 +198,7 @@ export const ConversationScrollButton = ({
       variant="outline"
       {...props}
     >
-      {children ?? (
-        <>
-          <ArrowDownIcon className="size-3.5" />
-          {label ? <span>{label}</span> : null}
-        </>
-      )}
+      {children ?? <ArrowDownIcon className="size-3.5" />}
     </Button>
   );
 };
