@@ -85,6 +85,13 @@ const SCROLL_LOCK_CLASS = "has-mobile-drawer";
 const DRAGGING_ATTR = "data-drawer-dragging";
 const SURFACE_ATTR = "data-drawer-surface";
 const SWIPE_HOOK_ATTR = "data-drawer-swipe";
+/**
+ * 展开中的抽屉（`left` / `right`，可同时存在）写在 `<html>` 上：
+ * Radix 的弹层一律 portal 到 `<body>`，层级写死在组件里（z-50），而抽屉是
+ * z-index 73/74 —— 抽屉里的二级菜单必须靠这个标记才能被 CSS 抬到抽屉之上，
+ * 否则「点了没反应」（菜单其实已经打开，只是被抽屉盖住）。
+ */
+const OPEN_LAYERS_ATTR = "data-drawer-open";
 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -118,6 +125,23 @@ export function readDrawerProgress(side: DrawerSide): number {
 /** 抽屉打开时锁住页面滚动（遮罩已挡住交互，避免背景跟着滚）。 */
 export function setDrawerScrollLock(locked: boolean): void {
   document.documentElement.classList.toggle(SCROLL_LOCK_CLASS, locked);
+}
+
+const openLayerSides = new Set<DrawerSide>();
+
+/**
+ * 登记/注销展开中的抽屉（见 OPEN_LAYERS_ATTR）。标记只用于 CSS 层级，
+ * 与滚动锁相互独立：两侧抽屉可以同时展开。
+ */
+export function setDrawerLayerOpen(side: DrawerSide, open: boolean): void {
+  if (open) openLayerSides.add(side);
+  else openLayerSides.delete(side);
+  const root = document.documentElement;
+  if (openLayerSides.size) {
+    root.setAttribute(OPEN_LAYERS_ATTR, [...openLayerSides].join(" "));
+    return;
+  }
+  root.removeAttribute(OPEN_LAYERS_ATTR);
 }
 
 /* -------------------------------------------------------------------------- *

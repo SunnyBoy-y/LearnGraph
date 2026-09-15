@@ -95,6 +95,7 @@ import { SettingsModal } from "@/components/layout/settings-modal";
 import { NativeActions } from "@/features/mobile/NativeActions";
 import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
 import {
+  setDrawerLayerOpen,
   setDrawerProgress,
   setDrawerScrollLock,
   useDraggingDrawer,
@@ -1832,7 +1833,11 @@ function SidebarNav({
         sessionId={shareTarget?.id ?? ""}
         sessionTitle={shareTarget?.title ?? ""}
       />
-      <UserMenu collapsed={collapsed} mobile={mobile} />
+      <UserMenu
+        collapsed={collapsed}
+        mobile={mobile}
+        onNavigate={onNavigate}
+      />
     </div>
   );
 }
@@ -2753,9 +2758,12 @@ function SessionProjects({
 function UserMenu({
   mobile = false,
   collapsed = false,
+  onNavigate,
 }: {
   mobile?: boolean;
   collapsed?: boolean;
+  /** 手机抽屉里由外壳传入：菜单项跳转前先收起抽屉，别让抽屉留在设置面板背后。 */
+  onNavigate?: () => void;
 }) {
   const { logout, username, workspaceId, workspaceName } = useAuth();
   const navigate = useNavigate();
@@ -2814,17 +2822,31 @@ function UserMenu({
         <DropdownMenuLabel>个人工作区</DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem
-          onSelect={() => navigate(`/w/${workspaceId}/settings/workspace`)}
+          onSelect={() => {
+            onNavigate?.();
+            navigate(`/w/${workspaceId}/settings/workspace`);
+          }}
         >
           <Settings />
           设置
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => navigate(`/w/${workspaceId}/memory`)}>
+        <DropdownMenuItem
+          onSelect={() => {
+            onNavigate?.();
+            navigate(`/w/${workspaceId}/memory`);
+          }}
+        >
           <Archive />
           工作区记忆
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void logout()} variant="destructive">
+        <DropdownMenuItem
+          onSelect={() => {
+            onNavigate?.();
+            void logout();
+          }}
+          variant="destructive"
+        >
           <LogOut />
           退出登录
         </DropdownMenuItem>
@@ -4962,6 +4984,17 @@ export function WorkspaceShell() {
     setDrawerScrollLock(navOpen);
     return () => setDrawerScrollLock(false);
   }, [navOpen]);
+  // 抽屉展开期间把 Radix 的 portal 弹层抬到抽屉之上：抽屉面板是 z-index
+  // 74/70，而弹层（头像菜单、「更多」、会话操作、确认弹窗）都 portal 到 body
+  // 且层级写死 z-50，不标记就会被抽屉整个盖住，看起来就是「点了没反应」。
+  useEffect(() => {
+    setDrawerLayerOpen("left", navOpen);
+    return () => setDrawerLayerOpen("left", false);
+  }, [navOpen]);
+  useEffect(() => {
+    setDrawerLayerOpen("right", graphDrawerOpen);
+    return () => setDrawerLayerOpen("right", false);
+  }, [graphDrawerOpen]);
   const commitDrawerDrag = useCallback((side: DrawerSide, open: boolean) => {
     if (side === "left") {
       setNavOpen(open);

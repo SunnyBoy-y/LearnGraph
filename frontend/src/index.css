@@ -5335,6 +5335,29 @@ html[data-drawer-dragging="left"] .mobile-nav-drawer-overlay {
 }
 
 /* ===========================================================================
+   抽屉展开时：把 portal 到 body 的 Radix 弹层抬到抽屉之上
+   ---------------------------------------------------------------------------
+   Radix 的弹层一律 portal 到 <body>，层级写死在各组件里（z-50），而左侧导航
+   抽屉是 z-index 74 / 遮罩 73，右侧图谱抽屉是 70 / 遮罩 69。于是抽屉里点头像、
+   点「更多」、点会话操作时，菜单其实已经打开了，只是被抽屉整个盖住 —— 实测
+   document.elementFromPoint 命中的是抽屉面板，表现就是「点了没反应」。
+   抽屉展开期间（<html data-drawer-open>，由 mobile-shell.ts 写入）把这些
+   portal 层整体抬到 76：层级仍然是「弹层 > 抽屉 > 页面」，与桌面端一致。
+   Popper 外层 wrapper 的 z-index 是 Radix 算完写在行内样式里的（抄的是 content
+   的计算值），普通规则盖不住，必须 !important。
+   76 刻意留在 80/85/90（文本选中菜单、概念分支窗）之下，那些该永远在最上层。
+   =========================================================================== */
+html[data-drawer-open] [data-radix-popper-content-wrapper],
+html[data-drawer-open] [data-slot="dialog-overlay"],
+html[data-drawer-open] [data-slot="dialog-content"],
+html[data-drawer-open] [data-slot="alert-dialog-overlay"],
+html[data-drawer-open] [data-slot="alert-dialog-content"],
+html[data-drawer-open] [data-slot="sheet-overlay"],
+html[data-drawer-open] [data-slot="sheet-content"] {
+  z-index: 76 !important;
+}
+
+/* ===========================================================================
    LearnGraph roadmap page — redesigned layout (lg-roadmap-*).
    Self-contained scope; does not touch the legacy .roadmap-* rules above.
    =========================================================================== */
