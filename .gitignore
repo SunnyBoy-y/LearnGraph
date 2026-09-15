@@ -206,6 +206,13 @@ backend/sandbox/.spec-test.json
 .spec-test.json
 /tests/
 
+# 一次性本地验证 / 诊断脚本与临时补丁脚手架（只留本地，不入库）
+# 注：backend/app/ 下的产品代码永不在此列（如 backend/app/voice/embedded_ice.py 属于产品代码，应正常提交）
+/backend/verify_*.py
+/backend/tmp_*.py
+/_seed_*.py
+/tmp-*/
+
 # Blog deliverables (engineering retrospective series) — generated output, kept local
 /blog-output/
 
