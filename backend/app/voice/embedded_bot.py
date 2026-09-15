@@ -1053,7 +1053,23 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point compatible with Pipecat Cloud."""
     transport = await create_transport(runner_args, transport_params)
-    await run_bot(transport, runner_args)
+    try:
+        await run_bot(transport, runner_args)
+    except asyncio.CancelledError:
+        # A cancelled bot is a normal ending, not a failure.  This coroutine is the
+        # ASGI background task of ``POST /api/v1/voice/sessions/{id}/api/offer``, so
+        # the two things that cancel it are both deliberate:
+        #
+        # * a reconnect replaced this pipeline -- ``runner_registry`` cancels the
+        #   registered task once the replacement has taken over the session;
+        # * uvicorn is shutting down and cancels its pending background tasks
+        #   (``Waiting for background tasks to complete``).
+        #
+        # Letting the CancelledError escape made uvicorn print a full
+        # ``ERROR: Exception in ASGI application`` traceback for both of them, which
+        # buried the errors that do matter.  The teardown itself already ran: it
+        # lives in ``run_bot``'s ``finally``.
+        logger.debug("Voice bot task cancelled; pipeline already torn down")
 
 
 if __name__ == "__main__":

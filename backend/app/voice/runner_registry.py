@@ -128,14 +128,29 @@ async def _close_handle(handle: VoiceRunnerHandle, *, reason: str) -> bool:
                 logger.debug("transport %s failed", method_name, exc_info=True)
     task = handle.task
     if task is not None and not task.done():
-        task.cancel()
+        # ``handle.stop`` above has already asked the runner to wind down, so the
+        # task normally returns on its own within a few milliseconds (all that is
+        # left is its own teardown).  Cancel only when it does not: this task is
+        # the ASGI background task the bot runs in, and force-cancelling it makes
+        # uvicorn print "Exception in ASGI application" for what is a normal
+        # hang-up or a reconnect.
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=5)
         except asyncio.TimeoutError:
             logger.warning(
-                "voice runner task for session %s did not stop in time",
+                "voice runner task for session %s did not stop in time; cancelling",
                 handle.voice_session_id,
             )
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "voice runner task for session %s ignored cancellation",
+                    handle.voice_session_id,
+                )
+            except asyncio.CancelledError:
+                pass
         except asyncio.CancelledError:
             pass
         except Exception:
