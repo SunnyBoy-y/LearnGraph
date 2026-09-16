@@ -235,8 +235,19 @@ def parse_realtime_upstream_event(raw: str | bytes) -> RealtimeUpstreamEvent:
     text = result.get("text")
     if not isinstance(text, str):
         return RealtimeUpstreamEvent(event=event)
-    end_time = result.get("end_time")
-    final = result.get("sentence_end") is True or isinstance(end_time, (int, float))
+    # ``sentence_end`` is the only authoritative end-of-sentence signal.
+    # Realtime recognition (qwen3-asr-flash / paraformer-realtime v2) repeats
+    # the same sentence text across several incremental events, and every one
+    # of them carries an integer ``end_time`` -- treating ``end_time`` as a
+    # final marker turns each repeat into a separate final, and the client
+    # (which appends finals) renders one spoken sentence several times.
+    # ``end_time`` remains a fallback only for result shapes that never emit
+    # ``sentence_end`` at all (gummy realtime), never for False/absent-marker
+    # events of models that do.
+    sentence_end = result.get("sentence_end")
+    final = sentence_end is True or (
+        sentence_end is None and isinstance(result.get("end_time"), (int, float))
+    )
     return RealtimeUpstreamEvent(event=event, text=text, final=final)
 
 
