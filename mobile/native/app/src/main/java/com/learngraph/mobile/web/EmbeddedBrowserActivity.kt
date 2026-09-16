@@ -15,6 +15,7 @@ import android.os.Environment
 import android.view.Gravity
 import android.view.View
 import android.webkit.DownloadListener
+import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -28,12 +29,20 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.learngraph.mobile.util.PermissionGate
+import com.learngraph.mobile.util.WebMicPermissionBridge
+import com.learngraph.mobile.util.parseTrustedOrigin
 
 /**
  * 原生版内嵌浏览器（仿 ChatGPT）：
  *  - 打开外部链接 / 网页版兜底（URL 由 EXTRA_URL 传入）
  *  - 异形屏适配：工具条避开状态栏（含挖孔），WebView 底部避开导航栏（手势/三键）
  *  - 工具条：关闭 ✕ | 后退 ◀ | 前进 ▶ | URL（点按复制） | 刷新 ⟳ | 菜单 ⋯
+ *
+ * v0.16.0：补齐麦克风链路。此前本 Activity 的 WebChromeClient 没覆写
+ * `onPermissionRequest`（WebView 默认拒绝），也没有任何运行时权限申请能力 ——
+ * 走「网页版兜底」这条路时麦克风 100% 不可用。现在与主壳共用
+ * WebMicPermissionBridge + PermissionGate。
  */
 class EmbeddedBrowserActivity : AppCompatActivity() {
 
@@ -54,6 +63,8 @@ class EmbeddedBrowserActivity : AppCompatActivity() {
     private lateinit var btnForward: TextView
     private lateinit var progressBar: ProgressBar
 
+    private var micBridge: WebMicPermissionBridge? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -62,6 +73,14 @@ class EmbeddedBrowserActivity : AppCompatActivity() {
             finish()
             return
         }
+
+        // 权限闸门必须在 onStart 之前注册
+        PermissionGate.install(this)
+        // 只信任本页地址：内嵌浏览器可能停在任意站点，不能让别的站点要麦克风
+        micBridge = WebMicPermissionBridge(
+            activity = { this },
+            trustedOrigins = { listOfNotNull(parseTrustedOrigin(webView.url), parseTrustedOrigin(url)) },
+        )
 
         webView = WebView(this)
         tuneWebView()
@@ -96,6 +115,8 @@ class EmbeddedBrowserActivity : AppCompatActivity() {
         s.displayZoomControls = false
         s.loadWithOverviewMode = true
         s.useWideViewPort = true
+        // WebRTC：远端音频走 <audio autoplay>，默认手势门禁会把它挡掉
+        s.mediaPlaybackRequiresUserGesture = false
         webView.overScrollMode = View.OVER_SCROLL_NEVER
 
         webView.webViewClient = object : WebViewClient() {
@@ -123,6 +144,16 @@ class EmbeddedBrowserActivity : AppCompatActivity() {
         webView.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 progressBar.progress = newProgress
+            }
+
+            // 麦克风（语音/听写）：不能直接 grant —— 必须先拿到系统录音权限，
+            // 否则 chromium 建不出音频输入流，网页侧只会得到 "Permission denied"。
+            override fun onPermissionRequest(request: PermissionRequest) {
+                micBridge?.onPermissionRequest(request) ?: runCatching { request.deny() }
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                micBridge?.onPermissionRequestCanceled(request)
             }
         }
 
@@ -261,6 +292,12 @@ class EmbeddedBrowserActivity : AppCompatActivity() {
                 }
             }
             .show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 权限申请路由切回本页（主壳可能刚在本页之下请求过权限）
+        PermissionGate.activate(this)
     }
 
     override fun onBackPressed() {

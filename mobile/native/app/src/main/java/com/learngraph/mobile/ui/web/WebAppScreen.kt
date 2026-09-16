@@ -5,7 +5,6 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.view.ViewGroup
@@ -56,13 +55,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import com.learngraph.mobile.LearnGraphApp
 import com.learngraph.mobile.data.AuthStore
 import com.learngraph.mobile.data.DownloadStatus
 import com.learngraph.mobile.data.DownloadStore
+import com.learngraph.mobile.util.PermissionGate
 import com.learngraph.mobile.util.PhotoCapture
+import com.learngraph.mobile.util.WebMicPermissionBridge
+import com.learngraph.mobile.util.parseTrustedOrigin
 import kotlinx.coroutines.launch
 
 /**
@@ -88,6 +89,21 @@ fun WebAppScreen(
     val downloadTasks by DownloadStore.tasks.collectAsState()
     val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
     val scope = rememberCoroutineScope()
+
+    // 麦克风授权桥：把网页的 getUserMedia 与系统运行时权限串起来。
+    // 不变量 —— 只有在系统真的授予 RECORD_AUDIO 之后，才对网页放行麦克风。
+    // trustedOrigins 懒解析：服务器地址可能在本次组合之后被连接页改写。
+    val micBridge = remember {
+        WebMicPermissionBridge(
+            activity = { context as? FragmentActivity },
+            trustedOrigins = {
+                listOf(
+                    webViewRef.value?.url,
+                    app.api.baseUrl,
+                ).mapNotNull { parseTrustedOrigin(it) }
+            },
+        )
+    }
 
     // 断网检测：离线时显示横幅，网络恢复后自动 reload 网页版
     var offline by remember { mutableStateOf(false) }
@@ -178,6 +194,10 @@ fun WebAppScreen(
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            // WebRTC：bot 的声音走 <audio autoplay>，断线自动重连时没有
+                            // 新的用户手势；默认 mediaPlaybackRequiresUserGesture=true
+                            // 会把远端音频挡掉。
+                            settings.mediaPlaybackRequiresUserGesture = false
                             settings.textZoom = 100
                             // 宽度定死为手机真实宽度：尊重 viewport meta（device-width），
                             // 初始缩放强制 100%（1:1 不缩放），禁用双指/页面缩放，不缩略显示
@@ -413,7 +433,7 @@ fun WebAppScreen(
 
                             // 内置下载器：拦截网页下载
                             setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-                                requestNotifPermissionIfNeeded(ctx)
+                                requestNotifPermissionIfNeeded()
                                 val token = if (isSameServer(Uri.parse(url), app.api.baseUrl)) authState.token else null
                                 DownloadStore.enqueue(
                                     context = ctx,
@@ -455,20 +475,22 @@ fun WebAppScreen(
                                     return true
                                 }
 
-                                // 麦克风（语音输入 / 长按语音条）：网页 getUserMedia({audio})
-                                // 必须在这里显式授权，否则 WebView 默认拒绝 → "permission denied"。
-                                // 仅放行纯音频捕获；同时申请摄像头的一律拒绝（隐私最小化）。
+                                // 麦克风（语音模式 / 长按语音条 / 听写）：网页 getUserMedia({audio})
+                                //
+                                // ⚠️ 不能在这里无条件 grant。grant() 只表示「网页被允许用
+                                // 麦克风」，不代表本 App 持有系统录音权限；系统没授权就放行，
+                                // chromium 建不出音频输入流，getUserMedia 会 reject 成
+                                // NotAllowedError（message 就是 "Permission denied"）。
+                                // 这里全部交给 WebMicPermissionBridge：它先把系统权限拿到手
+                                // （用时才申请、可反复申请、永久拒绝时引导去设置），再放行网页。
                                 override fun onPermissionRequest(request: android.webkit.PermissionRequest) {
-                                    val resources = request.resources
-                                    val audioOnly = resources.isNotEmpty() &&
-                                        resources.all { it == android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE }
-                                    if (audioOnly) {
-                                        request.grant(
-                                            arrayOf(android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE),
-                                        )
-                                    } else {
-                                        request.deny()
-                                    }
+                                    micBridge.onPermissionRequest(request)
+                                }
+
+                                // 网页跳转 / 重复申请时 WebView 会取消挂起的申请：
+                                // 必须清引用，否则对已取消的 request 调 grant() 会抛异常。
+                                override fun onPermissionRequestCanceled(request: android.webkit.PermissionRequest) {
+                                    micBridge.onPermissionRequestCanceled(request)
                                 }
                             }
 
@@ -524,16 +546,10 @@ fun WebAppScreen(
     }
 }
 
-private fun requestNotifPermissionIfNeeded(ctx: Context) {
-    if (Build.VERSION.SDK_INT >= 33) {
-        val activity = ctx as? Activity ?: return
-        if (
-            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2001)
-        }
-    }
+/** 通知权限（仅 API 33+ 需要）：统一走 PermissionGate，避免与其它权限申请互相挤掉。 */
+private fun requestNotifPermissionIfNeeded() {
+    if (Build.VERSION.SDK_INT < 33) return
+    PermissionGate.request(Manifest.permission.POST_NOTIFICATIONS)
 }
 
 /** 网页 → 原生 JS bridge（Android 4.2+ 需要 @JavascriptInterface 才暴露） */

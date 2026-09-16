@@ -3,7 +3,6 @@ package com.learngraph.mobile
 import android.Manifest
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
@@ -11,13 +10,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.fragment.app.FragmentActivity
 import com.learngraph.mobile.notify.ReplyNotifier
 import com.learngraph.mobile.ui.navigation.AppNav
 import com.learngraph.mobile.ui.theme.LearnGraphTheme
+import com.learngraph.mobile.util.PermissionGate
 import com.learngraph.mobile.util.PhotoCapture
 import com.learngraph.mobile.util.ShortcutActions
 import java.util.concurrent.Executors
@@ -40,6 +38,13 @@ import java.util.concurrent.Executors
  *  - 长按图标快捷方式（新对话/记笔记/投递任务/切换服务器）
  *  - 拍照即问（PhotoCapture launcher 注册）
  *  - 分享收件箱快捷动作注入
+ *
+ * v0.16.0 权限口径（见 PermissionGate）：
+ *  - 所有运行时权限申请走同一条串行队列。旧代码在 onCreate 里连发「通知」与
+ *    「麦克风」两个申请，后发的会被系统静默丢弃（同一时刻只允许一个在途申请），
+ *    直接导致网页里 getUserMedia 永远 "Permission denied"。
+ *  - **麦克风不再在冷启动盲问**：改由用户真正点语音/听写时触发
+ *    （WebMicPermissionBridge → PermissionGate），拒了也能反复再问。
  */
 class MainActivity : FragmentActivity() {
 
@@ -48,6 +53,8 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         PhotoCapture.init(this)
+        // 权限统一闸门：必须在 onStart 之前注册（registerForActivityResult 的硬约束）
+        PermissionGate.install(this)
         PhotoCapture.setWebView(null)
         ShortcutActions.register(this)
         // 从启动 Intent（快捷方式/分享）读取动作
@@ -84,7 +91,6 @@ class MainActivity : FragmentActivity() {
     private fun proceed() {
         ReplyNotifier.start(this)
         requestNotifPermissionIfNeeded()
-        requestMicPermissionIfNeeded()
         setContent {
             LearnGraphTheme {
                 AppNav()
@@ -160,6 +166,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 把权限申请路由切回本页（内嵌浏览器可能刚在本页之上跑过）
+        PermissionGate.activate(this)
         ReplyNotifier.setForeground(true)
     }
 
@@ -184,31 +192,14 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    /**
+     * 通知权限（仅 API 33+ 需要）。
+     *
+     * 走 PermissionGate 而不是直接 `ActivityCompat.requestPermissions`：
+     * 闸门保证同一时刻只有一个在途申请，不会再把别的权限申请挤掉。
+     */
     private fun requestNotifPermissionIfNeeded() {
-        if (
-            Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                1001,
-            )
-        }
-    }
-
-    /** 语音输入（长按语音条 / 麦克风）所需的麦克风运行时权限。 */
-    private fun requestMicPermissionIfNeeded() {
-        if (
-            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                1002,
-            )
-        }
+        if (Build.VERSION.SDK_INT < 33) return
+        PermissionGate.request(Manifest.permission.POST_NOTIFICATIONS)
     }
 }

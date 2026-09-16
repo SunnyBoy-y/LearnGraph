@@ -13,6 +13,15 @@
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
 
+    <!-- 语音/WebRTC（系统 WebView 里 getUserMedia({audio})）需要 RECORD_AUDIO。
+         它会隐式要求 android.hardware.microphone，这里显式声明为「非必需」，
+         避免无麦克风的设备（平板/盒子）被安装器判定为不兼容。
+         运行时申请口径见 util/PermissionGate.kt 与 util/WebMicPermissionBridge.kt：
+         麦克风「用时才问」，且任何一次拒绝都能反复再申请。 -->
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
     <application
         android:name=".LearnGraphApp"
         android:allowBackup="true"
