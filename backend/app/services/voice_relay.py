@@ -205,6 +205,26 @@ def _fingerprint(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:32]
 
 
+def _dedupe_urls(values: Any) -> tuple[str, ...]:
+    """Drop repeated ICE URLs while keeping the administrator's order.
+
+    Duplicates are not cosmetic here: the list is what both the browser and aiortc
+    are handed, and aiortc honours **only the first TURN entry**, so a list that
+    silently repeats a transport is a list whose real preference is hard to read.
+    Applied on write *and* on read, because rows saved before this existed still
+    carry the duplicate (`turns:…:5349?transport=tcp` was stored twice).
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in values or ():
+        url = str(item).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        ordered.append(url)
+    return tuple(ordered)
+
+
 class VoiceRelayService:
     """Read/write the single deployment relay row and resolve live credentials."""
 
@@ -224,7 +244,7 @@ class VoiceRelayService:
 
     def public_config(self) -> dict[str, Any]:
         config = self.get_config()
-        urls = [str(item) for item in (config.urls or [])] if config else []
+        urls = list(_dedupe_urls(config.urls)) if config else []
         return {
             "configured": config is not None and bool(config.secret_fingerprint),
             "enabled": bool(config.enabled) if config else False,
@@ -361,7 +381,7 @@ class VoiceRelayService:
             items = [str(item).strip() for item in raw]
         else:
             raise AppError(400, "voice_relay_urls_invalid", "urls 必须是字符串或字符串数组")
-        urls = tuple(item for item in items if item)
+        urls = _dedupe_urls(items)
         if not urls:
             raise AppError(400, "voice_relay_urls_required", "至少需要一个 STUN 或 TURN 地址")
         for url in urls:
@@ -445,7 +465,7 @@ class VoiceRelayService:
             api_base = (config.api_base or DEFAULT_API_BASE).rstrip("/")
             key_id = config.key_id or ""
             ttl = int(config.credential_ttl_seconds or DEFAULT_CREDENTIAL_TTL)
-            configured_urls = tuple(str(item) for item in (config.urls or []) if item)
+            configured_urls = _dedupe_urls(config.urls)
             payload = self._open_secret(config)
             self.db.commit()
         except ProviderSecretUnavailable as exc:
