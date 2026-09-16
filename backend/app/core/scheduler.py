@@ -9,6 +9,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import delete, func, select, text, update
 
@@ -1036,6 +1037,93 @@ async def mcp_runner_cleanup_scheduler(
             await asyncio.to_thread(run_mcp_runner_cleanup_sweep)
         except Exception:
             logger.exception("Periodic MCP runner cleanup wake-up failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+def run_voice_turn_sweep() -> dict[str, Any]:
+    """Settle voice turns no worker ever acknowledged (see ``voice/turns.py``).
+
+    Worker-local sweeps cover a live call, but not a worker that died, a pipeline
+    rebuilt mid-turn, or a call that ended while a turn was still ``accepted``.
+    This is the process-wide backstop: one indexed query for the sessions that
+    still hold open turns, then an age- and evidence-gated close per session.
+    """
+    from app.voice.turns import run_stale_turn_sweep
+
+    totals = run_stale_turn_sweep()
+    if totals.get("closed"):
+        logger.warning(
+            "Voice turn sweep closed %s stuck turns across %s sessions",
+            totals["closed"],
+            totals["sessions"],
+        )
+    return totals
+
+
+async def voice_turn_sweep_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    """Periodic aging sweep for stuck voice turns."""
+
+    interval = max(
+        5,
+        interval_seconds
+        if interval_seconds is not None
+        else int(get_settings().voice_turn_sweep_interval_seconds),
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_voice_turn_sweep)
+        except Exception:
+            logger.debug("Voice turn sweep round skipped", exc_info=True)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except TimeoutError:
+            continue
+
+
+def run_voice_session_reaper() -> dict[str, Any]:
+    """Close abandoned calls (see ``voice/reaper.py``).
+
+    The durable session TTL: a call whose peer is gone but whose row still says
+    ``active`` keeps a realtime ASR session and a bidirectional TTS stream open
+    for ever.  Nothing else in the system ends it.
+    """
+    from app.voice.reaper import run_voice_session_idle_sweep
+
+    totals = run_voice_session_idle_sweep()
+    if totals.get("closed"):
+        logger.warning(
+            "Voice session reaper closed %s abandoned session(s) (%s idle, %s kept "
+            "because their pipeline is still live)",
+            totals["closed"],
+            totals.get("idle"),
+            totals.get("skipped_local"),
+        )
+    return totals
+
+
+async def voice_session_reaper_scheduler(
+    stop: asyncio.Event,
+    interval_seconds: int | None = None,
+) -> None:
+    """Periodic idle sweep over active voice sessions."""
+
+    interval = max(
+        15,
+        interval_seconds
+        if interval_seconds is not None
+        else int(get_settings().voice_session_reaper_interval_seconds),
+    )
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(run_voice_session_reaper)
+        except Exception:
+            logger.debug("Voice session reaper round skipped", exc_info=True)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

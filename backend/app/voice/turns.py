@@ -20,13 +20,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 from uuid import uuid4
 
 from sqlalchemy import select
 
 from app.core.database import SessionLocal
-from app.domain.models import VoiceTurnRecord
+from app.domain.models import VoiceEventRecord, VoiceTurnRecord
 from app.voice.events import (
     PHASE_AUTHORITATIVE,
     VoiceEventSink,
@@ -50,6 +50,17 @@ OPEN_TURN_STATUSES = (TURN_ACCEPTED,)
 # ``list_turns`` uses this so a refresh recovers failed/interrupted turns too,
 # not just successful ones.
 TERMINAL_TURN_STATUSES = (TURN_FINALIZED, TURN_INTERRUPTED, TURN_FAILED)
+
+# Why a turn that nobody ever answered was closed by the aging sweep. It is a
+# failure, not a deletion: the question stays in the transcript with a retry
+# affordance, exactly like ``llm_error`` / ``turn_idle_timeout``.
+STALE_TURN_REASON = "turn_stale"
+# The call ended with this turn still open (hung up mid-answer / mid-typing).
+SESSION_CLOSED_TURN_REASON = "session_closed"
+# Events that prove the worker picked the turn up and is producing an answer
+# under *its own* turn id. Used by the sweep as the "somebody is working on this
+# turn" evidence, so a long but live answer is never mistaken for a hang.
+_TURN_PROGRESS_EVENT_PREFIX = "assistant."
 
 
 def utc_now() -> datetime:
@@ -219,6 +230,176 @@ def open_turn(voice_session_id: str) -> dict[str, Any] | None:
         return turn_to_dict(row) if row else None
 
 
+def _turn_age_secs(started_at: datetime | None, *, now: datetime) -> float | None:
+    """Age of a turn in seconds; ``None`` when the row carries no start time.
+
+    ``started_at`` is written as an aware UTC value, but SQLite hands it back
+    naive, so both shapes have to be accepted here.
+    """
+    if started_at is None:
+        return None
+    moment = (
+        started_at
+        if started_at.tzinfo is not None
+        else started_at.replace(tzinfo=timezone.utc)
+    )
+    return (now - moment).total_seconds()
+
+
+def list_stale_open_turns(
+    voice_session_id: str,
+    *,
+    max_age_secs: float,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Turns of this session still ``accepted`` past ``max_age_secs``, oldest first.
+
+    The age is compared in Python on purpose: the column is
+    ``DateTime(timezone=True)`` while SQLite stores it without an offset, so a
+    bound aware parameter compares as a *string* and silently misorders.
+    """
+    current = now or utc_now()
+    with SessionLocal() as db:
+        rows = db.scalars(
+            select(VoiceTurnRecord)
+            .where(
+                VoiceTurnRecord.voice_session_id == voice_session_id,
+                VoiceTurnRecord.status.in_(OPEN_TURN_STATUSES),
+            )
+            .order_by(VoiceTurnRecord.created_at.asc())
+        ).all()
+    stale: list[dict[str, Any]] = []
+    for row in rows:
+        age = _turn_age_secs(row.started_at, now=current)
+        if age is None or age < max(0.0, float(max_age_secs)):
+            continue
+        stale.append(turn_to_dict(row))
+    return stale
+
+
+def turn_has_worker_progress(voice_session_id: str, turn_id: str) -> bool:
+    """True when the worker produced assistant output under this turn's own id.
+
+    A turn the control plane opened and then nobody acknowledged carries only the
+    transcript/accept events of ``accept_turn`` (and, in the defect this guards
+    against, not even under its own id); a turn the worker is actually answering
+    carries ``assistant.*`` events. That difference is what lets the sweep close a
+    hung turn without ever cutting a live answer short.
+    """
+    if not turn_id:
+        return False
+    with SessionLocal() as db:
+        found = db.scalar(
+            select(VoiceEventRecord.event_id)
+            .where(
+                VoiceEventRecord.voice_session_id == voice_session_id,
+                VoiceEventRecord.turn_id == turn_id,
+                VoiceEventRecord.event_type.like(f"{_TURN_PROGRESS_EVENT_PREFIX}%"),
+            )
+            .limit(1)
+        )
+    return found is not None
+
+
+def finalize_stale_turns(
+    voice_session_id: str,
+    *,
+    max_age_secs: float,
+    skip_turn_ids: Iterable[str] = (),
+    reason: str = STALE_TURN_REASON,
+    now: datetime | None = None,
+) -> list[str]:
+    """Close stuck open turns of one session; returns the ids it closed.
+
+    Three guards, in order:
+
+    * ``skip_turn_ids`` — turns the caller (the audio worker) owns. Its own turn
+      has its own idle ceiling and closing it from the outside would bypass the
+      state that holds the answer.
+    * ``turn_has_worker_progress`` — a turn whose id shows up in ``assistant.*``
+      events is being answered right now, however old it is.
+    * the age ceiling itself.
+
+    Everything closed here is closed as ``failed``: the question is kept in the
+    transcript with a retry affordance, no empty assistant message is written, and
+    nothing reaches long-term memory.
+    """
+    skip = {str(item) for item in skip_turn_ids if item}
+    closed: list[str] = []
+    for row in list_stale_open_turns(
+        voice_session_id, max_age_secs=max_age_secs, now=now
+    ):
+        turn_id = str(row.get("turn_id") or "")
+        if not turn_id or turn_id in skip:
+            continue
+        if turn_has_worker_progress(voice_session_id, turn_id):
+            continue
+        try:
+            finalize_turn(
+                voice_session_id,
+                turn_id,
+                "",
+                user_text=str(row.get("user_text") or "") or None,
+                outcome=TURN_FAILED,
+                failure_reason=reason,
+            )
+        except Exception:
+            logger.warning(
+                "stale voice turn %s could not be closed", turn_id, exc_info=True
+            )
+            continue
+        closed.append(turn_id)
+        logger.warning(
+            "voice turn %s was never answered (age >= %.0fs); closed as %s",
+            turn_id,
+            max(0.0, float(max_age_secs)),
+            reason,
+        )
+    return closed
+
+
+def run_stale_turn_sweep(
+    *,
+    max_age_secs: float | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Process-wide aging sweep over every voice session that still has open turns.
+
+    This is the durable backstop for the case the per-call worker cannot cover:
+    a worker that died, a pipeline that was rebuilt mid-turn, or a turn the audio
+    path never acknowledged. Without it such a row stays ``accepted`` forever --
+    the page waits for a ``turn.finalized`` that never arrives, and the question
+    never reaches the transcript or memory.
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    ceiling = (
+        float(settings.voice_turn_stale_timeout)
+        if max_age_secs is None
+        else float(max_age_secs)
+    )
+    if ceiling <= 0:
+        return {"sessions": 0, "closed": 0}
+    current = utc_now()
+    with SessionLocal() as db:
+        session_ids = [
+            str(item)
+            for item in db.scalars(
+                select(VoiceTurnRecord.voice_session_id)
+                .where(VoiceTurnRecord.status.in_(OPEN_TURN_STATUSES))
+                .distinct()
+                .limit(max(1, int(limit)))
+            ).all()
+        ]
+    closed = 0
+    for session_id in session_ids:
+        closed += len(
+            finalize_stale_turns(session_id, max_age_secs=ceiling, now=current)
+        )
+    return {"sessions": len(session_ids), "closed": closed}
+
+
 def list_turns(voice_session_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
     """Authoritative transcript, oldest first.
 
@@ -244,6 +425,7 @@ def finalize_turn(
     turn_id: str,
     assistant_text: str = "",
     *,
+    user_text: str | None = None,
     request_id: str | None = None,
     audio_cursor_ms: int | None = None,
     context_epoch: int | None = None,
@@ -256,6 +438,12 @@ def finalize_turn(
     Idempotent: the status transition happens once, and the chat persistence is
     keyed on the turn id so a retry after a crash converges on the same
     messages.  Only this function writes long-term transcript/memory.
+
+    ``user_text`` is the caller's authoritative question whenever it holds more
+    than the row does.  The row only carries the segment that *opened* the turn
+    (see ``accept_turn``), while the caller merges consecutive ASR finals into one
+    question -- without this override the transcript keeps the first segment and
+    the page shows a truncated question beside an answer to the whole thing.
 
     ``outcome`` is the settled status: ``finalized`` (an answer exists),
     ``interrupted`` (barged in) or ``failed`` (no answer: provider error, or the
@@ -276,6 +464,16 @@ def finalize_turn(
         )
         if turn is None:
             raise ValueError(f"voice turn {turn_id} was not found")
+        if user_text is not None and user_text.strip():
+            merged = user_text.strip()
+            if turn.user_text != merged:
+                turn.user_text = merged
+                # Commit immediately: the branches below only commit when they
+                # change the status or fill in a missing answer, so an already
+                # settled turn (typically ``interrupted``) would otherwise drop
+                # this correction when the session closes.
+                db.commit()
+                db.refresh(turn)
         if turn.status not in TERMINAL_TURN_STATUSES:
             turn.assistant_text = assistant_text or turn.assistant_text
             turn.status = outcome

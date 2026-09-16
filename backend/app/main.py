@@ -24,6 +24,8 @@ from app.core.scheduler import (
     sandbox_cleanup_scheduler,
     sandbox_execution_scheduler,
     stream_events_retention_scheduler,
+    voice_session_reaper_scheduler,
+    voice_turn_sweep_scheduler,
     wal_checkpoint_scheduler,
 )
 from app.services.durable_queue import (
@@ -110,6 +112,10 @@ async def lifespan(app: FastAPI):
     sandbox_exec_task: asyncio.Task[None] | None = None
     stream_events_retention_stop: asyncio.Event | None = None
     stream_events_retention_task: asyncio.Task[None] | None = None
+    voice_turn_sweep_stop: asyncio.Event | None = None
+    voice_turn_sweep_task: asyncio.Task[None] | None = None
+    voice_reaper_stop: asyncio.Event | None = None
+    voice_reaper_task: asyncio.Task[None] | None = None
     if settings.mastery_embedded_scheduler_enabled:
         scheduler_stop = asyncio.Event()
         scheduler_task = asyncio.create_task(mastery_scheduler(scheduler_stop))
@@ -143,6 +149,26 @@ async def lifespan(app: FastAPI):
         hot_archive_stop = asyncio.Event()
         hot_archive_task = asyncio.create_task(
             hot_table_archive_scheduler(hot_archive_stop)
+        )
+    if settings.voice_turn_sweep_enabled and settings.voice_turn_stale_timeout > 0:
+        # Startup is where a voice turn left hanging by a previous process gets
+        # settled: the worker that owned it may never come back, and until it is
+        # closed the page keeps waiting and the question stays out of the
+        # transcript and out of memory.
+        voice_turn_sweep_stop = asyncio.Event()
+        voice_turn_sweep_task = asyncio.create_task(
+            voice_turn_sweep_scheduler(voice_turn_sweep_stop)
+        )
+    if (
+        settings.voice_session_reaper_enabled
+        and settings.voice_session_idle_timeout_seconds > 0
+    ):
+        # Session TTL: an abandoned call (closed lid, phone in a pocket) would
+        # otherwise hold a realtime ASR session and a bidirectional TTS stream open
+        # for ever, because nothing in the call path ends them.
+        voice_reaper_stop = asyncio.Event()
+        voice_reaper_task = asyncio.create_task(
+            voice_session_reaper_scheduler(voice_reaper_stop)
         )
     try:
         yield
@@ -184,6 +210,12 @@ async def lifespan(app: FastAPI):
         if hot_archive_stop is not None and hot_archive_task is not None:
             hot_archive_stop.set()
             await hot_archive_task
+        if voice_turn_sweep_stop is not None and voice_turn_sweep_task is not None:
+            voice_turn_sweep_stop.set()
+            await voice_turn_sweep_task
+        if voice_reaper_stop is not None and voice_reaper_task is not None:
+            voice_reaper_stop.set()
+            await voice_reaper_task
 
 
 class SecurityHeadersMiddleware:
