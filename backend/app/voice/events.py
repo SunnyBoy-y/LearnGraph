@@ -58,10 +58,17 @@ VOICE_EVENT_TYPES: tuple[str, ...] = (
     "turn.interrupted",
     "assistant.llm.delta",
     "assistant.sentence.queued",
+    "assistant.sentence.ended",
     "assistant.sentence.playback_started",
     "assistant.sentence.playback_ended",
+    # 客户端播放确认：只用于回放位置/审计，绝不参与回合终态判定。
+    "assistant.playback.ack",
     "processor.error",
     "processor.retry_scheduled",
+    # 非错误的阶段提示（"上游已关闭，下次说话会重连"/"本机 VAD 无帧，已用能量
+    # 兜底"）。与 processor.error 同一条 durable 通道，但客户端只在
+    # ``degraded=true`` 时才降级，所以这类提示不会把通话切进文本模式。
+    "processor.notice",
     "context.updated",
     "session.ice",
 )
@@ -155,7 +162,14 @@ def _to_handle(row: VoiceSessionRecord) -> VoiceSessionHandle:
 
 
 def envelope_from_record(record: VoiceEventRecord) -> dict[str, Any]:
-    """Serialize a durable event into the transport envelope the client reads."""
+    """Serialize a durable event into the transport envelope the client reads.
+
+    音频闸门代次与句身份从 ``payload`` 提升到顶层：一条语音数据流上的每个音频/
+    文字事件都带同一套身份（``generation_id``/``segment_id``/``context_id``），
+    客户端 reducer 才能在做任何渲染之前先判作用域。提升而不是改数据库列，是为了
+    不引入迁移：这些字段本来就随 ``emit`` 写进了 payload。
+    """
+    payload = dict(record.payload or {})
     return {
         "event_id": record.event_id,
         "type": record.event_type,
@@ -168,8 +182,12 @@ def envelope_from_record(record: VoiceEventRecord) -> dict[str, Any]:
         "phase": record.phase,
         "causality": dict(record.causality or {}),
         "audio_cursor_ms": record.audio_cursor_ms,
+        # 诊断用：Pipecat 的 audio context uuid，不是回合身份。
+        "context_id": payload.get("context_id"),
+        "generation_id": payload.get("generation_id"),
+        "segment_id": payload.get("segment_id"),
         "timestamp": record.created_at.isoformat() if record.created_at else None,
-        "payload": dict(record.payload or {}),
+        "payload": payload,
     }
 
 
@@ -197,6 +215,9 @@ class VoiceEventSink:
         audio_cursor_ms: int | None = None,
         request_id: str | None = None,
         session_epoch: int | None = None,
+        generation_id: int | None = None,
+        segment_id: str | None = None,
+        context_id: str | None = None,
     ) -> dict[str, Any]:
         """Append one event and return its transport envelope.
 
@@ -204,10 +225,22 @@ class VoiceEventSink:
         ``(request_id, event_type)`` returns the stored row instead of appending
         a second event with a new sequence number.  That is what lets a retried
         processor or a re-delivered HTTP call converge on one event.
+
+        ``generation_id``/``segment_id``/``context_id`` 合并进 payload 后由
+        :func:`envelope_from_record` 提升到顶层，因此调用方不需要（也不能）
+        为它们新增数据库列；``None`` 不写入，避免把"没有这个身份"误当成身份的
+        一个取值。
         """
         if event_type not in VOICE_EVENT_TYPES:
             raise ValueError(f"unknown voice event type: {event_type}")
         safe_payload = json_safe(payload or {})
+        for key, value in (
+            ("generation_id", generation_id),
+            ("segment_id", segment_id),
+            ("context_id", context_id),
+        ):
+            if value is not None:
+                safe_payload[key] = value
         safe_causality = json_safe(causality or {})
         rid = request_id or f"req_{uuid4().hex[:20]}"
         event_id = f"ve_{uuid4().hex[:24]}"

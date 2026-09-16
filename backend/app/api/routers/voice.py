@@ -98,7 +98,14 @@ def replay_voice_events(voice_session_id: str, after_event_seq: int = Query(defa
     service = svc(db, context, settings)
     events = service.replay_events(voice_session_id, after_event_seq)
     current = service.get_session(voice_session_id).event_seq
-    return VoiceEventReplayResponse(events=events, last_event_seq=max(current, events[-1].seq if events else after_event_seq))
+    last = max(current, events[-1].seq if events else after_event_seq)
+    # 会话级水位，而不是返回数组的最大值：同会话 event_seq 由实体主键自增保证连续，
+    # 任何按类型的过滤（replay_events(types=...)）都只是投递子集，用返回数组的最大值
+    # 会把被过滤掉的序号当成"已确认覆盖"，跳过的 seq 再也补不回来。
+    contiguous = max(int(current or 0), int(after_event_seq or 0))
+    return VoiceEventReplayResponse(
+        events=events, last_event_seq=last, contiguous_through=contiguous
+    )
 
 @router.post("/sessions/{voice_session_id}/turns/accept")
 def accept_voice_turn(voice_session_id: str, payload: dict, db: DB, context: CurrentWorkspace, settings: AppSettings):

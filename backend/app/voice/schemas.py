@@ -10,8 +10,10 @@ VOICE_EVENT_TYPES = (
     "session.created", "session.ready", "session.reconnecting", "session.closed",
     "user.started", "user.interim", "user.final", "turn.accepted", "turn.finalized",
     "turn.interrupted", "assistant.llm.delta", "assistant.sentence.queued",
+    "assistant.sentence.ended", "assistant.playback.ack",
     "assistant.sentence.playback_started", "assistant.sentence.playback_ended",
-    "processor.error", "processor.retry_scheduled", "context.updated",
+    "processor.error", "processor.retry_scheduled", "processor.notice",
+    "context.updated",
     "session.ice",
 )
 
@@ -25,6 +27,12 @@ class RTVIEventEnvelope(BaseModel):
     event_id: str | None = None
     session_epoch: int = 1
     turn_id: str | None = None
+    # 音频闸门代次 / 句段身份 / Pipecat audio context，由 durable payload 提升而来
+    # （见 ``app.voice.events.envelope_from_record``）。声明成字段是为了让"每个
+    # 音频与文字事件都带同一套身份"成为类型契约，而不是靠 extra="allow" 兜底。
+    generation_id: int | None = None
+    segment_id: str | None = None
+    context_id: str | None = None
     phase: Literal["speculative", "authoritative"] = "authoritative"
     causality: dict[str, Any] = Field(default_factory=dict)
     audio_cursor_ms: int | None = Field(default=None, ge=0)
@@ -179,3 +187,7 @@ class VoiceEventResponse(BaseModel):
 class VoiceEventReplayResponse(BaseModel):
     events: list[RTVIEventEnvelope] = Field(default_factory=list)
     last_event_seq: int = 0
+    # 连续覆盖水位：服务端保证 <= 该值的序号已全部投递（不存在空洞）。
+    # 客户端只能从它之后继续拉取，否则按类型过滤出来的"跳号"会被误判成丢事件，
+    # 而被跳过的序号永远补不回来。
+    contiguous_through: int = 0
