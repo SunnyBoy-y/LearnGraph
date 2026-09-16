@@ -13,9 +13,9 @@ import type { VoiceRenderUpdate } from "./voice-session-controller";
  * settled turn and carries no text of its own.
  */
 export function shouldCommitVoiceRender(
-  update: Pick<VoiceRenderUpdate, "final" | "role" | "text" | "removes">,
+  update: Pick<VoiceRenderUpdate, "final" | "role" | "text" | "removes" | "retireTurnSegments">,
 ): boolean {
   if (update.role !== "user" && update.role !== "assistant") return false;
   if (update.text.trim().length > 0) return true;
-  return (update.removes?.length ?? 0) > 0;
+  return (update.removes?.length ?? 0) > 0 || Boolean(update.retireTurnSegments);
 }

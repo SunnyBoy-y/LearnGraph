@@ -112,7 +112,7 @@ import {
   transcribeAudioFile,
   transcribeDictationSegment,
 } from "@/api";
-import { VoiceCallControl, VoiceComposerActions } from "@/features/voice/voice-orb";
+import { VoiceCallControl, VoiceComposerActions, VoiceOrb } from "@/features/voice/voice-orb";
 import { voiceStatusText } from "@/features/voice/voice-status";
 import { VoiceTaskChip } from "@/features/voice/voice-task-chip";
 import { voiceSessionController } from "@/features/voice/voice-session-controller";
@@ -142,6 +142,7 @@ import {
 } from "@/components/ai-elements/conversation";
 import { useConversationScrollController } from "@/features/chat/use-conversation-scroll-controller";
 import { shouldCommitVoiceRender } from "@/features/voice/voice-render-policy";
+import { mergeVoiceTrace, retireVoiceRows } from "@/features/voice/voice-rows";
 import {
   Message as AiMessage,
   MessageAction,
@@ -193,6 +194,11 @@ import {
 } from "@/components/chat/question-set-pager";
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
+import {
+  isPlainSpokenSentence,
+  readVoiceTypingTiming,
+  VoiceTypingText,
+} from "@/components/chat/voice-typing-text";
 import {
   locateSelectionInContent,
   selectionToolbarPoint,
@@ -981,6 +987,30 @@ const DICTATION_CLEANUP_MAX_CHUNK_CHARS = 1_800;
 const DICTATION_CLEANUP_CONTEXT_CHARS = 80;
 const DICTATION_CLEANUP_MAX_FAILURES = 2;
 
+/**
+ * 上游 WS 通道会对同一句重复下发 final（增量假设曾因带 end_time 被误判为
+ * final，见 backend/app/services/dictation.py 的 final 判定修复）。这里做
+ * 前端兜底：短窗口内文本相同的 final 只追加一次，避免「一句话原样重复四遍」。
+ * 窗口很短（2.5s），不会误伤用户刻意重复的同一句话。
+ */
+const DICTATION_FINAL_DEDUP_WINDOW_MS = 2_500;
+let lastDictationFinal: { text: string; at: number } = { text: "", at: 0 };
+
+/** 返回可追加的干净文本；重复 final 返回 null（调用方跳过追加）。 */
+function dedupeDictationFinal(text: string): string | null {
+  const clean = String(text ?? "").trim();
+  if (!clean) return null;
+  const now = Date.now();
+  if (
+    clean === lastDictationFinal.text &&
+    now - lastDictationFinal.at < DICTATION_FINAL_DEDUP_WINDOW_MS
+  ) {
+    return null;
+  }
+  lastDictationFinal = { text: clean, at: now };
+  return clean;
+}
+
 // 听写文本 → 热词候选：按标点/空白分词，过滤单字、纯数字与常见语气词。
 const ASR_HOTWORD_STOPWORDS = new Set([
   "这个", "那个", "然后", "就是", "一个", "我们", "你们", "他们", "可以",
@@ -1714,7 +1744,7 @@ function UserMessage({
           </div>
         )}
       </MessageContent>
-      {!editing ? (
+      {!editing && message.provider_trace?.voice_segment !== true ? (
         <MessageActions className="chat-message-actions--user min-h-8 justify-end opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           <MessageAction
             label="复制消息"
@@ -1933,9 +1963,26 @@ function AssistantMessageInner({
       shown.role === "assistant" &&
       part.status === "streaming"
     ) {
+      // Typewriter: the sentence being read aloud is typed out as it plays, so
+      // the text never runs ahead of the voice and the unspoken tail is simply
+      // not on screen. Prose only -- typing needs the text split up, which would
+      // show markdown syntax while the sentence is still being read.
+      const typing =
+        shown.status === "streaming" ? readVoiceTypingTiming(part.data) : null;
+      const sentence = part.content ?? "";
+      const typed = Boolean(typing && isPlainSpokenSentence(sentence));
       return (
-        <div className="chat-voice-sentence is-speaking" key={part.id}>
-          {rendered}
+        <div
+          // The caret marks where the voice is, so the typing path needs no
+          // background -- and painting one would now cover the whole answer.
+          className={typed ? "chat-voice-sentence" : "chat-voice-sentence is-speaking"}
+          key={part.id}
+        >
+          {typed ? (
+            <VoiceTypingText active text={sentence} timing={typing} />
+          ) : (
+            rendered
+          )}
         </div>
       );
     }
@@ -2158,22 +2205,31 @@ function AssistantMessageInner({
         ) : null}
         </div>
       </MessageContent>
-      <StreamStatsBadge
-        messageId={message.id}
-        status={shown.status}
-        providerTrace={shown.provider_trace}
-      />
-      <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
-        <MessageAction
-          label="复制全文"
-          onClick={() =>
-           void navigator.clipboard
-              .writeText(fullText)
-              .then(() => toast.success("已复制回答"))
-              .catch(() => toast.error("无法复制回答"))
-          }
-          tooltip="复制全文"
-        >
+      {
+        // A voice answer is not a token stream, so this badge has nothing to
+        // measure: while the answer was being read aloud it sat underneath it
+        // announcing "waiting for the first character" about text that was
+        // already on screen.
+        shown.provider_trace?.voice_turn === true ? null : (
+          <StreamStatsBadge
+            messageId={message.id}
+            status={shown.status}
+            providerTrace={shown.provider_trace}
+          />
+        )
+      }
+      {shown.provider_trace?.voice_turn === true && shown.status === "streaming" ? null : (
+        <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
+          <MessageAction
+            label="复制全文"
+            onClick={() =>
+             void navigator.clipboard
+                .writeText(fullText)
+                .then(() => toast.success("已复制回答"))
+                .catch(() => toast.error("无法复制回答"))
+            }
+            tooltip="复制全文"
+          >
           <Copy className="size-3.5" />
         </MessageAction>
         <MessageAction
@@ -2228,6 +2284,7 @@ function AssistantMessageInner({
           </DropdownMenuContent>
         </DropdownMenu>
       </MessageActions>
+      )}
     </AiMessage>
   );
 }
@@ -2885,6 +2942,7 @@ export function ChatCanvasPage() {
       const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
       const text = item?.text?.trim() || "";
       const removals = item?.removes ?? [];
+      const retireTurnSegments = item?.retireTurnSegments ?? "";
       if (!item?.id || !item?.role) return;
       if (!shouldCommitVoiceRender(item)) return;
       // 只接受当前会话的语音回合，避免切换会话后残留的回调写进别的会话。
@@ -2900,17 +2958,39 @@ export function ChatCanvasPage() {
       // Every sentence already spoken, in order; the last one is being read aloud
       // right now and is the only part marked `streaming`.
       const spoken = item.role === "assistant" ? (item.spokenSegments ?? []) : [];
+      // One block, not one per sentence: a paragraph break after every sentence
+      // reads as a chopped-up answer, while speech just continues. The block
+      // holds every sentence already heard and carries the playback anchor of
+      // the sentence being read, so the canvas types inside it as it goes.
+      const live = !item.final && spoken.length > 0;
+      const spokenText = spoken.map((segment) => segment.text).join("");
+      const liveSegment = live ? spoken[spoken.length - 1] : null;
       const parts: MessagePart[] = spoken.length
-        ? spoken.map((sentence, index) => ({
-            id: `temp-voice-part-${item.id}-s${index}`,
-            type: "text" as const,
-            status: (index === spoken.length - 1 && !item.final
-              ? "streaming"
-              : "completed") as MessagePart["status"],
-            content: sentence,
-            sequence: index,
-            data: { kind: "final_answer" },
-          }))
+        ? [
+            {
+              id: `temp-voice-part-${item.id}`,
+              type: "text" as const,
+              status: (live
+                ? "streaming"
+                : "completed") as MessagePart["status"],
+              content: spokenText,
+              sequence: 0,
+              data: liveSegment
+                ? {
+                    kind: "final_answer",
+                    voice_typing: {
+                      row_id: item.id,
+                      cursor_ms: liveSegment.cursorMs,
+                      started_at: liveSegment.startedAt,
+                      base_chars: Math.max(
+                        0,
+                        spokenText.length - liveSegment.text.length,
+                      ),
+                    },
+                  }
+                : { kind: "final_answer" },
+            },
+          ]
         : [
             {
               id: `temp-voice-part-${item.id}`,
@@ -2921,7 +3001,7 @@ export function ChatCanvasPage() {
               data: { kind: "final_answer" },
             },
           ];
-      const trace: Record<string, unknown> = {
+      const trace: Record<string, unknown> = mergeVoiceTrace(undefined, {
         voice_turn: true,
         voice_segment: Boolean(item.voiceSegment),
         interrupted: Boolean(item.interrupted),
@@ -2930,13 +3010,12 @@ export function ChatCanvasPage() {
         client_message_id: item.clientMessageId,
         authoritative: Boolean(item.authoritative || item.final),
         retryable: item.deliveryStatus === "failed",
-      };
+      });
       setLocalMessages((current) => {
-        const kept = removals.length
-          ? current.filter((message) =>
-              !removals.some((retired) => message.id === `temp-voice-${retired}`),
-            )
-          : current;
+        const kept = retireVoiceRows(current, {
+          removes: removals,
+          retireTurnSegments,
+        });
         // A per-segment row is matched by its own id only: every segment of a
         // turn shares the turn id, so a turn-id match would rewrite one segment
         // with another segment's text.
@@ -2956,7 +3035,7 @@ export function ChatCanvasPage() {
                 content: text,
                 status,
                 parts,
-                provider_trace: { ...message.provider_trace, ...trace },
+                provider_trace: mergeVoiceTrace(message.provider_trace, trace),
               }
             : message);
         }
@@ -4153,6 +4232,10 @@ export function ChatCanvasPage() {
     ];
   }, [history.data, localMessages, sessionId]);
   const activeCommittedAnswerTurnId = useMemo(() => {
+    // In voice mode, keep the scroll container following live speech at the bottom smoothly.
+    // Anchoring to the answer top causes compensateLayoutChange() to fight with live typing,
+    // which was the primary root cause of "一直出现文字跳动".
+    if (voiceModeOpen) return null;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (
@@ -4164,7 +4247,7 @@ export function ChatCanvasPage() {
       }
     }
     return null;
-  }, [messages]);
+  }, [messages, voiceModeOpen]);
   useLayoutEffect(() => {
     if (!activeCommittedAnswerTurnId) return;
     notifyCommittedAnswerStarted(
@@ -7657,15 +7740,18 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       dictationStopRequestedRef.current = false;
       setDictationFinalizing(null);
       dictationCleanupSessionRef.current = session;
+      lastDictationFinal = { text: "", at: 0 };
       const appendFinalText = (text: string) => {
+        const clean = dedupeDictationFinal(text);
+        if (!clean) return;
         // 中英文混排:两侧都是字母数字时补一个空格再拼接。
         const joiner =
           session.pending &&
           /[A-Za-z0-9]$/.test(session.pending) &&
-          /^[A-Za-z0-9]/.test(text)
+          /^[A-Za-z0-9]/.test(clean)
             ? " "
             : "";
-        session.pending += joiner + text;
+        session.pending += joiner + clean;
       };
       const handleFatal = (message: string) => {
         toast.error(message);
@@ -7889,6 +7975,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     hold.active = true;
     hold.final = "";
     hold.interim = "";
+    lastDictationFinal = { text: "", at: 0 };
     hold.handle = null;
     hold.speech = null;
     setVoiceBarActive(true);
@@ -7929,7 +8016,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         },
         onFinal: (text) => {
           if (!holdRef.current.active) return;
-          holdRef.current.final += text;
+          const clean = dedupeDictationFinal(text);
+          if (clean) holdRef.current.final += clean;
           holdRef.current.interim = "";
         },
         onDegrade: () => {},
@@ -9781,9 +9869,24 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             })}
           </div>
         ) : null}
+        {/* 彩色球：通话状态的视觉指示（2026-09-15 恢复）。
+            它是「指示器」不是控件——静音与挂断仍在输入条上；拨号宿主仍在本页面
+            （见上面的 voiceAutoDialedForRef），球体本身不再自行 connect()，否则
+            进入语音模式会开出第二通电话。内联排布在状态行之上，不做绝对定位，
+            因此不会遮住它正在描述的对话。 */}
+        {voiceModeOpen ? (
+          <VoiceOrb
+            audioLevel={voiceSnapshotForGating.audioLevel}
+            audioSource={voiceSnapshotForGating.audioSource}
+            error={voiceSnapshotForGating.error}
+            muted={voiceSnapshotForGating.muted}
+            state={voiceSnapshotForGating.state}
+            transport={voiceSnapshotForGating.transport}
+          />
+        ) : null}
         {/* 语音状态：连接/聆听/思考/说话 + 模型 pin + ICE 路径，一行小字随输入区
-            排布。这里曾经挂着一个悬浮球和一块绝对定位的字幕卡（2026-09-14 删除）：
-            实时转录与导师回答现在直接进对话流，状态不再需要浮在对话之上。 */}
+            排布。绝对定位的字幕卡已于 2026-09-14 删除——实时转录与导师回答直接进
+            对话流；上面那颗彩色球（2026-09-15 恢复）只做视觉指示，不重复这些文字。 */}
         {voiceModeOpen ? (
           <>
             <p

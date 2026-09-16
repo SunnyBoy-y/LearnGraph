@@ -49,6 +49,25 @@ export type VoiceTranscriptRole = TranscriptEntry["role"];
 export type VoiceAudioSource = "idle" | "user" | "assistant";
 export type VoiceTranscript = TranscriptEntry;
 export type VoiceTaskEvent = VoiceTaskPatch;
+
+/**
+ * One assistant sentence whose audio has already started.
+ *
+ * `cursorMs` / `startedAt` are what turn "one block per sentence" into karaoke
+ * captions: the backend reports where the sentence sits in the reply's audio
+ * stream, and the marker arrives as that sentence's first frame is queued, so
+ * the pair gives the canvas a sentence-level playback clock (see
+ * `components/chat/voice-karaoke-text.tsx`).
+ */
+export interface VoiceSpokenSegment {
+  /** Sentence text exactly as it was spoken. */
+  text: string;
+  /** Offset (ms) of this sentence's first audio frame inside the reply audio. */
+  cursorMs: number;
+  /** `performance.now()` at which that frame entered the output queue. */
+  startedAt: number;
+}
+
 export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"> {
   id: string;
   role: "user" | "assistant";
@@ -65,13 +84,26 @@ export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"
    */
   removes?: string[];
   /**
+   * Turn whose ephemeral per-segment user rows must go.
+   *
+   * `removes` is a snapshot of the rows this client happens to remember, which
+   * makes the collapse depend on the *next* turn boundary arriving at all: a
+   * `user.final` re-delivered after a flush (the RTVI push channel and the HTTP
+   * event catch-up both feed the same handler) allocates a fresh row key nobody
+   * has on their retire list, and that row then sat next to the authoritative one
+   * for as long as the turn stayed open. Stating the *turn* instead lets the
+   * canvas resolve ownership itself -- every per-segment row of that turn is
+   * retired, whenever it was created and in whatever order the events arrived.
+   */
+  retireTurnSegments?: string;
+  /**
    * Assistant sentences whose audio has already started, in order.
    *
    * Text follows the audio, not the LLM stream: the last entry is the sentence
    * being spoken right now, which the canvas highlights. Empty means "one
    * undivided message" (a settled turn).
    */
-  spokenSegments?: string[];
+  spokenSegments?: VoiceSpokenSegment[];
   /** Marks an ephemeral per-segment user row (see `removes`). */
   voiceSegment?: boolean;
 }
@@ -159,13 +191,20 @@ const REMOTE_SESSION_STORAGE_KEY = "learngraph.voice.remote-sessions.v1";
  * failure -- offline, expired session, relay misconfigured -- degrades to an
  * empty list, i.e. exactly the behaviour of a deployment that never configured a
  * relay, so a broken relay can never make calling impossible.
+ *
+ * Degrading is not the same as failing silently, though. The empty result is
+ * cached for a much shorter time than a real one, and the error is reported: a
+ * single transient failure used to pin `[]` for the full five minutes, which for
+ * a remote caller meant five minutes of relay-less calls that could not connect,
+ * with nothing anywhere saying why.
  */
 const ICE_SERVERS_TTL_MS = 5 * 60_000;
-let iceServersCache: { at: number; servers: RTCIceServer[] } | null = null;
+const ICE_SERVERS_FAILURE_TTL_MS = 15_000;
+let iceServersCache: { at: number; servers: RTCIceServer[]; ttlMs: number } | null = null;
 
 async function loadIceServers(): Promise<RTCIceServer[]> {
   const now = Date.now();
-  if (iceServersCache && now - iceServersCache.at < ICE_SERVERS_TTL_MS) {
+  if (iceServersCache && now - iceServersCache.at < iceServersCache.ttlMs) {
     return iceServersCache.servers;
   }
   try {
@@ -179,10 +218,14 @@ async function loadIceServers(): Promise<RTCIceServer[]> {
         username: item.username ?? undefined,
         credential: item.credential ?? undefined,
       })) as RTCIceServer[];
-    iceServersCache = { at: now, servers };
+    iceServersCache = { at: now, servers, ttlMs: ICE_SERVERS_TTL_MS };
     return servers;
-  } catch {
-    iceServersCache = { at: now, servers: [] };
+  } catch (error) {
+    console.warn(
+      "[voice] ICE servers unavailable; dialing without STUN/TURN (a direct path can still connect, a remote one cannot)",
+      error,
+    );
+    iceServersCache = { at: now, servers: [], ttlMs: ICE_SERVERS_FAILURE_TTL_MS };
     return [];
   }
 }
@@ -231,6 +274,16 @@ const RTVI_LABEL = "rtvi-ai";
 const RTVI_VERSION = "2.1.0";
 /** Custom client message the embedded pipeline turns into a barge-in. */
 export const VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt";
+/**
+ * Custom client message announcing a typed turn's idempotency key.
+ *
+ * `send-text` cannot carry it (Pipecat's payload has only content/options, and
+ * the append frame it produces only holds role/content), yet the worker needs it
+ * to attach to the turn the control plane already created instead of opening a
+ * second one. Sent on the same ordered data channel immediately before
+ * `send-text`, and consumed by the journal (`expect_typed_turn`).
+ */
+export const VOICE_TYPED_TURN_MESSAGE = "learngraph-typed-turn";
 
 function sendRtvi(message: { type: string; data?: unknown }): boolean {
   if (dataChannel?.readyState !== "open") return false;
@@ -278,11 +331,20 @@ let userSegments: string[] = [];
 let userLiveRowIndex = -1;
 /** Server turn id the segment accumulator belongs to ("" until it is known). */
 let userSegmentsTurnId = "";
+/**
+ * User turns whose single authoritative row has already been rendered.
+ *
+ * A `user.final` for such a turn is a re-delivery (the durable push channel and
+ * the HTTP event catch-up both feed the same handler), not a new utterance: it
+ * must not allocate another bubble next to the settled one. Bounded, because it
+ * only has to outlive the turn it belongs to.
+ */
+const settledUserTurns = new Set<string>();
 let activeAssistantTurnId = "";
 let assistantLlmText = "";
 let assistantSpokenText = "";
 /** Sentences whose audio has started; the last one is being spoken right now. */
-let assistantSpokenSentences: string[] = [];
+let assistantSpokenSentences: VoiceSpokenSegment[] = [];
 let assistantSentenceSequence = 0;
 let assistantLlmComplete = false;
 let assistantFinalized = false;
@@ -662,19 +724,24 @@ function resetUserSegments() {
  *
  * From here on the single authoritative row for that turn is the only one that
  * should be on screen: the pauses are a mid-turn detail, not a permanent shape
- * of the conversation.
+ * of the conversation. Both forms of retirement are stated: the row ids this
+ * client remembers, and the turn id (so the canvas can also sweep a per-segment
+ * row created by an event this accumulator never saw, e.g. a `user.final`
+ * re-delivered after a flush).
  */
 function retireUserSegments(turnId?: string) {
   const removes = currentUserSegmentRowIds();
-  if (removes.length) {
+  const retireTurnSegments = String(turnId || userSegmentsTurnId || "");
+  if (removes.length || retireTurnSegments) {
     dispatchVoiceRender({
-      id: `user-turn-${userRowKey}-settle`,
+      id: `user-turn-${userRowKey || "settle"}-settle`,
       role: "user",
       text: "",
       final: true,
       createdAt: new Date().toISOString(),
       turnId,
       removes,
+      retireTurnSegments: retireTurnSegments || undefined,
     });
   }
   resetUserSegments();
@@ -690,6 +757,10 @@ function retireUserSegments(turnId?: string) {
 function renderUserSegment(text: string, committed: boolean, turnId?: string) {
   const clean = String(text || "").trim();
   if (!clean) return;
+  // The turn already has its one authoritative row on screen: a later final for
+  // the same turn is a re-delivery, and rendering it here is what left a second,
+  // identical bubble beside the settled one until the next turn boundary.
+  if (turnId && settledUserTurns.has(turnId)) return;
   ensureUserRowKey();
   const index = committed ? Math.max(0, userSegments.length - 1) : userSegments.length;
   userLiveRowIndex = committed ? -1 : index;
@@ -749,33 +820,79 @@ function segmentOfUserFinal(
   return full;
 }
 
+/**
+ * Renders the one authoritative user row of a turn and retires its fragments.
+ *
+ * The single writer for a user turn: whichever event closes the user half
+ * (`turn.accepted`, a merged `user.final`, the RTVI turn boundary), it lands
+ * here, so the row identity and the retirement rule cannot drift apart. The row
+ * is keyed by the turn (typed turns additionally by their `client_message_id`),
+ * and the fragments are retired *by turn* -- not by a list of ids this client
+ * happens to remember, which is what made a re-delivered `user.final` leave an
+ * orphan beside the settled row.
+ */
+function renderAuthoritativeUserTurn(
+  turnId: string,
+  text: string,
+  options: { clientMessageId?: string; createdAt?: string } = {},
+) {
+  const clean = String(text || "").trim();
+  const clientMessageId = options.clientMessageId;
+  if (turnId) {
+    settledUserTurns.add(turnId);
+    if (settledUserTurns.size > 32) {
+      const [oldest] = settledUserTurns;
+      settledUserTurns.delete(oldest);
+    }
+  }
+  const removes = currentUserSegmentRowIds();
+  const createdAt = options.createdAt || new Date().toISOString();
+  if (!clean) {
+    // Settled but carrying no text of its own (a re-delivery): the fragments
+    // still have to go, and a removal-only update is what says that.
+    if (removes.length || turnId) {
+      dispatchVoiceRender({
+        id: `user-turn-${turnId || "unknown"}-settle`,
+        role: "user",
+        text: "",
+        final: true,
+        turnId,
+        removes,
+        retireTurnSegments: turnId,
+        createdAt,
+      });
+    }
+    return;
+  }
+  if (durableEventCount === 0 && !clientMessageId) {
+    appendTranscriptItem("user", clean, false, turnId, { turnId });
+  }
+  dispatchVoiceRender({
+    id: userEntryId(turnId, clientMessageId),
+    role: "user",
+    text: clean,
+    final: true,
+    turnId,
+    clientMessageId,
+    deliveryStatus: clientMessageId ? "accepted" : undefined,
+    removes,
+    retireTurnSegments: turnId,
+    createdAt,
+  });
+  lastCommittedUserTurnId = turnId;
+  activeUserTurnId = "";
+}
+
 /** 把一个用户回合的（可能多段）final 合成一条记录并广播出去。 */
 function flushPendingUserFinal() {
   const text = pendingUserFinal;
   pendingUserFinal = "";
   if (text.trim()) {
-    const turnId = ensureUserTurnId();
     // Audio turns are owned by the worker: it opens the durable turn and emits
     // `user.final`/`turn.accepted`, which is what becomes the authoritative
     // transcript entry. Creating a turn here as well would produce two turns
     // (and two chat messages) for one utterance, so the client only renders.
-    //
-    // Whatever the segment bubbles showed while the turn was open is superseded
-    // by this one row, hence the explicit `removes`: nothing else can retire a
-    // row once it is on the canvas.
-    const removes = currentUserSegmentRowIds();
-    if (durableEventCount === 0) appendTranscriptItem("user", text, false, turnId, { turnId });
-    dispatchVoiceRender({
-      id: userEntryId(turnId, undefined),
-      role: "user",
-      text,
-      final: true,
-      turnId,
-      removes,
-      createdAt: new Date().toISOString(),
-    });
-    lastCommittedUserTurnId = turnId;
-    activeUserTurnId = "";
+    renderAuthoritativeUserTurn(ensureUserTurnId(), text);
   }
   // An empty flush (both the aggregator's turn boundary and the durable
   // `turn.finalized` fire for one turn) must not mint a fresh turn id: that id
@@ -908,33 +1025,54 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       // row look like the durable twin of some other message).
       renderUserSegment(text, false, turnId);
       return;
-    case "user.final":
+    case "user.final": {
+      const typedClientId = String(
+        payload.client_message_id ?? payload.clientMessageId ?? "",
+      ).trim();
       activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
       noteUserSegmentsTurn(turnId);
+      update({ interimUserText: "" });
+      if (typedClientId) {
+        // A typed utterance already owns its authoritative row: `sendText`
+        // rendered it under `user-typed-<client_message_id>` and the durable
+        // `turn.accepted` promotes it in place. Rendering a per-segment row here
+        // was the duplicate -- the typed branch of `turn.accepted` never retires
+        // one, so the fragment sat beside the settled bubble for as long as the
+        // turn stayed open (i.e. permanently on a hung turn).
+        renderAuthoritativeUserTurn(
+          turnId || activeUserTurnId,
+          text || pendingTyped.get(typedClientId)?.text || "",
+          { clientMessageId: typedClientId },
+        );
+        return;
+      }
       // `payload.text` is already the merged turn text, so it replaces rather
       // than accumulates; joining it would duplicate every earlier segment.
       pendingUserFinal = text;
-      update({ interimUserText: "" });
       commitUserSegment(
         segmentOfUserFinal(payload, text, userSegments),
         turnId || activeUserTurnId,
       );
       return;
+    }
     case "turn.accepted": {
       const clientId = String(payload.client_message_id ?? payload.clientMessageId ?? "");
       if (clientId && pendingTyped.has(clientId)) {
         const pending = pendingTyped.get(clientId)!;
         pendingTyped.set(clientId, { ...pending, turnId });
-        if (turnId) lastCommittedUserTurnId = turnId;
         clearTypedAcceptTimer(clientId);
         pendingTyped.delete(clientId);
         // The transcript entry is produced by the reducer from this same event,
         // so no manual append is needed (and would double the bubble).
-        dispatchVoiceRender({
-          id: userEntryId(turnId, clientId), role: "user", text: pending.text,
-          final: true, turnId, clientMessageId: clientId, deliveryStatus: "accepted",
-          createdAt: new Date().toISOString(), eventId: event.event_id,
+        renderAuthoritativeUserTurn(turnId || pending.turnId || "", pending.text, {
+          clientMessageId: clientId,
         });
+      } else {
+        // Voice turn accepted: flush the user's question into the authoritative
+        // bubble immediately and retire the interim segment bubbles so they
+        // cannot linger or stack a second copy bar.
+        if (turnId) lastCommittedUserTurnId = turnId;
+        flushPendingUserFinal();
       }
       return;
     }
@@ -958,6 +1096,7 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       }
       return;
     case "turn.interrupted":
+      flushPendingUserFinal();
       finalizeAssistantTurn(true);
       return;
     case "assistant.llm.delta":
@@ -1072,14 +1211,27 @@ function appendAssistantSentence(text: string, sequence?: number, audioCursorMs?
   }
   // Preserve the original spacing between sentences.
   assistantSpokenText = assistantSpokenText ? `${assistantSpokenText}${text}` : text;
-  assistantSpokenSentences.push(clean);
+  assistantSpokenSentences.push({
+    // Verbatim, not trimmed: the live block joins these back into one run of
+    // text, and it has to match what the backend stores for the same turn.
+    text,
+    cursorMs: lastAudioCursorMs,
+    // The marker is emitted as this sentence's first audio frame is queued, so
+    // this timestamp is the sentence's own playback anchor.
+    startedAt: performance.now(),
+  });
   emitAssistantSpoken();
 }
 
 function finalizeAssistantTurn(interrupted: boolean) {
   if (assistantFinalized || !activeAssistantTurnId) return;
   assistantFinalized = true;
-  const text = (interrupted ? assistantSpokenText : (assistantLlmText || assistantSpokenText)).trim();
+  // What was read aloud is the answer. The LLM draft is shown only when nothing
+  // was spoken at all -- the degraded "audio never played" turn, where the answer
+  // is handed over as text on purpose. Text the user has not heard must not
+  // appear, and the backend stores exactly the same spoken-only text.
+  const spoken = assistantSpokenText.trim();
+  const text = spoken || (interrupted ? "" : assistantLlmText.trim());
   const turnId = activeAssistantTurnId;
   // The live bubble is replaced by the settled one; leaving both would show the
   // answer twice (they have different row ids on purpose, see emitAssistantSpoken).
@@ -1159,12 +1311,14 @@ function handleRtviMessage(raw: string) {
       // utterance or drift apart on segment numbering.
       const observerOwnsRows = durableEventCount === 0;
       if (data.final) {
-        // 一个「用户回合」可能产生多段 final：本机 VAD 判定停止即 commit
-        // （见 §6.5.2 的延迟修复），所以说话中途的停顿也会各出一段 final。
-        // 每段各自成气泡，等聚合器广播回合边界（user-stopped-speaking）时再合并成一条。
-        pendingUserFinal = joinTranscriptSegment(pendingUserFinal, text);
+        // 一个「用户回合」可能产生多段 final：本机 VAD 判定停止即 commit。
+        // 当 durableEventCount > 0 时，权威的 user.final 事件管理 pendingUserFinal；
+        // observer 只在老后端/无持久化事件兜底时操作 pendingUserFinal，避免串句污染。
+        if (observerOwnsRows) {
+          pendingUserFinal = joinTranscriptSegment(pendingUserFinal, text);
+          commitUserSegment(text);
+        }
         update({ interimUserText: "" });
-        if (observerOwnsRows) commitUserSegment(text);
       } else {
         update({ interimUserText: text });
         if (observerOwnsRows) renderUserSegment(text, false);
@@ -1691,6 +1845,17 @@ export const voiceSessionController = {
     const content = text.trim();
     if (!content) return false;
     const clientMessageId = existingClientMessageId || crypto.randomUUID();
+    // Announce the idempotency key first, on the same ordered channel: the
+    // worker needs it to attach to the turn `persistAcceptedTurn` is about to
+    // create (otherwise one typed utterance becomes the client's turn plus a
+    // worker-opened one -- two rows, two bubbles).
+    sendRtvi({
+      type: "client-message",
+      data: {
+        t: VOICE_TYPED_TURN_MESSAGE,
+        d: { client_message_id: clientMessageId, text: content },
+      },
+    });
     if (!sendRtvi({
       type: "send-text",
       data: { content, client_message_id: clientMessageId, options: { run_immediately: true, audio_response: true } },
