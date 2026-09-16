@@ -99,9 +99,15 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
         if intent is TurnIntent.BACKCHANNEL:
             await self._suppress_backchannel()
             return
-        # No usable transcript at all is treated as a real barge-in after the
-        # bounded window.  Losing an explicit "stop" is worse than one extra
-        # interruption.
+        if not self._pending_text.strip():
+            # A window that expired without a single recognised word is noise --
+            # a cough, a chair, or the tutor's own audio bleeding into the mic --
+            # not a barge-in.  Interrupting on it cut the turn off *before* it had
+            # answered anything, which is how an answer the user did hear ended up
+            # recorded against whatever they said next.  An explicit stop is still
+            # acted on immediately, because that path needs the word recognised.
+            await self._suppress_backchannel()
+            return
         await self._trigger_interrupt_turn()
 
     async def _trigger_normal_turn(self) -> None:
@@ -128,6 +134,10 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
         if intent is TurnIntent.INTERRUPTION:
             await self._trigger_interrupt_turn()
         elif intent is TurnIntent.BACKCHANNEL:
+            await self._suppress_backchannel()
+        elif not self._pending_text.strip():
+            # Speech ended before anything was recognised: same rule as the
+            # decision window -- noise is not a barge-in, so the turn stands.
             await self._suppress_backchannel()
         else:
             await self._trigger_interrupt_turn()

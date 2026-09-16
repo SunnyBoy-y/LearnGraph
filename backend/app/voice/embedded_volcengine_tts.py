@@ -13,10 +13,9 @@ import json
 import os
 import struct
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Optional
 
 import websockets
 from loguru import logger
@@ -239,6 +238,7 @@ class VolcengineTTSService(TTSService):
         api_key: str = "",
         settings: VolcengineTTSSettings | None = None,
         journal: Any = None,
+        generation_source: Callable[[], int] | None = None,
         **kwargs,
     ):
         if settings is None:
@@ -246,13 +246,17 @@ class VolcengineTTSService(TTSService):
         settings.api_key = api_key
         settings.voice = None
         settings.language = None
-        # 真流式开关：
-        #   1（默认）= Pipecat 以句为单位聚合 LLM 增量，同一个火山 session
-        #              连续 TaskRequest；第一句开始合成时就下发音频，后续句子
-        #              不需要等待整段 LLM 完成。
+        # 逐句合成开关：
+        #   1（默认）= Pipecat 以句为单位聚合 LLM 增量，**每句开一个独立的火山
+        #              session**；该句第一批音频到达即下发字幕游标，字幕边界与
+        #              音频边界严格一致。
         #   0        = 旧的“一次 run_tts 一个 session、整段文本一次投喂”。
-        # 句级聚合是有意的：火山协议提供 TTSSentenceStart，能够把字幕游标
-        # 绑定到对应句子的第一批音频，而不是把整段 bot-output 提前发到前端。
+        #
+        # 为什么不再是“一个 session 连续 TaskRequest”：实测（一个 session 里发 3 个
+        # TaskRequest）火山 v3 只回 1 个 TTSSentenceStart（text 为空）、0 个
+        # TTSSentenceEnd，而三句音频全部合成了。于是“靠 TTSSentenceEnd 推进游标”的
+        # 写法永远只能标出第一句 —— 前端就表现为整段回答一次蹦出来。改成一句一
+        # session 后，每句的首帧音频本身就是精确边界，不再依赖供应商的句子事件。
         self._streaming_sentences = os.getenv("VOLC_TTS_STREAMING", "1").lower() not in (
             "0",
             "false",
@@ -261,8 +265,8 @@ class VolcengineTTSService(TTSService):
         )
         super().__init__(
             settings=settings,
-            # 句级聚合会在下一个句子的首字符到达时确认边界；单句回答则在
-            # LLMFullResponseEndFrame 到达时 flush。每个句子仍复用同一火山 session。
+            # 句级聚合：每确认一句就调用一次 run_tts，而一次 run_tts 就是"这一句的
+            # session"。单句回答在 LLMFullResponseEndFrame 到达时 flush。
             text_aggregation_mode=(
                 TextAggregationMode.SENTENCE if self._streaming_sentences else None
             ),
@@ -271,28 +275,53 @@ class VolcengineTTSService(TTSService):
         self._ws: Any = None
         self._options: TTSRequestOptions | None = None
         self._logid = ""
-        # 当前正在合成的 session_id，用于 interruption 取消与 stale audio 过滤。
+        # 当前正在合成的这一句的 session_id，用于 interruption 取消与 stale audio 过滤。
         self._current_session_id = ""
-        # 流式模式下这个 session 服务的 audio context，以及它的音频接收任务。
+        # 本 turn 的 audio context：跨句复用，直到 flush（文本结束）或打断才移除。
         self._streaming_context_id: str | None = None
-        self._receiver_task: asyncio.Task | None = None
-        # 单点计时用：本 session 是否已发过第一个 TaskRequest。
+        # 单点计时用：本 turn 是否已发过第一个 TaskRequest。
         self._first_task_sent = False
-        # 火山服务端的 TTSSentenceStart/End 与 TaskRequest 保持顺序；把待合成
-        # 的句子排队，等对应句子的第一批音频到达后再发 RTVI 字幕游标。
-        self._pending_sentence_texts: deque[str] = deque()
-        self._active_sentence_text = ""
-        self._active_sentence_marker_sent = False
+        # 逐句字幕游标：**仅在 journal 没有给出句身份时**（无 journal / 没有未
+        # finalize 的 turn）作为兜底计数器使用；有 journal 时序号由它分配。
         self._sentence_sequence = 0
         self._audio_cursor_ms = 0
-        # Optional durable journal.  When present, every caption marker is also
-        # written to the append-only event log, which is what lets a client that
-        # missed data-channel frames reconcile by ``(turn_id, sentence_seq)``
-        # instead of by text.
+        # 句子合成按序串联：后一句等前一句收完音频再开自己的 session。任务放在
+        # 后台（不阻塞 process_frame），否则打断帧会被"正在合成的那一句"挡住。
+        self._session_chain: asyncio.Task | None = None
+        # Optional durable journal.  When present it **allocates** the sentence
+        # identity (``turn_id`` / ``sentence_seq`` / ``segment_id``) and records
+        # it in the append-only event log, so a client that missed data-channel
+        # frames reconciles by ``(turn_id, sentence_seq)`` instead of by text.
+        # One allocator only: the fast-path marker below carries the journal's
+        # number, it does not invent one.
         self._journal = journal
+        # 音频闸门代次来源（`VoiceGenerationGate.generation`）。句子身份里的
+        # `generation_id` 必须与"这一句的音频属于哪一代"同源，否则前端无法用代次
+        # 判断一条迟到的 marker 是不是上一轮被打断的残留。没接线时为 None：宁可没
+        # 有代次，也不要编一个看起来有效的数字。
+        self._generation_source = generation_source
         # Bounded upstream reconnect bookkeeping (TTS websocket).
         self._reconnect_attempt = 0
         self._reconnect_lock = asyncio.Lock()
+        # 收尾标志：`cleanup()` 会先置位再 await，而 `_connect_bidirectional` 会检查
+        # 它——否则一场正在进行的重连可以在收尾之后建出一条没人负责的连接（ASR 侧
+        # 同一类窄窗口泄漏，2026-09-16 一并修掉）。
+        self._closed = False
+
+    def _upstream_alive(self) -> bool:
+        ws = self._ws
+        return ws is not None and not getattr(ws, "closed", False)
+
+    async def _detach_upstream(self, reason: str) -> bool:
+        """摘掉并关闭当前上游连接，幂等。必须在重连锁内调用。"""
+        ws, self._ws = self._ws, None
+        if ws is None:
+            return False
+        try:
+            await ws.close()
+        except Exception:  # noqa: BLE001
+            logger.debug(f"{self}: close upstream failed ({reason})", exc_info=True)
+        return True
 
     async def setup(self, setup: FrameProcessorSetup):
         await super().setup(setup)
@@ -320,15 +349,35 @@ class VolcengineTTSService(TTSService):
         }
 
     async def _connect_bidirectional(self) -> None:
-        self._ws = await websockets.connect(
+        if self._closed:
+            # 收尾已经开始（或已完成）：绝不能在收尾之后再建一条没人负责的连接。
+            raise RuntimeError("TTS service is closing")
+        if self._ws is not None:
+            # 一条连接只能有一个主人：覆盖引用而不关闭，会让旧 WS 一直活着。
+            await self._detach_upstream("reconnect")
+        ws = await websockets.connect(
             self._settings.endpoint,
             additional_headers=self._headers(),
             max_size=10 * 1024 * 1024,
             open_timeout=15,
         )
+        if self._closed:
+            # 握手与收尾赛跑：cleanup() 跑的时候看到的 `_ws` 还是 None，于是这条
+            # 刚建好的连接没有任何人会关它。就地关掉。
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError("TTS service closing during connect")
+        self._ws = ws
         self._logid = self._ws.response.headers.get("x-tt-logid", "")
-        await self._send_event(EventType.StartConnection)
-        await self._expect_event(EventType.ConnectionStarted, EventType.ConnectionFailed)
+        try:
+            await self._send_event(EventType.StartConnection)
+            await self._expect_event(EventType.ConnectionStarted, EventType.ConnectionFailed)
+        except Exception:
+            # 握手失败不能留成半开连接。
+            await self._detach_upstream("handshake_failed")
+            raise
         logger.info(f"{self}: connected to {self._settings.endpoint}")
 
     async def on_audio_context_interrupted(self, context_id: str):
@@ -339,17 +388,29 @@ class VolcengineTTSService(TTSService):
         继续占用服务端资源、甚至混入下一轮。这里发 CancelSession 让火山立即
         放弃当前 session（收到 SessionCanceled 后服务端释放资源）。
         """
-        # 先停接收任务再取消 session，避免接收循环把 SessionCanceled 当成
-        # "本会话正常结束"后去动已经被基类移除的 audio context。
-        await self._stop_streaming_session("interrupted")
-        await self._cancel_current_session("interrupted")
+        # 顺序有讲究：先记住正在合成的那一句的 session id，再掐断串联链（含它的
+        # 接收循环），最后用记住的 id 通知火山放弃该 session。反过来的话，链被取消
+        # 时 `_synthesize_sentence` 的 finally 已经把 `_current_session_id` 清空，
+        # CancelSession 就发不出去 —— 服务端会把这一句合成完（白占资源，残余音频还
+        # 可能混进下一轮）。
+        session_id = self._current_session_id
+        chain = self._session_chain
+        self._session_chain = None
+        if chain is not None and not chain.done():
+            await self.cancel_task(chain)
+        await self._cancel_session_id(session_id, "interrupted")
+        # 轮次被打断，下一轮从序号 1 重新开始。
+        self._begin_turn_captions()
 
     async def _cancel_current_session(self, reason: str) -> None:
-        session_id = self._current_session_id
+        await self._cancel_session_id(self._current_session_id, reason)
+
+    async def _cancel_session_id(self, session_id: str, reason: str) -> None:
         if not session_id:
             return
         if not self._ws:
-            self._current_session_id = ""
+            if self._current_session_id == session_id:
+                self._current_session_id = ""
             return
         try:
             await self._send_event(EventType.CancelSession, session_id)
@@ -388,15 +449,17 @@ class VolcengineTTSService(TTSService):
     async def run_tts(
         self, text: str, context_id: str
     ) -> AsyncGenerator[Frame | None, None]:
-        """把 LLM 的文本增量投喂给火山并产出音频。
+        """把一句文本投喂给火山并产出音频。
 
-        流式模式（默认，`VOLC_TTS_STREAMING=1`）：同一个 audio context 内只开
-        一个火山 session，Pipecat 每确认一个句子就发送一个 `TaskRequest`；音频
-        由后台接收任务写进 audio context。文本结束（`LLMFullResponseEndFrame`
-        → `flush_audio`）时才发 `FinishSession`，所以第一句无需等待完整回答。
+        流式模式（默认，`VOLC_TTS_STREAMING=1`）：**一句一个 session**。Pipecat 每
+        确认一个句子就调用一次本方法，这里为它开一个 session、发一个 TaskRequest、
+        立刻 FinishSession，然后把这一句的音频按到达顺序写进本 turn 的 audio
+        context；该句首批音频入队的那一刻下发字幕游标（精确的音频边界）。audio
+        context 跨句复用，直到文本结束（`flush_audio`）或被打断才移除，所以整段
+        回答的播放是连续的。
 
-        非流式模式（`VOLC_TTS_STREAMING=0`）：保持旧行为——每次调用都 StartSession
-        → 整段文本一次 TaskRequest → FinishSession → 同步收音频。
+        非流式模式（`VOLC_TTS_STREAMING=0`）：每次调用都 StartSession → 整段文本
+        一次 TaskRequest → FinishSession → 同步收音频（回退开关）。
         """
         if not self._streaming_sentences:
             async for frame in self._run_tts_one_shot(text, context_id):
@@ -412,37 +475,101 @@ class VolcengineTTSService(TTSService):
             return
         try:
             if not self.audio_context_available(context_id):
-                # 一个 turn 一个 audio context：这里同时是"开新 session"的时机。
-                # 先建 context 并放行 TTSStartedFrame，再握手 + 起接收任务，保证
-                # 音频不会排到 TTSStartedFrame 前面。
+                # 一个 turn 一个 audio context，跨句复用：先建 context 并放行
+                # TTSStartedFrame，保证音频不会排到它前面。
                 await self.create_audio_context(context_id)
+                self._streaming_context_id = context_id
+                # 这里**不**重置字幕游标：基类在某些路径上会重建 audio context，
+                # 若在此把序号归零，同一轮里后面的句子会因为序号回退而被前端去重
+                # 丢掉。游标在轮次结束时重置（flush_audio / 打断）。
                 await self.start_ttfb_metrics()
                 yield TTSStartedFrame(context_id=context_id)
-                await self._start_streaming_session(context_id)
-            await self._send_text(text)
+            self._enqueue_sentence(text, context_id)
             await self.start_tts_usage_metrics(text)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{self}: run_tts 失败: {exc}")
             await self.push_error(error_msg=f"TTS 合成失败: {exc}", exception=exc)
         yield None
 
-    async def flush_audio(self, context_id: str | None = None) -> None:
-        """文本结束（基类在 LLMFullResponseEndFrame 后调用）：FinishSession 收尾。
+    def _enqueue_sentence(self, text: str, context_id: str) -> None:
+        """Queue one sentence behind the previous one, without blocking the frame loop.
 
-        `FinishSession` 不是"立刻切断"，而是告诉火山"文本发完了，把缓冲的音频
-        合成完并结束本 session"。收到 SessionFinished/TTSEnded 后接收任务才
-        把 audio context 标记为结束。
+        Ordering matters twice over: the audio all lands in one context, so sessions
+        must not interleave, and the caption sequence must increase monotonically or
+        the client drops later sentences as duplicates.
+        """
+        previous = self._session_chain
+
+        async def _run_after_previous() -> None:
+            if previous is not None and not previous.done():
+                await asyncio.gather(previous, return_exceptions=True)
+            try:
+                await self._synthesize_sentence(text, context_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # run_tts does not await synthesis any more, so a failure here would
+                # otherwise disappear into a task nobody reads -- the sentence just
+                # never gets spoken and nothing says why.
+                logger.warning(f"{self}: 这一句合成失败（已跳过）: {exc}")
+                if self._journal is not None:
+                    await self._journal.processor_error(
+                        "tts",
+                        f"这一句合成失败，已跳过：{exc}",
+                        retryable=True,
+                        attempt=self._reconnect_attempt,
+                    )
+
+        self._session_chain = self.create_task(_run_after_previous())
+
+    async def _close_turn_context(
+        self, context_id: str | None, chain: asyncio.Task | None
+    ) -> None:
+        """After the last sentence drains: close the context and reset the cursor.
+
+        Runs as its own task so `flush_audio` (called from the frame loop) returns
+        immediately; the base class only reports end-of-playback once the context
+        is marked for deletion.
+        """
+        if chain is not None:
+            await asyncio.gather(chain, return_exceptions=True)
+        if context_id and self.audio_context_available(context_id):
+            await self.remove_audio_context(context_id)
+            timeline_mark("tts", "audio context 已收尾（文本结束）")
+        self._begin_turn_captions()
+
+    def _begin_turn_captions(self) -> None:
+        """Reset the per-turn caption cursor.
+
+        Called at the *end* of a turn (flush or interruption) rather than when the
+        audio context is created, so a context recreated mid-turn cannot restart
+        the sequence and make the client drop later sentences as duplicates.  It
+        only resets the *fallback* counter and the turn's audio cursor: with a
+        journal in place the sequence itself belongs to the turn it numbers, and
+        resetting it here must not be visible to the client as a rewind.
+        """
+        self._sentence_sequence = 0
+        self._audio_cursor_ms = 0
+        self._first_task_sent = False
+
+    async def flush_audio(self, context_id: str | None = None) -> None:
+        """文本结束（基类在 LLMFullResponseEndFrame 后调用）：收尾本 turn 的 context。
+
+        每句的 session 在开出去时就已经 `FinishSession` 了，所以这里没有"长期
+        session"要结束；剩下的事情是把本 turn 的 audio context 标记为结束，让基类
+        把已排队的音频放完并报出播放结束（BotStoppedSpeaking）。这正是"逐句 session"
+        与"一句一个 context"的分界：session 逐句结束，context 整轮结束。
         """
         if not self._streaming_sentences:
             return
-        session_id = self._current_session_id
-        if not session_id or self._ws is None:
-            return
-        try:
-            await self._send_event(EventType.FinishSession, session_id)
-            timeline_mark("tts", "FinishSession 已发出（文本结束）")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"{self}: FinishSession 发送失败: {exc}")
+        target = context_id or self._streaming_context_id
+        self._streaming_context_id = None
+        chain = self._session_chain
+        self._session_chain = None
+        # Hand off: the remaining sentence still has to drain before the context can
+        # be closed, and blocking the frame loop here would delay a barge-in that
+        # arrives while the last sentence is still being synthesised.
+        self.create_task(self._close_turn_context(target, chain))
 
     async def _ensure_upstream(self) -> bool:
         """Reuse the live TTS websocket, or rebuild it with bounded backoff.
@@ -452,13 +579,16 @@ class VolcengineTTSService(TTSService):
         only an exhausted budget is reported as degraded, and the voice session
         itself stays alive either way.
         """
-        ws = self._ws
-        if ws is not None and not getattr(ws, "closed", False):
+        if self._closed:
+            return False
+        if self._upstream_alive():
             return True
         async with self._reconnect_lock:
-            ws = self._ws
-            if ws is not None and not getattr(ws, "closed", False):
+            if self._closed:
+                return False
+            if self._upstream_alive():
                 return True
+            await self._detach_upstream("replaced")
             from app.voice.journal import backoff_delay
 
             attempts = 4
@@ -470,6 +600,8 @@ class VolcengineTTSService(TTSService):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
+                    if self._closed:
+                        return False
                     delay = backoff_delay(attempt, base=0.5, cap=8.0)
                     self._reconnect_attempt = attempt
                     if self._journal is not None:
@@ -483,7 +615,7 @@ class VolcengineTTSService(TTSService):
                         f"{self}: TTS 上游重连第 {attempt} 次失败: {exc}"
                     )
                     await asyncio.sleep(delay)
-            self._ws = None
+            self._reconnect_attempt = attempts
             if self._journal is not None:
                 await self._journal.processor_error(
                     "tts",
@@ -493,50 +625,63 @@ class VolcengineTTSService(TTSService):
                 )
             return False
 
-    async def _start_streaming_session(self, context_id: str) -> None:
-        """开一个火山 session 并把它的音频接收任务挂起来。"""
-        await self._stop_streaming_session("restart")
+    async def _synthesize_sentence(self, text: str, context_id: str) -> None:
+        """合成**一句**：独立 session，首帧音频即该句的字幕边界。
+
+        这是整个逐句字幕的地基。火山 v3 在一个长 session 里不会逐句回
+        TTSSentenceStart/End（实测 3 个 TaskRequest → 1 个 SentenceStart、0 个
+        SentenceEnd），所以"等 SentenceEnd 再推进游标"永远只标出第一句。换成一句
+        一个 session 后，本句的首帧音频就是我们需要的精确边界，且不依赖供应商事件。
+
+        session 开出去即 `FinishSession`：该句文本已经完整，让火山把这一句合成完
+        并结束 session；音频由本方法按到达顺序写进本 turn 的 audio context。
+        """
+        if self._closed:
+            # 收尾期间不要再合成：`_ensure_upstream` 会拒绝建连，抛异常只会把一次
+            # 正常挂断刷成一条错误。
+            return
         if not await self._ensure_upstream():
             raise RuntimeError("TTS upstream is unavailable")
         session_id = str(uuid.uuid4())
         options = self._options
-        self._streaming_context_id = context_id
         self._current_session_id = session_id
-        self._first_task_sent = False
-        self._pending_sentence_texts.clear()
-        self._active_sentence_text = ""
-        self._active_sentence_marker_sent = False
-        self._sentence_sequence = 0
-        self._audio_cursor_ms = 0
-        await self._send_event(
-            EventType.StartSession,
-            session_id,
-            options.to_v3_start_session_payload("", "BidirectionalTTS"),
-        )
-        await self._expect_event(EventType.SessionStarted, EventType.SessionFailed)
-        timeline_mark("tts", "session 握手完成(StartSession→SessionStarted)")
-        self._receiver_task = self.create_task(
-            self._receive_streaming_audio(context_id, session_id)
-        )
+        try:
+            await self._send_event(
+                EventType.StartSession,
+                session_id,
+                options.to_v3_start_session_payload("", "BidirectionalTTS"),
+            )
+            await self._expect_event(EventType.SessionStarted, EventType.SessionFailed)
+            timeline_mark("tts", "session 握手完成(StartSession→SessionStarted)")
+            await self._send_event(
+                EventType.TaskRequest, session_id, options.to_v3_task_payload(text)
+            )
+            if not self._first_task_sent:
+                self._first_task_sent = True
+                timeline_mark("tts", "首个 TaskRequest 已发出")
+            await self._send_event(EventType.FinishSession, session_id)
+            identity = await self._drain_sentence_audio(context_id, session_id, text)
+            if identity is not None:
+                await self._emit_sentence_end_marker(context_id, identity)
+        finally:
+            if self._current_session_id == session_id:
+                self._current_session_id = ""
 
-    async def _send_text(self, text: str) -> None:
-        """把一段增量文本追加进当前 session。"""
-        session_id = self._current_session_id
-        if not session_id or self._ws is None:
-            return
-        if not self._first_task_sent:
-            self._first_task_sent = True
-            timeline_mark("tts", "首个 TaskRequest 已发出")
-        self._pending_sentence_texts.append(text)
-        await self._send_event(
-            EventType.TaskRequest,
-            session_id,
-            self._options.to_v3_task_payload(text),
-        )
+    async def _drain_sentence_audio(
+        self, context_id: str, session_id: str, sentence_text: str
+    ) -> dict[str, Any] | None:
+        """收完这一句的音频；首帧入队时下发句起点 marker。
 
-    async def _receive_streaming_audio(self, context_id: str, session_id: str) -> None:
-        """后台读循环：把本 session 的音频写进 audio context，直到 session 结束。"""
-        first_audio = True
+        注意这里**不**移除 audio context：后面的句子还要往同一个 context 里排音频，
+        context 由 `flush_audio`（整轮文本结束）或打断来收尾。
+
+        正常收完（`SessionFinished/SessionCanceled/TTSEnded`）时把句身份交回调用方，
+        由它补发句结束 marker：句结束偏移只有在音频收干之后才存在，而本方法在收到
+        结束事件的那一刻就要 `return` 了。被打断或出错时返回 None —— 那一句既没有
+        结束偏移，也不该让前端认为它播完了。
+        """
+        marker_sent = False
+        identity: dict[str, Any] | None = None
         try:
             while True:
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=60)
@@ -549,70 +694,27 @@ class VolcengineTTSService(TTSService):
                         continue
                     if not msg.payload:
                         continue
-                    if first_audio:
-                        first_audio = False
-                        timeline_mark("tts", "火山首个音频包")
-                    audio_frame = TTSAudioRawFrame(
-                        msg.payload, self.sample_rate, 1, context_id=context_id
+                    await self.append_to_audio_context(
+                        context_id,
+                        TTSAudioRawFrame(
+                            msg.payload, self.sample_rate, 1, context_id=context_id
+                        ),
                     )
-                    # TTSSentenceStart 通常先于音频到达。若供应商省略该事件，
-                    # 则按 TaskRequest 顺序回退；两种路径都只在第一批音频入队
-                    # 后发字幕游标，避免前端先收到整段文字。
-                    if not self._active_sentence_text and self._pending_sentence_texts:
-                        self._active_sentence_text = self._pending_sentence_texts.popleft()
-                        self._active_sentence_marker_sent = False
-                    await self.append_to_audio_context(context_id, audio_frame)
-                    if self._active_sentence_text and not self._active_sentence_marker_sent:
-                        self._sentence_sequence += 1
-                        await self.append_to_audio_context(
-                            context_id,
-                            RTVIServerMessageFrame(
-                                data={
-                                    "type": "voice-sentence-start",
-                                    "text": self._active_sentence_text,
-                                    "sequence": self._sentence_sequence,
-                                    "sentence_seq": self._sentence_sequence,
-                                    "audio_cursor_ms": int(self._audio_cursor_ms),
-                                    "event_id": f"tts_{uuid.uuid4().hex[:20]}",
-                                    "turn_id": context_id,
-                                }
-                            ),
+                    if not marker_sent:
+                        # 首批音频已入队：这就是这一句开始被朗读的时刻。先入队、
+                        # 再发游标，前端才不会先看到字后听到声。
+                        marker_sent = True
+                        timeline_mark("tts", "火山首个音频包")
+                        identity = await self._emit_sentence_marker(
+                            context_id, sentence_text
                         )
-                        self._active_sentence_marker_sent = True
-                        if self._journal is not None:
-                            await self._journal.sentence_queued(
-                                self._active_sentence_text,
-                                audio_cursor_ms=int(self._audio_cursor_ms),
-                            )
-                    self._audio_cursor_ms += int(len(msg.payload) / 2 / self.sample_rate * 1000)
+                    self._audio_cursor_ms += int(
+                        len(msg.payload) / 2 / self.sample_rate * 1000
+                    )
                 elif msg.type == MsgType.FullServerResponse:
                     data = decode_payload(msg.payload)
                     if msg.event == EventType.SessionFailed:
                         raise RuntimeError(f"TTS session failed: {data}")
-                    if msg.event == EventType.TTSSentenceStart:
-                        # The protocol event has no stable text field in all API
-                        # versions, so use the ordered TaskRequest queue as source
-                        # of truth and only fall back to a payload text when present.
-                        payload_text = data.get("text") if isinstance(data, dict) else None
-                        # A provider can repeat TTSSentenceStart or deliver it just
-                        # after the first audio packet. In that case the fallback
-                        # queue already identifies the active sentence; consuming
-                        # another entry here would shift every later caption by one.
-                        if not payload_text and self._active_sentence_text:
-                            continue
-                        self._active_sentence_text = str(
-                            payload_text or (
-                                self._pending_sentence_texts.popleft()
-                                if self._pending_sentence_texts
-                                else ""
-                            )
-                        )
-                        self._active_sentence_marker_sent = False
-                        continue
-                    if msg.event == EventType.TTSSentenceEnd:
-                        self._active_sentence_text = ""
-                        self._active_sentence_marker_sent = False
-                        continue
                     if msg.event in (
                         EventType.SessionFinished,
                         EventType.SessionCanceled,
@@ -626,7 +728,7 @@ class VolcengineTTSService(TTSService):
                                 f"TTS session failed: {data.get('status_code')} "
                                 f"{data.get('message', '')}"
                             )
-                        break
+                        return identity
                 elif msg.type == MsgType.Error:
                     raise RuntimeError(
                         f"TTS failed: {msg.error_code} {decode_payload(msg.payload)}"
@@ -644,21 +746,115 @@ class VolcengineTTSService(TTSService):
                     retryable=True,
                     attempt=self._reconnect_attempt,
                 )
-        finally:
-            self._pending_sentence_texts.clear()
-            self._active_sentence_text = ""
-            self._active_sentence_marker_sent = False
-            # 只有还在基类手里的 context 才由我们收尾；被打断时基类已移除它。
-            if self.audio_context_available(context_id):
-                await self.remove_audio_context(context_id)
+        return None
 
-    async def _stop_streaming_session(self, reason: str) -> None:
-        """停掉接收任务（session 本身由 FinishSession / CancelSession 结束）。"""
-        task = self._receiver_task
-        self._receiver_task = None
-        self._streaming_context_id = None
-        if task is not None and not task.done():
-            await self.cancel_task(task)
+    def _current_generation(self) -> int | None:
+        """本句所属的音频闸门代次；没有接线时为 None。"""
+        if self._generation_source is None:
+            return None
+        return int(self._generation_source())
+
+    async def _queue_sentence_identity(self, text: str, context_id: str) -> dict[str, Any]:
+        """句身份的唯一分配入口：先落持久事件，再把身份交给快通道 marker。
+
+        为什么必须由 journal 分配：适配器以前自己数 `_sentence_sequence`，journal 内部
+        另数一套，同一条流上的快通道 marker 与持久事件因此带着两套互不相等的序号，
+        前端按 `(turn_id, sentence_seq)` 归并时必然错位（重复定稿或丢句）。现在只有
+        一个分配者，快通道的 `sequence` 只是它的向后兼容别名。
+        """
+        generation_id = self._current_generation()
+        audio_cursor_ms = int(self._audio_cursor_ms)
+        if self._journal is not None:
+            identity = await self._journal.sentence_queued(
+                text,
+                audio_cursor_ms=audio_cursor_ms,
+                context_id=context_id,
+                generation_id=generation_id,
+            )
+            if identity:
+                # 本地计数器跟着 journal 走：万一它下一句没有可用 turn（返回 {}）而
+                # 退回本地兜底，序号也不会倒退。
+                self._sentence_sequence = int(identity["sentence_seq"])
+                return {
+                    "turn_id": identity.get("turn_id"),
+                    "sentence_seq": int(identity["sentence_seq"]),
+                    "segment_id": identity.get("segment_id"),
+                    "generation_id": identity.get("generation_id", generation_id),
+                    "audio_cursor_ms": int(
+                        identity.get("audio_cursor_ms") or audio_cursor_ms
+                    ),
+                }
+        # 没有 journal（老部署）或 journal 里没有未 finalize 的 turn：序号只能本地
+        # 兜底，`turn_id`/`segment_id` 留空由前端按 unattributed 处理——编一个假的回合
+        # id 会把这句话并进一个并不存在的回合。
+        self._sentence_sequence += 1
+        return {
+            "turn_id": None,
+            "sentence_seq": self._sentence_sequence,
+            "segment_id": None,
+            "generation_id": generation_id,
+            "audio_cursor_ms": audio_cursor_ms,
+        }
+
+    async def _emit_sentence_marker(
+        self, context_id: str, sentence_text: str
+    ) -> dict[str, Any]:
+        """下发"这一句正在被朗读"的起点 marker，并写进持久事件流。
+
+        返回句身份，供句结束时补发 `voice-sentence-end`。
+        """
+        identity = await self._queue_sentence_identity(sentence_text, context_id)
+        sentence_seq = int(identity["sentence_seq"])
+        await self.append_to_audio_context(
+            context_id,
+            RTVIServerMessageFrame(
+                data={
+                    "type": "voice-sentence-start",
+                    "event_id": f"tts_{uuid.uuid4().hex[:20]}",
+                    "text": sentence_text,
+                    "sequence": sentence_seq,
+                    "sentence_seq": sentence_seq,
+                    "segment_id": identity["segment_id"],
+                    "audio_cursor_ms": int(identity["audio_cursor_ms"]),
+                    "turn_id": identity["turn_id"],
+                    "context_id": context_id,
+                    "generation_id": identity["generation_id"],
+                }
+            ),
+        )
+        return identity
+
+    async def _emit_sentence_end_marker(
+        self, context_id: str, identity: dict[str, Any]
+    ) -> None:
+        """这一句的音频已全部入队：补发句结束 marker，并落一条持久事件。
+
+        只有起点偏移的话，前端无法知道"这一句播到哪里算完"，句内进度就只能用字速
+        猜。补上终点偏移后，句内位置是**在有界窗口里插值**，而不是承诺逐字对齐
+        （§6 明确不取供应商词级时间戳、不承诺毫秒级对齐）。
+        """
+        await self.append_to_audio_context(
+            context_id,
+            RTVIServerMessageFrame(
+                data={
+                    "type": "voice-sentence-end",
+                    "event_id": f"ttse_{uuid.uuid4().hex[:20]}",
+                    "sentence_seq": int(identity["sentence_seq"]),
+                    "segment_id": identity["segment_id"],
+                    "audio_end_cursor_ms": int(self._audio_cursor_ms),
+                    "turn_id": identity["turn_id"],
+                    "context_id": context_id,
+                    "generation_id": identity["generation_id"],
+                }
+            ),
+        )
+        if self._journal is not None:
+            await self._journal.sentence_ended(
+                sentence_seq=int(identity["sentence_seq"]),
+                audio_end_cursor_ms=int(self._audio_cursor_ms),
+                segment_id=identity["segment_id"],
+                generation_id=identity["generation_id"],
+            )
 
     async def _run_tts_one_shot(
         self, text: str, context_id: str
@@ -727,23 +923,36 @@ class VolcengineTTSService(TTSService):
         yield None
 
     async def cleanup(self):
-        # 先把接收任务停掉，否则它会在 WS 关闭后继续等 recv（并可能报错刷日志）。
-        await self._stop_streaming_session("cleanup")
+        # 一句一 session：每句的接收循环都在 run_tts 里被 await 完，没有后台任务要在
+        # WS 关闭前先停掉。
+        # ``_closed`` 先置位（挡住并发重连建新连接），拆卸走重连锁：旧实现直接读写
+        # ``_ws``，一场正在进行的重连可以在收尾窗口里建出一条没人关得掉的连接。
+        self._closed = True
         await super().cleanup()
-        if self._ws:
-            try:
-                msg = Message(
-                    type=MsgType.FullClientRequest,
-                    flag=MsgTypeFlagBits.WithEvent,
-                    event=EventType.FinishConnection,
-                    payload=b"{}",
-                )
-                await self._ws.send(msg.marshal())
-                await asyncio.wait_for(self._ws.recv(), timeout=1)
-            except Exception:
-                pass
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
+        try:
+            await asyncio.wait_for(self._reconnect_lock.acquire(), timeout=6.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(f"{self}: 重连在 6s 内没有落定，跳过锁直接关连接")
+            ws, self._ws = self._ws, None
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        try:
+            if self._ws:
+                try:
+                    msg = Message(
+                        type=MsgType.FullClientRequest,
+                        flag=MsgTypeFlagBits.WithEvent,
+                        event=EventType.FinishConnection,
+                        payload=b"{}",
+                    )
+                    await self._ws.send(msg.marshal())
+                    await asyncio.wait_for(self._ws.recv(), timeout=1)
+                except Exception:
+                    pass
+            await self._detach_upstream("cleanup")
+        finally:
+            self._reconnect_lock.release()

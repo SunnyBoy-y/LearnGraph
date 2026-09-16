@@ -67,11 +67,34 @@ FINALIZE_GRACE_SECS = 6.0
 # produces no text, no TTS and therefore no speaking frames, so nothing else
 # would ever close the turn.
 DEFAULT_IDLE_TIMEOUT_SECS = 20.0
+# How many consecutive idle ceilings may be skipped while audio is still playing.
+# Six re-arms is two minutes of continuous speech, which is far past any real
+# answer; past that we assume the end-of-playback signal was lost and finalize.
+MAX_PLAYBACK_REARMS = 6
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RETRY_MAX_DELAY = 8.0
 # ``assistant.llm.delta`` is a caption stream, not an audit log: coalesce writes.
 LLM_DELTA_MIN_INTERVAL_SECS = 0.4
+# A turn opened by the control plane that no worker ever acknowledged is closed
+# by the aging sweep after this long (see ``reconcile_stale_turns``). Generous on
+# purpose: it must never race a slow-but-live provider round trip.
+DEFAULT_STALE_TURN_SECS = 180.0
+# How often the audio worker re-runs that sweep for its own session.
+DEFAULT_RECONCILE_INTERVAL_SECS = 15.0
+# How long a client-announced typed idempotency key stays usable. The client
+# sends it immediately before ``send-text``; the window only has to absorb the
+# RTVI message task hand-off, not a network round trip.
+TYPED_KEY_TTL_SECS = 20.0
+# RTVI custom client message: ``{t: VOICE_TYPED_TURN_MESSAGE, d: {...}}``.
+# ``send-text`` itself cannot carry the client's idempotency key (Pipecat's
+# ``SendTextData`` has no such field and the append frame it produces only holds
+# role/content), so the client announces it on this channel first.
+VOICE_TYPED_TURN_MESSAGE = "learngraph-typed-turn"
+# 客户端播放确认的 phase 取值（契约 §2.5）。``ended`` 表示该句已经播完，剩下的
+# 都是"播到哪里"的位置报告。
+PLAYBACK_PHASE_PROGRESS = "progress"
+PLAYBACK_PHASE_ENDED = "ended"
 
 
 def _jitter(base: float) -> float:
@@ -94,9 +117,25 @@ class _TurnState:
     assistant_text: str = ""
     sentence_seq: int = 0
     sentence_texts: dict[int, str] = field(default_factory=dict)
-    played_sentence_seq: int = 0
+    # 每句的媒体窗口（句首入队游标 / 句尾结束游标）与它所属的 audio context。
+    # 保留它们是为了把客户端 playback_ack 的媒体位置换算成"这一句听到了第几个
+    # 字"：句内位置只能是估算（见 ``_played_chars``），但没有窗口就完全无法定位。
+    sentence_start_cursor_ms: dict[int, int] = field(default_factory=dict)
+    sentence_end_cursor_ms: dict[int, int] = field(default_factory=dict)
+    sentence_contexts: dict[int, str] = field(default_factory=dict)
+    # 由 playback_ack 填充：key 为 sentence_seq，value 为该句已播报的字符数。
+    # 缺失的 key 表示"从未收到过确认"，那一句按已入队全文计（老客户端兜底）。
+    sentence_heard_chars: dict[int, int] = field(default_factory=dict)
+    # 是否至少收到过一条 playback_ack；只用于在 turn 载荷里标注诚实程度。
+    acknowledged: bool = False
     playback_observed: bool = False
-    playback_start_pending: bool = False
+    # True between BotStartedSpeaking and BotStoppedSpeaking. Distinct from
+    # ``playback_observed`` (which latches): this one says audio is being heard
+    # *right now*, which is what stops the idle ceiling from firing mid-answer.
+    playback_active: bool = False
+    # Consecutive idle re-arms granted while audio was still playing, so a
+    # playback that never reports its end cannot hold the turn open forever.
+    playback_rearms: int = 0
     audio_cursor_ms: int = 0
     llm_closed: bool = False
     finalized: bool = False
@@ -121,6 +160,8 @@ class VoiceTurnJournal:
         retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
         retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY,
         retry_hook: Callable[[], Awaitable[None]] | None = None,
+        stale_turn_secs: float = DEFAULT_STALE_TURN_SECS,
+        reconcile_interval_secs: float = DEFAULT_RECONCILE_INTERVAL_SECS,
     ) -> None:
         self.voice_session_id = voice_session_id
         self._publish = publish
@@ -139,6 +180,13 @@ class VoiceTurnJournal:
         self._retry_base_delay = max(0.1, float(retry_base_delay))
         self._retry_max_delay = max(self._retry_base_delay, float(retry_max_delay))
         self._retry_hook = retry_hook
+        # Aging sweep for turns this worker never picked up (see
+        # ``reconcile_stale_turns``): the ceiling, the throttle between rounds,
+        # and the idempotency keys the client announced for typed utterances.
+        self._stale_turn_secs = max(0.0, float(stale_turn_secs))
+        self._reconcile_interval_secs = max(1.0, float(reconcile_interval_secs))
+        self._last_reconcile_at = 0.0
+        self._pending_typed: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
         self.degraded = False
         self.degraded_reason = ""
@@ -208,6 +256,33 @@ class VoiceTurnJournal:
         state = self._turn
         if state is None or state.finalized:
             return
+        if state.playback_active:
+            # Audio is still being played, so the turn IS making progress even
+            # though no event has been emitted for a while -- a single sentence
+            # can take longer than the idle ceiling to speak, and the only
+            # progress signals we emit are per sentence.  Finalizing here marked
+            # a perfectly good answer ``turn_idle_timeout``/degraded about a
+            # second before its audio actually finished, which also dropped the
+            # exchange from long-term memory.
+            #
+            # Bounded, so a playback that never reports its end still reaches a
+            # terminal state instead of hanging the turn forever.
+            if state.playback_rearms < MAX_PLAYBACK_REARMS:
+                state.playback_rearms += 1
+                logger.debug(
+                    "voice turn %s idle for %.0fs but still playing; re-arming (%d/%d)",
+                    state.turn_id,
+                    self._idle_timeout_secs,
+                    state.playback_rearms,
+                    MAX_PLAYBACK_REARMS,
+                )
+                self._arm_turn_deadline()
+                return
+            logger.warning(
+                "voice turn %s still reports playback after %d idle re-arms; finalizing",
+                state.turn_id,
+                state.playback_rearms,
+            )
         # Progress happened after the timer was armed: re-arm instead of
         # finalizing a turn that is merely long.
         logger.warning(
@@ -246,9 +321,7 @@ class VoiceTurnJournal:
         self._arm_turn_deadline()
 
     async def user_started(self) -> None:
-        # Barge-in: the user talking over the bot interrupts the open turn.
-        if self._turn is not None and not self._turn.finalized:
-            await self.turn_interrupted(reason="user_started_speaking")
+        """VAD signals that the user started speaking."""
         await self._emit(
             "user.started",
             payload={},
@@ -285,23 +358,32 @@ class VoiceTurnJournal:
             return
         async with self._lock:
             if self._turn is not None and not self._turn.finalized:
-                # Multi-segment ASR merge: one turn, one user message.
-                state = self._turn
-                state.user_text = (
-                    f"{state.user_text}{segment}" if state.user_text else segment
-                )
-                await self._emit(
-                    "user.final",
-                    payload={
-                        "text": state.user_text,
-                        "segment": segment,
-                        "merged": True,
-                        "client_message_id": client_message_id,
-                    },
-                    turn_id=state.turn_id,
-                    request_id=f"user.final:{state.turn_id}:{len(state.user_text)}",
-                )
-                return
+                if (
+                    not self._turn.assistant_text
+                    and not self._turn.sentence_seq
+                    and not self._turn.playback_observed
+                ):
+                    # Multi-segment ASR merge: one turn, one user message (user paused mid-sentence).
+                    state = self._turn
+                    state.user_text = (
+                        f"{state.user_text}{segment}" if state.user_text else segment
+                    )
+                    await self._emit(
+                        "user.final",
+                        payload={
+                            "text": state.user_text,
+                            "segment": segment,
+                            "merged": True,
+                            "client_message_id": client_message_id,
+                        },
+                        turn_id=state.turn_id,
+                        request_id=f"user.final:{state.turn_id}:{len(state.user_text)}",
+                    )
+                    return
+                # The assistant has already begun generating or speaking: this new utterance
+                # is a new turn (barge-in), NOT a continuation of the previous question.
+                # Concat here was the root cause of "ASR混入上一句已经结束的显示".
+                await self.turn_interrupted(reason="barge_in")
             existing = await asyncio.to_thread(
                 turn_api.open_turn, self.voice_session_id
             )
@@ -341,9 +423,14 @@ class VoiceTurnJournal:
 
         Pipecat's ``send-text`` appends the message to the LLM context instead of
         running it through STT, so it must be journaled from the append frame.
-        The turn is usually already open because the client posts an idempotent
-        ``turns/accept`` first; when it is not, the worker opens one so the
-        exchange still reaches the transcript.
+
+        Identity comes first: when the client told us which idempotency key it
+        used (``expect_typed_turn``, carried over RTVI ahead of ``send-text``),
+        ``accept_turn`` is called with that key, so the row is the *same* one the
+        control plane's ``turns/accept`` created -- whichever of the two lands
+        first, one utterance can never become two turns (and two chat messages).
+        Without a key the worker attaches to the turn the control plane already
+        opened, and only opens one itself as a last resort.
         """
         content = str(text or "").strip()
         if not content:
@@ -353,6 +440,22 @@ class VoiceTurnJournal:
                 if self._turn.user_text:
                     return
                 self._turn.user_text = content
+                return
+            key = self._take_typed_client_message_id(content)
+            if key:
+                try:
+                    accepted = await asyncio.to_thread(
+                        turn_api.accept_turn,
+                        self.voice_session_id,
+                        content,
+                        client_message_id=key,
+                    )
+                except Exception:
+                    logger.warning("typed voice turn accept failed", exc_info=True)
+                    return
+                self._begin_turn(
+                    _TurnState(turn_id=str(accepted["turn_id"]), user_text=content)
+                )
                 return
             existing = await asyncio.to_thread(turn_api.open_turn, self.voice_session_id)
             if existing is not None:
@@ -372,6 +475,109 @@ class VoiceTurnJournal:
         )
 
     # -------------------------------------------------------- assistant side
+
+    def expect_typed_turn(self, client_message_id: str, text: str = "") -> None:
+        """Remember the idempotency key the client is about to type with.
+
+        Called from the RTVI client-message channel, which the browser writes
+        *before* ``send-text`` on the same ordered data channel. The key is what
+        makes the worker's ``accept_turn`` land on the row the control plane's
+        ``turns/accept`` created instead of opening a second turn for one
+        utterance.
+
+        A hint, never an identity: the turn is identified by the key itself (and
+        by the database's per-key uniqueness), and the text is only used to pair
+        the announcement with the append frame that follows it -- the two arrive
+        on the same channel but are handled by separate tasks, so their order is
+        not something to depend on.
+        """
+        key = str(client_message_id or "").strip()
+        if not key:
+            return
+        fingerprint = str(text or "").strip()
+        self._pending_typed[fingerprint] = (key, asyncio.get_running_loop().time())
+        # Bounded: a client that announces keys it never uses must not grow this.
+        if len(self._pending_typed) > 8:
+            oldest = sorted(self._pending_typed.items(), key=lambda item: item[1][1])
+            for stale_key, _ in oldest[: len(self._pending_typed) - 8]:
+                self._pending_typed.pop(stale_key, None)
+
+    def _take_typed_client_message_id(self, content: str) -> str | None:
+        """Consume the announced key for this typed text, if one is still fresh."""
+        now = asyncio.get_running_loop().time()
+        for fingerprint in (content, ""):
+            entry = self._pending_typed.pop(fingerprint, None)
+            if entry is not None:
+                key, announced_at = entry
+                if now - announced_at <= TYPED_KEY_TTL_SECS:
+                    return key
+                return None
+        # No announcement for this text: drop anything that has expired so a
+        # later, unrelated utterance cannot inherit a stale key.
+        for fingerprint, (_, announced_at) in list(self._pending_typed.items()):
+            if now - announced_at > TYPED_KEY_TTL_SECS:
+                self._pending_typed.pop(fingerprint, None)
+        return None
+
+    async def reconcile_stale_turns(self, *, force: bool = False) -> int:
+        """Close turns of this session that nobody ever picked up.
+
+        The control plane creates the turn *before* the worker sees the
+        utterance, so the row exists even when nothing else in the pipeline ever
+        acknowledges it. Without this sweep such a row stays ``accepted`` forever:
+        the page waits for a ``turn.finalized`` that never comes, and the question
+        is never persisted or remembered.
+
+        Throttled because it runs from the 1 Hz control watchdog, and the worker's
+        own open turn is skipped -- its idle ceiling is the right closer, and
+        closing it here would bypass the state that holds the answer.
+        """
+        if self._stale_turn_secs <= 0:
+            return 0
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if not force and now - self._last_reconcile_at < self._reconcile_interval_secs:
+            return 0
+        self._last_reconcile_at = now
+        skip = [self._turn.turn_id] if self._turn is not None else []
+        try:
+            closed = await asyncio.to_thread(
+                turn_api.finalize_stale_turns,
+                self.voice_session_id,
+                max_age_secs=self._stale_turn_secs,
+                skip_turn_ids=skip,
+            )
+        except Exception:
+            logger.warning("voice stale turn sweep failed", exc_info=True)
+            return 0
+        return len(closed)
+
+    async def close_open_turns_on_session_end(self) -> int:
+        """Settle everything still open when the call ends.
+
+        The worker's own turn is finalized through the normal path (what was
+        spoken is the answer; a turn with nothing spoken is a ``failed`` turn that
+        keeps the question). Any other open row belongs to a turn this worker
+        never picked up, so it is closed as a failure too. Called *before* the
+        runner is cancelled -- afterwards there is no loop left to emit from.
+        """
+        state = self._turn
+        spoken = self._spoken_assistant_text(state) if state is not None else ""
+        await self.assistant_completed(
+            outcome=turn_api.TURN_FINALIZED if spoken else turn_api.TURN_FAILED,
+            failure_reason=None if spoken else turn_api.SESSION_CLOSED_TURN_REASON,
+        )
+        try:
+            closed = await asyncio.to_thread(
+                turn_api.finalize_stale_turns,
+                self.voice_session_id,
+                max_age_secs=0.0,
+                reason=turn_api.SESSION_CLOSED_TURN_REASON,
+            )
+        except Exception:
+            logger.warning("voice session-end turn sweep failed", exc_info=True)
+            return 0
+        return len(closed)
 
     def note_assistant_text(self, text: str) -> None:
         """Accumulate the authoritative assistant text (sync; no IO).
@@ -408,41 +614,178 @@ class VoiceTurnJournal:
             phase="speculative",
         )
 
-    async def sentence_queued(self, text: str, *, audio_cursor_ms: int | None = None) -> None:
-        """A sentence entered the TTS output queue (speculative caption)."""
+    def current_turn_id(self) -> str | None:
+        """当前未 finalize 的持久 turn id，没有则 None。同步、无 IO。
+
+        TTS 适配器需要用这个 id 给快通道 marker 打身份：Pipecat 的
+        ``context_id`` 只是音频 context 的 uuid，把 marker 的 ``turn_id`` 填成它
+        会让字幕落到另一个回合（F03/F04 的根因）。这里读的就是账本自己认的那条
+        turn，因此 marker 与持久事件永远指向同一个回合。
+        """
+        state = self._turn
+        if state is None or state.finalized:
+            return None
+        return state.turn_id
+
+    async def sentence_queued(
+        self,
+        text: str,
+        *,
+        audio_cursor_ms: int | None = None,
+        context_id: str | None = None,
+        generation_id: int | None = None,
+    ) -> dict[str, Any]:
+        """A sentence's audio entered playback; it is being read aloud now.
+
+        This is the marker the page draws a sentence from, and the journal's only
+        record of what the user actually heard -- see ``_spoken_assistant_text``.
+
+        句身份（``sentence_seq`` / ``segment_id``）由账本统一分配并原样返回，
+        快通道 marker 必须用这一份：以前 TTS 适配器自己数一套、账本另数一套，
+        于是同一句话在两个通道里序号不同，字幕与持久事件永远对不上（F02/F04/F05
+        的共同根因）。
+        """
         if self._turn is None or self._turn.finalized:
-            return
+            return {}
         state = self._turn
         state.sentence_seq += 1
-        state.sentence_texts[state.sentence_seq] = str(text or "").strip()
-        if state.playback_start_pending:
-            # BotStartedSpeakingFrame can race the first caption marker. The
-            # first queued sentence is the one playback started for, not every
-            # sentence whose marker happened to arrive before the frame.
-            state.played_sentence_seq = max(state.played_sentence_seq, 1)
-            state.playback_start_pending = False
+        sequence = state.sentence_seq
+        # Kept verbatim: two adjacent sentences have to concatenate back into the
+        # text that was spoken, including any separator whitespace the provider
+        # put between them (English answers would lose it otherwise).
+        state.sentence_texts[sequence] = str(text or "")
+        segment_id = f"{state.turn_id}:s{sequence}"
         if audio_cursor_ms is not None:
-            state.audio_cursor_ms = max(state.audio_cursor_ms, int(audio_cursor_ms))
+            cursor = int(audio_cursor_ms)
+            state.sentence_start_cursor_ms[sequence] = cursor
+            # 信封沿用"回合内累计最大值"语义：乱序/重复的 marker 不得让游标倒退。
+            state.audio_cursor_ms = max(state.audio_cursor_ms, cursor)
+        if context_id is not None:
+            state.sentence_contexts[sequence] = str(context_id)
         self._touch_turn()
         await self._emit(
             "assistant.sentence.queued",
-            payload={"text": text, "sentence_seq": state.sentence_seq},
+            payload={
+                "text": text,
+                "sentence_seq": sequence,
+                "segment_id": segment_id,
+                "generation_id": generation_id,
+                "context_id": context_id,
+            },
             turn_id=state.turn_id,
             phase="speculative",
             audio_cursor_ms=state.audio_cursor_ms or None,
+            generation_id=generation_id,
+            segment_id=segment_id,
+            context_id=context_id,
         )
+        return {
+            "turn_id": state.turn_id,
+            "sentence_seq": sequence,
+            "segment_id": segment_id,
+            "generation_id": generation_id,
+            "audio_cursor_ms": state.audio_cursor_ms,
+        }
+
+    async def sentence_ended(
+        self,
+        *,
+        sentence_seq: int,
+        audio_end_cursor_ms: int,
+        segment_id: str | None = None,
+        generation_id: int | None = None,
+    ) -> None:
+        """落一条 ``assistant.sentence.ended``：这一句的音频已经收尾。
+
+        句尾游标是句内位置估算的分母（见 ``_played_chars``），也是"这一句到底说
+        完了没有"的唯一服务端证据；它必须落进账本，否则打断时只能靠"已入队即已
+        听到"这个偏乐观的假设。
+        """
+        state = self._turn
+        if state is None or state.finalized:
+            return
+        sequence = int(sentence_seq)
+        cursor = max(0, int(audio_end_cursor_ms))
+        state.sentence_end_cursor_ms[sequence] = cursor
+        resolved_segment = segment_id or f"{state.turn_id}:s{sequence}"
+        # 信封的 ``audio_cursor_ms`` 保持"句首入队游标的回合内最大值"语义，句尾
+        # 游标只出现在 payload 里：混进同一个字段会让回放游标在两个意义上跳。
+        await self._emit(
+            "assistant.sentence.ended",
+            payload={
+                "text": state.sentence_texts.get(sequence, ""),
+                "sentence_seq": sequence,
+                "segment_id": resolved_segment,
+                "generation_id": generation_id,
+                "context_id": state.sentence_contexts.get(sequence),
+                "audio_end_cursor_ms": cursor,
+            },
+            turn_id=state.turn_id,
+            phase="speculative",
+            audio_cursor_ms=state.audio_cursor_ms or None,
+            generation_id=generation_id,
+            segment_id=resolved_segment,
+            context_id=state.sentence_contexts.get(sequence),
+        )
+
+    async def playback_ack(
+        self,
+        *,
+        sentence_seq: int | None,
+        played_ms: int,
+        phase: str,
+        generation_id: int | None = None,
+    ) -> None:
+        """浏览器报告"已经出声播到哪里了"。
+
+        只用于回放位置、逐句展示精度与审计：**它绝不参与回合的终态判定**（既不
+        收尾也不续命）。客户端时钟会受设备、后台标签页与浏览器省电策略影响，
+        把它当成完成判据会把"用户没听到"变成"系统认为说完了"。
+
+        记录下来的字符数只用于把已听到的句子截成前缀，缺 ack 的句子仍按已入队
+        全文计，所以一条丢失或迟到的确认不会让整段回答消失。
+        """
+        state = self._turn
+        if state is None or state.finalized:
+            return
+        sequence = None if sentence_seq is None else int(sentence_seq)
+        played = max(0, int(played_ms))
+        if sequence is not None:
+            chars = self._played_chars(state, sequence, played, str(phase or ""))
+            if chars is not None:
+                state.sentence_heard_chars[sequence] = max(
+                    state.sentence_heard_chars.get(sequence, 0), chars
+                )
+        state.acknowledged = True
+        await self._emit(
+            "assistant.playback.ack",
+            payload={
+                "sentence_seq": sequence,
+                "played_ms": played,
+                "phase": str(phase or ""),
+            },
+            turn_id=state.turn_id,
+            phase="speculative",
+            generation_id=generation_id,
+        )
+
+    def heard_text(self) -> str:
+        """当前回合计为"用户已听到"的文本。
+
+        与 ``_spoken_assistant_text`` 同源，供 worker 在 finalize 之前对外说明
+        "到底说出去多少"（例如折叠未播完的余量）。
+        """
+        state = self._turn
+        if state is None:
+            return ""
+        return self._spoken_assistant_text(state)
 
     async def playback_started(self) -> None:
         state = self._turn
         if state is not None and not state.finalized:
             state.playback_observed = True
-            if state.sentence_seq > 0:
-                # Playback begins with the first queued sentence. Later markers
-                # may already be queued for synthesis, but they are not evidence
-                # that the user heard them.
-                state.played_sentence_seq = max(state.played_sentence_seq, 1)
-            else:
-                state.playback_start_pending = True
+            state.playback_active = True
+            state.playback_rearms = 0
         self._touch_turn()
         await self._emit(
             "assistant.sentence.playback_started",
@@ -453,9 +796,17 @@ class VoiceTurnJournal:
         )
 
     async def playback_ended(self) -> None:
+        if self._turn is not None:
+            self._turn.playback_active = False
         await self._emit(
             "assistant.sentence.playback_ended",
-            payload={"sentence_seq": self._turn.sentence_seq if self._turn else 0},
+            payload={
+                "sentence_seq": self._turn.sentence_seq if self._turn else 0,
+                # 输出队列已排空 = 这就是本回合的最后一次播报。前端只认这个标记
+                # 收尾（再叠加 llm 已结束），而不是自己用 RMS 静音去猜：静音判完成
+                # 会在句间停顿处把回答切成两半（F03）。
+                "turn_final": True,
+            },
             turn_id=self._turn.turn_id if self._turn else None,
             phase="speculative",
             audio_cursor_ms=self._turn.audio_cursor_ms if self._turn else None,
@@ -490,6 +841,24 @@ class VoiceTurnJournal:
             return
         if not self._turn.llm_closed:
             return
+        if self._turn.playback_observed:
+            # Playback was observed, so TTS is demonstrably alive and this timer
+            # is not allowed to conclude "no playback frames".  What it is really
+            # looking at is a sentence that is still being spoken: the grace is
+            # measured from LLM close, while ``BotStoppedSpeakingFrame`` only
+            # arrives when the *last* sentence finishes -- and a spoken answer is
+            # routinely longer than the grace.  Finalizing here marked a
+            # perfectly normal turn degraded, which latched a false "voice
+            # playback unavailable" banner for the rest of the call and dropped
+            # the exchange from long-term memory (``memory`` is False whenever a
+            # degraded reason is set).  Declining is safe: the idle deadline is
+            # refreshed by playback progress and still bounds the turn, so a
+            # genuine stall reaches a terminal state by itself.
+            logger.debug(
+                "voice turn %s skipped the grace finalize: playback already observed",
+                self._turn.turn_id,
+            )
+            return
         logger.info(
             "voice turn %s finalized by grace timer (no playback frames)",
             self._turn.turn_id,
@@ -506,14 +875,14 @@ class VoiceTurnJournal:
         degraded_reason: str | None = None,
         memory: bool | None = None,
     ) -> None:
-        """Finalize the open turn exactly once, from the authoritative text.
+        """Finalize the open turn exactly once, from the text that was read aloud.
 
         ``outcome="failed"`` is the "no answer" path: the provider errored or the
         turn went idle with nothing to say. The user's question is still
         persisted (an unanswered turn must not vanish on refresh), no assistant
         message is written, and nothing reaches long-term memory. ``memory`` may
-        be passed explicitly; by default only a successful turn with observed
-        playback is memory-eligible.
+        be passed explicitly; by default only a turn whose answer was actually
+        spoken is memory-eligible.
         """
         async with self._lock:
             state = self._turn
@@ -521,10 +890,19 @@ class VoiceTurnJournal:
                 return
             state.finalized = True
             self._cancel_recovery_timers()
+        spoken = self._spoken_assistant_text(state)
+        # What the user heard is the whole answer. The LLM's output is only used
+        # when no sentence was ever spoken at all *and* the turn still succeeded
+        # -- the degraded "audio never played, fall back to text" path, where the
+        # page hands the answer over as text on purpose. A failed or interrupted
+        # turn with nothing spoken has nothing the user heard, so it stays empty.
+        assistant_text = spoken or (
+            state.assistant_text if outcome == turn_api.TURN_FINALIZED else ""
+        )
         if memory is None:
             memory = (
                 outcome == turn_api.TURN_FINALIZED
-                and state.playback_observed
+                and bool(spoken)
                 and degraded_reason is None
             )
         if degraded_reason:
@@ -543,23 +921,83 @@ class VoiceTurnJournal:
                 },
                 turn_id=state.turn_id,
             )
+        await self._emit_turn_finalized(
+            state,
+            outcome=outcome,
+            failure_reason=failure_reason,
+            spoken=spoken,
+            assistant_text=assistant_text,
+        )
         try:
             await asyncio.to_thread(
                 turn_api.finalize_turn,
                 self.voice_session_id,
                 state.turn_id,
-                state.assistant_text,
+                assistant_text,
+                # The journal is the authority on the user's question: it merges
+                # consecutive ASR finals into one turn, while the row still holds
+                # only the first segment that opened it.  Passing it here is what
+                # keeps the transcript (and the page) from showing a truncated
+                # question next to an answer to the whole thing.
+                user_text=state.user_text or None,
                 audio_cursor_ms=state.audio_cursor_ms or None,
                 outcome=outcome,
                 failure_reason=failure_reason,
-                # A failed turn has no answer. A finalized turn is memory-eligible
-                # only when the transport actually observed playback; text that
-                # stayed in the queue or was lost with TTS must remain visible
-                # for audit without becoming long-term memory.
+                # Only what was read aloud may be remembered; text that stayed in
+                # the queue or was lost with TTS must not become long-term memory.
                 memory=memory,
             )
         except Exception:
             logger.warning("voice turn finalize failed", exc_info=True)
+
+    async def _emit_turn_finalized(
+        self,
+        state: _TurnState,
+        *,
+        outcome: str,
+        failure_reason: str | None,
+        spoken: str,
+        assistant_text: str,
+    ) -> None:
+        """落一条带完整拆分的 ``turn.finalized``。
+
+        "已经说出去的"和"生成出来但没播出去"必须分开写：前端把它们放进同一个
+        气泡的两块（已听到的记录 + 折叠的余量），长期记忆只吃前者。以前一个
+        ``text`` 字段同时承担"转录内容"和"实际播报内容"两个意思，于是要么把没
+        读出来的字写进转录（把没说过的话当成说过了），要么把听到的内容截断。
+
+        这里**先**用 ``turn.finalized:{turn_id}`` 这个 request_id 落事件，
+        ``turn_api.finalize_turn`` 内部的同名事件会命中 emit 的幂等分支，因此账本
+        里始终只有一条 ``turn.finalized``，而载荷带的是这份拆分。反过来做不行：
+        幂等分支只返回已存在的行，不会把后来的载荷合并进去。
+        """
+        generated = state.assistant_text
+        unheard = (
+            generated[len(spoken) :] if generated.startswith(spoken) else generated
+        )
+        await self._emit(
+            "turn.finalized",
+            payload={
+                "role": "assistant",
+                # 与落库的助手文本一致（正常回合里它就等于 spoken）。
+                "text": assistant_text,
+                "user_text": state.user_text,
+                "outcome": outcome,
+                "failure_reason": failure_reason,
+                "failed": outcome == turn_api.TURN_FAILED,
+                "retryable": outcome != turn_api.TURN_FINALIZED,
+                "heard_text": spoken,
+                "unheard_text": unheard,
+                "generated_text": generated,
+                "acknowledged": state.acknowledged,
+                "interrupted": outcome == turn_api.TURN_INTERRUPTED,
+                "audio_cursor_ms": state.audio_cursor_ms or None,
+            },
+            turn_id=state.turn_id,
+            request_id=f"turn.finalized:{state.turn_id}",
+            audio_cursor_ms=state.audio_cursor_ms or None,
+        )
+
 
     async def llm_failed(self, message: str) -> None:
         """Handle an LLM-stage failure for the open turn.
@@ -645,10 +1083,11 @@ class VoiceTurnJournal:
     async def turn_interrupted(self, *, reason: str = "barge_in") -> None:
         """Abandon the open turn, keeping only what the user actually heard.
 
-        The portion of the assistant text whose playback was observed is written
-        to the transcript so a refresh still shows what was said, but it is
-        explicitly *not* offered to long-term memory: the user never heard the
-        rest of it.
+        The sentences whose playback had started are written to the transcript so
+        a refresh still shows what was said, but they are explicitly *not*
+        offered to long-term memory: the rest of the answer never reached the
+        user, and cutting an exchange off mid-answer is not something to learn
+        from.
         """
         async with self._lock:
             state = self._turn
@@ -662,38 +1101,88 @@ class VoiceTurnJournal:
             turn_id=state.turn_id,
             reason=reason,
         )
-        heard_text = self._heard_assistant_text(state)
-        if heard_text.strip():
-            try:
-                await asyncio.to_thread(
-                    turn_api.finalize_turn,
-                    self.voice_session_id,
-                    state.turn_id,
-                    heard_text,
-                    memory=False,
-                    audio_cursor_ms=state.audio_cursor_ms or None,
-                )
-            except Exception:
-                logger.warning("interrupted voice turn persist failed", exc_info=True)
+        heard_text = self._spoken_assistant_text(state)
+        # Persist even when nothing was heard.  ``finalize_turn`` documents that an
+        # interrupted turn keeps the user's question in the transcript -- dropping
+        # it is exactly what made it look like the user never spoke -- but this
+        # path used to bail out whenever there was no assistant audio, so any
+        # utterance that was barged over before the bot made a sound vanished from
+        # the conversation entirely.  With no assistant text the turn still
+        # settles as ``interrupted`` and stays out of long-term memory.
+        try:
+            await asyncio.to_thread(
+                turn_api.finalize_turn,
+                self.voice_session_id,
+                state.turn_id,
+                heard_text,
+                user_text=state.user_text or None,
+                memory=False,
+                audio_cursor_ms=state.audio_cursor_ms or None,
+            )
+        except Exception:
+            logger.warning("interrupted voice turn persist failed", exc_info=True)
 
     @staticmethod
-    def _heard_assistant_text(state: _TurnState) -> str:
-        """Best-effort text the transport actually reached during playback.
+    def _spoken_assistant_text(state: _TurnState) -> str:
+        """Exactly the sentences whose audio entered playback, in order.
 
-        Sentence markers are emitted when audio enters the TTS context; only
-        sentences at or before the first observed playback are considered
-        heard. If a provider omitted markers but the transport still confirmed
-        playback, the authoritative LLM text is the only available fallback.
+        A sentence lands in ``sentence_texts`` when the TTS adapter emits its
+        marker -- the moment that sentence's first audio frame is queued, which
+        is also the moment the page draws it. *Every* such sentence counts: an
+        interrupted turn keeps all of them (the old version stopped at the first
+        one, so an answer the user heard in full was stored as its opening
+        sentence), and a sentence that never reached playback is not in this
+        dict at all, so it can never be shown, persisted or remembered.
+
+        The LLM's own output is not a substitute: it can run well past what was
+        spoken, and writing it is what put words on the page (and into memory)
+        that were never read aloud.
+
+        曾经收到过播放确认的句子只算确认到的那个前缀：一个"说了三个字就被打断"
+        的句子必须落成那三个字，而不是整句（F02）。没有确认记录的句子仍然按已
+        入队全文计——老客户端不发确认，把缺失当成"一个字都没听到"会让整段回答
+        消失，那是更坏的错误。句内位置本身是估算（见 :meth:`_played_chars`），
+        所以 ``turn.finalized`` 用 ``acknowledged`` 标注哪些回合有真凭据。
         """
-        if not state.playback_observed:
-            return ""
-        if not state.sentence_texts:
-            return state.assistant_text
-        heard = "".join(
-            state.sentence_texts.get(seq, "")
-            for seq in range(1, state.played_sentence_seq + 1)
-        )
-        return heard or state.assistant_text
+        parts: list[str] = []
+        for sequence in sorted(state.sentence_texts):
+            text = state.sentence_texts[sequence]
+            heard = state.sentence_heard_chars.get(sequence)
+            if heard is None:
+                parts.append(text)
+            else:
+                parts.append(text[: max(0, min(len(text), heard))])
+        # 拼接后统一清尾部空白：截断到句中的前缀常以空格结尾，而句间分隔空白
+        # 属于下一句的开头，不该残留在这里。
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _played_chars(
+        state: _TurnState, sentence_seq: int, played_ms: int, phase: str
+    ) -> int | None:
+        """把客户端的媒体位置换算成"这一句听到了第几个字"。
+
+        ``played_ms`` 是**整轮回答已出声的媒体位置**（客户端音量累加器的读数，
+        与服务端 marker 的句首/句尾游标同一条时间线）；只有拿它减去本句的句首
+        游标，才知道这一句播了多久。
+
+        返回 ``None`` 表示无法定位：句首游标缺失或没有句尾游标时，一个位置报告
+        不能被折算成字符数——按 0 记会把"其实已经说了半句"的句子清空，比保守地
+        不记录更糟。句内位置永远是估算（线性插值，精度受音量检测周期限制），
+        所以它只用于展示，不用于任何终态判定。
+        """
+        text = state.sentence_texts.get(sentence_seq)
+        if text is None:
+            return None
+        if phase == PLAYBACK_PHASE_ENDED:
+            return len(text)
+        start = state.sentence_start_cursor_ms.get(sentence_seq)
+        end = state.sentence_end_cursor_ms.get(sentence_seq)
+        if start is None or end is None or end <= start:
+            return None
+        elapsed = min(max(played_ms - start, 0), end - start)
+        return min(len(text), int(len(text) * elapsed / (end - start)))
+
 
     # ------------------------------------------------------- errors/lifecycle
 
@@ -732,6 +1221,23 @@ class VoiceTurnJournal:
                 "delay_ms": delay_ms,
                 "reason": reason,
             },
+            turn_id=self._turn.turn_id if self._turn else None,
+        )
+
+    async def notice(self, stage: str, code: str, message: str) -> None:
+        """Record a stage note that is deliberately **not** an error.
+
+        Same durable channel as ``processor.error``, but the client only degrades a
+        call for errors carrying ``degraded=true`` (and only then forces text input
+        and mutes the microphone).  Some of the most consequential voice events are
+        invisible to the user and would otherwise leave no trace at all -- "the
+        upstream session closed, next speech reconnects", "the local VAD produced
+        no frames, PCM energy fallback is carrying the turn".  They belong in the
+        durable log, not in a red banner, so they are emitted as notices.
+        """
+        await self._emit(
+            "processor.notice",
+            payload={"stage": stage, "code": code, "message": message},
             turn_id=self._turn.turn_id if self._turn else None,
         )
 
@@ -854,6 +1360,23 @@ class VoiceJournalProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
     async def _observe_user(self, frame: Frame, direction: FrameDirection) -> None:
+        # A frame has to be observed *upstream of whoever consumes it*.  This is
+        # why this tap sits between STT and the user aggregator, and why the
+        # typed-message branch below lives here rather than on the assistant tap:
+        # ``LLMMessagesAppendFrame`` (what RTVI's ``send-text`` pushes from the top
+        # of the pipeline) is consumed by ``LLMUserAggregator`` -- it calls
+        # ``add_messages`` and never re-pushes the frame -- and the assistant tap
+        # sits *downstream* of that aggregator.  Observing it there never fired,
+        # so every typed utterance went un-journaled: no turn was opened (the
+        # ``assistant.*`` events were emitted with ``turn_id=None``), the idle
+        # ceiling was never armed and ``finalize_turn`` was never reached, which
+        # left the page waiting on an answer that could not be closed, persisted
+        # or remembered.
+        if isinstance(frame, LLMMessagesAppendFrame):
+            for message in frame.messages or ():
+                if isinstance(message, dict) and message.get("role") == "user":
+                    await self._journal.user_typed(str(message.get("content") or ""))
+            return
         if isinstance(frame, InterimTranscriptionFrame):
             await self._journal.user_interim(frame.text)
         elif isinstance(frame, TranscriptionFrame):
@@ -865,6 +1388,12 @@ class VoiceJournalProcessor(FrameProcessor):
 
     async def _observe_assistant(self, frame: Frame, direction: FrameDirection) -> None:
         if isinstance(frame, LLMMessagesAppendFrame):
+            # Fallback only: the user tap owns this frame today (see
+            # ``_observe_user``, which is upstream of the aggregator that consumes
+            # it).  Kept so a Pipecat version that starts forwarding the frame
+            # downstream still journals typed input -- ``user_typed`` is
+            # idempotent per turn, so a second observation cannot open a second
+            # turn.
             for message in frame.messages or ():
                 if isinstance(message, dict) and message.get("role") == "user":
                     await self._journal.user_typed(str(message.get("content") or ""))
@@ -932,6 +1461,9 @@ class VoiceControlWatchdog:
     on_interrupt: Callable[[dict[str, Any]], Awaitable[None]]
     on_model_changed: Callable[[dict[str, Any]], Awaitable[None]]
     on_close: Callable[[str], Awaitable[None]]
+    # Aging sweep for turns nobody acknowledged. Optional so the watchdog stays
+    # usable (and testable) without a journal bound to a session.
+    on_reconcile: Callable[[], Awaitable[int]] | None = None
     interval_secs: float = 1.0
     _cursor: int = 0
     _task: asyncio.Task[Any] | None = field(default=None, init=False)
@@ -979,6 +1511,13 @@ class VoiceControlWatchdog:
             elif event_type == "session.closed":
                 await self.on_close("session.closed")
                 return
+        # Turns the control plane opened and no worker ever acknowledged are
+        # invisible to every other recovery path (no idle ceiling is armed for a
+        # turn this journal never opened, and no provider error is ever reported
+        # for it). The sweep is throttled internally, so running it on every tick
+        # stays cheap.
+        if self.on_reconcile is not None:
+            await self.on_reconcile()
         session = await asyncio.to_thread(load_session, self.voice_session_id)
         if session is None:
             await self.on_close("session_missing")

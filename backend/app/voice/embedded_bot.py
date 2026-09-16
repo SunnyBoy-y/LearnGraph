@@ -16,9 +16,11 @@
 #
 
 import asyncio
+import contextlib
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -76,6 +78,7 @@ from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
 from app.voice.embedded_volcengine_tts import VolcengineTTSService
 from app.voice.journal import (
     STAGE_LLM,
+    VOICE_TYPED_TURN_MESSAGE,
     VoiceControlWatchdog,
     VoiceJournalProcessor,
     VoiceTurnJournal,
@@ -93,14 +96,45 @@ load_dotenv(override=True)
 MAIN_WORKER_NAME = "learngraph"
 TUTOR_WORKER_NAME = "tutor"
 VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt"
+# RTVI 自定义客户端消息 ``{t: VOICE_PLAYBACK_MESSAGE, d: {...}}``：浏览器自述的
+# 播放位置（§2.5）。它**只**用于回放进度与体验，绝不是"用户听完了"的持久判据。
+VOICE_PLAYBACK_MESSAGE = "learngraph-playback"
 
-SYSTEM_INSTRUCTION = (
+# 口语回答预算（F08）。语音回答的成本主要在"听"：一段 60 秒的朗读会把用户锁在
+# 麦克风外，而文字可以扫读。所以预算约束的是**默认详略**，不是内容完整性——它说明
+# "什么时候该短"，任何情况下都不允许为了守住预算而截断事实、数字或必要的长代码。
+DEFAULT_SPEECH_BUDGET_SENTENCES = "2-3"
+DEFAULT_SPEECH_BUDGET_SECONDS = "15-25"
+
+
+def speech_budget_instruction() -> str:
+    """口语回答预算说明；句数与秒数可用环境变量覆盖（默认 2–3 句 / 15–25 秒）。"""
+    sentences = (
+        os.getenv("VOICE_SPEECH_BUDGET_SENTENCES", "").strip()
+        or DEFAULT_SPEECH_BUDGET_SENTENCES
+    )
+    seconds = (
+        os.getenv("VOICE_SPEECH_BUDGET_SECONDS", "").strip()
+        or DEFAULT_SPEECH_BUDGET_SECONDS
+    )
+    return (
+        f"默认把口头回答控制在 {sentences} 句、大约 {seconds} 秒以内；"
+        "用户明确要求深入讲解时不受这个预算限制，继续展开。"
+        "任何情况下都不得为了控制长度而省略关键事实、数字、结论，"
+        "也不得截断必要的事实陈述或长代码——预算只约束默认详略，"
+        "不约束内容的完整与正确。"
+    )
+
+
+_BASE_SYSTEM_INSTRUCTION = (
     "你是一个友好的中文语音导师。你的回答会被直接朗读出来，所以请使用自然、"
     "口语化的中文，避免 emoji、特殊符号、列表、Markdown 等无法朗读的内容。"
     "回答要简洁、亲切，像真人对话一样。遇到需要联网研究、深度分析或工具执行的"
     "请求时，调用相应的后台任务工具，先快速确认受理，然后继续和用户实时对话；"
     "不要等待后台任务完成，也不要把后台原始结果逐字念出。"
 )
+
+SYSTEM_INSTRUCTION = _BASE_SYSTEM_INSTRUCTION + speech_budget_instruction()
 
 
 def load_session_row(voice_session_id: str):
@@ -533,6 +567,112 @@ async def route_pipeline_error(journal: VoiceTurnJournal, frame: Any) -> None:
     )
 
 
+# 客户端打断 id 的保留窗口。它只需要覆盖"重连重放 + 用户连点"这段几秒到几十秒的
+# 窗口，不需要在整个通话期间记账。
+MAX_TRACKED_INTERRUPT_IDS = 64
+
+
+class InterruptIdDeduplicator:
+    """同一个 ``interruptId`` 只打断一次。
+
+    为什么需要：客户端在数据通道上重发打断（重连重放、用户连点"停止播报"，或
+    数据通道与 HTTP 兜底同时到达）时，每一次处理都会推进 generation 闸门。多余的
+    那一次会把**已经开始朗读的下一轮回答**判成上一代的残留音频而丢弃 —— 表现就是
+    "打断一次之后导师变哑巴"。因此按客户端给的 id 去重，而不是按到达次数。
+    """
+
+    def __init__(self, max_ids: int = MAX_TRACKED_INTERRUPT_IDS) -> None:
+        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._max_ids = max(1, int(max_ids))
+
+    def accept(self, interrupt_id: str) -> bool:
+        """第一次见到这个 id 返回 True；重复的 id 返回 False。"""
+        key = str(interrupt_id or "").strip()
+        if not key:
+            # 不带 id 的旧客户端无法去重：只能按"每次都是新的打断"处理，否则
+            # 真正的第二次打断会被误吞。
+            return True
+        if key in self._seen:
+            return False
+        self._seen[key] = None
+        while len(self._seen) > self._max_ids:
+            self._seen.popitem(last=False)
+        return True
+
+
+def _int_or_none(value: Any) -> int | None:
+    """Best-effort int for a client-supplied field; garbage becomes ``None``."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def handle_learngraph_client_message(
+    *,
+    message: Any,
+    journal: VoiceTurnJournal | None,
+    generation_gate: VoiceGenerationGate,
+    interrupt_bot: Callable[[], Awaitable[None]],
+    interrupts: InterruptIdDeduplicator,
+) -> None:
+    """Route the browser's ``learngraph-*`` RTVI messages, the call's control plane.
+
+    Kept as a module-level function rather than an inline closure so the routing
+    itself is assertable: this is the only place where a client message becomes a
+    journal write or a barge-in, and both stay silent when a branch is dropped.
+
+    Three message types, one rule each:
+
+    * ``learngraph-typed-turn`` -- announce the idempotency key of an utterance the
+      control plane already opened a turn for.
+    * ``learngraph-playback`` -- the browser's own playback position.  **体验用**:
+      it feeds the replay cursor and audit only.  It must never take part in
+      finalize/memory 判定 -- the browser can be muted, in a background tab or
+      throttled, so "played" is not "heard".
+    * ``learngraph-interrupt`` -- barge-in, deduplicated by ``interruptId``.
+    """
+    message_type = str(getattr(message, "type", "") or "")
+    payload = getattr(message, "data", None)
+    data = payload if isinstance(payload, dict) else {}
+
+    if message_type == VOICE_TYPED_TURN_MESSAGE:
+        # The browser announces the idempotency key it is about to type with
+        # *before* ``send-text`` on the same ordered data channel. Without it the
+        # worker cannot tell which turn the control plane already opened for this
+        # utterance, so one typed message would become the client's turn plus a
+        # worker-opened one.
+        if journal is not None:
+            journal.expect_typed_turn(
+                str(data.get("client_message_id") or ""),
+                str(data.get("text") or ""),
+            )
+        return
+
+    if message_type == VOICE_PLAYBACK_MESSAGE:
+        if journal is not None:
+            await journal.playback_ack(
+                sentence_seq=_int_or_none(data.get("sentence_seq")),
+                played_ms=_int_or_none(data.get("played_ms")) or 0,
+                phase=str(data.get("phase") or ""),
+                generation_id=_int_or_none(data.get("generation_id")),
+            )
+        return
+
+    if message_type != VOICE_INTERRUPT_MESSAGE:
+        return
+
+    interrupt_id = str(data.get("interruptId") or "")
+    if not interrupts.accept(interrupt_id):
+        logger.debug("Duplicate barge-in ignored: interruptId={}", interrupt_id)
+        return
+    logger.info("Client requested barge-in over RTVI; interrupting the bot")
+    generation_gate.invalidate()
+    await interrupt_bot()
+
+
 def _voice_peer_connection(runner_args: Any) -> Any:
     """Return the aiortc peer connection behind the runner arguments."""
 
@@ -733,6 +873,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             or os.getenv("VOLC_TTS_API_KEY", "")
         ),
         journal=journal,
+        # 句子身份里的 generation_id 必须来自**同一个**闸门实例：它是"这一句属于
+        # 哪一代音频"的唯一权威，前端据此丢弃被打断那一代的迟到 marker。
+        generation_source=lambda: generation_gate.generation,
         settings=VolcengineTTSService.Settings(
             voice_type=str(
                 getattr(getattr(tts_provider, "options", None), "voice_type", None)
@@ -907,14 +1050,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         rtvi = None
 
     if rtvi is not None:
+        # 每个语音会话一份打断去重表：去重窗口只需覆盖同一次打断在数据通道上的重发，
+        # 跨会话共享既没有必要，也会把 id 空间搅在一起。
+        interrupts = InterruptIdDeduplicator()
 
         @rtvi.event_handler("on_client_message")
         async def on_client_message(rtvi_processor, message):
-            if getattr(message, "type", "") != VOICE_INTERRUPT_MESSAGE:
-                return
-            logger.info("Client requested barge-in over RTVI; interrupting the bot")
-            generation_gate.invalidate()
-            await rtvi_processor.interrupt_bot()
+            await handle_learngraph_client_message(
+                message=message,
+                journal=journal,
+                generation_gate=generation_gate,
+                interrupt_bot=rtvi_processor.interrupt_bot,
+                interrupts=interrupts,
+            )
 
         async def _fast_interrupt() -> None:
             generation_gate.invalidate()
@@ -974,6 +1122,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             close_reason = reason or "session_closed"
             logger.info("voice session %s closing: %s", session_id, close_reason)
             generation_gate.invalidate()
+            if journal is not None:
+                # Settle the open exchange *before* the loop is cancelled: a call
+                # that ends mid-answer (or mid-typing) must not leave a turn
+                # ``accepted`` forever, which is what kept the question out of the
+                # transcript and out of memory.
+                with contextlib.suppress(Exception):
+                    await journal.close_open_turns_on_session_end()
             await runner.cancel(close_reason)
 
         watchdog = VoiceControlWatchdog(
@@ -981,6 +1136,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             on_interrupt=_on_interrupt,
             on_model_changed=_on_model_changed,
             on_close=_on_close,
+            on_reconcile=(
+                journal.reconcile_stale_turns if journal is not None else None
+            ),
         )
 
         async def _cleanup_watchdog() -> None:

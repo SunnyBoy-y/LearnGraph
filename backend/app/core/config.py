@@ -713,7 +713,13 @@ class Settings(BaseSettings):
     # doc/LearnGraph_实时语音全双工管线接线设计_v1.0.md §6.5.2.
     voice_smart_turn_stop_secs: float | None = None
     voice_smart_turn_pre_speech_ms: float | None = None
-    voice_vad_stop_secs: float | None = None
+    # 本机 Silero VAD 的静音判定时长。Pipecat 默认 0.2s，中文口语的句中
+    # 停顿（换气/断句）常超过它，导致一句话被 VAD 切成多段；配合
+    # DASHSCOPE_ASR_COMMIT_ON_VAD_STOP=1（VAD 停即 commit），每段都会
+    # 出一个截断的 final（实测把"你还…"定稿成"你还"）。0.5s 保留真实句间
+    # 停顿，只把 0.5s 以上的静默当作话轮结束（约多等 0.3s 才出 final，
+    # 换来回合不再被切碎）。
+    voice_vad_stop_secs: float | None = 0.5
     # Mirrors Pipecat's ``LLMUserAggregatorParams.user_turn_stop_timeout``
     # default (5.0s): the hard ceiling on how long a user turn may stay open
     # when no stop strategy fires.
@@ -726,6 +732,34 @@ class Settings(BaseSettings):
     # it measures "stuck", not "slow". When it fires with no text the turn is
     # finalized as failed and the user's question is still persisted.
     voice_turn_idle_timeout: float = 20.0
+    # Aging ceiling for a turn the audio worker never acknowledged. The control
+    # plane creates the turn before the worker sees the utterance, so a turn can
+    # exist that no other recovery path owns: no idle ceiling is armed for it and
+    # no provider error is ever reported for it. Past this age it is settled as
+    # failed (question kept, retry offered) by the worker's sweep and by the
+    # process-wide sweep. Generous on purpose: it must never race a slow but live
+    # provider round trip. 0 disables the sweep.
+    voice_turn_stale_timeout: float = 180.0
+    # How often the process-wide stale-turn sweep runs (worker-local sweeps are
+    # throttled to a fraction of this).
+    voice_turn_sweep_interval_seconds: float = 30.0
+    voice_turn_sweep_enabled: bool = True
+    # ---- 会话级空闲收尾（S7 的会话 TTL）---------------------------------------
+    # 通话被丢弃（不挂断、不关页面、手机进后台）时，durable 会话会一直保持
+    # ``active``：没有任何一层会关掉它，而它背后挂着一条实时 ASR 会话、一条双向
+    # TTS 流和一次 WebRTC peer。这里是有活动证据的兜底收尾：
+    #
+    #   activity = max(voice_sessions.updated_at,
+    #                  MAX(voice_events.created_at),
+    #                  MAX(voice_turns.updated_at))
+    #
+    # 客户端的事件轮询是只读的，因此它**不会**把一条死会话续命；反过来，只要还有
+    # 转录、回答、任务或上下文更新在写事件，会话就绝不会被误收。同一进程内的管线
+    # 若报告最近仍有音频输入（`DashScopeSTTService.last_audio_activity_at`），本轮
+    # 也会跳过。0 关闭该兜底（会话即随通话无限期保持）。
+    voice_session_idle_timeout_seconds: float = 2700.0
+    voice_session_reaper_interval_seconds: float = 60.0
+    voice_session_reaper_enabled: bool = True
     # LLM-stage retry budget. Only a generation that produced *no* text is
     # retried (see ``VoiceTurnJournal.llm_failed``), which keeps the retry
     # idempotent: there is no partial answer to duplicate and the voice pipeline
