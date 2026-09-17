@@ -37,6 +37,16 @@ append ≤ 15 MiB，总缓冲无上限）。本服务现在遵守三条契约：
    commit。修复前"VAD 不产生帧"等于"这个人说的话永远出不了 final 且没有任何
    报错"——因为 commit 与 partial **都**只认 VAD 帧。
 
+**回合边界不丢文本（2026-09-17 修复"说两轮后麦克风就哑了"）**：这是一条比上面
+三条更硬的契约——**任何一条已经收到的 final 都必须变成文本**，即使它回来得太晚、
+已经越过回合边界。旧实现在 ``UserStoppedSpeakingFrame`` 处清空在途 commit 队列，
+而 commit 是在 VAD 停止时发的、final 要 0.5~1s 才回：一旦 final 输给 p99 安全网
+（回合先结束），它回来时就找不到配对、被判为 "unsolicited" 整条丢掉。丢掉的正是
+用户刚说的那句话，而且**每一轮都丢**——用户看到的正是"说两轮之后麦克风死了"。
+现在回合边界只把在途 commit 标 ``superseded``（文本保留、``finalized=False`` 不许
+它结束/重开回合），队列直到超时才清理；丢 final 也从 DEBUG 升级为 WARNING +
+durable notice，杜绝"用户说了话、服务端一句日志都没有"。
+
 本适配层把该 WebSocket 客户端包成 Pipecat 的 STTService：
   run_stt(audio) 仅喂入音频；后台 read loop 收到结果后 push TranscriptionFrame。
 """
@@ -97,6 +107,17 @@ DEFAULT_ENERGY_ONSET_SECS = 0.06
 DEFAULT_ENERGY_STOP_SECS = 0.4
 # 空闲看门狗检查周期。
 IDLE_CHECK_INTERVAL_SECS = 1.0
+# commit 门的最小语音量：自上次 commit 以来至少听到这么多语音，才值得向云端提交。
+# 与能量"开口"阈值同量级——够长到不会被 VAD 停止之后的一两帧残留噪声点亮（那会
+# 拿到幻觉 final），又短到不会把一句很短的"嗯"挡掉。
+_MIN_COMMIT_SPEECH_SECS = DEFAULT_ENERGY_ONSET_SECS
+# 一条 commit 超过这么久没有 final 回来，就当作服务端不会回了。回合结束不再清空
+# 队列（见 ``process_frame`` 中 ``UserStoppedSpeakingFrame`` 的处理），留着这类
+# 僵尸记录会让下一个 final 被错配到它身上。
+_PENDING_COMMIT_MAX_AGE_SECS = 20.0
+# "丢掉的 final" 的上报节流。用户可见的"我说了话却什么都没发生"必须在 durable log
+# 里留下痕迹，但一条已经坏掉的会话不该把日志刷满。
+_FINAL_DROP_NOTICE_INTERVAL_SECS = 60.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -222,6 +243,17 @@ class DashScopeSTTService(STTService):
         self._pending_commits: deque[_PendingCommit] = deque()
         self._connection_generation = 0
         self._utterance_generation = 0
+        # 自上一次 commit 以来，本机听到的语音时长（秒）。这是 commit 门与
+        # partial 门共用的判据：``_speech_seen`` 在每次 commit 之后复位，单看它
+        # 无法表达"commit 之后本回合又说了话"——旧实现因此会出现"字幕照常滚动、
+        # commit 永远缺席"的状态（用户看得见自己的话，回合却再也不结束）。
+        # 反过来，只按"现在有没有能量"判断又会让 VAD 停止后的一两帧残留噪声
+        # 触发一次对静音缓冲的 commit，拿到幻觉 final。
+        self._uncommitted_speech_secs = 0.0
+        # 被丢弃的 final 计数 + 最后一次上报时间。丢话以前只有一行 DEBUG 日志：
+        # 用户看到的是"我说了话但什么都没发生"，而服务端日志一片安静。
+        self._dropped_finals = 0
+        self._last_final_drop_notice_at = float("-inf")
         # commit 的触发点（2026-09-12 单点计时定位后修正）：
         #   "1"（默认）→ 本机 VAD 判定停止（VADUserStoppedSpeakingFrame）即 commit；
         #   "0"        → 等聚合器广播 UserStoppedSpeakingFrame 再 commit（旧行为）。
@@ -599,6 +631,10 @@ class DashScopeSTTService(STTService):
             self._energy_silence_secs = 0.0
             self._last_speech_at = now
             self._energy_speech_secs += frame_secs
+            # 未提交语音量：commit 的真判据（见 ``_speech_since_commit``）。一个
+            # commit 只把"截至此刻的那段音频"变成文本；此后继续说的话必须重新
+            # 攒够时长，才值得再提交一次。
+            self._uncommitted_speech_secs += frame_secs
             if (
                 not self._energy_speech
                 and self._energy_speech_secs >= self._energy_onset_secs
@@ -723,11 +759,20 @@ class DashScopeSTTService(STTService):
             await self._send_commit("vad-stop")
         if isinstance(frame, UserStoppedSpeakingFrame):
             # This is a real turn boundary, unlike VADUserStoppedSpeakingFrame:
-            # Smart Turn has decided that the user is done. Any still-unresolved
-            # commit from the previous turn must not consume the next turn's
-            # final, and its late final must not reopen the turn.
+            # Smart Turn has decided that the user is done. Bumping the utterance
+            # generation detaches the commits still in flight from the *next*
+            # turn -- but it must not throw their text away. A commit sent at VAD
+            # stop lands 0.5-1s later; when that final loses the race against the
+            # p99 safety net, the stop frame arrives first and the old code
+            # cleared the queue here, so the final came back "unsolicited" and
+            # was dropped whole. The next turn then committed on top of an
+            # already-finalized buffer, and the call went permanently silent:
+            # the "speak two turns and the mic is dead" bug. Keep them queued and
+            # mark them superseded instead -- their text still reaches the
+            # aggregator, while ``finalized=False`` keeps them from ending or
+            # reopening a turn.
             self._utterance_generation += 1
-            self._pending_commits.clear()
+            self._mark_pending_commits_superseded()
             if not self._commit_on_vad_stop:
                 timeline_mark("stt", "收到回合结束帧")
                 await self._send_commit("turn-stopped")
@@ -736,20 +781,78 @@ class DashScopeSTTService(STTService):
         for commit in self._pending_commits:
             commit.superseded = True
 
+    def _speech_since_commit(self) -> bool:
+        """本机自上一次 commit 以来，是否确实听到过语音？
+
+        commit 门与 partial 门必须读同一个判据。旧实现把 partial 门写成
+        ``_speech_seen or _energy_speech``、commit 门只写 ``_speech_seen``，而
+        ``_speech_seen`` 在每次 commit 后复位——于是"本回合 commit 过一次、之后
+        又说了话"时，字幕照常滚动而 commit 永远缺席：用户看得见自己的话，回合却
+        再也不结束，整通电话就此哑掉。
+        """
+        return (
+            self._speech_seen
+            or self._uncommitted_speech_secs >= _MIN_COMMIT_SPEECH_SECS
+        )
+
+    def _prune_pending_commits(self) -> None:
+        """丢掉太久没有 final 的 commit。
+
+        ``UserStoppedSpeakingFrame`` 不再清空队列（见 ``process_frame``），所以
+        队列里可能留下一条"服务端始终没回 final"的记录；不清理它，下一个 final
+        会被按 FIFO 错配到它身上。超过 ``_PENDING_COMMIT_MAX_AGE_SECS`` 即视为
+        已丢失——这条记录也不再有任何可配对的 final 会来。
+        """
+        cutoff = time.time() - _PENDING_COMMIT_MAX_AGE_SECS
+        while self._pending_commits and self._pending_commits[0].sent_at < cutoff:
+            stale = self._pending_commits.popleft()
+            logger.warning(
+                f"{self}: dropping commit {stale.event_id} (trigger={stale.trigger})"
+                f" after {_PENDING_COMMIT_MAX_AGE_SECS:.0f}s without a final"
+            )
+            self._dropped_finals += 1
+
+    async def _note_final_dropped(self, *, text_len: int, reason: str) -> None:
+        """丢掉的 final 必须可见。
+
+        以前这两条路径只写一行 DEBUG：用户看到的是"我说了话但什么都没发生"，
+        而服务端日志里连一条 WARNING 都没有，排障时无从下手。现在每次都记
+        WARNING，并按 ``_FINAL_DROP_NOTICE_INTERVAL_SECS`` 节流上报一条 durable
+        notice（同一会话里的第一次必定上报）。
+        """
+        self._dropped_finals += 1
+        logger.warning(
+            f"{self}: dropped ASR final without a matching commit"
+            f" (reason={reason}, text_len={text_len}, total_dropped={self._dropped_finals})"
+        )
+        if self._journal is None:
+            return
+        now = time.monotonic()
+        if now - self._last_final_drop_notice_at < _FINAL_DROP_NOTICE_INTERVAL_SECS:
+            return
+        self._last_final_drop_notice_at = now
+        await self._journal.notice(
+            "asr",
+            "final_without_commit",
+            f"收到 {self._dropped_finals} 条没有配对 commit 的 final"
+            f"（最近一条 reason={reason}, text_len={text_len}），这些文本无法进入转录",
+        )
+
     async def _send_commit(self, trigger: str) -> None:
         """向 DashScope 发送 input_audio_buffer.commit，强制立即出 final。
 
-        只有在本机 VAD（或能量兜底）本回合确实听到过语音时才 commit：静音缓冲的
-        commit 会拿到幻觉 final（见 ``__init__`` 的说明），进而自激出无限空回合。
-        ``trigger`` 仅用于单点计时日志，标明这次 commit 是被谁触发的。
+        只有在本机 VAD（或能量兜底）自上次 commit 以来确实听到过语音时才 commit：
+        静音缓冲的 commit 会拿到幻觉 final（见 ``__init__`` 的说明），进而自激出
+        无限空回合。``trigger`` 仅用于单点计时日志，标明这次 commit 是被谁触发的。
         """
         if self._closed or not self._upstream_alive():
             return
         if not self._commit_on_eou:
             return
-        if not self._speech_seen:
+        if not self._speech_since_commit():
             logger.debug(f"{self}: skipped commit on EOU (no local speech this turn)")
             return
+        self._prune_pending_commits()
         event_id = self._next_event_id("commit")
         try:
             await self._ws.send(
@@ -774,6 +877,9 @@ class DashScopeSTTService(STTService):
             logger.debug(f"{self}: committed audio buffer on EOU")
             timeline_mark("stt", "commit 已发出", f"trigger={trigger}")
             self._speech_seen = False
+            # 已提交的语音不再计入"未提交语音量"：此后若用户接着说，必须重新攒够
+            # ``_MIN_COMMIT_SPEECH_SECS`` 才允许再提交一次（避免对残留噪声提交）。
+            self._uncommitted_speech_secs = 0.0
             # 新段落开始：下一条 partial 属于新文本，不再与上一段去重。
             self._last_partial_text = ""
         except Exception as exc:  # noqa: BLE001
@@ -819,8 +925,10 @@ class DashScopeSTTService(STTService):
                     text = str(payload.get("text") or payload.get("stash") or "").strip()
                     # 仅在"本回合确实有语音"时上报 partial，避免静音期间的
                     # 服务端幻觉 partial 触发一次空回合。能量兜底期间也算有语音，
-                    # 否则 VAD 缺席时实时字幕会一句话都不显示。
-                    if text and (self._speech_seen or self._energy_speech):
+                    # 否则 VAD 缺席时实时字幕会一句话都不显示。判据与 commit 门
+                    # 共用（``_speech_since_commit``）——两门不一致就会出现
+                    # "字幕在动、回合永远不结束"。
+                    if text and (self._energy_speech or self._speech_since_commit()):
                         # 成对下发（同一次更新两条相同文本）只报第一条；
                         # 假设重置（新句）视为新文本。
                         if text != self._last_partial_text:
@@ -876,26 +984,28 @@ class DashScopeSTTService(STTService):
         carry both connection and utterance generations.
         """
         text = str(payload.get("transcript") or payload.get("text") or "").strip()
+        self._prune_pending_commits()
         commit: _PendingCommit | None = None
         while self._pending_commits:
             candidate = self._pending_commits.popleft()
-            if (
-                candidate.connection_generation != self._connection_generation
-                or candidate.utterance_generation != self._utterance_generation
-            ):
+            if candidate.connection_generation != self._connection_generation:
+                # 上一个连接的 commit：它的音频与新连接无关，丢弃（重连后属正常）。
                 logger.debug(
                     "[DashScopeEvt] dropping stale final (connection={}, utterance={})",
                     candidate.connection_generation,
                     candidate.utterance_generation,
                 )
                 continue
+            if candidate.utterance_generation != self._utterance_generation:
+                # 回合边界已经翻页（本机 VAD 开口 / Smart Turn 判定结束），但这
+                # 条 commit 的音频就是刚刚那一轮说的话：文本必须留下，只是不许
+                # 它结束或重开一个回合。旧实现在这里直接丢掉，于是"说话"和
+                # "有回合"是两回事——用户说两轮之后麦克风就"死"了。
+                candidate.superseded = True
             commit = candidate
             break
         if commit is None:
-            logger.debug(
-                "[DashScopeEvt] dropping unsolicited final (text_len={})",
-                len(text),
-            )
+            await self._note_final_dropped(text_len=len(text), reason="unsolicited")
             return
         timeline_mark(
             "stt",
