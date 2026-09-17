@@ -205,7 +205,13 @@ class VoiceContextService:
         user_part_id = str(uuid5(NAMESPACE_URL, deterministic_key + ":user-part"))
         assistant_part_id = str(uuid5(NAMESPACE_URL, deterministic_key + ":assistant-part"))
         trace = {
+            # Both spellings are written on purpose: the canvas gates captions and
+            # voice-only affordances on `voice_turn`, while rows created
+            # optimistically by the page carry the same key, so reading only one of
+            # them is what used to drop a voice answer back to "ordinary message"
+            # as soon as the history was refetched from the server.
             "voice": True,
+            "voice_turn": True,
             "voice_turn_id": turn_id,
             "request_id": request_id,
             "client_message_id": client_message_id,

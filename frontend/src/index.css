@@ -1702,6 +1702,11 @@ body.is-resizing .workspace-resizer {
    text. The banner must be unmissable -- the user is otherwise still
    talking into a microphone nothing is listening to. */
 .chat-voice-degraded-note { align-self: center; margin: 2px 0 8px; max-width: 460px; padding: 6px 12px; border: 1px solid rgba(214, 148, 40, .45); border-radius: 8px; background: rgba(214, 148, 40, .12); text-align: center; font-size: 12px; line-height: 1.5; }
+/* 通话需要用户做一件事时的提示条（恢复声音 / 重试连接）：与上面的降级横幅同一视觉
+   等级，但必须带一个可点的动作 —— 这两种失败都表现为"看起来一切正常却没有结果"。 */
+.chat-voice-recovery { align-self: center; display: flex; align-items: center; gap: 8px; margin: 2px 0 8px; padding: 5px 12px; border: 1px solid rgba(86, 122, 214, .45); border-radius: 8px; background: rgba(86, 122, 214, .1); font-size: 12px; line-height: 1.5; }
+.chat-voice-recovery button { padding: 2px 10px; border: 1px solid rgba(86, 122, 214, .55); border-radius: 6px; background: var(--background); color: inherit; font: inherit; font-weight: 600; cursor: pointer; }
+.chat-voice-recovery button:hover { background: rgba(86, 122, 214, .18); }
 /* 句级语音字幕：正在朗读的那一句比正文淡一档（"一点点灰度"），读完回归正文色。
    用背景高亮会读成"选中"，用浅一档的前景色才是"正在读"；未开始的句子由后端
    决定不下发，因此这里只会收到已经开始播放的句子。 */
@@ -1716,6 +1721,9 @@ body.is-resizing .workspace-resizer {
 .chat-composer .chat-composer__voice-mode.is-live { color: #fff; background: #111315; border-radius: 999px; }
 .chat-composer .chat-composer__voice-mode.is-live:hover { color: #fff; background: #33383d; }
 .dark .chat-composer .chat-composer__voice-mode.is-live { color: #12160f; background: #eef2ee; }
+/* 重载后服务端通话可能还活着：同一个拨号键改成"回到通话中"，用一圈虚线说明它不是
+   一次全新的呼叫。 */
+.chat-composer .chat-composer__voice-mode.is-resumable { border: 3px dashed rgba(86, 122, 214, .75) !important; }
 .dark .chat-composer .chat-composer__voice-mode.is-live:hover { color: #12160f; background: #d5dcd5; }
 .chat-composer .chat-composer__voice-mode.is-error { color: var(--muted-foreground); }
 .chat-composer .chat-composer__hangup { color: #fff; background: #111315; border-radius: 999px; }

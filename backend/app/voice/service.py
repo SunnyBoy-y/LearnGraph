@@ -646,14 +646,16 @@ class VoiceSessionService:
             raise AppError(404, "voice_turn_not_found", "Voice turn was not found")
         return row
 
-    def transcript(self, voice_session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    def transcript(self, voice_session_id: str, limit: int = 50, *, include_open: bool = True) -> list[dict[str, Any]]:
         """Authoritative transcript for reload/reconnect recovery.
 
-        Only finalized turns are returned, which is what makes a page refresh
-        reproduce the conversation without replaying speculative captions.
+        Settled turns are what make a page refresh reproduce the conversation
+        without replaying speculative captions. The still-running turn is
+        appended so a reload mid-answer keeps the user's own question on screen;
+        it carries no assistant text until it settles.
         """
         self.get_session(voice_session_id)
-        return list_turns(voice_session_id, limit=limit)
+        return list_turns(voice_session_id, limit=limit, include_open=include_open)
 
     def runtime_config(self, voice_session_id: str) -> dict[str, Any]:
         """Return non-secret provider choices for the optional audio worker."""

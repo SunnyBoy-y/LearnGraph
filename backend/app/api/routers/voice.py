@@ -204,9 +204,14 @@ def interrupt_voice_session(voice_session_id: str, db: DB, context: CurrentWorks
 
 @router.get("/sessions/{voice_session_id}/transcript")
 def get_voice_transcript(voice_session_id: str, limit: int = Query(default=50, ge=1, le=500),
+                         include_open: bool = Query(default=True),
                          db: DB = None, context: CurrentWorkspace = None, settings: AppSettings = None):
-    """Authoritative transcript (finalized turns only) for reload recovery."""
+    """Authoritative transcript for reload recovery.
+
+    Settled turns plus (by default) the turn that is still running: a reload
+    during an answer must not make the user's own question disappear.
+    """
     return {
         "voice_session_id": voice_session_id,
-        "turns": svc(db, context, settings).transcript(voice_session_id, limit=limit),
+        "turns": svc(db, context, settings).transcript(voice_session_id, limit=limit, include_open=include_open),
     }

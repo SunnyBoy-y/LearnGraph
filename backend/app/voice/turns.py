@@ -400,12 +400,25 @@ def run_stale_turn_sweep(
     return {"sessions": len(session_ids), "closed": closed}
 
 
-def list_turns(voice_session_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+def list_turns(
+    voice_session_id: str,
+    *,
+    limit: int = 50,
+    include_open: bool = False,
+) -> list[dict[str, Any]]:
     """Authoritative transcript, oldest first.
 
     Includes every settled status, not just ``finalized``: a failed or
     interrupted turn still holds the user's question, and hiding it here is what
     used to make a dropped turn vanish on refresh.
+
+    ``include_open`` additionally appends the turn that is still running. A page
+    reload during an answer used to lose that turn *entirely* -- it has no
+    persisted chat messages yet, and the live caption row lives only in the
+    canvas -- so the user's own question disappeared until the turn settled.
+    Reconciliation keeps such a turn transient (the stale-turn sweep and the
+    pipeline's own finalize both settle it), and long-term memory still only
+    ever takes finalized turns, so exposing it cannot leak an unfinished answer.
     """
     with SessionLocal() as db:
         rows = db.scalars(
@@ -417,7 +430,18 @@ def list_turns(voice_session_id: str, *, limit: int = 50) -> list[dict[str, Any]
             .order_by(VoiceTurnRecord.finalized_at.asc(), VoiceTurnRecord.created_at.asc())
             .limit(int(limit))
         ).all()
-        return [turn_to_dict(row) for row in rows]
+        settled = [turn_to_dict(row) for row in rows]
+        if not include_open:
+            return settled
+        open_rows = db.scalars(
+            select(VoiceTurnRecord)
+            .where(
+                VoiceTurnRecord.voice_session_id == voice_session_id,
+                VoiceTurnRecord.status.in_(OPEN_TURN_STATUSES),
+            )
+            .order_by(VoiceTurnRecord.created_at.asc())
+        ).all()
+        return settled + [turn_to_dict(row) for row in open_rows]
 
 
 def finalize_turn(
