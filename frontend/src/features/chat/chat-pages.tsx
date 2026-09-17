@@ -195,10 +195,9 @@ import {
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
-  isPlainSpokenSentence,
-  readVoiceTypingTiming,
-  VoiceTypingText,
-} from "@/components/chat/voice-typing-text";
+  readVoiceCaptionSegments,
+  VoiceSentenceCaptions,
+} from "@/components/chat/voice-sentence-captions";
 import {
   locateSelectionInContent,
   selectionToolbarPoint,
@@ -1956,35 +1955,17 @@ function AssistantMessageInner({
       }
     />
   );
-    // A voice answer is rendered one block per spoken sentence, so the streaming
-    // part is precisely the sentence whose audio is playing right now.
+    // 句级字幕：文本"什么时候出现"完全由后端排期决定（收到 marker 即代表这一句
+    // 开始播放），前端只负责三态着色——未开始的句子根本不会出现在这里。
     if (
       shown.provider_trace?.voice_turn === true &&
       shown.role === "assistant" &&
-      part.status === "streaming"
+      shown.status === "streaming"
     ) {
-      // Typewriter: the sentence being read aloud is typed out as it plays, so
-      // the text never runs ahead of the voice and the unspoken tail is simply
-      // not on screen. Prose only -- typing needs the text split up, which would
-      // show markdown syntax while the sentence is still being read.
-      const typing =
-        shown.status === "streaming" ? readVoiceTypingTiming(part.data) : null;
-      const sentence = part.content ?? "";
-      const typed = Boolean(typing && isPlainSpokenSentence(sentence));
-      return (
-        <div
-          // The caret marks where the voice is, so the typing path needs no
-          // background -- and painting one would now cover the whole answer.
-          className={typed ? "chat-voice-sentence" : "chat-voice-sentence is-speaking"}
-          key={part.id}
-        >
-          {typed ? (
-            <VoiceTypingText active text={sentence} timing={typing} />
-          ) : (
-            rendered
-          )}
-        </div>
-      );
+      const captions = readVoiceCaptionSegments(part.data);
+      if (captions.length) {
+        return <VoiceSentenceCaptions key={part.id} segments={captions} />;
+      }
     }
     return rendered;
   };
@@ -2958,13 +2939,10 @@ export function ChatCanvasPage() {
       // Every sentence already spoken, in order; the last one is being read aloud
       // right now and is the only part marked `streaming`.
       const spoken = item.role === "assistant" ? (item.spokenSegments ?? []) : [];
-      // One block, not one per sentence: a paragraph break after every sentence
-      // reads as a chopped-up answer, while speech just continues. The block
-      // holds every sentence already heard and carries the playback anchor of
-      // the sentence being read, so the canvas types inside it as it goes.
+      // 整段回答仍是**一个块**（不是一句一段），块的族色由每一句自己的状态决定：
+      // 正在朗读的那句淡一档，读完的回归正文色。
       const live = !item.final && spoken.length > 0;
       const spokenText = spoken.map((segment) => segment.text).join("");
-      const liveSegment = live ? spoken[spoken.length - 1] : null;
       const parts: MessagePart[] = spoken.length
         ? [
             {
@@ -2975,20 +2953,17 @@ export function ChatCanvasPage() {
                 : "completed") as MessagePart["status"],
               content: spokenText,
               sequence: 0,
-              data: liveSegment
-                ? {
-                    kind: "final_answer",
-                    voice_typing: {
-                      row_id: item.id,
-                      cursor_ms: liveSegment.cursorMs,
-                      started_at: liveSegment.startedAt,
-                      base_chars: Math.max(
-                        0,
-                        spokenText.length - liveSegment.text.length,
-                      ),
-                    },
-                  }
-                : { kind: "final_answer" },
+              // 句级字幕：每一句带上"是否正在朗读"（= 还没收到它的 end marker）。
+              // 未开始的句子不在这个数组里 —— 后端根本还没把它的文本发过来。
+              data: {
+                kind: "final_answer",
+                voice_captions: {
+                  segments: spoken.map((segment) => ({
+                    text: segment.text,
+                    reading: segment.endMs === null,
+                  })),
+                },
+              },
             },
           ]
         : [

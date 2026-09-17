@@ -62,10 +62,18 @@ export type VoiceTaskEvent = VoiceTaskPatch;
 export interface VoiceSpokenSegment {
   /** Sentence text exactly as it was spoken. */
   text: string;
+  /** 账本序号：`voice-sentence-start` / `voice-sentence-end` 共用的句身份。 */
+  seq: number;
   /** Offset (ms) of this sentence's first audio frame inside the reply audio. */
   cursorMs: number;
-  /** `performance.now()` at which that frame entered the output queue. */
-  startedAt: number;
+  /**
+   * 该句播完时的媒体偏移；`null` = 正在朗读。
+   *
+   * 由服务端的 `voice-sentence-end` 写入，而那条 marker 是**排期到这一句真正播完的
+   * 时刻**才下发的（后端 marker 排期投递）。所以前端不需要任何播放时钟、也不需要
+   * 字速估算：没有 `endMs` 就是"正在读"，收到就是"读完了"。
+   */
+  endMs: number | null;
 }
 
 export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"> {
@@ -1215,11 +1223,28 @@ function appendAssistantSentence(text: string, sequence?: number, audioCursorMs?
     // Verbatim, not trimmed: the live block joins these back into one run of
     // text, and it has to match what the backend stores for the same turn.
     text,
+    seq: assistantSentenceSequence,
     cursorMs: lastAudioCursorMs,
-    // The marker is emitted as this sentence's first audio frame is queued, so
-    // this timestamp is the sentence's own playback anchor.
-    startedAt: performance.now(),
+    // 起点 marker 到达 = 这一句开始播放；它什么时候播完由后端补一条 end marker。
+    endMs: null,
   });
+  emitAssistantSpoken();
+}
+
+/**
+ * 标记某一句已播完（服务端 `voice-sentence-end`）。
+ *
+ * 这条 marker 由后端排期到"这一句播完"的时刻才下发，所以前端拿到它就可以直接把
+ * 该句从"正在读（灰）"切成"读完（正常色）"，无需任何本地播放时钟。
+ */
+function markAssistantSentenceEnded(sequence: number, endCursorMs?: number) {
+  const seq = Number(sequence);
+  if (!Number.isFinite(seq) || seq <= 0) return;
+  const target = assistantSpokenSentences.find(
+    (segment) => segment.seq === seq && segment.endMs === null,
+  );
+  if (!target) return;
+  target.endMs = Number.isFinite(endCursorMs) ? Number(endCursorMs) : 0;
   emitAssistantSpoken();
 }
 
@@ -1358,18 +1383,25 @@ function handleRtviMessage(raw: string) {
     }
     case "server-message": {
       // The backend disables Pipecat's eager bot-output/bot-tts-text messages.
-      // It emits this marker only after the first audio frame for a sentence has
-      // entered the WebRTC output queue, giving the canvas a sentence-level
-      // playback cursor instead of the whole LLM response.
-      if (String(data.type ?? "") === "voice-sentence-start") {
+      // It emits these markers only when a sentence's playback actually starts
+      // and ends (the backend schedules the delivery to the playback position),
+      // giving the canvas sentence-level captions instead of the whole LLM
+      // response.
+      const markerType = String(data.type ?? "");
+      if (markerType === "voice-sentence-start" || markerType === "voice-sentence-end") {
         const markerId = String(data.event_id ?? data.eventId ?? "");
         if (markerId && seenEventIds.has(markerId)) return;
         if (markerId) seenEventIds.add(markerId);
-        appendAssistantSentence(
-          String(data.text ?? ""),
-          Number(data.sequence ?? data.sentence_seq),
-          Number(data.audio_cursor_ms),
-        );
+        const sequence = Number(data.sentence_seq ?? data.sequence);
+        if (markerType === "voice-sentence-start") {
+          appendAssistantSentence(
+            String(data.text ?? ""),
+            sequence,
+            Number(data.audio_cursor_ms),
+          );
+        } else {
+          markAssistantSentenceEnded(sequence, Number(data.audio_end_cursor_ms));
+        }
       }
       return;
     }
