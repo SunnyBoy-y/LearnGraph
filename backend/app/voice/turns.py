@@ -609,6 +609,7 @@ def interrupt_turn(
     *,
     turn_id: str | None = None,
     reason: str = "barge_in",
+    origin: str = "control",
     request_id: str | None = None,
 ) -> dict[str, Any]:
     """Mark the open turn interrupted and publish the interrupt event.
@@ -616,6 +617,17 @@ def interrupt_turn(
     The event is what the audio worker observes (possibly via another worker),
     so an interrupt issued over HTTP still stops the audio that is being
     produced in a different process.
+
+    ``origin`` records who caused the interrupt, and it exists to stop a
+    self-inflicted loop: when the *pipeline itself* barges in (VAD, or the
+    client's RTVI barge-in) it has already stopped its own audio, yet the
+    interrupt is still journalled for the transcript. If that record looked
+    like an externally requested interrupt, the worker's own control watchdog
+    would read it one tick later and barge in again -- and the second barge-in
+    lands on whatever the *next* turn is already generating (a typed turn starts
+    within milliseconds), aborting it and leaving the user with a silently
+    dropped question. ``"pipeline"`` therefore means "already applied where it
+    happened; do not re-apply"; anything else means "apply it".
     """
     target: str | None = turn_id
     if target is None:
@@ -641,6 +653,7 @@ def interrupt_turn(
         payload={
             "reason": reason,
             "turn_id": target,
+            "origin": origin,
             "heard_text": (snapshot or {}).get("assistant_text") or "",
         },
         turn_id=target,

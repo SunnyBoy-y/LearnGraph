@@ -1177,6 +1177,11 @@ class VoiceTurnJournal:
             self.voice_session_id,
             turn_id=state.turn_id,
             reason=reason,
+            # 本管线已经把音频停掉了（这条路径就是被 InterruptionFrame 触发的），
+            # 事件只是留给转录看。若它看起来像"外部请求的打断"，本进程的
+            # VoiceControlWatchdog 会在下一个 tick 再打断一次，而那一击会落在
+            # 紧接着开始的下一轮（打字回合通常毫秒级就起跑）上把它掐死。
+            origin="pipeline",
         )
         heard_text = self._spoken_assistant_text(state)
         # Persist even when nothing was heard.  ``finalize_turn`` documents that an
@@ -1582,6 +1587,18 @@ class VoiceControlWatchdog:
             self._cursor = max(self._cursor, int(event.get("event_seq") or 0))
             event_type = event.get("type")
             if event_type == "turn.interrupted":
+                # 只执行"别处请求的"打断。``origin="pipeline"`` 的打断是本管线自己
+                # 造成的（VAD / 客户端 RTVI barge-in），音频那时已经停了；再打断一次
+                # 会落在下一轮刚起跑的 generation 上并把它掐掉（实测：打字回合的
+                # LLM 请求 TTFB 0.3s 之后被这一击 abort，零文本、用户的问题静默丢失）。
+                payload = event.get("payload")
+                origin = payload.get("origin") if isinstance(payload, dict) else None
+                if origin == "pipeline":
+                    logger.debug(
+                        "Skipping self-inflicted interrupt (turn %s)",
+                        event.get("turn_id"),
+                    )
+                    continue
                 await self.on_interrupt(event)
             elif event_type == "context.updated":
                 await self.on_model_changed(event)
