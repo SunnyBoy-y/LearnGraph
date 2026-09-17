@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -136,6 +137,12 @@ class _TurnState:
     # Consecutive idle re-arms granted while audio was still playing, so a
     # playback that never reports its end cannot hold the turn open forever.
     playback_rearms: int = 0
+    # 本回合的播放锚点（``time.monotonic()`` 秒）：第一个 BotStartedSpeakingFrame
+    # 到达的时刻，也就是输出传输开始按实时节奏写音频、媒体时钟起走的原点。
+    # 逐句文本的投递排期全靠它：第 N 句的音频在 ``anchor + sentence_start_cursor_ms``
+    # 出声，文本也只能到那时才下发——"未读文本不进前端、不入库"由此成为结构保证
+    # （见 ``reserve_sentence_seq`` / ``playback_anchor_at``）。None = 还没开始播放。
+    playback_anchor_at: float | None = None
     audio_cursor_ms: int = 0
     llm_closed: bool = False
     finalized: bool = False
@@ -634,6 +641,7 @@ class VoiceTurnJournal:
         audio_cursor_ms: int | None = None,
         context_id: str | None = None,
         generation_id: int | None = None,
+        sequence: int | None = None,
     ) -> dict[str, Any]:
         """A sentence's audio entered playback; it is being read aloud now.
 
@@ -644,12 +652,33 @@ class VoiceTurnJournal:
         快通道 marker 必须用这一份：以前 TTS 适配器自己数一套、账本另数一套，
         于是同一句话在两个通道里序号不同，字幕与持久事件永远对不上（F02/F04/F05
         的共同根因）。
+
+        **调用时刻就是"这一句开始播放"的时刻**（逐句字幕方案 B）：TTS 适配器先用
+        :meth:`reserve_sentence_seq` 预约序号（句尾 marker 要复用它），等这一句真的
+        开始出声时才带 ``sequence=`` 调这里记账。于是"没被读到的文字不进前端、不进
+        数据库"是结构保证而不是事后裁切：没走到这一步的句子根本不在账本里。
         """
         if self._turn is None or self._turn.finalized:
             return {}
         state = self._turn
-        state.sentence_seq += 1
-        sequence = state.sentence_seq
+        if sequence is None:
+            state.sentence_seq += 1
+            sequence = state.sentence_seq
+        else:
+            sequence = int(sequence)
+            if sequence <= 0:
+                return {}
+            if sequence in state.sentence_texts:
+                # 同序号重复投递（重试 / 快通道与持久通道都到）：身份原样返回，
+                # 不重复记账、不重复发事件。
+                return {
+                    "turn_id": state.turn_id,
+                    "sentence_seq": sequence,
+                    "segment_id": f"{state.turn_id}:s{sequence}",
+                    "generation_id": generation_id,
+                    "audio_cursor_ms": state.audio_cursor_ms,
+                }
+            state.sentence_seq = max(state.sentence_seq, sequence)
         # Kept verbatim: two adjacent sentences have to concatenate back into the
         # text that was spoken, including any separator whitespace the provider
         # put between them (English answers would lose it otherwise).
@@ -786,6 +815,10 @@ class VoiceTurnJournal:
             state.playback_observed = True
             state.playback_active = True
             state.playback_rearms = 0
+            if state.playback_anchor_at is None:
+                # 本回合第一次"开始说话"的沿 = 媒体时钟原点。之后的重复沿（同一
+                # 回合里输出队列排空又续上）不得覆盖它，否则排期会整体前移。
+                state.playback_anchor_at = time.monotonic()
         self._touch_turn()
         await self._emit(
             "assistant.sentence.playback_started",
@@ -794,6 +827,55 @@ class VoiceTurnJournal:
             phase="speculative",
             audio_cursor_ms=self._turn.audio_cursor_ms if self._turn else None,
         )
+
+    def playback_anchor_at(self) -> float | None:
+        """本回合播放锚点（``time.monotonic()`` 秒），None = 音频还没开始播放。
+
+        TTS 适配器用它把「句首/句尾媒体游标」换算成"应当在什么时刻出声"，从而把
+        文本投递排期到那一刻（逐句字幕方案 B）。
+        """
+        state = self._turn
+        if state is None or state.finalized:
+            return None
+        return state.playback_anchor_at
+
+    def open_turn_id(self) -> str | None:
+        """当前未 finalize 的回合 id；没有可用回合时返回 None。"""
+        state = self._turn
+        if state is None or state.finalized:
+            return None
+        return state.turn_id
+
+    def sentence_recorded(self, sequence: int) -> bool:
+        """这一句是否已经进入账本（= 它真的开始播放过）。
+
+        句尾 marker 的投递用它做前置条件：起点都被账本拒绝的句子（回合已收尾 / 从未
+        开始播放），句尾也就无从谈起——否则一条"未读句子的结束标记"仍会跑到前端去。
+        """
+        state = self._turn
+        if state is None:
+            return False
+        return int(sequence) in state.sentence_texts
+
+    def reserve_sentence_seq(self) -> int | None:
+        """预分配句序号，但**不记账**（不写 ``sentence_texts``、不发事件）。
+
+        逐句字幕方案 B 要求把「句身份分配」与「记账」分开：
+
+        * 序号必须在句音频入队时就定下来——句尾 marker 要复用它，而且序号必须与
+          播放顺序一致；
+        * 但句子的**文本**只允许在它**开始播放**的那一刻进入账本 / 事件流 / 上下文，
+          否则用户没听到的文字就已经落库了。
+
+        所以这里只递增计数器；真正的 ``sentence_queued`` 由 TTS 适配器在投递时刻带
+        ``sequence=`` 调用。序号被烧掉（那一句最终没播）是无害的——它只是排序键。
+        分配器始终是账本：适配器自己数的那一套只是"没有账本"时的兜底。
+        """
+        state = self._turn
+        if state is None or state.finalized:
+            return None
+        state.sentence_seq += 1
+        return state.sentence_seq
 
     async def playback_ended(self) -> None:
         if self._turn is not None:
@@ -959,22 +1041,19 @@ class VoiceTurnJournal:
         spoken: str,
         assistant_text: str,
     ) -> None:
-        """落一条带完整拆分的 ``turn.finalized``。
+        """落一条只带"真的播出去过"那一侧的 ``turn.finalized``。
 
-        "已经说出去的"和"生成出来但没播出去"必须分开写：前端把它们放进同一个
-        气泡的两块（已听到的记录 + 折叠的余量），长期记忆只吃前者。以前一个
-        ``text`` 字段同时承担"转录内容"和"实际播报内容"两个意思，于是要么把没
-        读出来的字写进转录（把没说过的话当成说过了），要么把听到的内容截断。
+        载荷里**没有**未播出的余量：生成出来但没进播放的字既不上屏也不落库。
+        前端拿到的 ``text`` 就是用户实际听到的内容，``heard_text`` 是同一份播报
+        记录的显式命名（正常回合里两者相等，被打断时是听到的那个前缀）。以前
+        一个 ``text`` 字段同时承担"转录内容"和"实际播报内容"两个意思，于是要么
+        把没读出来的字写进转录（把没说过的话当成说过了），要么把听到的内容截断。
 
         这里**先**用 ``turn.finalized:{turn_id}`` 这个 request_id 落事件，
         ``turn_api.finalize_turn`` 内部的同名事件会命中 emit 的幂等分支，因此账本
-        里始终只有一条 ``turn.finalized``，而载荷带的是这份拆分。反过来做不行：
-        幂等分支只返回已存在的行，不会把后来的载荷合并进去。
+        里始终只有一条 ``turn.finalized``，而载荷带的是这份播报记录。反过来做
+        不行：幂等分支只返回已存在的行，不会把后来的载荷合并进去。
         """
-        generated = state.assistant_text
-        unheard = (
-            generated[len(spoken) :] if generated.startswith(spoken) else generated
-        )
         await self._emit(
             "turn.finalized",
             payload={
@@ -987,8 +1066,6 @@ class VoiceTurnJournal:
                 "failed": outcome == turn_api.TURN_FAILED,
                 "retryable": outcome != turn_api.TURN_FINALIZED,
                 "heard_text": spoken,
-                "unheard_text": unheard,
-                "generated_text": generated,
                 "acknowledged": state.acknowledged,
                 "interrupted": outcome == turn_api.TURN_INTERRUPTED,
                 "audio_cursor_ms": state.audio_cursor_ms or None,
