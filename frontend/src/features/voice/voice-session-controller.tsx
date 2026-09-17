@@ -1129,12 +1129,32 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       // not heard yet. `assistantLlmText` remains the finalize fallback.
       return;
     case "assistant.sentence.queued":
+      // 句首字幕的**兜底**，不是"提前显示"：这条账本事件与实时 marker
+      // `voice-sentence-start` 由同一处按同一时刻投递（TTS 适配器先写账本、
+      // 紧跟着推 marker，实测相差几毫秒），所以它到得只会更晚。
+      // 同句以 `sentence_seq` 去重（见 appendAssistantSentence）：marker 先到就
+      // 由 marker 渲染，这条成为空操作；marker 丢了则由它补上字幕。
+      //
+      // 为什么必须有这条兜底：marker 走 RTVI 实时通道，且它的投递**排在一次账本
+      // 写之后**。一旦那次写被卡住（例如 journal 锁死）或数据通道丢包，前端就拿不到
+      // 任何"已朗读"文本，`bot-stopped-speaking` 收尾时 `assistantSpokenText` 为空、
+      // 整段回退成 LLM 草稿——现象正是"音频播完才把整段答案显示出来"。
+      appendAssistantSentence(
+        text,
+        Number(payload.sentence_seq ?? payload.sequence),
+        event.audio_cursor_ms ?? undefined,
+      );
+      return;
+    case "assistant.sentence.ended":
+      // 句尾字幕的兜底（同上）：把这一句从"正在读（灰）"切回正常色。
+      markAssistantSentenceEnded(
+        Number(payload.sentence_seq ?? payload.sequence),
+        Number(payload.audio_end_cursor_ms),
+      );
+      return;
     case "assistant.sentence.playback_started":
-      // Durable sentence events are not the playback anchor: `queued` fires when
-      // a sentence is handed to synthesis (before it is heard) and
-      // `playback_started` carries no sentence text. The audio-anchored marker
-      // is the TTS adapter's `voice-sentence-start` server message, which is what
-      // drives the live bubble.
+      // 这条 durable 事件不带句文本，也不是播放锚点；句首由上面的 `queued`
+      // 或实时 marker 驱动。
       return;
     case "assistant.sentence.playback_ended":
       if (payload.final === true || payload.turn_final === true) finalizeAssistantTurn(false);
