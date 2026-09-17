@@ -295,6 +295,17 @@ class VolcengineTTSService(TTSService):
         # 句子合成按序串联：后一句等前一句收完音频再开自己的 session。任务放在
         # 后台（不阻塞 process_frame），否则打断帧会被"正在合成的那一句"挡住。
         self._session_chain: asyncio.Task | None = None
+        # 本轮所有句子合成任务。``_session_chain`` 只指向队尾，而每个任务都在
+        # ``await gather(previous)`` 上等前一个——取消时必须按集合逐个取消并等它们
+        # 真正结束，否则会有 recv 循环活过打断（见 ``_cancel_sentence_tasks``）。
+        self._sentence_tasks: set[asyncio.Task] = set()
+        # 字幕代次：打断时 +1。一个句子在**入队**时记住当时的代次，之后无论是合成、
+        # 收音频还是投递 marker，只要发现代次变了立刻放弃——被打断那一句的文本绝不能
+        # 按新回合的身份领序号（否则一句从没播过的旧句子会进字幕、进转录，甚至进记忆）。
+        self._caption_epoch = 0
+        # 连续几句合成失败。单句失败只报 retryable（下一句会重建 session）；连续失败
+        # 意味着"导师说不出话了"，那时必须降级并让用户看见，而不是继续静默。
+        self._consecutive_sentence_failures = 0
         # 已排期但尚未到点的 marker 投递任务（句首 / 句尾）。
         # 排期是逐句字幕方案 B 的核心：marker 必须在该句**开始/结束播放**的时刻才
         # 下发，否则文字会跑在声音前面，而且未播放的文本会先进前端与账本。
@@ -407,12 +418,22 @@ class VolcengineTTSService(TTSService):
         # 时 `_synthesize_sentence` 的 finally 已经把 `_current_session_id` 清空，
         # CancelSession 就发不出去 —— 服务端会把这一句合成完（白占资源，残余音频还
         # 可能混进下一轮）。
+        # 先推进字幕代次：任何还在飞的旧句（合成中、收音频中、等投递）都会在下一次
+        # 判断时发现自己已经过期并立刻退出，而不是把旧文本按新回合的身份领一个序号。
+        self._caption_epoch += 1
         session_id = self._current_session_id
         chain = self._session_chain
         self._session_chain = None
-        if chain is not None and not chain.done():
-            await self.cancel_task(chain)
+        # 取消本轮**全部**句子任务并等它们结束。只取消队尾是不够的：实测取消之后仍有
+        # recv 在跑，下一句的 recv 一起步就报 "cannot call recv while another coroutine
+        # is already running recv or recv_streaming"（见 `_cancel_sentence_tasks`）。
+        await self._cancel_sentence_tasks(chain)
         await self._cancel_session_id(session_id, "interrupted")
+        # 火山账号同时只允许 1 个 session：CancelSession 只是"请求"，服务端释放之前
+        # 新的 StartSession 会被拒（55000000 session number limit exceeded: 1），整句
+        # 合成失败、用户一个音都听不到（实测）。这里独占 recv 等服务端确认（有超时，
+        # 拿不到也不阻塞，调用方还有重试兜底）。
+        await self._await_session_release(session_id, timeout=1.5)
         # 剩下的音频永远不会播出来了：撤销所有还没到点的 marker 投递，否则打断之后
         # 还会陆陆续续吐出几句"从未被听到"的文本。
         self._cancel_pending_deliveries()
@@ -421,6 +442,65 @@ class VolcengineTTSService(TTSService):
 
     async def _cancel_current_session(self, reason: str) -> None:
         await self._cancel_session_id(self._current_session_id, reason)
+
+    async def _cancel_sentence_tasks(self, chain: asyncio.Task | None) -> None:
+        """取消本轮所有句子合成任务，并等它们真正结束。
+
+        ``_session_chain`` 只指向**队尾**，而每个任务都在 ``await gather(previous)``
+        上等前一个，所以"取消队尾"并不能保证前面的 recv 循环已经退出——实测打断之后
+        仍有 recv 在跑，下一句的 recv 一起步就报 ``cannot call recv while another
+        coroutine is already running recv or recv_streaming``，那一句随即合成失败、
+        整轮静默。上游读取的串行化不能建立在"取消应该会传播"的假设上。
+
+        这里逐个取消并 ``gather`` 等干净：``gather(return_exceptions=True)`` 让被取消
+        任务的 CancelledError 不向上冒泡（打断路径不能因为一句合成被取消而失败）。
+        """
+        targets = {task for task in self._sentence_tasks if not task.done()}
+        self._sentence_tasks.clear()
+        if chain is not None and not chain.done():
+            targets.add(chain)
+        if not targets:
+            return
+        for task in targets:
+            task.cancel()
+        await asyncio.gather(*targets, return_exceptions=True)
+
+    async def _await_session_release(self, session_id: str, *, timeout: float) -> bool:
+        """等服务端确认那个 session 已经释放（CancelSession → SessionCanceled）。
+
+        火山账号的并发上限是 1 个 session，而 ``CancelSession`` 只是"请求"：服务端真正
+        释放之前再开新 session 会被拒（``session number limit exceeded: 1``），表现为整句
+        合成失败、用户听不到任何声音。调用方在打断时已经把本轮所有合成任务取消并等干净，
+        所以这里可以独占 recv 而不与任何人抢同一个连接。
+
+        拿不到确认不算失败：返回 False，调用方的 StartSession 重试会兜住。
+        """
+        if not session_id or not self._upstream_alive():
+            return False
+        deadline = time.monotonic() + max(0.0, timeout)
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.debug(f"{self}: 等服务端释放 session {session_id} 超时")
+                    return False
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+                if not isinstance(raw, bytes):
+                    continue
+                msg = Message.from_bytes(raw)
+                if msg.type != MsgType.FullServerResponse:
+                    continue
+                if msg.session_id and msg.session_id != session_id:
+                    # 别的 session 的响应（不应该出现，出现了也不能当成"已释放"）。
+                    continue
+                if msg.event in (EventType.SessionCanceled, EventType.SessionFinished):
+                    logger.debug(f"{self}: session {session_id} 已释放（{msg.event}）")
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"{self}: 等待 session 释放时上游异常: {exc}")
+            return False
 
     async def _cancel_session_id(self, session_id: str, reason: str) -> None:
         if not session_id:
@@ -516,28 +596,43 @@ class VolcengineTTSService(TTSService):
         the client drops later sentences as duplicates.
         """
         previous = self._session_chain
+        # 入队这一刻的代次：这一句从属于"当时的那个回合"。打断会把代次 +1，之后
+        # 这一步（以及它的合成任务）就会发现自己是旧句子并放弃，不再领新回合的序号。
+        epoch = self._caption_epoch
 
         async def _run_after_previous() -> None:
             if previous is not None and not previous.done():
                 await asyncio.gather(previous, return_exceptions=True)
+            if epoch != self._caption_epoch:
+                logger.debug(f"{self}: 跳过被打断那一句的合成（代次已过期）")
+                return
             try:
-                await self._synthesize_sentence(text, context_id)
+                await self._synthesize_sentence(text, context_id, epoch=epoch)
+                self._consecutive_sentence_failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 # run_tts does not await synthesis any more, so a failure here would
                 # otherwise disappear into a task nobody reads -- the sentence just
                 # never gets spoken and nothing says why.
+                self._consecutive_sentence_failures += 1
                 logger.warning(f"{self}: 这一句合成失败（已跳过）: {exc}")
                 if self._journal is not None:
+                    # 连续失败才算"导师说不出话了"：单句失败下一句会重建 session，
+                    # 报 retryable；连续失败必须降级，否则用户只会听到一片安静而界面
+                    # 一个字都不说（`degraded=True` 才会亮出"语音播报不可用"）。
+                    degraded = self._consecutive_sentence_failures >= 2
                     await self._journal.processor_error(
                         "tts",
                         f"这一句合成失败，已跳过：{exc}",
-                        retryable=True,
+                        retryable=not degraded,
+                        degraded=degraded,
                         attempt=self._reconnect_attempt,
                     )
 
         self._session_chain = self.create_task(_run_after_previous())
+        self._sentence_tasks.add(self._session_chain)
+        self._session_chain.add_done_callback(self._sentence_tasks.discard)
 
     async def _close_turn_context(
         self, context_id: str | None, chain: asyncio.Task | None
@@ -643,7 +738,43 @@ class VolcengineTTSService(TTSService):
                 )
             return False
 
-    async def _synthesize_sentence(self, text: str, context_id: str) -> None:
+    async def _open_sentence_session(self, session_id: str, *, epoch: int) -> None:
+        """StartSession → SessionStarted，专为"上一句刚被取消"留退避重试。
+
+        火山账号同时只允许 1 个 session。``CancelSession`` 到达服务端并真正释放之前，
+        新的 ``StartSession`` 会被拒（``55000000 session number limit exceeded: 1``）——
+        这不是"这一句有问题"，而是上一句的释放还在路上。所以只对这一个错误退避重试；
+        重试前再查一次代次，被打断就立刻放弃（不再为一句已经作废的话占资源）。
+        """
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._send_event(
+                    EventType.StartSession,
+                    session_id,
+                    self._options.to_v3_start_session_payload("", "BidirectionalTTS"),
+                )
+                await self._expect_event(EventType.SessionStarted, EventType.SessionFailed)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                retryable = (
+                    "session number limit" in str(exc)
+                    or "session limit" in str(exc)
+                )
+                if attempt >= attempts or not retryable or epoch != self._caption_epoch:
+                    raise
+                delay = 0.2 * attempt
+                logger.warning(
+                    f"{self}: 上一句的 session 尚未释放，{delay:.1f}s 后重试"
+                    f"（{attempt}/{attempts - 1}）: {exc}"
+                )
+                await asyncio.sleep(delay)
+
+    async def _synthesize_sentence(
+        self, text: str, context_id: str, *, epoch: int | None = None
+    ) -> None:
         """合成**一句**：独立 session，首帧音频即该句的字幕边界。
 
         这是整个逐句字幕的地基。火山 v3 在一个长 session 里不会逐句回
@@ -653,10 +784,19 @@ class VolcengineTTSService(TTSService):
 
         session 开出去即 `FinishSession`：该句文本已经完整，让火山把这一句合成完
         并结束 session；音频由本方法按到达顺序写进本 turn 的 audio context。
+
+        ``epoch`` 是这一句入队时的字幕代次：被打断过就整句放弃（既不建 session，也不
+        写音频、不发 marker），因为它的音频永远不会播出来。省略时按"当前代次"处理
+        （直接调用者——测试、离线驱动——没有入队这一步）。
         """
+        if epoch is None:
+            epoch = self._caption_epoch
         if self._closed:
             # 收尾期间不要再合成：`_ensure_upstream` 会拒绝建连，抛异常只会把一次
             # 正常挂断刷成一条错误。
+            return
+        if epoch != self._caption_epoch:
+            logger.debug(f"{self}: 这一句已被打断，跳过合成: {text[:20]!r}")
             return
         if not await self._ensure_upstream():
             raise RuntimeError("TTS upstream is unavailable")
@@ -664,12 +804,7 @@ class VolcengineTTSService(TTSService):
         options = self._options
         self._current_session_id = session_id
         try:
-            await self._send_event(
-                EventType.StartSession,
-                session_id,
-                options.to_v3_start_session_payload("", "BidirectionalTTS"),
-            )
-            await self._expect_event(EventType.SessionStarted, EventType.SessionFailed)
+            await self._open_sentence_session(session_id, epoch=epoch)
             timeline_mark("tts", "session 握手完成(StartSession→SessionStarted)")
             await self._send_event(
                 EventType.TaskRequest, session_id, options.to_v3_task_payload(text)
@@ -678,7 +813,9 @@ class VolcengineTTSService(TTSService):
                 self._first_task_sent = True
                 timeline_mark("tts", "首个 TaskRequest 已发出")
             await self._send_event(EventType.FinishSession, session_id)
-            identity = await self._drain_sentence_audio(context_id, session_id, text)
+            identity = await self._drain_sentence_audio(
+                context_id, session_id, text, epoch=epoch
+            )
             if identity is not None:
                 await self._emit_sentence_end_marker(context_id, identity)
         finally:
@@ -686,7 +823,12 @@ class VolcengineTTSService(TTSService):
                 self._current_session_id = ""
 
     async def _drain_sentence_audio(
-        self, context_id: str, session_id: str, sentence_text: str
+        self,
+        context_id: str,
+        session_id: str,
+        sentence_text: str,
+        *,
+        epoch: int | None = None,
     ) -> dict[str, Any] | None:
         """收完这一句的音频；首帧入队时下发句起点 marker。
 
@@ -697,11 +839,24 @@ class VolcengineTTSService(TTSService):
         由它补发句结束 marker：句结束偏移只有在音频收干之后才存在，而本方法在收到
         结束事件的那一刻就要 `return` 了。被打断或出错时返回 None —— 那一句既没有
         结束偏移，也不该让前端认为它播完了。
+
+        ``epoch`` 每一帧都要查：打断之后这一句的音频永远不会播出来，既不能写进 audio
+        context，也不能领一个属于**新回合**的句身份（实测：打断后 3.4 秒才到的首帧会让
+        一句从没播过的旧句子拿到新回合的序号 1，于是它出现在字幕里、被写进转录，成为
+        打字那句的"回答"）。
         """
         marker_sent = False
         identity: dict[str, Any] | None = None
+        if epoch is None:
+            epoch = self._caption_epoch
         try:
             while True:
+                if epoch != self._caption_epoch:
+                    logger.debug(
+                        f"{self}: 这一句在收音频过程中被打断，丢弃其剩余音频: "
+                        f"{sentence_text[:20]!r}"
+                    )
+                    return None
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=60)
                 if not isinstance(raw, bytes):
                     raise RuntimeError(f"unexpected text frame: {raw!r}")
@@ -724,7 +879,7 @@ class VolcengineTTSService(TTSService):
                         marker_sent = True
                         timeline_mark("tts", "火山首个音频包")
                         identity = await self._emit_sentence_marker(
-                            context_id, sentence_text
+                            context_id, sentence_text, epoch=epoch
                         )
                     self._audio_cursor_ms += int(
                         len(msg.payload) / 2 / self.sample_rate * 1000
@@ -773,7 +928,7 @@ class VolcengineTTSService(TTSService):
         return int(self._generation_source())
 
     async def _emit_sentence_marker(
-        self, context_id: str, sentence_text: str
+        self, context_id: str, sentence_text: str, *, epoch: int
     ) -> dict[str, Any]:
         """预约句身份，并把"这一句开始朗读"的 marker **排期到它开始播放的时刻**。
 
@@ -803,6 +958,10 @@ class VolcengineTTSService(TTSService):
             "generation_id": generation_id,
             "audio_cursor_ms": audio_cursor_ms,
             "context_id": context_id,
+            # 投递时还要再查一次代次：句身份是在投递到点前就定下来的，而打断可能发生
+            # 在"定身份"与"到点"之间（那时 `_cancel_pending_deliveries` 也会撤销它，
+            # 这里是第二道闸，保证任何一条路径都不会漏）。
+            "caption_epoch": int(epoch),
             # 文本随身份一起带上：投递到点时才写账本，那一刻需要它。
             "text": sentence_text,
         }
@@ -876,6 +1035,9 @@ class VolcengineTTSService(TTSService):
         """到点投递句首 marker：先记账，再下发快通道 marker。"""
         try:
             await self._wait_until_due(int(due_cursor_ms))
+            if int(identity.get("caption_epoch") or 0) != self._caption_epoch:
+                # 定身份之后被打断：这一句从未开始播放，一个字都不该出现。
+                return
             if not await self._record_sentence(identity):
                 # 账本已经拒绝（回合被 finalize / 打断）：这一句从未开始播放，它就
                 # 不该出现在前端或数据库里的任何地方。
@@ -907,6 +1069,8 @@ class VolcengineTTSService(TTSService):
         """到点投递句尾 marker：这一句播完了（前端据此把该句切成正常色）。"""
         try:
             await self._wait_until_due(int(due_cursor_ms))
+            if int(identity.get("caption_epoch") or 0) != self._caption_epoch:
+                return
             if self._journal is not None:
                 if not self._journal.sentence_recorded(int(identity["sentence_seq"])):
                     # 起点都没进账本（从未开始播放）：不能给一句不存在的话发句尾。
