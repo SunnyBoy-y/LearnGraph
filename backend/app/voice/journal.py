@@ -363,6 +363,7 @@ class VoiceTurnJournal:
         segment = str(text or "").strip()
         if not segment:
             return
+        barge_in = False
         async with self._lock:
             if self._turn is not None and not self._turn.finalized:
                 if (
@@ -387,10 +388,51 @@ class VoiceTurnJournal:
                         request_id=f"user.final:{state.turn_id}:{len(state.user_text)}",
                     )
                     return
-                # The assistant has already begun generating or speaking: this new utterance
-                # is a new turn (barge-in), NOT a continuation of the previous question.
-                # Concat here was the root cause of "ASR混入上一句已经结束的显示".
-                await self.turn_interrupted(reason="barge_in")
+                # The assistant has already begun generating or speaking: this new
+                # utterance is a new turn (barge-in), NOT a continuation of the
+                # previous question.  Concat here was the root cause of
+                # "ASR混入上一句已经结束的显示".
+                #
+                # The finalize itself runs *below*, outside the lock.  It has to:
+                # ``turn_interrupted`` takes this very lock, ``asyncio.Lock`` is not
+                # reentrant, and calling it from inside a locked section wedges the
+                # journal permanently -- no exception, no warning, and every later
+                # event (user and assistant alike) is silently lost while the audio
+                # pipeline keeps running normally.  That is the "用一会儿语音就又
+                # 没反应了" bug: ASR keeps producing finals, the ledger stops dead.
+                barge_in = True
+        if barge_in:
+            await self.turn_interrupted(reason="barge_in")
+        await self._open_turn_for_final(segment, client_message_id=client_message_id)
+
+    async def _open_turn_for_final(
+        self, segment: str, *, client_message_id: str | None = None
+    ) -> None:
+        """Open (or attach to) the turn that owns this ASR segment.
+
+        Split out of ``user_final`` so the barge-in finalize can run without
+        holding the lock (see there).  Because the lock is released in between,
+        the open-turn check is repeated here: a concurrent final must be merged
+        into the turn it belongs to rather than overwritten by ``_begin_turn``.
+        """
+        async with self._lock:
+            if self._turn is not None and not self._turn.finalized:
+                state = self._turn
+                state.user_text = (
+                    f"{state.user_text}{segment}" if state.user_text else segment
+                )
+                await self._emit(
+                    "user.final",
+                    payload={
+                        "text": state.user_text,
+                        "segment": segment,
+                        "merged": True,
+                        "client_message_id": client_message_id,
+                    },
+                    turn_id=state.turn_id,
+                    request_id=f"user.final:{state.turn_id}:{len(state.user_text)}",
+                )
+                return
             existing = await asyncio.to_thread(
                 turn_api.open_turn, self.voice_session_id
             )
