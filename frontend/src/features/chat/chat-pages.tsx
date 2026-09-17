@@ -9927,10 +9927,11 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               onCancel={(taskId) => void voiceSessionController.cancelTask(taskId)}
               tasks={voiceSnapshotForGating.tasks}
             />
-            {voiceTextFallback && voiceSnapshotForGating.degradedNotice ? (
-              // The call dropped to text. Say so explicitly, and say that the
-              // record survives: silently accepting typed input while the user
-              // believes they are still speaking is the failure this prevents.
+            {voiceSnapshotForGating.degradedNotice ? (
+              // 任何阶段降级都必须说出来，而不是只在「麦克风听不见你」时：
+              // `degradedNotice` 里已经分好了 asr / tts 的文案，而 TTS 降级意味着
+              // 导师说不出话了（回答只有文字）——用户会以为对方不理他，界面却
+              // 一个字都不解释。ASR 降级那条仍然要说明"记录与任务都会保留"。
               <p
                 aria-live="polite"
                 className="chat-voice-degraded-note"
