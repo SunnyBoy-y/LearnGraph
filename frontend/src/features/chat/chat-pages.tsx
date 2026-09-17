@@ -1404,6 +1404,19 @@ function findPersistedUserTwin(
  * points at the temp user id, so the chain lands on the real answer bubble
  * even when the temp answer itself has no content yet.
  */
+/**
+ * Whether a message came from a voice turn.
+ *
+ * Two spellings of the same fact exist on purpose: the durable trace the server
+ * writes (`voice`) and the optimistic row this page creates while the call is
+ * live (`voice_turn`). Reading only one of them is what made a voice answer lose
+ * its sentence captions -- and its voice-only affordances -- the moment the
+ * history was refetched from the server.
+ */
+function isVoiceTrace(trace: Message["provider_trace"]): boolean {
+  return trace?.voice_turn === true || trace?.voice === true;
+}
+
 function findVoiceCounterpart(
   message: Message,
   persisted: Message[],
@@ -1413,7 +1426,7 @@ function findVoiceCounterpart(
   // durable turn id / client message id recorded in provider_trace, so the
   // overlay survives a history refetch instead of painting a second bubble.
   const trace = message.provider_trace;
-  if (!trace || trace.voice_turn !== true) return undefined;
+  if (!isVoiceTrace(trace)) return undefined;
   const turnId = typeof trace.turn_id === "string" ? trace.turn_id : undefined;
   const clientMessageId =
     typeof trace.client_message_id === "string" ? trace.client_message_id : undefined;
@@ -1422,7 +1435,7 @@ function findVoiceCounterpart(
     if (item.session_id !== message.session_id) return false;
     if (item.role !== message.role) return false;
     const itemTrace = item.provider_trace;
-    if (!itemTrace || itemTrace.voice !== true) return false;
+    if (!isVoiceTrace(itemTrace)) return false;
     return (
       (turnId !== undefined && itemTrace.voice_turn_id === turnId) ||
       (clientMessageId !== undefined &&
@@ -1958,7 +1971,7 @@ function AssistantMessageInner({
     // 句级字幕：文本"什么时候出现"完全由后端排期决定（收到 marker 即代表这一句
     // 开始播放），前端只负责三态着色——未开始的句子根本不会出现在这里。
     if (
-      shown.provider_trace?.voice_turn === true &&
+      isVoiceTrace(shown.provider_trace) &&
       shown.role === "assistant" &&
       shown.status === "streaming"
     ) {
@@ -2191,7 +2204,7 @@ function AssistantMessageInner({
         // measure: while the answer was being read aloud it sat underneath it
         // announcing "waiting for the first character" about text that was
         // already on screen.
-        shown.provider_trace?.voice_turn === true ? null : (
+        isVoiceTrace(shown.provider_trace) ? null : (
           <StreamStatsBadge
             messageId={message.id}
             status={shown.status}
@@ -2199,7 +2212,7 @@ function AssistantMessageInner({
           />
         )
       }
-      {shown.provider_trace?.voice_turn === true && shown.status === "streaming" ? null : (
+      {isVoiceTrace(shown.provider_trace) && shown.status === "streaming" ? null : (
         <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
           <MessageAction
             label="复制全文"
@@ -4178,7 +4191,7 @@ export function ChatCanvasPage() {
             appended.push(message);
           }
         } else if (
-          message.provider_trace?.voice_turn === true &&
+          isVoiceTrace(message.provider_trace) &&
           message.provider_trace?.authoritative === true &&
           TERMINAL_MESSAGE_STATUSES.includes(
             confirmed.status as (typeof TERMINAL_MESSAGE_STATUSES)[number],
@@ -9887,6 +9900,29 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 ? ` · ${voiceSnapshotForGating.icePath.relayed ? "中继连接" : "直连"}（${voiceSnapshotForGating.icePath.label}）`
                 : ""}
             </p>
+            {voiceSnapshotForGating.playbackBlocked || voiceSnapshotForGating.transport === "error" ? (
+              // 通话需要用户做一件事：浏览器按自动播放策略拦了导师的声音，或者连接失败
+              // 需要重试。两种失败都表现为"看起来一切正常却没有结果"，所以必须给一个可点
+              // 的动作，而不是继续在状态行里被动描述。
+              <div className="chat-voice-recovery" role="status">
+                {voiceSnapshotForGating.playbackBlocked ? (
+                  <>
+                    <span>浏览器拦住了导师的声音。</span>
+                    <button onClick={() => void voiceSessionController.resumeRemoteAudio()} type="button">
+                      恢复声音
+                    </button>
+                  </>
+                ) : null}
+                {voiceSnapshotForGating.transport === "error" ? (
+                  <>
+                    <span>可以重试连接。</span>
+                    <button onClick={() => void voiceSessionController.connect()} type="button">
+                      重试连接
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            ) : null}
             <VoiceTaskChip
               onCancel={(taskId) => void voiceSessionController.cancelTask(taskId)}
               tasks={voiceSnapshotForGating.tasks}

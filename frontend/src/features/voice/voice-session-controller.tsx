@@ -14,7 +14,7 @@ import {
   getVoiceTask as requestVoiceTask,
   startVoiceTask as requestVoiceTaskStart,
 } from "@/api/voice";
-import { setVoiceSessionActive } from "./voice-session-markers";
+import { clearVoiceSessionResumable, markVoiceSessionResumable, setVoiceSessionActive } from "./voice-session-markers";
 import {
   degradedNotice,
   deriveDegradedStages,
@@ -176,6 +176,16 @@ export interface VoiceSessionSnapshot {
    * candidate pair is nominated. Null until that event arrives.
    */
   icePath: VoiceIcePath | null;
+  /**
+   * True when the browser refused to start playback of the tutor's audio (the
+   * autoplay policy blocks sound until the page has been interacted with).
+   *
+   * The call itself is healthy in every other respect -- the pipeline is
+   * talking, the captions advance, the mic still works -- so this is not an
+   * `error`: it needs its own flag plus a one-click fix (a gesture-triggered
+   * `play()`), otherwise the page looks connected and stays silent.
+   */
+  playbackBlocked: boolean;
 }
 
 /** Which ICE candidate pair a live call is using (from the ``session.ice`` event). */
@@ -268,7 +278,7 @@ function forgetRemoteSession(workspaceId: string, sessionId: string) {
     window.localStorage.setItem(REMOTE_SESSION_STORAGE_KEY, JSON.stringify(stored));
   } catch { /* storage is optional */ }
 }
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, textFallback: false, icePath: null };
+const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, textFallback: false, icePath: null, playbackBlocked: false };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
@@ -381,6 +391,8 @@ let eventPollTimer: number | null = null;
 let eventPollDelayMs = 1500;
 /** Retained remote audio element so it can be torn down deterministically. */
 let remoteAudio: HTMLAudioElement | null = null;
+/** Mirrors `snapshot.playbackBlocked` so the `ontrack` closure can compare. */
+let remoteAudioBlocked = false;
 /** Idempotency guard: DELETE runs at most once per remote session. */
 let closedRemoteSession: string | null = null;
 /** Pending typed bubbles awaiting their `turn.accepted` echo. */
@@ -591,7 +603,7 @@ async function recoverVoiceSessionState(): Promise<void> {
   const [transcriptResult, sessionResult] = await Promise.all([
     apiClient
       .get<{
-        turns?: Array<{ turn_id: string; user_text?: string; assistant_text?: string; client_message_id?: string | null; finalized_at?: string | null }>;
+        turns?: Array<{ turn_id: string; user_text?: string; assistant_text?: string; client_message_id?: string | null; finalized_at?: string | null; status?: string; failure_reason?: string | null }>;
       }>(`/voice/sessions/${remote}/transcript?limit=50`)
       .catch(() => null),
     requestVoiceSession(remote).catch(() => null),
@@ -1431,6 +1443,34 @@ function readLimit(): ThinkingLimit {
   try { const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")?.thinkingLimit; return ["off", "low", "medium", "high", "xhigh"].includes(value) ? value : "high"; } catch { return "high"; }
 }
 function persistLimit(value: ThinkingLimit) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ thinkingLimit: value })); } catch { /* storage is optional */ } }
+
+/**
+ * Turn a `getUserMedia` rejection into something the user can act on.
+ *
+ * The browser's own text ("Permission denied") says what happened but not what
+ * to do next, and the call cannot recover on its own: this page only re-asks for
+ * the microphone when the user asks it to (auto-dial runs once per session), so
+ * the wording has to name the retry. Returns null for errors this mapping does
+ * not know, which then fall through to the browser's message.
+ */
+function describeMicrophoneError(error: unknown): string | null {
+  if (!(error instanceof DOMException)) return null;
+  switch (error.name) {
+    case "NotAllowedError":
+    case "PermissionDeniedError":
+      return "浏览器阻止了麦克风。请点地址栏的权限图标允许麦克风，然后点「重试连接」。";
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+      return "没有找到麦克风设备。接上麦克风后点「重试连接」。";
+    case "NotReadableError":
+    case "TrackStartError":
+      return "麦克风被其它程序占用了。关掉占用它的程序后点「重试连接」。";
+    case "OverconstrainedError":
+      return "当前麦克风不满足通话要求。换一个输入设备后点「重试连接」。";
+    default:
+      return null;
+  }
+}
 function cleanupAudioTransport() {
   if (peerConnection) {
     peerConnection.onicecandidate = null;
@@ -1454,6 +1494,7 @@ function cleanupAudioTransport() {
   }
   localStream?.getTracks().forEach((track) => track.stop());
   localStream = null;
+  remoteAudioBlocked = false;
   // The remote <audio> element keeps playing if it is not explicitly released.
   if (remoteAudio) {
     try {
@@ -1564,6 +1605,16 @@ function startUserAudioLevelMonitor(stream: MediaStream) {
  * truthful and independent of that gap: `bot-llm-started` still drives
  * "thinking", and real audible output drives "speaking".
  */
+/**
+ * How long a silent output may still mean "the answer is done" when the
+ * per-sentence end marker never arrived.
+ *
+ * The marker is the real signal (the backend schedules it at the sentence's true
+ * playback end); this is only a safety valve so a dropped marker cannot leave a
+ * finished answer hanging as a live bubble.
+ */
+const OUTPUT_DRAIN_FALLBACK_MS = 2500;
+
 function startBotAudioLevelMonitor(stream: MediaStream) {
   try {
     const Ctor = window.AudioContext;
@@ -1588,7 +1639,18 @@ function startBotAudioLevelMonitor(stream: MediaStream) {
         }
       } else if (snapshot.state === "speaking" && now - lastBotLoudAt > 450) {
         update({ state: "listening" });
-        if (assistantLlmComplete) finalizeAssistantTurn(false);
+        // A gap in the output is not the end of the answer. Sentence-by-sentence
+        // synthesis leaves silence while the next sentence is still being
+        // produced, and finalizing on that gap is exactly what split one answer
+        // into two bubbles. Wait for the backend's "this sentence finished
+        // playing" marker (scheduled at the true playback end), with a generous
+        // fallback so a lost marker cannot leave the bubble open forever.
+        const silenceMs = now - lastBotLoudAt;
+        const lastSegment = assistantSpokenSentences[assistantSpokenSentences.length - 1];
+        const outputDrained = Boolean(lastSegment) && lastSegment.endMs !== null;
+        if (assistantLlmComplete && (outputDrained || silenceMs > OUTPUT_DRAIN_FALLBACK_MS)) {
+          finalizeAssistantTurn(false);
+        }
       }
     }, 100);
   } catch {
@@ -1645,6 +1707,27 @@ export const voiceSessionController = {
   },
   setThinkingLimit(value: ThinkingLimit) { persistLimit(value); update({ thinkingLimit: value }); },
   setMuted(value: boolean) { update({ muted: value }); applyMutedToLocalStream(); },
+  /**
+   * Start the tutor's audio after the browser blocked it.
+   *
+   * Must be called from a user gesture (the "恢复声音" button): the autoplay
+   * policy only allows `play()` without one before any sound has been played,
+   * and re-issuing it outside a gesture would fail exactly as it did on `ontrack`.
+   */
+  async resumeRemoteAudio(): Promise<boolean> {
+    const audio = remoteAudio;
+    if (!audio) return false;
+    try {
+      await audio.play();
+      remoteAudioBlocked = false;
+      update({ playbackBlocked: false });
+      return true;
+    } catch {
+      remoteAudioBlocked = true;
+      update({ playbackBlocked: true });
+      return false;
+    }
+  },
   async connect() {
     if (!snapshot.sessionId || snapshot.transport === "connecting" || snapshot.transport === "connected") return;
     if (snapshot.transport === "reconnecting") cleanupAudioTransport();
@@ -1668,7 +1751,7 @@ export const voiceSessionController = {
       durableEventCount = 0;
       closedRemoteSession = null;
     }
-    update({ transport: "connecting", state: "ready", error: null, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" });
+    update({ transport: "connecting", state: "ready", error: null, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", playbackBlocked: false });
     let remoteId: string | null = snapshot.sessionIdRemote;
     try {
       // The endpoint is intentionally explicit: until the backend voice contract
@@ -1808,7 +1891,17 @@ export const voiceSessionController = {
         remoteAudio = audio;
         audio.autoplay = true;
         audio.srcObject = event.streams[0];
-        void audio.play().catch(() => undefined);
+        // Autoplay policy: a `play()` that rejects means the tutor's audio never
+        // reaches the speakers, and no amount of retrying fixes it without a user
+        // gesture. Surface it instead of swallowing it, and clear it when playback
+        // does start (either from the gesture-triggered retry or a later frame).
+        const markPlayback = (blocked: boolean) => {
+          if (remoteAudioBlocked === blocked) return;
+          remoteAudioBlocked = blocked;
+          update({ playbackBlocked: blocked });
+        };
+        audio.addEventListener("playing", () => markPlayback(false));
+        void audio.play().then(() => markPlayback(false)).catch(() => markPlayback(true));
         if (event.streams[0]) startBotAudioLevelMonitor(event.streams[0]);
       };
       const offer = await peerConnection.createOffer();
@@ -1819,6 +1912,10 @@ export const voiceSessionController = {
       remotePcId = answer?.pc_id ?? null;
       flushIceCandidates();
       if (remoteId) setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, true);
+      // A page reload cannot keep the peer connection, but the call itself is
+      // still standing on the server: remember it so the reloaded page can offer
+      // "回到通话中" instead of silently dropping the user out of the session.
+      markVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId);
       reconnectAttempt = 0;
       update({
         transport: "connected", state: "listening", sessionIdRemote: remoteId,
@@ -1846,11 +1943,11 @@ export const voiceSessionController = {
         void apiClient.delete(`/voice/sessions/${remoteId}`).catch(() => undefined);
       }
       if (error instanceof DOMException && error.name === "AbortError") return;
-      const message = error instanceof ApiError && error.status === 404 ? "语音服务尚未启用，请先部署 SmallWebRTC 语音服务。" : error instanceof Error ? error.message : "语音连接失败";
+      const message = describeMicrophoneError(error) ?? (error instanceof ApiError && error.status === 404 ? "语音服务尚未启用，请先部署 SmallWebRTC 语音服务。" : error instanceof Error ? error.message : "语音连接失败");
       update({ transport: "error", state: "error", error: message });
     }
   },
-  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; lastCommittedUserTurnId = ""; resetUserSegments(); activeAssistantTurnId = ""; assistantLlmText = ""; assistantSpokenText = ""; assistantSpokenSentences = []; assistantSentenceSequence = 0; assistantLlmComplete = false; assistantFinalized = false; for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
+  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; lastCommittedUserTurnId = ""; resetUserSegments(); activeAssistantTurnId = ""; assistantLlmText = ""; assistantSpokenText = ""; assistantSpokenSentences = []; assistantSentenceSequence = 0; assistantLlmComplete = false; assistantFinalized = false; for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); clearVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
   async interrupt() {
     // Durable first: the interrupt must reach the worker even when this page is
     // the one that lost its data channel. The RTVI path stays as a faster copy

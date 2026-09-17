@@ -468,6 +468,9 @@ h1, h2, h3, p { margin-top: 0; }
 .knowledge-node.is-focused { border-color: #b7791f; box-shadow: 0 0 0 3px rgba(183,121,31,.1); }
 .knowledge-node.is-current { border-color: #2b6ca3; box-shadow: 0 0 0 3px rgba(43,108,163,.12), 0 6px 18px rgba(24,60,92,.08); }
 .knowledge-node.is-mastered { border-color: #7bc9a8; }
+.knowledge-node.is-verified { border: 2px solid #b18c30 !important; }
+.knowledge-node__achievement { display: inline-flex; margin-top: 5px; padding: 1px 6px; border-radius: 6px; background: color-mix(in srgb, #b18c30 12%, var(--background)); color: #896714; font-size: 10px; }
+.dark .knowledge-node__achievement { color: #e3c46a; }
 .knowledge-node.is-locked { border-style: dashed; border-color: #ccd0cb; opacity: .84; }
 .knowledge-node[data-status='learning']::before { content: ''; position: absolute; top: 14px; bottom: 14px; left: -1px; width: 3px; border-radius: 0 3px 3px 0; background: #2b6ca3; }
 .knowledge-node[data-status='due']::before { content: ''; position: absolute; top: 14px; bottom: 14px; left: -1px; width: 3px; border-radius: 0 3px 3px 0; background: #d9a34a; }

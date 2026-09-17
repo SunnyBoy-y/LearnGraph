@@ -384,7 +384,12 @@ export function seedFromServerTurns(state: TranscriptState, turns: readonly Serv
   for (const turn of turns) {
     const createdAt = turn.finalized_at ?? new Date().toISOString();
     const clientMessageId = turn.client_message_id ?? undefined;
-    const unanswered = turn.status === "failed" || (!turn.assistant_text && turn.status !== "finalized");
+    // A turn that is still running has no assistant text yet and no failure: it
+    // must come back as the user's question on its own, not as a dropped turn
+    // with a retry badge, otherwise a reload mid-answer nags the user to resend a
+    // question the tutor is answering right now.
+    const inFlight = turn.status === "accepted";
+    const unanswered = !inFlight && (turn.status === "failed" || (!turn.assistant_text && turn.status !== "finalized"));
     if (turn.user_text) {
       next = upsert(next, {
         id: userEntryId(turn.turn_id, clientMessageId),

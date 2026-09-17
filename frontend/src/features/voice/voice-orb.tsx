@@ -10,6 +10,7 @@ import {
   type VoiceTransportState,
 } from "./voice-session-controller";
 import { voiceStatusText } from "./voice-status";
+import { readVoiceSessionResumable } from "./voice-session-markers";
 
 /**
  * The composer's voice controls -- and the only place a call's connection state
@@ -428,13 +429,20 @@ export function VoiceCallControl({
   const connected = voice.transport === "connected";
   const connecting =
     voice.transport === "connecting" || voice.transport === "reconnecting";
+  // A reload drops the peer connection but not the call: the durable session, its
+  // turns and its task shelf all survive on the server. The button therefore
+  // offers a way back in rather than presenting a call that never started --
+  // clicking it re-opens voice mode, which dials again and recovers state.
+  const resumable = !active && readVoiceSessionResumable(workspaceId, sessionId);
   const label = active
     ? connected
       ? "挂断全双工语音"
       : connecting
         ? "取消语音连接"
         : "结束语音导师通话"
-    : "开始全双工语音";
+    : resumable
+      ? "回到通话中"
+      : "开始全双工语音";
   return (
     <PromptInputButton
       aria-label={label}
@@ -442,6 +450,7 @@ export function VoiceCallControl({
       className={cn(
         "chat-composer__voice-mode",
         active && "is-active",
+        resumable && "is-resumable",
         // Grey + spinner until the peer connection is actually up: "connected"
         // is a fact about the transport, not an intention.
         active && connecting && "is-connecting",
