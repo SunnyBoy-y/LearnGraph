@@ -11,9 +11,12 @@ export interface GraphNode {
   target_weight: number
   teaching_strategy?: string
   mastery_stars: number
+  achievement_score?: number | null
   retrieval_state: string
   evidence_state: string
   attention_state: string
+  /** 该节点的学习页（教材 / 互动实验 / 闯关测评）是否已经生成。 */
+  has_learning_page?: boolean
 }
 
 export interface GraphEdge {
@@ -34,6 +37,8 @@ export interface GraphSummary {
   revision: number
   published_at: IsoDateTime | null
   cover_svg?: string | null
+  /** 该图谱有 AI 封面正在后台生成（书架显示「生成中」角标）。 */
+  cover_ai_active?: boolean
 }
 
 export type GraphCoverMode = 'generated' | 'template' | 'image' | 'svg'
@@ -52,6 +57,61 @@ export interface GraphCoverView {
   cover_svg: string
   templates: GraphCoverTemplate[]
   used_default: boolean
+}
+
+/**
+ * AI cover generation. `svg` = the text model draws a vector cover (no
+ * image-model spend); `image` = the image provider draws a raster cover.
+ */
+export type GraphCoverEngine = 'svg' | 'image'
+
+/** `fallback` means the drafting model was unavailable and a template text was
+ * provided instead — it is still editable, it is just not model-authored. */
+export type GraphCoverDraftSource = 'model' | 'fallback' | 'user_edited'
+
+export interface GraphCoverDraftRequest {
+  engine: GraphCoverEngine
+  hint?: string
+  provider_id?: string
+  model_id?: string
+}
+
+export interface GraphCoverDraftView {
+  engine: GraphCoverEngine
+  prompt: string
+  prompt_source: Exclude<GraphCoverDraftSource, 'user_edited'>
+}
+
+export interface GraphCoverAIRequest {
+  engine: GraphCoverEngine
+  prompt: string
+  prompt_source?: GraphCoverDraftSource
+  provider_id?: string
+  model_id?: string
+}
+
+export type GraphCoverAIStatus =
+  | 'idle'
+  | 'queued'
+  | 'running'
+  | 'ready'
+  | 'failed'
+  | 'cancelled'
+
+export interface GraphCoverAIJobView {
+  id: string | null
+  graph_id: string | null
+  engine: GraphCoverEngine | null
+  status: GraphCoverAIStatus
+  prompt: string
+  prompt_source: string
+  provider_id: string | null
+  model_id: string | null
+  file_id: string | null
+  error: string | null
+  active: boolean
+  created_at: string | null
+  updated_at: string | null
 }
 
 export interface Graph extends GraphSummary {

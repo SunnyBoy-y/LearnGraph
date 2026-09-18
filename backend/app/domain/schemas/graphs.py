@@ -19,9 +19,14 @@ class GraphNodeView(ORMModel):
     teaching_strategy: str = ""
     external_concept_id: str | None
     mastery_stars: int
+    achievement_score: int | None = None
     retrieval_state: str
     evidence_state: str
     attention_state: str
+    # A generated node learning page (教材 / 互动实验 / 闯关测评) is a durable,
+    # version-pinned package. The canvas only needs to know whether one already
+    # exists, so it can decorate the node without opening every learning page.
+    has_learning_page: bool = False
 
 
 class GraphEdgeView(ORMModel):
@@ -42,6 +47,9 @@ class GraphSummary(ORMModel):
     revision: int
     published_at: datetime | None
     cover_svg: str | None = None
+    # An AI cover generation is running for this graph. The bookshelf needs it to
+    # keep the 「生成中」 badge after a reload, when no dialog is open to poll.
+    cover_ai_active: bool = False
 
 
 class GraphCoverUpdateRequest(BaseModel):
@@ -67,6 +75,53 @@ class GraphCoverTemplate(BaseModel):
     id: Literal["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"]
     name: str
     cover_svg: str
+
+
+class GraphCoverDraftRequest(BaseModel):
+    """Phase 1 of the AI cover flow: draft the brief, draw nothing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    engine: Literal["svg", "image"] = "svg"
+    hint: str = Field(default="", max_length=500)
+    provider_id: str | None = Field(default=None, max_length=120)
+    model_id: str | None = Field(default=None, max_length=200)
+
+
+class GraphCoverDraftView(BaseModel):
+    engine: Literal["svg", "image"]
+    prompt: str
+    # ``model`` = drafted by the model, ``fallback`` = template text because the
+    # drafting model was unavailable (the user can still edit it).
+    prompt_source: Literal["model", "fallback"]
+
+
+class GraphCoverAIRequest(BaseModel):
+    """Phase 2: the confirmed brief, submitted to the background worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    engine: Literal["svg", "image"]
+    prompt: str = Field(min_length=1, max_length=2000)
+    prompt_source: Literal["model", "fallback", "user_edited"] = "user_edited"
+    provider_id: str | None = Field(default=None, max_length=120)
+    model_id: str | None = Field(default=None, max_length=200)
+
+
+class GraphCoverAIJobView(BaseModel):
+    id: str | None = None
+    graph_id: str | None = None
+    engine: str | None = None
+    status: Literal["idle", "queued", "running", "ready", "failed", "cancelled"]
+    prompt: str = ""
+    prompt_source: str = ""
+    provider_id: str | None = None
+    model_id: str | None = None
+    file_id: str | None = None
+    error: str | None = None
+    active: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class GraphCoverView(BaseModel):

@@ -1,5 +1,9 @@
 import type {
   Graph,
+  GraphCoverAIJobView,
+  GraphCoverAIRequest,
+  GraphCoverDraftRequest,
+  GraphCoverDraftView,
   GraphCoverMode,
   GraphCoverView,
   GraphRevision,
@@ -39,6 +43,45 @@ export function updateGraphCover(
 export function getGraphCover(graphId: string): Promise<GraphCoverView> {
   return apiClient.get<GraphCoverView>(
     `/graphs/${encodeURIComponent(graphId)}/cover`,
+  )
+}
+
+/** Phase 1 of the AI cover flow: draft a brief to review before paying for a drawing. */
+export function draftAIGraphCover(
+  graphId: string,
+  payload: GraphCoverDraftRequest,
+): Promise<GraphCoverDraftView> {
+  return apiClient.post<GraphCoverDraftView, GraphCoverDraftRequest>(
+    `/graphs/${encodeURIComponent(graphId)}/cover/ai/draft`,
+    payload,
+  )
+}
+
+/** Phase 2: submit the confirmed brief; the worker draws it in the background. */
+export function startAIGraphCover(
+  graphId: string,
+  payload: GraphCoverAIRequest,
+): Promise<GraphCoverAIJobView> {
+  return apiClient.post<GraphCoverAIJobView, GraphCoverAIRequest>(
+    `/graphs/${encodeURIComponent(graphId)}/cover/ai`,
+    payload,
+  )
+}
+
+export function getAIGraphCoverStatus(
+  graphId: string,
+): Promise<GraphCoverAIJobView> {
+  return apiClient.get<GraphCoverAIJobView>(
+    `/graphs/${encodeURIComponent(graphId)}/cover/ai`,
+  )
+}
+
+export function cancelAIGraphCover(
+  graphId: string,
+): Promise<GraphCoverAIJobView> {
+  return apiClient.post<GraphCoverAIJobView, Record<string, never>>(
+    `/graphs/${encodeURIComponent(graphId)}/cover/ai/cancel`,
+    {},
   )
 }
 

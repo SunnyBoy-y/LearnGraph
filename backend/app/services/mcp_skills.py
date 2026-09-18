@@ -229,16 +229,24 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "function_name": "lg_graph_cover_update",
         "description": (
             "Change a graph cover using a generated cover, a built-in template, "
-            "a validated image data URL, or safe static SVG."
+            "a validated image data URL, safe static SVG, or AI generation. "
+            "AI cover generation is two-phase: mode='ai_draft' returns an "
+            "editable brief for the user to review, and mode='ai' submits that "
+            "confirmed brief to a background worker. engine='svg' has the text "
+            "model draw a vector cover (no image-model spend); engine='image' "
+            "calls the workspace image Provider for a raster cover."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "graph_id": {"type": "string", "minLength": 1, "maxLength": 36},
-                "mode": {"type": "string", "enum": ["generated", "template", "image", "svg"]},
+                "mode": {"type": "string", "enum": ["generated", "template", "image", "svg", "ai_draft", "ai"]},
                 "template": {"type": "string", "enum": ["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"]},
                 "image_data_url": {"type": "string", "maxLength": 2800000},
                 "svg": {"type": "string", "maxLength": 48000},
+                "engine": {"type": "string", "enum": ["svg", "image"]},
+                "prompt": {"type": "string", "maxLength": 2000},
+                "hint": {"type": "string", "maxLength": 500},
             },
             "required": ["graph_id", "mode"], "additionalProperties": False,
         },
@@ -678,7 +686,7 @@ BUILTIN_TOOL_DESCRIPTION_ZH: dict[str, str] = {
     "builtin.review.list_due": "读取当前到期的 LearnGraph 复习节点。",
     "builtin.graph.read": "读取已授权的目标图谱，并按标签或描述检索匹配的节点。",
     "builtin.graph.cover.read": "读取已授权图谱的当前封面及可用封面模式。",
-    "builtin.graph.cover.update": "为已授权图谱选择生成封面、模板封面、图片封面或安全静态 SVG 封面。",
+    "builtin.graph.cover.update": "为已授权图谱选择生成封面、模板封面、图片封面、安全静态 SVG 封面，或走两阶段 AI 生成（先拟草案、确认后再生成矢量/位图封面）。",
     "builtin.graph.update_candidate_node": "更新候选图谱修订中的一个节点。已发布的图谱不可变，必须通过经审核的提案修改。",
     "builtin.roadmap.read": "按路线图 ID 或 Goal 的最新路线图读取已授权路线图。",
     "builtin.roadmap.replan": "基于 Goal 当前的图谱与已验证的学习事实，创建新的可审核路线图草稿。不会直接发布路线图。",
@@ -4822,6 +4830,10 @@ class MCPAndSkillService:
             )
             edges_truncated = len(edge_rows) > edge_limit
             from app.domain.schemas.graphs import GraphNodeView
+            from app.services.graphs import learning_page_node_ids
+
+            # 学习页是否已生成必须反映真实状态，不能被 schema 默认值抹成 False。
+            page_ready = learning_page_node_ids(self.db, self.workspace_id, graph.id)
 
             return {
                 "graph": {
@@ -4832,7 +4844,10 @@ class MCPAndSkillService:
                     "revision": graph.revision,
                 },
                 "nodes": [
-                    GraphNodeView.model_validate(node).model_dump(mode="json")
+                    {
+                        **GraphNodeView.model_validate(node).model_dump(mode="json"),
+                        "has_learning_page": node.id in page_ready,
+                    }
                     for node in nodes[:limit]
                 ],
                 "edges": [
@@ -4855,11 +4870,17 @@ class MCPAndSkillService:
             graph_id = str(arguments["graph_id"])
             from app.domain.schemas.graphs import GraphCoverUpdateRequest
             from app.services.graph_cover import default_graph_cover
+            from app.services.graph_cover_ai import GraphCoverAIService
             from app.services.graph_cover_management import GraphCoverService
             cover_service = GraphCoverService(
                 self.db, self.workspace_id, self.principal.user_id,
                 can_access=lambda target_id, access: authz.can_access_resource(workspace, "graph", target_id, access),
             )
+            ai_service = GraphCoverAIService(
+                self.db, self.workspace_id, self.principal.user_id,
+                can_access=lambda target_id, access: authz.can_access_resource(workspace, "graph", target_id, access),
+            )
+            ai_job = ai_service.latest_job(graph_id)
             if tool_name.endswith("read"):
                 view = cover_service.read(graph_id)
                 graph_row = self.db.scalar(
@@ -4880,8 +4901,46 @@ class MCPAndSkillService:
                         and graph_row.cover_svg
                         and graph_row.cover_svg != default_graph_cover(graph_row.title)
                     ),
-                    "available_modes": ["generated", "template", "image", "svg"],
+                    "available_modes": ["generated", "template", "image", "svg", "ai_draft", "ai"],
                     "templates": ["ancient", "literature", "history", "science", "chemistry", "paper", "midnight", "sunrise"],
+                    "ai": {
+                        "engines": ["svg", "image"],
+                        "generating": bool(ai_job and ai_job.status in {"queued", "running"}),
+                        "last_status": ai_job.status if ai_job else None,
+                        "last_engine": ai_job.engine if ai_job else None,
+                        "last_error": ai_job.error if ai_job else None,
+                    },
+                }
+            if arguments.get("mode") in {"ai_draft", "ai"}:
+                engine = str(arguments.get("engine") or "svg")
+                if arguments.get("mode") == "ai_draft":
+                    drafted = ai_service.draft(
+                        graph_id, engine=engine, hint=str(arguments.get("hint") or "")
+                    )
+                    return {
+                        "graph_id": graph_id,
+                        "mode": "ai_draft",
+                        "engine": drafted["engine"],
+                        "prompt": drafted["prompt"],
+                        "prompt_source": drafted["prompt_source"],
+                        "note": (
+                            "把这段草案原样给用户看，等用户确认或改写后，再用 "
+                            "mode='ai' 带上最终 prompt 提交生成；草案阶段不产生图片费用。"
+                        ),
+                    }
+                submitted = ai_service.submit(
+                    graph_id, engine=engine, prompt=str(arguments.get("prompt") or "")
+                )
+                return {
+                    "graph_id": graph_id,
+                    "mode": "ai",
+                    "engine": engine,
+                    "status": submitted["status"],
+                    "cover_job_id": submitted["id"],
+                    "note": (
+                        "已提交后台生成，耗时数十秒；不要重复提交，完成后封面会更新。"
+                        "失败时用 lg_graph_cover_read 读 ai.last_error 如实告知用户。"
+                    ),
                 }
             payload = GraphCoverUpdateRequest.model_validate(
                 {

@@ -14,6 +14,18 @@ export const CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY =
   "chat.dictation_cleanup_model";
 /** 复习与练习中心的出题与简答题判分模型；未配置时回落对话模型。 */
 export const PRACTICE_EXERCISE_MODEL_SETTING_KEY = "practice.exercise_model";
+/** 教学包（节点学习页）生成模型：教材 / 互动实验 / 小剧场 / 闯关测评共用。 */
+export const LEARNING_PACKAGE_MODEL_SETTING_KEY = "learning.package_model";
+/**
+ * 「AI 生成封面」矢量引擎用的生成模型（LLM 直接产出 SVG）。
+ * 与 chat.*_model 同形（provider_id + model_id 成对或同时为 null），未配置时
+ * 后端回落工作区对话模型；位图引擎不走这个键，它用「功能模型」里的图片生成目标。
+ */
+export const GRAPH_COVER_MODEL_SETTING_KEY = "graph.cover_model";
+/** 「AI 生成封面」的默认引擎：svg（矢量，不花图片模型的钱）或 image（位图）。 */
+export const GRAPH_COVER_ENGINE_SETTING_KEY = "graph.cover_engine";
+/** 「功能模型」总键：位图引擎的图片生成目标写在这里的 image_generation 分支。 */
+export const FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY = "models.functional_defaults";
 /** ASR 显式语言选择（"auto" / zh-CN / en-US / 其他 BCP-47）。 */
 export const CHAT_ASR_LANGUAGE_SETTING_KEY = "chat.asr_language";
 /** ASR 热词表（术语/人名/代码标识符），paraformer-realtime-v2 原生支持。 */
@@ -29,11 +41,28 @@ export const CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY =
 export { CHAT_RESPONSE_STYLE_SETTING_KEY } from "@/lib/response-style";
 export const TRAJECTORY_ENABLED_SETTING_KEY =
   "trajectory.enabled";
+/** 语音调试面板（右侧栏「语音延迟」栏目）：未配置时默认关闭。 */
+export const VOICE_DEBUG_PANEL_SETTING_KEY =
+  "voice.debug_panel";
 
 export type ChatFeatureModelSetting = {
   provider_id: string | null;
   model_id: string | null;
 };
+
+/**
+ * 封面 AI 引擎；未配置或取值非法时默认「矢量」——它不需要图片 Provider，
+ * 也不产生图片模型费用，是更安全的默认。
+ */
+export function readGraphCoverEngine(
+  settings: WorkspaceSetting[] | undefined,
+): "svg" | "image" {
+  const value = settings?.find(
+    (setting) => setting.key === GRAPH_COVER_ENGINE_SETTING_KEY,
+  )?.value;
+  if (value === "image") return "image";
+  return "svg";
+}
 
 export type ChatDefaultResponseModeSetting = {
   response_mode: ResponseMode;
@@ -82,6 +111,16 @@ export function isTrajectoryEnabled(
 ): boolean {
   const value = settings?.find(
     (setting) => setting.key === TRAJECTORY_ENABLED_SETTING_KEY,
+  )?.value;
+  return value === true;
+}
+
+/** 语音调试面板为可选特性（排障用），未配置时默认关闭。 */
+export function isVoiceDebugPanelEnabled(
+  settings: WorkspaceSetting[] | undefined,
+): boolean {
+  const value = settings?.find(
+    (setting) => setting.key === VOICE_DEBUG_PANEL_SETTING_KEY,
   )?.value;
   return value === true;
 }

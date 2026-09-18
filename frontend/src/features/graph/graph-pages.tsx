@@ -1,3 +1,4 @@
+import { LearningBuildSettings } from '@/features/learning/node-learning-page';
 import {
   useCallback,
   useEffect,
@@ -29,7 +30,6 @@ import {
   Lock,
   ListTree,
   ListChecks,
-  MessageCircle,
   Minus,
   MoreHorizontal,
   MousePointer2,
@@ -80,6 +80,7 @@ import { saveBlobViaNative } from "@/lib/native-download";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { GraphLegend } from "@/components/graph/graph-legend";
 import { GraphReviewDialog } from "@/components/graph/graph-review-dialog";
+import { GraphCoverAIBadge, GraphCoverAIEditor } from "@/features/graph/graph-cover-ai";
 import {
   getKnowledgeGraphTreeDepth,
   getKnowledgeGraphTreeDepths,
@@ -216,7 +217,16 @@ type ShelfBook = {
   needsReview: boolean;
   masteryProgress: number;
   cover: string;
+  /** 该图谱有 AI 封面正在后台生成：书架显示角标并独立轮询。 */
+  coverAiActive?: boolean;
 };
+
+/** 三个纯矢量模板（paper/midnight/sunrise）没有实拍底图，用调色板色块当缩略图。 */
+const TEMPLATE_SWATCHES = {
+  paper: "linear-gradient(135deg, #f4f0e8 0%, #d9d1c2 55%, #445849 100%)",
+  midnight: "linear-gradient(135deg, #171c35 0%, #30395f 55%, #a5b4fc 100%)",
+  sunrise: "linear-gradient(135deg, #fff0df 0%, #ffd2ac 55%, #db754c 100%)",
+} as const;
 
 function generatedCover(title: string, progress: number) {
   const hue = Math.abs([...title].reduce((sum, char) => sum + char.charCodeAt(0), 0)) % 360;
@@ -352,6 +362,7 @@ function shelfBooks(
       needsReview: graph?.status === "candidate",
       masteryProgress,
       cover: graph?.cover_svg || generatedCover(book.title, masteryProgress),
+      coverAiActive: graph?.cover_ai_active,
     };
   });
   const graphEntries = graphSummaries
@@ -374,6 +385,7 @@ function shelfBooks(
       isGoalBook: false,
       needsReview: graph.status === "candidate",
       cover: graph.cover_svg || generatedCover(graph.title, graph.id === currentGraph?.id && currentGraph?.nodes.length ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length : 0),
+      coverAiActive: graph.cover_ai_active,
     }));
   return [...goalEntries, ...graphEntries];
 }
@@ -406,6 +418,7 @@ function toWorkbenchKnowledgeGraph(
       label: node.label,
       description: node.description,
       stars: node.mastery_stars,
+      achievementScore: node.achievement_score,
       state: node.retrieval_state,
       evidence: node.evidence_state,
       focused: node.attention_state === "focused",
@@ -413,6 +426,8 @@ function toWorkbenchKnowledgeGraph(
       targetWeight: node.target_weight,
       exploreCount: exploreCounts[node.id] ?? 0,
       mastered: node.attention_state === "mastered",
+      // 装饰标记：该节点的学习页（交互页）已经生成，卡片右上角挂一枚徽章。
+      hasLearningPage: Boolean(node.has_learning_page),
       blockedByPrerequisite: blockedNodeIds.has(node.id),
       // Light secondary metadata only: the plan annotates the map, it never
       // restates the node's own learning status.
@@ -447,10 +462,16 @@ function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => 
   const queryClient = useQueryClient();
   const save = useMutation({
     mutationFn: (payload: Parameters<typeof updateGraphCover>[1]) => updateGraphCover(book!.graphId!, payload),
-    onSuccess: () => {
+    onSuccess: (view) => {
       void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graphs") });
       void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graph", book?.graphId) });
-      toast.success("封面已更新");
+      // 后端一直在回传 used_default，但此前前端从不读它：降级封面（生成失败退回默认
+      // 封面）会伪装成"成功"。这里如实说明，用户才知道封面为什么不是定制的。
+      if (view.used_default) {
+        toast.warning("本次未能生成定制封面，已使用默认封面。");
+      } else {
+        toast.success("封面已更新");
+      }
       onClose();
     },
     onError: (error) => toast.error(error.message),
@@ -468,33 +489,37 @@ function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => 
   }
   return (
     <Dialog open={Boolean(book)} onOpenChange={(open) => { if (!open && !save.isPending) onClose(); }}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>替换「{book?.title}」的封面</DialogTitle>
-          <DialogDescription>选择模板、上传图片，或根据图谱内容生成封面。</DialogDescription>
+          <DialogDescription>选择模板、上传图片、按图谱内容绘制，或让模型生成一张。</DialogDescription>
         </DialogHeader>
-        {book ? <img className="aspect-[32/15] w-full rounded-lg object-cover" src={book.cover} onError={(event) => { event.currentTarget.src = generatedCover(book.title, book.masteryProgress); }} alt={`${book.title} 当前封面`} /> : null}
-        <div className="grid grid-cols-5 gap-2">
+        {book ? <img className="mx-auto max-h-36 w-auto rounded-lg object-contain" src={book.cover} onError={(event) => { event.currentTarget.src = generatedCover(book.title, book.masteryProgress); }} alt={`${book.title} 当前封面`} /> : null}
+        <div className="grid grid-cols-4 gap-2">
           {([
             { id: "ancient", label: "古风", color: "text-white", image: "/graph-covers/ancient.jpg" },
             { id: "literature", label: "文学", color: "text-white", image: "/graph-covers/literature.jpg" },
             { id: "history", label: "历史", color: "text-white", image: "/graph-covers/history.jpg" },
             { id: "science", label: "理科", color: "text-white", image: "/graph-covers/science.jpg" },
             { id: "chemistry", label: "化学", color: "text-white", image: "/graph-covers/chemistry.jpg" },
+            { id: "paper", label: "纸感", color: "text-foreground", image: "" },
+            { id: "midnight", label: "星夜", color: "text-white", image: "" },
+            { id: "sunrise", label: "晨光", color: "text-foreground", image: "" },
           ] as const).map((template) => (
-              <Button key={template.id} className={`h-20 ${template.color} relative overflow-hidden border-0`} style={{ backgroundImage: `linear-gradient(180deg, transparent 20%, rgba(0,0,0,.65)), url(${template.image})`, backgroundSize: "cover", backgroundPosition: "center" }} disabled={save.isPending} variant="outline" onClick={() => save.mutate({ mode: "template", template: template.id })}>
+              <Button key={template.id} className={`h-16 ${template.color} relative overflow-hidden border-0`} style={template.image ? { backgroundImage: `linear-gradient(180deg, transparent 20%, rgba(0,0,0,.65)), url(${template.image})`, backgroundSize: "cover", backgroundPosition: "center" } : { backgroundImage: TEMPLATE_SWATCHES[template.id] }} disabled={save.isPending} variant="outline" onClick={() => save.mutate({ mode: "template", template: template.id })}>
               {template.label}
             </Button>
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button disabled={save.isPending} onClick={() => save.mutate({ mode: "generated" })}><Sparkles className="size-4" />{save.isPending ? "处理中…" : "生成封面"}</Button>
+          <Button disabled={save.isPending} onClick={() => save.mutate({ mode: "generated" })}><Sparkles className="size-4" />{save.isPending ? "处理中…" : "按图谱绘制"}</Button>
           <label className="inline-flex cursor-pointer items-center rounded-lg border px-3 py-2 text-sm">
             上传图片
             <input className="sr-only" type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={save.isPending} onChange={(event) => { upload(event.target.files?.[0]); event.target.value = ""; }} />
           </label>
-          <span className="text-xs text-muted-foreground">最大 2 MB</span>
+          <span className="text-xs text-muted-foreground">「按图谱绘制」是按标题、节点数量和学习进度用代码画的，不调用模型；上传最大 2 MB</span>
         </div>
+        {book?.graphId ? <GraphCoverAIEditor busy={save.isPending} graphId={book.graphId} /> : null}
       </DialogContent>
     </Dialog>
   );
@@ -674,6 +699,7 @@ function GraphBookshelf({
                   </span>
                   <span className="graph-library__book-meta">
                     <b>{entry.status}</b>
+                    {entry.coverAiActive && entry.graphId ? <GraphCoverAIBadge graphId={entry.graphId} /> : null}
                     <small>{entry.progress}</small>
                     <span aria-label={`掌握进度 ${Math.round(entry.masteryProgress * 100)}%`} className="mt-1 block h-1.5 w-24 overflow-hidden rounded-full bg-muted"><span className="block h-full rounded-full bg-primary" style={{ width: `${Math.round(entry.masteryProgress * 100)}%` }} /></span>
                   </span>
@@ -1146,6 +1172,17 @@ export function GraphWorkspacePage() {
     });
     return map;
   }, [blockedNodeIds, effectiveGraph]);
+
+  /**
+   * 已生成学习页（交互页）的节点数。图例据此说明卡片右上角那枚装饰徽章，
+   * 与类型 / 状态一样，缺省时保留词条但置灰。
+   */
+  const nodePageCount = useMemo(
+    () =>
+      (effectiveGraph?.nodes ?? []).filter((node) => node.has_learning_page)
+        .length,
+    [effectiveGraph],
+  );
 
   /** Types actually present in this graph — the legend marks the rest as unused. */
   const nodeTypeCounts = useMemo(() => {
@@ -1790,14 +1827,7 @@ export function GraphWorkspacePage() {
   /** Shared "start studying this node" entry (node card, plan item, inspector). */
   function startNodeLearning(node: { id: string; label: string }) {
     if (!activeGraph) return;
-    openLearningProject({
-      graphId: activeGraph.id,
-      title: activeGraph.title,
-      nodeId: node.id,
-      nodeLabel: node.label,
-      prompt: `请从「${node.label}」开始讲解：它是什么、在「${activeGraph.title}」中承担什么角色，以及我接下来应如何练习？`,
-    });
-    toast.message(`正在从「${node.label}」开始学习…`);
+    navigate(`${base}/learn/nodes/${node.id}`);
   }
 
   function studyFromNode(node: KnowledgeNode["data"] & { id: string }) {
@@ -1805,14 +1835,13 @@ export function GraphWorkspacePage() {
   }
 
   /**
-   * Plan items route by their real action type: `learn` opens the existing node
-   * study flow, `review` / `practice` / `assessment` create a Practice Session
-   * scoped to that node. Nothing here invents a second practice UI.
+   * Learning, experiments and checkpoints share the versioned node page.
+   * Spaced review retains its existing practice-session workflow.
    */
   function startPlanItem(item: PlanItemView) {
-    if (item.routing.route === "learn") {
-      if (!item.nodeId) return;
-      startNodeLearning({ id: item.nodeId, label: item.title });
+    if (item.routing.kind !== "review" && item.nodeId) {
+      const tab = item.routing.kind === "assessment" ? "exam" : item.routing.kind === "practice" ? "lab" : "lesson";
+      navigate(`${base}/learn/nodes/${item.nodeId}?tab=${tab}`);
       return;
     }
     void startPlanPracticeSession(item)
@@ -2131,6 +2160,7 @@ export function GraphWorkspacePage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {activeGraph?.status === "published" && <LearningBuildSettings graphId={activeGraph.id} />}
             {activeGraph ? (
               <Button
                 aria-pressed={planPanelOpen}
@@ -2487,6 +2517,7 @@ export function GraphWorkspacePage() {
               <div className="graph-workbench-canvas__graph">
                 <GraphLegend
                   className="graph-legend--floating"
+                  pageCount={nodePageCount}
                   statusCounts={nodeStatusCounts}
                   typeCounts={nodeTypeCounts}
                 />
@@ -2812,6 +2843,15 @@ function GraphNodeInspector({
           {levelLabel ? (
             <span className="graph-node-panel__level" title="图谱层级">
               {levelLabel}
+            </span>
+          ) : null}
+          {node.has_learning_page ? (
+            <span
+              className="graph-node-panel__page"
+              title="教材、互动实验与闯关测评已生成"
+            >
+              <Sparkles aria-hidden="true" className="size-3" />
+              已生成交互页
             </span>
           ) : null}
           {currentLearning ? (
@@ -3257,7 +3297,7 @@ function GraphNodeInspector({
           </Button>
         ) : null}
         <Button className="w-full" onClick={onLearn} size="sm">
-          <MessageCircle className="size-4" />
+          <BookOpen className="size-4" />
           {locked ? "仍然学习此节点" : primaryLabel}
         </Button>
         {onLocate ? (

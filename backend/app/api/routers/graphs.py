@@ -7,7 +7,12 @@ from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.providers.factory import model_provider_for_workspace
 from app.domain.schemas.common import ActionResponse
 from app.domain.models import GraphNode
+from app.domain.graph_cover_models import COVER_ACTIVE_STATUSES, GraphCoverJob
 from app.domain.schemas.graphs import (
+    GraphCoverAIJobView,
+    GraphCoverAIRequest,
+    GraphCoverDraftRequest,
+    GraphCoverDraftView,
     GraphCoverUpdateRequest,
     GraphCoverView,
     GraphNodeView,
@@ -27,6 +32,7 @@ from app.domain.schemas.graphs import (
 from app.services.graphs import GraphService
 from app.services.authorization import AuthorizationService
 from app.services.graph_cover import generate_graph_cover
+from app.services.graph_cover_ai import GraphCoverAIService
 from app.services.graph_cover_management import GraphCoverService
 
 
@@ -58,17 +64,30 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
     ]
     node_labels: dict[str, list[str]] = {}
     mastered_counts: dict[str, int] = {}
+    ai_cover_active: set[str] = set()
     if graph_items:
+        graph_ids = [item.id for item in graph_items]
         nodes = db.scalars(
             select(GraphNode).where(
                 GraphNode.workspace_id == context.workspace_id,
-                GraphNode.graph_id.in_([item.id for item in graph_items]),
+                GraphNode.graph_id.in_(graph_ids),
             ).order_by(GraphNode.graph_id, GraphNode.id)
         ).all()
         for node in nodes:
             node_labels.setdefault(node.graph_id, []).append(node.label)
             if node.mastery_stars >= 3:
                 mastered_counts[node.graph_id] = mastered_counts.get(node.graph_id, 0) + 1
+        # One batched lookup keeps the shelf able to show an in-flight AI cover
+        # after a reload, instead of polling every card.
+        ai_cover_active = set(
+            db.scalars(
+                select(GraphCoverJob.graph_id).where(
+                    GraphCoverJob.workspace_id == context.workspace_id,
+                    GraphCoverJob.graph_id.in_(graph_ids),
+                    GraphCoverJob.status.in_(COVER_ACTIVE_STATUSES),
+                )
+            ).all()
+        )
     return [
         GraphSummary.model_validate({
             **item.__dict__,
@@ -77,6 +96,7 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
                 node_labels=node_labels.get(item.id),
                 progress=mastered_counts.get(item.id, 0) / max(1, len(node_labels.get(item.id, []))),
             ),
+            "cover_ai_active": item.id in ai_cover_active,
         })
         for item in graph_items
     ]
@@ -106,6 +126,69 @@ def graph_cover(graph_id: str, db: DB, context: CurrentWorkspace, settings: AppS
         db, context.workspace_id, context.principal.user_id,
         can_access=lambda target_id, permission: authz.can_access_resource(context.workspace, "graph", target_id, permission),
     ).read(graph_id)
+
+
+def _cover_ai_service(db, context) -> GraphCoverAIService:
+    authz = AuthorizationService(db, context.principal)
+    return GraphCoverAIService(
+        db, context.workspace_id, context.principal.user_id,
+        can_access=lambda target_id, permission: authz.can_access_resource(context.workspace, "graph", target_id, permission),
+    )
+
+
+@router.post("/{graph_id}/cover/ai/draft", response_model=GraphCoverDraftView)
+def draft_ai_graph_cover(
+    graph_id: str,
+    payload: GraphCoverDraftRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> GraphCoverDraftView:
+    """Phase 1: let the model propose a cover brief the user can edit.
+
+    Synchronous on purpose — the draft is one short text response, and the user
+    is waiting to *read* it before deciding whether to spend image-model money.
+    """
+    return GraphCoverDraftView.model_validate(
+        _cover_ai_service(db, context).draft(
+            graph_id,
+            engine=payload.engine,
+            hint=payload.hint,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+        )
+    )
+
+
+@router.post("/{graph_id}/cover/ai", response_model=GraphCoverAIJobView, status_code=202)
+def start_ai_graph_cover(
+    graph_id: str,
+    payload: GraphCoverAIRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> GraphCoverAIJobView:
+    """Phase 2: submit the confirmed brief; the worker draws it in the background."""
+    return GraphCoverAIJobView.model_validate(
+        _cover_ai_service(db, context).submit(
+            graph_id,
+            engine=payload.engine,
+            prompt=payload.prompt,
+            prompt_source=payload.prompt_source,
+            provider_id=payload.provider_id,
+            model_id=payload.model_id,
+        )
+    )
+
+
+@router.get("/{graph_id}/cover/ai", response_model=GraphCoverAIJobView)
+def ai_graph_cover_status(graph_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> GraphCoverAIJobView:
+    return GraphCoverAIJobView.model_validate(_cover_ai_service(db, context).status(graph_id))
+
+
+@router.post("/{graph_id}/cover/ai/cancel", response_model=GraphCoverAIJobView)
+def cancel_ai_graph_cover(graph_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> GraphCoverAIJobView:
+    return GraphCoverAIJobView.model_validate(_cover_ai_service(db, context).cancel(graph_id))
 
 
 @router.get("/merges", response_model=list[NodeMergeView])

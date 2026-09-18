@@ -367,15 +367,18 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
     OfficialSkillSpec(
         key="graph-cover",
         display_name="图谱 SVG 封面",
-        version="1.0.0",
+        version="1.1.0",
         dir_name="graph_cover",
         description=(
             "Generate and manage graph covers: read graph context, choose a "
             "generated/template/image cover, or persist safe static SVG; "
-            "refreshes use a default cover on failure."
+            "refreshes use a default cover on failure. Also offers two-phase AI "
+            "covers: draft a brief for the user to confirm, then generate a "
+            "vector cover with the text model or a raster cover with the image "
+            "Provider in the background."
         ),
         grant_reason="official_skill_auto_enable",
-        trigger_phrases=("更换封面", "替换封面", "生成封面", "图谱封面"),
+        trigger_phrases=("更换封面", "替换封面", "生成封面", "图谱封面", "AI 封面", "AI 生成封面"),
         required_tools=(
             "lg_graph_read",
             "lg_graph_cover_read",

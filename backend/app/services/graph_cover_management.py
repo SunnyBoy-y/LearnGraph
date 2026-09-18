@@ -21,17 +21,26 @@ from app.services.graph_cover import (
 )
 
 
-def normalize_cover_image(data_url: str) -> str:
-    """Decode, resize, and re-encode uploads; filenames/MIME claims are not trusted."""
+def normalize_cover_bytes(raw: bytes, *, max_bytes: int = 2 * 1024 * 1024) -> str:
+    """Decode, resize, and re-encode a raster cover; extraction is the only trust.
+
+    Shared by the user upload path and the AI image engine: the source bytes are
+    decoded here, EXIF-rotated, fitted to 640×300 and re-encoded as JPEG, so a
+    filename or MIME claim never influences the stored artifact.
+
+    ``max_bytes`` differs per caller on purpose — an upload is capped at the
+    documented 2 MB, while an image model may legitimately return a larger PNG
+    that we are about to shrink anyway.
+    """
     from PIL import Image, ImageOps, UnidentifiedImageError
 
-    match = re.fullmatch(r"data:image/(?:png|jpeg|webp|gif);base64,([A-Za-z0-9+/=]+)", data_url)
-    if not match:
-        raise AppError(422, "invalid_cover_image", "请选择 PNG、JPG、WebP 或 GIF 图片")
     try:
-        raw = base64.b64decode(match[1], validate=True)
-        if len(raw) > 2 * 1024 * 1024:
-            raise AppError(413, "cover_image_too_large", "封面图片不能超过 2 MB")
+        if len(raw) > max_bytes:
+            raise AppError(
+                413,
+                "cover_image_too_large",
+                f"封面图片不能超过 {max_bytes // (1024 * 1024)} MB",
+            )
         with Image.open(io.BytesIO(raw)) as image:
             if image.format not in {"PNG", "JPEG", "WEBP", "GIF"} or image.width * image.height > 25_000_000:
                 raise ValueError("Unsupported cover image dimensions or format")
@@ -42,6 +51,18 @@ def normalize_cover_image(data_url: str) -> str:
         return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
     except (binascii.Error, OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
         raise AppError(422, "invalid_cover_image", "图片无法读取，请重新选择有效图片") from exc
+
+
+def normalize_cover_image(data_url: str) -> str:
+    """Decode, resize, and re-encode uploads; filenames/MIME claims are not trusted."""
+    match = re.fullmatch(r"data:image/(?:png|jpeg|webp|gif);base64,([A-Za-z0-9+/=]+)", data_url)
+    if not match:
+        raise AppError(422, "invalid_cover_image", "请选择 PNG、JPG、WebP 或 GIF 图片")
+    try:
+        raw = base64.b64decode(match[1], validate=True)
+    except binascii.Error as exc:
+        raise AppError(422, "invalid_cover_image", "图片无法读取，请重新选择有效图片") from exc
+    return normalize_cover_bytes(raw)
 
 
 class GraphCoverService:
