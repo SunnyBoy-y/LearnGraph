@@ -110,6 +110,10 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
             return
         await self._trigger_interrupt_turn()
 
+    def _is_backchannel(self, text: str) -> bool:
+        """整句都是背声词/填充词（「嗯。」「哦。」「对。」…）时才为真。"""
+        return self._classifier.classify(text) is TurnIntent.BACKCHANNEL
+
     async def _trigger_normal_turn(self) -> None:
         self._clear_pending()
         await self.trigger_user_turn_started(
@@ -191,7 +195,28 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
                     await self._cancel_decision()
                     await self._trigger_interrupt_turn()
                 return ProcessFrameResult.STOP
+            # 决策窗口之外的转录。两条路都会走到这里：
+            #   * 窗口已按"什么都没听清"关掉（决策超时 / VAD 停止），随后 ASR
+            #     的 final 才回来；
+            #   * ASR 的 partial 比本机 VAD 帧先到——实测「嗯」的 partial 比
+            #     ``VADUserStartedSpeakingFrame`` 早 7ms，于是窗口根本还没开。
+            # 旧实现在这里**无条件**起一个回合，而回合默认带打断：任何一次背声词
+            # 都会在音频里切掉正在播的回答，随后这句背声词还被当成一个问题回答
+            # （实测 ``嗯。`` → 13ms 后 turn.interrupted → bot 回「嗯，我在这儿。」）。
+            # 分类器在窗口内才是权威判据，窗口外同样必须先问它。
             await self._cancel_decision()
+            if self._bot_speaking:
+                # 机器人正在出声。这一刻的「嗯。」是"我在听"，不是一次发言：既不
+                # 起回合，也不打断；换成带实义的文本则照旧抢断。
+                if self._is_backchannel(text):
+                    await self._suppress_backchannel()
+                    return ProcessFrameResult.STOP
+                await self._trigger_interrupt_turn()
+                return ProcessFrameResult.STOP
+            # 机器人没出声：孤零零一个「嗯」很可能就是在回答（"听懂了吗？"→"嗯"），
+            # 这种发言照旧起回合；它打断不了任何音频，因为本来就没人在说话。
+            # （"回答在途但还没出声"的那几秒由 STT 层的背声词门闩负责，见
+            # ``DashScopeSTTService._is_backchannel_filler``。）
             await self._trigger_normal_turn()
             return ProcessFrameResult.STOP
 

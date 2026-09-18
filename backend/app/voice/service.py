@@ -243,6 +243,13 @@ class VoiceSessionService:
         pipeline may already be mid-generation on the previous pin.  The event
         carries ``applied_epoch`` so the client can show the epoch that is
         really in force instead of assuming the request took effect.
+
+        ``reason="model_switch"`` is the marker that separates a *request* from
+        the two other things that share this event type: the context-snapshot
+        refresh (``reason="context_snapshot"``, nothing to do with the model) and
+        the worker's own acknowledgement (``origin="pipeline"``).  Without it a
+        client that keys on the event type alone reports a model switch every
+        time a call is created.
         """
         self.get_session(voice_session_id, write=True)
         row = self.db.get(VoiceSessionRecord, voice_session_id)
@@ -251,6 +258,7 @@ class VoiceSessionService:
         self.db.commit()
         effective = self.get_session(voice_session_id)
         self.envelope(voice_session_id, "context.updated", {
+            "reason": "model_switch",
             "model_id": row.model_id,
             "provider_id": row.provider_id,
             "applies_to": "next_turn",
@@ -259,7 +267,15 @@ class VoiceSessionService:
         return effective
 
     def update_context_snapshot(self, voice_session_id: str, snapshot: dict[str, Any]) -> VoiceSession:
-        """Persist an immutable context package for reconnects/next turns."""
+        """Persist an immutable context package for reconnects/next turns.
+
+        The event says "the context package changed", never "the model changed":
+        it carries no ``model_id`` and is marked ``reason="context_snapshot"`` so
+        a reader cannot mistake a snapshot write (which happens on every call
+        creation) for a model switch.  This is also what the worker's watchdog
+        needs in order to tell an instruction from its own acknowledgement --
+        see ``VoiceControlWatchdog.tick``.
+        """
         self.get_session(voice_session_id, write=True)
         row = self.db.get(VoiceSessionRecord, voice_session_id)
         import json
@@ -270,6 +286,7 @@ class VoiceSessionService:
         self.db.commit()
         effective = self.get_session(voice_session_id)
         self.envelope(voice_session_id, "context.updated", {
+            "reason": "context_snapshot",
             "context_version": row.context_snapshot.get("context_build_id") or row.context_snapshot.get("version"),
             "applies_to": "next_turn",
             "applied_epoch": effective.session_epoch,

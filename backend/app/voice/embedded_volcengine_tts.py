@@ -16,23 +16,18 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
+from typing import Any, AsyncGenerator, Callable, Optional
 
 import websockets
 from loguru import logger
 from pipecat.frames.frames import Frame, TTSAudioRawFrame, TTSStartedFrame
 from pipecat.processors.frame_processor import FrameProcessorSetup
-from pipecat.processors.frameworks.rtvi.frames import RTVIServerMessageFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TextAggregationMode, TTSService
 
+from app.voice.caption_ledger import VoiceLedgerFrame
 from app.voice.embedded_timeline import timeline_mark
-
-# 排期等待播放锚点的上限：首句的 marker 可能在输出传输开始写音频之前就排好队，
-# 但锚点总会在一两个音频帧内出现。等不到就退化为"立即下发"，绝不把字幕卡死。
-MARKER_ANCHOR_WAIT_SECS = 3.0
-# 单个 marker 允许延迟的上限（防御性）：即使游标异常大也不睡到天荒地老。
-MARKER_MAX_DELAY_SECS = 180.0
+from app.voice.embedded_tts_aggregator import CommaSentenceAggregator
 
 DEFAULT_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
 
@@ -279,6 +274,11 @@ class VolcengineTTSService(TTSService):
             ),
             **kwargs,
         )
+        # 切句颗粒度：基类在 __init__ 里建的是 SimpleTextAggregator（只认句末标点、
+        # 且每个切点都要等一个前瞻字符）。这里换成"逗号也切、非拉丁标点即时切"的版本
+        # ——顿号不切。基类只在 aggregate()/flush()/handle_interruption() 三处用这个
+        # 属性，构造后直接替换即可（见 app/voice/embedded_tts_aggregator.py）。
+        self._text_aggregator = CommaSentenceAggregator()
         self._ws: Any = None
         self._options: TTSRequestOptions | None = None
         self._logid = ""
@@ -288,9 +288,6 @@ class VolcengineTTSService(TTSService):
         self._streaming_context_id: str | None = None
         # 单点计时用：本 turn 是否已发过第一个 TaskRequest。
         self._first_task_sent = False
-        # 逐句字幕游标：**仅在 journal 没有给出句身份时**（无 journal / 没有未
-        # finalize 的 turn）作为兜底计数器使用；有 journal 时序号由它分配。
-        self._sentence_sequence = 0
         self._audio_cursor_ms = 0
         # 句子合成按序串联：后一句等前一句收完音频再开自己的 session。任务放在
         # 后台（不阻塞 process_frame），否则打断帧会被"正在合成的那一句"挡住。
@@ -306,13 +303,6 @@ class VolcengineTTSService(TTSService):
         # 连续几句合成失败。单句失败只报 retryable（下一句会重建 session）；连续失败
         # 意味着"导师说不出话了"，那时必须降级并让用户看见，而不是继续静默。
         self._consecutive_sentence_failures = 0
-        # 已排期但尚未到点的 marker 投递任务（句首 / 句尾）。
-        # 排期是逐句字幕方案 B 的核心：marker 必须在该句**开始/结束播放**的时刻才
-        # 下发，否则文字会跑在声音前面，而且未播放的文本会先进前端与账本。
-        self._pending_marker_deliveries: set[asyncio.Task] = set()
-        # 上一条 marker 的到点游标：句尾与前一句的句首可能落在同一毫秒（前者的结束
-        # 游标就是后者的起始游标），用严格递增把它钉成确定顺序。
-        self._last_delivery_due_ms = 0
         # Optional durable journal.  When present it **allocates** the sentence
         # identity (``turn_id`` / ``sentence_seq`` / ``segment_id``) and records
         # it in the append-only event log, so a client that missed data-channel
@@ -434,9 +424,9 @@ class VolcengineTTSService(TTSService):
         # 合成失败、用户一个音都听不到（实测）。这里独占 recv 等服务端确认（有超时，
         # 拿不到也不阻塞，调用方还有重试兜底）。
         await self._await_session_release(session_id, timeout=1.5)
-        # 剩下的音频永远不会播出来了：撤销所有还没到点的 marker 投递，否则打断之后
-        # 还会陆陆续续吐出几句"从未被听到"的文本。
-        self._cancel_pending_deliveries()
+        # 剩下的音频永远不会播出来了：还没到播放时刻的账本帧会随输出传输的媒体队列
+        # 重置（``_audio_queue.reset()``）一起被丢弃，所以这里不需要额外撤销——被
+        # 打断的句子既不会点亮字幕，也不会进账本。
         # 轮次被打断，下一轮从序号 1 重新开始。
         self._begin_turn_captions()
 
@@ -660,10 +650,8 @@ class VolcengineTTSService(TTSService):
         journal in place the sequence itself belongs to the turn it numbers, and
         resetting it here must not be visible to the client as a rewind.
         """
-        self._sentence_sequence = 0
         self._audio_cursor_ms = 0
         self._first_task_sent = False
-        self._last_delivery_due_ms = 0
 
     async def flush_audio(self, context_id: str | None = None) -> None:
         """文本结束（基类在 LLMFullResponseEndFrame 后调用）：收尾本 turn 的 context。
@@ -817,7 +805,8 @@ class VolcengineTTSService(TTSService):
                 context_id, session_id, text, epoch=epoch
             )
             if identity is not None:
-                await self._emit_sentence_end_marker(context_id, identity)
+                # 音频已全部入队：把句尾账本帧排到它**后面**，由输出传输在"这一句真的播完"时放行。
+                await self._enqueue_sentence_end(context_id, identity)
         finally:
             if self._current_session_id == session_id:
                 self._current_session_id = ""
@@ -830,7 +819,7 @@ class VolcengineTTSService(TTSService):
         *,
         epoch: int | None = None,
     ) -> dict[str, Any] | None:
-        """收完这一句的音频；首帧入队时下发句起点 marker。
+        """收完这一句的音频；首帧入队时把句首账本帧排到它前面。
 
         注意这里**不**移除 audio context：后面的句子还要往同一个 context 里排音频，
         context 由 `flush_audio`（整轮文本结束）或打断来收尾。
@@ -845,7 +834,7 @@ class VolcengineTTSService(TTSService):
         一句从没播过的旧句子拿到新回合的序号 1，于是它出现在字幕里、被写进转录，成为
         打字那句的"回答"）。
         """
-        marker_sent = False
+        ledger_started = False
         identity: dict[str, Any] | None = None
         if epoch is None:
             epoch = self._caption_epoch
@@ -867,20 +856,22 @@ class VolcengineTTSService(TTSService):
                         continue
                     if not msg.payload:
                         continue
+                    if not ledger_started:
+                        # 首批音频**即将**入队：这一刻就是这一句开始被朗读的因果边界。
+                        # 账本帧先排到它前面（同一队列、同一顺序），再排音频——两者
+                        # 一起被输出传输按真实播放节奏放行，账本因此记在"真的开始播"
+                        # 那一刻。
+                        ledger_started = True
+                        timeline_mark("tts", "火山首个音频包")
+                        identity = await self._enqueue_sentence_start(
+                            context_id, sentence_text, epoch=epoch
+                        )
                     await self.append_to_audio_context(
                         context_id,
                         TTSAudioRawFrame(
                             msg.payload, self.sample_rate, 1, context_id=context_id
                         ),
                     )
-                    if not marker_sent:
-                        # 首批音频已入队：这就是这一句开始被朗读的时刻。先入队、
-                        # 再发游标，前端才不会先看到字后听到声。
-                        marker_sent = True
-                        timeline_mark("tts", "火山首个音频包")
-                        identity = await self._emit_sentence_marker(
-                            context_id, sentence_text, epoch=epoch
-                        )
                     self._audio_cursor_ms += int(
                         len(msg.payload) / 2 / self.sample_rate * 1000
                     )
@@ -927,258 +918,61 @@ class VolcengineTTSService(TTSService):
             return None
         return int(self._generation_source())
 
-    async def _emit_sentence_marker(
+    async def _enqueue_sentence_start(
         self, context_id: str, sentence_text: str, *, epoch: int
     ) -> dict[str, Any]:
-        """预约句身份，并把"这一句开始朗读"的 marker **排期到它开始播放的时刻**。
+        """把"这一句开始播放"的账本帧排到它第一帧音频**之前**。
 
-        为什么不能像以前那样立即下发：本句音频入队远早于它开始出声（合成远快于
-        播放，输出队列里可以堆好几句）。立即下发就等于文字跑在声音前面，而且未播放
-        的文本会先进入前端与持久事件流。现在投递到点时才调用
-        ``journal.sentence_queued``——"未读文本不进前端、不入库"因此是结构保证，
-        而不是事后裁切。
+        为什么不再是"发一条 marker"：账本必须记在"音频真的被写出去"的因果时刻，而不是
+        入队的时刻——合成远快于播放，入队即记账会让压在执行队列里、还没播出来的整段回答
+        提前落库并进记忆。这里只把一枚 ``VoiceLedgerFrame`` 放进 audio context 队列，
+        让它和音频一起排队；真正写账本的是输出传输下游的 ``VoiceLedgerRelay``。
 
-        返回句身份，供句尾 marker 复用（序号在这里就定下来，所以句尾不必等投递）。
+        由此句身份（``sentence_seq`` / ``segment_id``）也改由账本在**释放时刻**分配：
+        序号按播放顺序产生，不再需要"预约"，也就不存在烧掉的序号。
         """
-        generation_id = self._current_generation()
-        audio_cursor_ms = int(self._audio_cursor_ms)
-        turn_id = self._journal.open_turn_id() if self._journal is not None else None
-        sequence = (
-            self._journal.reserve_sentence_seq() if self._journal is not None else None
-        )
-        if sequence is None:
-            # 没有账本或账本里没有可用回合：序号只能本地兜底，turn_id 留空由前端按
-            # unattributed 处理（编一个假的回合 id 会把这句话并进不存在的回合）。
-            self._sentence_sequence += 1
-            sequence = self._sentence_sequence
         identity: dict[str, Any] = {
-            "turn_id": turn_id,
-            "sentence_seq": int(sequence),
-            "segment_id": f"{turn_id}:s{sequence}" if turn_id else None,
-            "generation_id": generation_id,
-            "audio_cursor_ms": audio_cursor_ms,
-            "context_id": context_id,
-            # 投递时还要再查一次代次：句身份是在投递到点前就定下来的，而打断可能发生
-            # 在"定身份"与"到点"之间（那时 `_cancel_pending_deliveries` 也会撤销它，
-            # 这里是第二道闸，保证任何一条路径都不会漏）。
-            "caption_epoch": int(epoch),
-            # 文本随身份一起带上：投递到点时才写账本，那一刻需要它。
+            "token": uuid.uuid4().hex,
             "text": sentence_text,
+            "context_id": context_id,
+            "audio_cursor_ms": int(self._audio_cursor_ms),
+            "generation_id": self._current_generation(),
+            "caption_epoch": int(epoch),
         }
-        self._schedule_marker_delivery(
-            deliver=self._deliver_sentence_start(
-                identity=identity,
-                sentence_text=sentence_text,
-                due_cursor_ms=self._next_due_cursor_ms(audio_cursor_ms),
-            )
+        await self.append_to_audio_context(
+            context_id,
+            VoiceLedgerFrame(
+                kind="start",
+                token=str(identity["token"]),
+                text=sentence_text,
+                context_id=context_id,
+                audio_cursor_ms=int(identity["audio_cursor_ms"]),
+                generation_id=identity["generation_id"],
+            ),
         )
         return identity
 
-    def _next_due_cursor_ms(self, cursor_ms: int) -> int:
-        """给 marker 排一个**严格递增**的到点游标。
-
-        为什么需要：前一句的结束游标恰好等于后一句的起始游标（前者音频的终点就是后者
-        的起点），两条 marker 因此会落在同一毫秒上，投递顺序取决于任务调度——前端可能
-        先看到"第 2 句开始"再看到"第 1 句结束"。这里给每条 marker 至少 +1ms 的严格
-        递增序，顺序就与音轨一致；累计漂移是每 marker 1ms，句级判定完全无感。
-        """
-        due = max(int(cursor_ms), self._last_delivery_due_ms + 1)
-        self._last_delivery_due_ms = due
-        return due
-
-    def _schedule_marker_delivery(self, *, deliver: Awaitable[None]) -> None:
-        """后台排期一个 marker 投递任务（不阻塞帧循环）。
-
-        用裸 asyncio 任务而不是 ``self.create_task``：投递必须能在处理器 ``setup()``
-        之前就排上（离线驱动、以及首句早于 task manager 就绪的场景都会踩到），而且它
-        的生命周期完全由本类负责——``cleanup()`` 与打断都会显式撤销
-        （``_cancel_pending_deliveries``），不需要 pipecat 的任务管理器代管。
-        """
-        if self._closed:
-            self._abandon_delivery(deliver)
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._abandon_delivery(deliver)
-            return
-        task = loop.create_task(deliver)
-        self._pending_marker_deliveries.add(task)
-        task.add_done_callback(self._pending_marker_deliveries.discard)
-
-    @staticmethod
-    def _abandon_delivery(deliver: Awaitable[None]) -> None:
-        """放弃一条还没跑起来的投递，顺手关掉协程避免 "never awaited" 噪音。"""
-        close = getattr(deliver, "close", None)
-        if callable(close):
-            close()
-
-    def _cancel_pending_deliveries(self) -> None:
-        """撤销本回合所有还没到点的 marker 投递。
-
-        只在**打断**时调用：那时剩下的音频永远不会播出来，未投递的文本也就不该再
-        出现。正常收尾（``_close_turn_context``）**不能**调用它——那一时刻只是合成
-        结束，输出队列里还压着几十秒没播完的音频，撤销会把后半段字幕整段丢掉。
-        """
-        pending = list(self._pending_marker_deliveries)
-        self._pending_marker_deliveries.clear()
-        for task in pending:
-            task.cancel()
-
-    async def _deliver_sentence_start(
-        self,
-        *,
-        identity: dict[str, Any],
-        sentence_text: str,
-        due_cursor_ms: int,
-    ) -> None:
-        """到点投递句首 marker：先记账，再下发快通道 marker。"""
-        try:
-            await self._wait_until_due(int(due_cursor_ms))
-            if int(identity.get("caption_epoch") or 0) != self._caption_epoch:
-                # 定身份之后被打断：这一句从未开始播放，一个字都不该出现。
-                return
-            if not await self._record_sentence(identity):
-                # 账本已经拒绝（回合被 finalize / 打断）：这一句从未开始播放，它就
-                # 不该出现在前端或数据库里的任何地方。
-                return
-            await self._push_marker(
-                str(identity.get("context_id") or ""),
-                {
-                    "type": "voice-sentence-start",
-                    "event_id": f"tts_{uuid.uuid4().hex[:20]}",
-                    "text": sentence_text,
-                    "sequence": int(identity["sentence_seq"]),
-                    "sentence_seq": int(identity["sentence_seq"]),
-                    "segment_id": identity.get("segment_id"),
-                    "audio_cursor_ms": int(identity["audio_cursor_ms"]),
-                    "turn_id": identity.get("turn_id"),
-                    "context_id": identity.get("context_id"),
-                    "generation_id": identity.get("generation_id"),
-                },
-            )
-            timeline_mark("tts", "句首 marker 已投递(开始播放)")
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.warning(f"{self}: 句首 marker 投递失败", exc_info=True)
-
-    async def _deliver_sentence_end(
-        self, *, identity: dict[str, Any], audio_end_cursor_ms: int, due_cursor_ms: int
-    ) -> None:
-        """到点投递句尾 marker：这一句播完了（前端据此把该句切成正常色）。"""
-        try:
-            await self._wait_until_due(int(due_cursor_ms))
-            if int(identity.get("caption_epoch") or 0) != self._caption_epoch:
-                return
-            if self._journal is not None:
-                if not self._journal.sentence_recorded(int(identity["sentence_seq"])):
-                    # 起点都没进账本（从未开始播放）：不能给一句不存在的话发句尾。
-                    return
-                await self._journal.sentence_ended(
-                    sentence_seq=int(identity["sentence_seq"]),
-                    audio_end_cursor_ms=int(audio_end_cursor_ms),
-                    segment_id=identity.get("segment_id"),
-                    generation_id=identity.get("generation_id"),
-                )
-            await self._push_marker(
-                str(identity.get("context_id") or ""),
-                {
-                    "type": "voice-sentence-end",
-                    "event_id": f"ttse_{uuid.uuid4().hex[:20]}",
-                    "sentence_seq": int(identity["sentence_seq"]),
-                    "segment_id": identity.get("segment_id"),
-                    "audio_end_cursor_ms": int(audio_end_cursor_ms),
-                    "turn_id": identity.get("turn_id"),
-                    "context_id": identity.get("context_id"),
-                    "generation_id": identity.get("generation_id"),
-                },
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.warning(f"{self}: 句尾 marker 投递失败", exc_info=True)
-
-    async def _record_sentence(self, identity: dict[str, Any]) -> bool:
-        """在投递时刻把这一句写进账本；回合已收尾时返回 False（不投递）。
-
-        没有账本的旧部署直接返回 True：那种情况下不存在"入库"这件事，marker 照发。
-        """
-        if self._journal is None:
-            return True
-        recorded = await self._journal.sentence_queued(
-            str(identity.get("text") or ""),
-            audio_cursor_ms=int(identity["audio_cursor_ms"]),
-            context_id=identity.get("context_id") or None,
-            generation_id=identity.get("generation_id"),
-            sequence=int(identity["sentence_seq"]),
-        )
-        return bool(recorded)
-
-    async def _push_marker(self, context_id: str, data: dict[str, Any]) -> None:
-        """把 marker 交给下游；audio context 已收尾时直接 push，保证仍能到达前端。"""
-        frame = RTVIServerMessageFrame(data=data)
-        if context_id and self.audio_context_available(context_id):
-            await self.append_to_audio_context(context_id, frame)
-            return
-        await self.push_frame(frame)
-
-    async def _wait_until_due(self, due_cursor_ms: int) -> None:
-        """睡到"该句应当出声/播完"的时刻（相对本回合播放锚点）。"""
-        anchor = await self._playback_anchor()
-        if anchor is None:
-            # 锚点缺席（音频从未开始播放，或回合已收尾）：保持旧行为立即投递，
-            # 让账本/前端自己去拒绝一条不该存在的句子。
-            return
-        due = anchor + max(0, int(due_cursor_ms)) / 1000.0
-        delay = due - time.monotonic()
-        if delay <= 0:
-            return
-        await asyncio.sleep(min(delay, MARKER_MAX_DELAY_SECS))
-
-    async def _playback_anchor(self) -> float | None:
-        """取本回合播放锚点，短暂等待它出现；一直不来则返回 None（退化为立即投递）。
-
-        首句的 marker 通常排在输出传输写出第一帧音频之前几毫秒，所以"稍等一下"是
-        常态而不是异常；但等不到就必须放弃等待——宁可字幕早到，也不能把整轮字幕
-        卡在一个永远不会出现的锚点上。
-        """
-        if self._journal is None:
-            return None
-        deadline = time.monotonic() + MARKER_ANCHOR_WAIT_SECS
-        while True:
-            anchor = self._journal.playback_anchor_at()
-            if anchor is not None:
-                return anchor
-            if self._closed or time.monotonic() >= deadline:
-                return None
-            await asyncio.sleep(0.02)
-
-    async def _emit_sentence_end_marker(
+    async def _enqueue_sentence_end(
         self, context_id: str, identity: dict[str, Any]
     ) -> None:
-        """这一句的音频已全部入队：把"句尾"marker **排期到它播完的时刻**。
+        """把句尾账本帧排到这一句音频的**后面**（audio context 队列尾）。
 
-        两个游标都要：只有起点的话前端不知道"这一句播到哪里算完"，句内进度就只能用
-        字速猜（§6 明确不取供应商词级时间戳、不承诺毫秒级对齐）。而且和句首一样，
-        投递必须按播放节奏——音频全部入队时这一句往往还没开始出声，此时下发就等于
-        提前把字幕切成"已播完"。
+        最后一批音频可能还没写出，所以这里同样只入队、不记账；等它在输出传输里被放行
+        时，这一句的音频正好播完。
         """
-        end_cursor_ms = int(self._audio_cursor_ms)
-        self._schedule_marker_delivery(
-            deliver=self._deliver_sentence_end(
-                identity=identity,
-                audio_end_cursor_ms=end_cursor_ms,
-                due_cursor_ms=self._next_due_cursor_ms(end_cursor_ms),
-            )
-        )
-
-    async def wait_for_pending_deliveries(self, timeout: float = 5.0) -> None:
-        """等所有已排期的 marker 投递落定（测试与排障用）。"""
-        pending = list(self._pending_marker_deliveries)
-        if not pending:
+        if int(identity.get("caption_epoch") or 0) != self._caption_epoch:
+            # 定身份之后被打断：这一句不会再播完，句尾也就无从谈起。
             return
-        await asyncio.wait(pending, timeout=timeout)
+        await self.append_to_audio_context(
+            context_id,
+            VoiceLedgerFrame(
+                kind="end",
+                token=str(identity["token"]),
+                context_id=context_id,
+                audio_end_cursor_ms=int(self._audio_cursor_ms),
+                generation_id=identity.get("generation_id"),
+            ),
+        )
 
     async def _run_tts_one_shot(
         self, text: str, context_id: str
@@ -1252,7 +1046,6 @@ class VolcengineTTSService(TTSService):
         # ``_closed`` 先置位（挡住并发重连建新连接），拆卸走重连锁：旧实现直接读写
         # ``_ws``，一场正在进行的重连可以在收尾窗口里建出一条没人关得掉的连接。
         self._closed = True
-        self._cancel_pending_deliveries()
         await super().cleanup()
         try:
             await asyncio.wait_for(self._reconnect_lock.acquire(), timeout=6.0)

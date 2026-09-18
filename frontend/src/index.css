@@ -510,6 +510,13 @@ h1, h2, h3, p { margin-top: 0; }
 .knowledge-node.is-locked.is-current .knowledge-node__cta { opacity: 1; }
 .knowledge-node__cta:hover { background: #f3f7f4; border-color: var(--lg-green-dark); }
 .knowledge-node__current-badge { position: absolute; top: -9px; left: 12px; padding: 1px 7px; border-radius: 999px; background: #e8f1fb; border: 1px solid #bcd6ee; color: #2b6ca3; font-size: 9px; font-weight: 750; }
+
+/* 图谱卡片装饰标记：该节点的学习页（交互页）已经生成。
+   徽章骑在卡片右上角外侧，不占用卡片内的任何一行信息，也不与右上角的
+   折叠 +N 徽、右侧折叠按钮、左上角「当前学习」争夺位置。 */
+.knowledge-node__page-badge { position: absolute; top: -9px; right: -9px; z-index: 2; display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid #b7ded3; border-radius: 999px; background: #eef8f5; color: #0f7a63; box-shadow: 0 2px 6px rgba(17,46,31,.14); }
+.knowledge-node__page-badge svg { width: 11px; height: 11px; }
+.dark .knowledge-node__page-badge { border-color: rgba(111,211,183,.42); background: #16302a; color: #6fd3b7; }
 .knowledge-node__collapse { position: absolute; top: 50%; right: -11px; z-index: 3; display: grid; place-items: center; width: 22px; height: 22px; margin-top: -11px; border: 1px solid #c7cec7; border-radius: 999px; background: #fff; color: #2a3530; box-shadow: 0 4px 12px rgba(24,33,29,.1); cursor: pointer; transition: background .15s, border-color .15s, transform .15s; }
 .knowledge-node.is-tree-branch-left .knowledge-node__collapse { right: auto; left: -11px; }
 .knowledge-node__collapse:hover { background: #f3f7f4; border-color: var(--lg-green-dark); transform: scale(1.06); }
@@ -1629,40 +1636,37 @@ body.is-resizing .workspace-resizer {
    2026-09-15: the orb came back as a state indicator. It sits *inline* above that
    status line (never absolutely positioned), so it cannot cover the messages it is
    describing -- which is what got the previous floating layer deleted. */
-/* Orb motion (2026-09-15). The sphere stays a plain CSS gradient: loudness,
-   the speaking rhythm, the tap pulse and the tap hue boost all arrive as custom
-   properties published by the orb's animation loop (see voice-orb.tsx), which
-   low-passes the raw level and otherwise never re-renders React.
+/* Orb rendering (2026-09-18). The sphere came back from demo-voice2o2's 呼吸彩球
+   as a canvas: the three-stop body, its specular highlight, the light the floor
+   bounces back, the breathing glow, the tap ring and the two slow rings are all
+   draw calls now -- and it is a physical object, so dragging it stretches it,
+   throwing it bounces it off the viewport, and it then settles back home. The
+   motion engine lives in voice-orb.tsx and still never re-renders React.
 
-   `--voice-level`  0..1  smoothed loudness
-   `--voice-scale`  1     breathing scale (idle breathing + level + tap pulse)
-   `--voice-ring`   0..1  tap ring, decaying as it expands
-   `--voice-hue-shift` deg extra hue rotation, wound up by repeated taps
-   `--voice-hue`    deg   base hue, set per side (is-user-voice / is-assistant-voice) */
+   It is painted on a fixed, viewport-sized layer portal'd onto <body>: that is
+   what lets it be thrown anywhere, and keeps any ancestor's overflow from
+   clipping it -- while being out of flow means none of it can move the text
+   around it. The only part left in the layout is the 84px anchor below: the
+   sphere's home (ORB_RADIUS = 34, so the 68px sphere sits inside it) and the one
+   place it can always be grabbed from. */
 .chat-voice-orb-dock { align-self: center; display: flex; flex-direction: column; align-items: center; margin: 2px 0 6px; pointer-events: auto; }
-.chat-voice-orb-dock__visual { width: 84px; aspect-ratio: 1; display: grid; place-items: center; border-radius: 50%; pointer-events: auto; cursor: grab; touch-action: none; transition: transform .2s cubic-bezier(.2,.8,.2,1); }
+.chat-voice-orb-dock__visual { width: 84px; height: 84px; cursor: grab; touch-action: none; }
 .chat-voice-orb-dock__visual:active { cursor: grabbing; }
-.chat-voice-orb { position: relative; width: 112px; aspect-ratio: 1; margin: 0; display: grid; place-items: center; }
-.chat-voice-orb__core { position: relative; z-index: 2; width: 68%; aspect-ratio: 1; border-radius: 50%; background: radial-gradient(circle at 32% 24%, #fff 0 8%, hsl(calc(var(--voice-hue, 225) + var(--voice-level, 0) * 55 + var(--voice-hue-shift, 0)) 90% 90%) 25%, hsl(calc(var(--voice-hue, 225) + var(--voice-level, 0) * 65 + var(--voice-hue-shift, 0)) 75% 65%) 54%, hsl(calc(var(--voice-hue, 225) + var(--voice-level, 0) * 80 + var(--voice-hue-shift, 0)) 70% 48%) 100%); box-shadow: 0 12px 38px rgba(70,99,231,.28), inset -10px -12px 18px rgba(34,52,165,.18); transform: scale(var(--voice-scale, 1)); transition: filter .2s ease, box-shadow .2s ease; }
-/* Tap ring: expands as it fades, so a tap reads as a push rather than a blink. */
-.chat-voice-orb__pulse { position: absolute; width: 100%; aspect-ratio: 1; border-radius: 50%; border: 2px solid hsl(var(--voice-hue, 225) 90% 65%); opacity: calc(var(--voice-ring, 0) * .5); transform: scale(calc(1 + (1 - var(--voice-ring, 0)) * 1.6)); pointer-events: none; }
-.chat-voice-orb__halo { position: absolute; border: 1px solid rgba(94,122,245,.18); border-radius: 50%; transform: scale(.7); animation: chat-voice-orb-ring 3.8s ease-out infinite; }
-.chat-voice-orb__halo--one { width: 74%; height: 74%; }
-.chat-voice-orb__halo--two { width: 100%; height: 100%; animation-delay: 1.2s; }
-/* Listening and speaking both widen the glow with the input level and speed the
-   rings up; the hue shifts per side (is-user-voice / is-assistant-voice) so "who
-   is talking" is readable at a glance. Thinking keeps the calm default. */
-.chat-voice-orb.is-listening .chat-voice-orb__core, .chat-voice-orb.is-speaking .chat-voice-orb__core { box-shadow: 0 18px calc(42px + var(--voice-level, 0) * 40px) rgba(70,99,231,.5), inset -12px -16px 22px rgba(34,52,165,.22); }
-.chat-voice-orb.is-listening .chat-voice-orb__halo, .chat-voice-orb.is-speaking .chat-voice-orb__halo { animation-duration: calc(2.2s - var(--voice-level, 0) * 1.1s); }
-@keyframes chat-voice-orb-ring { 0% { opacity: .65; transform: scale(.58); } 100% { opacity: 0; transform: scale(1); } }
-@media (prefers-reduced-motion: reduce) { .chat-voice-orb__core, .chat-voice-orb__halo { animation: none; } .chat-voice-orb__pulse { opacity: 0; } }
-.chat-voice-orb-dock.is-user-voice { --voice-hue: 160; }
-.chat-voice-orb-dock.is-assistant-voice { --voice-hue: 270; }
-.chat-voice-orb-dock.is-user-voice .chat-voice-orb__halo { border-color: rgba(38, 190, 150, .35); }
-.chat-voice-orb-dock.is-assistant-voice .chat-voice-orb__halo { border-color: rgba(138, 92, 245, .35); }
-.chat-voice-orb-dock.is-muted .chat-voice-orb__core { filter: saturate(.3); }
-.chat-voice-orb-dock.is-muted .chat-voice-orb__halo { animation: none; opacity: 0; }
-.chat-voice-orb-dock.is-error .chat-voice-orb__core { filter: grayscale(.75); }
+/* pointer-events: none is deliberate: this layer covers the whole viewport, and
+   the sphere is grabbed through a hit test instead (see voice-orb.tsx). */
+/* 100% (not just inset: 0) is load-bearing: a canvas is a replaced element, so
+   with an auto width it takes its bitmap's size instead of the viewport's, and
+   the loop that sizes that bitmap would then grow it every single resync. */
+.chat-voice-orb-ball { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
+/* Muted and error change how the sphere is presented, not what it draws. They sit
+   on the layer itself, which cannot be reached from the dock: it is on <body>. */
+.chat-voice-orb-ball.is-muted { filter: saturate(.3); }
+.chat-voice-orb-ball.is-error { filter: grayscale(.75); }
+/* Reduced motion keeps the sphere as a still readout: it cannot be dragged (see
+   voice-orb.tsx), so its anchor must not swallow scrolls either. */
+@media (prefers-reduced-motion: reduce) {
+  .chat-voice-orb-dock__visual { cursor: default; touch-action: auto; }
+}
 /* Typewriter captions: the sentence being read aloud is typed out as it is
    spoken, so nothing appears before the voice reaches it -- the not-yet-read
    tail is simply absent rather than dimmed. The estimate behind the caret is
@@ -1705,6 +1709,7 @@ body.is-resizing .workspace-resizer {
    text. The banner must be unmissable -- the user is otherwise still
    talking into a microphone nothing is listening to. */
 .chat-voice-degraded-note { align-self: center; margin: 2px 0 8px; max-width: 460px; padding: 6px 12px; border: 1px solid rgba(214, 148, 40, .45); border-radius: 8px; background: rgba(214, 148, 40, .12); text-align: center; font-size: 12px; line-height: 1.5; }
+.chat-voice-degraded-note.is-pipeline-notice { border-color: rgba(84, 124, 196, .45); background: rgba(84, 124, 196, .12); }
 /* 通话需要用户做一件事时的提示条（恢复声音 / 重试连接）：与上面的降级横幅同一视觉
    等级，但必须带一个可点的动作 —— 这两种失败都表现为"看起来一切正常却没有结果"。 */
 .chat-voice-recovery { align-self: center; display: flex; align-items: center; gap: 8px; margin: 2px 0 8px; padding: 5px 12px; border: 1px solid rgba(86, 122, 214, .45); border-radius: 8px; background: rgba(86, 122, 214, .1); font-size: 12px; line-height: 1.5; }
@@ -1714,7 +1719,9 @@ body.is-resizing .workspace-resizer {
    用背景高亮会读成"选中"，用浅一档的前景色才是"正在读"；未开始的句子由后端
    决定不下发，因此这里只会收到已经开始播放的句子。 */
 .chat-voice-captions { white-space: pre-wrap; word-break: break-word; }
-.chat-voice-captions__sentence.is-reading { color: var(--color-muted-foreground); }
+/* 未读（官方 bot-output 已下发、但还没被朗读）的部分用灰字。灰字只活在前端内存里：
+   刷新或被打断后就消失，账本永远只认真的播过的句子。 */
+.chat-voice-captions__unread { color: var(--color-muted-foreground); }
 .chat-composer .chat-composer__mute.is-active { color: #d9483f; }
 .chat-composer .chat-composer__mute.is-active:hover { color: #b8352d; }
 /* Connection state lives on this button: grey + spinner until the peer
@@ -1951,12 +1958,22 @@ body.is-resizing .workspace-resizer {
 .chat-generated-image:focus-within .chat-generated-image__actions { opacity: 1; }
 .chat-generated-image__actions button { display: grid; width: 30px; height: 30px; place-items: center; border: 0; border-radius: 8px; background: rgba(20,20,20,.62); color: #fff; cursor: pointer; backdrop-filter: blur(6px); transition: background .16s ease; }
 .chat-generated-image__actions button:hover { background: rgba(20,20,20,.85); }
-/* 点击放大后的灯箱查看层。 */
-.chat-image-lightbox { display: grid; width: auto !important; max-width: min(94vw, 1500px) !important; gap: 10px !important; padding: 0 !important; border: 0 !important; border-radius: 12px; background: transparent !important; box-shadow: none !important; --tw-ring-shadow: 0 0 #0000; }
-.chat-image-lightbox__image { max-width: min(92vw, 1500px); max-height: 82svh; border-radius: 12px; background: #101010; object-fit: contain; box-shadow: 0 24px 80px rgba(0,0,0,.42); }
-.chat-image-lightbox__toolbar { display: flex; justify-content: center; gap: 8px; }
+/* 点击放大后的灯箱查看层：DialogContent 铺满视口的透明层，手势面覆盖整屏
+   （滚轮/拖动/双指都在手势面上，光标不用压在小图上也能缩放）；舞台是图片外加
+   圆角与阴影的"卡片"，缩放、平移的 transform 打在舞台上——外框与图是一个刚体，
+   缩小时不会剩下一个不变的空框。工具栏贴底居中，不会被内容顶出视口。 */
+.chat-image-lightbox { position: fixed !important; top: 50% !important; left: 50% !important; display: block !important; width: 100vw !important; height: 100dvh !important; max-width: none !important; padding: 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; --tw-ring-shadow: 0 0 #0000; }
+.chat-image-lightbox__surface { position: absolute; inset: 0; display: grid; place-items: center; touch-action: none; -webkit-user-select: none; user-select: none; }
+.chat-image-lightbox__stage { position: relative; overflow: hidden; border-radius: 12px; background: #101010; box-shadow: 0 24px 80px rgba(0,0,0,.42); transform-origin: center center; will-change: transform; }
+.chat-image-lightbox__stage.is-zoomed { cursor: grab; }
+.chat-image-lightbox__stage.is-dragging { cursor: grabbing; }
+.chat-image-lightbox__image { display: block; max-width: min(92vw, 1500px); max-height: 82svh; object-fit: contain; -webkit-user-drag: none; }
+.chat-image-lightbox__toolbar { position: absolute; bottom: 18px; left: 50%; display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; transform: translateX(-50%); }
 .chat-image-lightbox__toolbar button { display: inline-flex; align-items: center; gap: 6px; border: 0; border-radius: 999px; background: rgba(24,24,24,.85); color: #fff; cursor: pointer; padding: 8px 14px; font-size: 12px; font-weight: 600; backdrop-filter: blur(6px); transition: background .16s ease; }
 .chat-image-lightbox__toolbar button:hover { background: rgba(24,24,24,1); }
+.chat-image-lightbox__toolbar button:disabled { cursor: default; opacity: .45; }
+.chat-image-lightbox__toolbar button:disabled:hover { background: rgba(24,24,24,.85); }
+.chat-image-lightbox__percent { display: inline-flex; min-width: 56px; align-items: center; justify-content: center; border-radius: 999px; background: rgba(24,24,24,.85); color: #fff; padding: 8px 10px; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; backdrop-filter: blur(6px); }
 .message-attachment { display: flex; align-items: center; gap: 10px; width: min(430px, 100%); margin: 10px 0; border: 1px solid #e0e0e0; border-radius: 14px; background: #fafafa; padding: 9px 10px; }
 .message-attachment__icon { display: grid; flex: none; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: #ededed; color: #555; }
 .message-attachment__meta { display: grid; min-width: 0; flex: 1; gap: 2px; }
@@ -4073,6 +4090,10 @@ body.is-resizing .workspace-resizer {
 .graph-node-panel__type { color: #4d7a5f; font-weight: 750; letter-spacing: .06em; }
 .graph-node-panel__level { color: #9aa19b; font-weight: 700; }
 .graph-node-panel__current { padding: 1px 7px; border-radius: 999px; background: #e8f1fb; color: #2b6ca3; font-weight: 750; }
+
+/* 节点详情里的同一个状态：与画布卡片右上角徽章同义，两处必须一致。 */
+.graph-node-panel__page { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border-radius: 999px; background: #eef8f5; color: #0f7a63; font-weight: 750; }
+.dark .graph-node-panel__page { background: rgba(111,211,183,.16); color: #6fd3b7; }
 .graph-node-panel__title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .graph-node-panel__title-row h2 { margin: 0; font-size: 17px; font-weight: 720; line-height: 1.32; }
 .graph-node-panel__head-actions { display: flex; flex: none; align-items: center; gap: 4px; }
@@ -4122,6 +4143,11 @@ body.is-resizing .workspace-resizer {
 .graph-legend__type.is-application { color: #6d5aa8; }
 .graph-legend__type.is-lab { color: #2f7f8f; }
 .graph-legend__type.is-open { color: #a8802a; }
+
+/* 图例里的同一枚标记：词条色块与卡片徽章保持一致。 */
+.graph-legend__page { display: grid; width: 14px; height: 14px; flex: none; place-items: center; border-radius: 999px; background: #eef8f5; color: #0f7a63; }
+.graph-legend__page svg { width: 10px; height: 10px; }
+.dark .graph-legend__page { background: rgba(111,211,183,.16); color: #6fd3b7; }
 .graph-legend__status { width: 7px; height: 7px; flex: none; border-radius: 999px; background: #c2c7c3; }
 .graph-legend__status.is-progress { background: #2b6ca3; }
 .graph-legend__status.is-mastered { background: #0b8f70; }
@@ -4468,6 +4494,23 @@ html[data-color-mode='mono'] .topbar-model-status {
 .document-excel-grid td > code { margin-top: 2px; color: #707070; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; }
 
 .document-blob-image { display: block; max-width: 100%; max-height: 78svh; margin: auto; object-fit: contain; box-shadow: 0 16px 48px rgba(0,0,0,.17); user-select: none; }
+/* 图片预览的放大入口：点击复用共享灯箱（滚轮/双指缩放、拖拽平移、双击还原）。
+   资料库点开图片看到的就是这一层，没有它就只能"下载到本地再看"。 */
+.document-blob-image__zoom { position: relative; display: block; width: 100%; padding: 0; border: 0; background: none; cursor: zoom-in; }
+.document-blob-image__zoom:focus-visible { outline: 2px solid var(--ring); outline-offset: 4px; border-radius: 12px; }
+.document-blob-image__zoom-hint {
+  position: absolute; right: 10px; bottom: 10px;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  color: var(--muted-foreground);
+  font-size: 11px; line-height: 1.4;
+  backdrop-filter: blur(3px);
+  transition: color .15s, opacity .15s;
+  opacity: .85;
+}
+.document-blob-image__zoom:hover .document-blob-image__zoom-hint { color: var(--foreground); opacity: 1; }
 
 /* Focused roadmap review and vertical learning timeline */
 .roadmap-review-bar { display: flex; align-items: center; justify-content: space-between; gap: 20px; border-left: 3px solid var(--primary); background: color-mix(in srgb, var(--primary) 5%, var(--background)); padding: 14px 16px; }

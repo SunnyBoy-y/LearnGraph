@@ -152,6 +152,23 @@ class TurnIntentClassifier:
 DEFAULT_TURN_INTENT_CLASSIFIER = TurnIntentClassifier()
 
 
+def is_backchannel(
+    text: str, *, classifier: TurnIntentClassifier | None = None
+) -> bool:
+    """整句都是背声词/填充词（「嗯。」「哦。」「对。」「uh huh」…）时为真。
+
+    "整句都是"是刻意的强条件：``classify`` 只在规范化后的全文恰好（或逐词）
+    命中背声词表时才返回 ``BACKCHANNEL``，所以「嗯，我想问一下」这类带实义的
+    发言不算——它是一次真实抢断。
+
+    判据与 ``AdaptiveUserTurnStartStrategy`` 共用同一个分类器实例族，避免
+    "这一层认为它是背声词、那一层认为它是发言"的分裂。
+    """
+    return (classifier or DEFAULT_TURN_INTENT_CLASSIFIER).classify(
+        text
+    ) is TurnIntent.BACKCHANNEL
+
+
 def normalize_transcript(text: str) -> str:
     value = unicodedata.normalize("NFKC", str(text or ""))
     value = value.replace("'", "").replace("\u2019", "")

@@ -31,7 +31,12 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.bus import BusBridgeProcessor
 from pipecat.frames.frames import Frame, LLMRunFrame, MetricsFrame
-from pipecat.metrics.metrics import TTFBMetricsData
+from pipecat.metrics.metrics import (
+    LLMUsageMetricsData,
+    TTFATMetricsData,
+    TTFBMetricsData,
+    TurnMetricsData,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import (
     PipelineParams,
@@ -59,6 +64,7 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 
+from app.voice.caption_ledger import VoiceLedgerRelay
 from app.voice.embedded_context import VoiceContextAdapter, VoiceContextState
 from app.voice.coordinator_adapter import ensure_coordinator_delegation_port_factory
 from app.voice.embedded_dashscope_stt import DashScopeSTTService
@@ -84,6 +90,10 @@ from app.voice.journal import (
     VoiceTurnJournal,
     _stage_for_processor,
 )
+from app.providers.dialects import ThinkingOffVerdict, thinking_off_verdict
+from app.providers.thinking_policy import ThinkingOff
+from app.services.provider_capabilities import record_thinking_off_observation
+from app.voice.policy import resolve_llm_thinking_off
 from app.voice.runner_registry import (
     VoiceRunnerHandle,
     get_runner,
@@ -105,6 +115,28 @@ VOICE_PLAYBACK_MESSAGE = "learngraph-playback"
 # "什么时候该短"，任何情况下都不允许为了守住预算而截断事实、数字或必要的长代码。
 DEFAULT_SPEECH_BUDGET_SENTENCES = "2-3"
 DEFAULT_SPEECH_BUDGET_SECONDS = "15-25"
+
+# 前台实时回合恒为「关闭思考」。当某个 Provider 方言/模型根本表达不出关闭（自定义
+# 网关、能力快照缺失等）时，通话照常但代价必须可见：这条文案经 ``processor.notice``
+# 落到前端提醒条上（不是 error：不降级、不强制文字输入、不静音麦克风）。
+VOICE_THINKING_OFF_UNAVAILABLE_NOTICE = (
+    "检测到模型 {model} 无法关闭思考，回复延迟会明显增加"
+)
+
+# 「关闭思考」发了字段却**没生效**：网关把未知字段丢掉、厂商改了默认值、方言表过期……
+# 与上一条的区别：上一条是"压根表达不出"，这一条是"看起来表达了，实测仍在推理"。
+# 真机事故（2026-09-18）：``enable_thinking=False`` 发给 DeepSeek 官方被忽略，
+# 官方照样返回 398 个 reasoning token、首字晚 2.58 s，占端到端 3638 ms 的 71%，
+# 而且**静默**——字段非空，所以"无法关闭思考"那条提醒发不出来。现在两段都有话：
+# 会话开始用实测记录提醒（L2），运行中由 LatencyPercentileProcessor 用上游 usage 报警（L3）。
+VOICE_THINKING_OFF_INEFFECTIVE_NOTICE_CODE = "thinking_off_ineffective"
+VOICE_THINKING_OFF_INEFFECTIVE_NOTICE = (
+    "检测到模型 {model} 的「关闭思考」未生效（实测仍在推理），回复延迟会明显增加"
+)
+
+
+#: 语音侧"关闭思考"实测结论的上报回调（L3，见 ``LatencyPercentileProcessor``）。
+ThinkingOffReporter = Callable[[ThinkingOffVerdict], Awaitable[None]]
 
 
 def speech_budget_instruction() -> str:
@@ -186,10 +218,28 @@ def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
                 settings,
                 model_id=handle.model_id,
                 provider_id=handle.provider_id,
-                thinking_mode=handle.max_thinking_mode,
+                # 前台实时回合恒为 off（见 policy.resolve_llm_thinking_off）：先按 "off"
+                # 解析，这样"能否关闭思考"在目录层就已经问过一次。
+                thinking_mode="off",
             )
+            if not getattr(llm, "available", False):
+                # 目录里声明"只支持思考"的模型在 off 下会被拒（thinking_required）。
+                # 前台依然要提供服务——口径是"照常服务 + 前端提醒延迟增加"——所以退回该
+                # 模型自己的默认档位再解析一次；run_bot 那边会因为表达不出关闭而发提醒。
+                # 真正不可服务的（模型被删、Provider 被停）两次都拿不到，照旧带真实原因拒绝。
+                retry = model_provider_for_workspace(
+                    db,
+                    handle.workspace_id,
+                    settings,
+                    model_id=handle.model_id,
+                    provider_id=handle.provider_id,
+                    thinking_mode=None,
+                )
+                if getattr(retry, "available", False):
+                    llm = retry
         logger.info(
-            "Voice providers: llm={}/{} thinking={} asr={} tts={}",
+            "Voice providers: llm={}/{} thinking=off(forced) "
+            "session_thinking_max={} asr={} tts={}",
             getattr(llm, "provider_id", None),
             getattr(llm, "model_id", None),
             handle.max_thinking_mode,
@@ -204,14 +254,76 @@ def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
         return _VoiceProviderConfig()
 
 
+def context_change_report(
+    trigger_payload: Mapping[str, Any] | None,
+    *,
+    repointed: bool,
+    effective_model_id: str | None,
+    applied_epoch: int,
+) -> dict[str, Any]:
+    """Build the worker's ``context.updated`` acknowledgement.
+
+    Three things share this event type: a model-switch request from the control
+    plane (``reason="model_switch"``), a context-snapshot write
+    (``reason="context_snapshot"``, no model involved) and this report.  Only
+    ``origin="pipeline"`` says "this was already applied by the running
+    pipeline" -- which is exactly what ``VoiceControlWatchdog`` skips so it does
+    not answer its own answer, one event per second for the rest of the call.
+
+    The trigger's fields are carried through on purpose: the client needs the
+    request (``model_id``/``reason``) next to what is really in force
+    (``effective_model_id``) and whether it took effect (``repointed``).
+    """
+    return {
+        **dict(trigger_payload or {}),
+        "origin": "pipeline",
+        "repointed": repointed,
+        "applied_epoch": applied_epoch,
+        "effective_model_id": effective_model_id,
+        "applies_to": "next_turn",
+        "certainty": "repointed" if repointed else "next_connection",
+    }
+
+
 class LatencyPercentileProcessor(FrameProcessor):
-    """Rolling LLM TTFB percentile logger."""
+    """Rolling latency percentile logger: LLM TTFB + 本机回合判定模型。
+
+    ``TurnMetricsData`` 只在这里落账：RTVIObserver 的 ``metrics`` 报文只认
+    TTFB/TTFA/TTFAT/Processing/Usage 那几类，本机 Smart Turn 的推理耗时不在其中，
+    所以真机读数的唯一落点是这行日志。它同时也是"这点耗时到底加没加进端到端"的
+    判据 —— DashScope 的 commit 在 VAD 停止时就发了，识别往返与本机推理并行，
+    只有推理慢过识别往返时它才会真正压在回合边界上。
+
+    L3（本类新增的第二个职责）：**"关闭思考"到底生效没有**的落账点。pipecat 白送两条
+    互相独立的证据——``TTFATMetricsData.thinking_time``（首包到首个正文字之间的空隙；
+    思考 token 不产出任何帧，只能在时间轴上看见）与 usage 里的 ``reasoning_tokens``
+    （厂商自己承认产出了思考 token）。意图 = off 却观察到思考 ⇒ 违约：交给注入的回调
+    去写日志、发前端提醒、并把实测结论回写 provider 快照（L2）。
+
+    为什么必须在这一层：这是整条链上**唯一不依赖"方言表对不对"**的检查。厂商偷改默认值、
+    网关丢掉未知字段、表过期——都只能靠"意图 vs 实测"发现。fail-loud，不 fail-closed：
+    通话照常进行，只是不再允许它静默。
+    """
 
     WINDOW = 50
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        thinking_off_intent: bool = False,
+        on_thinking_off_verdict: "ThinkingOffReporter | None" = None,
+    ):
         super().__init__()
         self._samples: list[float] = []
+        # (推理耗时 ms, 是否判定回合结束)。后者也要看：Silero 的 stop_secs 判停
+        # 常常落在句子中间，那些"假停顿"同样会各跑一次模型。
+        self._turn: list[tuple[float, bool]] = []
+        # 本轮会话是否真的要求了"关闭思考"（只有要求了才谈得上违约）。
+        self._thinking_off_intent = bool(thinking_off_intent)
+        self._on_thinking_off_verdict = on_thinking_off_verdict
+        # 违规与通过各只上报一次：第一轮就足以说明问题，不必把日志/DB 刷满。
+        self._thinking_off_flagged = False
+        self._thinking_off_confirmed = False
 
     def _percentile(self, sorted_vals: list[float], p: float) -> float:
         if not sorted_vals:
@@ -239,14 +351,82 @@ class LatencyPercentileProcessor(FrameProcessor):
             sv[-1] * 1000,
         )
 
+    def _report_turn(self) -> None:
+        window = self._turn[-self.WINDOW :]
+        sv = sorted(ms for ms, _ in window)
+        complete = sum(1 for _, done in window if done)
+        logger.info(
+            "Smart turn latency (window={}): p50={:.0f}ms p90={:.0f}ms "
+            "p99={:.0f}ms (min={:.0f}ms max={:.0f}ms, turn_complete={}/{})",
+            len(window),
+            self._percentile(sv, 0.50),
+            self._percentile(sv, 0.90),
+            self._percentile(sv, 0.99),
+            sv[0],
+            sv[-1],
+            complete,
+            len(window),
+        )
+
+    async def _check_thinking_off(
+        self,
+        *,
+        reasoning_tokens: int | None = None,
+        thinking_time_ms: float | None = None,
+    ) -> None:
+        """L3：把本轮"意图 vs 实测"交给共享判据，再由注入的回调落账。"""
+
+        if not self._thinking_off_intent or self._on_thinking_off_verdict is None:
+            return
+        verdict = thinking_off_verdict(
+            intent_off=True,
+            reasoning_tokens=reasoning_tokens,
+            thinking_time_ms=thinking_time_ms,
+        )
+        if verdict is None:
+            return
+        if verdict.violated:
+            if self._thinking_off_flagged:
+                return
+            self._thinking_off_flagged = True
+        else:
+            if self._thinking_off_confirmed:
+                return
+            self._thinking_off_confirmed = True
+        try:
+            await self._on_thinking_off_verdict(verdict)
+        except Exception:
+            # 一条观测记录绝不允许打断通话。
+            logger.warning("thinking-off verdict reporter failed", exc_info=True)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, MetricsFrame):
             got_ttfb = False
+            got_turn = False
             for data in frame.data:
                 if isinstance(data, TTFBMetricsData) and data.value is not None:
                     self._samples.append(float(data.value))
                     got_ttfb = True
+                elif isinstance(data, TurnMetricsData):
+                    self._turn.append(
+                        (float(data.e2e_processing_time_ms), bool(data.is_complete))
+                    )
+                    got_turn = True
+                elif isinstance(data, TTFATMetricsData):
+                    # 思考 token 不产出任何帧，只能在时间轴上看见：这就是那段时间。
+                    thinking = getattr(data, "thinking_time", None)
+                    if thinking is not None:
+                        await self._check_thinking_off(
+                            thinking_time_ms=float(thinking) * 1000.0
+                        )
+                elif isinstance(data, LLMUsageMetricsData):
+                    usage = getattr(data, "value", None)
+                    await self._check_thinking_off(
+                        reasoning_tokens=int(
+                            getattr(usage, "reasoning_tokens", 0) or 0
+                        )
+                    )
             if got_ttfb:
                 if len(self._samples) >= 3:
                     self._report()
@@ -254,6 +434,14 @@ class LatencyPercentileProcessor(FrameProcessor):
                     logger.info(
                         "TTFB samples so far: {} (need >=3 to compute p90/p95/p99)",
                         len(self._samples),
+                    )
+            if got_turn:
+                if len(self._turn) >= 3:
+                    self._report_turn()
+                else:
+                    logger.info(
+                        "Smart turn samples so far: {} (need >=3 to compute p50/p90/p99)",
+                        len(self._turn),
                     )
         await self.push_frame(frame, direction)
 
@@ -489,6 +677,7 @@ def build_pipeline_steps(
     assistant_aggregator: FrameProcessor,
     result_delivery: FrameProcessor | None = None,
     generation_gate: FrameProcessor | None = None,
+    ledger_relay: FrameProcessor | None = None,
 ) -> list[FrameProcessor]:
     """Assemble the main worker's pipeline in one testable place."""
     steps: list[FrameProcessor] = [transport_input, stt]
@@ -502,7 +691,15 @@ def build_pipeline_steps(
     steps.append(tts)
     if generation_gate is not None:
         steps.append(generation_gate)
-    steps.extend([latency, transport_output, assistant_aggregator])
+    steps.append(latency)
+    steps.append(transport_output)
+    # The ledger relay must sit **strictly downstream of the transport**: only there
+    # do frames arrive after the audio ahead of them has actually been written out,
+    # which is what makes "this sentence started/finished playing" a fact rather
+    # than an estimate (see app/voice/caption_ledger.py).
+    if ledger_relay is not None:
+        steps.append(ledger_relay)
+    steps.append(assistant_aggregator)
     return steps
 
 
@@ -850,20 +1047,104 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             )
         raise RuntimeError(f"Voice LLM provider unavailable: {reason}")
 
+    llm_base_url = str(
+        getattr(llm_provider, "base_url", None)
+        or os.getenv("VOICE_LLM_BASE_URL", "")
+        or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    )
+    llm_model = str(
+        getattr(llm_provider, "model_id", None)
+        or os.getenv("VOICE_LLM_MODEL", "")
+        or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    )
+    # 前台恒 off：pipecat 的 OpenAI 服务自己没有思考开关，``Settings.extra`` 是唯一能
+    # 落到请求体上的通道，所以这里必须把厂商自己的"关闭"字段显式拼出来——而且只能放
+    # 进 ``extra_body``（见 ``LlmThinkingOff.settings_extra``：摊在顶层会被 SDK 的签名
+    # 校验拦下，每一轮都抛 TypeError，整通没有回答）。
+    thinking_off = resolve_llm_thinking_off(
+        provider_type=getattr(llm_provider, "provider_type", None),
+        base_url=llm_base_url,
+        model_id=llm_model,
+        capabilities=getattr(llm_provider, "capabilities", None),
+    )
+    if thinking_off.expressible:
+        logger.info(
+            "Voice LLM thinking pinned off: mechanism={} fields={}",
+            thinking_off.mechanism,
+            thinking_off.fields,
+        )
+    else:
+        # 有一个方言表达不出"关闭思考"（例如自定义网关上的模型，或能力快照缺失）。
+        # 口径：**照常服务**（这个模型上就按厂商默认走，通常是思考开启），但必须
+        # 让用户在界面上看到代价——首字延迟会明显变长。走 ``processor.notice``
+        # 而不是 ``processor.error``：通话不降级、不强制文字输入、麦克风不静音。
+        notice = VOICE_THINKING_OFF_UNAVAILABLE_NOTICE.format(model=llm_model)
+        logger.warning("Voice LLM thinking cannot be disabled: {}", notice)
+        if journal is not None:
+            await journal.notice(STAGE_LLM, "thinking_off_unavailable", notice)
+
+    if thinking_off.expressible and thinking_off.suspect:
+        # L2：上一次真机实测已经证明这套机制关不掉（或认出了厂商源、却只能靠通用兜底
+        # 字段）。会话开始就把代价说清楚，而不是等用户听出慢两秒。
+        ineffective_notice = VOICE_THINKING_OFF_INEFFECTIVE_NOTICE.format(model=llm_model)
+        logger.warning(
+            "Voice LLM thinking off looks ineffective: mechanism={} source={} reason={}",
+            thinking_off.mechanism,
+            thinking_off.source,
+            thinking_off.reason or "-",
+        )
+        if journal is not None:
+            await journal.notice(
+                STAGE_LLM,
+                VOICE_THINKING_OFF_INEFFECTIVE_NOTICE_CODE,
+                ineffective_notice,
+            )
+
+    async def report_thinking_off_verdict(verdict: ThinkingOffVerdict) -> None:
+        """L3 的落账点：意图 vs 实测不符就喊出来，并把结论回写 provider 快照（L2）。"""
+
+        if verdict.violated:
+            logger.warning(
+                "Voice thinking=off was ignored by the upstream: {} "
+                "(model={}, mechanism={}, source={})",
+                verdict.detail,
+                llm_model,
+                thinking_off.mechanism or "-",
+                thinking_off.source,
+            )
+            if journal is not None:
+                await journal.notice(
+                    STAGE_LLM,
+                    VOICE_THINKING_OFF_INEFFECTIVE_NOTICE_CODE,
+                    VOICE_THINKING_OFF_INEFFECTIVE_NOTICE.format(model=llm_model),
+                )
+        else:
+            logger.info(
+                "Voice thinking=off honoured: {} (model={})", verdict.detail, llm_model
+            )
+        # 写库是"真机结论 → 数据"的闭环（L2）：下一次解析会优先采用它。
+        # 线程里做，且失败只留日志——观测绝不能拖慢或打断通话。
+        await asyncio.to_thread(
+            record_thinking_off_observation,
+            provider_id=getattr(llm_provider, "provider_id", None),
+            model_id=llm_model,
+            verified=not verdict.violated,
+            mechanism=thinking_off.mechanism,
+            surface="voice",
+            reasoning_tokens=verdict.reasoning_tokens,
+            thinking_time_ms=verdict.thinking_time_ms,
+            detail=verdict.detail,
+        )
+
     llm = OpenAILLMService(
         api_key=llm_api_key,
-        base_url=str(
-            getattr(llm_provider, "base_url", None)
-            or os.getenv("VOICE_LLM_BASE_URL", "")
-            or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        ),
+        base_url=llm_base_url,
         settings=OpenAILLMService.Settings(
-            model=str(
-                getattr(llm_provider, "model_id", None)
-                or os.getenv("VOICE_LLM_MODEL", "")
-                or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-            ),
+            model=llm_model,
             system_instruction=SYSTEM_INSTRUCTION,
+            # 表达不出关闭时就是空 dict：宁可不发字段（= 该模型按自己的默认走），
+            # 也不能把别的方言的字段塞给它——那会直接让上游 400、整通没有回答。
+            extra=thinking_off.settings_extra,
         ),
     )
 
@@ -959,7 +1240,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    latency = LatencyPercentileProcessor()
+    latency = LatencyPercentileProcessor(
+        # 只有"真的要求了关闭思考"才谈得上违约。表达不出时上游按自己的默认走，
+        # 那种情况上面的 notice 已经说清楚了，不该在这里重复报警。
+        thinking_off_intent=thinking_off.expressible,
+        on_thinking_off_verdict=report_thinking_off_verdict,
+    )
     generation_gate = VoiceGenerationGate()
     bridge = BusBridgeProcessor(
         bus=runner.bus,
@@ -998,15 +1284,28 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         latency=latency,
         transport_output=transport.output(),
         assistant_aggregator=assistant_aggregator,
+        # 句级账本的写入者：坐在输出传输下游，只在"这一句的音频真的写出去了"之后
+        # 才落账（未听到的文本因此进不了账本、转录与记忆）。
+        ledger_relay=VoiceLedgerRelay(journal=journal) if journal is not None else None,
     )
     pipeline = Pipeline(insert_timeline_probes(pipeline_steps))
 
     worker = PipelineWorker(
         pipeline,
         name=MAIN_WORKER_NAME,
+        # 字幕交给官方的句级路径：``AggregatedTextFrame`` → ``bot-output{new}``（整句先
+        # 到、灰着），``TTSTextFrame`` → ``bot-output{completed}``（这一句播完时点亮）。
+        # 前者在开口前被 observer 扣住，后者随音频队列被真实播放节奏放行，前端不需要
+        # 任何播放时钟。``bot-tts-text`` 只是排障用的旁路，保持关闭以免多一路流量。
         rtvi_observer_params=RTVIObserverParams(
-            bot_output_enabled=False,
+            bot_output_enabled=True,
             bot_tts_enabled=False,
+            # 把服务端 Silero 的 VAD 起止（`vad-user-started-speaking` /
+            # `vad-user-stopped-speaking`）也送给前端：延迟面板要"用户声音只用 VAD"的
+            # 原始信号 —— 它是模型判定，且由 user aggregator 直接广播，独立于回合策略
+            # 与回合终结（pipecat 的 message docstring 原话）。前端只消费 stop 那条
+            # 作标注（"人声停止"≠"话说完了"），开轮权仍归账本的 `user.started`。
+            vad_user_speaking_enabled=True,
         ),
         params=PipelineParams(
             audio_in_sample_rate=16000,
@@ -1099,22 +1398,60 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             repointed = False
             llm_service = getattr(agent, "llm", None)
             model = handle_now.model_id or getattr(llm_provider, "model_id", None)
-            if llm_service is not None and model:
+            # 换模型必须连"关闭思考"的字段一起换：该方言会随 Provider/模型变
+            # （DeepSeek 是 thinking:{type}，DashScope 是 enable_thinking）。
+            pin = await asyncio.to_thread(_resolve_voice_provider_config, session_id)
+            pin_llm = pin.llm if getattr(pin.llm, "available", False) else None
+            pinned_model = str(
+                getattr(pin_llm, "model_id", None) or model or ""
+            )
+            off = resolve_llm_thinking_off(
+                provider_type=getattr(pin_llm, "provider_type", None),
+                base_url=str(
+                    getattr(pin_llm, "base_url", None)
+                    or os.getenv("VOICE_LLM_BASE_URL", "")
+                    or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+                ),
+                model_id=pinned_model,
+                capabilities=getattr(pin_llm, "capabilities", None),
+            )
+            if llm_service is not None and pinned_model:
                 try:
                     settings_obj = getattr(llm_service, "_settings", None)
                     if settings_obj is not None and hasattr(settings_obj, "model"):
-                        settings_obj.model = str(model)
+                        settings_obj.model = pinned_model
+                        if pin_llm is not None:
+                            # 新方言表达不出关闭时置空——把上一家的字段继续发过去会让
+                            # 新上游 400，整通没有回答，比"这次换模型仍在思考"更糟。
+                            # 解析不出新 Provider（被停用/删除）时**不动** extra：正在跑
+                            # 的那条链路用的仍是它自己方言的字段。
+                            settings_obj.extra = off.settings_extra
                         repointed = True
                 except Exception:
                     logger.debug("voice model re-pin failed", exc_info=True)
-            await journal.context_updated({
-                **dict(event.get("payload") or {}),
-                "repointed": repointed,
-                "applied_epoch": handle_now.session_epoch,
-                "effective_model_id": model,
-                "applies_to": "next_turn",
-                "certainty": "repointed" if repointed else "next_connection",
-            })
+            await journal.context_updated(
+                context_change_report(
+                    event.get("payload"),
+                    repointed=repointed,
+                    effective_model_id=pinned_model or model,
+                    applied_epoch=handle_now.session_epoch,
+                ),
+                # 一条请求只该有一条回执：request_id 以触发事件为键，重复处理
+                # （游标回退、两个 worker 先后读到同一条）只会命中同一行。
+                request_id=f"context.report:{event.get('event_id') or handle_now.session_epoch}",
+            )
+            if llm_service is not None and pin_llm is not None and not off.expressible:
+                # 注意顺序：提醒必须在 context.updated **之后**发。客户端收到"换模型
+                # 成功"的回执时会先清掉上一家模型的提示，再按本条建立新提示——反过来的
+                # 话，刚发出的提醒会被那条清空覆盖掉。
+                notice = VOICE_THINKING_OFF_UNAVAILABLE_NOTICE.format(
+                    model=pinned_model or model or "未知"
+                )
+                logger.warning("Voice model switch: {}", notice)
+                if journal is not None:
+                    await journal.notice(
+                        STAGE_LLM, "thinking_off_unavailable", notice
+                    )
 
 
         async def _on_close(reason: str) -> None:

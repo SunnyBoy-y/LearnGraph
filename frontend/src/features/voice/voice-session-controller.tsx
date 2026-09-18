@@ -41,6 +41,14 @@ import {
   type VoiceTaskPatch,
   type VoiceTaskState,
 } from "./voice-tasks";
+import {
+  applyBotOutput,
+  captionText,
+  keepLitParts,
+  lightFirstUnlit,
+  type VoiceBotOutputPart,
+} from "./voice-bot-output";
+import { markVoiceLatency, resetVoiceLatency } from "./voice-latency-store";
 
 export type VoiceTransportState = "idle" | "connecting" | "connected" | "reconnecting" | "error";
 export type VoiceSessionState = "closed" | "ready" | "listening" | "thinking" | "speaking" | "error";
@@ -51,30 +59,10 @@ export type VoiceTranscript = TranscriptEntry;
 export type VoiceTaskEvent = VoiceTaskPatch;
 
 /**
- * One assistant sentence whose audio has already started.
- *
- * `cursorMs` / `startedAt` are what turn "one block per sentence" into karaoke
- * captions: the backend reports where the sentence sits in the reply's audio
- * stream, and the marker arrives as that sentence's first frame is queued, so
- * the pair gives the canvas a sentence-level playback clock (see
- * `components/chat/voice-karaoke-text.tsx`).
+ * 字幕段落类型与它的状态机都在 `./voice-bot-output`：数据源是**官方**的
+ * `bot-output`（协议 2.x 句级路径），前端不再自己排期、也不算任何时钟。
  */
-export interface VoiceSpokenSegment {
-  /** Sentence text exactly as it was spoken. */
-  text: string;
-  /** 账本序号：`voice-sentence-start` / `voice-sentence-end` 共用的句身份。 */
-  seq: number;
-  /** Offset (ms) of this sentence's first audio frame inside the reply audio. */
-  cursorMs: number;
-  /**
-   * 该句播完时的媒体偏移；`null` = 正在朗读。
-   *
-   * 由服务端的 `voice-sentence-end` 写入，而那条 marker 是**排期到这一句真正播完的
-   * 时刻**才下发的（后端 marker 排期投递）。所以前端不需要任何播放时钟、也不需要
-   * 字速估算：没有 `endMs` 就是"正在读"，收到就是"读完了"。
-   */
-  endMs: number | null;
-}
+export type { VoiceBotOutputPart, VoiceCaptionMode } from "./voice-bot-output";
 
 export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"> {
   id: string;
@@ -105,13 +93,12 @@ export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"
    */
   retireTurnSegments?: string;
   /**
-   * Assistant sentences whose audio has already started, in order.
+   * Assistant text as the official `bot-output` channel announced it, in order.
    *
-   * Text follows the audio, not the LLM stream: the last entry is the sentence
-   * being spoken right now, which the canvas highlights. Empty means "one
-   * undivided message" (a settled turn).
+   * 每一段带自己的"已读游标"：`new` 的段整段未读（灰），`completed` 的段整段已读。
+   * 未读部分只活在这份内存里——刷新或被打断后就撤下，账本与转录永远只认真的播过的句子。
    */
-  spokenSegments?: VoiceSpokenSegment[];
+  captionParts?: VoiceBotOutputPart[];
   /** Marks an ephemeral per-segment user row (see `removes`). */
   voiceSegment?: boolean;
 }
@@ -169,6 +156,17 @@ export interface VoiceSessionSnapshot {
   degradedStages: string[];
   /** Human-readable explanation for the degraded banner. */
   degradedNotice: string | null;
+  /**
+   * 最近一条**需要用户知道代价**的 pipeline 提示（durable `processor.notice`）。
+   *
+   * 它不是降级：通话照常、不强制文字输入、麦克风不静音。目前唯一来源是"前台实时
+   * 回合要求关闭思考，但这个模型/方言表达不出来"——那种情况下模型会按厂商默认继续
+   * 思考，每轮首字明显变慢。用户不知道就会以为服务坏了，所以必须说出来。
+   *
+   * 只认白名单里的 code：ASR 自适应重连、VAD 兜底之类的 notice 是排障信息，留在
+   * durable 事件里即可，不该占用界面。
+   */
+  pipelineNotice: string | null;
   /** True when ordinary text chat must be allowed even though voice mode is on. */
   textFallback: boolean;
   /**
@@ -199,6 +197,13 @@ export interface VoiceIcePath {
 
 const STORAGE_KEY = "learngraph.voice.preferences.v1";
 const REMOTE_SESSION_STORAGE_KEY = "learngraph.voice.remote-sessions.v1";
+
+/**
+ * `processor.notice` 里唯一会被提到界面上的 code：前台实时回合要求关闭思考，但当前
+ * 模型/方言表达不出关闭字段（服务端仍照常服务，模型会按厂商默认继续思考）——这条
+ * 提示的价值就是告诉用户"每轮首字变慢是已知原因，不是服务坏了"。
+ */
+const THINKING_OFF_UNAVAILABLE_NOTICE_CODE = "thinking_off_unavailable";
 
 /**
  * Deployment-wide ICE servers (STUN/TURN) configured by the instance
@@ -278,7 +283,7 @@ function forgetRemoteSession(workspaceId: string, sessionId: string) {
     window.localStorage.setItem(REMOTE_SESSION_STORAGE_KEY, JSON.stringify(stored));
   } catch { /* storage is optional */ }
 }
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, textFallback: false, icePath: null, playbackBlocked: false };
+const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, pipelineNotice: null, textFallback: false, icePath: null, playbackBlocked: false };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
@@ -361,9 +366,8 @@ const settledUserTurns = new Set<string>();
 let activeAssistantTurnId = "";
 let assistantLlmText = "";
 let assistantSpokenText = "";
-/** Sentences whose audio has started; the last one is being spoken right now. */
-let assistantSpokenSentences: VoiceSpokenSegment[] = [];
-let assistantSentenceSequence = 0;
+/** 官方 `bot-output` 折出来的段落：整段文本 + 每段的已读游标。 */
+let assistantCaptionParts: VoiceBotOutputPart[] = [];
 let assistantLlmComplete = false;
 let assistantFinalized = false;
 let lastAudioCursorMs = 0;
@@ -455,14 +459,36 @@ function applyDurableEvent(event: VoiceEventLike) {
 /** How many durable events this page has folded in (0 = journal unavailable). */
 let durableEventCount = 0;
 
+/**
+ * Ask the control plane to open the durable turn for a typed utterance.
+ *
+ * 应答里的 `turn_id` 就是这一轮的**权威身份**，必须用上：控制面写的
+ * `user.final` / `turn.accepted` 只能靠 1.5s 轮询补投，而数据通道上的输出侧事件
+ * （worker 写的 `assistant.*`）会先把游标推到它们前面 —— 游标只前进不回补，那两个
+ * 事件就永远不会再被取回。真机证据：本机日志的轮询游标 `… 27 → 32`，而这一轮的
+ * `user.final`/`turn.accepted` 正是 29/30；同一通话里 4 条打字回合的身份全都没到。
+ * 拿不到身份，延迟面板就只能把这一轮的 LLM/TTS 信号按"无主"计数（面板：只有两行
+ * 实时通道 + 未测得 + 永远"进行中"）。
+ *
+ * 身份对不上也没关系：这一轮在服务端可能由 worker 先建（那时应答给回的就是 worker
+ * 那个 id）—— 这里用的始终是服务端应答里的真值，不是客户端猜的 id。
+ */
 function persistAcceptedTurn(turnId: string, userText: string, clientMessageId?: string) {
   const remote = snapshot.sessionIdRemote;
   if (!remote || !userText.trim()) return;
-  void apiClient.post(`/voice/sessions/${remote}/turns/accept`, {
-    turn_id: turnId,
-    text: userText.trim(),
-    client_message_id: clientMessageId,
-  }).catch(() => undefined);
+  void apiClient
+    .post<{ turn_id?: string; turnId?: string }>(`/voice/sessions/${remote}/turns/accept`, {
+      turn_id: turnId,
+      text: userText.trim(),
+      client_message_id: clientMessageId,
+    })
+    .then((accepted) => {
+      const confirmed = String(accepted?.turn_id ?? accepted?.turnId ?? "").trim();
+      if (!confirmed) return;
+      // 认领身份：这一轮随后的账本记号（含已经先到的）都会归到它自己名下。
+      markVoiceLatency({ stage: "turnAccepted", source: "typed", turnId: confirmed });
+    })
+    .catch(() => undefined);
 }
 
 /**
@@ -530,6 +556,49 @@ function scheduleReconnect() {
   }, delay);
 }
 
+/**
+ * 数据通道上的账本事件该怎么推进轮询游标（纯函数，单测覆盖）。
+ *
+ * 数据通道**只带 worker 写的事件**：`journal._emit → _publish` 才下发。控制面（API
+ * 进程）写的那些根本不在上面 —— 打字回合的 `user.final` / `turn.accepted`（`accept_turn`
+ * 只写库）、HTTP 触发的 `turn.interrupted`、`session.closed`、部分 `context.updated`。
+ * 所以"事件序号不连续"是**常态**，不是异常。
+ *
+ * 正因为如此，按序号直接推进游标是错的：轮询是 `after_event_seq=<游标>`，游标一旦被
+ * 数据通道推过那些没送达的序号，它们就**再也取不回来**。真机证据：会话
+ * `vs_c03d8b92…` 的访问日志游标 `…27 → 32`，而那条打字回合的身份事件正是 29/30 ——
+ * 客户端因此永远认领不到这一轮，转录里的打字气泡也永远等不到「回合受理」（12s 后
+ * 被判发送失败），延迟面板则把这一轮的 LLM/TTS 信号全当"无主"。
+ *
+ * 规则：只在 `seq == 游标 + 1` 时推进（游标为 0 = 本次连接还没有游标，允许直接采纳，
+ * 否则一个中途加入的客户端永远等不到开头）；发现缺口就**不动游标**并要求补投一轮轮询，
+ * 由它把缺口补齐、并把游标推进到页内最大值（页内序号是连续的）。
+ */
+export function advanceDurableCursor(
+  cursor: number,
+  seq: number,
+): { cursor: number; backfill: boolean } {
+  if (!Number.isFinite(seq) || seq <= cursor) return { cursor, backfill: false };
+  if (cursor === 0 || seq === cursor + 1) return { cursor: seq, backfill: false };
+  return { cursor, backfill: true };
+}
+
+/**
+ * 发现缺口后立刻补一轮轮询（不等定时器）。
+ *
+ * 与定时轮询并发也无害：`pollVoiceEvents` 按 `event_id` 去重、游标单调前进，两条
+ * 请求最多各取一次同一页。
+ */
+let eventCatchUpInFlight = false;
+function requestEventCatchUp() {
+  if (eventCatchUpInFlight) return;
+  if (!snapshot.sessionIdRemote) return;
+  eventCatchUpInFlight = true;
+  void pollVoiceEvents().finally(() => {
+    eventCatchUpInFlight = false;
+  });
+}
+
 /** Fetch and fold durable events newer than the local cursor. */
 async function pollVoiceEvents(): Promise<boolean> {
   const remote = snapshot.sessionIdRemote;
@@ -547,6 +616,8 @@ async function pollVoiceEvents(): Promise<boolean> {
       });
       if (!normalized || seenEventIds.has(normalized.event_id)) continue;
       seenEventIds.add(normalized.event_id);
+      // 轮询页里的序号是连续的，所以这里照旧按最大值推进游标（它同时也是"补投完成"的
+      // 收口：页内的缺口由这一页填上了）。
       if (normalized.event_seq > snapshot.lastEventSeq) {
         update({ lastEventSeq: normalized.event_seq, sessionEpoch: normalized.session_epoch });
       }
@@ -927,8 +998,7 @@ function beginAssistantTurn() {
   try { localStorage.setItem(`learngraph.voice.turn.${snapshot.sessionId}`, activeAssistantTurnId); } catch { /* optional */ }
   assistantLlmText = "";
   assistantSpokenText = "";
-  assistantSpokenSentences = [];
-  assistantSentenceSequence = 0;
+  assistantCaptionParts = [];
   lastAudioCursorMs = 0;
   assistantLlmComplete = false;
   assistantFinalized = false;
@@ -996,7 +1066,9 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
   }
   switch (type) {
     case "session.created":
-      update({ state: "ready", error: null });
+      // 新一通电话：上一通的提示（例如"这个模型关不掉思考"）是旧 Provider 解析的
+      // 产物，必须清掉，否则会挂在新通话上误导用户。
+      update({ state: "ready", error: null, pipelineNotice: null });
       return;
     case "session.ready":
       // A rebuilt pipeline re-resolves every stage, so a previous degradation is
@@ -1027,11 +1099,15 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       return;
     case "session.closed":
       forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId);
-      update({ transport: "idle", state: "closed", sessionIdRemote: null });
+      update({ transport: "idle", state: "closed", sessionIdRemote: null, pipelineNotice: null });
       return;
     case "user.started":
       activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
       update({ state: "listening", interimUserText: "" });
+      // 刻意不传 `turnId`：账本这条带的是**上一轮**的 id（journal 先发事件、后开新轮），
+      // 照身份归位会把用户这次真实开口吞掉。起音永远是新一轮的开始，身份等
+      // `user.final` / `turn.accepted` 到达时认领（见 voice-latency.ts 的归轮规则）。
+      markVoiceLatency({ stage: "userStarted", source: "ledger" });
       return;
     case "user.interim":
       activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
@@ -1046,6 +1122,7 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       renderUserSegment(text, false, turnId);
       return;
     case "user.final": {
+      markVoiceLatency({ stage: "asrFinal", source: "ledger", detail: text, turnId });
       const typedClientId = String(
         payload.client_message_id ?? payload.clientMessageId ?? "",
       ).trim();
@@ -1076,6 +1153,7 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       return;
     }
     case "turn.accepted": {
+      markVoiceLatency({ stage: "turnAccepted", source: "ledger", turnId });
       const clientId = String(payload.client_message_id ?? payload.clientMessageId ?? "");
       if (clientId && pendingTyped.has(clientId)) {
         const pending = pendingTyped.get(clientId)!;
@@ -1116,10 +1194,15 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       }
       return;
     case "turn.interrupted":
+      // 这条收尾挂在**被打断的那一轮**上：按身份归位（它常常在新一轮起音之后几毫秒
+      // 才到，以前会把刚开的新轮立刻关掉，产出一条"未测得"垃圾行；现在会补记到被打断
+      // 的那一轮上，还能看出"被打断在第几毫秒"）。
+      markVoiceLatency({ stage: "answerDone", source: "barge-in", turnId });
       flushPendingUserFinal();
       finalizeAssistantTurn(true);
       return;
     case "assistant.llm.delta":
+      markVoiceLatency({ stage: "llmFirst", source: "ledger", turnId });
       if (!activeAssistantTurnId || (turnId && activeAssistantTurnId !== turnId)) beginAssistantTurn();
       assistantLlmText += text;
       update({ state: "thinking", streamingAssistantText: assistantLlmText });
@@ -1129,36 +1212,63 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       // not heard yet. `assistantLlmText` remains the finalize fallback.
       return;
     case "assistant.sentence.queued":
-      // 句首字幕的**兜底**，不是"提前显示"：这条账本事件与实时 marker
-      // `voice-sentence-start` 由同一处按同一时刻投递（TTS 适配器先写账本、
-      // 紧跟着推 marker，实测相差几毫秒），所以它到得只会更晚。
-      // 同句以 `sentence_seq` 去重（见 appendAssistantSentence）：marker 先到就
-      // 由 marker 渲染，这条成为空操作；marker 丢了则由它补上字幕。
+      // 这条账本事件现在只承担**持久层**职责（转录 / 记忆 / 刷新恢复），不再驱动字幕：
+      // 字幕由官方 `bot-output` 独立负责，两个通道各管一件事，也就不会再互相打架。
       //
-      // 为什么必须有这条兜底：marker 走 RTVI 实时通道，且它的投递**排在一次账本
-      // 写之后**。一旦那次写被卡住（例如 journal 锁死）或数据通道丢包，前端就拿不到
-      // 任何"已朗读"文本，`bot-stopped-speaking` 收尾时 `assistantSpokenText` 为空、
-      // 整段回退成 LLM 草稿——现象正是"音频播完才把整段答案显示出来"。
-      appendAssistantSentence(
-        text,
-        Number(payload.sentence_seq ?? payload.sequence),
-        event.audio_cursor_ms ?? undefined,
-      );
+      // 为什么不能让两边都渲染：账本记账是**因果**的（帧被输出传输放行才写），而
+      // `bot-output` 的 `new` 天生早于音频（那是卡拉OK 需要的预读）。把预读交给账本
+      // 就等于让"没播出来的文本"进事件流——正是本项目明令禁止的那件事。
+      if (Number.isFinite(Number(event.audio_cursor_ms))) {
+        lastAudioCursorMs = Math.max(lastAudioCursorMs, Number(event.audio_cursor_ms));
+      }
+      markVoiceLatency({ stage: "sentenceQueued", source: "ledger", turnId });
+      void text;
       return;
     case "assistant.sentence.ended":
-      // 句尾字幕的兜底（同上）：把这一句从"正在读（灰）"切回正常色。
-      markAssistantSentenceEnded(
-        Number(payload.sentence_seq ?? payload.sequence),
-        Number(payload.audio_end_cursor_ms),
-      );
+      // 点亮这一句 —— 而且只有这条事件能点亮它。
+      //
+      // 为什么不用官方 `bot-output` 的 `completed`：RTVI 消息是
+      // `OutputTransportMessageUrgentFrame`，**不排在媒体队列里**，所以它到达的时刻与
+      // 音频播到哪无关（真机实测：无词级时间戳的服务商上它比该句音频早到 13.5 秒）。
+      // 而这条账本事件是 TTS 适配器把账本帧排在那一句音频**后面**、被输出传输按真实播放
+      // 节奏放行时才写下的（S5 到点保证），所以"到点"由它承担。
+      //
+      // 文本与预读灰字仍然全部来自官方通道，这里只负责切换颜色。
+      {
+        const lit = lightFirstUnlit(assistantCaptionParts, text || undefined);
+        if (lit !== assistantCaptionParts) {
+          assistantCaptionParts = lit;
+          emitAssistantCaptions();
+        }
+      }
+      markVoiceLatency({ stage: "sentenceEnded", source: "ledger", detail: text, turnId });
       return;
     case "assistant.sentence.playback_started":
-      // 这条 durable 事件不带句文本，也不是播放锚点；句首由上面的 `queued`
-      // 或实时 marker 驱动。
+      // 导师开始出声的**语义锚点**：账本这条写在输出传输真的把这一轮第一段音频
+      // 写出去之后（S5 到点保证），而且带回合语义。以前用的是远端音频轨的能量阈值，
+      // 那个只在"响不响"层面成立：服务端写完音频、到浏览器放完缓冲之间还有几十~几百
+      // 毫秒，能量打点落在收尾之后就会凭空开出一轮"导师出声 0 ms"的幻影轮。
+      // 句首文本仍由上面的 `queued` 或官方 `bot-output` 驱动，与这里无关。
+      markVoiceLatency({ stage: "botSpeaking", source: "ledger", turnId });
       return;
     case "assistant.sentence.playback_ended":
-      if (payload.final === true || payload.turn_final === true) finalizeAssistantTurn(false);
+      if (payload.final === true || payload.turn_final === true) {
+        // 整轮播完：末句结束标记之后账本把这一轮收尾，面板以此结束计时。
+        // 按身份归位：这一轮若已经因为新一轮起音被收进历史，就补记到它自己的行上。
+        markVoiceLatency({ stage: "answerDone", source: "ledger", turnId });
+        finalizeAssistantTurn(false);
+      }
       return;
+    case "processor.notice": {
+      // 不是错误：不设置 error、不进降级、不强制文字输入，只在状态区提醒代价。
+      // 只认白名单 code——其它 notice 是排障信息（ASR 自适应重连、VAD 兜底帧缺失），
+      // 不该占用界面。
+      if (String(payload.code ?? "") !== THINKING_OFF_UNAVAILABLE_NOTICE_CODE) return;
+      const message = String(payload.message ?? "").trim();
+      if (!message) return;
+      update({ pipelineNotice: message });
+      return;
+    }
     case "processor.error": {
       const stages = deriveDegradedStages(snapshot.degradedStages, payload);
       const textFallback = requiresTextFallback(stages);
@@ -1185,15 +1295,26 @@ function processVoiceEvent(event: VoiceEventEnvelope) {
       // Never optimistically show the requested model as live: the pin is a
       // statement about the next turn, and only an explicit confirmation may
       // move the model the UI presents as current (see deriveModelPin).
+      // ``null`` means the event was not about the model at all (a context
+      // snapshot, or a report with nothing to report): the existing pin -- which
+      // may be absent -- stays exactly as it is.
       const pin = deriveModelPin(
         payload,
         event,
         snapshot.effectiveModelId ?? snapshot.modelId,
+        snapshot.modelPin,
       );
+      if (!pin) return;
       update({
         modelPin: pin,
         ...(pin.repointed && pin.effectiveModelId
-          ? { effectiveModelId: pin.effectiveModelId }
+          ? {
+              effectiveModelId: pin.effectiveModelId,
+              // 换模型会重新解析"能否关闭思考"：旧模型的"关不掉"提示对新模型不成立。
+              // 服务端在 context.updated 之后才会补发新模型对应的 notice（若能表达关闭
+              // 就不发），所以先清后设不会互相覆盖。
+              pipelineNotice: null,
+            }
           : {}),
       });
       return;
@@ -1221,63 +1342,25 @@ function assistantLiveRemovalIds(turnId?: string): string[] {
   return [...ids];
 }
 
-function emitAssistantSpoken() {
-  update({ streamingAssistantText: assistantSpokenText });
-  if (!assistantSpokenText.trim() || !activeAssistantTurnId) return;
-  dispatchVoiceRender({
-    id: assistantLiveRowId(activeAssistantTurnId), role: "assistant", text: assistantSpokenText,
-    final: false, createdAt: new Date().toISOString(), turnId: activeAssistantTurnId,
-    sentenceSeq: assistantSentenceSequence,
-    audioCursorMs: lastAudioCursorMs,
-    // Sentence granularity is what makes the text correspond to the audio: the
-    // canvas renders one block per spoken sentence and highlights the last one,
-    // which is the sentence whose audio is playing right now.
-    spokenSegments: [...assistantSpokenSentences],
-  });
-}
-
-function appendAssistantSentence(text: string, sequence?: number, audioCursorMs?: number) {
-  const clean = text.trim();
-  if (!clean) return;
-  if (Number.isFinite(audioCursorMs)) lastAudioCursorMs = Math.max(lastAudioCursorMs, Number(audioCursorMs));
-  if (!activeAssistantTurnId) beginAssistantTurn();
-  // The backend marker is emitted after this sentence's first audio frame has
-  // entered the output queue. Deduplicate by the backend sequence, never by
-  // text: two consecutive sentences are allowed to have identical content.
-  const markerSequence = Number(sequence);
-  if (Number.isFinite(markerSequence) && markerSequence > 0) {
-    if (markerSequence <= assistantSentenceSequence) return;
-    assistantSentenceSequence = markerSequence;
-  }
-  // Preserve the original spacing between sentences.
-  assistantSpokenText = assistantSpokenText ? `${assistantSpokenText}${text}` : text;
-  assistantSpokenSentences.push({
-    // Verbatim, not trimmed: the live block joins these back into one run of
-    // text, and it has to match what the backend stores for the same turn.
-    text,
-    seq: assistantSentenceSequence,
-    cursorMs: lastAudioCursorMs,
-    // 起点 marker 到达 = 这一句开始播放；它什么时候播完由后端补一条 end marker。
-    endMs: null,
-  });
-  emitAssistantSpoken();
-}
-
 /**
- * 标记某一句已播完（服务端 `voice-sentence-end`）。
+ * 把当前的段落列表广播给聊天画布。
  *
- * 这条 marker 由后端排期到"这一句播完"的时刻才下发，所以前端拿到它就可以直接把
- * 该句从"正在读（灰）"切成"读完（正常色）"，无需任何本地播放时钟。
+ * `assistantSpokenText` 只保留**已点亮**（`completed`）的部分：它是"用户已经听到的
+ * 文本"，也是 finalize 在没有账本可用时的兜底正文。屏幕上的 `text` 则是整段已宣布的
+ * 文本（含灰字）——灰字只活在这一帧内存里。
  */
-function markAssistantSentenceEnded(sequence: number, endCursorMs?: number) {
-  const seq = Number(sequence);
-  if (!Number.isFinite(seq) || seq <= 0) return;
-  const target = assistantSpokenSentences.find(
-    (segment) => segment.seq === seq && segment.endMs === null,
-  );
-  if (!target) return;
-  target.endMs = Number.isFinite(endCursorMs) ? Number(endCursorMs) : 0;
-  emitAssistantSpoken();
+function emitAssistantCaptions() {
+  const announced = captionText(assistantCaptionParts);
+  assistantSpokenText = captionText(keepLitParts(assistantCaptionParts));
+  update({ streamingAssistantText: announced });
+  if (!announced.trim() || !activeAssistantTurnId) return;
+  dispatchVoiceRender({
+    id: assistantLiveRowId(activeAssistantTurnId), role: "assistant", text: announced,
+    final: false, createdAt: new Date().toISOString(), turnId: activeAssistantTurnId,
+    audioCursorMs: lastAudioCursorMs,
+    // 段落粒度让文本与音频对应：每段自带已读游标，画布据此把未读部分画成灰字。
+    captionParts: [...assistantCaptionParts],
+  });
 }
 
 function finalizeAssistantTurn(interrupted: boolean) {
@@ -1292,7 +1375,7 @@ function finalizeAssistantTurn(interrupted: boolean) {
   const turnId = activeAssistantTurnId;
   // The live bubble is replaced by the settled one; leaving both would show the
   // answer twice (they have different row ids on purpose, see emitAssistantSpoken).
-  const removes = assistantSpokenSentences.length
+  const removes = assistantCaptionParts.length
     ? assistantLiveRemovalIds(turnId)
     : [];
   turnAudioCursors.delete(turnId);
@@ -1312,7 +1395,8 @@ function finalizeAssistantTurn(interrupted: boolean) {
   activeAssistantTurnId = "";
   assistantLlmText = "";
   assistantSpokenText = "";
-  assistantSentenceSequence = 0;
+  // 灰字只存活在这一回合里：收尾（含被打断）时一并撤下，屏幕上不留从未朗读过的文本。
+  assistantCaptionParts = [];
   try { localStorage.removeItem(`learngraph.voice.turn.${snapshot.sessionId}`); } catch { /* optional */ }
 }
 
@@ -1337,7 +1421,13 @@ function handleRtviMessage(raw: string) {
     const event = normalizeVoiceEvent(candidate);
     if (event && !seenEventIds.has(event.event_id)) {
       seenEventIds.add(event.event_id);
-      if (event.event_seq > snapshot.lastEventSeq) update({ lastEventSeq: event.event_seq, sessionEpoch: event.session_epoch });
+      // 见 `advanceDurableCursor`：数据通道只带 worker 写的事件，控制面写的那些不在
+      // 这条通道上，游标因此只能推进到**连续**的位置；有缺口就交给轮询补投。
+      const advanced = advanceDurableCursor(snapshot.lastEventSeq, event.event_seq);
+      if (advanced.cursor !== snapshot.lastEventSeq) {
+        update({ lastEventSeq: advanced.cursor, sessionEpoch: event.session_epoch });
+      }
+      if (advanced.backfill) requestEventCatchUp();
       processVoiceEvent(event);
     }
     return;
@@ -1368,6 +1458,7 @@ function handleRtviMessage(raw: string) {
       // utterance or drift apart on segment numbering.
       const observerOwnsRows = durableEventCount === 0;
       if (data.final) {
+        markVoiceLatency({ stage: "asrFinal", source: "rtvi", detail: text });
         // 一个「用户回合」可能产生多段 final：本机 VAD 判定停止即 commit。
         // 当 durableEventCount > 0 时，权威的 user.final 事件管理 pendingUserFinal；
         // observer 只在老后端/无持久化事件兜底时操作 pendingUserFinal，避免串句污染。
@@ -1382,16 +1473,24 @@ function handleRtviMessage(raw: string) {
       }
       return;
     }
+    // 服务端 VAD 的两条消息（`vad-user-started-speaking` / `vad-user-stopped-speaking`）
+    // 整体不消费：开轮权归账本 `user.started`（durable、可续传；VAD 那条比账本早到几毫秒，
+    // 此刻轮次还没开出来，记下来只会被当成"上一轮的尾巴"，两个开轮信号各开一轮）。而
+    // "人声停止"是句子中间的停顿也会触发的标注、不是回合边界，它曾经只喂给延迟面板的一行，
+    // 已随那一行一并移除。
     case "user-stopped-speaking":
+      markVoiceLatency({ stage: "userDone", source: "rtvi" });
       flushPendingUserFinal();
       return;
     case "bot-llm-started":
       // 安全网：万一没有收到回合边界消息，导师开始作答也意味着用户说完了。
+      markVoiceLatency({ stage: "llmStart", source: "rtvi" });
       flushPendingUserFinal();
       beginAssistantTurn();
       update({ state: "thinking", streamingAssistantText: "" });
       return;
     case "bot-llm-text":
+      markVoiceLatency({ stage: "llmFirst", source: "rtvi" });
       if (!activeAssistantTurnId) beginAssistantTurn();
       assistantLlmText = `${assistantLlmText}${String(data.text ?? "")}`;
       return;
@@ -1399,53 +1498,62 @@ function handleRtviMessage(raw: string) {
       assistantLlmComplete = true;
       return;
     }
-    case "bot-started-speaking":
-      update({ state: "speaking" });
+    // 此处刻意没有 `bot-started-speaking` / `bot-stopped-speaking` / `bot-interrupted`：
+    // 这套拓扑下 RTVI 不携带它们（输出传输把这些帧推过 observer，见
+    // `startBotAudioLevelMonitor` 的说明），三个 case 曾经永不触发，只让人误以为这里还有
+    // 一条兜底。说话状态由远端音频能量驱动，收尾由账本（`playback_ended` /
+    // `turn.interrupted` / `turn.finalized`）与音频静默兜底承担。
+    case "server-message":
+      // 自研字幕 marker（`voice-sentence-start` / `voice-sentence-end`）已经退场：
+      // 字幕改由下面的官方 `bot-output` 驱动，这里只剩账本信封（在上面就已消费）。
       return;
-    case "bot-stopped-speaking": {
-      update({ state: "listening" });
-      finalizeAssistantTurn(false);
+    case "bot-output": {
+      // 官方句级路径：`new` = 整句先到（还没朗读 → 灰），`completed` = 这一句的
+      // `TTSTextFrame` 已被输出传输按真实播放节奏放行（→ 正常色）。客户端不做任何
+      // 时钟计算，游标就是服务端给的 `accumulated_text` 长度。
+      if (!activeAssistantTurnId) beginAssistantTurn();
+      const progress = (data.spoken_progress ?? data.spokenProgress) as
+        | { accumulated_text?: string; remaining_text?: string }
+        | undefined;
+      // `completed` 只表示"这一句的文本已经终稿"，**不表示音频播完了**（见
+      // `assistant.sentence.ended` 的注释）：这里把它降级成 in-progress，并且**丢掉它
+      // 带的 accumulated_text** —— 线上那条消息的 accumulated 就是整句，留着它照样会把
+      // 句子点亮（真机实测它比音频早 13.5 秒到）。`new` 则照原样开一段（预读）。
+      const spokenStatus = String(data.spoken_status ?? "");
+      const isCompleted = spokenStatus === "completed";
+      const next = applyBotOutput(assistantCaptionParts, {
+        text: String(data.text ?? ""),
+        aggregatedBy: data.aggregated_by as string | undefined,
+        spokenStatus: isCompleted ? "in-progress" : spokenStatus,
+        willBeSpoken: data.will_be_spoken as boolean | undefined,
+        accumulatedText: isCompleted ? "" : progress?.accumulated_text,
+        remainingText: progress?.remaining_text,
+        segmentId: (data.segment_id ?? data.segmentId ?? null) as number | null,
+      });
+      // 同一条消息重投（快通道 / 重连）时 reducer 原样返回，避免重复广播。
+      if (next === assistantCaptionParts) return;
+      assistantCaptionParts = next;
+      emitAssistantCaptions();
       return;
     }
-    case "bot-interrupted": {
-      update({ state: "listening" });
-      lastBotLoudAt = 0;
-      finalizeAssistantTurn(true);
-      return;
-    }
-    case "server-message": {
-      // The backend disables Pipecat's eager bot-output/bot-tts-text messages.
-      // It emits these markers only when a sentence's playback actually starts
-      // and ends (the backend schedules the delivery to the playback position),
-      // giving the canvas sentence-level captions instead of the whole LLM
-      // response.
-      const markerType = String(data.type ?? "");
-      if (markerType === "voice-sentence-start" || markerType === "voice-sentence-end") {
-        const markerId = String(data.event_id ?? data.eventId ?? "");
-        if (markerId && seenEventIds.has(markerId)) return;
-        if (markerId) seenEventIds.add(markerId);
-        const sequence = Number(data.sentence_seq ?? data.sequence);
-        if (markerType === "voice-sentence-start") {
-          appendAssistantSentence(
-            String(data.text ?? ""),
-            sequence,
-            Number(data.audio_cursor_ms),
-          );
-        } else {
-          markAssistantSentenceEnded(sequence, Number(data.audio_end_cursor_ms));
-        }
-      }
-      return;
-    }
-    case "bot-output":
     case "bot-tts-text":
-      // Deliberately ignored: these observer messages are generated before the
-      // browser has played the associated audio and caused the old eager render.
+      // 排障旁路（后端 `bot_tts_enabled=False`），不参与渲染。
       return;
     default:
       // `metrics` / `bot-ready` carry nothing the captions need.
       return;
   }
+}
+
+/**
+ * 测试与排障入口：把一条 RTVI 原始报文喂给控制器。
+ *
+ * 数据通道上走的就是这条路径（`dataChannel.onmessage` → `handleRtviMessage`）。以前这条
+ * 函数是模块私有的，于是"bot-output 进来之后字幕状态如何变化"这件事只能靠真机麦克风验证；
+ * 这里把它暴露出来，让单测能在 jsdom 里喂真实报文格式跑完整链路。
+ */
+export function ingestVoiceRtviMessage(raw: string): void {
+  handleRtviMessage(raw);
 }
 
 function emit() { for (const listener of listeners) listener(); }
@@ -1593,6 +1701,14 @@ function stopUserAudioLevelMonitor() {
   publishAudioLevel();
 }
 
+/**
+ * 麦克风电平表。
+ *
+ * 这里**只**产出 UI 用的电平（波形/球），不再参与任何"用户是不是在说话"的判断：
+ * 人声判定一律以服务端 VAD（Silero）+ 回合判定（Smart Turn）为准，即账本的
+ * `user.started` 与 RTVI 的 `vad-user-stopped-speaking` / `user-stopped-speaking`。
+ * 曾经在这里用 RMS 阈值猜"用户说完了"当兜底锚点，那是拿响度冒充 VAD。
+ */
 function startUserAudioLevelMonitor(stream: MediaStream) {
   try {
     const Ctor = window.AudioContext;
@@ -1654,6 +1770,10 @@ function startBotAudioLevelMonitor(stream: MediaStream) {
       const now = Date.now();
       if (rms > 0.01) {
         lastBotLoudAt = now;
+        // 这里**不再**打 `botSpeaking` 延迟锚点：远端音频能量只是"响不响"，它没有
+        // 回合语义，一旦落在"服务端已收尾、浏览器还在播缓冲"的空档，就会凭空开出
+        // 一轮"导师出声 0 ms / 整屏等待"的幻影轮。延迟面板的"导师出声"改用账本
+        // `assistant.sentence.playback_started`（带 turn 语义，见那里的注释）。
         if (snapshot.transport === "connected" && snapshot.state !== "speaking") {
           update({ state: "speaking" });
         }
@@ -1662,13 +1782,15 @@ function startBotAudioLevelMonitor(stream: MediaStream) {
         // A gap in the output is not the end of the answer. Sentence-by-sentence
         // synthesis leaves silence while the next sentence is still being
         // produced, and finalizing on that gap is exactly what split one answer
-        // into two bubbles. Wait for the backend's "this sentence finished
-        // playing" marker (scheduled at the true playback end), with a generous
-        // fallback so a lost marker cannot leave the bubble open forever.
+        // into two bubbles. Wait until the last announced part is `completed`
+        // (the official channel sends that when the sentence's text frame is
+        // released by the output transport, i.e. at the true playback end), with
+        // a generous fallback so a lost message cannot leave the bubble open.
         const silenceMs = now - lastBotLoudAt;
-        const lastSegment = assistantSpokenSentences[assistantSpokenSentences.length - 1];
-        const outputDrained = Boolean(lastSegment) && lastSegment.endMs !== null;
+        const lastPart = assistantCaptionParts[assistantCaptionParts.length - 1];
+        const outputDrained = Boolean(lastPart) && lastPart.status === "completed";
         if (assistantLlmComplete && (outputDrained || silenceMs > OUTPUT_DRAIN_FALLBACK_MS)) {
+          markVoiceLatency({ stage: "answerDone", source: "audio" });
           finalizeAssistantTurn(false);
         }
       }
@@ -1762,14 +1884,15 @@ export const voiceSessionController = {
       activeAssistantTurnId = "";
       assistantLlmText = "";
       assistantSpokenText = "";
-      assistantSpokenSentences = [];
-      assistantSentenceSequence = 0;
+      assistantCaptionParts = [];
       assistantLlmComplete = false;
       assistantFinalized = false;
       resetTranscriptState();
       resetTaskState();
       durableEventCount = 0;
       closedRemoteSession = null;
+      // 延迟面板按"每次通话"清空：上一通电话的耗时数字对新会话没有意义。
+      resetVoiceLatency();
     }
     update({ transport: "connecting", state: "ready", error: null, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", playbackBlocked: false });
     let remoteId: string | null = snapshot.sessionIdRemote;
@@ -1967,7 +2090,7 @@ export const voiceSessionController = {
       update({ transport: "error", state: "error", error: message });
     }
   },
-  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; lastCommittedUserTurnId = ""; resetUserSegments(); activeAssistantTurnId = ""; assistantLlmText = ""; assistantSpokenText = ""; assistantSpokenSentences = []; assistantSentenceSequence = 0; assistantLlmComplete = false; assistantFinalized = false; for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); clearVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
+  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; lastCommittedUserTurnId = ""; resetUserSegments(); activeAssistantTurnId = ""; assistantLlmText = ""; assistantSpokenText = ""; assistantCaptionParts = []; assistantLlmComplete = false; assistantFinalized = false; resetVoiceLatency(); for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); clearVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
   async interrupt() {
     // Durable first: the interrupt must reach the worker even when this page is
     // the one that lost its data channel. The RTVI path stays as a faster copy
@@ -2014,6 +2137,9 @@ export const voiceSessionController = {
     }
     pendingTyped.set(clientMessageId, { text: content });
     lastCommittedUserTurnId = clientMessageId;
+    // 打字回合也参与延迟统计：起点是"发送"这一刻（照 demo 的 text 轮），
+    // 后续环节与语音轮共用同一条链路。
+    markVoiceLatency({ stage: "userDone", source: "typed", kind: "text" });
     // Create the durable idempotent turn record up front.  The worker attaches
     // to this same turn (it is idempotent on `client_message_id`), so a typed
     // message can never become two turns.

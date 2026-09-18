@@ -113,7 +113,7 @@ import {
   transcribeDictationSegment,
 } from "@/api";
 import { VoiceCallControl, VoiceComposerActions, VoiceOrb } from "@/features/voice/voice-orb";
-import { voiceStatusText } from "@/features/voice/voice-status";
+import { voiceModelPinText, voiceStatusText } from "@/features/voice/voice-status";
 import { VoiceTaskChip } from "@/features/voice/voice-task-chip";
 import { voiceSessionController } from "@/features/voice/voice-session-controller";
 import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
@@ -141,7 +141,10 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { useConversationScrollController } from "@/features/chat/use-conversation-scroll-controller";
-import { shouldCommitVoiceRender } from "@/features/voice/voice-render-policy";
+import {
+  shouldCommitVoiceRender,
+  voiceRenderStartsSession,
+} from "@/features/voice/voice-render-policy";
 import { mergeVoiceTrace, retireVoiceRows } from "@/features/voice/voice-rows";
 import {
   Message as AiMessage,
@@ -195,9 +198,9 @@ import {
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
-  readVoiceCaptionSegments,
-  VoiceSentenceCaptions,
-} from "@/components/chat/voice-sentence-captions";
+  readVoiceCaptionParts,
+  VoiceCaptions,
+} from "@/components/chat/voice-captions";
 import {
   locateSelectionInContent,
   selectionToolbarPoint,
@@ -1968,16 +1971,17 @@ function AssistantMessageInner({
       }
     />
   );
-    // 句级字幕：文本"什么时候出现"完全由后端排期决定（收到 marker 即代表这一句
-    // 开始播放），前端只负责三态着色——未开始的句子根本不会出现在这里。
+    // 语音字幕：数据源是官方的 `bot-output`（句级路径）。整段文本随 `new` 先到并
+    // 灰着，每一句在自己的 `completed` 到达时点亮——到点由输出传输的媒体队列保证
+    // （文本帧排在那句音频后面），前端不做任何时钟计算。
     if (
       isVoiceTrace(shown.provider_trace) &&
       shown.role === "assistant" &&
       shown.status === "streaming"
     ) {
-      const captions = readVoiceCaptionSegments(part.data);
+      const captions = readVoiceCaptionParts(part.data);
       if (captions.length) {
-        return <VoiceSentenceCaptions key={part.id} segments={captions} />;
+        return <VoiceCaptions key={part.id} parts={captions} />;
       }
     }
     return rendered;
@@ -2922,6 +2926,105 @@ export function ChatCanvasPage() {
     voiceAutoDialedForRef.current = key;
     void voiceSessionController.connect();
   }, [voiceModeOpen, voiceReadyToDial, workspaceId, sessionId]);
+  // 「新会话」= 换一个会话，不是"在同一个会话里继续"：通话属于它所在的那个会话，
+  // 所以工作区外壳在建会话前先广播这个事件，这里把通话挂断并退出语音模式。
+  //
+  // 不这么做会有两个后果：上面那次自动拨号会因为 key（工作区:会话）变了而把上一通
+  // 电话带进新会话，用户看到的新会话"还在上一通电话里"；而新会话本该是一张白纸。
+  useEffect(() => {
+    const hangUpForNewConversation = () => {
+      // 没开过通话（快照里连会话都没有）时不动控制器：快照是全局单例，空会话上的
+      // disconnect() 只会做一轮没有对象的清理。
+      if (voiceSessionController.getSnapshot().sessionId) {
+        voiceSessionController.disconnect();
+      }
+      setVoiceModeOpen(false);
+    };
+    window.addEventListener(
+      "learngraph:new-conversation",
+      hangUpForNewConversation,
+    );
+    return () =>
+      window.removeEventListener(
+        "learngraph:new-conversation",
+        hangUpForNewConversation,
+      );
+  }, []);
+  // 语音会话的自动命名。
+  //
+  // 文本路径在 `message.accepted` 那一刻就拿到了首条用户消息的 id，随即调用
+  // `/auto-title`；语音路径没有那条事件，只能等这条消息**已经能被看见**再动手。
+  // 而它是后端在 `turn.finalized` **之后**才写进 messages 的，所以这里要按节奏补取
+  // 几次历史查询（`pending` 集合一直挂着，直到那一条真的出现）。
+  //
+  // 命名权只属于本会话的首条用户消息——后端 `auto_title_session` 会再校验一次
+  // `source_message_id`，所以这里读到的"第一条"必须和它看到的是同一条。
+  const voiceTitlePendingRef = useRef<Set<string>>(new Set());
+  const voiceTitleRequestedRef = useRef<Set<string>>(new Set());
+  const voiceTitleRefetchTimers = useRef<number[]>([]);
+  useEffect(
+    () => () => {
+      voiceTitleRefetchTimers.current.forEach((timer) =>
+        window.clearTimeout(timer),
+      );
+    },
+    [],
+  );
+  const armVoiceTitleRefetch = useCallback(
+    (targetSessionId: string) => {
+      if (
+        !targetSessionId ||
+        voiceTitlePendingRef.current.has(targetSessionId) ||
+        voiceTitleRequestedRef.current.has(targetSessionId)
+      ) {
+        return;
+      }
+      voiceTitlePendingRef.current.add(targetSessionId);
+      // 节奏与流式收尾的 retryPersistedReconciliation 一致：取早了会读到还没落库的
+      // 历史，而这条消息只会被写一次。
+      for (const delay of [400, 1_500, 4_000]) {
+        voiceTitleRefetchTimers.current.push(
+          window.setTimeout(() => {
+            if (!voiceTitlePendingRef.current.has(targetSessionId)) return;
+            void queryClient.invalidateQueries({
+              queryKey: workspaceQueryKey(
+                workspaceId,
+                "messages",
+                targetSessionId,
+              ),
+            });
+          }, delay),
+        );
+      }
+    },
+    [queryClient, workspaceId],
+  );
+  // 语音回合与文本首条消息同等地位：一条用户话落定，这个会话就不再是"空草稿"。
+  // 少了这一步，侧栏会继续把它当草稿藏着（空草稿不列出），点「新会话」还会被复用
+  // 回同一个会话——用户看到的就是"没离开上一通电话"。
+  //
+  // 这条判据不跟着"画布是否在渲染"走（所以没有并进下面那个 effect）：通话可以
+  // 在退出语音模式后仍然活着（刷新/切页后的「回到通话中」），那时用户说的话
+  // 同样属于这个会话。
+  useEffect(() => {
+    const onVoiceTurnSettled = (event: Event) => {
+      const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
+      if (!item || !voiceRenderStartsSession(item)) return;
+      // 同样只认当前会话：别的会话的回调不能把这里的草稿毕业掉。
+      if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
+      clearDraftSessionId(sessionId);
+      window.dispatchEvent(
+        new CustomEvent("learngraph:session-started", {
+          detail: { sessionId },
+        }),
+      );
+      markSessionTouched(sessionId);
+      armVoiceTitleRefetch(sessionId);
+    };
+    window.addEventListener("learngraph:voice-render", onVoiceTurnSettled);
+    return () =>
+      window.removeEventListener("learngraph:voice-render", onVoiceTurnSettled);
+  }, [armVoiceTitleRefetch, sessionId]);
   // Voice turns → the conversation canvas.
   //
   // Interim speech and the tutor's answer are rendered live now: they used to be
@@ -2949,14 +3052,14 @@ export function ChatCanvasPage() {
           : item.final
             ? "completed"
             : "streaming";
-      // Every sentence already spoken, in order; the last one is being read aloud
-      // right now and is the only part marked `streaming`.
-      const spoken = item.role === "assistant" ? (item.spokenSegments ?? []) : [];
-      // 整段回答仍是**一个块**（不是一句一段），块的族色由每一句自己的状态决定：
-      // 正在朗读的那句淡一档，读完的回归正文色。
-      const live = !item.final && spoken.length > 0;
-      const spokenText = spoken.map((segment) => segment.text).join("");
-      const parts: MessagePart[] = spoken.length
+      // 官方 `bot-output` 宣布过的段落，按到达顺序；每段自带"已读游标"。
+      const captions =
+        item.role === "assistant" ? (item.captionParts ?? []) : [];
+      // 整段回答仍是**一个块**（不是一句一段）：这一块里既有已经点亮的句子，也有还没
+      // 朗读的灰字（官方 Karaoke 的预读）。灰字只活在前端内存里，刷新/打断即消失。
+      const live = !item.final && captions.length > 0;
+      const spokenText = captions.map((caption) => caption.text).join("");
+      const parts: MessagePart[] = captions.length
         ? [
             {
               id: `temp-voice-part-${item.id}`,
@@ -2966,14 +3069,16 @@ export function ChatCanvasPage() {
                 : "completed") as MessagePart["status"],
               content: spokenText,
               sequence: 0,
-              // 句级字幕：每一句带上"是否正在朗读"（= 还没收到它的 end marker）。
-              // 未开始的句子不在这个数组里 —— 后端根本还没把它的文本发过来。
+              // 每段原样交给渲染器：Karaoke 模式下它把未读部分画成灰字。
               data: {
                 kind: "final_answer",
                 voice_captions: {
-                  segments: spoken.map((segment) => ({
-                    text: segment.text,
-                    reading: segment.endMs === null,
+                  parts: captions.map((caption) => ({
+                    text: caption.text,
+                    segmentId: caption.segmentId,
+                    spokenChars: caption.spokenChars,
+                    status: caption.status,
+                    willBeSpoken: caption.willBeSpoken,
                   })),
                 },
               },
@@ -3048,7 +3153,7 @@ export function ChatCanvasPage() {
     return () => {
       window.removeEventListener("learngraph:voice-render", onVoiceRender);
     };
-  }, [sessionId, voiceModeOpen, workspaceId]);
+  }, [armVoiceTitleRefetch, sessionId, voiceModeOpen, workspaceId]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -4777,6 +4882,13 @@ export function ChatCanvasPage() {
     }
     return undefined;
   }, [messages]);
+  // 追问提示只服务文本输入框的回合：语音回合的回答不做锚点，空会话没有回合可锚。
+  // 两者都是「结构性不可锚定」，所以要掐掉整条链路（读、生成、pending、error 一起
+  // 失效），而不是把 anchor 置成 null —— null 是「无需锚点」的合法值，会让门控放行
+  // 并弹出「正在生成问题提示…」。
+  const suggestionAnchorIsVoice = Boolean(
+    latestAssistantMessage && isVoiceTrace(latestAssistantMessage.provider_trace),
+  );
   const suggestionAnchor = isEmptySession
     ? null
     : latestAssistantMessage?.status === "completed"
@@ -4833,6 +4945,93 @@ export function ChatCanvasPage() {
       ),
     [settings.data],
   );
+  /**
+   * 自动命名成功后把新标题写回侧栏缓存。
+   *
+   * 文本路径与语音路径共用：标题是会话的属性，不是某条传输路径的属性，所以两条路径
+   * 只允许在"触发点"上不同，落盘后的收敛必须一致。
+   */
+  const applyGeneratedSessionTitle = useCallback(
+    async (updatedSession: Session) => {
+      queryClient.setQueryData<Session[]>(
+        workspaceQueryKey(workspaceId, "sessions"),
+        (current) => {
+          if (!current) return [updatedSession];
+          if (!current.some((item) => item.id === updatedSession.id)) {
+            return [updatedSession, ...current];
+          }
+          return current.map((item) =>
+            item.id === updatedSession.id
+              ? { ...item, title: updatedSession.title }
+              : item,
+          );
+        },
+      );
+      await queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "sessions"),
+      });
+    },
+    [queryClient, workspaceId],
+  );
+  // 语音会话的自动命名触发点。
+  //
+  // 触发条件是"这个会话的首条用户消息就是语音回合"：文本回合有它自己的触发点
+  // （`message.accepted`），两边都动手会为同一个会话各付一次模型调用。
+  useEffect(() => {
+    if (sessionId === "new" || !voiceTitlePendingRef.current.has(sessionId))
+      return;
+    if (!history.isSuccess) return;
+    const firstUser = (history.data ?? []).find(
+      (message) => message.role === "user" && message.session_id === sessionId,
+    );
+    // 还没落库：等 `armVoiceTitleRefetch` 补的那几次重取。
+    if (!firstUser) return;
+    // 尾巴窗口里的"第一条"不一定真的是首条：只有从时间线头部开始的窗口才认得出首条。
+    // 认错了后端会以 source_message_id 不符拒掉，那是一次白付的模型调用。
+    if (historyHasMoreBefore) return;
+    voiceTitlePendingRef.current.delete(sessionId);
+    if (!currentSession || !isVoiceTrace(firstUser.provider_trace)) return;
+    // 标题已经不是默认值：有人先命名过（或用户改过名），不再插手。
+    if (!isDefaultDraftTitle(currentSession.title)) return;
+    if (voiceTitleRequestedRef.current.has(sessionId)) return;
+    voiceTitleRequestedRef.current.add(sessionId);
+    // 模型沿用设置里的自动命名模型；没配就沿用这通话用的那个（与文本路径
+    // 回退到本次请求模型同构），两个都没有时交给后端的工作区默认模型。
+    // 快照在这里现取：把它写进依赖数组会让这个 effect 跟着每一次音量
+    // 跳动重跑，而它真正关心的只有"哪条消息是首条"。
+    const call = voiceSessionController.getSnapshot();
+    const callModel = call.sessionId === sessionId ? call : null;
+    void autoTitleSession(sessionId, {
+      source_message_id: firstUser.id,
+      expected_title: currentSession.title,
+      provider_id: autoTitleModel.provider_id ?? callModel?.providerId ?? undefined,
+      model_id: autoTitleModel.model_id ?? callModel?.modelId ?? undefined,
+    })
+      .then(applyGeneratedSessionTitle)
+      .catch((error: unknown) => {
+        if (
+          error instanceof ApiError &&
+          error.code === "session_title_changed"
+        ) {
+          void queryClient.invalidateQueries({
+            queryKey: workspaceQueryKey(workspaceId, "sessions"),
+          });
+          return;
+        }
+        // 通话中弹一句"命名失败"只会打断用户，而后果（标题保持默认、可以手动改）
+        // 与文本路径失败时一样；这里不额外打扰。
+      });
+  }, [
+    applyGeneratedSessionTitle,
+    autoTitleModel,
+    currentSession,
+    history.data,
+    history.isSuccess,
+    historyHasMoreBefore,
+    queryClient,
+    sessionId,
+    workspaceId,
+  ]);
   const suggestedPromptsModel = useMemo(
     () =>
       readChatFeatureModelSetting(
@@ -4893,11 +5092,17 @@ export function ChatCanvasPage() {
   }, [asrHotwords, saveAsrHotwords]);
   // 全双工语音模式是一通「通话」：画布里不该再出现「接下来可以问」这种需要点选
   // 才能继续的提示卡，也不该为它去读/生成提示（生成失败还会弹「问题提示生成失败」）。
-  // 这里把整条提示链路关掉——读、生成、pending、error 全部随之失效；挂断退出语音
-  // 模式后条件恢复，提示会自动回来。
+  // `!voiceBlocksComposer` 只覆盖通话进行中，挂断后会立刻复原——所以真正的口径放在
+  // 锚点上：语音回合的回答永不充当锚点（`!suggestionAnchorIsVoice`）。通话结束后提示
+  // 不会自己回来，直到用户在输入框里发出一轮文本回合。
+  //
+  // 空会话同理：还没有任何回合可锚，开场提示来自工作区记忆（客户端），不该为它读库、
+  // 调模型，也不该写下批次行。
   const canPrepareSuggestedPrompts = Boolean(
     !goalMode &&
       !voiceBlocksComposer &&
+      !suggestionAnchorIsVoice &&
+      !isEmptySession &&
       settings.isSuccess &&
       suggestedPromptsEnabled &&
       sessions.isSuccess &&
@@ -6199,29 +6404,7 @@ export function ChatCanvasPage() {
                       autoTitleModel.provider_id ?? requestProvider.id,
                     model_id: autoTitleModel.model_id ?? requestModelId,
                   })
-                    .then(async (updatedSession) => {
-                      queryClient.setQueryData<Session[]>(
-                        workspaceQueryKey(workspaceId, "sessions"),
-                        (current) => {
-                          if (!current) return [updatedSession];
-                          if (
-                            !current.some(
-                              (item) => item.id === updatedSession.id,
-                            )
-                          ) {
-                            return [updatedSession, ...current];
-                          }
-                          return current.map((item) =>
-                            item.id === updatedSession.id
-                              ? { ...item, title: updatedSession.title }
-                              : item,
-                          );
-                        },
-                      );
-                      await queryClient.invalidateQueries({
-                        queryKey: workspaceQueryKey(workspaceId, "sessions"),
-                      });
-                    })
+                    .then(applyGeneratedSessionTitle)
                     .catch(async (error: unknown) => {
                       if (
                         error instanceof ApiError &&
@@ -6459,6 +6642,7 @@ export function ChatCanvasPage() {
       queryClient,
       activeModelProvider,
       activeImageProvider,
+      applyGeneratedSessionTitle,
       autoTitleModel,
       currentSession,
       generationMode,
@@ -8522,6 +8706,22 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       responseMode !== "agentic" &&
       goalFlow.stage !== "capture",
   );
+  // 右槽（输入框右下角那一格）三态判定，2026-09-17 修订。
+  //
+  // 这里原来是「输入框为空 → 只渲染全双工语音入口 / 有文字 → 只渲染发送键」的
+  // 二选一，于是「回答进行中」这个恰恰最需要中断的场景落在空输入框那一支，
+  // 中断键根本不挂载；而 `queueOnClick`（有文字 + 正在回答 = 排队发送）又把
+  // `onStop` 抹成 undefined，onStop 分支成了死代码。现在把三态显式写开：
+  //
+  //   非语音模式 + 空文字 + 正在回答 -> 中断键，占用语音入口的格子
+  //   非语音模式 + 空文字 + 空闲     -> 全双工语音入口，且这是它唯一可用的时机
+  //   其余（有文字、语音模式内）     -> 沿用原语义，有文字时仍走排队发送
+  //
+  // 目标流程（`goalFlow.busy`）没有取消 API，期间不给中断键，语音入口维持
+  // 渲染但置灰 —— 否则那一格会空掉。
+  const voiceDialBlocked = streamOrSubmitted || goalFlow.busy;
+  const composerShowsInterrupt =
+    !voiceModeOpen && !composerHasText && streamOrSubmitted && !goalFlow.busy;
   const goalStageLabel =
     goalFlow.stage === "capture"
       ? "描述目标"
@@ -9202,7 +9402,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             });
           }}
         >
-          {isEmptySession && !goalMode ? (
+          {isEmptySession && !goalMode && !voiceModeOpen ? (
             <EmptySessionPrompts
               disabled={
                 history.isPending || status !== "ready" || sessionIsClosed
@@ -9857,15 +10057,20 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             })}
           </div>
         ) : null}
-        {/* 彩色球：通话状态的视觉指示（2026-09-15 恢复）。
+        {/* 彩色球：通话状态的视觉指示 + 可拖拽的物理小球（2026-09-15 恢复；
+            2026-09-18 改为 canvas 绘制，移植 demo-voice2o2 的「呼吸彩球」）。
             它是「指示器」不是控件——静音与挂断仍在输入条上；拨号宿主仍在本页面
             （见上面的 voiceAutoDialedForRef），球体本身不再自行 connect()，否则
-            进入语音模式会开出第二通电话。内联排布在状态行之上，不做绝对定位，
-            因此不会遮住它正在描述的对话。 */}
+            进入语音模式会开出第二通电话。
+            球体画在挂到 <body> 的 fixed 浮层上，可以被拖到屏幕任意位置、抛出后
+            撞边回弹再回到这里的 84px 锚点；浮层不进布局，所以拖拽与抛出都不会
+            影响文字边距——但它也不再保证「绝不遮住对话」（抛出时球会从消息上方
+            越过，这正是悬浮的代价）。
+            自 2026-09-18 起色相持续流转（并随点击加速），不再按说话方配色，
+            「谁在说话」改由球体的运动方式体现，不再由颜色体现。 */}
         {voiceModeOpen ? (
           <VoiceOrb
             audioLevel={voiceSnapshotForGating.audioLevel}
-            audioSource={voiceSnapshotForGating.audioSource}
             error={voiceSnapshotForGating.error}
             muted={voiceSnapshotForGating.muted}
             state={voiceSnapshotForGating.state}
@@ -9891,11 +10096,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 voiceSnapshotForGating.state,
                 voiceSnapshotForGating.error,
               )}
-              {voiceSnapshotForGating.modelPin
-                ? voiceSnapshotForGating.modelPin.repointed
-                  ? ` · 已切换到「${voiceSnapshotForGating.modelPin.effectiveModelId ?? voiceSnapshotForGating.modelPin.requestedModelId}」，下一轮生效`
-                  : ` · 本次通话仍在使用「${voiceSnapshotForGating.modelPin.effectiveModelId ?? "当前模型"}」，「${voiceSnapshotForGating.modelPin.requestedModelId ?? "新模型"}」将在下次接通后生效`
-                : ""}
+              {/* 模型 pin 的文案统一由 voiceModelPinText 给：它只在**真的换过模型**
+                  时才有内容，缺失的模型名也绝不用占位符冒充——一个叫「新模型」的
+                  模型并不存在，那是把上下文快照事件误当模型声明时的产物。 */}
+              {voiceModelPinText(voiceSnapshotForGating.modelPin)}
               {voiceSnapshotForGating.icePath
                 ? ` · ${voiceSnapshotForGating.icePath.relayed ? "中继连接" : "直连"}（${voiceSnapshotForGating.icePath.label}）`
                 : ""}
@@ -9938,6 +10142,18 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 role="status"
               >
                 {voiceSnapshotForGating.degradedNotice}
+              </p>
+            ) : null}
+            {voiceSnapshotForGating.pipelineNotice ? (
+              // 「前台要求关闭思考，但这个模型表达不出来」这类提醒必须说出来：通话本身
+              // 是好的，只是每轮首字明显变慢，用户不知道就会以为服务坏了。它不是降级
+              // （不放开文字输入、不静音麦克风），所以不进 degradedNotice。
+              <p
+                aria-live="polite"
+                className="chat-voice-degraded-note is-pipeline-notice"
+                role="status"
+              >
+                {voiceSnapshotForGating.pipelineNotice}
               </p>
             ) : null}
           </>
@@ -10565,9 +10781,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   sessionId={sessionId}
                   workspaceId={workspaceId}
                 />}
-            {composerText.trim() === "" ? (
+            {!(composerHasText || composerShowsInterrupt) ? (
               <VoiceCallControl
                 active={voiceModeOpen}
+                disabled={voiceDialBlocked}
                 modelId={selectedModelId}
                 onExit={() => setVoiceModeOpen(false)}
                 onStart={() => setVoiceModeOpen(true)}
@@ -10580,36 +10797,46 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               aria-label={
                 queueOnClick
                   ? "发送消息（加入队列）"
-                  : streamOrSubmitted || goalFlow.busy
-                    ? "停止生成"
+                  : composerShowsInterrupt ||
+                      streamOrSubmitted ||
+                      goalFlow.busy
+                    ? "中断回答"
                     : "发送消息"
               }
               className={cn(
                 "chat-composer__submit",
-                status === "streaming" &&
+                (composerShowsInterrupt || status === "streaming") &&
                   !queueOnClick &&
                   "chat-composer__submit--stop",
               )}
               disabled={
-                !activeGenerationProvider ||
-                !activeGenerationModelId ||
-                sessionIsClosed ||
-                closeSessionMutation.isPending ||
-                goalFlow.busy ||
-                goalComposerLocked
+                composerShowsInterrupt
+                  ? false
+                  : !activeGenerationProvider ||
+                    !activeGenerationModelId ||
+                    sessionIsClosed ||
+                    closeSessionMutation.isPending ||
+                    goalFlow.busy ||
+                    goalComposerLocked
               }
               onStop={
-                streamOrSubmitted && !queueOnClick
-                  ? stopCurrentGeneration
-                  : undefined
+                composerShowsInterrupt ? stopCurrentGeneration : undefined
               }
-              status={goalFlow.busy ? "submitted" : status}
+              status={
+                // 中断态一律按 streaming 渲染：图标是方块而不是 spinner，
+                // 「思考中」阶段同样要一眼看出可以打断。
+                composerShowsInterrupt
+                  ? "streaming"
+                  : goalFlow.busy
+                    ? "submitted"
+                    : status
+              }
             >
               {goalFlow.busy ? (
                 <LoaderCircle className="size-3.5 animate-spin" />
               ) : queueOnClick ? (
                 <ArrowUp className="size-4" />
-              ) : status === "streaming" ? (
+              ) : composerShowsInterrupt || status === "streaming" ? (
                 <Square className="size-3.5" color="#111" fill="#111" strokeWidth={0} />
               ) : status === "submitted" ? (
                 <LoaderCircle className="size-3.5 animate-spin" />

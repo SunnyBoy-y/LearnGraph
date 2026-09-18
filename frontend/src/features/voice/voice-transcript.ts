@@ -474,23 +474,52 @@ export interface ModelPinState {
 /**
  * Interpret a `context.updated` event as a model-pin statement.
  *
- * The rule that matters: **absence of confirmation is never treated as
- * confirmation.** Only an explicit `repointed: true` (meaning the running
- * pipeline re-pointed its LLM service) is allowed to change the model the UI
- * presents as live; anything else keeps the previous effective model and marks
- * the switch as taking effect on the next connection. A backend that does not
- * report `repointed` at all therefore degrades to the honest answer instead of
- * silently claiming a switch that may not have happened.
+ * Three different things share this event type, and only one of them is about
+ * the model:
+ *
+ * 1. a switch request from the control plane (`reason: "model_switch"`, or any
+ *    event that names the requested `model_id` on an older backend);
+ * 2. a context-snapshot write (`reason: "context_snapshot"`) — emitted on every
+ *    call creation, nothing to do with the model;
+ * 3. the running pipeline's report (`origin: "pipeline"`), which answers 1 or 2.
+ *
+ * Two rules decide whether this event says anything about the model at all, and
+ * `null` is the honest answer when it does not (the caller then keeps whatever
+ * pin it already had):
+ *
+ * - a context snapshot (2) is never a model statement, and neither is any other
+ *   event that names no model and asks for no switch;
+ * - a report (3) never *invents* a pin, because a report carries no user request.
+ *
+ * After that, the rule that matters: **absence of confirmation is never treated
+ * as confirmation.** Only an explicit `repointed: true` may change the model the
+ * UI presents as live; anything else keeps the previous effective model and marks
+ * the switch as taking effect on the next connection.
+ *
+ * The snapshot exclusion is what fixed a false banner: every call creation writes
+ * a context snapshot, the client replayed that event and rendered
+ * "本次通话仍在使用「X」，「新模型」将在下次接通后生效" on a call where nothing
+ * was switched at all.
  */
 export function deriveModelPin(
   payload: Record<string, unknown>,
   event: { session_epoch?: number },
   previousEffectiveModelId: string | null,
-): ModelPinState {
-  const requested =
+  previousPin: ModelPinState | null = null,
+): ModelPinState | null {
+  const reportedRequest =
     (payload.model_id as string | undefined) ??
     (payload.requested_model_id as string | undefined) ??
     null;
+  const reason = typeof payload.reason === "string" ? payload.reason : "";
+  const isPipelineReport = payload.origin === "pipeline";
+  const asksForSwitch = reason === "model_switch" || Boolean(reportedRequest);
+  // 无关事件（上下文快照等）：不建立、也不改写 pin。
+  if (!isPipelineReport && !asksForSwitch) return null;
+  // 回执是"对某次请求的答复"：没有请求、也没有既有 pin 时，不能凭它造出一条声明。
+  if (isPipelineReport && !asksForSwitch && !previousPin) return null;
+
+  const requested = reportedRequest ?? previousPin?.requestedModelId ?? null;
   const repointed = payload.repointed === true;
   const reported = payload.effective_model_id as string | undefined;
   return {

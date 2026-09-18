@@ -1,22 +1,40 @@
 """DashScope 实时语音识别（qwen3-asr-flash-realtime）— Pipecat STTService 适配。
 
 协议（阿里云百炼 Qwen-ASR-Realtime，与忆伴 Agent/src/voice/stt.py 同源）：
-  -> session.update（turn_detection=null，即 Manual 模式）
+  -> session.update（turn_detection=null → Manual；server_vad → 云端 VAD）
   -> input_audio_buffer.append(base64 16k PCM)
-  -> input_audio_buffer.commit（由本机回合结束信号触发）
+  -> input_audio_buffer.commit（Manual：由本机"这句说完"信号触发）
+  -> 追加一段静音 PCM（云端 VAD：同样的触发，见下）
+  <- input_audio_buffer.speech_started / speech_stopped（云端 VAD 的段边界）
   <- conversation.item.input_audio_transcription.text（partial，两种模式均下发）
   <- conversation.item.input_audio_transcription.completed（final）
   -> session.finish（关闭前；服务端回 session.finished 后才断开）
 
-**Manual 模式是必须的**：官方文档对 ``input_audio_buffer.commit`` 明确标注
-"禁用场景：VAD 模式"。旧实现把 session 配成 ``server_vad`` 却又在回合结束
-时发 commit —— 该事件会被忽略，本机回合结束信号永远无法提前 finalize。
-因此通话链路必须关闭云端 VAD，回合边界完全交给本机 Silero VAD + Smart Turn v3。
+**两种断句模式，默认云端 VAD（2026-09-18 起）**：
 
-**由此 commit 成为硬依赖**：Manual 模式没有任何自动断句，必须由
-``UserStoppedSpeakingFrame``（Pipecat 用户聚合器在停策略触发时广播）驱动
-commit，否则永远不会产生 final 转录。``DASHSCOPE_ASR_COMMIT_ON_EOU=0``
-仅用于排障，开启状态下会让本服务不产生任何 final。
+* **云端 VAD（默认，``DASHSCOPE_ASR_TURN_DETECTION=server_vad``）**：由云端自己判断
+  "这段音频算不算语音、在哪里结束"，因此环境噪音不再被当成一句"嗯"送进转录并打断
+  对话（`threshold`/`silence_duration_ms` 见 ``_build_session_update``）。代价是段尾
+  必须由我们补：本机为了省带宽把静音挡在门外（见下面第 2 条"语音门闩"），云端因此
+  **永远看不到"静音"这个结束信号**，于是本地判定"这句说完了"时主动补一段 ≥
+  ``silence_duration_ms`` 的静音 PCM，云端 VAD 立即 finish 本段并下发 final。
+  但本机能量尾巴（``DASHSCOPE_ASR_ENERGY_STOP_SECS``，默认 0.4s，与云端
+  ``silence_duration_ms`` 等长）期间送出去的正是"安静帧"，云端往往**先我们一步**
+  自己 ``committed``；那时再补静音就是往空缓冲里灌静音——拿不到 final、多付一段
+  计费，还会让"补了几段／回收了几段"的账永久拉偏（``cloud_vad_no_final`` 误报的
+  来源，2026-09-18 修）。现在的规则是：服务端的 ``committed`` 会复位本地"自上次交接
+  以来听到过语音"的门闩（等价于我们自己的 commit/补静音完成了一次交接），因此 EOU
+  时不会再补；真需要补时也只在"服务端手里还有未提交音频"时才发（见
+  ``_finish_segment``）；而"补静音后没有 final"只有在**这条连接从未见过
+  ``committed``** 时才算真故障（见 ``_check_pad_stall``）。
+* **Manual（``=none``）**：官方文档对 ``input_audio_buffer.commit`` 标注
+  "禁用场景：VAD 模式"，所以 Manual 下 commit 既是唯一的 finalize 手段，也是产生
+  final 的唯一触发点；回合边界完全交给本机 Silero VAD + Smart Turn v3。
+
+两种模式由 ``_finish_segment()`` 统一分发（Manual → commit；云端 VAD → 补静音），
+调用点、门闩与"任何已收到的 final 都必须变成文本"的契约完全一致。
+``DASHSCOPE_ASR_COMMIT_ON_EOU=0`` 仅用于排障，开启状态下 Manual 模式不会有任何
+final 转录。
 
 **连接生命周期与"有人在说话"解耦（2026-09-16 硬化）**：上游会话此前完全跟随
 通话存活——静音、长时间没人说话、乃至本机 VAD 根本没生效时，都会整通占着一条
@@ -32,7 +50,9 @@ append ≤ 15 MiB，总缓冲无上限）。本服务现在遵守三条契约：
    VAD/打断链路不依赖这条 socket，所以插话依然即时生效。
 2. **语音门闩**：只有"当前确实有语音活动"（本机 VAD 帧或 PCM 能量）才向上游
    append / 触发重连。静音帧既不再无脑灌进云端缓冲，也不会把 4 次退避的重连
-   循环压在音频处理路径上（旧行为：``_ws is None`` 时每一帧都重连一轮）。
+   循环压在音频处理路径上（旧行为：``_ws is None`` 时每一帧都重连一轮）。云端 VAD
+   模式下这条门闩更严格：**任何静音都不外送**（Manual 模式仍保留"最后一个信号之后
+   2s 内继续送"的句尾尾巴）。理由见模块开头——送静音等于把段尾判定权交给云端。
 3. **能量兜底**：本机 VAD 帧缺席时，PCM 能量仍会置位 ``_speech_seen`` 并触发
    commit。修复前"VAD 不产生帧"等于"这个人说的话永远出不了 final 且没有任何
    报错"——因为 commit 与 partial **都**只认 VAD 帧。
@@ -68,6 +88,8 @@ from typing import Any, AsyncGenerator
 import websockets
 from loguru import logger
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
@@ -83,6 +105,7 @@ from pipecat.utils.time import time_now_iso8601
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from app.voice.embedded_timeline import timeline_mark
+from app.voice.embedded_turn_intent import is_backchannel
 
 
 # interim 字幕单条长度上限：partial 的 ``text`` 是整段单调增长的假设文本，
@@ -115,6 +138,19 @@ _MIN_COMMIT_SPEECH_SECS = DEFAULT_ENERGY_ONSET_SECS
 # 队列（见 ``process_frame`` 中 ``UserStoppedSpeakingFrame`` 的处理），留着这类
 # 僵尸记录会让下一个 final 被错配到它身上。
 _PENDING_COMMIT_MAX_AGE_SECS = 20.0
+# 云端 VAD（``turn_detection=server_vad``）的默认参数：官方推荐值。
+DEFAULT_VAD_SILENCE_MS = 400.0
+# 官方对 ``silence_duration_ms`` 的取值范围。
+VAD_SILENCE_RANGE_MS = (200.0, 6000.0)
+DEFAULT_VAD_THRESHOLD = 0.0
+# 补静音在 ``silence_duration_ms`` 之上留的余量：云端必须从"最后那段静音"里判出段尾，
+# 刚好等于阈值时边界太脆（采样/分片对齐），多给 200ms 让判定稳定落在我们这一侧。
+DEFAULT_SEGMENT_SILENCE_MARGIN_MS = 200.0
+# 补静音的分片长度：单条 append 保持小而密，避免与真实音频帧的节奏差太远。
+SEGMENT_SILENCE_CHUNK_MS = 100.0
+# 云端的 final 没在这么久内回来，就认为"补静音没能让它收尾"（配置没生效/服务端不
+# 支持 VAD/网络抖动），报一条 notice——不能让它静默退化成另一种哑麦。
+DEFAULT_PAD_FINAL_GRACE_SECS = 2.5
 # "丢掉的 final" 的上报节流。用户可见的"我说了话却什么都没发生"必须在 durable log
 # 里留下痕迹，但一条已经坏掉的会话不该把日志刷满。
 _FINAL_DROP_NOTICE_INTERVAL_SECS = 60.0
@@ -160,9 +196,14 @@ class DashScopeSTTSettings(STTSettings):
     # 枚举再映射为服务侧代码，而 DashScope 只认原始 ISO 代码（v1.1 已修过
     # zh-CN→zh 同类问题），直接下发可避免二次转换。
     asr_language: str = "zh"
-    # 保留字段：Manual 模式下云端 VAD 已关闭，该值不再被使用，
-    # 仅为兼容既有调用方（embedded_bot.py 仍会传 silence_ms）。
+    # 断句模式：``server_vad``（云端 VAD，默认）| ``none``（Manual，见模块 docstring）。
+    turn_detection: str = "server_vad"
+    # 云端 VAD 判定"这一段说完了"所需的静音时长（毫秒）：官方默认 800、推荐 400、
+    # 范围 [200, 6000]。Manual 模式下该字段不被使用（但 ``embedded_bot.py`` 照旧
+    # 从 provider 配置/``DASHSCOPE_ASR_SILENCE_MS`` 透传，默认 400）。
     silence_ms: int = 400
+    # 云端 VAD 的语音灵敏度门限：官方默认 0.2、推荐 0.0（最灵敏，不吞音量偏小的说话）。
+    vad_threshold: float = 0.0
     api_key: str = ""
 
 
@@ -226,8 +267,8 @@ class DashScopeSTTService(STTService):
         )
         if not self._commit_on_eou:
             logger.warning(
-                f"{self}: DASHSCOPE_ASR_COMMIT_ON_EOU 已关闭，但 Manual 模式下"
-                " commit 是唯一的 finalize 触发手段——本服务将不会产生 final 转录。"
+                f"{self}: DASHSCOPE_ASR_COMMIT_ON_EOU 已关闭，本服务不会产生 final 转录"
+                "（Manual 模式下 commit 是唯一的 finalize 手段，云端 VAD 模式下则是补静音）。"
             )
         # 本机 VAD 自上次 commit 以来是否真的听到过语音。DashScope 在
         # Manual 模式下对"纯静音缓冲"的 commit 会稳定返回幻觉 final（实测
@@ -268,6 +309,59 @@ class DashScopeSTTService(STTService):
         self._commit_on_vad_stop = os.getenv(
             "DASHSCOPE_ASR_COMMIT_ON_VAD_STOP", "1"
         ).lower() not in ("0", "false", "no", "off")
+        # ------------------------------------------------- 断句模式（默认云端 VAD）
+        requested_mode = (
+            os.getenv("DASHSCOPE_ASR_TURN_DETECTION")
+            or settings.turn_detection
+            or "server_vad"
+        ).strip().lower()
+        if requested_mode not in ("server_vad", "none"):
+            logger.warning(
+                f"{self}: DASHSCOPE_ASR_TURN_DETECTION={requested_mode!r} 无法识别，"
+                "回落到 server_vad（none = Manual 模式）"
+            )
+            requested_mode = "server_vad"
+        self._turn_detection_mode = requested_mode
+        self._cloud_vad_enabled = requested_mode == "server_vad"
+        raw_silence = _env_float("DASHSCOPE_ASR_VAD_SILENCE_MS", settings.silence_ms or DEFAULT_VAD_SILENCE_MS)
+        low, high = VAD_SILENCE_RANGE_MS
+        self._vad_silence_ms = min(max(raw_silence, low), high)
+        if self._vad_silence_ms != raw_silence:
+            logger.warning(
+                f"{self}: silence_duration_ms={raw_silence:.0f} 超出官方范围"
+                f" [{low:.0f}, {high:.0f}]，已收敛为 {self._vad_silence_ms:.0f}"
+            )
+        self._vad_threshold = min(
+            max(_env_float("DASHSCOPE_ASR_VAD_THRESHOLD", settings.vad_threshold), -1.0),
+            1.0,
+        )
+        # 本机"这句说完了"之后补的静音长度：必须 ≥ silence_duration_ms，否则云端判不出段尾。
+        self._segment_silence_ms = _env_float(
+            "DASHSCOPE_ASR_SEGMENT_SILENCE_MS",
+            self._vad_silence_ms + DEFAULT_SEGMENT_SILENCE_MARGIN_MS,
+        )
+        if self._segment_silence_ms < self._vad_silence_ms:
+            logger.warning(
+                f"{self}: DASHSCOPE_ASR_SEGMENT_SILENCE_MS="
+                f"{self._segment_silence_ms:.0f} 小于 silence_duration_ms="
+                f"{self._vad_silence_ms:.0f} —— 云端无法判出段尾，已抬到后者"
+            )
+            self._segment_silence_ms = self._vad_silence_ms
+        self._segments_finished = 0
+        # 云端 VAD 模式的自诊断：补了静音却迟迟等不到 final 时必须留痕（见
+        # ``_check_pad_stall``）——否则"配置没生效/服务端不支持 VAD"会退化成
+        # 又一种"用户说了话却什么都没有"的哑麦，且没有任何日志。
+        self._segments_padded = 0
+        self._segments_resolved = 0
+        self._pad_stall_notified = False
+        self._pad_stall_deadline: float | None = None
+        # "云端自己在判段"的证据，以及"服务端手里还有多少没提交的音频"——补静音该不该
+        # 发，由这两个数决定（每条连接各一份，见 ``_connect``）。
+        self._server_commits = 0
+        self._audio_chunks_since_server_commit = 0
+        self._pad_final_grace_secs = _env_float(
+            "DASHSCOPE_ASR_PAD_FINAL_GRACE_SECS", DEFAULT_PAD_FINAL_GRACE_SECS
+        )
         # Optional durable journal (ASR-stage errors are reported through it) and
         # bounded reconnect bookkeeping for the upstream websocket.
         self._journal = journal
@@ -312,6 +406,12 @@ class DashScopeSTTService(STTService):
         self._notified_vad_missing = False
         self._energy_speech_episodes = 0
         self._idle_task: asyncio.Task | None = None
+        # --------------------------------------------------- 背声词门闩（见
+        # ``_is_backchannel_filler``）。``_bot_speaking`` 跟着输出传输广播的
+        # BotStarted/StoppedSpeakingFrame 走：那两个帧会沿管线上行经过本服务，
+        # 所以这里的判据与回合策略、与账本的"机器人在出声"完全同源。
+        self._bot_speaking = False
+        self._suppressed_backchannels = 0
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -514,6 +614,10 @@ class DashScopeSTTService(STTService):
         self._ws = ws
         self._event_id = 0
         self._connection_generation += 1
+        # 证据按连接重置：新连接要重新被接受 server_vad 参数，旧连接的 committed 不能
+        # 替它背书（上一版把这两个数当全局用，重连后会把真故障说成误报）。
+        self._server_commits = 0
+        self._audio_chunks_since_server_commit = 0
         self._session_finished.clear()
         # 新会话 = 新的活动时钟：空闲退役的判据必须从这里重新计时。
         now = time.monotonic()
@@ -532,16 +636,26 @@ class DashScopeSTTService(STTService):
         logger.info(f"{self}: connected to {self._settings.ws_url}")
 
     def _build_session_update(self) -> dict:
-        """构建 session.update —— **Manual 模式**（``turn_detection=null``）。
+        """构建 session.update —— 云端 VAD（默认）或 Manual（见模块 docstring）。
 
-        官方语义：``turn_detection`` 是 VAD 模式的开关；设为 ``null`` 即关闭
-        云端 VAD 并启用 Manual 模式。Manual 模式下服务端不做断句，回合边界
-        完全由本机 Silero VAD + Smart Turn v3 决定，并由
-        ``input_audio_buffer.commit`` 手动触发识别——这正是双工通话要的语义。
+        ``turn_detection`` 是 VAD 模式的开关：``null`` 关闭云端 VAD 进入 Manual
+        （官方语义），给一个 ``{"type": "server_vad", ...}`` 则开启云端 VAD。
 
-        （旧实现发的是 ``server_vad``，而该模式下 commit 属"禁用场景"，
-        导致回合结束时的 commit 被忽略、无法提前 finalize。）
+        开启云端 VAD 的目的**不是**把断句权交出去（本机 Silero VAD + Smart Turn v3
+        仍是回合边界的唯一决策者），而是借云端的语音/非语音判定把环境噪音挡在转录
+        之外——Manual 模式下任何够响的杂音都会被本机能量门送去识别，用户会看到
+        莫名其妙的"嗯"把对话打断。段尾则由 ``_pad_silence()`` 在本机判定说完时补，
+        所以云端只负责"这段算不算语音"，不负责"回合在哪结束"。
         """
+        turn_detection: dict | None = None
+        if self._cloud_vad_enabled:
+            turn_detection = {
+                "type": "server_vad",
+                # 官方默认 0.2；0.0 最灵敏（不吞音量偏小的说话），噪音过滤交给识别器。
+                "threshold": self._vad_threshold,
+                # 官方默认 800、推荐 400：这就是"我们补多长静音它才肯收尾"的阈值。
+                "silence_duration_ms": int(round(self._vad_silence_ms)),
+            }
         return {
             "event_id": self._next_event_id("session"),
             "type": "session.update",
@@ -554,7 +668,7 @@ class DashScopeSTTService(STTService):
                     "language": self._settings.asr_language or "zh",
                 },
                 # None = 关闭云端 VAD，进入 Manual 模式（commit 才合法）。
-                "turn_detection": None,
+                "turn_detection": turn_detection,
             },
         }
 
@@ -578,8 +692,22 @@ class DashScopeSTTService(STTService):
             yield None
             return
         signal, speaking = await self._note_audio(audio)
-        if not (signal or self._recent_signal()):
-            # 纯静音：不进云端缓冲，也就不需要任何连接。
+        if self._cloud_vad_enabled:
+            # 云端 VAD 模式：静音一律不外送。
+            #
+            # 云端一旦看到累积 ≥ ``silence_duration_ms`` 的静音就会自己切段，而本机
+            # VAD 允许的句中停顿（``stop_secs``）恰恰比它长——把静音送上去等于把
+            # "半句被切"的权力交出去（这正是当初改用 Manual 的原因）。这里改成
+            # 只送"本地判定正在说话"的帧，段尾由 ``_pad_silence()`` 在本机真的判定
+            # 说完时精确补上，云端因此只在我们要它收尾的时候收尾。
+            #
+            # ``speaking`` 已包含两件事：这一帧本身够响，或本机仍处于能量判定的
+            # 说话状态（含 ``_energy_stop_secs`` 的尾巴），所以句尾不会被削掉。
+            keep = speaking
+        else:
+            keep = signal or self._recent_signal()
+        if not keep:
+            # 静音：不进云端缓冲，也就不需要任何连接。
             yield None
             return
         if not self._upstream_alive():
@@ -600,6 +728,8 @@ class DashScopeSTTService(STTService):
                         }
                     )
                 )
+                # 服务端手里因此多了一段没提交的音频：补静音才有意义。
+                self._audio_chunks_since_server_commit += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"{self}: send audio failed: {exc}")
                 # 旧实现只把 ``_ws`` 置空：旧 socket 与它的读任务会一直活着（TCP
@@ -654,9 +784,9 @@ class DashScopeSTTService(STTService):
                 if self._energy_silence_secs >= self._energy_stop_secs:
                     self._energy_speech = False
                     timeline_mark("stt", "能量判定收口")
-                    # 与 VAD 停止帧同一条 commit 路径：谁先到谁提交，`_speech_seen`
-                    # 门闩保证一次语音只提交一次。
-                    await self._send_commit("energy-stop")
+                    # 与 VAD 停止帧同一条收尾路径：谁先到谁收尾，`_speech_since_commit`
+                    # 门闩保证一次语音只收尾一次。
+                    await self._finish_segment("energy-stop")
         return rms >= self._signal_rms, loud or self._energy_speech
 
     async def _note_vad_missing(self) -> None:
@@ -689,6 +819,8 @@ class DashScopeSTTService(STTService):
             await asyncio.sleep(IDLE_CHECK_INTERVAL_SECS)
             if self._closed:
                 return
+            # 与"退役"无关的独立检查：补静音有没有被服务端回应（见 _check_pad_stall）。
+            await self._check_pad_stall()
             if self._ws is None:
                 continue
             quiet_for = time.monotonic() - max(
@@ -738,6 +870,11 @@ class DashScopeSTTService(STTService):
         """
         await super().process_frame(frame, direction)
         now = time.monotonic()
+        # 机器人是否正在出声/正在作答：背声词门闩的判据（见 _is_backchannel_filler）。
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
         # 本机 VAD 判定用户开口：标记"这一轮确实有语音"，供 commit 门闩使用。
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._vad_seen = True
@@ -756,7 +893,7 @@ class DashScopeSTTService(STTService):
         # 等聚合器广播 UserStoppedSpeakingFrame（回合已经结束之后）。
         if isinstance(frame, VADUserStoppedSpeakingFrame) and self._commit_on_vad_stop:
             timeline_mark("stt", "收到 VAD 停止帧")
-            await self._send_commit("vad-stop")
+            await self._finish_segment("vad-stop")
         if isinstance(frame, UserStoppedSpeakingFrame):
             # This is a real turn boundary, unlike VADUserStoppedSpeakingFrame:
             # Smart Turn has decided that the user is done. Bumping the utterance
@@ -775,7 +912,7 @@ class DashScopeSTTService(STTService):
             self._mark_pending_commits_superseded()
             if not self._commit_on_vad_stop:
                 timeline_mark("stt", "收到回合结束帧")
-                await self._send_commit("turn-stopped")
+                await self._finish_segment("turn-stopped")
 
     def _mark_pending_commits_superseded(self) -> None:
         for commit in self._pending_commits:
@@ -838,8 +975,177 @@ class DashScopeSTTService(STTService):
             f"（最近一条 reason={reason}, text_len={text_len}），这些文本无法进入转录",
         )
 
+    def _assistant_reply_in_flight(self) -> bool:
+        """助手是否还欠着这一句的回答（== 用户此刻多半只是在回应）。
+
+        本地判据是 ``_bot_speaking``（输出传输开始写音频）；账本还多知道一段窗口：
+        用户的话已经有归属、回合还没落定——从 LLM 出第一个字到第一帧音频真的写出去
+        之间有一到几秒（实测 1~3s），而那正是用户最容易应一声「嗯」的空档。
+        """
+        if self._bot_speaking:
+            return True
+        checker = getattr(self._journal, "assistant_reply_in_flight", None)
+        if checker is None:
+            return False
+        try:
+            return bool(checker())
+        except Exception:  # noqa: BLE001 - 过滤是尽力而为，绝不能让 ASR 读循环挂掉
+            logger.debug(f"{self}: assistant reply query failed", exc_info=True)
+            return False
+
+    def _is_backchannel_filler(self, text: str) -> bool:
+        """整句都是背声词（「嗯。」「哦。」「对。」…）且助手正在作答 → 不入管线。
+
+        背声词是"我在听"的回应，不是一次发言。放它过去会做三件错事：起一个用户
+        回合、把正在播的回答打断（实测 ``嗯。`` 13ms 后 turn.interrupted，随后这
+        句背声词还被当成一个问题回答）、并污染下一轮的用户消息。因此在文本出生的
+        这一层就掐掉：账本、上屏（RTVI ``user-transcription``）、聚合器、记忆都
+        不会再看到它。
+
+        反过来，"助手在作答时才算"是刻意的：助手没在作答、回合也已落定时，孤零零
+        一个「嗯」很可能**就是**回答（"听懂了吗？"→"嗯"），那种情况必须照常放行。
+        """
+        if not text or not is_backchannel(text):
+            return False
+        if not self._assistant_reply_in_flight():
+            return False
+        self._suppressed_backchannels += 1
+        logger.debug(
+            f"{self}: suppressed backchannel while assistant is replying"
+            f" (text_len={len(text)}, total={self._suppressed_backchannels})"
+        )
+        timeline_mark("stt", "背声词滤除", f"text_len={len(text)}")
+        return True
+
+    async def _finish_segment(self, trigger: str) -> None:
+        """本机判定"这一句说完了" → 让上游把当前这一段 finalize 出来。
+
+        两种断句模式的手段不同、语义相同（见模块 docstring）：
+
+        * **Manual**：``input_audio_buffer.commit``——该模式下这是唯一的 finalize
+          手段，也是产生 final 的唯一触发点。
+        * **云端 VAD**：补一段静音 PCM。官方文档把 ``commit`` 标注为"禁用场景：VAD
+          模式"，发了会被忽略；而云端的段尾判定读的就是**收到的静音**，本机又把静音
+          挡在门外（``run_stt`` 的两个门），所以必须由我们主动补上这个"没有语音了"的
+          信号，它才会 finish 本段。
+
+        两者都只在"自上次收尾以来本机确实听到语音"（``_speech_since_commit``）时执行：
+        对一段没有语音的缓冲收尾，Manual 会拿到幻觉 final，云端 VAD 则是白发一段静音
+        （只多付计费）。
+        """
+        if self._closed or not self._upstream_alive():
+            return
+        if not self._commit_on_eou:
+            return
+        if not self._speech_since_commit():
+            logger.debug(f"{self}: skipped segment finish on EOU (no local speech this turn)")
+            return
+        if self._cloud_vad_enabled:
+            if self._server_commits and not self._audio_chunks_since_server_commit:
+                # 云端已经自己收尾了这一段，此后我们没再送过音频：补静音落进空缓冲，
+                # 等不到 final，只会多付一段静音计费，并把"补了几段/回收了几段"的账
+                # 永久拉偏（那正是 cloud_vad_no_final 误报的来源）。
+                #
+                # 正常路径上这一步已经被上一行的 ``_speech_since_commit()`` 挡住了
+                # （服务端的 committed 会复位本地门闩）；这条判据是补刀：本地 VAD 报
+                # 了"开口"、我们却因为音量门没把任何音频送上去时（门闩为真、计数为 0），
+                # 补静音同样只会白发一段。
+                logger.debug(
+                    f"{self}: skipped pad on EOU (云端已自行收尾这一段，"
+                    f"commits={self._server_commits})"
+                )
+                timeline_mark("stt", "云端已收尾，跳过补静音")
+                return
+            await self._pad_silence(trigger)
+            return
+        await self._send_commit(trigger)
+
+    async def _pad_silence(self, trigger: str) -> None:
+        """向云端追加一段静音 PCM：云端 VAD 模式下的"段尾信号"。
+
+        长度 = ``_segment_silence_ms``（默认 ``silence_duration_ms`` + 200ms 余量），
+        按 ``SEGMENT_SILENCE_CHUNK_MS`` 分片追加。追加完成后与 commit 成功一样复位
+        门闩：本段已经交给服务端了，此后用户再说话必须重新攒够语音量才值得再收尾一次。
+
+        计费说明：静音帧同样计入 STT 的音频时长（每回合多付约 0.6s），这是"让云端
+        自己收尾"的代价；换来的是噪音不再被当成一句话打断对话。
+        """
+        ws = self._ws
+        if ws is None:
+            return
+        step_ms = SEGMENT_SILENCE_CHUNK_MS
+        total_ms = float(self._segment_silence_ms)
+        silence = bytes(int(16000 * step_ms / 1000.0) * 2)  # 16k 单声道 PCM16 全零
+        encoded = base64.b64encode(silence).decode("ascii")
+        sent_ms = 0.0
+        try:
+            while sent_ms < total_ms:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "event_id": self._next_event_id("silence"),
+                            "type": "input_audio_buffer.append",
+                            "audio": encoded,
+                        }
+                    )
+                )
+                sent_ms += step_ms
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{self}: pad silence failed: {exc}")
+            await self._retire_upstream("pad_failed")
+            return
+        # 补静音是上游流量：在它触发的 final 回来之前不许退役这条会话。
+        self._last_upstream_event_at = time.monotonic()
+        self._speech_seen = False
+        self._uncommitted_speech_secs = 0.0
+        self._last_partial_text = ""
+        self._segments_finished += 1
+        self._segments_padded += 1
+        if self._pad_stall_deadline is None:
+            # 补了静音就要有一个 final 来回应它；没人回应就报出来（见 _check_pad_stall）。
+            self._pad_stall_deadline = time.monotonic() + self._pad_final_grace_secs
+        logger.debug(
+            f"{self}: padded {total_ms:.0f}ms silence to finish segment "
+            f"#{self._segments_finished} (trigger={trigger})"
+        )
+        timeline_mark("stt", "补静音收尾", f"{total_ms:.0f}ms trigger={trigger}")
+
+    async def _check_pad_stall(self) -> None:
+        """补静音之后迟迟没有 final → 报一条 notice（由空闲看门狗每秒驱动一次）。
+
+        这是新模式唯一的失败面：如果服务端不支持 ``turn_detection=server_vad``、
+        参数被拒、或者补的静音不足以让它判出段尾，用户侧的表现就是"说话没有任何反应"，
+        而那正是我们花了两轮才修掉的哑麦。宁可吵一次，也不能静默。
+        """
+        deadline = self._pad_stall_deadline
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self._pad_stall_deadline = None
+        if self._segments_resolved >= self._segments_padded or self._pad_stall_notified:
+            return
+        if self._server_commits:
+            # 这条连接里云端确实在判段（见过 ``input_audio_buffer.committed``）：本告警
+            # 的措辞（"云端 VAD 可能未生效"）就不成立，剩下的只是某次补静音落在已提交的
+            # 空缓冲上——那是我们的账没对上，不是用户的故障，只该进 DEBUG。
+            logger.debug(
+                f"{self}: pad produced no final within "
+                f"{self._pad_final_grace_secs:.1f}s, but cloud VAD already committed "
+                f"{self._server_commits} time(s) on this connection"
+            )
+            return
+        self._pad_stall_notified = True
+        message = (
+            f"补静音后 {self._pad_final_grace_secs:.1f}s 内没有收到 final"
+            f"（已补 {self._segments_padded} 段、收到 {self._segments_resolved} 段），"
+            "云端 VAD 可能未生效；可临时设 DASHSCOPE_ASR_TURN_DETECTION=none 回退 Manual"
+        )
+        logger.warning(f"{self}: {message}")
+        timeline_mark("stt", "补静音后无 final")
+        if self._journal is not None:
+            await self._journal.notice("asr", "cloud_vad_no_final", message)
+
     async def _send_commit(self, trigger: str) -> None:
-        """向 DashScope 发送 input_audio_buffer.commit，强制立即出 final。
+        """向 DashScope 发送 input_audio_buffer.commit，强制立即出 final（仅 Manual）。
 
         只有在本机 VAD（或能量兜底）自上次 commit 以来确实听到过语音时才 commit：
         静音缓冲的 commit 会拿到幻觉 final（见 ``__init__`` 的说明），进而自激出
@@ -912,6 +1218,27 @@ class DashScopeSTTService(STTService):
                 if etype == "session.finished":
                     # 收尾握手：cleanup() 等这个事件到齐后再断开连线。
                     self._session_finished.set()
+                if etype in (
+                    "input_audio_buffer.speech_started",
+                    "input_audio_buffer.speech_stopped",
+                    "input_audio_buffer.committed",
+                ):
+                    # 云端 VAD 的段边界与提交回执。排障时用它确认"云端确实在判段"，
+                    # 而不是只看我们自己补的静音；首次出现已由上面的 info 记过一次。
+                    timeline_mark("stt", f"云端{etype.rsplit('.', 1)[-1]}")
+                    if etype == "input_audio_buffer.committed":
+                        # 服务端自己收尾了这一段：它既是"云端 VAD 真的在判段"的权威证据，
+                        # 也让"还有多少音频没被提交"归零——此后没再送音频就不该再补静音。
+                        self._server_commits += 1
+                        self._audio_chunks_since_server_commit = 0
+                        # 服务端已经把这一批音频收下了，等价于我们自己的 commit/补静音完成
+                        # 过一次"交接"：本地"自上次交接以来听到过语音"的门闩必须随之复位。
+                        # 不复位就还会在 EOU 时再补一段谁也回应不了的静音——真机上
+                        # ``committed`` 比我们第一次补静音早 6–113ms，那一段永远等不到
+                        # final，补/收的账差 1，于是 ``cloud_vad_no_final`` 误报。
+                        self._speech_seen = False
+                        self._uncommitted_speech_secs = 0.0
+                        self._last_partial_text = ""
                 if "transcription" in etype:
                     # 只记事件类型与文本长度，不记转录正文（日志脱敏）。
                     logger.debug(
@@ -937,11 +1264,12 @@ class DashScopeSTTService(STTService):
                             # 4964+ 且逐字增长），interim 只用于实时字幕，
                             # 截断到尾部即可，权威文本以 final 为准。
                             display = text[-_INTERIM_MAX_CHARS:] if len(text) > _INTERIM_MAX_CHARS else text
-                            await self.push_frame(
-                                InterimTranscriptionFrame(
-                                    display, self._user_id, time_now_iso8601()
+                            if not self._is_backchannel_filler(display):
+                                await self.push_frame(
+                                    InterimTranscriptionFrame(
+                                        display, self._user_id, time_now_iso8601()
+                                    )
                                 )
-                            )
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     await self._handle_final(payload)
                 elif etype in ("error", "asr.error"):
@@ -985,6 +1313,11 @@ class DashScopeSTTService(STTService):
         """
         text = str(payload.get("transcript") or payload.get("text") or "").strip()
         self._prune_pending_commits()
+        # 任何一个 final 都算"回应了最近一次补静音"：清掉等待与告警状态。
+        # （Manual 模式 ``_segments_padded`` 恒为 0，这里等价于空操作。）
+        self._segments_resolved = min(self._segments_padded, self._segments_resolved + 1)
+        self._pad_stall_notified = False
+        self._pad_stall_deadline = None
         commit: _PendingCommit | None = None
         while self._pending_commits:
             candidate = self._pending_commits.popleft()
@@ -1004,6 +1337,34 @@ class DashScopeSTTService(STTService):
                 candidate.superseded = True
             commit = candidate
             break
+        if commit is None and self._cloud_vad_enabled:
+            # 云端 VAD 模式：这一段是服务端自己判出来的，本来就没有配对的 commit——
+            # 这是**正常路径**（语义等价于 Manual 下那条 commit 的 final），不是丢文本。
+            # 文本照常进转录，并允许它结束本回合；若按 Manual 的规则在这里丢弃，
+            # "说两轮后哑"就会以另一种形式回来（用户说了话，服务端一句日志都不留）。
+            timeline_mark("stt", "云端 VAD 收尾", f"text_len={len(text)}")
+            if not text:
+                return
+            # 用量指标如实上报（识别确实发生了），过滤只决定文本去不去管线。
+            await self.emit_stt_usage_metrics()
+            if self._is_backchannel_filler(text):
+                return
+            await self.push_frame(
+                TranscriptionFrame(
+                    text,
+                    self._user_id,
+                    time_now_iso8601(),
+                    result={
+                        "commit_id": None,
+                        "commit_trigger": "server_vad",
+                        "connection_generation": self._connection_generation,
+                        "utterance_generation": self._utterance_generation,
+                        "superseded": False,
+                    },
+                    finalized=True,
+                )
+            )
+            return
         if commit is None:
             await self._note_final_dropped(text_len=len(text), reason="unsolicited")
             return
@@ -1014,7 +1375,10 @@ class DashScopeSTTService(STTService):
         )
         if not text:
             return
+        # 用量指标如实上报（识别确实发生了），过滤只决定文本去不去管线。
         await self.emit_stt_usage_metrics()
+        if self._is_backchannel_filler(text):
+            return
         await self.push_frame(
             TranscriptionFrame(
                 text,

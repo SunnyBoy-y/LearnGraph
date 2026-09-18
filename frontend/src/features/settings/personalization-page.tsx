@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Palette, RotateCcw, Sparkles, Trash2 } from "lucide-react";
+import { Activity, Gauge, Palette, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { listSettings, updateSetting } from "@/api";
 import { clearSelectionExplanations } from "@/features/chat/selection-explanation";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
-import { isTrajectoryEnabled, TRAJECTORY_ENABLED_SETTING_KEY } from "@/lib/workspace-settings";
+import {
+  isTrajectoryEnabled,
+  isVoiceDebugPanelEnabled,
+  TRAJECTORY_ENABLED_SETTING_KEY,
+  VOICE_DEBUG_PANEL_SETTING_KEY,
+} from "@/lib/workspace-settings";
 import {
   ErrorState,
   LoadingState,
@@ -106,6 +111,23 @@ export function PersonalizationPage() {
         ],
       );
       toast.success("轨迹追踪设置已更新");
+    },
+  });
+
+  const voiceDebugEnabled = isVoiceDebugPanelEnabled(settings.data);
+  const voiceDebugSave = useMutation({
+    mutationFn: (enabled: boolean) =>
+      updateSetting(VOICE_DEBUG_PANEL_SETTING_KEY, enabled),
+    onError: (error: Error) => toast.error(error.message),
+    onSuccess: (setting) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(
+        workspaceQueryKey(workspaceId, "settings"),
+        (current) => [
+          ...(current ?? []).filter((item) => item.key !== setting.key),
+          setting,
+        ],
+      );
+      toast.success("语音调试面板设置已更新");
     },
   });
 
@@ -219,6 +241,27 @@ export function PersonalizationPage() {
             checked={trajectoryEnabled}
             disabled={trajectorySave.isPending}
             onCheckedChange={(checked) => trajectorySave.mutate(checked)}
+          />
+        </div>
+      </Surface>
+
+      <Surface className="mt-5 p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <Gauge className="mt-0.5 size-5 shrink-0 text-primary" />
+            <div className="min-w-0 text-sm leading-6 text-muted-foreground">
+              <p className="font-medium text-foreground">语音调试面板</p>
+              <p className="mt-1">
+                开启后，对话页右侧栏会显示“语音延迟”标签页，逐轮列出全双工语音的
+                识别、回合受理、模型首字、合成与播放各环节耗时，以及“从用户说完到
+                导师出声”的总耗时。关闭时该标签页完全不渲染。
+              </p>
+            </div>
+          </div>
+          <Switch
+            checked={voiceDebugEnabled}
+            disabled={voiceDebugSave.isPending}
+            onCheckedChange={(checked) => voiceDebugSave.mutate(checked)}
           />
         </div>
       </Surface>

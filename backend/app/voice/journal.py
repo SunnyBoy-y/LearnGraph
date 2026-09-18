@@ -851,6 +851,24 @@ class VoiceTurnJournal:
             return ""
         return self._spoken_assistant_text(state)
 
+    def assistant_reply_in_flight(self) -> bool:
+        """用户这句话已经有归属、助手还欠一个回答时为真（= 本回合已开且未终结）。
+
+        给背声词门闩（``DashScopeSTTService._is_backchannel_filler``）用。只要助手
+        还在作答——刚收到问题、正在生成、已经在播——用户的「嗯。」就是在回应，不是
+        一次发言；反过来，回合落定之后的「嗯」很可能**就是**回答（"听懂了吗？"→
+        "嗯"），必须放行。
+
+        实现只看"回合是否已开且未终结"，而不是"音频是否在播"：从 LLM 出第一个字到
+        第一帧音频真的写出去之间有一到几秒（实测 1~3s），而那正是用户最容易应一声
+        「嗯」的空档；只盯 ``BotStartedSpeakingFrame`` 会把它整段漏掉。
+
+        本方法只读一个快照、不加锁：判据是"回合开着吗"，偶发的一帧偏差只会让门闩
+        宽/窄一点点，而为了它去抢账本锁会把 ASR 读循环拖进死锁风险。
+        """
+        state = self._turn
+        return state is not None and not state.finalized
+
     async def playback_started(self) -> None:
         state = self._turn
         if state is not None and not state.finalized:
@@ -1410,8 +1428,18 @@ class VoiceTurnJournal:
             request_id=f"session.closed:{self.voice_session_id}",
         )
 
-    async def context_updated(self, payload: dict[str, Any]) -> None:
-        await self._emit("context.updated", payload=payload)
+    async def context_updated(
+        self, payload: dict[str, Any], *, request_id: str | None = None
+    ) -> None:
+        """Report a context/model change on the durable channel.
+
+        A worker-authored report must carry ``origin="pipeline"`` in its payload
+        and a ``request_id`` derived from the event it answers.  The payload
+        marker is what ``VoiceControlWatchdog`` uses to tell "do this" from "this
+        was done"; the request id makes the report idempotent per triggering
+        event, so even a re-read cannot append a second row.
+        """
+        await self._emit("context.updated", payload=payload, request_id=request_id)
 
 
 async def run_with_retry(
@@ -1643,6 +1671,20 @@ class VoiceControlWatchdog:
                     continue
                 await self.on_interrupt(event)
             elif event_type == "context.updated":
+                # 同样的自触发回路，落在模型上：``origin="pipeline"`` 的
+                # context.updated 是**回执**——本管线对别处请求的答复（"已把 LLM
+                # 服务指向 X 了"），不是指令。watchdog 若再执行一次
+                # ``on_model_changed``，那条回执又会写出一条新的 context.updated，
+                # 于是每秒一条、持续到挂断，而前端的模型 pin 也就永远停在
+                # "将在下次接通后生效"上。
+                payload = event.get("payload")
+                origin = payload.get("origin") if isinstance(payload, dict) else None
+                if origin == "pipeline":
+                    logger.debug(
+                        "Skipping self-authored context.updated (seq %s)",
+                        event.get("event_seq"),
+                    )
+                    continue
                 await self.on_model_changed(event)
             elif event_type == "session.closed":
                 await self.on_close("session.closed")
