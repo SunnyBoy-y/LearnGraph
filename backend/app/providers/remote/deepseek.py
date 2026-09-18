@@ -179,6 +179,12 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
         payload = super()._apply_call_options(payload, responses=responses)
         if responses:
             return payload
+        if "thinking" in payload:
+            # 已经有人显式决定过这一轮的 thinking（能力快照的 ``thinking_off`` 声明，
+            # 或 `thinking_mapping` 解析出的档位）。方言知识只有一处
+            # （``providers.dialects``），适配器不再重复判断——重复判断正是
+            # "文字关得掉、语音关不掉"那类分叉的来源。
+            return payload
         thinking_mode = self.call_options.thinking_mode if self.call_options else "off"
         payload["thinking"] = {
             "type": "disabled" if thinking_mode == "off" else "enabled"

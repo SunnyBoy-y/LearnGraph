@@ -36,6 +36,38 @@ IMAGE_INPUT_MODES: tuple[ImageInputMode, ...] = ("native", "external_vision", "a
 # for the fallback get this switch instead.
 DISABLE_THINKING_PARAMETER = "enable_thinking"
 
+# 能力未知（不在目录里、也没有用户声明）时的默认输出上限。旧的 4096 是保守值，
+# 但长结构化输出（教学包的试卷/教材）在 4096 上必被截断，而截断只会表现为
+# "结构化生成失败"，与真实原因完全不符 —— 所以默认值取一个够用的量级，再由
+# clamp_max_output_tokens 按模型真实上下文窗口收敛，避免向更小的模型乱报上限。
+DEFAULT_MAX_OUTPUT_TOKENS = 142_000
+# 输出上限之外至少要给输入留出的空间。chat 侧还要再从剩余里扣 4,096 估算输入预算，
+# 所以这里必须留够，否则"抬高默认输出上限"会顺手把对话的输入预算压到 8000 地板。
+MIN_INPUT_HEADROOM_TOKENS = 12_288
+
+
+def clamp_max_output_tokens(max_output_tokens: int, context_window_tokens: int) -> int:
+    """Bound a declared output cap by what the model's context window can hold.
+
+    A cap larger than the window is not a bigger budget — upstreams reject it
+    outright (400) or silently leave nothing for the prompt. Raising the
+    *unknown-model default* therefore has to come with this clamp, or models with
+    a small window would start failing requests they used to serve.
+
+    The reserved headroom is ``max(12_288, window / 4)``: input and output share
+    one window, and the smaller the window the less of it can be promised to the
+    output side. For the windows that matter here it is a no-op — 200k keeps
+    142k, 256k keeps 142k, 1M keeps the vendor figure — while a 32k model is
+    capped to ~20k instead of being handed a 142k promise it cannot honour.
+    """
+
+    declared = max(1, int(max_output_tokens or 0))
+    window = int(context_window_tokens or 0)
+    if window <= 0:
+        return min(declared, 1_000_000)
+    headroom = max(MIN_INPUT_HEADROOM_TOKENS, window // 4)
+    return min(declared, max(1, window - headroom), 1_000_000)
+
 
 class ModelCapabilityError(ValueError):
     """The requested call mode is not supported by the selected model snapshot."""
@@ -356,7 +388,7 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
         raise ModelCapabilityError(
             "image_input_mode=native requires supports_image_input=true"
         )
-    max_output_tokens = int(payload.get("max_output_tokens") or 4_096)
+    max_output_tokens = int(payload.get("max_output_tokens") or DEFAULT_MAX_OUTPUT_TOKENS)
     context_window_tokens, context_limit_tokens, context_source = _normalize_context_tokens(
         payload
     )
@@ -437,7 +469,7 @@ _CATALOG_BASE_CAPABILITIES: dict[str, Any] = {    "reasoning_efforts": ["low", "
     "context_limit_tokens": 204_000,
     "context_window_source": "conservative_default",
     "context_window_confidence": "unknown",
-    "max_output_tokens": 4_096,
+    "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
     "chat_compaction_ratio": 0.8,
     "agent_compaction_ratio": 1 / 3,
 }
@@ -538,8 +570,8 @@ def catalog_capability_snapshot(
     merged["context_limit_tokens"] = min(limit, window)
     merged.setdefault("context_window_source", "official_catalog")
     merged.setdefault("context_window_confidence", "confirmed")
-    output = int(merged.get("max_output_tokens") or 4_096)
-    merged["max_output_tokens"] = max(1, min(output, 1_000_000))
+    output = int(merged.get("max_output_tokens") or DEFAULT_MAX_OUTPUT_TOKENS)
+    merged["max_output_tokens"] = clamp_max_output_tokens(output, window)
     merged["chat_compaction_ratio"] = min(
         1.0, max(0.1, float(merged.get("chat_compaction_ratio", 0.8)))
     )

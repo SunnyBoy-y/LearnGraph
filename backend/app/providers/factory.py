@@ -86,15 +86,17 @@ from app.providers.remote.transcription import (
 )
 from app.providers.remote.anysearch import AnySearchSearchProvider
 from app.providers.model_options import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     ModelCapabilityError,
+    clamp_max_output_tokens,
     model_capabilities_for_model,
     resolve_model_call_options,
 )
+from app.providers.dialects import uses_deepseek_native_adapter
 from app.providers.model_catalog import unified_model_defaults
 from app.providers.qwen_catalog import is_dashscope_api_base_url
 from app.providers.remote.deepseek import (
     DeepSeekChatProvider,
-    is_deepseek_chat_configuration,
 )
 from app.providers.remote.openai import (
     OpenAICompatibleChatProvider,
@@ -485,13 +487,21 @@ def model_provider_for_workspace(
         # but still require their own OpenAI-compatible request shape.  Routing
         # those models through ``DeepSeekChatProvider`` adds DeepSeek-only
         # fields such as ``thinking`` and breaks Agent tool calls at the
-        # gateway.  Use the native adapter only for the legacy explicit type or
-        # the official DeepSeek API origin.
+        # gateway.  Use the native adapter only for the legacy explicit type, a
+        # declared DeepSeek identity, or the official DeepSeek API origin.
+        #
+        # 判定只有一处（``providers.dialects.provider_dialect``）：声明优先、域名兜底，
+        # 且**认 ``/v1``**。以前这里用的是 ``is_deepseek_chat_configuration``——那是给
+        # 带凭据的余额接口用的**严格**信任边界（path 必须为空或 ``/``），于是
+        # ``https://api.deepseek.com/v1`` 这样的官方行被判成"通用网关"，
+        # 请求体里发的是 ``enable_thinking``（DeepSeek 不认）而不是原生 ``thinking``，
+        # 真机上表现为"文字链路关得掉思考、语音链路关不掉"（见 dialects 模块注释）。
         is_deepseek = (
             provider.provider_type == "deepseek_chat"
-            or is_deepseek_chat_configuration(
+            or uses_deepseek_native_adapter(
                 provider.provider_type,
                 provider.base_url,
+                capabilities,
             )
         )
         # Qwen was historically created through the generic
@@ -635,8 +645,12 @@ def model_provider_for_workspace(
             # window. The physical vendor limit remains in the capability
             # snapshot and is never exceeded by a per-model override.
             "context_window_tokens": context_limit_tokens,
-            "max_output_tokens": int(
-                effective_model_capabilities.get("max_output_tokens") or 4_096
+            "max_output_tokens": clamp_max_output_tokens(
+                int(
+                    effective_model_capabilities.get("max_output_tokens")
+                    or DEFAULT_MAX_OUTPUT_TOKENS
+                ),
+                context_window_tokens,
             ),
             "extra_headers": extra_headers,
         }

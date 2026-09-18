@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from copy import deepcopy
 from typing import Any
@@ -10,10 +11,14 @@ import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
+from app.providers.dialects import thinking_off_verdict
 from app.providers.model_options import ModelCallOptions
 from app.providers.qwen_catalog import is_dashscope_origin
 from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
 from app.providers.remote.schema_compat import sanitize_tool_definitions
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderHTTPError(RuntimeError):
@@ -148,6 +153,25 @@ def _is_aliyun_responses_endpoint(base_url: str) -> bool:
         return False
     host = (parsed.hostname or "").casefold()
     return bool(host) and host.endswith(".aliyuncs.com")
+
+
+def _is_openai_origin(base_url: str) -> bool:
+    """Return whether ``base_url`` addresses the official OpenAI API host.
+
+    Only the Chat Completions payload shape depends on this: native OpenAI
+    rejects the legacy ``max_tokens`` on reasoning models, so the output ceiling
+    has to travel as ``max_completion_tokens`` there. Compatible gateways
+    (DashScope/Qwen, DeepSeek, GLM, self-hosted) keep ``max_tokens``.
+    """
+
+    if not base_url:
+        return False
+    try:
+        parsed = urlsplit(base_url.strip())
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold()
+    return bool(host) and (host == "openai.com" or host.endswith(".openai.com"))
 
 
 def normalize_openai_api_base_url(base_url: str) -> str:
@@ -357,6 +381,9 @@ class _StreamingHTTPProvider:
         self.last_sources: list[dict[str, str]] = []
         self.last_usage: dict[str, int] = {}
         self.last_request_id: str | None = None
+        # Set when an upstream rejection proves the declared output ceiling is
+        # wrong for this endpoint (see _apply_output_budget).
+        self.output_budget_disabled = False
         # This is a workspace-confirmed model capability, not an inference from
         # a provider family.  A provider can expose text-only and vision models
         # under the same endpoint.
@@ -456,6 +483,78 @@ class _StreamingHTTPProvider:
             ):
                 tools.append({"type": "web_search"})
             payload["tools"] = tools
+        return payload
+
+    def _audit_thinking_off(self) -> None:
+        """L3 不变量：本轮意图 = ``off``，上游却仍在思考 ⇒ 违约。**fail-loud，不 fail-closed**。
+
+        这是"关闭思考"这条链上**唯一不依赖方言表**的一环：字段有没有发对、网关认不认、
+        厂商有没有偷改默认值，全部用上游自己回的 usage 对账。真机事故（2026-09-18）：
+        ``enable_thinking=False`` 发给 DeepSeek 官方被忽略，官方照样返回 398 个
+        reasoning token、首字晚 2.58 s——当时没有任何一处会喊出来，只能靠人肉翻日志。
+        自研适配器家族（chat / agent / 批量）共用 ``_StreamingHTTPProvider``，
+        所以这里一处即可覆盖这三条链路；语音链路走 pipecat，另有自己的接入点。
+        """
+
+        options = getattr(self, "call_options", None)
+        if options is None:
+            return
+        try:
+            usage = getattr(self, "last_usage", None) or {}
+            verdict = thinking_off_verdict(
+                intent_off=getattr(options, "thinking_mode", None) == "off",
+                reasoning_tokens=usage.get("reasoning_tokens"),
+            )
+            if verdict is None or not verdict.violated:
+                return
+            logger.warning(
+                "%s ignored thinking=off: %s (model=%s, provider_options=%s)",
+                type(self).__name__,
+                verdict.detail,
+                getattr(self, "model_id", "?"),
+                getattr(options, "provider_options", None),
+            )
+        except Exception:
+            # 观测绝不允许影响一次真实请求：这里在 finally 里跑，抛出去会盖掉原异常。
+            logger.debug("thinking-off audit failed", exc_info=True)
+
+    def _apply_output_budget(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
+        """Ask for the model's full output budget instead of the gateway default.
+
+        Structured teaching content is long (a 试卷 carries prompt, options, answer
+        key, rubric and explanation per question, and a thinking model spends part
+        of the same budget on reasoning). When the request omits the cap, upstream
+        defaults — 4096 tokens on several gateways, including the Qwen catalog —
+        truncate the JSON, and a truncated reply fails structural validation no
+        matter how often it is retried. The number sent is the same
+        ``max_output_tokens`` this workspace already bills against, so the ceiling
+        never disagrees with the cost estimate.
+
+        Field name follows the endpoint contract: Responses uses
+        ``max_output_tokens``; native OpenAI Chat Completions rejects the legacy
+        ``max_tokens`` on reasoning models and accepts ``max_completion_tokens``
+        everywhere; every other compatible gateway (DashScope/Qwen, DeepSeek, GLM)
+        takes ``max_tokens``. A caller that already chose a cap keeps it.
+        """
+        options = self.call_options
+        if getattr(self, "output_budget_disabled", False):
+            # Upstream rejected our declared ceiling: retry/continue without one
+            # rather than turning a configuration mismatch into a failed stage.
+            return payload
+        if options is not None and any(
+            key in options.provider_options
+            for key in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+        ):
+            return payload
+        budget = int(getattr(self, "max_output_tokens", 0) or 0)
+        if budget <= 0:
+            return payload
+        if responses:
+            payload.setdefault("max_output_tokens", budget)
+        elif _is_openai_origin(self.base_url):
+            payload.setdefault("max_completion_tokens", budget)
+        else:
+            payload.setdefault("max_tokens", budget)
         return payload
 
     def _capture_response_sources(self, response_payload: dict[str, Any]) -> None:
@@ -966,6 +1065,8 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
             yield from self._stream_answer(prompt)
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("Responses stream timed out") from exc
+        finally:
+            self._audit_thinking_off()
 
     def stream_chat(
         self,
@@ -1117,6 +1218,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                 }
             }
         payload = self._apply_call_options(payload, responses=True)
+        payload = self._apply_output_budget(payload, responses=True)
         response = self._post_json("responses", payload)
         texts = [content.get("text") for item in response.get("output", []) if isinstance(item, dict) for content in item.get("content", []) if isinstance(content, dict) and content.get("type") == "output_text"]
         if len(texts) != 1 or not isinstance(texts[0], str):
@@ -1205,6 +1307,8 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             yield from self._stream_answer(prompt)
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("Compatible Chat stream timed out") from exc
+        finally:
+            self._audit_thinking_off()
 
     @staticmethod
     def _usage_from_chat_chunk(usage: object) -> dict[str, int] | None:
@@ -1539,6 +1643,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             },
             responses=False,
         )
+        payload = self._apply_output_budget(payload, responses=False)
         response = self._post_json("chat/completions", payload)
         try:
             content = response["choices"][0]["message"]["content"]
@@ -1585,12 +1690,17 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             "messages": messages,
             "response_format": response_format,
         }, responses=False)
+        payload = self._apply_output_budget(payload, responses=False)
         response = self._post_json("chat/completions", payload)
         try:
             content = response["choices"][0]["message"]["content"]
-            result = json.loads(content)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise ProviderResponseError("Compatible Chat structured response is invalid") from exc
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderResponseError("Provider response contains no chat text") from exc
+        # Compatible gateways frequently wrap json_object output in a code
+        # fence or prepend a short sentence even when the response_format is
+        # accepted. Use the same bounded extractor as the prompted-json path so
+        # those harmless wrappers do not consume all three generation retries.
+        result = _parse_json_object_text(content)
         usage = response.get("usage") or {}
         input_details = usage.get("prompt_tokens_details") or {}
         output_details = usage.get("completion_tokens_details") or {}
@@ -1884,6 +1994,9 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
                 raise ProviderHTTPError(
                     f"DashScope native stream transport failed ({type(exc).__name__})"
                 ) from exc
+            finally:
+                # 原生分支自己走一套 HTTP，super() 的审计覆盖不到它。
+                self._audit_thinking_off()
             return
         yield from super().stream_answer(prompt)
 
