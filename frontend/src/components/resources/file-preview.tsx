@@ -55,6 +55,8 @@ export interface FilePreviewCanvasProps {
   onEmbeddedImage?: EmbeddedImageHandler;
   onTextSelection?: TextSelectionHandler;
   imageActions?: ReactNode;
+  /** 图片预览是否支持点击放大（复用共享灯箱）。 */
+  imageZoom?: boolean;
   audioDetails?: ReactNode;
   pdfPage?: number;
   onPdfPageChange?: (page: number) => void;
@@ -68,6 +70,7 @@ export function FilePreviewCanvas({
   onEmbeddedImage,
   onTextSelection,
   imageActions,
+  imageZoom = false,
   audioDetails,
   pdfPage,
   onPdfPageChange,
@@ -142,7 +145,7 @@ export function FilePreviewCanvas({
         <VideoPreview blob={blob} filename={filename} />
       ) : kind === "image" ? (
         <div className="grid min-h-[36rem] place-items-center gap-4 bg-muted/30 p-8">
-          <BlobImage alt={filename} blob={blob} />
+          <BlobImage alt={filename} blob={blob} zoomable={imageZoom} />
           {imageActions}
         </div>
       ) : kind === "html" ? (

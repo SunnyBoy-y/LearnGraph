@@ -219,8 +219,9 @@ export function generateSessionSuggestedPrompts(
   sessionId: string,
   payload: SuggestedPromptRequest,
   options: ApiRequestOptions = {},
-): Promise<SuggestedPromptBatch> {
-  return apiClient.post<SuggestedPromptBatch, SuggestedPromptRequest>(
+): Promise<SuggestedPromptBatch | undefined> {
+  // 204 = 「结构性不可锚定，没有批次」：空会话与语音回合都不生成。
+  return apiClient.post<SuggestedPromptBatch | undefined, SuggestedPromptRequest>(
     `/sessions/${encodeURIComponent(sessionId)}/suggested-prompts`,
     payload,
     options,

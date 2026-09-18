@@ -997,6 +997,7 @@ export function DocumentLearningPage() {
               </div>
               ) : undefined}
               mimeType={file.mime_type}
+              imageZoom
               onEmbeddedImage={(image) => setEmbeddedImages((current) => [
                 ...current,
                 { id: createUuid(), ...image },

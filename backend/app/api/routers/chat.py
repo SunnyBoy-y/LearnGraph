@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import threading
-from collections.abc import Callable, Iterable
+import weakref
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated
@@ -12,6 +14,7 @@ from uuid import uuid4
 
 from fastapi import (
     APIRouter,
+    Depends,
     File,
     Form,
     Header,
@@ -26,6 +29,11 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB, WorkspaceContext
+from app.core.admission import (
+    AdmissionTicket,
+    acquire_agent_stream_slot,
+    snapshot_admission_metrics,
+)
 from app.core.errors import AppError
 from app.domain.models import (
     Message,
@@ -81,6 +89,55 @@ from app.services.authorization import AuthorizationService
 
 router = APIRouter(prefix="/sessions", tags=["chat"])
 SSE_TRANSPORT_READY_COMMENT = ": learngraph-stream-ready\n\n"
+logger = logging.getLogger(__name__)
+
+
+def _admit_agent_generation() -> Iterator[AdmissionTicket]:
+    """Admission dependency for the three generation endpoints.
+
+    Declared as the FIRST dependency of each endpoint — ordered ahead of
+    ``db: DB`` / ``context: CurrentWorkspace`` — so FastAPI resolves it before
+    creating any database session. That ordering is the entire point. Those
+    dependencies run DB queries, and a gate that ran later (in the handler
+    body) would already have spent a pooled connection on the very request it
+    is about to reject: under a burst of simultaneous requests the pool could
+    still time out before the gate ever saw them, which is exactly the opaque
+    failure this module exists to replace.
+
+    Being a dependency also means a rejection consumes no connection at all
+    and skips auth/preflight, so the cost is that a saturated deployment
+    answers 429 even for a session id that does not exist. That is an
+    acceptable trade for an immediate, legible reason instead of a 10-second
+    stall followed by an unreadable ``QueuePool limit ... reached``.
+
+    It is a *generator* dependency on purpose. A plain function dependency
+    would only be able to release inside the handler, and the handler never
+    runs when a later dependency (auth / workspace) rejects the request — so
+    every 403/404 raised after admission would leak one slot until the gate
+    wedged. FastAPI guarantees a yield dependency's ``finally`` runs even when
+    a later dependency or the endpoint raises, which is the one place that
+    covers every non-handoff outcome.
+    """
+    lease = acquire_agent_stream_slot()
+    if lease is None:
+        raise AppError(
+            429,
+            "agent_stream_capacity_exceeded",
+            "同时进行的对话已达到本机上限，请稍后重试。",
+            details=snapshot_admission_metrics(),
+        )
+    try:
+        yield lease
+    finally:
+        # Skipped once the transport has claimed ownership, because a detached
+        # generation may outlive this request; the worker, the never-started
+        # guard and the generator's GC finalizer release it in that case.
+        lease.release_if_unclaimed()
+
+
+# Placed ahead of ``db: DB`` in the signature so it is solved first; see the
+# dependency's docstring for why the ordering is load-bearing.
+AgentStreamLease = Annotated[AdmissionTicket, Depends(_admit_agent_generation)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +154,7 @@ def _detached_sse_transport(
     session_id: str,
     thread_name: str,
     on_disconnect: Callable[[], None] | None = None,
+    lease: AdmissionTicket | None = None,
 ):
     output: queue.Queue[str | object | _DetachedStreamFailure] = queue.Queue(
         maxsize=256
@@ -122,6 +180,22 @@ def _detached_sse_transport(
         except BaseException as exc:
             publish(_DetachedStreamFailure(exc))
         finally:
+            # Release before signalling completion, so "the consumer saw the
+            # end of the stream" implies "the slot is already back". Both the
+            # worker's database sessions are closed by this point: the inner
+            # producer's ``with session_factory()`` block and its own finally
+            # have already run, which is also why the *generation* — not the
+            # subscriber — owns the slot lifetime.
+            if lease is not None:
+                try:
+                    lease.release()
+                except Exception:
+                    # Never let bookkeeping hang the response: a failure in
+                    # the release path must not stop the end marker below, or
+                    # the consumer would block on output.get() forever. A
+                    # leaked slot is loud in the metrics; a wedged SSE stream
+                    # is not.
+                    logger.exception("Agent stream admission release failed")
             publish(_DETACHED_STREAM_END)
 
     worker = threading.Thread(
@@ -131,8 +205,10 @@ def _detached_sse_transport(
     )
 
     def events():
-        worker.start()
+        worker_started = False
         try:
+            worker.start()
+            worker_started = True
             yield SSE_TRANSPORT_READY_COMMENT
             while True:
                 item = output.get()
@@ -178,6 +254,12 @@ def _detached_sse_transport(
             # Do not stop the worker. Clearing this flag only disables the
             # abandoned transport queue, preventing disconnect backpressure.
             subscriber_active.clear()
+            # The worker owns the slot once it has started. If it never did
+            # (the client aborted before the response body was iterated at
+            # all), its own finally will never run, so hand the slot back here
+            # instead of leaking one admission slot per abandoned request.
+            if lease is not None and not worker_started:
+                lease.release()
             if on_disconnect is not None:
                 try:
                     on_disconnect()
@@ -186,7 +268,20 @@ def _detached_sse_transport(
                     # continues its own persistence either way.
                     pass
 
-    return events()
+    stream = events()
+    if lease is not None:
+        # Taking ownership: from here the detached generation releases the slot
+        # itself, so the request-lifecycle owner stops touching it.
+        lease.claim()
+        # Safety net for the one path that executes no ``finally`` at all. If
+        # the response object is built but never iterated (the client aborted
+        # before the response started, so Starlette never began the body
+        # iterator), then neither the worker nor the generator ever runs — and
+        # closing or collecting an *unstarted* generator executes no code
+        # either, so the slot would leak on every such request. release() is
+        # idempotent, so this never double-frees the normal paths.
+        weakref.finalize(stream, lease.release)
+    return stream
 
 
 def _detached_message_stream(
@@ -198,6 +293,7 @@ def _detached_message_stream(
     idempotency_key: str | None,
     last_event_id: str | None,
     session_factory: sessionmaker,
+    lease: AdmissionTicket | None = None,
 ):
     """Run generation independently from the HTTP subscriber.
 
@@ -264,6 +360,7 @@ def _detached_message_stream(
         produce,
         session_id=session_id,
         thread_name=f"learngraph-message-{session_id[:8]}",
+        lease=lease,
     )
 
 
@@ -275,6 +372,7 @@ def _detached_retry_stream(
     message_id: str,
     payload: MessageRetryRequest,
     session_factory: sessionmaker,
+    lease: AdmissionTicket | None = None,
 ):
     def produce():
         # Retry streams are full generations too — count them as active so
@@ -317,6 +415,7 @@ def _detached_retry_stream(
         produce,
         session_id=session_id,
         thread_name=f"learngraph-retry-{message_id[:8]}",
+        lease=lease,
     )
 
 
@@ -848,6 +947,13 @@ def get_suggested_prompts(
     "/{session_id}/suggested-prompts",
     response_model=SuggestedPromptBatchView,
     responses={
+        204: {
+            "description": (
+                "No batch was produced: the conversation has no turn yet (the "
+                "new-session opener belongs to the workspace memories) or its "
+                "current turn is a full-duplex voice turn"
+            )
+        },
         402: {
             "description": (
                 "The workspace hard budget blocks the remote call "
@@ -898,9 +1004,9 @@ def generate_suggested_prompts(
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
-) -> SuggestedPromptBatchView:
+) -> SuggestedPromptBatchView | Response:
     require_session_access(session_id, "write", db, context)
-    return service(
+    batch = service(
         db,
         context,
         settings,
@@ -908,6 +1014,12 @@ def generate_suggested_prompts(
         provider_id=payload.provider_id,
         thinking_mode="off",
     ).generate_suggested_prompts(session_id, payload)
+    if batch is None:
+        # Structural refusal (empty session / voice anchor): "no batch" is the
+        # answer, not an error. A client that has not learned the gate yet then
+        # shows nothing rather than a failure card it cannot resolve.
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return batch
 
 
 @router.post("/{session_id}/close", response_model=SessionView)
@@ -1111,6 +1223,7 @@ def list_message_versions(session_id: str, message_id: str, db: DB, context: Cur
 def stream_message(
     session_id: str,
     payload: MessageCreateRequest,
+    lease: AgentStreamLease,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
@@ -1157,8 +1270,9 @@ def stream_message(
             provider_id=payload.provider_id,
             thinking_mode=payload.thinking_mode,
             search_route=payload.search_route,
-            # Preflight only needs validation dependencies. Deferring the Agent
-            # runtime avoids MCP/Sandbox setup before the stream can start.
+            # Preflight only needs validation dependencies. Deferring the
+            # Agent runtime avoids MCP/Sandbox setup before the stream can
+            # start.
             agent_mode=False,
         )
     stream_service.preflight_create_stream(
@@ -1168,6 +1282,10 @@ def stream_message(
         last_event_id=after_event_id or last_event_id,
     )
 
+    # Hand the slot to the transport: from here the worker, the never-started
+    # guard or the generator's GC finalizer releases it. Nothing in this
+    # handler releases it any more — the admission dependency's ``finally`` is
+    # the single lifecycle owner for every non-handoff outcome.
     return StreamingResponse(
         _detached_message_stream(
             context=context,
@@ -1181,6 +1299,7 @@ def stream_message(
                 autoflush=False,
                 expire_on_commit=False,
             ),
+            lease=lease,
         ),
         media_type="text/event-stream",
         headers={
@@ -1197,6 +1316,7 @@ def stream_message(
 def async_message(
     session_id: str,
     payload: MessageCreateRequest,
+    lease: AgentStreamLease,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
@@ -1248,6 +1368,10 @@ def async_message(
         last_event_id=None,
     )
 
+    # The background drain thread below starts the transport worker, which then
+    # claims the slot. Building the transport before the thread exists also
+    # means a saturated deployment rejects the *submission* rather than
+    # accepting a job it cannot run.
     events = _detached_message_stream(
         context=context,
         settings=settings,
@@ -1260,6 +1384,7 @@ def async_message(
             autoflush=False,
             expire_on_commit=False,
         ),
+        lease=lease,
     )
 
     def drain() -> None:
@@ -1373,6 +1498,7 @@ def cancel_message(session_id: str, message_id: str, db: DB, context: CurrentWor
 def retry_message(
     session_id: str,
     message_id: str,
+    lease: AgentStreamLease,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
@@ -1407,6 +1533,7 @@ def retry_message(
                 autoflush=False,
                 expire_on_commit=False,
             ),
+            lease=lease,
         ),
         media_type="text/event-stream",
         headers={

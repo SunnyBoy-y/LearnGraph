@@ -14,7 +14,6 @@ import {
   Quote,
   ShieldAlert,
   Sparkles,
-  X,
 } from "lucide-react";
 
 import { MessageResponse } from "@/components/ai-elements/message";
@@ -39,6 +38,7 @@ import {
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
+import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
 import {
   isSandboxImageArtifactPart,
@@ -70,7 +70,6 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
   DialogDescription,
   DialogHeader,
@@ -1225,44 +1224,6 @@ function UserConfirmationPart({ data }: { data: PartData }) {
   );
 }
 
-/**
- * 二级弹窗图片预览（复用 chat-image-lightbox 样式，与流式图片灯箱一致）。
- */
-function ImageLightbox({
-  alt,
-  filename,
-  onOpenChange,
-  open,
-  src,
-}: {
-  alt: string;
-  filename: string;
-  onOpenChange: (open: boolean) => void;
-  open: boolean;
-  src: string;
-}) {
-  return (
-    <Dialog onOpenChange={onOpenChange} open={open}>
-      <DialogContent
-        aria-describedby={undefined}
-        className="chat-image-lightbox"
-        showCloseButton={false}
-      >
-        <DialogTitle className="sr-only">预览图片 {filename}</DialogTitle>
-        <img alt={alt} className="chat-image-lightbox__image" src={src} />
-        <div className="chat-image-lightbox__toolbar">
-          <DialogClose asChild>
-            <button type="button">
-              <X className="size-4" />
-              关闭
-            </button>
-          </DialogClose>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 function ImagePart({ data, status }: { data: PartData; status: string }) {
   const directSrc = safeHref(data?.src ?? data?.url);
   const fileId = typeof data?.file_id === "string" ? data.file_id : "";
@@ -1316,7 +1277,7 @@ function ImagePart({ data, status }: { data: PartData; status: string }) {
       {src ? (
         <ImageLightbox
           alt={alt}
-          filename={title}
+          dialogTitle={`预览图片 ${title}`}
           onOpenChange={setLightboxOpen}
           open={lightboxOpen}
           src={src}
@@ -1537,7 +1498,7 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
         {imageHref ? (
           <ImageLightbox
             alt={filename}
-            filename={filename}
+            dialogTitle={`预览图片 ${filename}`}
             onOpenChange={setLightboxOpen}
             open={lightboxOpen}
             src={imageHref}

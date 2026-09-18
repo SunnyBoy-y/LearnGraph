@@ -1,14 +1,9 @@
 import { useEffect, useState } from "react";
-import { CircleAlert, Download, LoaderCircle, X } from "lucide-react";
+import { CircleAlert, Download, LoaderCircle } from "lucide-react";
 
 import { downloadFile } from "@/api/files";
+import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import type { MessagePart } from "@/types/sessions";
 
 /**
@@ -57,28 +52,19 @@ function SandboxImageLightbox({
   title: string;
 }) {
   return (
-    <Dialog onOpenChange={onOpenChange} open={open}>
-      <DialogContent
-        aria-describedby={undefined}
-        className="chat-image-lightbox"
-        showCloseButton={false}
-      >
-        <DialogTitle className="sr-only">查看图片产物</DialogTitle>
-        <img alt={title} className="chat-image-lightbox__image" src={source} />
-        <div className="chat-image-lightbox__toolbar">
-          <button onClick={onDownload} type="button">
-            <Download className="size-4" />
-            下载图片
-          </button>
-          <DialogClose asChild>
-            <button type="button">
-              <X className="size-4" />
-              关闭
-            </button>
-          </DialogClose>
-        </div>
-      </DialogContent>
-    </Dialog>
+    <ImageLightbox
+      actions={
+        <button onClick={onDownload} type="button">
+          <Download className="size-4" />
+          下载图片
+        </button>
+      }
+      alt={title}
+      dialogTitle="查看图片产物"
+      onOpenChange={onOpenChange}
+      open={open}
+      src={source}
+    />
   );
 }
 

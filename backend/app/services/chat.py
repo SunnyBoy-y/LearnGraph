@@ -7861,12 +7861,36 @@ class ChatService:
     def _suggested_prompt_anchor(
         self,
         timeline: list[Message],
-    ) -> tuple[Message | None, MessageVersion | None]:
+    ) -> tuple[Message | None, MessageVersion | None, str | None]:
+        """Resolve the anchor a suggested-prompt batch may hang on.
+
+        Returns ``(message, version, blocked_reason)``.  ``blocked_reason`` is a
+        structural refusal -- this conversation cannot carry follow-up prompts at
+        all -- and it is deliberately *not* an error: both callers answer "no
+        batch" so the canvas stays empty instead of painting a card the user
+        cannot act on.  Two shapes are refused:
+
+        - ``"empty"``: a session with no turn yet.  That opener comes from the
+          workspace memories on the client, so the model must not spend a call on
+          it and no batch row may be written for it.
+        - ``"voice"``: the anchor would be a full-duplex voice answer.  Follow-up
+          prompts are a text-composer affordance -- tapping one sends it through
+          the ordinary chat path -- so a voice turn never reads or generates them,
+          and leaving the call does not bring the card back.
+
+        A last message that is merely *not* a completed assistant answer (failed
+        or still streaming) is not a blocked reason: it stays ``(None, None,
+        None)`` so ``suggested_prompt_anchor_unavailable`` and
+        ``suggested_prompt_anchor_stale`` keep their existing meaning.
+        """
         if not timeline:
-            return None, None
+            return None, None, "empty"
         message = timeline[-1]
         if message.role != "assistant" or message.status != "completed":
-            return None, None
+            return None, None, None
+        trace = message.provider_trace if isinstance(message.provider_trace, dict) else {}
+        if trace.get("voice") is True or trace.get("voice_turn") is True:
+            return None, None, "voice"
         version = self.db.scalar(
             self.message_versions.query().where(
                 MessageVersion.message_id == message.id,
@@ -7875,8 +7899,8 @@ class ChatService:
             )
         )
         if version is None:
-            return None, None
-        return message, version
+            return None, None, None
+        return message, version, None
 
     def _suggested_prompts_enabled(self) -> bool:
         setting = self.db.scalar(
@@ -8382,8 +8406,15 @@ class ChatService:
             return None
         timeline = self._session_timeline(session_id)
         self._require_suggested_prompt_timeline_access(session, timeline)
-        anchor_message, anchor_version = self._suggested_prompt_anchor(timeline)
-        if timeline and (anchor_message is None or anchor_version is None):
+        anchor_message, anchor_version, anchor_blocked = self._suggested_prompt_anchor(
+            timeline
+        )
+        # No turn yet, or the anchor is a voice turn: nothing this feature may
+        # read -- and a batch written before this gate (the empty-session opener)
+        # must not resurface through the read path either.
+        if anchor_blocked or (
+            timeline and (anchor_message is None or anchor_version is None)
+        ):
             return None
         context_hash, _, _, _, _ = self._suggested_prompt_context(
             session,
@@ -8416,7 +8447,7 @@ class ChatService:
         self,
         session_id: str,
         payload: SuggestedPromptGenerateRequest,
-    ) -> SuggestedPromptBatchView:
+    ) -> SuggestedPromptBatchView | None:
         session = self.sessions.require(session_id, "session")
         # Authorize every linked context object before settings or Provider
         # checks can disclose anything about this Session's configuration.
@@ -8436,7 +8467,14 @@ class ChatService:
             timeline,
             session_permission="write",
         )
-        anchor_message, anchor_version = self._suggested_prompt_anchor(timeline)
+        anchor_message, anchor_version, anchor_blocked = self._suggested_prompt_anchor(
+            timeline
+        )
+        if anchor_blocked:
+            # Structurally ineligible anchor (empty session / voice turn): answer
+            # "no batch" and write nothing, instead of spending a model call on
+            # rows the canvas will never show.
+            return None
         self._validate_suggested_prompt_anchor(
             payload,
             timeline,
@@ -8633,7 +8671,9 @@ class ChatService:
             )
 
         current_timeline = self._session_timeline(session_id)
-        current_message, current_version = self._suggested_prompt_anchor(current_timeline)
+        current_message, current_version, _ = self._suggested_prompt_anchor(
+            current_timeline
+        )
         anchor_changed = (
             (anchor_message.id if anchor_message is not None else None)
             != (current_message.id if current_message is not None else None)
@@ -13238,9 +13278,10 @@ class ChatService:
         user_part_type = (
             "subapp_event" if payload.message_kind == "subapp_event" else "text"
         )
-        user_part_data: dict = {}
+        user_part_data: dict = {"learning_node_ids": list(payload.node_ids)} if payload.node_ids else {}
         if payload.message_kind == "subapp_event":
             user_part_data = {
+                **user_part_data,
                 "subapp_event_id": payload.subapp_event_id,
                 "event_type": payload.subapp_event_id or "",
             }

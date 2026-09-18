@@ -9,6 +9,14 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- MODIFY_AUDIO_SETTINGS：Chromium 的 Android 音频层在枚举/启用录音设备时要**同时**
+         检查 RECORD_AUDIO 与 MODIFY_AUDIO_SETTINGS（media/audio/android/audio_manager_android.cc）。
+         只声明 RECORD_AUDIO 时，Chromium 会打
+         "Requires MODIFY_AUDIO_SETTINGS and RECORD_AUDIO. No audio device will be available for recording"
+         并报 "Unable to select communication device!"，于是网页 getUserMedia({audio}) 直接
+         reject 成 NotReadableError("Could not start audio source") —— 系统里录音权限明明是 granted。
+         它是普通（安装期）权限，不弹窗、无需运行时申请。 -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />

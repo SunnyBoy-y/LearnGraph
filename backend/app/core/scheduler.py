@@ -18,6 +18,7 @@ from app.core.database import SessionLocal
 from app.core.database import active_stream_count
 from app.core.database import commit_with_locked_retry
 from app.core.database import run_sqlite_gate_watchdog
+from app.core.admission import snapshot_admission_metrics
 from app.core.database import snapshot_sqlite_metrics
 from app.core.process_lock import acquire_advisory_lock, release_advisory_lock
 from app.domain.models import (
@@ -1190,6 +1191,30 @@ async def wal_checkpoint_scheduler(
                 )
             except Exception:
                 logger.debug("SQLite metrics snapshot failed", exc_info=True)
+            # P0-4: surface agent-stream admission so an operator can see
+            # whether the deployment is actually saturating before users
+            # report it. rejected>0 means callers got an explicit busy
+            # response, which is the intended behaviour at the ceiling — but
+            # a sustained non-zero rate means the ceiling is too low for the
+            # real workload, not that the gate is broken.
+            try:
+                admission = await asyncio.to_thread(snapshot_admission_metrics)
+                logger.info(
+                    "Agent stream admission: enabled=%s limit=%s in_flight=%s "
+                    "peak=%s acquired=%s released=%s rejected=%s "
+                    "pool_capacity=%s conns_per_stream=%s",
+                    admission.get("enabled"),
+                    admission.get("limit"),
+                    admission.get("in_flight"),
+                    admission.get("peak_in_flight"),
+                    admission.get("acquired"),
+                    admission.get("released"),
+                    admission.get("rejected"),
+                    admission.get("pool_capacity"),
+                    admission.get("connections_per_stream"),
+                )
+            except Exception:
+                logger.debug("Admission metrics snapshot failed", exc_info=True)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

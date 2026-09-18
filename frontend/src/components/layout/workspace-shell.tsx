@@ -135,6 +135,7 @@ const KnowledgeGraph = lazy(() =>
 import { NodeExploreChain } from "@/components/graph/node-explore";
 import { SessionFilesList } from "@/features/chat/session-files-list";
 import { TrajectoryRail } from "@/features/trajectory/TrajectoryRail";
+import { VoiceLatencyRail } from "@/features/voice/voice-debug-panel";
 import { SessionShareDialog } from "@/features/chat/session-share-dialog";
 import {
   archiveProject,
@@ -160,6 +161,7 @@ import {
   updateGraphNode,
   updateProject as updateProjectRecord,
   updateSession,
+  updateSetting,
 } from "@/api";
 import { createSession } from "@/api/sessions";
 import {
@@ -181,7 +183,17 @@ import {
   setSessionComposerPrefs,
 } from "@/lib/session-composer-prefs";
 import { readChatDefaultResponseMode } from "@/lib/workspace-settings";
-import { isTrajectoryEnabled } from "@/lib/workspace-settings";
+import {
+  isTrajectoryEnabled,
+  isVoiceDebugPanelEnabled,
+} from "@/lib/workspace-settings";
+import {
+  readSidebarProjectFolders,
+  resolveSidebarProjectOpen,
+  UI_PREFERENCES_SETTING_KEY,
+  withSidebarProjectFolder,
+  type SidebarProjectFolders,
+} from "@/lib/sidebar-folders";
 import type { Session } from "@/types/sessions";
 import type { Graph, GraphNode, GraphSummary } from "@/types/graphs";
 import type { DeleteImpact } from "@/types/workflow";
@@ -572,8 +584,9 @@ function SidebarNav({
     queryFn: listSessions,
     staleTime: 30_000,
   });
+  const settingsQueryKey = workspaceQueryKey(workspaceId, "settings");
   const settingsQuery = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "settings"),
+    queryKey: settingsQueryKey,
     queryFn: listSettings,
     staleTime: 30_000,
   });
@@ -585,6 +598,74 @@ function SidebarNav({
     [settingsQuery.data],
   );
   const [activeSessionId, setActiveSessionId] = useState("");
+  // 图谱文件夹（项目）默认折叠，每次手动开合都入库到工作区设置 ui.preferences。
+  // 该键与 theme 共用，所以写回是「读最新值 → 合并一个字段 → 整体覆盖」。
+  const persistedProjectFolders = useMemo(
+    () =>
+      readSidebarProjectFolders(
+        settingsQuery.data as WorkspaceSetting[] | undefined,
+      ),
+    [settingsQuery.data],
+  );
+  // 本次访问里用户手动开合过的文件夹：立即生效，并优先于自动展开与入库状态。
+  const [folderOverrides, setFolderOverrides] = useState<SidebarProjectFolders>(
+    {},
+  );
+  const folderOverridesRef = useRef<SidebarProjectFolders>({});
+  // 写回串行化：两次快速开合若并发做读改写，后一次会把前一次的字段覆盖掉。
+  const folderSaveChain = useRef<Promise<unknown>>(Promise.resolve());
+  // 当前会话所在的文件夹本次访问临时展开（用户手动折叠后由 overrides 接管）。
+  const activeProjectId = useMemo(
+    () => findProjectForSession(projects, activeSessionId)?.id,
+    [activeSessionId, projects],
+  );
+  const projectFolderOpen = useMemo(() => {
+    const open: SidebarProjectFolders = {};
+    for (const project of projects) {
+      open[project.id] = resolveSidebarProjectOpen({
+        projectId: project.id,
+        activeProjectId,
+        overrides: folderOverrides,
+        persisted: persistedProjectFolders,
+      });
+    }
+    return open;
+  }, [activeProjectId, folderOverrides, persistedProjectFolders, projects]);
+  const toggleProjectFolder = useCallback(
+    (projectId: string, open: boolean) => {
+      const next = { ...folderOverridesRef.current, [projectId]: open };
+      folderOverridesRef.current = next;
+      setFolderOverrides(next);
+      folderSaveChain.current = folderSaveChain.current
+        .catch(() => undefined)
+        .then(async () => {
+          const current = queryClient
+            .getQueryData<WorkspaceSetting[]>(settingsQueryKey)
+            ?.find((item) => item.key === UI_PREFERENCES_SETTING_KEY)?.value;
+          return updateSetting(
+            UI_PREFERENCES_SETTING_KEY,
+            withSidebarProjectFolder(current, projectId, open),
+          );
+        })
+        .then((setting) => {
+          queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
+            ...(current ?? []).filter((item) => item.key !== setting.key),
+            setting,
+          ]);
+        })
+        .catch((error: unknown) => {
+          // 入库失败就丢掉本次访问的本地决定，回到服务端状态，避免本地显示与
+          // 刷新后的结果不一致。
+          folderOverridesRef.current = {};
+          setFolderOverrides({});
+          void queryClient.invalidateQueries({ queryKey: settingsQueryKey });
+          toast.error(
+            error instanceof Error ? error.message : "文件夹折叠状态保存失败",
+          );
+        });
+    },
+    [queryClient, settingsQueryKey],
+  );
   /** Empty draft kept for reuse; hidden from the sidebar until the first message. */
   const [hiddenDraftSessionId, setHiddenDraftSessionId] = useState<string | null>(
     () => getDraftSessionId(),
@@ -866,6 +947,10 @@ function SidebarNav({
       const options =
         typeof input === "string" ? { projectId: input } : (input ?? {});
       const projectId = options.projectId;
+      // 「新会话」是一次会话切换，不是"在同一个会话里继续"：通话属于它所在的那个会话，
+      // 必须先挂断再建新的。不这么做，新会话会被上一通电话的自动拨号带走（语音页
+      // 监听这个事件做挂断与退出语音模式）。
+      window.dispatchEvent(new CustomEvent("learngraph:new-conversation"));
       // Reuse the single empty draft so multi-click "新对话" never spawns duplicates.
       if (
         !projectId &&
@@ -1729,6 +1814,8 @@ function SidebarNav({
 
         <SessionProjects
           activeSessionId={activeSessionId}
+          onToggleProjectFolder={toggleProjectFolder}
+          projectFolderOpen={projectFolderOpen}
           workspaceId={workspaceId}
           onCreateConversation={(projectId) =>
             projectId
@@ -1851,6 +1938,8 @@ const MemoSidebarNav = memo(SidebarNav);
 function SessionProjects({
   workspaceId,
   activeSessionId,
+  projectFolderOpen,
+  onToggleProjectFolder,
   onCreateConversation,
   onCreateProject,
   onRequestProjectDeletion,
@@ -1870,6 +1959,10 @@ function SessionProjects({
 }: {
   workspaceId: string;
   activeSessionId: string;
+  /** 项目文件夹的已解析开合状态（缺省折叠；当前会话所在文件夹临时展开）。 */
+  projectFolderOpen: Record<string, boolean>;
+  /** 用户手动开合某个文件夹：立即生效并入库。 */
+  onToggleProjectFolder: (projectId: string, open: boolean) => void;
   onCreateConversation: (projectId?: string) => Promise<void>;
   onCreateProject: (title: string) => Promise<string>;
   onRequestProjectDeletion: (project: SidebarProject) => void;
@@ -1900,9 +1993,6 @@ function SessionProjects({
       window.removeEventListener("storage", refresh);
     };
   }, []);
-  const [expandedProjects, setExpandedProjects] = useState<
-    Record<string, boolean>
-  >({});
   // Parent conversations with nested 划词解释 / side threads act as folders.
   const [expandedSessions, setExpandedSessions] = useState<
     Record<string, boolean>
@@ -2101,7 +2191,8 @@ function SessionProjects({
     if (!title) return;
     try {
       const id = await onCreateProject(title);
-      setExpandedProjects((current) => ({ ...current, [id]: true }));
+      // 刚建的空文件夹先展开，方便直接往里加对话；折叠回去同样会入库。
+      onToggleProjectFolder(id, true);
       setProjectName("");
       setCreatingProject(false);
     } catch (error) {
@@ -2559,7 +2650,10 @@ function SessionProjects({
       ) : null}
       <div className="sidebar-sessions__list mt-2 space-y-2">
         {visibleProjects.map((project) => {
-          const open = expandedProjects[project.id] ?? true;
+          // 默认折叠；搜索时强制展开，否则命中的会话被文件夹挡住看不见。
+          const open = normalizedQuery
+            ? true
+            : (projectFolderOpen[project.id] ?? false);
           return (
             <section className="sidebar-project" key={project.id}>
               <div
@@ -2584,10 +2678,7 @@ function SessionProjects({
                       toggleProjectSelection(project);
                       return;
                     }
-                    setExpandedProjects((current) => ({
-                      ...current,
-                      [project.id]: !open,
-                    }));
+                    onToggleProjectFolder(project.id, !open);
                   }}
                   type="button"
                 >
@@ -3519,7 +3610,7 @@ function ChatGraphRail({
   workspaceId: string;
 }) {
   const [view, setView] = useState<
-    "learning" | "capability" | "files" | "trajectory"
+    "learning" | "capability" | "files" | "trajectory" | "voice"
   >("learning");
   const [boundOverride, setBoundOverride] = useState<{
     graphId: string;
@@ -3543,11 +3634,17 @@ function ChatGraphRail({
     staleTime: 30_000,
   });
   const trajectoryEnabled = isTrajectoryEnabled(settings.data);
+  const voiceDebugEnabled = isVoiceDebugPanelEnabled(settings.data);
 
   // 开关关闭后若仍停在「轨迹」视图，回落到默认视图。
   useEffect(() => {
     if (!trajectoryEnabled && view === "trajectory") setView("learning");
   }, [trajectoryEnabled, view]);
+
+  // 同一个约定：语音调试面板关掉时栏目整个不渲染，视点也不能停在它上面。
+  useEffect(() => {
+    if (!voiceDebugEnabled && view === "voice") setView("learning");
+  }, [voiceDebugEnabled, view]);
 
   const bindGraph = (graph: GraphSummary) => {
     if (!project) {
@@ -3624,9 +3721,22 @@ function ChatGraphRail({
             轨迹
           </Button>
         ) : null}
+        {voiceDebugEnabled ? (
+          <Button
+            aria-selected={view === "voice"}
+            onClick={() => setView("voice")}
+            role="tab"
+            size="xs"
+            variant="ghost"
+          >
+            语音延迟
+          </Button>
+        ) : null}
       </div>
       {view === "trajectory" ? (
         <TrajectoryRail sessionId={sessionId} workspaceId={workspaceId} />
+      ) : view === "voice" ? (
+        <VoiceLatencyRail />
       ) : view === "files" ? (
         <SessionFilesList
           sessionId={sessionId}
@@ -3742,6 +3852,7 @@ function toRailKnowledgeGraph(
         label: node.label,
         description: node.description,
         stars: node.mastery_stars,
+      achievementScore: node.achievement_score,
         state: node.retrieval_state,
         evidence: node.evidence_state,
         focused: node.attention_state === "focused",
@@ -3779,6 +3890,7 @@ function BoundGraphRail({
   title: string;
   workspaceId: string;
 }) {
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const graphQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
@@ -4012,11 +4124,6 @@ function BoundGraphRail({
       </div>
     );
 
-  const rootLabel =
-    graph.nodes.find((node) => node.node_type === "root")?.label ??
-    graph.nodes[0]?.label ??
-    title;
-
   const childNodes = selectedNode
     ? graph.edges
         .filter((edge) => edge.source_node_id === selectedNode.id)
@@ -4057,17 +4164,7 @@ function BoundGraphRail({
       nodeId: selectedNode.id,
       nodeLabel: selectedNode.label,
     });
-    const encyclopediaPrompt =
-      `请以百科词条格式讲解「${selectedNode.label}」。` +
-      `要求：1) 精确定义与边界；2) 在「${rootLabel}」中的位置；` +
-      `3) 1–2 个关键例子；4) 常见误区；5) 可自测的掌握标准。` +
-      `用清晰小标题组织，不要只复述节点说明。`;
-    window.dispatchEvent(
-      new CustomEvent("learngraph:compose", {
-        detail: { content: encyclopediaPrompt, autoSend: true },
-      }),
-    );
-    toast.success(`开始学习：${selectedNode.label}`);
+    navigate(`/w/${workspaceId}/learn/nodes/${selectedNode.id}`);
   }
 
   function studyNextNode() {
@@ -4091,15 +4188,7 @@ function BoundGraphRail({
       nodeId: next.id,
       nodeLabel: next.label,
     });
-    const encyclopediaPrompt =
-      `请以百科词条格式讲解「${next.label}」。` +
-      `要求：1) 精确定义与边界；2) 与「${selectedNode.label}」的关系；` +
-      `3) 关键例子；4) 常见误区；5) 可自测的掌握标准。`;
-    window.dispatchEvent(
-      new CustomEvent("learngraph:compose", {
-        detail: { content: encyclopediaPrompt, autoSend: true },
-      }),
-    );
+    navigate(`/w/${workspaceId}/learn/nodes/${next.id}`);
   }
 
   function compareWithParent() {

@@ -188,6 +188,40 @@ class Settings(BaseSettings):
     sqlite_pool_size: int = 10
     sqlite_pool_max_overflow: int = 20
     sqlite_pool_timeout_seconds: int = 10
+    # ── Agent-stream admission control (P0-4) ─────────────────────────────
+    #
+    # A stream is expensive in *connections*, not requests: the request-scoped
+    # session (get_db) stays open until the SSE body finishes, and the detached
+    # worker opens a second session for the whole generation. So N concurrent
+    # streams pin ~2N pooled connections. Without a gate the (capacity+1)-th
+    # stream blocks in pool checkout for sqlite_pool_timeout_seconds and then
+    # fails with an opaque "QueuePool limit ... reached" (reproduced in
+    # doc/LearnGraph_并发压测报告_v1.0.md §5.1: 20 streams, 19/20, 1 pool
+    # timeout). The gate rejects immediately at the HTTP edge with a legible
+    # 429 instead, so the failure is instant and the message actionable.
+    #
+    # admission_enabled=False turns the gate into an explicit unbounded no-op
+    # (kill switch; occupancy is then reported as limit=None, never as a
+    # misleading huge number).
+    agent_stream_admission_enabled: bool = True
+    # Ceiling on concurrent agent generations. 0 = derive from pool capacity as
+    # (pool_size + max_overflow - pool_reserve) // connections_per_stream, which
+    # stays correct when an operator tunes the pool. >0 pins it explicitly.
+    agent_stream_max_concurrent: int = 0
+    # Connections kept free of stream admission for scheduler sweeps, background
+    # workers and the admitting request's own auth/preflight queries. Note that
+    # FastAPI resolves the CurrentWorkspace dependency (a DB query) BEFORE the
+    # handler body, so the reserve must also cover that query — the gate cannot
+    # run earlier than the handler. 6 of the default 30 leaves 24 for streams,
+    # i.e. 12 concurrent generations, which is exactly the concurrency the load
+    # test proved clean (doc/LearnGraph_并发压测报告_v1.0.md §3) and well below
+    # the 20 that hit a pool timeout. Being too low costs a clean retryable
+    # 429; being too high costs an opaque 10s stall and a failed turn, so the
+    # default errs conservative.
+    agent_stream_pool_reserve: int = 6
+    # Pool connections one admitted stream pins: the request-scoped session plus
+    # the detached worker session. Both live as long as the generation does.
+    agent_stream_connections_per_stream: int = 2
     # Period (seconds) of the background SQLite WAL checkpoint maintenance
     # loop. A multi-MB WAL makes the next autocheckpoint write many MB back
     # into the main file while holding the single SQLite write lock, which can
@@ -307,6 +341,11 @@ class Settings(BaseSettings):
     durable_queue_poll_seconds: float = 0.25
     durable_queue_lease_seconds: int = 300
     durable_queue_max_attempts: int = 3
+    # 教学包生成：每次生成（含修复）最多几次模型调用、同一阶段内并发几路、
+    # 以及被中断的阶段允许自动重放几次（纯生成阶段幂等，但重放会再次计费）。
+    learning_generation_attempts: int = 3
+    learning_generation_parallel: int = 2
+    learning_stage_replay_limit: int = 1
     # Event-driven Agent turns for bidirectional sub-applications. Default off:
     # enabling it can trigger paid model calls without a frontend consent turn.
     subapp_event_agent_enabled: bool = False

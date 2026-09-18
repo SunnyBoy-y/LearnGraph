@@ -11,20 +11,14 @@ import {
   Download,
   LoaderCircle,
   Maximize2,
-  X,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { downloadFile } from "@/api/files";
+import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import { downloadViaNative } from "@/lib/native-download";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import type { MessagePart } from "@/types/sessions";
 
 function safeImageSource(value: unknown) {
@@ -488,31 +482,19 @@ function ChatImagePart({ part }: { part: MessagePart }) {
         </div>
       ) : null}
       {interactive ? (
-        <Dialog onOpenChange={setLightboxOpen} open={lightboxOpen}>
-          <DialogContent
-            aria-describedby={undefined}
-            className="chat-image-lightbox"
-            showCloseButton={false}
-          >
-            <DialogTitle className="sr-only">查看生成的图片</DialogTitle>
-            <img alt={alt} className="chat-image-lightbox__image" src={source} />
-            <div className="chat-image-lightbox__toolbar">
-              <button
-                onClick={() => void handleDownload()}
-                type="button"
-              >
-                <Download className="size-4" />
-                下载图片
-              </button>
-              <DialogClose asChild>
-                <button type="button">
-                  <X className="size-4" />
-                  关闭
-                </button>
-              </DialogClose>
-            </div>
-          </DialogContent>
-        </Dialog>
+        <ImageLightbox
+          actions={
+            <button onClick={() => void handleDownload()} type="button">
+              <Download className="size-4" />
+              下载图片
+            </button>
+          }
+          alt={alt}
+          dialogTitle="查看生成的图片"
+          onOpenChange={setLightboxOpen}
+          open={lightboxOpen}
+          src={source}
+        />
       ) : null}
     </figure>
   );

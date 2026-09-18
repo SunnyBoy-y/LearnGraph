@@ -6,7 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { ChevronLeft, ChevronRight, LoaderCircle } from "lucide-react";
+import { ChevronLeft, ChevronRight, LoaderCircle, ZoomIn } from "lucide-react";
 import type {
   PDFDocumentLoadingTask,
   PDFDocumentProxy,
@@ -16,6 +16,7 @@ import type {
 import type { Cell, Workbook, Worksheet } from "exceljs";
 
 import { Button } from "@/components/ui/button";
+import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { createSandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
 import { usePreviewPause } from "@/lib/preview-pause-controller";
@@ -26,18 +27,35 @@ type PdfJsModule = typeof import("pdfjs-dist");
 // actually renders. The worker URL is a separate ?url import resolved by Vite.
 let pdfjsPromise: Promise<PdfJsModule> | undefined;
 
+/**
+ * Vite's `?url` module carries the asset URL as its default export, while a
+ * dynamic `import()` always yields that module's namespace object — never a
+ * bare string. A namespace object has a null prototype, so `String(namespace)`
+ * throws `TypeError: Cannot convert object to primitive value`; the default
+ * export is the only valid source of the URL.
+ */
+function assetUrl(module: string | { default: string }) {
+  return typeof module === "string" ? module : module.default;
+}
+
 function loadPdfjs() {
-  const promise =
-    pdfjsPromise ??
-    Promise.all([
+  if (!pdfjsPromise) {
+    pdfjsPromise = Promise.all([
       import("pdfjs-dist"),
       import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
-    ]).then(([pdfjs, workerUrl]) => {
-      pdfjs.GlobalWorkerOptions.workerSrc = String(workerUrl);
-      return pdfjs;
-    });
-  pdfjsPromise = promise;
-  return promise;
+    ])
+      .then(([pdfjs, workerModule]) => {
+        pdfjs.GlobalWorkerOptions.workerSrc = assetUrl(workerModule);
+        return pdfjs;
+      })
+      .catch((reason: unknown) => {
+        // Never cache a rejected load: a transient failure would otherwise
+        // keep every later PDF preview broken until a full page reload.
+        pdfjsPromise = undefined;
+        throw reason;
+      });
+  }
+  return pdfjsPromise;
 }
 
 
@@ -869,8 +887,26 @@ export function ExcelWorkbookViewer({
 }
 
 
-export function BlobImage({ blob, alt }: { blob: Blob; alt: string }) {
+/**
+ * 图片原图预览。
+ *
+ * `zoomable` 打开时，点击图片进入**共享图片灯箱**（`@/components/chat/image-lightbox`）：
+ * 滚轮/双指缩放、拖拽平移、双击还原。资料库里点开图片看的就是这一层，所以这里必须
+ * 支持缩放——否则看清细节只剩"下载到本地再看"这一条路。灯箱由本组件自己承载（只有它
+ * 手里有 objectURL），调用方只需多传一个布尔量。
+ */
+export function BlobImage({
+  blob,
+  alt,
+  zoomable = false,
+}: {
+  blob: Blob;
+  alt: string;
+  /** 允许点击放大（复用共享灯箱）。 */
+  zoomable?: boolean;
+}) {
   const [source, setSource] = useState("");
+  const [zoomOpen, setZoomOpen] = useState(false);
 
   useEffect(() => {
     const objectUrl = URL.createObjectURL(blob);
@@ -879,13 +915,37 @@ export function BlobImage({ blob, alt }: { blob: Blob; alt: string }) {
   }, [blob]);
 
   if (!source) return <ViewerState>正在读取图片原始文件...</ViewerState>;
-  return (
+  const image = (
     <img
       alt={alt}
       className="document-blob-image"
       draggable={false}
       src={source}
     />
+  );
+  if (!zoomable) return image;
+  return (
+    <>
+      <button
+        aria-label={`放大预览 ${alt}`}
+        className="document-blob-image__zoom"
+        onClick={() => setZoomOpen(true)}
+        type="button"
+      >
+        {image}
+        <span aria-hidden="true" className="document-blob-image__zoom-hint">
+          <ZoomIn className="size-3.5" />
+          点击放大
+        </span>
+      </button>
+      <ImageLightbox
+        alt={alt}
+        dialogTitle={`图片预览 · ${alt}`}
+        onOpenChange={setZoomOpen}
+        open={zoomOpen}
+        src={source}
+      />
+    </>
   );
 }
 

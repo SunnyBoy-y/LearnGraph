@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from sqlalchemy import select, text
 
 from app.api.deps import DB
+from app.core.admission import snapshot_admission_metrics
 from app.domain.models import ProviderConfig
 from app.domain.schemas.common import HealthResponse
 
@@ -50,4 +51,5 @@ def health(db: DB) -> HealthResponse:
         version="0.1.0",
         database="sqlite",
         remote_capabilities_enabled=remote_enabled is not None,
+        agent_stream_admission=snapshot_admission_metrics(),
     )

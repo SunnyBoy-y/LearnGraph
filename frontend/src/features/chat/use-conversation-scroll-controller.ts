@@ -533,6 +533,19 @@ export function useConversationScrollController(): ConversationScrollController 
       expectedProgrammaticTopRef.current !== null &&
       Math.abs(nextTop - expectedProgrammaticTopRef.current) <= 2;
 
+    // The scroller is not only moved by this controller: the wheel, a touch
+    // drag, the keyboard, and the browser's own clamping all move it too. That
+    // displacement is not a layout change, so it has to be folded into the
+    // anchor's baseline here and now. A layout decision frame that was already
+    // scheduled for this same frame (streaming content resizes nearly every
+    // frame) runs *after* this and would otherwise read the pre-scroll baseline,
+    // mistake the learner's own scroll for content growth above the anchor, and
+    // scroll the viewport straight back — the reason the reply could not be
+    // scrolled by hand while it was streaming.
+    const scrollDelta = nextTop - previousTop;
+    if (scrollDelta !== 0 && activeAnchorRef.current) {
+      activeAnchorRef.current.viewportTop -= scrollDelta;
+    }
     lastScrollTopRef.current = nextTop;
     setIsAtBottom(nearBottom);
     if (isProgrammatic) {

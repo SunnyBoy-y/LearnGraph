@@ -16,6 +16,9 @@ class HealthResponse(BaseModel):
     version: str
     database: str
     remote_capabilities_enabled: bool
+    # P0-4: live agent-stream admission occupancy. Optional with a default so
+    # existing clients keep working unchanged.
+    agent_stream_admission: dict[str, Any] | None = None
 
 
 class ActionResponse(BaseModel):
