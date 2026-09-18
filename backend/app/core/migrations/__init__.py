@@ -303,6 +303,29 @@ def _voice_turn_failure_reason(connection: Connection) -> None:
     connection.exec_driver_sql("ALTER TABLE voice_turns ADD COLUMN failure_reason VARCHAR(120)")
 
 
+def _learning_packages(connection: Connection) -> None:
+    from app.domain.learning_package_models import (
+        LearningPolicy, LearningEligibility, LearningBuild, LearningPackage,
+        LearningEnrollment, LearningAttempt, LearningAchievement,
+    )
+    for model in (LearningPolicy, LearningEligibility, LearningBuild, LearningPackage,
+                  LearningEnrollment, LearningAttempt, LearningAchievement):
+        model.__table__.create(bind=connection, checkfirst=True)
+
+
+def _graph_cover_ai_jobs(connection: Connection) -> None:
+    """Create the durable AI cover job table for pre-existing installations.
+
+    ``create_all`` covers fresh databases; this additive revision keeps upgraded
+    SQLite/PostgreSQL/MySQL installations able to record an AI cover attempt and
+    its readable failure reason. Idempotent, like every other revision here.
+    """
+
+    from app.domain.graph_cover_models import GraphCoverJob
+
+    GraphCoverJob.__table__.create(bind=connection, checkfirst=True)
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -366,6 +389,12 @@ MIGRATIONS = (
         "v1.8.0",
         "Voice result inbox, idempotent delivery, revision and peer isolation",
         apply_voice_reliability_migration,
+    ),
+    SchemaMigration("v1.9.0", "Durable node learning packages, generation policies, assessments and achievements", _learning_packages),
+    SchemaMigration(
+        "v1.10.0",
+        "Durable AI graph cover generation jobs (svg/image engines)",
+        _graph_cover_ai_jobs,
     ),
 )
 

@@ -71,6 +71,8 @@ function isAllowedResourceUrl(value: string) {
 }
 
 export interface SandboxedHtmlPreviewOptions {
+  /** Learning packages are self-contained and must not load remote assets. */
+  offline?: boolean
   /**
    * Inject the browser-sandbox runtime shim (`window.__lg` + `fetch` relay).
    * The shim talks to the host bridge over postMessage (`lg:1` protocol) so
@@ -149,5 +151,6 @@ export function sandboxedHtmlPreviewDocument(
 
   const shimTag = options.runtimeShim ? sandboxRuntimeShimInlineTag() : "";
   const clientTag = options.subappClient ? subappClientInlineTag() : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${SANDBOXED_HTML_PREVIEW_CSP}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${PREVIEW_CONTROL_SHIM}${shimTag}${clientTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
+  const policy = options.offline ? "default-src 'none'; img-src data: blob:; media-src data: blob:; font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" : SANDBOXED_HTML_PREVIEW_CSP;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${PREVIEW_CONTROL_SHIM}${shimTag}${clientTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
 }

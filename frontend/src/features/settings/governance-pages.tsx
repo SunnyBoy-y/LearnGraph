@@ -160,6 +160,7 @@ import type {
 } from "@/types/migrations";
 import type { WorkspaceSetting } from "@/types/settings";
 import { currentWorkspaceQueryKey } from "@/lib/query-keys";
+import { LearningModelSelect } from "@/features/learning/learning-model-select";
 import {
   FEATURE_MODEL_DEFAULT,
   FEATURE_MODEL_FOLLOW_CONVERSATION,
@@ -3142,7 +3143,7 @@ export function WorkspaceSettingsPage() {
 
       <Surface className="p-5">
         <SectionHeading
-          description="为自动标题、下一步问题提示、语音转写整理、练习出题与判分、记忆整理与 Embedding 选择模型；对话类功能留空则跟随对话当前模型。"
+          description="为自动标题、下一步问题提示、语音转写整理、练习出题与判分、教学包生成、记忆整理与 Embedding 选择模型；对话类功能留空则跟随对话当前模型。"
           title="功能模型"
         />
         <div className="mt-5 grid gap-3 lg:grid-cols-2">
@@ -3213,6 +3214,13 @@ export function WorkspaceSettingsPage() {
               placeholder="跟随对话模型"
               value={featureModelValue(exerciseModel.provider_id, exerciseModel.model_id)}
             />
+          </div>
+          <div className="rounded-xl border p-4">
+            <p className="text-sm font-medium">教学包生成模型</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              节点学习页的教材、互动实验、小剧场与闯关测评共用；结构化输出很长，建议选择输出上限足够大的模型
+            </p>
+            <LearningModelSelect />
           </div>
           <div className="rounded-xl border p-4">
             <p className="text-sm font-medium">记忆整理模型</p>

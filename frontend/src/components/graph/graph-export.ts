@@ -151,8 +151,8 @@ function renderEdge(edge: GraphExportEdge, arrow: boolean): string {
 const TYPE_LABELS: Record<string, string> = {
   root: "目标",
   concept: "概念",
-  practice: "实验 / 测验",
-  assessment: "实验 / 测验",
+  practice: "交互实验",
+  assessment: "测评关卡",
 };
 
 function typeLabel(node: GraphExportNode): string {

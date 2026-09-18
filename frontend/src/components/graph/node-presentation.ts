@@ -18,6 +18,7 @@ import {
   Lightbulb,
   Route,
   Target,
+  Medal,
   type LucideIcon,
 } from "lucide-react";
 
@@ -29,6 +30,7 @@ export type NodeTypeId =
   | "method"
   | "application"
   | "lab"
+  | "assessment"
   | "open";
 
 export type NodeTypeProfile = {
@@ -78,11 +80,12 @@ export const NODE_TYPE_PROFILES: Record<NodeTypeId, NodeTypeProfile> = {
   },
   lab: {
     id: "lab",
-    label: "实验 / 测验",
+    label: "交互实验",
     icon: FlaskConical,
     tone: "lab",
-    hint: "动手练习与验收测评",
+    hint: "通过动手操作理解知识",
   },
+  assessment: { id: "assessment", label: "测评关卡", icon: Medal, tone: "lab", hint: "通过正式测评获得通关标记" },
   open: {
     id: "open",
     label: "开放性任务",
@@ -100,13 +103,13 @@ export const NODE_TYPE_ORDER: NodeTypeId[] = [
   "method",
   "application",
   "lab",
+  "assessment",
   "open",
 ];
 
 /**
  * Backend `node_type` (and forward-compatible aliases) → UI type.
- * Practice and assessment both read as hands-on work in the learner's
- * mental model, so they share the “实验 / 测验” profile.
+ * Experiments and formal checkpoints have distinct purposes and entry labels.
  */
 const NODE_TYPE_ALIASES: Record<string, NodeTypeId> = {
   root: "root",
@@ -128,9 +131,9 @@ const NODE_TYPE_ALIASES: Record<string, NodeTypeId> = {
   case: "application",
   practice: "lab",
   exercise: "lab",
-  assessment: "lab",
-  quiz: "lab",
-  test: "lab",
+  assessment: "assessment",
+  quiz: "assessment",
+  test: "assessment",
   experiment: "lab",
   lab: "lab",
   open: "open",

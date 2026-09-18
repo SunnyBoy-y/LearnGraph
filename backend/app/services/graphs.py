@@ -9,6 +9,7 @@ from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
+from app.domain.learning_package_models import LearningAchievement, LearningAttempt, LearningEligibility, LearningPackage
 from app.domain.models import Evidence, FileReference, Graph, GraphEdge, GraphNode, GraphNodeMerge, GraphRevision, Message, utc_now
 from app.domain.schemas.graphs import (
     GraphView,
@@ -35,6 +36,27 @@ from app.repositories.domain import (
 )
 from app.services.billing import BillingService
 from app.services.graph_cover import generate_graph_cover
+
+
+def learning_page_node_ids(db: Session, workspace_id: str, graph_id: str) -> set[str]:
+    """Nodes in one graph whose generated learning page already exists.
+
+    ``LearningEligibility.current_package_id`` is only set once a build published
+    a complete package (教材＋互动实验＋闯关测评), so it is the authoritative
+    "这个节点已经有交互页" signal. Reading it as one batch keeps the canvas and
+    the agent-facing graph tools free of per-node learning-page requests.
+    """
+    return set(db.scalars(select(LearningEligibility.node_id).where(
+        LearningEligibility.workspace_id == workspace_id,
+        LearningEligibility.graph_id == graph_id,
+        LearningEligibility.current_package_id.is_not(None),
+    )).all())
+
+
+def node_has_learning_page(db: Session, node_id: str) -> bool:
+    """Single-node variant for the paths that return exactly one node."""
+    guard = db.get(LearningEligibility, node_id)
+    return bool(guard and guard.current_package_id)
 
 
 class GraphService:
@@ -114,6 +136,14 @@ class GraphService:
     def list(self) -> list[Graph]:
         return list(self.db.scalars(self.graphs.query().order_by(Graph.updated_at.desc())).all())
 
+    def _learning_page_node_ids(self, graph_id: str) -> set[str]:
+        """Nodes in this graph whose learning page is already generated."""
+        return learning_page_node_ids(self.db, self.workspace_id, graph_id)
+
+    def _node_has_learning_page(self, node_id: str) -> bool:
+        """Single-node variant used by the paths that return one node."""
+        return node_has_learning_page(self.db, node_id)
+
     def detail(self, graph_id: str) -> GraphView:
         graph = self.graphs.require(graph_id, "graph")
         if not self._can_access_graph(graph.id, "read"):
@@ -124,9 +154,26 @@ class GraphService:
             .order_by(GraphNode.id)
         ).all()
         edges = self.db.scalars(self.edges.query().where(GraphEdge.graph_id == graph.id)).all()
+        from app.services.learning_packages import fingerprint
+        node_fingerprints = {node.id: fingerprint(node) for node in nodes}
+        award_rows = self.db.execute(select(LearningAchievement.node_id, LearningAchievement.score, LearningPackage.fingerprint).join(
+            LearningAttempt, LearningAttempt.id == LearningAchievement.attempt_id).join(
+            LearningPackage, LearningPackage.id == LearningAttempt.package_id).join(
+            GraphNode, GraphNode.id == LearningAchievement.node_id).where(
+                GraphNode.graph_id == graph.id, LearningAchievement.workspace_id == self.workspace_id,
+                LearningAchievement.user_id == self.actor_id)).all()
+        awards = {node_id: score for node_id, score, digest in award_rows if node_fingerprints.get(node_id) == digest}
+        learning_page_nodes = self._learning_page_node_ids(graph.id)
         return GraphView.model_validate({
             **graph.__dict__,
-            "nodes": nodes,
+            "nodes": [
+                {
+                    **node.__dict__,
+                    "achievement_score": awards.get(node.id),
+                    "has_learning_page": node.id in learning_page_nodes,
+                }
+                for node in nodes
+            ],
             "edges": edges,
             "cover_svg": graph.cover_svg or generate_graph_cover(
                 graph.title,
@@ -178,6 +225,7 @@ class GraphService:
         )
         self.db.commit()
         self.db.refresh(node)
+        node.has_learning_page = self._node_has_learning_page(node.id)
         return node
 
     def revisions(self, graph_id: str) -> list[GraphRevision]:
@@ -272,6 +320,7 @@ class GraphService:
         )
         self.db.commit()
         self.db.refresh(node)
+        node.has_learning_page = self._node_has_learning_page(node.id)
         return node
 
     def delete_node(self, graph_id: str, node_id: str, expected_revision: int) -> str:

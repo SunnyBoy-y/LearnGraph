@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronUp, Sparkles } from "lucide-react";
 
 import {
   NODE_STATUS_ORDER,
@@ -20,10 +20,13 @@ const LEGEND_COLLAPSED_KEY = "learngraph:graph-legend-collapsed";
 export function GraphLegend({
   typeCounts,
   statusCounts,
+  pageCount = 0,
   className,
 }: {
   typeCounts: ReadonlyMap<NodeTypeId, number>;
   statusCounts: ReadonlyMap<NodeLearningStatusId, number>;
+  /** Nodes whose learning page (交互页) is already generated. */
+  pageCount?: number;
   className?: string;
 }) {
   const [collapsed, setCollapsed] = useState(() => {
@@ -132,6 +135,25 @@ export function GraphLegend({
                 </li>
               );
             })}
+          </ul>
+        </div>
+        <div className="graph-legend__group">
+          <p>标记</p>
+          <ul>
+            <li
+              className={pageCount ? undefined : "is-absent"}
+              title={
+                pageCount
+                  ? `该节点的学习页（教材 / 互动实验 / 闯关测评）已经生成 · 当前图谱 ${pageCount} 个`
+                  : "当前图谱还没有已生成学习页的节点"
+              }
+            >
+              <span className="graph-legend__page" aria-hidden="true">
+                <Sparkles />
+              </span>
+              已生成交互页
+              {pageCount ? <em>{pageCount}</em> : null}
+            </li>
           </ul>
         </div>
       </section>

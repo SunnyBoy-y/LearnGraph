@@ -27,6 +27,7 @@ const ChatCanvasPage = lazy(() => import('@/features/chat/chat-pages').then((mod
 const VersionsPage = lazy(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.VersionsPage })))
 const EvidenceReviewPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.EvidenceReviewPage })))
 const ExerciseAnswerPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.ExerciseAnswerPage })))
+const NodeLearningPage = lazy(() => import('@/features/learning/node-learning-page').then((module) => ({ default: module.NodeLearningPage })))
 const PracticeCenterPage = lazy(() => import('@/features/practice/practice-center-page').then((module) => ({ default: module.PracticeCenterPage })))
 const PracticeSessionPage = lazy(() => import('@/features/practice/practice-session-page').then((module) => ({ default: module.PracticeSessionPage })))
 const PracticeReportPage = lazy(() => import('@/features/practice/practice-report-page').then((module) => ({ default: module.PracticeReportPage })))
@@ -143,6 +144,7 @@ function AppRoutes() {
         <Route element={<GraphWorkspacePage />} path="graphs/:graphId" />
         <Route element={<CapabilityGraphPage />} path="capabilities" />
         <Route element={<JointStudyPage />} path="learn/joint" />
+        <Route element={<NodeLearningPage />} path="learn/nodes/:nodeId" />
         <Route element={<ChatCanvasPage />} path="chat/:sessionId" />
         <Route element={<VersionsPage />} path="chat/:sessionId/versions" />
         <Route element={<SourcesPage />} path="sources" />

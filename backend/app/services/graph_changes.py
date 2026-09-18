@@ -21,7 +21,7 @@ from app.domain.models import (
 )
 from app.domain.schemas.graphs import ModelConversationGraphProposal
 from app.repositories.audit import AuditRepository
-from app.repositories.domain import GraphChangeSetRepository
+from app.repositories.domain import GraphChangeSetRepository, GraphNodeRepository
 from app.services.graph_cover import generate_graph_cover
 
 
@@ -33,6 +33,7 @@ class GraphChangeSetService:
         self.workspace_id = workspace_id
         self.actor_id = actor_id
         self.change_sets = GraphChangeSetRepository(db, workspace_id)
+        self.nodes = GraphNodeRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
 
     @staticmethod
@@ -862,17 +863,20 @@ class GraphChangeSetService:
         changed_nodes: list[GraphNode] = []
         for change in proposal.nodes:
             if change.change == "add":
-                node = GraphNode(
-                    workspace_id=self.workspace_id,
-                    graph_id=graph.id,
-                    label=change.label,
-                    description=change.description,
-                    node_type=change.node_type,
-                    retrieval_state="unverified",
-                    evidence_state="none",
+                # The repository flushes the node and then opens its eligibility
+                # guard, so the guard never shares a flush with the node row it
+                # references.
+                node = self.nodes.add(
+                    GraphNode(
+                        workspace_id=self.workspace_id,
+                        graph_id=graph.id,
+                        label=change.label,
+                        description=change.description,
+                        node_type=change.node_type,
+                        retrieval_state="unverified",
+                        evidence_state="none",
+                    )
                 )
-                self.db.add(node)
-                self.db.flush()
             else:
                 node = self.db.scalar(
                     select(GraphNode).where(

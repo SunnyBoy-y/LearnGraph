@@ -54,6 +54,7 @@ from app.domain.models import (
     VoiceTaskLinkRecord,
     VoiceTurnRecord,
 )
+from app.domain.learning_package_models import open_eligibility_guard
 from app.repositories.scoped import ScopedRepository
 
 
@@ -73,8 +74,24 @@ class GraphChangeSetRepository(ScopedRepository[GraphChangeSet]):
 
 
 class GraphNodeRepository(ScopedRepository[GraphNode]):
+    """The single funnel for node creation, so the eligibility guard is never missed.
+
+    ``add`` opens the node's learning-package eligibility guard row right after
+    the node row exists. The ordering is explicit on purpose: the guard's foreign
+    keys point at ``graph_nodes``/``graphs``, and the unit of work has no
+    relationship to order those mappers by, so it falls back to sorting them by
+    ``module.ClassName``. Creating the guard in the same flush as its node is
+    therefore emitted child-first and rejected by SQLite (PRAGMA
+    foreign_keys=ON). See ``open_eligibility_guard``.
+    """
+
     def __init__(self, db: Session, workspace_id: str) -> None:
         super().__init__(db, GraphNode, workspace_id)
+
+    def add(self, instance: GraphNode) -> GraphNode:
+        node = super().add(instance)
+        open_eligibility_guard(self.db, node)
+        return node
 
 
 class GraphEdgeRepository(ScopedRepository[GraphEdge]):

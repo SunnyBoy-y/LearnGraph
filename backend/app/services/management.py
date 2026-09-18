@@ -38,6 +38,9 @@ from app.domain.settings import (
     CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
     FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY,
+    GRAPH_COVER_ENGINE_SETTING_KEY,
+    GRAPH_COVER_MODEL_SETTING_KEY,
+    LEARNING_PACKAGE_MODEL_SETTING_KEY,
     PRACTICE_EXERCISE_MODEL_SETTING_KEY,
 )
 from app.domain.schemas.management import (
@@ -4489,6 +4492,21 @@ class SettingsService:
             "default": {"provider_id": None, "model_id": None},
             "risk": "medium",
         },
+        LEARNING_PACKAGE_MODEL_SETTING_KEY: {
+            "description": "Default model for node learning-page generation (教材/实验/小剧场/试卷)",
+            "default": {"provider_id": None, "model_id": None},
+            "risk": "medium",
+        },
+        GRAPH_COVER_MODEL_SETTING_KEY: {
+            "description": "Generation model for AI graph covers, vector engine (the text model draws the SVG)",
+            "default": {"provider_id": None, "model_id": None},
+            "risk": "medium",
+        },
+        GRAPH_COVER_ENGINE_SETTING_KEY: {
+            "description": "Default AI cover engine: svg (text model, no image-model spend) or image (image Provider)",
+            "default": "svg",
+            "risk": "low",
+        },
         FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY: {
             "description": "Capability-specific default Provider/model routing",
             "default": {},
@@ -4696,6 +4714,8 @@ class SettingsService:
             CHAT_AUTO_TITLE_MODEL_SETTING_KEY,
             CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY,
             CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY,
+            GRAPH_COVER_MODEL_SETTING_KEY,
+            LEARNING_PACKAGE_MODEL_SETTING_KEY,
             PRACTICE_EXERCISE_MODEL_SETTING_KEY,
         }:
             try:
@@ -4710,6 +4730,14 @@ class SettingsService:
                     ),
                     {"key": key, "errors": exc.errors(include_input=False)},
                 ) from exc
+        elif key == GRAPH_COVER_ENGINE_SETTING_KEY:
+            if value not in {"svg", "image"}:
+                raise AppError(
+                    422,
+                    "invalid_setting_value",
+                    "graph.cover_engine must be 'svg' or 'image'",
+                    {"key": key},
+                )
         elif key == CHAT_RESPONSE_STYLE_SETTING_KEY:
             try:
                 value = ChatResponseStyleSettingValue.model_validate(value).model_dump()

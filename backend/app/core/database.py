@@ -832,9 +832,11 @@ def describe_pending_sqlite_migrations() -> list[str]:
         return []
     from app.domain import (  # noqa: F401
         extension_models,
+        graph_cover_models,
         memory_event_models,
         migration_models,
         models,
+        learning_package_models,
     )
     from app.core.migrations import MIGRATIONS
 
@@ -1027,9 +1029,11 @@ def backup_sqlite_before_migration(pending: list[str]) -> Path | None:
 def init_database() -> None:
     from app.domain import (  # noqa: F401
         extension_models,
+        graph_cover_models,
         memory_event_models,
         migration_models,
         models,
+        learning_package_models,
     )
     from app.core.migrations import apply_schema_migrations
 
@@ -1127,13 +1131,13 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.8.0"
-CURRENT_SCHEMA_DESCRIPTION = "Voice result inbox, idempotent delivery, revision and peer isolation; voice turn failure reasons"
+CURRENT_SCHEMA_REVISION = "v1.10.0"
+CURRENT_SCHEMA_DESCRIPTION = "Durable AI graph cover generation jobs (svg/image engines)"
 
 
 def _compute_schema_checksum() -> str:
     """Hash of all table/schema metadata for drift detection."""
-    from app.domain import extension_models, migration_models, models  # noqa: F401
+    from app.domain import extension_models, graph_cover_models, migration_models, models, learning_package_models  # noqa: F401
 
     h = hashlib.sha256()
     for table_name in sorted(Base.metadata.tables):

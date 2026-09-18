@@ -25,6 +25,7 @@ from app.domain.models import (
     Workspace,
     WorkspaceSetting,
 )
+from app.repositories.domain import GraphNodeRepository
 from app.services.authorization import ensure_permission_catalog
 from app.services.auth import validate_new_password
 
@@ -186,9 +187,10 @@ def seed_demo_data(db: Session) -> None:
         dict(id="node-index", label="索引", mastery_stars=2, retrieval_state="due", evidence_state="single"),
         dict(id="node-transaction", label="事务", mastery_stars=2, retrieval_state="relearning", evidence_state="conflicted", attention_state="focused"),
     ]
+    nodes = GraphNodeRepository(db, DEMO_WORKSPACE_ID)
     for spec in node_specs:
         if db.get(GraphNode, spec["id"]) is None:
-            db.add(GraphNode(workspace_id=DEMO_WORKSPACE_ID, graph_id=graph.id, **spec))
+            nodes.add(GraphNode(workspace_id=DEMO_WORKSPACE_ID, graph_id=graph.id, **spec))
     db.flush()
 
     edge_specs = [

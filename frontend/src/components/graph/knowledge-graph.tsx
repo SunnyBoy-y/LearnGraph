@@ -37,6 +37,7 @@ import {
   MoreHorizontal,
   Plus,
   RotateCcw,
+  Sparkles,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -82,6 +83,7 @@ export type KnowledgeNodeData = {
   description?: string;
   nodeType?: string;
   stars?: number;
+  achievementScore?: number | null;
   state?: string;
   root?: boolean;
   evidence?: string;
@@ -100,6 +102,11 @@ export type KnowledgeNodeData = {
   exploreCount?: number;
   /** User-declared mastery; only these enter the capability graph. */
   mastered?: boolean;
+  /**
+   * 节点学习页（交互页）已经生成。纯装饰标记：它只回答「这里有没有一份
+   * 现成的学习页」，学习状态仍由图谱自己的状态位表达。
+   */
+  hasLearningPage?: boolean;
   /** Node availability: an unsatisfied prerequisite blocks this node. */
   blockedByPrerequisite?: boolean;
   /** Selected-node neighbourhood pass: focus / neighbour / dimmed. */
@@ -274,6 +281,7 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
       className={cn(
         "knowledge-node",
         selected && "is-selected",
+        data.achievementScore != null && "is-verified",
         isRoot && "is-root",
         data.rootEmphasis && "is-root-emphasis",
         Boolean(data.focused) && "is-focused",
@@ -304,6 +312,16 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
         position={targetPosition}
         type="target"
       />
+      {data.hasLearningPage ? (
+        <span
+          aria-label="已生成交互页"
+          className="knowledge-node__page-badge"
+          role="img"
+          title="已生成交互页：教材、互动实验与闯关测评已就绪"
+        >
+          <Sparkles aria-hidden="true" />
+        </span>
+      ) : null}
       {!isRoot || !tree ? (
         <div className="knowledge-node__meta">
           <span
@@ -336,6 +354,7 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
         </div>
       ) : null}
       <strong>{tree && isRoot ? "根" : data.label}</strong>
+      {data.achievementScore != null && <span className="knowledge-node__achievement" title="正式测评通过；与自评掌握状态分别记录">✦ 已通关 · {data.achievementScore} 分</span>}
       {tree && !isRoot && data.description ? (
         <p className="knowledge-node__summary">{data.description}</p>
       ) : null}

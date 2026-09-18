@@ -71,6 +71,7 @@ export type GraphNode = {
   external_concept_id: string | null
   target_weight: number
   mastery_stars: number
+  achievement_score?: number | null
   retrieval_state: string
   evidence_state: string
   attention_state: string
