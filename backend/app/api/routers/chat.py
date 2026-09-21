@@ -75,11 +75,16 @@ from app.services.chat import ChatService
 from app.services.dictation import (
     DictationService,
     authenticate_realtime_dictation,
+    build_openai_realtime_audio_frame,
+    build_openai_realtime_finish,
+    build_openai_realtime_session_update,
     build_realtime_finish_task,
     build_realtime_run_task,
     dashscope_realtime_ws_url,
     is_realtime_transcription_model,
+    parse_openai_realtime_upstream_event,
     parse_realtime_upstream_event,
+    uses_openai_realtime_transport,
 )
 from app.services.billing import BillingService
 from app.services.graph_changes import GraphChangeSetService
@@ -622,6 +627,12 @@ async def _ws_error(websocket: WebSocket, code: str, message: str) -> None:
         pass
 
 
+def _passthrough_pcm(chunk: bytes) -> bytes:
+    """inference 方言的上行帧就是裸二进制 PCM，不做封装。"""
+
+    return chunk
+
+
 @router.websocket("/dictation/realtime")
 async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings) -> None:
     """Proxy live microphone PCM to the DashScope realtime ASR WebSocket.
@@ -673,7 +684,11 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
             "The configured transcription model is not a realtime model",
         )
         return
-    upstream_url = dashscope_realtime_ws_url(adapter.base_url)
+    # 端点与协议都由模型家族决定（见 services/dictation.py 的端点说明）：
+    # qwen3-asr-flash-realtime 家族走 /api-ws/v1/realtime 的 OpenAI 方言，
+    # paraformer/gummy 家族保持 /api-ws/v1/inference 的 run-task 方言。
+    openai_realtime = uses_openai_realtime_transport(adapter.model_id)
+    upstream_url = dashscope_realtime_ws_url(adapter.base_url, adapter.model_id)
     if upstream_url is None:
         await _ws_error(
             websocket,
@@ -703,13 +718,47 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
         await _ws_error(websocket, exc.code, exc.message)
         return
 
+    language = str(start.get("language") or "").strip() or None
+    hotwords_raw = start.get("hotwords")
+    hotwords = (
+        [str(item).strip() for item in hotwords_raw if str(item).strip()]
+        if isinstance(hotwords_raw, list)
+        else None
+    )
+
+    # 两套方言的差异集中在这几个局部变量里，握手/泵送逻辑完全共用：
+    # 上行音频的封装方式、就绪事件名、收尾事件名、收尾帧、事件解析器与鉴权头。
+    if openai_realtime:
+        parse_upstream_event = parse_openai_realtime_upstream_event
+        ready_event = "session.updated"
+        finished_event = "session.finished"
+        open_frame = build_openai_realtime_session_update(
+            adapter.model_id, sample_rate, language=language
+        )
+        finish_frame = build_openai_realtime_finish()
+        encode_audio = build_openai_realtime_audio_frame
+        upstream_headers = {
+            "Authorization": f"Bearer {adapter.api_key}",
+            "OpenAI-Beta": "realtime=v1",
+        }
+    else:
+        parse_upstream_event = parse_realtime_upstream_event
+        ready_event = "task-started"
+        finished_event = "task-finished"
+        task_id, open_frame = build_realtime_run_task(
+            adapter.model_id, sample_rate, language=language, hotwords=hotwords
+        )
+        finish_frame = build_realtime_finish_task(task_id)
+        encode_audio = _passthrough_pcm
+        upstream_headers = {"Authorization": f"bearer {adapter.api_key}"}
+
     from websockets.asyncio.client import connect as ws_connect
 
     started_at = asyncio.get_running_loop().time()
     try:
         upstream = await ws_connect(
             upstream_url,
-            additional_headers={"Authorization": f"bearer {adapter.api_key}"},
+            additional_headers=upstream_headers,
             max_size=2**22,
             open_timeout=15,
         )
@@ -721,24 +770,16 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
         )
         return
 
-    language = str(start.get("language") or "").strip() or None
-    hotwords_raw = start.get("hotwords")
-    hotwords = (
-        [str(item).strip() for item in hotwords_raw if str(item).strip()]
-        if isinstance(hotwords_raw, list)
-        else None
-    )
-    task_id, run_task = build_realtime_run_task(
-        adapter.model_id, sample_rate, language=language, hotwords=hotwords
-    )
     finish_sent = False
+    handshake_ok = False
     try:
-        await upstream.send(run_task)
+        await upstream.send(open_frame)
         while True:
-            event = parse_realtime_upstream_event(
+            event = parse_upstream_event(
                 await asyncio.wait_for(upstream.recv(), timeout=20)
             )
-            if event.event == "task-started":
+            if event.event == ready_event:
+                handshake_ok = True
                 break
             if event.event == "task-failed":
                 await _ws_error(
@@ -746,10 +787,20 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
                 )
                 return
     except Exception:
-        await _ws_error(websocket, "asr_task_failed", "DashScope did not start the ASR task")
+        await _ws_error(
+            websocket,
+            "asr_task_failed",
+            "DashScope did not start the ASR session"
+            if openai_realtime
+            else "DashScope did not start the ASR task",
+        )
         return
     finally:
-        if websocket.client_state.name != "CONNECTED":
+        # 握手没走到 ready（客户端断开、或上游以 task-failed 拒了这个模型/参数）时，
+        # 上游连接必须在这里关掉：这条路径会 return，后面的泵送阶段再也不会接手它。
+        # 旧实现只在"客户端已断开"时关闭，于是每次被上游拒绝都漏掉一条到 DashScope
+        # 的长连接（修复前 qwen 模型每次都走这条路径）。
+        if not handshake_ok or websocket.client_state.name != "CONNECTED":
             await upstream.close()
 
     if websocket.client_state.name != "CONNECTED":
@@ -774,7 +825,8 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
                     return "disconnect"
                 data = message.get("bytes")
                 if data:
-                    await upstream.send(data)
+                    # OpenAI 方言要求 base64 的 append 帧，inference 方言直接收二进制。
+                    await upstream.send(encode_audio(data))
                     continue
                 text = message.get("text")
                 if not text:
@@ -784,7 +836,7 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
                 except json.JSONDecodeError:
                     continue
                 if isinstance(frame, dict) and frame.get("type") == "stop":
-                    await upstream.send(build_realtime_finish_task(task_id))
+                    await upstream.send(finish_frame)
                     finish_sent = True
                     return "stop"
         except Exception:
@@ -792,20 +844,24 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
 
     async def pump_upstream() -> dict[str, int] | None:
         """Relay text events until the task ends; returns usage when finished."""
+        usage: dict[str, int] = {}
         try:
             async for raw_event in upstream:
-                event = parse_realtime_upstream_event(raw_event)
-                if event.event == "result-generated" and event.text is not None:
-                    await websocket.send_json(
-                        {"type": "final" if event.final else "partial", "text": event.text}
-                    )
-                elif event.event == "task-finished":
-                    return event.usage
-                elif event.event == "task-failed":
+                event = parse_upstream_event(raw_event)
+                if event.usage:
+                    for key, value in event.usage.items():
+                        usage[key] = usage.get(key, 0) + value
+                if event.event == "task-failed":
                     await _ws_error(
                         websocket, "asr_task_failed", event.error or "ASR task failed"
                     )
                     return None
+                if event.text is not None:
+                    await websocket.send_json(
+                        {"type": "final" if event.final else "partial", "text": event.text}
+                    )
+                elif event.event == finished_event:
+                    return usage or None
         except Exception:
             return None
         return None
@@ -822,7 +878,7 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
             stop_reason = client_task.result()
             if not finish_sent:
                 try:
-                    await upstream.send(build_realtime_finish_task(task_id))
+                    await upstream.send(finish_frame)
                     finish_sent = True
                 except Exception:
                     pass

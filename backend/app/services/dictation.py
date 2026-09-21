@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 from datetime import timezone
@@ -28,6 +29,28 @@ from app.services.billing import BillingService
 # reject accidental full-file uploads on the microphone endpoint, not to size
 # normal traffic.
 MAX_DICTATION_SEGMENT_BYTES = 10 * 1024 * 1024
+
+
+# ---- DashScope 实时 ASR 的两个端点（按模型家族分工，2026-09-20 实测）----------
+#
+# 同一个 host、同一把 key，两个端点说的是两套协议，且**各自只认自己的模型家族**：
+#
+#   /api-ws/v1/inference   老 ``run-task`` 协议（task_group=audio / task=asr）
+#                          → paraformer-realtime-* / gummy-realtime-*
+#   /api-ws/v1/realtime    OpenAI realtime 协议（session.update + append/commit）
+#                          → qwen3-asr-flash-realtime 家族
+#
+# 把 ``qwen3-asr-flash-realtime`` 发到 inference 端点会立刻收到
+# ``task-failed / error_code=ModelNotFound``（"Model not found
+# (qwen3-asr-flash-realtime)!"），听写实时通道因此永远等不到 ``task-started``，
+# 只能一路降级到分段上传。所以端点必须由模型 id 决定，不能只看 host。
+DASHSCOPE_INFERENCE_WS_PATH = "/api-ws/v1/inference"
+DASHSCOPE_OPENAI_REALTIME_WS_PATH = "/api-ws/v1/realtime"
+
+# 归属 OpenAI realtime 端点的模型家族。判据刻意保守——只有 qwen 系的 realtime
+# 模型经过实测，其余（paraformer / gummy / 未知型号）保持历史行为走 inference
+# 端点，避免"没验过的型号被改道"。
+_OPENAI_REALTIME_MODEL_PREFIXES = ("qwen",)
 
 
 def authenticate_realtime_dictation(
@@ -96,11 +119,31 @@ def is_realtime_transcription_model(model_id: str | None) -> bool:
     return "realtime" in (model_id or "").casefold()
 
 
-def dashscope_realtime_ws_url(base_url: str | None) -> str | None:
-    """Derive the DashScope realtime inference WebSocket URL for ``base_url``.
+def uses_openai_realtime_transport(model_id: str | None) -> bool:
+    """该实时 ASR 模型是否必须走 DashScope 的 OpenAI realtime 端点。
+
+    与语音通话路径（``app/providers/remote/dashscope_realtime.py``）一致：
+    ``qwen3-asr-flash-realtime`` 只提供 ``/api-ws/v1/realtime`` 的 OpenAI 方言，
+    inference 端点会以 ``ModelNotFound`` 拒掉它。
+    """
+
+    name = (model_id or "").strip().casefold()
+    if "realtime" not in name:
+        return False
+    return name.startswith(_OPENAI_REALTIME_MODEL_PREFIXES)
+
+
+def dashscope_realtime_ws_url(
+    base_url: str | None, model_id: str | None = None
+) -> str | None:
+    """Derive the DashScope realtime ASR WebSocket URL for ``base_url``.
 
     The configured Provider row stores the compatible-mode HTTP origin; the
-    realtime ASR service lives at ``/api-ws/v1/inference`` on the same host.
+    realtime ASR service lives on the same host, but the **path depends on the
+    model family** (see the module constants): ``qwen3-asr-flash-realtime`` is
+    served at ``/api-ws/v1/realtime`` (and needs the model id in the query
+    string), while the ``paraformer``/``gummy`` realtime families are served at
+    ``/api-ws/v1/inference``.
 
     Both the public DashScope gateway (``dashscope*.aliyuncs.com``) and the
     dedicated per-tenant deployments (``*.maas.aliyuncs.com``) advertise the
@@ -126,7 +169,12 @@ def dashscope_realtime_ws_url(base_url: str | None) -> str | None:
         ".maas.aliyuncs.com"
     ):
         return None
-    return f"wss://{parsed.netloc}/api-ws/v1/inference"
+    if uses_openai_realtime_transport(model_id):
+        query = urlencode({"model": str(model_id).strip()})
+        return urlunsplit(
+            ("wss", parsed.netloc, DASHSCOPE_OPENAI_REALTIME_WS_PATH, query, "")
+        )
+    return f"wss://{parsed.netloc}{DASHSCOPE_INFERENCE_WS_PATH}"
 
 
 def build_realtime_run_task(
@@ -177,6 +225,125 @@ def build_realtime_finish_task(task_id: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+# ---- OpenAI realtime 方言（/api-ws/v1/realtime）-------------------------------
+#
+# 帧构造与事件名与语音通话路径（``app/voice/embedded_dashscope_stt.py``）同源，
+# 那条路径已在真实网关跑通；这里只是把它搬到听写代理里，让打字框旁的实时听写
+# 用同一个上游协议。
+
+
+def build_openai_realtime_session_update(
+    model_id: str,
+    sample_rate: int,
+    language: str | None = None,
+) -> str:
+    """Build the DashScope realtime ``session.update`` frame.
+
+    听写通道只负责"边说边出字"，不管理回合，所以断句交给云端 VAD
+    （``turn_detection=server_vad``）：浏览器持续上行 PCM（含静音），云端据此
+    自然切段并下发 ``.completed``。参数与语音通话路径取同一组。
+
+    ``hotwords`` 不下发：该方言的热词字段未经真实网关验证，语音通话路径同样不发
+    （paraformer 家族走 inference 端点时仍照旧透传）。
+    """
+
+    transcription: dict[str, Any] = {"model": model_id}
+    if language and language != "auto":
+        # 与 inference 通道一致：DashScope 只接受 ISO 639-1 语言码（zh-CN → zh）。
+        transcription["language"] = language.split("-")[0]
+    message = {
+        "event_id": f"evt_session_{uuid4().hex[:12]}",
+        "type": "session.update",
+        "session": {
+            "modalities": ["text"],
+            "input_audio_format": "pcm",
+            "sample_rate": sample_rate,
+            "input_audio_transcription": transcription,
+            "turn_detection": {
+                "type": "server_vad",
+                # threshold 0.0 最灵敏（不吞音量偏小的说话），噪音过滤交给识别器；
+                # silence_duration_ms 400 是官方推荐值。
+                "threshold": 0.0,
+                "silence_duration_ms": 400,
+            },
+        },
+    }
+    return json.dumps(message, ensure_ascii=False)
+
+
+def build_openai_realtime_audio_frame(audio: bytes) -> str:
+    """Wrap one PCM16 chunk as an ``input_audio_buffer.append`` frame."""
+
+    return json.dumps(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(audio).decode("ascii"),
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_openai_realtime_finish() -> str:
+    """``session.finish``：服务端先补尾句 final，再回 ``session.finished``。"""
+
+    return json.dumps({"type": "session.finish"}, ensure_ascii=False)
+
+
+def _usage_from_openai_realtime_event(payload: dict[str, Any]) -> dict[str, int]:
+    raw_usage = payload.get("usage")
+    usage: dict[str, int] = {}
+    if isinstance(raw_usage, dict):
+        for key, value in raw_usage.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                usage[str(key)] = value
+    return usage
+
+
+def parse_openai_realtime_upstream_event(raw: str | bytes) -> RealtimeUpstreamEvent:
+    """Normalize a DashScope OpenAI-realtime event into transport-neutral fields.
+
+    只认三个事件：``conversation.item.input_audio_transcription.text``（整段单调
+    增长的假设文本，旧版协议把它放在 ``stash`` 里）、``...completed``（定稿）、
+    ``session.finished``（收尾）。其余（``session.created`` / ``speech_started`` /
+    ``input_audio_buffer.committed`` 等）原样透传事件名，由调用方忽略。
+
+    失败事件统一归一成 ``task-failed``：听写代理的握手循环与运行循环都只认这一个
+    名字，两套方言因此共用同一段错误处理。
+    """
+
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return RealtimeUpstreamEvent(event="invalid")
+    if not isinstance(payload, dict):
+        return RealtimeUpstreamEvent(event="invalid")
+    event = str(payload.get("type") or "")
+    if event == "conversation.item.input_audio_transcription.text":
+        # 空文本的 partial 不上屏（文本层用 None 表示"这条事件没有文本"）。
+        text = str(payload.get("text") or payload.get("stash") or "").strip()
+        return RealtimeUpstreamEvent(event=event, text=text or None)
+    if event == "conversation.item.input_audio_transcription.completed":
+        text = str(payload.get("transcript") or payload.get("text") or "").strip()
+        return RealtimeUpstreamEvent(
+            event=event,
+            text=text or None,
+            final=True,
+            usage=_usage_from_openai_realtime_event(payload),
+        )
+    if event == "session.finished":
+        return RealtimeUpstreamEvent(
+            event=event, usage=_usage_from_openai_realtime_event(payload)
+        )
+    if event in {"error", "asr.error"}:
+        code = str(payload.get("code") or "").strip()
+        message = str(payload.get("message") or payload.get("error") or "").strip()
+        detail = ": ".join(part for part in (code, message) if part)
+        return RealtimeUpstreamEvent(
+            event="task-failed", error=detail or "DashScope realtime ASR failed"
+        )
+    return RealtimeUpstreamEvent(event=event or "unknown")
 
 
 @dataclass(slots=True)
