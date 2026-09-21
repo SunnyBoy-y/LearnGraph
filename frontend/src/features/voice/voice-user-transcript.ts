@@ -1,3 +1,4 @@
+import { createUuid } from "@/lib/uuid";
 import type { VoiceRenderUpdate } from "./voice-session-controller";
 
 type Row = { id: string; turnId?: string; confirmed: string; createdAt: string };
@@ -18,7 +19,7 @@ export class VoiceUserTranscript {
     if (!text.trim()) return null;
     if (!this.current) {
       this.current = {
-        id: `user-draft-${crypto.randomUUID()}`, confirmed: "", createdAt: new Date().toISOString(),
+        id: `user-draft-${createUuid()}`, confirmed: "", createdAt: new Date().toISOString(),
       };
     }
     return this.render(this.current, text, false);

@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { apiClient, ApiError } from "@/api/client";
+import { createUuid } from "@/lib/uuid";
 import {
   cancelVoiceTask as requestVoiceTaskCancel,
   getVoiceIceServers,
@@ -308,7 +309,7 @@ export const VOICE_TYPED_TURN_MESSAGE = "learngraph-typed-turn";
 
 function sendRtvi(message: { type: string; data?: unknown }): boolean {
   if (dataChannel?.readyState !== "open") return false;
-  dataChannel.send(JSON.stringify({ label: RTVI_LABEL, id: crypto.randomUUID(), ...message }));
+  dataChannel.send(JSON.stringify({ label: RTVI_LABEL, id: createUuid(), ...message }));
   return true;
 }
 
@@ -715,7 +716,7 @@ function stopTaskPolling() {
 }
 
 function ensureUserTurnId() {
-  if (!activeUserTurnId) activeUserTurnId = crypto.randomUUID();
+  if (!activeUserTurnId) activeUserTurnId = createUuid();
   try { localStorage.setItem(`learngraph.voice.turn.${snapshot.sessionId}`, activeUserTurnId); } catch { /* optional */ }
   return activeUserTurnId;
 }
@@ -855,7 +856,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     case "user.started":
       // The journal may still be pointing at the previous turn when speech
       // starts. Never adopt that id for the new utterance.
-      activeUserTurnId = crypto.randomUUID();
+      activeUserTurnId = createUuid();
       update({ state: "listening", interimUserText: "" });
       // 刻意不传 `turnId`：账本这条带的是**上一轮**的 id（journal 先发事件、后开新轮），
       // 照身份归位会把用户这次真实开口吞掉。起音永远是新一轮的开始，身份等
@@ -863,7 +864,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       markVoiceLatency({ stage: "userStarted", source: "ledger" });
       return;
     case "user.interim":
-      activeUserTurnId = activeUserTurnId || crypto.randomUUID();
+      activeUserTurnId = activeUserTurnId || createUuid();
       update({ interimUserText: text });
       // The live hypothesis of the segment being spoken. Its row keeps the id it
       // will have once this segment is finalized, so finalizing replaces the text
@@ -879,7 +880,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       const typedClientId = String(
         payload.client_message_id ?? payload.clientMessageId ?? "",
       ).trim();
-      activeUserTurnId = turnId || activeUserTurnId || crypto.randomUUID();
+      activeUserTurnId = turnId || activeUserTurnId || createUuid();
       update({ interimUserText: "" });
       if (typedClientId) {
         // A typed utterance already owns its authoritative row: `sendText`
@@ -1659,7 +1660,7 @@ export const voiceSessionController = {
   sendText(text: string, existingClientMessageId?: string): boolean {
     const content = text.trim();
     if (!content) return false;
-    const clientMessageId = existingClientMessageId || crypto.randomUUID();
+    const clientMessageId = existingClientMessageId || createUuid();
     // Announce the idempotency key first, on the same ordered channel: the
     // worker needs it to attach to the turn `persistAcceptedTurn` is about to
     // create (otherwise one typed utterance becomes the client's turn plus a

@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { apiClient } from '@/api/client'
 import { sandboxedHtmlPreviewDocument } from '@/lib/sandboxed-html-preview'
+import { createUuid } from '@/lib/uuid'
 import { workspaceQueryKey } from '@/lib/query-keys'
 import { learningApi, type ActivitySpec, type ActivityState, type Attempt, type Build, type Enrollment, type LearningPageData, type Policy } from './node-learning-api'
 import './node-learning.css'
@@ -100,7 +101,7 @@ export function NodeLearningPage() {
   const control = useMutation({mutationFn: (action: 'cancel' | 'retry') => learningApi.control(data!.build!.id, action), onSuccess: updateBuild, onError: (e: Error) => {toast.error(e.message); void page.refetch()}})
   const start = useMutation({mutationFn: () => learningApi.start(nodeId), onSuccess: setEnrollment, onError: (e: Error) => toast.error(e.message)})
   const progress = useMutation({mutationFn: (payload: {section_id?: string; action_id?: string; reset_activity?: boolean}) => learningApi.progress(enrollment!.id, {expected_revision:enrollment!.revision,...payload}), onSuccess: setEnrollment, onError: (e: Error) => {toast.error(e.message); start.mutate()}})
-  const beginExam = useMutation({mutationFn: () => learningApi.startAttempt(nodeId, crypto.randomUUID()), onSuccess: row=>{const next: Record<string, string> = {attempt: row.id}; const returnSession = params.get('returnSession'); if (returnSession) next.returnSession = returnSession; setParams(next); setTab('exam')}, onError:(e:Error)=>toast.error(e.message)})
+  const beginExam = useMutation({mutationFn: () => learningApi.startAttempt(nodeId, createUuid()), onSuccess: row=>{const next: Record<string, string> = {attempt: row.id}; const returnSession = params.get('returnSession'); if (returnSession) next.returnSession = returnSession; setParams(next); setTab('exam')}, onError:(e:Error)=>toast.error(e.message)})
   useEffect(()=>{setEnrollment(null);setTab('lesson')},[nodeId])
   useEffect(()=>{if(data?.enrollment)setEnrollment(data.enrollment)},[data?.enrollment])
   useEffect(()=>{if(!params.get('attempt')&&!params.get('tab'))setTab(data?.node.node_type==='assessment'?'exam':data?.node.node_type==='practice'?'lab':'lesson')},[data?.node.node_type,nodeId,params])
