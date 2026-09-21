@@ -67,6 +67,12 @@ x-app-environment: &app-environment
   LEARNGRAPH_DATABASE_URL: sqlite:////data/learngraph.db
   LEARNGRAPH_STORAGE_ROOT: /data/storage
   LEARNGRAPH_MEMORY_ROOT: /data/memory
+  # 临时记忆评测接口（backend/app/api/routers/memory_eval.py）：默认关闭。
+  # 置 true 后 app 会挂载一组**不校验 bearer / 工作区头**的
+  # /api/v1/memory-eval/*（bootstrap / write / ask / status / memories），
+  # 只应在本地或受信网络短时开启，评测结束即改回 false 并删掉下面这行的 key。
+  LEARNGRAPH_MEMORY_EVAL_ENABLED: ${LEARNGRAPH_MEMORY_EVAL_ENABLED:-false}
+  LEARNGRAPH_MEMORY_EVAL_DEEPSEEK_API_KEY: ${LEARNGRAPH_MEMORY_EVAL_DEEPSEEK_API_KEY:-}
   LEARNGRAPH_VOICE_RUNTIME_EMBEDDED: ${LEARNGRAPH_VOICE_RUNTIME_EMBEDDED:-true}
   # 语音回合结束（EOU）单点计时探针：1 = 每轮输出一条 [VT] 时间线，用于把
   # 「用户闭嘴 → 出文字 → 出声音」拆成分段耗时；0（或缺省关闭）时管线里不会

@@ -228,9 +228,9 @@ def evaluate_capacity(
         )
         or 0
     )
-    effective_max_instances = effective_max_instances(settings, policy)
+    max_instances = effective_max_instances(settings, policy)
     total_active = user_active + instance_active
-    if total_active >= effective_max_instances:
+    if total_active >= max_instances:
         return False, "waiting_capacity", 5
 
     host_active = int(
@@ -400,6 +400,98 @@ class SandboxSchedulerService:
 
     # ── scheduling tick ────────────────────────────────────────────────
 
+    def _recover_stale_starting_jobs(self, now) -> int:
+        """Return abandoned CAS claims to the queue.
+
+        A process crash or a worker exception before ``_run_job`` starts can
+        leave a job in STARTING with no ``started_at``.  Do not reclaim it
+        immediately because the worker may still be between the CAS commit and
+        its first database write; thirty seconds is long beyond that handoff.
+        """
+        cutoff = now - timedelta(seconds=30)
+        stale_jobs = list(
+            self.db.scalars(
+                select(SandboxJob).where(
+                    SandboxJob.status == "STARTING",
+                    SandboxJob.started_at.is_(None),
+                    SandboxJob.available_at <= cutoff,
+                )
+            ).all()
+        )
+        if not stale_jobs:
+            return 0
+
+        recovered = 0
+        terminal_task_statuses = {
+            "SUCCEEDED",
+            "PARTIAL",
+            "FAILED",
+            "TIMED_OUT",
+            "CANCELLED",
+            "STALE",
+            "INTERRUPTED",
+        }
+        for job in stale_jobs:
+            job.status = "QUEUED"
+            job.reason = "stale_starting_recovered"
+            job.available_at = now
+            payload = job.payload_json if isinstance(job.payload_json, dict) else {}
+            task_id = payload.get("task_id")
+            task = self.db.get(SandboxAgentTask, task_id) if isinstance(task_id, str) else None
+            if task is not None and task.status not in terminal_task_statuses:
+                task.status = "QUEUED"
+                task.status_reason = "stale_starting_recovered"
+                append_agent_event(
+                    self.db,
+                    task,
+                    "retry_scheduled",
+                    {"job_id": job.id, "reason": "stale_starting_recovered"},
+                )
+            recovered += 1
+        self.db.commit()
+        return recovered
+
+    def _sync_expired_subagent_tasks(self, now) -> int:
+        """Mirror queue expiry onto the durable sub-agent task row."""
+        expired_jobs = list(
+            self.db.scalars(
+                select(SandboxJob).where(
+                    SandboxJob.kind == "subagent",
+                    SandboxJob.status == "EXPIRED",
+                    SandboxJob.reason == "queue_deadline",
+                )
+            ).all()
+        )
+        terminal_task_statuses = {
+            "SUCCEEDED",
+            "PARTIAL",
+            "FAILED",
+            "TIMED_OUT",
+            "CANCELLED",
+            "STALE",
+            "INTERRUPTED",
+        }
+        synced = 0
+        for job in expired_jobs:
+            payload = job.payload_json if isinstance(job.payload_json, dict) else {}
+            task_id = payload.get("task_id")
+            task = self.db.get(SandboxAgentTask, task_id) if isinstance(task_id, str) else None
+            if task is None or task.status in terminal_task_statuses:
+                continue
+            task.status = "TIMED_OUT"
+            task.status_reason = "queue_deadline"
+            task.finished_at = now
+            append_agent_event(
+                self.db,
+                task,
+                "timed_out",
+                {"job_id": job.id, "reason": "queue_deadline"},
+            )
+            synced += 1
+        if synced:
+            self.db.commit()
+        return synced
+
     def schedule_once(self) -> dict[str, int]:
         """Run one scheduling round. Returns counters for observability.
 
@@ -410,6 +502,7 @@ class SandboxSchedulerService:
         """
         counters = {"expired": 0, "started": 0, "requeued": 0, "failed": 0, "claimed": 0}
         now = utc_now()
+        counters["recovered"] = self._recover_stale_starting_jobs(now)
         # 1. Expire jobs past their queue deadline.
         expired = self.db.execute(
             update(SandboxJob)
@@ -422,6 +515,7 @@ class SandboxSchedulerService:
         )
         counters["expired"] = int(expired.rowcount or 0)
         self.db.commit()
+        counters["synced_expired_tasks"] = self._sync_expired_subagent_tasks(now)
         # 2. Release expired reservations.
         released = self.db.execute(
             update(SandboxReservation)
@@ -474,9 +568,92 @@ class SandboxSchedulerService:
                 if job is None:
                     return
                 worker = SandboxSchedulerService(db, self.settings)
-                worker._run_job(job)
-        except Exception:  # noqa: BLE001 - bounded worker failure
+                try:
+                    worker._run_job(job)
+                except Exception as exc:  # noqa: BLE001 - bounded worker failure
+                    worker._recover_worker_failure(job, exc)
+        except Exception:  # noqa: BLE001 - recovery must not escape the worker
             logger.exception("sandbox scheduler worker failed for job %s", job_id)
+
+    def _recover_worker_failure(self, job: SandboxJob, exc: Exception) -> None:
+        """Close the state transition when a worker fails outside ``_run_job``.
+
+        Admission and job dispatch happen before ``_run_job`` enters its normal
+        error boundary.  A bug in either phase used to leave the CAS-claimed job
+        in ``STARTING`` forever, which also left its durable sub-agent task in
+        ``QUEUED``.  Retry boundedly while the job still has attempts left;
+        otherwise persist a terminal failure for both the job and its task.
+        """
+        logger.exception("sandbox scheduler worker failed for job %s", job.id)
+        if job.status in {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
+            return
+
+        now = utc_now()
+        error_class = type(exc).__name__
+        error_message = " ".join(str(exc).split())[:500] or "sandbox scheduler worker failed"
+        retry = job.attempt < MAX_JOB_ATTEMPTS and not job.cancel_requested
+        task = None
+        payload = job.payload_json if isinstance(job.payload_json, dict) else {}
+        task_id = payload.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            task = self.db.get(SandboxAgentTask, task_id)
+
+        if retry:
+            job.status = "QUEUED"
+            job.reason = "worker_retry"
+            job.error_class = error_class
+            job.error_message = error_message
+            job.available_at = now + timedelta(seconds=min(30, 5 * job.attempt))
+            if task is not None and task.status not in {
+                "SUCCEEDED",
+                "PARTIAL",
+                "FAILED",
+                "TIMED_OUT",
+                "CANCELLED",
+                "STALE",
+                "INTERRUPTED",
+            }:
+                task.status = "QUEUED"
+                task.status_reason = "worker_retry"
+                append_agent_event(
+                    self.db,
+                    task,
+                    "retry_scheduled",
+                    {
+                        "job_id": job.id,
+                        "attempt": job.attempt + 1,
+                        "error_class": error_class,
+                    },
+                )
+        else:
+            job.status = "FAILED"
+            job.reason = "sandbox_scheduler_worker_failed"
+            job.error_class = error_class
+            job.error_message = error_message
+            job.finished_at = now
+            if task is not None and task.status not in {
+                "SUCCEEDED",
+                "PARTIAL",
+                "FAILED",
+                "TIMED_OUT",
+                "CANCELLED",
+                "STALE",
+                "INTERRUPTED",
+            }:
+                task.status = "FAILED"
+                task.status_reason = error_class
+                task.finished_at = now
+                append_agent_event(
+                    self.db,
+                    task,
+                    "failed",
+                    {
+                        "job_id": job.id,
+                        "error_class": error_class,
+                        "error_message": error_message,
+                    },
+                )
+        self.db.commit()
 
     # ── execution ──────────────────────────────────────────────────────
 

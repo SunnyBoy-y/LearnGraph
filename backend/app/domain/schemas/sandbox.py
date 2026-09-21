@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.domain.schemas.common import ORMModel
 
@@ -491,6 +491,8 @@ class SandboxAgentCommandView(ORMModel):
 
 class SandboxJobView(BaseModel):
     """Public view of a queued/running sandbox job (unified scheduler)."""
+
+    model_config = ConfigDict(from_attributes=True)
 
     id: str
     workspace_id: str

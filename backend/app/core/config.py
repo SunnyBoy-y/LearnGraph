@@ -380,6 +380,12 @@ class Settings(BaseSettings):
     memory_file_revision_invalidation_enabled: bool = True
     memory_agent_run_enabled: bool = True
     memory_strategy_enabled: bool = False
+    # 临时记忆评测接口（backend/app/api/routers/memory_eval.py）。
+    # 默认关闭：打开后会挂载一组**不校验 bearer / 工作区头**的
+    # /api/v1/memory-eval/* 端点，只应在本地或受信网络里短时开启，
+    # 评测结束即关（连同 LEARNGRAPH_MEMORY_EVAL_DEEPSEEK_API_KEY 一起删）。
+    memory_eval_enabled: bool = False
+    memory_eval_deepseek_api_key: str | None = None
     memory_event_master_key: str | None = None
     memory_outbox_worker_enabled: bool = True
     memory_outbox_interval_seconds: int = 5
