@@ -220,6 +220,10 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       <<: *app-environment
+      # The API process owns SQLite schema and writes. Preview only serves
+      # immutable bundle assets and must not compete for the database writer
+      # lock from its separate process.
+      LEARNGRAPH_SQLITE_READ_ONLY: "true"
       LEARNGRAPH_HOST_BRIDGE_TOKEN_FILE: /run/secrets/host-bridge-token
     volumes:
       - "${LEARNGRAPH_DATA_DIR:-learngraph-data}:/data"

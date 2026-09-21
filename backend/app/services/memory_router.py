@@ -232,30 +232,40 @@ class MemoryRouter:
         if self.db is None:
             return None
         try:
-            trace = MemoryRetrievalTrace(
-                tenant_id=scope.tenant_id,
-                workspace_id=scope.workspace_id,
-                subject_user_id=scope.principal_user_id,
-                agent_id=scope.agent_id,
-                query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
-                routes_json=list(routes),
-                signals_json=[
-                    {"intent": s.intent, "confidence": s.confidence, "marker": s.marker}
-                    for s in signals
-                ],
-                candidate_count=len(retrieval.candidates),
-                selected_count=len(retrieval.candidates),
-                excluded_counts_json=retrieval.excluded,
-                degraded_modes_json=list(retrieval.degraded_modes),
-                fts_capability=probe_memory_search_fts_capability(self.db),
-                strategy="hybrid_memory_v2",
-                status="completed",
-                latency_ms=latency_ms,
-            )
-            self.db.add(trace)
-            self.db.flush()
+            # A savepoint, not a bare flush.  This row is telemetry, and its own
+            # failure must stay its own: the previous fallback called
+            # ``rollback()`` on the *caller's* session, so the moment traces were
+            # actually turned on (they were not: see below) a failed trace write
+            # could have discarded a request's pending work.  ``begin_nested()``
+            # confines the rollback to this row.
+            #
+            # Note for whoever wires this up next: until ``MemoryRouter`` is built
+            # with a ``db`` the whole method is a no-op, which is why the chat and
+            # voice read paths had no traces at all.
+            with self.db.begin_nested():
+                trace = MemoryRetrievalTrace(
+                    tenant_id=scope.tenant_id,
+                    workspace_id=scope.workspace_id,
+                    subject_user_id=scope.principal_user_id,
+                    agent_id=scope.agent_id,
+                    query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                    routes_json=list(routes),
+                    signals_json=[
+                        {"intent": s.intent, "confidence": s.confidence, "marker": s.marker}
+                        for s in signals
+                    ],
+                    candidate_count=len(retrieval.candidates),
+                    selected_count=len(retrieval.candidates),
+                    excluded_counts_json=retrieval.excluded,
+                    degraded_modes_json=list(retrieval.degraded_modes),
+                    fts_capability=probe_memory_search_fts_capability(self.db),
+                    strategy="hybrid_memory_v2",
+                    status="completed",
+                    latency_ms=latency_ms,
+                )
+                self.db.add(trace)
+                self.db.flush()
             return trace.id
         except Exception:
             # Telemetry must never break retrieval.
-            self.db.rollback()
             return None

@@ -12,6 +12,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
 )
+from app.voice.caption_ledger import VoiceLedgerFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
@@ -76,6 +77,10 @@ class VoiceGenerationGate(FrameProcessor):
                 self._context_generation.pop(context_id, None)
             await self.push_frame(frame, direction)
             return
+
+        if isinstance(frame, VoiceLedgerFrame):
+            if frame.generation_id is not None and frame.generation_id != self._generation:
+                return
 
         if isinstance(frame, TTSAudioRawFrame):
             context_id = str(getattr(frame, "context_id", "") or "")

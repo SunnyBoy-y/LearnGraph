@@ -53,6 +53,43 @@ export function retireVoiceRows(
 }
 
 /**
+ * 本地语音回合里，导师那一行的"父行"是谁。
+ *
+ * 语音回合的两行都带同一把客户端回合键（`turn_id`），打字回合的用户行则按幂等键
+ * 命名（`user-typed-<client_message_id>`，见 `userEntryId`）。把导师行挂到同一回合
+ * 的用户行上，画布就能顺着"持久化用户行 → 持久化回答行的 `parent_message_id`"这条
+ * 链找到它的孪生行 —— 与打字回合的乐观行走的是同一条规则。
+ *
+ * 为什么不能只认回合 id：服务端的回合 id 是**worker**开出来的，客户端只有在
+ * `user.final` / `turn.accepted` 送到时才知道它；这两个事件丢过（或 worker 先开
+ * 回合、id 与打字幂等键不同）时，本地行的键与服务端对不上，孪生行就永远配不上，
+ * 屏幕上的结果就是同一条回答两份。
+ */
+export function voiceTurnParentRowId(
+  rows: readonly Message[],
+  identity: { turnId?: string | null; clientMessageId?: string | null },
+): string | null {
+  const clientMessageId = String(identity.clientMessageId ?? "");
+  if (clientMessageId) {
+    const typed = rows.find(
+      (row) => row.role === "user" && row.id === `temp-voice-user-typed-${clientMessageId}`,
+    );
+    if (typed) return typed.id;
+  }
+  const turnId = String(identity.turnId ?? "");
+  if (!turnId) return null;
+  const sameTurn = rows.filter(
+    (row) =>
+      row.role === "user" &&
+      String(row.provider_trace?.turn_id ?? "") === turnId,
+  );
+  // 一个回合可能有多个用户行：逐段的临时行与合成后的权威行。权威行才是持久化
+  // 那一条的孪生（逐段行按内容永远配不上合并后的问题）。
+  const settled = sameTurn.find((row) => !isVoiceSegmentRow(row));
+  return (settled ?? sameTurn[sameTurn.length - 1])?.id ?? null;
+}
+
+/**
  * Fold a voice render's trace into an existing row's trace without erasing it.
  *
  * The authoritative row of a typed turn carries `client_message_id`, while the
@@ -70,4 +107,43 @@ export function mergeVoiceTrace(
     if (value !== undefined) merged[key] = value;
   }
   return merged;
+}
+
+function isVoice(row: Pick<Message, "provider_trace">): boolean {
+  return row.provider_trace?.voice === true || row.provider_trace?.voice_turn === true;
+}
+
+export function voiceActionsVisible(row: Pick<Message, "provider_trace" | "status">): boolean {
+  return !isVoice(row) || ["completed", "failed", "cancelled", "interrupted"].includes(row.status);
+}
+
+/** Shared projection for live rows, refetched history and calls that ended.
+ * Backend turns remain separate. Adjacent voice user turns are one visible
+ * utterance until a nonempty assistant message separates them. Keep the first
+ * row/part identity while appending, so React doesn't remount on every pause.
+ */
+export function mergeAdjacentVoiceUserMessages(rows: readonly Message[]): Message[] {
+  const result: Message[] = [];
+  for (const row of rows) {
+    if (isVoice(row) && row.role === "assistant" && !row.content?.trim() &&
+        !row.parts?.some((p) => p.content?.trim())) continue;
+    const previous = result[result.length - 1];
+    if (previous?.role !== "user" || row.role !== "user" ||
+        !isVoice(previous) || !isVoice(row) || previous.session_id !== row.session_id) {
+      result.push(row);
+      continue;
+    }
+    const a = previous.content ?? "";
+    const b = row.content ?? "";
+    const text = a + (/[A-Za-z0-9]$/.test(a) && /^[A-Za-z0-9]/.test(b) ? " " : "") + b;
+    result[result.length - 1] = {
+      ...previous, content: text, status: row.status,
+      parts: [{
+        id: previous.parts[0]?.id ?? `voice-part-${previous.id}`,
+          type: "text", content: text, status: row.status as Message["status"], sequence: 0,
+        data: { kind: "final_answer" },
+      }],
+    };
+  }
+  return result;
 }

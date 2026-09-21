@@ -65,6 +65,7 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
 )
 
 from app.voice.caption_ledger import VoiceLedgerRelay
+from app.voice.playback_context import VoicePlaybackContext
 from app.voice.embedded_context import VoiceContextAdapter, VoiceContextState
 from app.voice.coordinator_adapter import ensure_coordinator_delegation_port_factory
 from app.voice.embedded_dashscope_stt import DashScopeSTTService
@@ -73,11 +74,14 @@ from app.voice.embedded_delegation import (
     DelegationRequest,
     TaskControlRequest,
     VoiceDelegationPort,
+    dispatch_artifact_list,
     dispatch_delegation,
+    dispatch_memory_search,
     dispatch_task_control,
     resolve_delegation_port,
 )
 from app.voice.embedded_generation import VoiceGenerationGate
+from app.voice.embedded_memory import VoiceMemoryBridge, voice_memory_llm_service_class
 from app.voice.embedded_result_bridge import VoiceResultDeliveryProcessor
 from app.voice.embedded_timeline import insert_timeline_probes, timeline_enabled
 from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
@@ -109,6 +113,7 @@ VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt"
 # RTVI 自定义客户端消息 ``{t: VOICE_PLAYBACK_MESSAGE, d: {...}}``：浏览器自述的
 # 播放位置（§2.5）。它**只**用于回放进度与体验，绝不是"用户听完了"的持久判据。
 VOICE_PLAYBACK_MESSAGE = "learngraph-playback"
+
 
 # 口语回答预算（F08）。语音回答的成本主要在"听"：一段 60 秒的朗读会把用户锁在
 # 麦克风外，而文字可以扫读。所以预算约束的是**默认详略**，不是内容完整性——它说明
@@ -646,6 +651,34 @@ class TutorAgent(LLMWorker):
             instruction=instruction,
         )
 
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def search_memory(
+        self, params: FunctionCallParams, query: str, limit: int = 5
+    ) -> None:
+        """Look up what the user already told the system about a topic.
+
+        Use it when the answer depends on something the user said earlier --
+        preferences, past decisions, their level on a subject.  What comes back is
+        background to speak from, never something to read out verbatim.
+        """
+        await params.result_callback(
+            await dispatch_memory_search(self._delegation_port, query, limit=limit)
+        )
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def list_artifacts(
+        self, params: FunctionCallParams, query: str = "", limit: int = 5
+    ) -> None:
+        """List the artifacts this workspace has: cards and published collections.
+
+        Use it when the user asks what they have, or wants to be pointed at
+        something they made.  ``query`` narrows by title; leave it empty to list
+        the most recent.
+        """
+        await params.result_callback(
+            await dispatch_artifact_list(self._delegation_port, query, limit=limit)
+        )
+
 
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -678,6 +711,7 @@ def build_pipeline_steps(
     result_delivery: FrameProcessor | None = None,
     generation_gate: FrameProcessor | None = None,
     ledger_relay: FrameProcessor | None = None,
+    context_playback_guard: FrameProcessor | None = None,
 ) -> list[FrameProcessor]:
     """Assemble the main worker's pipeline in one testable place."""
     steps: list[FrameProcessor] = [transport_input, stt]
@@ -699,6 +733,8 @@ def build_pipeline_steps(
     # than an estimate (see app/voice/caption_ledger.py).
     if ledger_relay is not None:
         steps.append(ledger_relay)
+    if context_playback_guard is not None:
+        steps.append(context_playback_guard)
     steps.append(assistant_aggregator)
     return steps
 
@@ -989,6 +1025,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     context_adapter = (
         VoiceContextAdapter(session_id, SYSTEM_INSTRUCTION) if session_id else None
     )
+    # Per-turn memory recall. The snapshot above is pinned once per session and
+    # answers "what was this conversation about"; this answers "what does the
+    # question being asked right now need", which is the half the voice path
+    # never had. It is prefetched from the journal's user-text hook and consumed
+    # by the tutor's LLM request (see app/voice/embedded_memory.py).
+    memory_bridge = VoiceMemoryBridge(session_id) if session_id else None
+    if journal is not None and memory_bridge is not None:
+        journal.set_user_text_hook(memory_bridge.start)
     context_state = (
         await asyncio.to_thread(context_adapter.load)
         if context_adapter is not None
@@ -1136,9 +1180,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             detail=verdict.detail,
         )
 
-    llm = OpenAILLMService(
+    llm = voice_memory_llm_service_class()(
         api_key=llm_api_key,
         base_url=llm_base_url,
+        memory_bridge=memory_bridge,
         settings=OpenAILLMService.Settings(
             model=llm_model,
             system_instruction=SYSTEM_INSTRUCTION,
@@ -1271,6 +1316,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         else None
     )
 
+    playback_context = VoicePlaybackContext(context) if journal is not None else None
+    if journal is not None and playback_context is not None:
+        journal.set_playback_context_hook(playback_context.update_spoken)
+
     pipeline_steps = build_pipeline_steps(
         transport_input=transport.input(),
         stt=stt,
@@ -1287,6 +1336,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         # 句级账本的写入者：坐在输出传输下游，只在"这一句的音频真的写出去了"之后
         # 才落账（未听到的文本因此进不了账本、转录与记忆）。
         ledger_relay=VoiceLedgerRelay(journal=journal) if journal is not None else None,
+        context_playback_guard=playback_context,
     )
     pipeline = Pipeline(insert_timeline_probes(pipeline_steps))
 
@@ -1298,7 +1348,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         # 前者在开口前被 observer 扣住，后者随音频队列被真实播放节奏放行，前端不需要
         # 任何播放时钟。``bot-tts-text`` 只是排障用的旁路，保持关闭以免多一路流量。
         rtvi_observer_params=RTVIObserverParams(
-            bot_output_enabled=True,
+            bot_output_enabled=False,
             bot_tts_enabled=False,
             # 把服务端 Silero 的 VAD 起止（`vad-user-started-speaking` /
             # `vad-user-stopped-speaking`）也送给前端：延迟面板要"用户声音只用 VAD"的
@@ -1365,6 +1415,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
         async def _fast_interrupt() -> None:
             generation_gate.invalidate()
+            if memory_bridge is not None:
+                memory_bridge.invalidate()
             await rtvi.interrupt_bot()
 
         turn_strategy.set_interrupt_callback(_fast_interrupt)
@@ -1373,6 +1425,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
         async def _on_interrupt(_event: Mapping[str, Any]) -> None:
             generation_gate.invalidate()
+            if memory_bridge is not None:
+                # The turn this recall belonged to is over; drop it rather than
+                # let a late result wait for the next turn's request.
+                memory_bridge.invalidate()
             if rtvi is not None:
                 await rtvi.interrupt_bot()
 
@@ -1537,6 +1593,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await watchdog.stop()
         if session_id and get_runner(session_id) is handle:
             unregister_runner(session_id)
+        if journal is not None:
+            await journal.drain_persistence()
         if journal is not None and session_id:
             state = await asyncio.to_thread(load_session_row, session_id)
             if state is not None and not state.active:

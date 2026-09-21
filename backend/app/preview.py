@@ -35,6 +35,7 @@ from fastapi import APIRouter, FastAPI, Path
 from fastapi.responses import Response, StreamingResponse
 
 from app.api.deps import AppSettings, DB
+from app.core.config import get_settings
 from app.core.database import init_database
 from app.core.errors import install_error_handlers
 from app.providers.storage_factory import object_storage_provider
@@ -356,9 +357,12 @@ def serve_bundle_preview(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # The preview process owns its own database initialization (idempotent
-    # create_all), so it can be started independently of the main API.
-    init_database()
+    # In the managed Compose topology the API owns schema/migration writes.
+    # Preview only resolves immutable grants/assets, so sharing a writable
+    # SQLite connection here would create a second process-local writer gate
+    # and reintroduce cross-process lock contention.
+    if not get_settings().sqlite_read_only:
+        init_database()
     yield
 
 

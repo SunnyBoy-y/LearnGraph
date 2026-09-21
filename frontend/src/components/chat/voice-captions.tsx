@@ -68,13 +68,15 @@ export function readVoiceCaptionParts(
       record.status === "in-progress" || record.status === "completed"
         ? record.status
         : "new";
-    parts.push({
+    const part: VoiceBotOutputPart = {
       text: record.text,
       segmentId: typeof record.segmentId === "number" ? record.segmentId : null,
       spokenChars: typeof record.spokenChars === "number" ? record.spokenChars : 0,
       status,
       willBeSpoken: record.willBeSpoken !== false,
-    });
+    };
+    if (record.playbackStarted === true) part.playbackStarted = true;
+    parts.push(part);
   }
   return parts;
 }

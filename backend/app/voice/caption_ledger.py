@@ -1,34 +1,7 @@
-"""句级账本的**因果**触发：让"这一句开始/结束播放"由输出传输放行的帧来证明。
+"""Release sentence identities after transport audio writes, in media order.
 
-## 为什么需要这一层
-
-字幕已经交给 Pipecat 官方的 ``bot-output``（句级路径：``AggregatedTextFrame`` 的
-``new`` + ``TTSTextFrame`` 的 ``completed``），但账本（``journal``）必须继续回答
-"用户到底听到了什么"，它不能跟着字幕一起交给框架——官方通道不落库、丢包不可恢复，
-而"未听到的文本不落库、不进记忆"是本项目的硬口径。
-
-记账时刻必须是**因果**的：合成远快于播放，若在音频入队时就记账，压在执行队列里
-还没播出来的整段回答会提前几秒进账本、进转录、进记忆。所以这里把句首/句尾各做成
-一枚普通数据帧，按位置排在那一句音频的前后，让它们**和音频一起排队**。
-
-## 为什么到点保证是免费的
-
-输出传输对帧分两路（``transports/base_output.py``）：
-
-* ``SystemFrame`` → 直接 ``push_frame``，绕过所有队列；
-* 其余（``DataFrame``）→ 无 ``pts`` 时进 ``_audio_queue``，与音频块**同队列同序**。
-
-而音频写出是阻塞到真正被取走才返回的（WebRTC 发送端按 10ms 节拍消费）。于是排在
-音频后面的数据帧，只有在前序音频真的播完之后才会被放行到下游——**不需要任何时间戳、
-任何锚点换算、任何 sleep**。这正是官方句级/词级路径用的机制（S5）。
-
-因此本模块的帧**必须是 DataFrame**：换成 ``SystemFrame`` 就退化成"立即下发 + 只能
-靠自算时刻"，那是旧实现"字幕/记账时刻会漂"的根因。
-
-## 前端看不到它们
-
-``VoiceLedgerFrame`` 永不发给浏览器：relay 消费掉它（不再往下推），只把结果交给
-账本；字幕显示完全由官方 ``bot-output`` 负责。
+Synthesis only enqueues markers. The start marker is held until the first
+successfully written audio chunk; end/turn-end markers follow their audio.
 """
 
 from __future__ import annotations
@@ -37,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
-from pipecat.frames.frames import DataFrame
+from pipecat.frames.frames import DataFrame, InterruptionFrame, TTSAudioRawFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
@@ -58,6 +31,7 @@ class VoiceLedgerFrame(DataFrame):
     kind: str
     token: str
     text: str = ""
+    turn_id: str | None = None
     context_id: str | None = None
     audio_cursor_ms: int | None = None
     audio_end_cursor_ms: int | None = None
@@ -79,6 +53,7 @@ class VoiceLedgerRelay(FrameProcessor):
         self._journal = journal
         # token → journal 分配的句序号；句尾靠它把 ended 关到同一句上。
         self._sequences: dict[str, int] = {}
+        self._pending_start: VoiceLedgerFrame | None = None
 
     @property
     def journal(self) -> Any:
@@ -86,11 +61,21 @@ class VoiceLedgerRelay(FrameProcessor):
 
     async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, VoiceLedgerFrame):
-            if direction != FrameDirection.DOWNSTREAM:
+        if isinstance(frame, InterruptionFrame):
+            self._pending_start = None
+            self._sequences.clear()
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, VoiceLedgerFrame):
+                if frame.kind == "start":
+                    self._pending_start = frame
+                else:
+                    await self._release(frame)
                 return
-            await self._release(frame)
-            return
+            if isinstance(frame, TTSAudioRawFrame) and self._pending_start is not None:
+                pending = self._pending_start
+                if frame.context_id is None or pending.context_id == frame.context_id:
+                    self._pending_start = None
+                    await self._release(pending)
         await self.push_frame(frame, direction)
 
     async def _release(self, frame: VoiceLedgerFrame) -> None:
@@ -99,6 +84,11 @@ class VoiceLedgerRelay(FrameProcessor):
             logger.debug("VoiceLedgerRelay: no journal bound; dropping ledger frame")
             return
         try:
+            if frame.turn_id and frame.turn_id != journal.current_turn_id():
+                return
+            if frame.kind == "turn-end":
+                await journal.playback_ended()
+                return
             if frame.kind == "start":
                 identity = await journal.sentence_queued(
                     frame.text,

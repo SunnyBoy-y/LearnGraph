@@ -108,6 +108,11 @@ SPEECH_MODEL_SPECS: tuple[SpeechModelSpec, ...] = (
             "speech_model_id": "seed-tts-2.0-standard",
             "default_tts_model_id": "seed-tts-2.0-standard",
             "voice_type": "ICL_uranus_zh_female_heainainai_tob",
+            # X-Api-Resource-Id for the v3 bidirectional endpoint. Prefilled so the
+            # settings form never asks the operator to guess it: the seeded voice and
+            # every ICL_* clone voice belong to seed-tts-2.0 (seed-icl-2.0 is rejected
+            # by the server as "resource ID is mismatched with speaker related resource").
+            "resource_id": "seed-tts-2.0",
             "sample_rate": 24_000,
             "emotion": "",
             "speech_rate": 0,

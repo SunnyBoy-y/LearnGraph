@@ -303,6 +303,7 @@ class VolcengineTTSService(TTSService):
         # 连续几句合成失败。单句失败只报 retryable（下一句会重建 session）；连续失败
         # 意味着"导师说不出话了"，那时必须降级并让用户看见，而不是继续静默。
         self._consecutive_sentence_failures = 0
+        self._context_turns: dict[str, str | None] = {}
         # Optional durable journal.  When present it **allocates** the sentence
         # identity (``turn_id`` / ``sentence_seq`` / ``segment_id``) and records
         # it in the append-only event log, so a client that missed data-channel
@@ -589,6 +590,8 @@ class VolcengineTTSService(TTSService):
         # 入队这一刻的代次：这一句从属于"当时的那个回合"。打断会把代次 +1，之后
         # 这一步（以及它的合成任务）就会发现自己是旧句子并放弃，不再领新回合的序号。
         epoch = self._caption_epoch
+        turn_id = self._journal.current_turn_id() if self._journal else None
+        self._context_turns.setdefault(context_id, turn_id)
 
         async def _run_after_previous() -> None:
             if previous is not None and not previous.done():
@@ -636,6 +639,11 @@ class VolcengineTTSService(TTSService):
         if chain is not None:
             await asyncio.gather(chain, return_exceptions=True)
         if context_id and self.audio_context_available(context_id):
+            await self.append_to_audio_context(context_id, VoiceLedgerFrame(
+                kind="turn-end", token=f"end:{context_id}", context_id=context_id,
+                turn_id=self._context_turns.get(context_id),
+                generation_id=self._current_generation(),
+            ))
             await self.remove_audio_context(context_id)
             timeline_mark("tts", "audio context 已收尾（文本结束）")
         self._begin_turn_captions()
@@ -933,6 +941,7 @@ class VolcengineTTSService(TTSService):
         """
         identity: dict[str, Any] = {
             "token": uuid.uuid4().hex,
+            "turn_id": self._context_turns.get(context_id),
             "text": sentence_text,
             "context_id": context_id,
             "audio_cursor_ms": int(self._audio_cursor_ms),
@@ -944,6 +953,7 @@ class VolcengineTTSService(TTSService):
             VoiceLedgerFrame(
                 kind="start",
                 token=str(identity["token"]),
+                turn_id=identity.get("turn_id"),
                 text=sentence_text,
                 context_id=context_id,
                 audio_cursor_ms=int(identity["audio_cursor_ms"]),
@@ -968,6 +978,7 @@ class VolcengineTTSService(TTSService):
             VoiceLedgerFrame(
                 kind="end",
                 token=str(identity["token"]),
+                turn_id=identity.get("turn_id"),
                 context_id=context_id,
                 audio_end_cursor_ms=int(self._audio_cursor_ms),
                 generation_id=identity.get("generation_id"),

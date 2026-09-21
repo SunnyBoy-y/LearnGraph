@@ -171,6 +171,10 @@ class Settings(BaseSettings):
     # background sweep that kept a dirty session across a model call), the
     # retry helpers fail fast and retry with backoff instead of blocking 10s.
     sqlite_busy_timeout_ms: int = 2_000
+    # A secondary process such as the standalone subapp preview may share the
+    # SQLite file for reads, but it must never become a second schema migrator
+    # or writer.  The preview compose service enables this explicitly.
+    sqlite_read_only: bool = False
     # 旧库自动迁移安全网（SQLite）：启动只读预检发现"待应用的 schema/数据迁移"时，
     # 先用 SQLite 在线备份 API（WAL 安全、不停业务）把整库拷到
     # ``sqlite_migration_backup_dir``，再执行迁移；成功与否都保留快照，

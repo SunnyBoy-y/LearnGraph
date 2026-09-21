@@ -18,9 +18,31 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.domain.models import Message, MessagePartRecord, MessageVersion
+from app.domain.models import (
+    Message,
+    MessagePartRecord,
+    MessageStreamEvent,
+    MessageVersion,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Retrieval label for every memory read the voice path causes. It only lands in
+#: the trace/telemetry columns -- ranking never sees it -- which is what makes it
+#: safe to give voice its own label instead of sharing text chat's default.
+VOICE_MEMORY_AGENT_ID = "voice"
+
+
+def _last_user_text(timeline: list[Any]) -> str:
+    """Newest thing the user said in this conversation, or an empty string."""
+
+    for item in reversed(timeline):
+        if str(getattr(item, "role", "") or "") != "user":
+            continue
+        text = str(getattr(item, "content", "") or "").strip()
+        if text:
+            return text
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,14 +90,28 @@ class VoiceContextService:
     ) -> VoiceContextSnapshot:
         # Build through the ordinary prompt path so session ACLs, memory scope,
         # model budget and ContextBuilder policy stay identical to text chat.
+        #
+        # The query is what makes the retrieval conditioned.  It used to be
+        # empty here, which meant the pinned memory block was whatever the
+        # retriever ranked first with no question attached to it -- for a
+        # conversation already in progress that is close to noise.  The newest
+        # user turn in this chat session is the best query available at session
+        # start; the live turn gets its own recall in the audio worker
+        # (``app/voice/embedded_memory.py``), which is where per-turn relevance
+        # actually comes from.
+        timeline = self.chat._session_timeline(chat_session_id)
+        effective_query = str(query or "").strip() or _last_user_text(timeline)
         prompt, _summary = self.chat._build_model_prompt(
             chat_session_id,
-            query,
+            effective_query,
             node_ids=node_ids,
             additional_context="",
             agent_mode=False,
+            # Label every retrieval this snapshot causes as voice: the trace takes
+            # its agent from the scope, so without this a spoken recall and a
+            # typed one are the same row in ``memory_retrieval_traces``.
+            agent_id=VOICE_MEMORY_AGENT_ID,
         )
-        timeline = self.chat._session_timeline(chat_session_id)
         history = [
             {"id": item.id, "role": item.role, "content": item.content,
              "created_at": item.created_at.isoformat() if item.created_at else None}
@@ -90,34 +126,20 @@ class VoiceContextService:
             # In events mode this is the exact ContextBuilder package injected
             # by _build_model_prompt; in legacy/shadow mode it is still useful
             # telemetry and leaves legacy authorization untouched.
-            _block, telemetry = self.chat._build_v2_memory_context(
-                chat_session_id, query, node_ids=node_ids, task_id=task_id
+            #
+            # The package comes back with the build it already paid for, so the
+            # structured memories/learning_states do not cost a second
+            # retrieval: this used to run the whole ContextBuilder path a third
+            # time just to read the view off it.
+            _block, telemetry, built = self.chat._build_v2_memory_package(
+                chat_session_id,
+                effective_query,
+                node_ids=node_ids,
+                task_id=task_id,
+                agent_id=VOICE_MEMORY_AGENT_ID,
             )
             context_build_id = telemetry.get("context_build_id")
-            builder = getattr(self.chat, "context_builder", None)
-            if builder is not None:
-                from app.domain.memory_event_models import MemoryScopeContext
-                from app.domain.schemas.context_builds import ContextBuildRequest
-
-                built = builder.build(
-                    MemoryScopeContext(
-                        tenant_id=self.chat.tenant_id,
-                        principal_user_id=self.chat.actor_id,
-                        workspace_id=self.chat.workspace_id,
-                        task_id=task_id,
-                        conversation_id=chat_session_id,
-                        node_ids=tuple(node_ids or ()),
-                    ),
-                    ContextBuildRequest(
-                        conversation_id=chat_session_id,
-                        task_id=task_id,
-                        query=query,
-                        token_budget=int(token_budget or self.chat._memory_prompt_token_budget()),
-                        agent_id="voice",
-                        provider_id=getattr(self.chat.model_provider, "provider_id", None),
-                        model_id=str(getattr(self.chat.model_provider, "model_id", "")),
-                    ),
-                )
+            if built is not None:
                 context_build_id = built.view.context_build_id
                 memories = [item.model_dump(mode="json") for item in built.view.memories]
                 learning = list(built.view.learning_states or [])
@@ -194,6 +216,11 @@ class VoiceContextService:
             # deduplicates on (session, message), so re-enqueueing is safe.
             if memory and "assistant" in existing:
                 self._enqueue_memory(existing["assistant"])
+            # Same reasoning for the stream event: a crash between the message
+            # commit and the event write leaves a turn the client cannot replay,
+            # and a replay of the finalize is the only place that can notice.
+            if commit and "assistant" in existing:
+                self._record_message_completion(existing["assistant"])
             return existing["user"], existing.get("assistant")
 
         # Stable ids make a retry safe even when two workers race before either
@@ -291,7 +318,75 @@ class VoiceContextService:
         # memory=False, and a failed turn has no answer to remember at all.
         if memory and include_assistant:
             self._enqueue_memory(assistant)
+        if commit and include_assistant:
+            self._record_message_completion(
+                assistant, message_version_id=str(assistant_version.id)
+            )
         return user, (assistant if include_assistant else None)
+
+    def _record_message_completion(
+        self, assistant: Message, *, message_version_id: str | None = None
+    ) -> None:
+        """Write the ordinary ``message.completed`` stream event for a voice turn.
+
+        Text chat records one of these per finished assistant message
+        (``ChatService.create_stream``) and the client replays them after a
+        dropped stream; a voice answer is the same kind of durable message, so it
+        records the same event.  Being explicit about what this does *not* buy:
+
+        * it is **not** the sensitive-data gate.  That filter lives on the
+          memory event stream (``MemoryEventStore.append`` →
+          ``SensitiveDataFilter``), and a voice turn's extracted atoms already
+          pass through it like any other turn.  ``message_stream_events`` has no
+          backend consumer today; this is parity and audit, not safety.
+        * it is **not** idempotent at the database level:
+          ``uq_message_stream_sequence`` turns a second insert for the same
+          message version into an IntegrityError.  Existence is therefore checked
+          first, and any failure is logged rather than raised -- an audit row must
+          never turn a successfully written transcript into a failed turn.
+        """
+
+        if not str(getattr(assistant, "content", "") or "").strip():
+            return
+        try:
+            version_id = message_version_id or self.chat.db.scalar(
+                select(MessageVersion.id)
+                .where(MessageVersion.message_id == assistant.id)
+                .order_by(MessageVersion.version.desc())
+            )
+            if not version_id:
+                return
+            already = self.chat.db.scalar(
+                select(MessageStreamEvent.id).where(
+                    MessageStreamEvent.workspace_id == self.chat.workspace_id,
+                    MessageStreamEvent.message_version_id == version_id,
+                    MessageStreamEvent.sequence == 0,
+                )
+            )
+            if already is not None:
+                return
+            self.chat._append_event(
+                session_id=str(assistant.session_id),
+                message_id=str(assistant.id),
+                message_version_id=str(version_id),
+                part_id=None,
+                sequence=0,
+                event_type="message.completed",
+                payload={
+                    "status": str(assistant.status or "completed"),
+                    "provider_trace": dict(assistant.provider_trace or {}),
+                },
+            )
+        except Exception:  # pragma: no cover - audit write must never fail a turn
+            logger.warning(
+                "voice message.completed event failed for message %s",
+                getattr(assistant, "id", None),
+                exc_info=True,
+            )
+            try:
+                self.chat.db.rollback()
+            except Exception:
+                pass
 
     def _enqueue_memory(self, assistant_message: Message) -> None:
         """Hand a finalized voice exchange to the ordinary memory outbox.

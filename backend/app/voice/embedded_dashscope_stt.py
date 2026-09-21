@@ -81,7 +81,7 @@ import json
 import os
 import sys
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
@@ -257,6 +257,9 @@ class DashScopeSTTService(STTService):
         self._reader_task: asyncio.Task | None = None
         self._session_finished = asyncio.Event()
         self._event_id = 0
+        self._raw_event_logging = os.getenv(
+            "DASHSCOPE_ASR_LOG_RAW_EVENTS", "0"
+        ).lower() in ("1", "true", "yes", "on")
         # 回合结束主动 commit：Manual 模式下这是唯一的 finalize 触发手段
         # （云端 VAD 已关闭）。关闭它等价于让本服务不产生任何 final 转录。
         self._commit_on_eou = os.getenv("DASHSCOPE_ASR_COMMIT_ON_EOU", "1").lower() not in (
@@ -282,6 +285,10 @@ class DashScopeSTTService(STTService):
         # 一个布尔量无法表达两个合法 commit 同时在途，也无法区分迟到 final
         # 属于哪一个连接/utterance。 使用 FIFO 队列保存 commit 身份。
         self._pending_commits: deque[_PendingCommit] = deque()
+        # DashScope identifies one completed transcription by ``item_id``.
+        # Keep a bounded idempotency ledger so a repeated terminal event cannot
+        # consume the next commit and duplicate the user's question.
+        self._seen_final_items: OrderedDict[str, None] = OrderedDict()
         self._connection_generation = 0
         self._utterance_generation = 0
         # 自上一次 commit 以来，本机听到的语音时长（秒）。这是 commit 门与
@@ -481,6 +488,7 @@ class DashScopeSTTService(STTService):
         # 退役的连接不能再交付任何东西，包括在途 commit 的迟到 final。
         self._connection_generation += 1
         self._pending_commits.clear()
+        self._seen_final_items.clear()
         if reader is not None and reader is not asyncio.current_task():
             reader.cancel()
             with contextlib.suppress(BaseException):
@@ -1212,6 +1220,8 @@ class DashScopeSTTService(STTService):
                 self._last_upstream_event_at = time.monotonic()
                 payload = self._parse(raw)
                 etype = str(payload.get("type") or "")
+                if self._raw_event_logging:
+                    logger.info("[DashScopeRaw] %s", json.dumps(payload, ensure_ascii=False, default=str))
                 if etype not in seen_types:
                     seen_types.add(etype)
                     logger.info("[DashScopeEvt] 首次见 type={!r}", etype)
@@ -1312,6 +1322,16 @@ class DashScopeSTTService(STTService):
         carry both connection and utterance generations.
         """
         text = str(payload.get("transcript") or payload.get("text") or "").strip()
+        item_id = str(payload.get("item_id") or "").strip()
+        event_id = str(payload.get("event_id") or "").strip()
+        final_identity = item_id or event_id
+        if final_identity and final_identity in self._seen_final_items:
+            logger.debug("[DashScopeEvt] duplicate final ignored identity=%s", final_identity)
+            return
+        if final_identity:
+            self._seen_final_items[final_identity] = None
+            while len(self._seen_final_items) > 512:
+                self._seen_final_items.popitem(last=False)
         self._prune_pending_commits()
         # 任何一个 final 都算"回应了最近一次补静音"：清掉等待与告警状态。
         # （Manual 模式 ``_segments_padded`` 恒为 0，这里等价于空操作。）
@@ -1356,6 +1376,8 @@ class DashScopeSTTService(STTService):
                     time_now_iso8601(),
                     result={
                         "commit_id": None,
+                        "item_id": item_id or None,
+                        "event_id": event_id or None,
                         "commit_trigger": "server_vad",
                         "connection_generation": self._connection_generation,
                         "utterance_generation": self._utterance_generation,
@@ -1386,6 +1408,8 @@ class DashScopeSTTService(STTService):
                 time_now_iso8601(),
                 result={
                     "commit_id": commit.event_id,
+                    "item_id": item_id or None,
+                    "event_id": event_id or None,
                     "commit_trigger": commit.trigger,
                     "connection_generation": commit.connection_generation,
                     "utterance_generation": commit.utterance_generation,

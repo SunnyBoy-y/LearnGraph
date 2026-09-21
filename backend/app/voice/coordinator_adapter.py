@@ -9,6 +9,7 @@ deliberately contains no model calls, task scheduler, or audio output.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Mapping
 
 from sqlalchemy import select
@@ -17,8 +18,12 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.errors import AppError
 from app.domain.models import SandboxAgentTask
-from app.services.chat_service_factory import build_background_workspace_context
+from app.services.chat_service_factory import (
+    build_background_workspace_context,
+    build_voice_chat_service,
+)
 from app.services.voice_agent_coordinator import VoiceAgentCoordinator
+from app.services.voice_context import VOICE_MEMORY_AGENT_ID
 from app.voice.coordinator import VoiceTaskCoordinator, capture_voice_task_outcome
 from app.voice.embedded_delegation import (
     DelegationKind,
@@ -29,6 +34,8 @@ from app.voice.embedded_delegation import (
 from app.voice.events import load_session
 from app.voice.turns import open_turn
 
+
+logger = logging.getLogger(__name__)
 
 _READ_ONLY_TOOL_DEFAULTS = [
     "get_current_time",
@@ -83,6 +90,80 @@ class CoordinatorDelegationPort:
             task_id,
             delivery_state,
         )
+
+    async def search_memory(self, query: str, *, limit: int = 5) -> Mapping[str, Any]:
+        return await asyncio.to_thread(self._search_memory_sync, query, limit)
+
+    async def list_artifacts(self, query: str = "", *, limit: int = 5) -> Mapping[str, Any]:
+        return await asyncio.to_thread(self._list_artifacts_sync, query, limit)
+
+    def _search_memory_sync(self, query: str, limit: int) -> dict[str, Any]:
+        """Read memory through the ordinary chat read path, labelled as voice.
+
+        Deliberately not routed through the task coordinator: this is a read of
+        the same pool a typed question would read, and the only voice-specific
+        part is the trace label.
+        """
+
+        text = str(query or "").strip()
+        if not text:
+            return {"items": [], "count": 0, "reason": "empty_query"}
+        handle = load_session(self.voice_session_id)
+        if handle is None:
+            return {"items": [], "count": 0, "reason": "voice_session_not_found"}
+        with SessionLocal() as db:
+            chat = build_voice_chat_service(
+                db,
+                workspace_id=handle.workspace_id,
+                actor_id=handle.owner_user_id,
+                settings=get_settings(),
+                model_id=handle.model_id,
+                provider_id=handle.provider_id,
+                thinking_mode=handle.max_thinking_mode,
+            )
+            result = chat.voice_memory_search(
+                handle.chat_session_id,
+                text,
+                limit=limit,
+                agent_id=VOICE_MEMORY_AGENT_ID,
+            )
+            # Same as the per-turn recall: this session is a read session, so the
+            # commit only publishes the retrieval trace.  A failed commit is
+            # reported, not raised -- the lookup result is already in hand -- and
+            # closing the session discards the transaction for us.
+            try:
+                db.commit()
+            except Exception:
+                logger.warning("voice memory search trace commit failed", exc_info=True)
+        return dict(result or {})
+
+    def _list_artifacts_sync(self, query: str, limit: int) -> dict[str, Any]:
+        """List what the artifacts page lists: cards, plus published collections.
+
+        Both halves of that page are included on purpose -- a user asking "what
+        have I got" means the page, not one of its two tables.
+        """
+
+        from app.services.artifact_cards import ArtifactCardService
+        from app.services.artifact_gateway import ArtifactGatewayService
+
+        needle = str(query or "").strip().casefold()
+        top_k = max(1, min(int(limit or 5), 20))
+        handle = load_session(self.voice_session_id)
+        if handle is None:
+            return {"items": [], "count": 0, "reason": "voice_session_not_found"}
+        with self._coordinator() as (_coordinator, reliability, _chat, _turn):
+            db = reliability.db
+            cards = ArtifactCardService(
+                db, reliability.workspace_id, reliability.tenant_id
+            ).list_cards(sort="updated_at", order="desc", limit=50)
+            collections = ArtifactGatewayService(
+                db,
+                reliability.workspace_id,
+                handle.owner_user_id,
+                reliability.tenant_id,
+            ).list_artifact_summaries()
+        return _artifact_items(cards, collections, needle=needle, top_k=top_k)
 
     def _delegate_sync(self, request: DelegationRequest) -> dict[str, Any]:
         with self._coordinator() as (
@@ -423,6 +504,58 @@ class CoordinatorDelegationPort:
 
 
 _FACTORY_INSTALLED = False
+
+
+def _artifact_items(
+    cards: list[dict[str, Any]],
+    collections: list[tuple[Any, int]],
+    *,
+    needle: str,
+    top_k: int,
+) -> dict[str, Any]:
+    """Shape cards and published collections into one list for the tutor.
+
+    Split out of the adapter so the filtering and ordering can be asserted
+    without a database: it is the part that decides what the tutor is allowed to
+    claim exists.
+    """
+
+    items: list[dict[str, Any]] = []
+    for card in cards:
+        title = str(card.get("title") or "")
+        if needle and needle not in title.casefold():
+            continue
+        updated_at = card.get("updated_at")
+        items.append(
+            {
+                "kind": "card",
+                "id": str(card.get("card_id") or ""),
+                "title": title,
+                "status": str(card.get("status") or ""),
+                "card_type": str(card.get("card_type") or ""),
+                "interactive": bool(card.get("interactive")),
+                "version_count": int(card.get("version_count") or 0),
+                "chat_session_id": card.get("chat_session_id"),
+                "updated_at": updated_at.isoformat() if updated_at is not None else None,
+            }
+        )
+    for artifact, version_count in collections:
+        name = str(getattr(artifact, "name", "") or "")
+        if needle and needle not in name.casefold():
+            continue
+        created_at = getattr(artifact, "created_at", None)
+        items.append(
+            {
+                "kind": "collection",
+                "id": str(getattr(artifact, "id", "")),
+                "title": name,
+                "status": str(getattr(artifact, "status", "") or ""),
+                "version_count": int(version_count or 0),
+                "updated_at": created_at.isoformat() if created_at is not None else None,
+            }
+        )
+    items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return {"items": items[:top_k], "count": min(len(items), top_k)}
 
 
 def ensure_coordinator_delegation_port_factory() -> None:

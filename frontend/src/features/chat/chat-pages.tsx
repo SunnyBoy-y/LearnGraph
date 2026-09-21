@@ -145,7 +145,13 @@ import {
   shouldCommitVoiceRender,
   voiceRenderStartsSession,
 } from "@/features/voice/voice-render-policy";
-import { mergeVoiceTrace, retireVoiceRows } from "@/features/voice/voice-rows";
+import {
+  mergeVoiceTrace,
+  mergeAdjacentVoiceUserMessages,
+  voiceActionsVisible,
+  retireVoiceRows,
+  voiceTurnParentRowId,
+} from "@/features/voice/voice-rows";
 import {
   Message as AiMessage,
   MessageAction,
@@ -352,6 +358,10 @@ import {
 } from "@/features/chat/chat-message-parts";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
+import {
+  LearningPackageCanvas,
+  type LearningCanvasNode,
+} from "@/features/learning/learning-package-canvas";
 import {
   GoalSetupConversation,
   useGoalSetupFlow,
@@ -1454,6 +1464,7 @@ function findOptimisticCounterpart(
 ): Message | undefined {
   const voiceCounterpart = findVoiceCounterpart(message, persisted);
   if (voiceCounterpart) return voiceCounterpart;
+  if (isVoiceTrace(message.provider_trace)) return undefined;
   if (message.role === "user") {
     return findPersistedUserTwin(message, persisted);
   }
@@ -2216,7 +2227,7 @@ function AssistantMessageInner({
           />
         )
       }
-      {isVoiceTrace(shown.provider_trace) && shown.status === "streaming" ? null : (
+      {!voiceActionsVisible(shown) ? null : (
         <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
           <MessageAction
             label="复制全文"
@@ -3034,7 +3045,6 @@ export function ChatCanvasPage() {
   // shows), and `removes` retires the per-segment bubbles of a settled turn,
   // since nothing else can take a row back off the canvas.
   useEffect(() => {
-    if (!voiceModeOpen) return;
     const onVoiceRender = (event: Event) => {
       const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
       const text = item?.text?.trim() || "";
@@ -3079,6 +3089,7 @@ export function ChatCanvasPage() {
                     spokenChars: caption.spokenChars,
                     status: caption.status,
                     willBeSpoken: caption.willBeSpoken,
+                    playbackStarted: caption.playbackStarted,
                   })),
                 },
               },
@@ -3109,6 +3120,17 @@ export function ChatCanvasPage() {
           removes: removals,
           retireTurnSegments,
         });
+        // 导师行要挂到同一回合的本地用户行上（见 `voiceTurnParentRowId`）：这样即便
+        // 客户端从没拿到服务端的回合 id，画布仍能顺着"持久化用户行 → 持久化回答行的
+        // parent_message_id"这条链找到它的孪生行，而不是把落库的那一条当成另一条回答
+        // 并排画出来。
+        const parentRowId =
+          item.role === "assistant"
+            ? voiceTurnParentRowId(kept, {
+                turnId: item.turnId,
+                clientMessageId: item.clientMessageId,
+              })
+            : null;
         // A per-segment row is matched by its own id only: every segment of a
         // turn shares the turn id, so a turn-id match would rewrite one segment
         // with another segment's text.
@@ -3121,6 +3143,7 @@ export function ChatCanvasPage() {
                 (item.clientMessageId && message.provider_trace?.client_message_id === item.clientMessageId)),
             ));
         if (existing) {
+          if (existing.provider_trace?.authoritative === true && item.role === "assistant" && !item.final) return kept;
           if (!text) return kept;
           return kept.map((message) => message.id === existing.id
             ? {
@@ -3128,6 +3151,7 @@ export function ChatCanvasPage() {
                 content: text,
                 status,
                 parts,
+                parent_message_id: parentRowId ?? message.parent_message_id,
                 provider_trace: mergeVoiceTrace(message.provider_trace, trace),
               }
             : message);
@@ -3137,7 +3161,7 @@ export function ChatCanvasPage() {
           id,
           workspace_id: workspaceId,
           session_id: sessionId,
-          parent_message_id: null,
+          parent_message_id: parentRowId,
           role: item.role,
           version: 1,
           status,
@@ -4290,7 +4314,11 @@ export function ChatCanvasPage() {
             // arrived last (the refresh bug this exists to prevent), so the row
             // is dropped instead.
           } else if (counterpart && !retryOverlays.has(counterpart.id)) {
-            normalOverlays.set(counterpart.id, message);
+            normalOverlays.set(counterpart.id,
+              isVoiceTrace(message.provider_trace) && message.provider_trace?.authoritative === true &&
+              TERMINAL_MESSAGE_STATUSES.includes(counterpart.status as (typeof TERMINAL_MESSAGE_STATUSES)[number])
+                ? { ...counterpart, id: message.id, created_at: message.created_at }
+                : message);
           } else if (!appendedIds.has(message.id)) {
             appendedIds.add(message.id);
             appended.push(message);
@@ -4314,7 +4342,7 @@ export function ChatCanvasPage() {
           normalOverlays.set(confirmed.id, message);
       }
     });
-    return [
+    return mergeAdjacentVoiceUserMessages([
       ...persisted.map(
         (message) =>
           retryOverlays.get(message.id) ??
@@ -4322,7 +4350,7 @@ export function ChatCanvasPage() {
           message,
       ),
       ...appended,
-    ];
+    ]);
   }, [history.data, localMessages, sessionId]);
   const activeCommittedAnswerTurnId = useMemo(() => {
     // In voice mode, keep the scroll container following live speech at the bottom smoothly.
@@ -9402,6 +9430,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             });
           }}
         >
+          {learningNode?.nodeId ? (
+            <LearningPackageCanvas
+              learningNode={learningNode as LearningCanvasNode}
+              sessionId={sessionId}
+              workspaceId={workspaceId}
+            />
+          ) : null}
           {isEmptySession && !goalMode && !voiceModeOpen ? (
             <EmptySessionPrompts
               disabled={

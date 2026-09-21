@@ -1827,7 +1827,18 @@ export function GraphWorkspacePage() {
   /** Shared "start studying this node" entry (node card, plan item, inspector). */
   function startNodeLearning(node: { id: string; label: string }) {
     if (!activeGraph) return;
-    navigate(`${base}/learn/nodes/${node.id}`);
+    window.dispatchEvent(
+      new CustomEvent("learngraph:open-learning-project", {
+        detail: {
+          graphId: activeGraph.id,
+          title: activeGraph.title,
+          nodeId: node.id,
+          nodeLabel: node.label,
+          learningPackage: true,
+          prompt: `请围绕学习节点「${node.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+        },
+      }),
+    );
   }
 
   function studyFromNode(node: KnowledgeNode["data"] & { id: string }) {
@@ -1841,7 +1852,24 @@ export function GraphWorkspacePage() {
   function startPlanItem(item: PlanItemView) {
     if (item.routing.kind !== "review" && item.nodeId) {
       const tab = item.routing.kind === "assessment" ? "exam" : item.routing.kind === "practice" ? "lab" : "lesson";
-      navigate(`${base}/learn/nodes/${item.nodeId}?tab=${tab}`);
+      if (tab === "exam") {
+        // Exam answers and grading remain in the dedicated, durable attempt
+        // page; the lesson and lab stay in the conversational canvas.
+        navigate(`${base}/learn/nodes/${item.nodeId}?tab=${tab}`);
+      } else {
+        window.dispatchEvent(
+          new CustomEvent("learngraph:open-learning-project", {
+            detail: {
+              graphId: item.graphId ?? activeGraph?.id,
+              title: activeGraph?.title ?? item.title,
+              nodeId: item.nodeId,
+              nodeLabel: item.title,
+              learningPackage: true,
+              prompt: `请围绕学习节点「${item.title}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+            },
+          }),
+        );
+      }
       return;
     }
     void startPlanPracticeSession(item)

@@ -75,6 +75,14 @@ def _configure_sqlite_connection(dbapi_connection: Any, _: Any) -> None:
             raise RuntimeError("SQLite foreign key enforcement could not be enabled")
         cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
 
+        # A read-only companion process (currently the standalone preview
+        # origin) shares the database volume with the API.  It must not execute
+        # the WAL-mode PRAGMA: changing journal mode is itself a write and can
+        # contend with the API's single-writer gate from another process.
+        if settings.sqlite_read_only:
+            cursor.execute("PRAGMA query_only=ON")
+            return
+
         database_path = cursor.execute("PRAGMA database_list").fetchone()[2]
         is_network_path = str(database_path).startswith(("\\\\", "//"))
         # WAL is required for concurrent readers/writers on a local desktop DB.
@@ -1985,6 +1993,13 @@ def _apply_sqlite_additive_migrations() -> None:
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_messages_workspace_session_created "
             "ON messages(workspace_id, session_id, created_at)"
+        )
+        # Stream-event retention/archive filters by age before deleting or
+        # moving rows.  Without this index a multi-million-row projection is
+        # scanned under a write transaction, creating a long SQLite lock window.
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_message_stream_events_created_at "
+            "ON message_stream_events(created_at)"
         )
         # B1-7: TTL lease table for cross-process sweep mutual exclusion.
         connection.exec_driver_sql(

@@ -756,6 +756,7 @@ class MessageStreamEvent(Base, WorkspaceScopedMixin):
             "sequence",
             name="uq_message_stream_sequence",
         ),
+        Index("ix_message_stream_events_created_at", "created_at"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)

@@ -31,6 +31,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
+from uuid import uuid4
 from typing import Any, Awaitable, Callable, Iterable
 
 from pipecat.frames.frames import (
@@ -115,6 +116,9 @@ def backoff_delay(attempt: int, *, base: float = 0.5, cap: float = 30.0) -> floa
 class _TurnState:
     turn_id: str
     user_text: str = ""
+    # Provider final identity (DashScope item_id/commit_id). Re-delivered
+    # terminal ASR events must not append the same text a second time.
+    seen_user_final_ids: set[str] = field(default_factory=set)
     assistant_text: str = ""
     sentence_seq: int = 0
     sentence_texts: dict[int, str] = field(default_factory=dict)
@@ -195,6 +199,18 @@ class VoiceTurnJournal:
         self._last_reconcile_at = 0.0
         self._pending_typed: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
+        # Transcript/message writes are offloaded from the audio event loop and
+        # serialized per journal.  The gate prevents an interrupt finalization
+        # racing a normal playback finalization for the same turn while the
+        # actual synchronous ChatService/SQL work stays off-loop.
+        self._persistence_gate = asyncio.Semaphore(1)
+        # Pipecat's assistant aggregator can append the complete LLM draft to
+        # its in-memory context while handling InterruptionFrame.  The
+        # downstream context guard consumes this tuple and replaces that draft
+        # with the audio prefix that actually crossed the TTS start marker.
+        self._playback_context_hook: Callable[[str, str], None] | None = None
+        self._write_tail: asyncio.Task | None = None
+        self._user_text_hook: Callable[[str], None] | None = None
         self.degraded = False
         self.degraded_reason = ""
 
@@ -221,6 +237,12 @@ class VoiceTurnJournal:
             except Exception:
                 logger.debug("voice journal publish failed", exc_info=True)
         return envelope
+
+    async def _persist_offloop(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run synchronous turn/message persistence off the audio event loop."""
+
+        async with self._persistence_gate:
+            return await asyncio.to_thread(lambda: func(*args, **kwargs))
 
     def _cancel_finalize_timer(self) -> None:
         if self._finalize_handle is not None:
@@ -326,6 +348,31 @@ class VoiceTurnJournal:
         """
         self._turn = state
         self._arm_turn_deadline()
+        # Single funnel for "the user has said this": whichever path opened the
+        # turn (ASR, typed input, attaching to a client-opened turn), this is the
+        # earliest moment the words exist. The audio worker starts the turn's
+        # memory recall from here so the retrieval overlaps the turn decision
+        # instead of running after it.
+        self._note_user_text(state.user_text)
+
+    def set_user_text_hook(self, hook: Callable[[str], None] | None) -> None:
+        """Observe what the user has said so far, as soon as it is known.
+
+        A hook must not block and must not raise: it runs inside the journal's
+        lock on the audio event loop. Used for per-turn memory recall
+        (``app/voice/embedded_memory.py``).
+        """
+        self._user_text_hook = hook
+
+    def _note_user_text(self, text: str) -> None:
+        hook = self._user_text_hook
+        value = str(text or "").strip()
+        if hook is None or not value:
+            return
+        try:
+            hook(value)
+        except Exception:
+            logger.warning("voice journal user-text hook failed", exc_info=True)
 
     async def user_started(self) -> None:
         """VAD signals that the user started speaking."""
@@ -347,14 +394,21 @@ class VoiceTurnJournal:
     async def user_interim(self, text: str) -> None:
         if not str(text or "").strip():
             return
-        await self._emit(
+        await self._playback_event(
             "user.interim",
             payload={"text": text},
-            turn_id=self._turn.turn_id if self._turn else None,
+            turn_id=(self._turn.turn_id if self._turn and not self._turn.finalized
+                     and not self._turn.assistant_text and not self._turn.sentence_texts else None),
             phase="speculative",
         )
 
-    async def user_final(self, text: str, *, client_message_id: str | None = None) -> None:
+    async def user_final(
+        self,
+        text: str,
+        *,
+        client_message_id: str | None = None,
+        source_id: str | None = None,
+    ) -> None:
         """A finalized ASR segment: merge into the open turn, never duplicate.
 
         Consecutive finals inside one turn are concatenated (the user paused
@@ -364,8 +418,13 @@ class VoiceTurnJournal:
         if not segment:
             return
         barge_in = False
+        identity = str(source_id or "").strip()
         async with self._lock:
             if self._turn is not None and not self._turn.finalized:
+                if identity and identity in self._turn.seen_user_final_ids:
+                    return
+                if identity:
+                    self._turn.seen_user_final_ids.add(identity)
                 if (
                     not self._turn.assistant_text
                     and not self._turn.sentence_seq
@@ -373,9 +432,10 @@ class VoiceTurnJournal:
                 ):
                     # Multi-segment ASR merge: one turn, one user message (user paused mid-sentence).
                     state = self._turn
-                    state.user_text = (
-                        f"{state.user_text}{segment}" if state.user_text else segment
-                    )
+                    state.user_text = (state.user_text + (" " if state.user_text[-1:].isascii() and state.user_text[-1:].isalnum() and segment[:1].isascii() and segment[:1].isalnum() else "") + segment)
+                    # The recall started for the first segment; restart it for the
+                    # longer utterance so the query is the whole question.
+                    self._note_user_text(state.user_text)
                     await self._emit(
                         "user.final",
                         payload={
@@ -386,6 +446,10 @@ class VoiceTurnJournal:
                         },
                         turn_id=state.turn_id,
                         request_id=f"user.final:{state.turn_id}:{len(state.user_text)}",
+                    )
+                    await self._publish_live(
+                        "user.final", turn_id=state.turn_id,
+                        payload={"text": state.user_text, "client_message_id": client_message_id},
                     )
                     return
                 # The assistant has already begun generating or speaking: this new
@@ -403,10 +467,18 @@ class VoiceTurnJournal:
                 barge_in = True
         if barge_in:
             await self.turn_interrupted(reason="barge_in")
-        await self._open_turn_for_final(segment, client_message_id=client_message_id)
+        await self._open_turn_for_final(
+            segment,
+            client_message_id=client_message_id,
+            source_id=identity,
+        )
 
     async def _open_turn_for_final(
-        self, segment: str, *, client_message_id: str | None = None
+        self,
+        segment: str,
+        *,
+        client_message_id: str | None = None,
+        source_id: str | None = None,
     ) -> None:
         """Open (or attach to) the turn that owns this ASR segment.
 
@@ -418,9 +490,12 @@ class VoiceTurnJournal:
         async with self._lock:
             if self._turn is not None and not self._turn.finalized:
                 state = self._turn
-                state.user_text = (
-                    f"{state.user_text}{segment}" if state.user_text else segment
-                )
+                identity = str(source_id or "").strip()
+                if identity and identity in state.seen_user_final_ids:
+                    return
+                if identity:
+                    state.seen_user_final_ids.add(identity)
+                state.user_text = (state.user_text + (" " if state.user_text[-1:].isascii() and state.user_text[-1:].isalnum() and segment[:1].isascii() and segment[:1].isalnum() else "") + segment)
                 await self._emit(
                     "user.final",
                     payload={
@@ -432,15 +507,25 @@ class VoiceTurnJournal:
                     turn_id=state.turn_id,
                     request_id=f"user.final:{state.turn_id}:{len(state.user_text)}",
                 )
+                await self._publish_live(
+                    "user.final", turn_id=state.turn_id,
+                    payload={"text": state.user_text, "client_message_id": client_message_id},
+                )
                 return
             existing = await asyncio.to_thread(
                 turn_api.open_turn, self.voice_session_id
             )
+            if (existing is not None and self._turn is not None
+                    and self._turn.finalized and existing["turn_id"] == self._turn.turn_id):
+                existing = None
             if existing is not None:
                 # The client pre-opened this turn (typed input).  Attach to it
                 # instead of creating a parallel one.
                 state = _TurnState(turn_id=str(existing["turn_id"]))
                 state.user_text = str(existing.get("user_text") or segment)
+                identity = str(source_id or "").strip()
+                if identity:
+                    state.seen_user_final_ids.add(identity)
                 self._begin_turn(state)
                 await self._emit(
                     "user.final",
@@ -463,8 +548,14 @@ class VoiceTurnJournal:
             except Exception:
                 logger.warning("voice turn accept failed", exc_info=True)
                 return
-        self._begin_turn(
-            _TurnState(turn_id=str(accepted["turn_id"]), user_text=segment)
+        identity = str(source_id or "").strip()
+        state = _TurnState(turn_id=str(accepted["turn_id"]), user_text=segment)
+        if identity:
+            state.seen_user_final_ids.add(identity)
+        self._begin_turn(state)
+        await self._publish_live(
+            "user.final", turn_id=state.turn_id,
+            payload={"text": state.user_text, "client_message_id": client_message_id},
         )
 
     async def user_typed(self, text: str) -> None:
@@ -489,6 +580,10 @@ class VoiceTurnJournal:
                 if self._turn.user_text:
                     return
                 self._turn.user_text = content
+                # Typed input recalls memory too, and this branch bypasses
+                # ``_begin_turn`` -- it is the one place a turn's words are set
+                # without going through the funnel.
+                self._note_user_text(content)
                 return
             key = self._take_typed_client_message_id(content)
             if key:
@@ -507,6 +602,9 @@ class VoiceTurnJournal:
                 )
                 return
             existing = await asyncio.to_thread(turn_api.open_turn, self.voice_session_id)
+            if (existing is not None and self._turn is not None
+                    and self._turn.finalized and existing["turn_id"] == self._turn.turn_id):
+                existing = None
             if existing is not None:
                 state = _TurnState(turn_id=str(existing["turn_id"]))
                 state.user_text = str(existing.get("user_text") or content)
@@ -590,7 +688,7 @@ class VoiceTurnJournal:
         self._last_reconcile_at = now
         skip = [self._turn.turn_id] if self._turn is not None else []
         try:
-            closed = await asyncio.to_thread(
+            closed = await self._persist_offloop(
                 turn_api.finalize_stale_turns,
                 self.voice_session_id,
                 max_age_secs=self._stale_turn_secs,
@@ -616,6 +714,7 @@ class VoiceTurnJournal:
             outcome=turn_api.TURN_FINALIZED if spoken else turn_api.TURN_FAILED,
             failure_reason=None if spoken else turn_api.SESSION_CLOSED_TURN_REASON,
         )
+        await self.drain_persistence()
         try:
             closed = await asyncio.to_thread(
                 turn_api.finalize_stale_turns,
@@ -733,8 +832,9 @@ class VoiceTurnJournal:
             state.audio_cursor_ms = max(state.audio_cursor_ms, cursor)
         if context_id is not None:
             state.sentence_contexts[sequence] = str(context_id)
+        self._update_playback_context(state, self._spoken_assistant_text(state))
         self._touch_turn()
-        await self._emit(
+        await self._playback_event(
             "assistant.sentence.queued",
             payload={
                 "text": text,
@@ -781,7 +881,7 @@ class VoiceTurnJournal:
         resolved_segment = segment_id or f"{state.turn_id}:s{sequence}"
         # 信封的 ``audio_cursor_ms`` 保持"句首入队游标的回合内最大值"语义，句尾
         # 游标只出现在 payload 里：混进同一个字段会让回放游标在两个意义上跳。
-        await self._emit(
+        await self._playback_event(
             "assistant.sentence.ended",
             payload={
                 "text": state.sentence_texts.get(sequence, ""),
@@ -850,6 +950,50 @@ class VoiceTurnJournal:
         if state is None:
             return ""
         return self._spoken_assistant_text(state)
+
+    def set_playback_context_hook(self, hook: Callable[[str, str], None]) -> None:
+        self._playback_context_hook = hook
+
+    def _update_playback_context(self, state: _TurnState, text: str) -> None:
+        if self._playback_context_hook is not None:
+            self._playback_context_hook(state.turn_id, text)
+
+    def _enqueue_write(self, operation: Callable[[], Awaitable[Any]]) -> None:
+        """One FIFO writer per call; audio callbacks never wait on SQL or locks."""
+        previous = self._write_tail
+
+        async def write() -> None:
+            if previous is not None:
+                await asyncio.shield(previous)
+            try:
+                await operation()
+            except Exception:
+                logger.exception("voice persistence failed for %s", self.voice_session_id)
+
+        self._write_tail = asyncio.create_task(write(), name="voice-journal-write")
+
+    async def drain_persistence(self) -> None:
+        """Await pending writes at teardown/testing, never in the audio path."""
+        if self._write_tail is not None:
+            await asyncio.shield(self._write_tail)
+
+    async def _publish_live(self, event_type: str, **kwargs: Any) -> None:
+        if self._publish is not None:
+            try:
+                await self._publish({
+                    "type": event_type, "delivery": "live",
+                    "session_id": self.voice_session_id,
+                    **kwargs,
+                })
+            except Exception:
+                logger.exception("voice live event publish failed")
+
+    async def _playback_event(self, event_type: str, **kwargs: Any) -> None:
+        # Semantic identity is (turn_id, sentence_seq). The live and durable
+        # copies fold into the same UI segment; event_seq remains DB-owned.
+        kwargs["payload"] = {**kwargs.get("payload", {}), "live_event_id": uuid4().hex}
+        await self._publish_live(event_type, **kwargs)
+        self._enqueue_write(lambda: self._emit(event_type, **kwargs))
 
     def assistant_reply_in_flight(self) -> bool:
         """用户这句话已经有归属、助手还欠一个回答时为真（= 本回合已开且未终结）。
@@ -937,10 +1081,14 @@ class VoiceTurnJournal:
         state.sentence_seq += 1
         return state.sentence_seq
 
-    async def playback_ended(self) -> None:
+    async def playback_ended(self, *, turn_final: bool = True) -> None:
+        if not turn_final:
+            if self._turn is not None:
+                self._turn.playback_active = False
+            return
         if self._turn is not None:
             self._turn.playback_active = False
-        await self._emit(
+        await self._playback_event(
             "assistant.sentence.playback_ended",
             payload={
                 "sentence_seq": self._turn.sentence_seq if self._turn else 0,
@@ -1038,9 +1186,9 @@ class VoiceTurnJournal:
         # -- the degraded "audio never played, fall back to text" path, where the
         # page hands the answer over as text on purpose. A failed or interrupted
         # turn with nothing spoken has nothing the user heard, so it stays empty.
-        assistant_text = spoken or (
-            state.assistant_text if outcome == turn_api.TURN_FINALIZED else ""
-        )
+        # A generated LLM draft is not an answer the user heard. The media
+        # ledger is the sole authority for transcript, context and statistics.
+        assistant_text = spoken
         if memory is None:
             memory = (
                 outcome == turn_api.TURN_FINALIZED
@@ -1063,34 +1211,45 @@ class VoiceTurnJournal:
                 },
                 turn_id=state.turn_id,
             )
-        await self._emit_turn_finalized(
-            state,
-            outcome=outcome,
-            failure_reason=failure_reason,
-            spoken=spoken,
-            assistant_text=assistant_text,
+        self._update_playback_context(state, assistant_text)
+        await self._publish_live(
+            "turn.finalized", turn_id=state.turn_id,
+            payload={"role": "assistant", "text": assistant_text,
+                     "user_text": state.user_text, "outcome": outcome,
+                     "interrupted": outcome == turn_api.TURN_INTERRUPTED,
+                     "failed": outcome == turn_api.TURN_FAILED},
         )
-        try:
-            await asyncio.to_thread(
-                turn_api.finalize_turn,
-                self.voice_session_id,
-                state.turn_id,
-                assistant_text,
-                # The journal is the authority on the user's question: it merges
-                # consecutive ASR finals into one turn, while the row still holds
-                # only the first segment that opened it.  Passing it here is what
-                # keeps the transcript (and the page) from showing a truncated
-                # question next to an answer to the whole thing.
-                user_text=state.user_text or None,
-                audio_cursor_ms=state.audio_cursor_ms or None,
+
+        async def persist() -> None:
+            await self._emit_turn_finalized(
+                state,
                 outcome=outcome,
                 failure_reason=failure_reason,
-                # Only what was read aloud may be remembered; text that stayed in
-                # the queue or was lost with TTS must not become long-term memory.
-                memory=memory,
+                spoken=spoken,
+                assistant_text=assistant_text,
             )
-        except Exception:
-            logger.warning("voice turn finalize failed", exc_info=True)
+            try:
+                await self._persist_offloop(
+                    turn_api.finalize_turn,
+                    self.voice_session_id,
+                    state.turn_id,
+                    assistant_text,
+                    # The journal is the authority on the user's question: it merges
+                    # consecutive ASR finals into one turn, while the row still holds
+                    # only the first segment that opened it.  Passing it here is what
+                    # keeps the transcript (and the page) from showing a truncated
+                    # question next to an answer to the whole thing.
+                    user_text=state.user_text or None,
+                    audio_cursor_ms=state.audio_cursor_ms or None,
+                    outcome=outcome,
+                    failure_reason=failure_reason,
+                    # Only what was read aloud may be remembered; text that stayed in
+                    # the queue or was lost with TTS must not become long-term memory.
+                    memory=memory,
+                )
+            except Exception:
+                logger.warning("voice turn finalize failed", exc_info=True)
+        self._enqueue_write(persist)
 
     async def _emit_turn_finalized(
         self,
@@ -1232,37 +1391,36 @@ class VoiceTurnJournal:
                 return
             state.finalized = True
             self._cancel_recovery_timers()
-        await asyncio.to_thread(
-            turn_api.interrupt_turn,
-            self.voice_session_id,
-            turn_id=state.turn_id,
-            reason=reason,
-            # 本管线已经把音频停掉了（这条路径就是被 InterruptionFrame 触发的），
-            # 事件只是留给转录看。若它看起来像"外部请求的打断"，本进程的
-            # VoiceControlWatchdog 会在下一个 tick 再打断一次，而那一击会落在
-            # 紧接着开始的下一轮（打字回合通常毫秒级就起跑）上把它掐死。
-            origin="pipeline",
-        )
         heard_text = self._spoken_assistant_text(state)
-        # Persist even when nothing was heard.  ``finalize_turn`` documents that an
-        # interrupted turn keeps the user's question in the transcript -- dropping
-        # it is exactly what made it look like the user never spoke -- but this
-        # path used to bail out whenever there was no assistant audio, so any
-        # utterance that was barged over before the bot made a sound vanished from
-        # the conversation entirely.  With no assistant text the turn still
-        # settles as ``interrupted`` and stays out of long-term memory.
-        try:
-            await asyncio.to_thread(
-                turn_api.finalize_turn,
-                self.voice_session_id,
-                state.turn_id,
-                heard_text,
-                user_text=state.user_text or None,
-                memory=False,
+        self._update_playback_context(state, heard_text)
+        await self._publish_live(
+            "turn.interrupted", turn_id=state.turn_id,
+            payload={"reason": reason, "origin": "pipeline", "heard_text": heard_text},
+        )
+
+        async def persist() -> None:
+            interrupt_kwargs = {
+                "turn_id": state.turn_id,
+                "reason": reason,
+                "origin": "pipeline",
+            }
+            if heard_text:
+                interrupt_kwargs["heard_text"] = heard_text
+            await self._persist_offloop(
+                turn_api.interrupt_turn, self.voice_session_id, **interrupt_kwargs
+            )
+            await self._emit_turn_finalized(
+                state, outcome=turn_api.TURN_INTERRUPTED, failure_reason=None,
+                spoken=heard_text, assistant_text=heard_text,
+            )
+            await self._persist_offloop(
+                turn_api.finalize_turn, self.voice_session_id, state.turn_id,
+                heard_text, user_text=state.user_text or None, memory=False,
+                outcome=turn_api.TURN_INTERRUPTED,
                 audio_cursor_ms=state.audio_cursor_ms or None,
             )
-        except Exception:
-            logger.warning("interrupted voice turn persist failed", exc_info=True)
+
+        self._enqueue_write(persist)
 
     @staticmethod
     def _spoken_assistant_text(state: _TurnState) -> str:
@@ -1532,7 +1690,16 @@ class VoiceJournalProcessor(FrameProcessor):
         if isinstance(frame, InterimTranscriptionFrame):
             await self._journal.user_interim(frame.text)
         elif isinstance(frame, TranscriptionFrame):
-            await self._journal.user_final(frame.text)
+            result = getattr(frame, "result", None)
+            source_id = ""
+            if isinstance(result, dict):
+                source_id = str(
+                    result.get("item_id")
+                    or result.get("commit_id")
+                    or result.get("event_id")
+                    or ""
+                )
+            await self._journal.user_final(frame.text, source_id=source_id or None)
         elif isinstance(frame, UserStartedSpeakingFrame):
             await self._journal.user_started()
         elif isinstance(frame, UserStoppedSpeakingFrame):
@@ -1565,7 +1732,7 @@ class VoiceJournalProcessor(FrameProcessor):
             await self._journal.playback_started()
             return
         if isinstance(frame, BotStoppedSpeakingFrame):
-            await self._journal.playback_ended()
+            await self._journal.playback_ended(turn_final=False)
             return
         if isinstance(frame, InterruptionFrame):
             await self._journal.turn_interrupted(reason="barge_in")

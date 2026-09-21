@@ -288,6 +288,9 @@ type LearningProjectRequest = {
   prompt?: string;
   /** When set, the new chat auto-send will request a graph change proposal. */
   graphAction?: "none" | "propose_create" | "propose_update";
+  /** Marks a learning-package canvas entry and receives async open failures. */
+  learningPackage?: boolean;
+  onError?: (message: string) => void;
 };
 
 const LEARNING_NODE_CONTEXT_STORAGE_KEY = "learngraph:active-learning-node";
@@ -940,6 +943,8 @@ function SidebarNav({
             project?: SidebarProject;
             learningNode?: LearningNodeContext;
             pendingGraphAction?: "none" | "propose_create" | "propose_update";
+            learningPackage?: boolean;
+            onError?: (message: string) => void;
             /** When true, always create a fresh session (project / learning entry). */
             forceNew?: boolean;
           },
@@ -1096,6 +1101,7 @@ function SidebarNav({
                   ...(options.learningNode
                     ? { learningNode: options.learningNode }
                     : {}),
+                  ...(options.learningPackage ? { learningPackage: true } : {}),
                   ...(options.pendingGraphAction
                     ? { pendingGraphAction: options.pendingGraphAction }
                     : {}),
@@ -1105,7 +1111,9 @@ function SidebarNav({
         navigate(`${base}/chat/${session.id}`, navigationState);
         onNavigate?.();
       } catch (error) {
-        toast.error(error instanceof Error ? error.message : "无法创建新会话");
+        const message = error instanceof Error ? error.message : "无法创建新会话";
+        options.onError?.(message);
+        toast.error(message);
       } finally {
         creatingConversationRef.current = false;
         setCreatingConversation(false);
@@ -1169,21 +1177,26 @@ function SidebarNav({
         project,
         pendingPrompt: prompt,
         pendingGraphAction: request.graphAction,
-        learningNode: {
-          graphId,
-          nodeId: request.nodeId,
-          nodeLabel: request.nodeLabel,
-        },
-      });
+          learningNode: {
+            graphId,
+            nodeId: request.nodeId,
+            nodeLabel: request.nodeLabel,
+          },
+          learningPackage: request.learningPackage,
+          onError: request.onError,
+        });
     },
     [createConversation, projects, queryClient],
   );
 
   useEffect(() => {
     const open = (event: Event) => {
-      void openLearningProject(
-        (event as CustomEvent<LearningProjectRequest>).detail ?? {},
-      );
+      const detail = (event as CustomEvent<LearningProjectRequest>).detail ?? {};
+      void openLearningProject(detail).catch((error) => {
+        const message = error instanceof Error ? error.message : "无法打开学习对话";
+        detail.onError?.(message);
+        toast.error(message);
+      });
     };
     window.addEventListener("learngraph:open-learning-project", open);
     return () =>
@@ -3890,7 +3903,6 @@ function BoundGraphRail({
   title: string;
   workspaceId: string;
 }) {
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const graphQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph", graphId),
@@ -4164,7 +4176,20 @@ function BoundGraphRail({
       nodeId: selectedNode.id,
       nodeLabel: selectedNode.label,
     });
-    navigate(`/w/${workspaceId}/learn/nodes/${selectedNode.id}`);
+    // 学习内容和追问必须留在同一个对话画布中。由 shell 创建/复用会话，
+    // ChatCanvasPage 会在收到 learningNode 后挂载阶段式学习包预览。
+    window.dispatchEvent(
+      new CustomEvent("learngraph:open-learning-project", {
+        detail: {
+          graphId,
+          title: graph?.title ?? selectedNode.label,
+          nodeId: selectedNode.id,
+          nodeLabel: selectedNode.label,
+          learningPackage: true,
+          prompt: `请围绕学习节点「${selectedNode.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+        },
+      }),
+    );
   }
 
   function studyNextNode() {
@@ -4188,7 +4213,18 @@ function BoundGraphRail({
       nodeId: next.id,
       nodeLabel: next.label,
     });
-    navigate(`/w/${workspaceId}/learn/nodes/${next.id}`);
+    window.dispatchEvent(
+      new CustomEvent("learngraph:open-learning-project", {
+        detail: {
+          graphId,
+          title: graph?.title ?? next.label,
+          nodeId: next.id,
+          nodeLabel: next.label,
+          learningPackage: true,
+          prompt: `请围绕学习节点「${next.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+        },
+      }),
+    );
   }
 
   function compareWithParent() {

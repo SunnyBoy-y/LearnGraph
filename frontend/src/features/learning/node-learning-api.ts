@@ -7,7 +7,35 @@ export interface ActivityState { values: Record<string, number>; history: string
 export interface Question { id: string; kind: string; prompt: string; options: string[]; points: number; critical: boolean }
 export interface Paper { title: string; pass_score: number; practical_points: number; questions: Question[] }
 export interface Manifest { schema_version: number; blueprint: {title: string; objectives: string[]; estimated_minutes: number}; lesson: {sections: {id: string; title: string; body: string; takeaway: string}[]; svg: string; caption: string; html: string}; activity: ActivitySpec | null; exam: Paper; image?: {file_id: string; alt: string} | null; notes: string[]; provenance: string }
-export interface LearningPageData { node: {id: string; label: string; description: string; graph_id: string; graph_title?:string; graph_status?:string; node_type: string}; package: {id: string; manifest: Manifest; created_at: string} | null; stale: boolean; enrollment?: Enrollment | null; latest_attempt?: {id:string;status:string} | null; build: Build | null; achievement: {score: number; attempt_id: string; outdated?:boolean} | null }
+/**
+ * Learner-safe projection of the newest build checkpoint.
+ *
+ * Unlike a published Manifest this object is intentionally partial: the API
+ * exposes it after every completed build stage so the chat canvas can reveal
+ * the lesson progressively. It must never be used for grading (the private
+ * answer key is only present in the published package / attempt endpoint).
+ */
+export interface LearningBuildPreview {
+  schema_version?: number;
+  blueprint?: Manifest['blueprint'] | null;
+  lesson?: Pick<Manifest['lesson'], 'sections' | 'svg' | 'caption' | 'html'> | null;
+  activity?: ActivitySpec | null;
+  exam?: Paper | null;
+  image?: { file_id: string; alt: string } | null;
+  notes: string[];
+  provenance: string;
+  available?: {
+    blueprint?: boolean;
+    lesson?: boolean;
+    activity?: boolean;
+    exam?: boolean;
+    image?: boolean;
+  };
+  training_ready?: boolean;
+  draft_package_id?: string;
+  status?: string;
+}
+export interface LearningPageData { node: {id: string; label: string; description: string; graph_id: string; graph_title?:string; graph_status?:string; node_type: string}; package: {id: string; manifest: Manifest; created_at: string} | null; preview?: LearningBuildPreview | null; stale: boolean; enrollment?: Enrollment | null; latest_attempt?: {id:string;status:string} | null; build: Build | null; achievement: {score: number; attempt_id: string; outdated?:boolean} | null }
 export interface Enrollment { id: string; package_id: string; revision: number; progress: {sections: string[]; activity: ActivityState} }
 export interface Attempt { id: string; node_id: string; package_id: string; status: string; revision: number; answers: Record<string, string | string[]>; activity: ActivityState; activity_spec: ActivitySpec | null; paper: Paper; result: {score?: number; pass_score?: number; message: string; critical_passed?: boolean; practical_passed?: boolean; questions?: {id: string; points: number; max_points: number; feedback: string}[]} | null }
 const url = '/learning-pages'

@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from random import uniform
 from typing import Any, Callable, TypeVar
@@ -645,12 +645,15 @@ def run_parallel_generations(
     tasks: list[tuple[str, Callable[[], Any]]],
     *,
     max_workers: int | None = None,
+    on_result: Callable[[str, Any, BaseException | None], None] | None = None,
 ) -> dict[str, tuple[Any, BaseException | None]]:
     """Run independent generations concurrently; each task owns its DB session.
 
     Only *model calls* are concurrent: every callable opens a short-lived session
     through :func:`generate_checked`, so no transaction spans inference and the
-    SQLite write gate keeps serializing the short billing writes.
+    SQLite write gate keeps serializing the short billing writes. ``on_result``
+    runs on the collector thread as each future completes, allowing callers to
+    checkpoint successful siblings without waiting for the slowest generation.
     """
     workers = max_workers if max_workers is not None else int(getattr(get_settings(), "learning_generation_parallel", 2) or 2)
     results: dict[str, tuple[Any, BaseException | None]] = {}
@@ -660,12 +663,18 @@ def run_parallel_generations(
                 results[name] = (task(), None)
             except Exception as exc:  # noqa: BLE001 - caller decides per-task policy
                 results[name] = (None, exc)
+            if on_result is not None:
+                on_result(name, results[name][0], results[name][1])
         return results
     with ThreadPoolExecutor(max_workers=min(max(1, workers), len(tasks)), thread_name_prefix="learning-gen") as pool:
         futures = {name: pool.submit(task) for name, task in tasks}
-        for name, future in futures.items():
+        names = {future: name for name, future in futures.items()}
+        for future in as_completed(futures.values()):
+            name = names[future]
             try:
                 results[name] = (future.result(), None)
             except Exception as exc:  # noqa: BLE001 - caller decides per-task policy
                 results[name] = (None, exc)
+            if on_result is not None:
+                on_result(name, results[name][0], results[name][1])
     return results

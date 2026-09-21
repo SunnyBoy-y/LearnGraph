@@ -55,6 +55,22 @@ _SWEEP_DEFER_LOCK = threading.Lock()
 _SWEEP_DEFER_COUNTERS: dict[str, int] = {}
 
 
+def _acquire_advisory_lock_in_worker(
+    name: str, *, ttl_seconds: int
+) -> str | None:
+    """Claim a scheduler lease without touching the event-loop thread."""
+
+    with SessionLocal() as db:
+        return acquire_advisory_lock(db, name, ttl_seconds=ttl_seconds)
+
+
+def _release_advisory_lock_in_worker(name: str, token: str) -> None:
+    """Release a scheduler lease without touching the event-loop thread."""
+
+    with SessionLocal() as db:
+        release_advisory_lock(db, name, token)
+
+
 def _should_defer_sweep(name: str) -> bool:
     """True when the named non-urgent sweep should skip this round.
 
@@ -334,8 +350,11 @@ async def memory_retention_scheduler(
     )
     while not stop.is_set():
         # B1-7: only one process runs each sweep round.
-        with SessionLocal() as lock_db:
-            lock_token = acquire_advisory_lock(lock_db, "sweep.retention", ttl_seconds=600)
+        lock_token = await asyncio.to_thread(
+            _acquire_advisory_lock_in_worker,
+            "sweep.retention",
+            ttl_seconds=600,
+        )
         if lock_token is None:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -344,12 +363,18 @@ async def memory_retention_scheduler(
             continue
         try:
             await asyncio.to_thread(run_memory_retention_sweeps)
-            with SessionLocal() as lock_db:
-                release_advisory_lock(lock_db, "sweep.retention", lock_token)
+            await asyncio.to_thread(
+                _release_advisory_lock_in_worker,
+                "sweep.retention",
+                lock_token,
+            )
         except Exception:
             logger.exception("Periodic memory retention wake-up failed")
-            with SessionLocal() as lock_db:
-                release_advisory_lock(lock_db, "sweep.retention", lock_token)
+            await asyncio.to_thread(
+                _release_advisory_lock_in_worker,
+                "sweep.retention",
+                lock_token,
+            )
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
@@ -512,8 +537,11 @@ async def memory_extraction_scheduler(
     )
     while not stop.is_set():
         # B1-7: only one process runs each sweep round.
-        with SessionLocal() as lock_db:
-            lock_token = acquire_advisory_lock(lock_db, "sweep.extraction", ttl_seconds=600)
+        lock_token = await asyncio.to_thread(
+            _acquire_advisory_lock_in_worker,
+            "sweep.extraction",
+            ttl_seconds=600,
+        )
         if lock_token is None:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -522,12 +550,18 @@ async def memory_extraction_scheduler(
             continue
         try:
             await asyncio.to_thread(run_memory_extraction_sweeps)
-            with SessionLocal() as lock_db:
-                release_advisory_lock(lock_db, "sweep.extraction", lock_token)
+            await asyncio.to_thread(
+                _release_advisory_lock_in_worker,
+                "sweep.extraction",
+                lock_token,
+            )
         except Exception:
             logger.exception("Periodic memory extraction wake-up failed")
-            with SessionLocal() as lock_db:
-                release_advisory_lock(lock_db, "sweep.extraction", lock_token)
+            await asyncio.to_thread(
+                _release_advisory_lock_in_worker,
+                "sweep.extraction",
+                lock_token,
+            )
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
@@ -917,8 +951,11 @@ async def sandbox_cleanup_scheduler(
     )
     while not stop.is_set():
         # B1-7: only one process runs each sweep round.
-        with SessionLocal() as lock_db:
-            lock_token = acquire_advisory_lock(lock_db, "sweep.sandbox_cleanup", ttl_seconds=600)
+        lock_token = await asyncio.to_thread(
+            _acquire_advisory_lock_in_worker,
+            "sweep.sandbox_cleanup",
+            ttl_seconds=600,
+        )
         if lock_token is None:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
@@ -928,12 +965,18 @@ async def sandbox_cleanup_scheduler(
         try:
             await asyncio.to_thread(run_sandbox_cleanup_sweep)
             await asyncio.to_thread(run_execution_pool_sweep)
-            with SessionLocal() as lock_db:
-                release_advisory_lock(lock_db, "sweep.sandbox_cleanup", lock_token)
+            await asyncio.to_thread(
+                _release_advisory_lock_in_worker,
+                "sweep.sandbox_cleanup",
+                lock_token,
+            )
         except Exception:
             logger.exception("Periodic sandbox cleanup wake-up failed")
-            with SessionLocal() as lock_db:
-                release_advisory_lock(lock_db, "sweep.sandbox_cleanup", lock_token)
+            await asyncio.to_thread(
+                _release_advisory_lock_in_worker,
+                "sweep.sandbox_cleanup",
+                lock_token,
+            )
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:
@@ -957,8 +1000,11 @@ async def sandbox_execution_scheduler(
         else get_settings().sandbox_scheduler_interval_seconds,
     )
     while not stop.is_set():
-        with SessionLocal() as lock_db:
-            lock_token = acquire_advisory_lock(lock_db, "sweep.sandbox_execution", ttl_seconds=60)
+        lock_token = await asyncio.to_thread(
+            _acquire_advisory_lock_in_worker,
+            "sweep.sandbox_execution",
+            ttl_seconds=60,
+        )
         if lock_token is not None:
             try:
                 from app.services.sandbox_scheduler import run_scheduler_tick
@@ -969,8 +1015,11 @@ async def sandbox_execution_scheduler(
             except Exception:
                 logger.exception("Sandbox execution scheduler tick failed")
             finally:
-                with SessionLocal() as lock_db:
-                    release_advisory_lock(lock_db, "sweep.sandbox_execution", lock_token)
+                await asyncio.to_thread(
+                    _release_advisory_lock_in_worker,
+                    "sweep.sandbox_execution",
+                    lock_token,
+                )
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

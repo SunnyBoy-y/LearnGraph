@@ -907,6 +907,36 @@ def _new_messages_since(
     return messages[-_TRANSCRIPT_MESSAGE_CAP:]
 
 
+def _message_interaction_surface(message: Message) -> str:
+    """How this message reached the system: ``voice`` or ``text``.
+
+    A voice turn writes the same ``provider_trace`` markers as the transcript
+    (``voice`` / ``voice_turn``), which is what makes the surface recoverable
+    from the message alone -- no new column and no schema migration.
+    """
+
+    trace = getattr(message, "provider_trace", None)
+    if isinstance(trace, dict) and (trace.get("voice") or trace.get("voice_turn")):
+        return "voice"
+    return "text"
+
+
+def _provenance_surfaces(
+    evidence_ids: list[str], surface_by_evidence: dict[str, str]
+) -> dict[str, Any]:
+    """Label the surface a proposal's evidence came from, when it is not text.
+
+    Text stays unlabelled on purpose: writing the key on every extraction would
+    rewrite the structured payload of every atom in existing workspaces for no
+    gain.  Voice is the case that has to be visible.
+    """
+
+    surfaces = sorted({surface_by_evidence.get(item, "text") for item in evidence_ids})
+    if not surfaces or surfaces == ["text"]:
+        return {}
+    return {"surfaces": surfaces}
+
+
 def _user_evidence_for_messages(
     db: Session,
     workspace_id: str,
@@ -1100,6 +1130,16 @@ def extract_session_memories(
     )
     eligible_evidence_ids = {
         evidence.id for evidence in evidence_by_message.values()
+    }
+    # Which surface each piece of evidence came from. Voice turns carry the same
+    # provider_trace marker the transcript uses (see
+    # ``services/voice_context.py``), so a memory atom extracted from something
+    # the user *said* can be told apart from one they typed -- the memory record
+    # itself had no such label, and the message row was the only trace of it.
+    surface_by_evidence = {
+        evidence_by_message[item.id].id: _message_interaction_surface(item)
+        for item in messages
+        if item.id in evidence_by_message
     }
     transcript = "\n".join(
         (
@@ -1343,6 +1383,7 @@ def extract_session_memories(
                 "authorship": "user",
                 "source_kinds": ["user_statement"],
                 "profile_eligible": True,
+                **_provenance_surfaces(evidence_ids, surface_by_evidence),
             },
         }
         structured_payload = ensure_plan_canonical_key(

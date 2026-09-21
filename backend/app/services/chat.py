@@ -125,6 +125,7 @@ from app.services.graph_changes import GraphChangeSetService
 from app.services.billing import BillingQuote, BillingService
 from app.services.file_references import FileReferenceService
 from app.services.document_learning import DocumentLearningService
+from app.services.learning_package_context import learning_package_prompt_context
 from app.services.agent_runtime import AgentToolRuntime
 from app.services.chat_attachment_policy import (
     classify_non_agent_attachment,
@@ -963,6 +964,114 @@ class ChatService:
             task_id=task_id,
             token_budget=token_budget,
         )
+
+    def voice_memory_block(
+        self,
+        session_id: str,
+        query: str,
+        *,
+        node_ids: list[str] | None = None,
+        task_id: str | None = None,
+        token_budget: int | None = None,
+        agent_id: str = "voice",
+    ) -> tuple[str, dict]:
+        """The memory section ordinary chat would inject for this query.
+
+        One read path for both surfaces: ``memory_read_mode == "events"`` uses
+        the event-sourced Context Builder, anything else falls back to the
+        legacy loader, and the budget stays ``_memory_prompt_token_budget()`` --
+        so a spoken question recalls exactly what a typed one would.  The voice
+        worker calls this once per user turn, it is a pure read (nothing is
+        written to the transcript), and a failure degrades to "no memory this
+        turn" rather than an error the audio pipeline would have to handle.
+
+        ``agent_id`` labels the retrieval trace.  Without it a spoken recall and
+        a typed one are indistinguishable in ``memory_retrieval_traces`` -- the
+        trace takes its agent from the scope, and the scope default is
+        ``main_agent`` for every caller.
+        """
+
+        settings = get_settings()
+        budget = int(token_budget or self._memory_prompt_token_budget())
+        if self.memory_context_loader is not None and settings.memory_read_mode != "events":
+            block = self.memory_context_loader(
+                session_id,
+                query_text=query,
+                node_ids=node_ids or None,
+                prompt_token_budget=budget,
+            )
+            return str(block or ""), {
+                "read_mode": settings.memory_read_mode,
+                "source": "legacy_loader",
+            }
+        block, telemetry = self._build_v2_memory_context(
+            session_id,
+            query,
+            node_ids=node_ids,
+            task_id=task_id,
+            agent_id=agent_id,
+        )
+        return str(block or ""), telemetry
+
+    def voice_memory_search(
+        self,
+        session_id: str,
+        query: str,
+        *,
+        limit: int = 5,
+        agent_id: str = "voice",
+    ) -> dict[str, Any]:
+        """Structured recall for the voice tutor's ``search_memory`` tool.
+
+        The same single read path as the prompt block, returned as items the
+        model can talk about instead of a block that gets injected into a
+        request.  It prefers the retrieved set over the injected one: a tool call
+        is an explicit "go look", so budget trimming should not hide a match the
+        retriever already ranked -- the caller caps the size instead.
+
+        A failure is reported as ``degraded`` and never raised: a lookup the
+        tutor asked for must not be able to break the audio pipeline.
+        """
+
+        top_k = max(1, min(int(limit or 5), 20))
+        if not str(query or "").strip():
+            # An empty query is not a search: the build would reject it anyway
+            # (``ContextBuildRequest.query`` has a minimum length), and a reason
+            # the tutor can read beats a validation error dressed as a failure.
+            return {"items": [], "count": 0, "reason": "empty_query"}
+        try:
+            _block, telemetry, built = self._build_v2_memory_package(
+                session_id, query, agent_id=agent_id
+            )
+        except Exception:
+            logger.warning("voice memory search failed", exc_info=True)
+            return {"items": [], "count": 0, "degraded": True}
+        items: list[dict[str, Any]] = []
+        if built is not None:
+            candidates = list(
+                getattr(built.view, "retrieved_memories", None)
+                or built.view.memories
+            )
+            for item in candidates[:top_k]:
+                items.append(
+                    {
+                        "memory_id": item.target_id,
+                        "title": item.title,
+                        "content": str(item.content or "")[:400],
+                        "confidence": float(item.confidence),
+                        "scope": item.scope,
+                        "trust": item.trust,
+                        "source": item.source_event_id,
+                        "score": float(item.score),
+                    }
+                )
+        return {
+            "items": items,
+            "count": len(items),
+            "context_build_id": telemetry.get("context_build_id"),
+            "read_mode": telemetry.get("read_mode"),
+            "degraded": bool(telemetry.get("degraded")),
+        }
 
     def persist_voice_turn(
         self,
@@ -2137,6 +2246,7 @@ class ChatService:
         *,
         node_ids: list[str] | None = None,
         task_id: str | None = None,
+        agent_id: str | None = None,
     ) -> tuple[str | None, dict]:
         """Build memory context via the event-sourced Context Builder.
 
@@ -2147,9 +2257,36 @@ class ChatService:
         metrics.  On any failure both are safe no-ops.
         """
 
+        block, telemetry, _built = self._build_v2_memory_package(
+            session_id,
+            current_content,
+            node_ids=node_ids,
+            task_id=task_id,
+            agent_id=agent_id,
+        )
+        return block, telemetry
+
+    def _build_v2_memory_package(
+        self,
+        session_id: str,
+        current_content: str,
+        *,
+        node_ids: list[str] | None = None,
+        task_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> tuple[str | None, dict, Any | None]:
+        """The same build, plus the full package it produced.
+
+        The pinned voice snapshot needs the structured ``memories`` /
+        ``learning_states`` next to the prompt block.  Returning them from the
+        build that already ran keeps that snapshot from paying for the retrieval
+        twice -- it used to walk this whole path once for the prompt and then
+        again for the view.
+        """
+
         settings = get_settings()
         if self.context_builder is None or not settings.memory_context_builder_v2:
-            return None, {}
+            return None, {}, None
 
         # B1-5: in shadow mode the v2 build runs purely for comparison; sample
         # it at memory_shadow_sample_rate so most requests run only the legacy
@@ -2157,7 +2294,7 @@ class ChatService:
         if settings.memory_read_mode != "events":
             rate = settings.memory_shadow_sample_rate
             if rate is None or rate <= 0:
-                return None, {"degraded": True, "read_mode": settings.memory_read_mode}
+                return None, {"degraded": True, "read_mode": settings.memory_read_mode}, None
             if rate < 1.0:
                 import random
                 if random.random() > rate:
@@ -2165,12 +2302,17 @@ class ChatService:
                         "degraded": True,
                         "read_mode": settings.memory_read_mode,
                         "shadow_sampled_out": True,
-                    }
+                    }, None
 
         try:
             from app.domain.memory_event_models import MemoryScopeContext
             from app.domain.schemas.context_builds import ContextBuildRequest
 
+            # Who asked. It only ever lands in the trace/telemetry columns
+            # (``MemoryRetrievalTrace.agent_id`` is read from the scope), never
+            # in the ranking -- which is exactly why the voice path can carry its
+            # own label without changing what it retrieves.
+            resolved_agent_id = str(agent_id or "main_agent")
             scope = MemoryScopeContext(
                 tenant_id=self.tenant_id,
                 principal_user_id=self.actor_id,
@@ -2178,13 +2320,14 @@ class ChatService:
                 task_id=task_id,
                 conversation_id=session_id,
                 node_ids=tuple(node_ids or ()),
+                agent_id=resolved_agent_id,
             )
             request = ContextBuildRequest(
                 conversation_id=session_id,
                 task_id=task_id,
                 query=current_content,
                 token_budget=self._memory_prompt_token_budget(),
-                agent_id="main_agent",
+                agent_id=resolved_agent_id,
                 provider_id=self.model_provider.provider_id,
                 model_id=str(getattr(self.model_provider, "model_id", "")),
             )
@@ -2201,15 +2344,15 @@ class ChatService:
 
             if settings.memory_read_mode == "events":
                 self._write_shadow_telemetry(scope, request, built.view, telemetry)
-                return built.prompt_block, telemetry
+                return built.prompt_block, telemetry, built
 
             # Shadow mode: log comparison but still use legacy.
             self._write_shadow_telemetry(scope, request, built.view, telemetry)
-            return None, telemetry
+            return None, telemetry, built
 
         except Exception:
             logger.debug("v2 context builder failed, degrading to legacy", exc_info=True)
-            return None, {"degraded": True, "read_mode": settings.memory_read_mode}
+            return None, {"degraded": True, "read_mode": settings.memory_read_mode}, None
 
     def _write_shadow_telemetry(self, scope, request, view, telemetry: dict) -> None:
         """Best-effort telemetry write; never blocks chat.
@@ -2504,6 +2647,7 @@ class ChatService:
         agent_mode: bool = False,
         web_search_results_present: bool = False,
         audio_transcripts: list[tuple[FileRecord, AudioTranscription]] | None = None,
+        agent_id: str | None = None,
     ) -> tuple[str, ContextSummary | None]:
         history = self._session_timeline(session_id)
         if history_before_message_id is not None:
@@ -2533,6 +2677,14 @@ class ChatService:
                 audio_transcripts=audio_transcripts,
             )
         ]
+        package_context = learning_package_prompt_context(
+            self.db,
+            self.workspace_id,
+            node_ids or [],
+            session=session,
+        )
+        if package_context:
+            context_sections.append(package_context)
         if session.session_kind == "concept_branch" and session.context_capsule:
             context_sections.append(self._concept_capsule_prompt(session.context_capsule))
         if self.memory_context_loader is not None and get_settings().memory_read_mode != "events":
@@ -2549,7 +2701,7 @@ class ChatService:
                 )
             )
         v2_block, _v2_telemetry = self._build_v2_memory_context(
-            session_id, current_content, node_ids=node_ids
+            session_id, current_content, node_ids=node_ids, agent_id=agent_id
         )
         if v2_block is not None:
             context_sections.append(v2_block)
@@ -2883,6 +3035,14 @@ class ChatService:
                 audio_transcripts=audio_transcripts,
             )
         ]
+        package_context = learning_package_prompt_context(
+            self.db,
+            self.workspace_id,
+            node_ids or [],
+            session=session,
+        )
+        if package_context:
+            context_sections.append(package_context)
         if session.session_kind == "concept_branch" and session.context_capsule:
             context_sections.append(self._concept_capsule_prompt(session.context_capsule))
         if self.memory_context_loader is not None and get_settings().memory_read_mode != "events":
@@ -8920,6 +9080,15 @@ class ChatService:
         "last_finish_reason",
         "optimistic_target_message_id",
         "optimistic_persisted_message_id",
+        # 语音回合的身份：语音回合的消息没有乐观 id 映射，画布只能靠这几个键把
+        # "通话中本地渲染的那一行"与"worker 落库的那一行"认成同一行（回合 id /
+        # 幂等键），并据此决定语音专属渲染与语音会话的自动命名。少了它们，刷新
+        # 回来的持久化消息会被当成一条普通回答，与本地那一行并排画出同一条回答
+        # 两份（用户问题因为还能按内容配对，所以用户只看到回答重复）。
+        "voice",
+        "voice_turn",
+        "voice_turn_id",
+        "client_message_id",
     )
 
     # Part types whose full body is required for interactive list rendering

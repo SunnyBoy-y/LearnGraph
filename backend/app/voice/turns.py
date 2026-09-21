@@ -19,6 +19,7 @@ is exactly one persistence path and both can retry safely.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 from uuid import uuid4
@@ -50,6 +51,13 @@ OPEN_TURN_STATUSES = (TURN_ACCEPTED,)
 # ``list_turns`` uses this so a refresh recovers failed/interrupted turns too,
 # not just successful ones.
 TERMINAL_TURN_STATUSES = (TURN_FINALIZED, TURN_INTERRUPTED, TURN_FAILED)
+
+# Transcript write retry. Bounded and short: the write runs on a worker thread
+# while the call continues, and the underlying call is idempotent on the turn id,
+# so a couple of immediate attempts buy back the common transient failures
+# without holding a thread for a long outage.
+PERSIST_ATTEMPTS = 2
+PERSIST_RETRY_DELAY_SECS = 0.2
 
 # Why a turn that nobody ever answered was closed by the aging sweep. It is a
 # failure, not a deletion: the question stays in the transcript with a retry
@@ -553,10 +561,20 @@ def persist_turn_messages(
 ) -> bool:
     """Write the authoritative exchange into the ordinary chat transcript.
 
-    Failure is reported, never swallowed silently: the worker retries it on the
-    next control tick and the caller can surface a degraded state.  The
-    underlying call is idempotent on the turn id.
+    Runs on a worker thread (``journal._emit_turn_finalized`` uses
+    ``asyncio.to_thread``), so the retry below costs the audio loop nothing.
+
+    The retry is bounded and immediate: a transient failure (a busy SQLite
+    writer, a dropped connection) usually clears within a fraction of a second,
+    and the underlying call is idempotent on the turn id, so re-running it cannot
+    duplicate a message.  What this does **not** cover is a worker that dies
+    between the turn being marked final and the transcript being written: the
+    turn is already terminal, so the stale-turn sweep cannot see it, and the
+    ``persisted`` flag has no consumer.  Healing that case needs either a
+    persisted "needs write" flag or a queue kind, i.e. a schema decision, not
+    another retry loop here.
     """
+
     user_text = str(turn.get("user_text") or "").strip()
     if not user_text:
         return False
@@ -568,40 +586,46 @@ def persist_turn_messages(
     session = load_session(voice_session_id)
     if session is None:
         return False
-    try:
-        from app.core.config import get_settings
-        from app.services.chat_service_factory import build_voice_chat_service
+    last_error: Exception | None = None
+    for attempt in range(PERSIST_ATTEMPTS):
+        try:
+            from app.core.config import get_settings
+            from app.services.chat_service_factory import build_voice_chat_service
 
-        settings = get_settings()
-        with SessionLocal() as db:
-            chat_service = build_voice_chat_service(
-                db,
-                workspace_id=session.workspace_id,
-                actor_id=session.owner_user_id,
-                settings=settings,
-                model_id=session.model_id,
-                provider_id=session.provider_id,
-                thinking_mode=session.max_thinking_mode,
-            )
-            chat_service.persist_voice_turn(
-                session.chat_session_id,
-                turn_id=str(turn["turn_id"]),
-                user_text=user_text,
-                assistant_text=assistant_text,
-                client_message_id=turn.get("client_message_id"),
-                commit=True,
-                memory=memory,
-                include_assistant=include_assistant,
-                assistant_status="completed" if include_assistant else "failed",
-            )
-        return True
-    except Exception:
-        logger.warning(
-            "voice turn %s could not be written to the chat transcript",
-            turn.get("turn_id"),
-            exc_info=True,
-        )
-        return False
+            settings = get_settings()
+            with SessionLocal() as db:
+                chat_service = build_voice_chat_service(
+                    db,
+                    workspace_id=session.workspace_id,
+                    actor_id=session.owner_user_id,
+                    settings=settings,
+                    model_id=session.model_id,
+                    provider_id=session.provider_id,
+                    thinking_mode=session.max_thinking_mode,
+                )
+                chat_service.persist_voice_turn(
+                    session.chat_session_id,
+                    turn_id=str(turn["turn_id"]),
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    client_message_id=turn.get("client_message_id"),
+                    commit=True,
+                    memory=memory,
+                    include_assistant=include_assistant,
+                    assistant_status="completed" if include_assistant else "failed",
+                )
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < PERSIST_ATTEMPTS:
+                time.sleep(PERSIST_RETRY_DELAY_SECS * (attempt + 1))
+    logger.warning(
+        "voice turn %s could not be written to the chat transcript after %d attempts",
+        turn.get("turn_id"),
+        PERSIST_ATTEMPTS,
+        exc_info=last_error,
+    )
+    return False
 
 
 def interrupt_turn(
@@ -610,6 +634,7 @@ def interrupt_turn(
     turn_id: str | None = None,
     reason: str = "barge_in",
     origin: str = "control",
+    heard_text: str | None = None,
     request_id: str | None = None,
 ) -> dict[str, Any]:
     """Mark the open turn interrupted and publish the interrupt event.
@@ -654,7 +679,14 @@ def interrupt_turn(
             "reason": reason,
             "turn_id": target,
             "origin": origin,
-            "heard_text": (snapshot or {}).get("assistant_text") or "",
+            # The pipeline knows the playback prefix before the database row is
+            # updated.  Carry it in the interrupt event so a browser that misses
+            # the sentence marker can still settle the same A+B prefix.
+            "heard_text": (
+                str(heard_text).strip()
+                if heard_text is not None
+                else (snapshot or {}).get("assistant_text") or ""
+            ),
         },
         turn_id=target,
         request_id=request_id or f"turn.interrupted:{uuid4().hex[:12]}",

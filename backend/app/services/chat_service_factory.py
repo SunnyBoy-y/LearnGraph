@@ -327,7 +327,12 @@ def build_chat_service(
         model_provider_for_workspace(db, context.workspace_id, settings, **model_kwargs),
         tenant_id=context.principal.tenant_id,
         context_builder=(
-            ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db)))
+            # ``db=`` is what makes the router write a retrieval trace: without it
+            # ``_persist_trace`` returns early and every chat/voice read is
+            # invisible in ``memory_retrieval_traces``.  The trace rides this
+            # request's transaction (it is written inside a savepoint, so its own
+            # failure cannot roll the request back).
+            ContextBuilder(db, MemoryRouter(MemoryHybridRetriever(db), db=db))
             if settings.memory_context_builder_v2
             else None
         ),
