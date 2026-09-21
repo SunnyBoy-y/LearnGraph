@@ -67,18 +67,18 @@
   </tr>
   <tr>
     <th>Android 移动端</th>
-    <th>学习 / 能力图谱</th>
+    <th>双工语音交互</th>
   </tr>
   <tr>
     <td><img src=".github/assets/product-android-home.png" alt="LearnGraph Android 客户端主界面"></td>
-    <td><img src=".github/assets/product-graph.png" alt="LearnGraph 学习与能力图谱"></td>
+    <td><img src=".github/assets/product-voice.png" alt="LearnGraph 双工语音交互"></td>
   </tr>
   <tr>
-    <th>随心练习</th>
+    <th>学习图谱</th>
     <th>文档学习与溯源问答</th>
   </tr>
   <tr>
-    <td><img src=".github/assets/exam.png" alt="LearnGraph 交互练习与滑词解释"></td>
+    <td><img src=".github/assets/graph.png" alt="LearnGraph 学习图谱"></td>
     <td><img src=".github/assets/product-document-learning.png" alt="LearnGraph 文档学习与溯源问答"></td>
   </tr>
 </table>
