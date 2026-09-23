@@ -18,6 +18,14 @@ if [ "$(id -u)" = "0" ]; then
     "${DATA_ROOT}/memory" \
     "${DATA_ROOT}/sandbox-workspaces" \
     "${DATA_ROOT}/egress-policies"
+  # Older root-run releases could leave the stable web-fetch pool namespace
+  # owned by root. The app drops to UID 1000 below and needs to create fresh
+  # per-fetch workspaces under these dedicated temporary directories. Repair
+  # only the namespace directories; per-run workspaces may still be mounted by
+  # warm sandbox containers and keep their existing ownership.
+  find "${DATA_ROOT}/sandbox-workspaces" \
+    -mindepth 1 -maxdepth 1 -type d -name 'fetchpool-*' \
+    -exec chown learngraph:learngraph {} +
   if [ "$(stat -c %u "${DATA_ROOT}" 2>/dev/null || echo 0)" = "0" ]; then
     chown learngraph:learngraph "${DATA_ROOT}"
   fi

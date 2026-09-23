@@ -626,8 +626,8 @@ class Settings(BaseSettings):
     # Qwen companion path is used. This is the global hard gate: each workspace
     # can additionally toggle its own sandbox fetch switch and channel priority
     # in Provider 管理 -> 网页抓取 (``web_fetch.runtime`` setting). Defaults to
-    # on so sandbox-isolated fetch is the secure primary path out of the box.
-    sandbox_web_fetch_enabled: bool = True
+    # off; deployments must opt in after configuring the policy, proxy and image.
+    sandbox_web_fetch_enabled: bool = False
     # --- Frontend-sandbox networking (browser MagicCard / HTML preview) -------
     # Approval-free by product decision (only backend sandboxes require egress
     # approval). When enabled, JS-initiated network calls inside the browser

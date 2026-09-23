@@ -6,7 +6,7 @@ description: 在沙箱容器内按统一权限清单抓取网页并可选 chromi
 # 受审网页抓取与渲染
 
 > **门控 Skill**：这个包默认**可发现但不激活**。只有以下全部满足时才可用：
-> `LEARNGRAPH_SANDBOX_EGRESS_ENABLED=true` + `LEARNGRAPH_SANDBOX_WEB_FETCH_ENABLED=true` + 工作区 `web_fetch.policy.allowed_domains` 非空 + egress 代理在线且镜像含 `web_fetch` 任务。不满足时，网页抓取应走外部 FetchProvider（Crawl4AI/Firecrawl/Qwen），本包内容不适用。
+> 沙箱隔离网页抓取的全局开关默认关闭。显式设置 `LEARNGRAPH_SANDBOX_WEB_FETCH_ENABLED=true`，并同时满足 `LEARNGRAPH_SANDBOX_EGRESS_ENABLED=true`、工作区 `web_fetch.policy.allowed_domains` 非空、egress 代理在线且镜像含 `web_fetch` 任务后，本包内容才适用。不满足时，网页抓取应走外部 FetchProvider（Crawl4AI/Firecrawl/Qwen）。
 
 ## When to use
 
