@@ -255,11 +255,13 @@ class SandboxdBackend(SandboxBackendPort):
             "disk_bytes": spec.disk_bytes,
             "egress": egress_payload,
             "ttl_seconds": self._ttl_seconds(),
-            # Stable idempotency key per session: the daemon also reuses a
-            # still-alive sandbox for the same session_id (execution pool), so
-            # retries with the same key replay or reuse instead of duplicating
-            # the physical container.
-            "idempotency_key": f"pool-{spec.session_id}",
+            # Keep retries idempotent while allowing a deliberate runtime
+            # replacement when the workspace network policy changes. The
+            # policy digest is part of the immutable container configuration.
+            "idempotency_key": (
+                f"pool-{spec.session_id}-"
+                f"{egress_payload['policy_digest'] if egress_payload else 'offline'}"
+            ),
         }
         try:
             body = self._daemon().create_sandbox(payload)

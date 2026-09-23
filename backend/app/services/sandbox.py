@@ -1129,6 +1129,26 @@ class SandboxTaskService:
         self.db.refresh(task)
         return task
 
+    def _shared_instance_for_session(
+        self, session: SandboxSession
+    ) -> SandboxInstance | None:
+        """Return the pooled instance that owns this session's backend ref.
+
+        SandboxTaskService creates per-session containers even when Agent
+        instance pooling is enabled. The setting alone therefore cannot tell
+        whether this session points at a shared instance.
+        """
+        if (
+            (session.backend_id or "docker") != "sandboxd"
+            or not session.backend_session_ref
+        ):
+            return None
+        return self.db.scalar(
+            select(SandboxInstance).where(
+                SandboxInstance.backend_resource_ref == session.backend_session_ref
+            )
+        )
+
     def cleanup(self, session_id: str, *, include_all: bool = False) -> SandboxSession:
         session = self.get_session(session_id, include_all=include_all)
         if session.cleanup_status == "cleaned":
@@ -1136,17 +1156,21 @@ class SandboxTaskService:
         session.cleanup_status = "running"
         self.db.commit()
         if session.backend_session_ref:
-            try:
-                get_sandbox_backend_registry().for_backend_id(
-                    session.backend_id, self.settings, session.runtime_kind
-                ).delete(
-                    SandboxSessionHandle(session.id, session.backend_session_ref)
-                )
-            except SandboxBackendError as exc:
-                session.cleanup_status = "cleanup_blocked"
-                session.cleanup_error_class = type(exc).__name__
-                self.db.commit()
-                raise AppError(502, "sandbox_cleanup_failed", "Sandbox cleanup failed and is pending retry") from exc
+            if self._shared_instance_for_session(session) is None:
+                try:
+                    get_sandbox_backend_registry().for_backend_id(
+                        session.backend_id, self.settings, session.runtime_kind
+                    ).delete(
+                        SandboxSessionHandle(session.id, session.backend_session_ref)
+                    )
+                except SandboxBackendError as exc:
+                    session.cleanup_status = "cleanup_blocked"
+                    session.cleanup_error_class = type(exc).__name__
+                    self.db.commit()
+                    raise AppError(502, "sandbox_cleanup_failed", "Sandbox cleanup failed and is pending retry") from exc
+            # A pooled Agent session only borrows the instance. Its running
+            # command owns the active-execution lease, which is released by
+            # SandboxAgentWorkspaceService when that command exits.
         if session.workspace_relative_path:
             workspace_path = _sandbox_workspace_path(
                 self.settings, session.workspace_relative_path
@@ -1600,13 +1624,33 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         boundaries — the prefix prevents file pollution only).
         """
         instance = self._acquire_instance(session.runtime_kind)
+        desired_egress = self._egress_envelope()
+        desired_network_policy = _effective_network_policy(desired_egress)
         if instance.backend_resource_ref:
             try:
-                handle = backend.resume(instance.id, instance.backend_resource_ref)
-                session.backend_session_ref = instance.backend_resource_ref
+                recorded_network_policy = (instance.resource_envelope or {}).get(
+                    "network_policy"
+                )
+                if recorded_network_policy == desired_network_policy:
+                    handle = backend.resume(instance.id, instance.backend_resource_ref)
+                    session.backend_session_ref = instance.backend_resource_ref
+                    session.network_policy = desired_network_policy
+                    self.db.commit()
+                    self._ensure_chat_dir(backend, handle, session.chat_session_id)
+                    return handle
+                # The workspace egress switch changed while this pooled
+                # instance was warm. Its container network is immutable, so
+                # discard it and create a new one with the current envelope.
+                backend.delete(
+                    SandboxSessionHandle(instance.id, instance.backend_resource_ref)
+                )
+                instance.backend_resource_ref = None
+                instance.resource_envelope = {
+                    **(instance.resource_envelope or {}),
+                    "network_policy": desired_network_policy,
+                }
+                instance.state = "PROVISIONING"
                 self.db.commit()
-                self._ensure_chat_dir(backend, handle, session.chat_session_id)
-                return handle
             except SandboxBackendError:
                 instance.backend_resource_ref = None
         with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
@@ -1626,7 +1670,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 instance.state = "PROVISIONING"
                 self.db.commit()
                 try:
-                    egress_envelope = self._egress_envelope()
+                    egress_envelope = desired_egress
                     handle = backend.create(
                         SandboxCreateSpec(
                             session_id=instance.id,
@@ -1647,6 +1691,10 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                         )
                     )
                     instance.backend_resource_ref = handle.backend_ref
+                    instance.resource_envelope = {
+                        **(instance.resource_envelope or {}),
+                        "network_policy": _effective_network_policy(egress_envelope),
+                    }
                     instance.state = "READY"
                     instance.expires_at = utc_now() + timedelta(
                         seconds=self.settings.sandbox_container_absolute_ttl_seconds
@@ -1658,6 +1706,9 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     self.db.commit()
                     raise
             session.backend_session_ref = handle.backend_ref
+            session.network_policy = (instance.resource_envelope or {}).get(
+                "network_policy", session.network_policy
+            )
             session.lifecycle_state = "RUNNING"
             session.runtime_started_at = utc_now()
             session.runtime_last_used_at = utc_now()
