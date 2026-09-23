@@ -210,7 +210,11 @@ function LearningPackageCanvasView({
   const activity = manifest?.activity;
   const exam = manifest?.exam;
   const image = manifest?.image;
-  const loading = !manifest || ["queued", "running", "failed"].includes(buildStatus ?? "");
+  // A missing manifest is not necessarily an active load. For an on-demand
+  // node there may simply be no build yet; treating that state as loading hid
+  // the only control that can enqueue the build and left the canvas spinning
+  // forever. Only an actually queued/running build should show placeholders.
+  const buildActive = ["queued", "running"].includes(buildStatus ?? "");
 
   return (
     <article className="is-assistant learning-package-canvas" data-learning-node={nodeLabel}>
@@ -228,21 +232,33 @@ function LearningPackageCanvasView({
               </Button>
             ) : null}
             {blueprint ? (
-              <div className="learning-canvas-objectives">
-                <strong>本节目标</strong>
-                <ul>
-                  {blueprint.objectives.map((objective) => (
-                    <li key={objective}>{objective}</li>
-                  ))}
-                </ul>
-                <span>预计 {blueprint.estimated_minutes} 分钟</span>
-              </div>
-            ) : loading ? (
+              <>
+                <div className="learning-canvas-objectives">
+                  <strong>本节目标</strong>
+                  <ul>
+                    {blueprint.objectives.map((objective) => (
+                      <li key={objective}>{objective}</li>
+                    ))}
+                  </ul>
+                  <span>预计 {blueprint.estimated_minutes} 分钟</span>
+                </div>
+                {buildStatus === "failed" && onBuild ? (
+                  <Button size="sm" onClick={onBuild} disabled={buildPending}>
+                    {buildPending ? <LoaderCircle className="size-4 animate-spin" /> : <Play className="size-4" />}
+                    重试学习包生成
+                  </Button>
+                ) : null}
+              </>
+            ) : buildActive ? (
               <LoadingBlock label="学习目标" />
             ) : onBuild ? (
               <Button size="sm" onClick={onBuild} disabled={buildPending}>
                 {buildPending ? <LoaderCircle className="size-4 animate-spin" /> : <Play className="size-4" />}
-                {buildPending ? "正在创建学习包…" : "创建学习包"}
+                {buildPending
+                  ? "正在创建学习包…"
+                  : buildStatus === "failed"
+                    ? "重试学习包生成"
+                    : "创建学习包"}
               </Button>
             ) : (
               <p>节点内容尚未准备好，请先审核并发布图谱节点。</p>
@@ -254,7 +270,7 @@ function LearningPackageCanvasView({
             ) : null}
           </header>
 
-          {image ? <PreviewImage fileId={image.file_id} alt={image.alt} /> : loading ? <LoadingBlock label="插图" /> : null}
+          {image ? <PreviewImage fileId={image.file_id} alt={image.alt} /> : buildActive ? <LoadingBlock label="插图" /> : null}
           {lesson ? (
             <>
               <SvgIllustration svg={lesson.svg} caption={lesson.caption} />
@@ -290,7 +306,7 @@ function LearningPackageCanvasView({
                 />
               ) : null}
             </>
-          ) : loading ? (
+          ) : buildActive ? (
             <LoadingBlock label="图文教材" />
           ) : null}
 
@@ -315,7 +331,7 @@ function LearningPackageCanvasView({
                 onStart={onStartActivity}
               />
             )
-          ) : loading ? (
+          ) : buildActive ? (
             <LoadingBlock label="互动练习" />
           ) : null}
 
@@ -334,7 +350,7 @@ function LearningPackageCanvasView({
                 </Button>
               ) : null}
             </section>
-          ) : loading ? (
+          ) : buildActive ? (
             <LoadingBlock label="闯关测评" />
           ) : null}
 

@@ -639,7 +639,7 @@ def fallback_scene_html(spec: dict) -> str:
 <h3>{title}</h3><p>{instructions}</p><div data-role="state" aria-label="当前实验状态"></div><div data-role="actions">{buttons}</div><p data-role="feedback" aria-live="polite">等待第一次操作。</p>
 <script>(()=>{{const root=document.currentScript?.parentElement;const spec={payload};const stateEl=root?.querySelector('[data-role=state]');const feedback=root?.querySelector('[data-role=feedback]');function render(state){{if(!root)return;const values=state?.values||{{}};stateEl.replaceChildren(...(spec.variables||[]).map(v=>{{const item=document.createElement('span');item.textContent=v.label+': '+(v.states?.[String(values[v.id])]??values[v.id]??'—')+(v.unit?' '+v.unit:'');return item}}));feedback.textContent=state?.feedback||'选择一个操作开始。';}}function bind(){{root?.querySelectorAll('[data-action]').forEach(button=>button.addEventListener('click',async()=>{{button.disabled=true;try{{await window.__lgSubapp.emit('learning.action',{{action_id:button.dataset.action}});}}catch(error){{feedback.textContent='操作暂未提交，请重试。';}}finally{{button.disabled=false;}}}}));}}if(root)bind();window.__lgSubapp?.onState(render);render({{values:{{}},history:[]}});}})();</script></section>'''
 
-STAGE_EXAM_PROMPT = ("\n按教材出混合题（选择/判断/填空/简答按需组合），5-10 道为宜，包含可验证答案与评分规则。"
+STAGE_EXAM_PROMPT = ("\n按教材出混合题（选择/判断/填空/简答按需组合），控制在 5-6 道，优先覆盖核心目标，包含可验证答案与评分规则。"
     "先算好分值再输出：各题 points 与 practical_points 之和必须恰好等于 100。"
     "选择题 answers 使用从 0 开始的索引字符串（例如 [\"0\"]，不是数字 0）；填空用可接受同义答案；"
     "简答/大题用参考答案与不超过 200 字的 rubric；rubric 与 explanation 各不超过 200 字。通过线 80。")
@@ -908,7 +908,7 @@ def run_build_stage(job_id: str, token: str, build_id: str) -> bool:
                 tasks: list[tuple[str, Callable[[], Any]]] = []
                 if "lesson" not in snapshot:
                     tasks.append(("lesson", partial(generate_checked, run.workspace_id, run.actor_id, Lesson,
-                        prompt + "\n蓝图：" + json.dumps(snapshot["blueprint"], ensure_ascii=False) + "\n编写完整教材，至少两个详细章节、例子/反例和小结；SVG 使用 viewBox、自包含基础元素和清晰文字，不含 style/script/外链；html 可为空，若有必须完整自包含，无外部资源，仅用于辅助演示，不含考试答案。",
+                        prompt + "\n蓝图：" + json.dumps(snapshot["blueprint"], ensure_ascii=False) + "\n编写聚焦的完整教材，2-3 个章节即可；每章正文控制在约 600-1000 字，包含必要的例子/反例和小结。SVG 使用 viewBox、自包含基础元素和清晰文字，不含 style/script/外链；html 可为空，若有必须完整自包含，无外部资源，仅用于辅助演示，不含考试答案。",
                         validate_lesson, normalize=partial(normalize_payload, Lesson), label="图文教材", notes=stage_notes)))
                 if activity_required(node, snapshot) and "activity" not in snapshot:
                     tasks.append(("activity", partial(generate_checked, run.workspace_id, run.actor_id, Activity,
@@ -930,7 +930,8 @@ def run_build_stage(job_id: str, token: str, build_id: str) -> bool:
                 if has_activity and not snapshot.get("scene", {}).get("html"):
                     tasks.append(("scene", partial(generate_checked, run.workspace_id, run.actor_id, ActivityScene,
                         scene_prompt(prompt, snapshot), lambda value: validate_html(value["html"]),
-                        normalize=partial(normalize_payload, ActivityScene), label="互动小剧场", notes=stage_notes)))
+                        normalize=partial(normalize_payload, ActivityScene), attempts=1,
+                        label="互动小剧场", notes=stage_notes)))
                 if "exam" not in snapshot:
                     tasks.append(("exam", partial(generate_exam, run.workspace_id, run.actor_id, prompt, snapshot, stage_notes)))
                 results = run_parallel_generations(tasks, on_result=checkpoint_generation_result)

@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.errors import AppError
+from app.providers.model_options import resolve_model_call_options
 
 PayloadT = TypeVar("PayloadT")
 
@@ -574,6 +575,7 @@ def generate_raw(
     )
     if not getattr(provider, "available", True):
         raise AppError(503, "learning_model_unavailable", "请在设置中配置可用的结构化生成模型。")
+    _force_fast_structured_options(provider)
     if drop_output_cap:
         # Upstream refused our declared ceiling. Do not fail the stage over a
         # configuration mismatch we can side-step.
@@ -588,6 +590,34 @@ def generate_raw(
     billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0), attempt=1, usage_reported=bool(usage))
     db.commit()
     return result
+
+
+def _force_fast_structured_options(provider: Any) -> None:
+    """Disable chat-only reasoning/search overhead for package JSON calls.
+
+    Learning stages already have a closed schema plus deterministic validators;
+    carrying the workspace chat mode (for example ``medium`` thinking) into
+    every background call adds latency without improving the contract. Resolve
+    the provider's own capability mapping so each dialect receives the correct
+    off switch. If a legacy/custom provider cannot expose its capabilities,
+    leave its existing options untouched rather than breaking generation.
+    """
+    capabilities = getattr(provider, "capabilities", None)
+    model_id = str(getattr(provider, "model_id", "") or "").strip()
+    if not isinstance(capabilities, dict) or not model_id:
+        return
+    try:
+        provider.call_options = resolve_model_call_options(
+            capabilities,
+            model_id,
+            thinking_mode="off",
+            search_route="disabled",
+            disable_thinking_fallback=True,
+        )
+    except Exception:
+        # Capability snapshots from older/custom adapters may not contain the
+        # dialect metadata needed to express "off". Keep their original mode.
+        return
 
 
 def generate_checked(
