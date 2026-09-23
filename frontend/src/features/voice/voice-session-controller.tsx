@@ -67,6 +67,8 @@ export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"
   text: string;
   final: boolean;
   createdAt: string;
+  /** Full LLM draft currently available for the canvas typewriter. */
+  streamingText?: string;
   /**
    * Row ids this update retires from the conversation.
    *
@@ -330,6 +332,13 @@ const seenEventIds = new Set<string>();
 const renderedLiveEventIds = new Set<string>();
 const pendingTyped = new Map<string, { text: string; turnId?: string }>();
 const turnAudioCursors = new Map<string, number>();
+/**
+ * LLM text arrives before the sentence/audio ledger. Keep the streamed
+ * fragments per server turn so the conversation canvas can render a live
+ * typewriter bubble instead of waiting for TTS playback markers.
+ */
+const assistantDraftText = new Map<string, string>();
+const assistantDraftTerminalTurns = new Set<string>();
 
 /**
  * Authoritative + speculative transcript state, reduced from durable events.
@@ -401,6 +410,8 @@ function resetTranscriptState() {
   seenEventIds.clear();
   renderedLiveEventIds.clear();
   turnAudioCursors.clear();
+  assistantDraftText.clear();
+  assistantDraftTerminalTurns.clear();
 }
 
 /** Fold a durable event into the transcript projection. */
@@ -747,7 +758,18 @@ function renderPlaybackEvent(event: Parameters<VoicePlaybackTranscript["apply"]>
   } else {
     update({ streamingAssistantText: "" });
   }
-  dispatchVoiceRender(rendered);
+  const draftText = rendered.turnId ? assistantDraftText.get(rendered.turnId) : undefined;
+  const removes = [
+    ...(rendered.removes ?? []),
+    ...(rendered.final && !rendered.text.trim() && rendered.turnId
+      ? [`assistant-stream-${rendered.turnId}`]
+      : []),
+  ];
+  dispatchVoiceRender({
+    ...rendered,
+    ...(removes.length ? { removes } : {}),
+    ...(draftText ? { streamingText: draftText } : {}),
+  });
 }
 
 function normalizeVoiceEvent(input: Record<string, unknown>): VoiceEventEnvelope | null {
@@ -932,6 +954,10 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       if (String(payload.role ?? "") === "user") {
         renderAuthoritativeUserTurn(turnId || ensureUserTurnId(), text);
       } else {
+        if (turnId) {
+          assistantDraftTerminalTurns.add(turnId);
+          assistantDraftText.delete(turnId);
+        }
         if (turnId && typeof payload.user_text === "string" && payload.user_text.trim()) {
           renderAuthoritativeUserTurn(turnId, payload.user_text);
         }
@@ -940,12 +966,35 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       }
       return;
     case "turn.interrupted":
+      if (turnId) {
+        assistantDraftTerminalTurns.add(turnId);
+        assistantDraftText.delete(turnId);
+      }
       renderPlaybackEvent(event);
       markVoiceLatency({ stage: "answerDone", source: "barge-in", turnId });
       return;
     case "assistant.llm.delta":
       markVoiceLatency({ stage: "llmFirst", source: "ledger", turnId });
       if (snapshot.state !== "speaking") update({ state: "thinking" });
+      if (turnId && text && !assistantDraftTerminalTurns.has(turnId)) {
+        // VoiceJournal coalesces adjacent Pipecat TextFrame chunks into each
+        // payload.text while preserving their order. Append each emitted batch;
+        // event ids are de-duplicated before this switch, so replay cannot
+        // duplicate a batch.
+        const nextText = `${assistantDraftText.get(turnId) ?? ""}${text}`;
+        assistantDraftText.set(turnId, nextText);
+        update({ streamingAssistantText: nextText });
+        dispatchVoiceRender({
+          id: `assistant-stream-${turnId}`,
+          role: "assistant",
+          turnId,
+          text: nextText,
+          streamingText: nextText,
+          final: false,
+          createdAt: event.timestamp || new Date().toISOString(),
+          eventId: event.event_id,
+        });
+      }
       return;
     case "assistant.sentence.queued":
       flushPendingUserFinal();

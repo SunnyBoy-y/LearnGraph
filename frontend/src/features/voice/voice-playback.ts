@@ -14,7 +14,8 @@ type Turn = {
   terminal: boolean;
 };
 
-/** The media ledger is the only writer of the assistant's visible text.
+/** Playback-confirmed captions and terminal text, keyed by server turn.
+ * LLM draft deltas are rendered separately until playback markers arrive.
  * Live events and DB replay share (turn_id, sentence_seq), including repeated
  * identical sentences. A stale event can never change a different turn.
  */

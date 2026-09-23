@@ -136,11 +136,15 @@ export function mergeAdjacentVoiceUserMessages(rows: readonly Message[]): Messag
     const a = previous.content ?? "";
     const b = row.content ?? "";
     const text = a + (/[A-Za-z0-9]$/.test(a) && /^[A-Za-z0-9]/.test(b) ? " " : "") + b;
+    const partStatus: Message["parts"][number]["status"] =
+      row.status === "pending" || row.status === "streaming" || row.status === "failed"
+        ? row.status
+        : "completed";
     result[result.length - 1] = {
       ...previous, content: text, status: row.status,
       parts: [{
         id: previous.parts[0]?.id ?? `voice-part-${previous.id}`,
-          type: "text", content: text, status: row.status as Message["status"], sequence: 0,
+          type: "text", content: text, status: partStatus, sequence: 0,
         data: { kind: "final_answer" },
       }],
     };

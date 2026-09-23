@@ -234,10 +234,12 @@ export function reduceVoiceEvent(state: TranscriptState, event: VoiceEventLike):
     }
     case "assistant.llm.delta": {
       const draftTurn = turnId ?? "live";
+      const draftId = `assistant-draft-${draftTurn}`;
+      const previousDraft = next.entries.find((entry) => entry.id === draftId);
       return upsert(next, {
-        id: `assistant-draft-${draftTurn}`,
+        id: draftId,
         role: "assistant",
-        text,
+        text: `${previousDraft?.text ?? ""}${text}`,
         final: false,
         createdAt: now,
         phase: "speculative",

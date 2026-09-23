@@ -1982,16 +1982,18 @@ function AssistantMessageInner({
       }
     />
   );
-    // 语音字幕：数据源是官方的 `bot-output`（句级路径）。整段文本随 `new` 先到并
-    // 灰着，每一句在自己的 `completed` 到达时点亮——到点由输出传输的媒体队列保证
-    // （文本帧排在那句音频后面），前端不做任何时钟计算。
+    // 语音字幕：没有 LLM 草稿时，才使用官方 `bot-output` 的句级路径。
+    // 有草稿时主画布持续渲染完整文本，音频账本只负责推进回合状态。
     if (
       isVoiceTrace(shown.provider_trace) &&
       shown.role === "assistant" &&
       shown.status === "streaming"
     ) {
       const captions = readVoiceCaptionParts(part.data);
-      if (captions.length) {
+      // While the LLM draft is streaming, the canvas owns the full answer
+      // text. Karaoke captions remain available for turns that have no text
+      // draft, but they must not hide the typewriter content.
+      if (captions.length && typeof part.data?.voice_streaming_text !== "string") {
         return <VoiceCaptions key={part.id} parts={captions} />;
       }
     }
@@ -3062,13 +3064,20 @@ export function ChatCanvasPage() {
           : item.final
             ? "completed"
             : "streaming";
+      // Keep the full LLM draft visible while sentence-level audio markers
+      // advance. A playback marker must not roll the canvas back to only the
+      // sentence currently being spoken.
+      const streamingText =
+        item.role === "assistant" && !item.final
+          ? item.streamingText?.trim() || ""
+          : "";
+      const displayText = streamingText || text;
       // 官方 `bot-output` 宣布过的段落，按到达顺序；每段自带"已读游标"。
       const captions =
         item.role === "assistant" ? (item.captionParts ?? []) : [];
       // 整段回答仍是**一个块**（不是一句一段）：这一块里既有已经点亮的句子，也有还没
       // 朗读的灰字（官方 Karaoke 的预读）。灰字只活在前端内存里，刷新/打断即消失。
       const live = !item.final && captions.length > 0;
-      const spokenText = captions.map((caption) => caption.text).join("");
       const parts: MessagePart[] = captions.length
         ? [
             {
@@ -3077,7 +3086,7 @@ export function ChatCanvasPage() {
               status: (live
                 ? "streaming"
                 : "completed") as MessagePart["status"],
-              content: spokenText,
+              content: displayText,
               sequence: 0,
               // 每段原样交给渲染器：Karaoke 模式下它把未读部分画成灰字。
               data: {
@@ -3091,6 +3100,7 @@ export function ChatCanvasPage() {
                     willBeSpoken: caption.willBeSpoken,
                     playbackStarted: caption.playbackStarted,
                   })),
+                  ...(streamingText ? { voice_streaming_text: streamingText } : {}),
                 },
               },
             },
@@ -3100,7 +3110,7 @@ export function ChatCanvasPage() {
               id: `temp-voice-part-${item.id}`,
               type: "text" as const,
               status,
-              content: text,
+              content: displayText,
               sequence: 0,
               data: { kind: "final_answer" },
             },

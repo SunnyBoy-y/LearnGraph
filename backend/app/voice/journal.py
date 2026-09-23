@@ -179,7 +179,7 @@ class VoiceTurnJournal:
         self._grace_secs = grace_secs
         self._turn: _TurnState | None = None
         self._last_delta_at = 0.0
-        self._last_delta_text = ""
+        self._pending_delta_text = ""
         self._finalize_handle: asyncio.TimerHandle | None = None
         # Turn recovery. ``_deadline_handle`` bounds how long a turn may stay
         # open without progress; ``retry_hook`` re-runs a generation that
@@ -347,6 +347,8 @@ class VoiceTurnJournal:
         does not depend on which code path opened the turn.
         """
         self._turn = state
+        self._last_delta_at = 0.0
+        self._pending_delta_text = ""
         self._arm_turn_deadline()
         # Single funnel for "the user has said this": whichever path opened the
         # turn (ASR, typed input, attaching to a client-opened turn), this is the
@@ -743,22 +745,33 @@ class VoiceTurnJournal:
         self._touch_turn()
 
     async def assistant_delta(self, text: str, *, force: bool = False) -> None:
-        """Coalesced ``assistant.llm.delta`` for the speculative caption layer."""
-        if not text:
-            return
+        """Coalesce text frames without dropping characters from the draft."""
         loop = asyncio.get_running_loop()
         now = loop.time()
-        if (
-            not force
-            and now - self._last_delta_at < LLM_DELTA_MIN_INTERVAL_SECS
-        ):
+        async with self._lock:
+            state = self._turn
+            if state is None or state.finalized:
+                return
+            self._pending_delta_text += text
+            if (
+                not force
+                and now - self._last_delta_at < LLM_DELTA_MIN_INTERVAL_SECS
+            ):
+                return
+            delta_text = self._pending_delta_text
+            if not delta_text:
+                return
+            self._pending_delta_text = ""
+            self._last_delta_at = now
+            await self._emit_assistant_delta(delta_text, state.turn_id)
+
+    async def _emit_assistant_delta(self, text: str, turn_id: str) -> None:
+        if not text:
             return
-        self._last_delta_at = now
-        self._last_delta_text = text
         await self._emit(
             "assistant.llm.delta",
             payload={"text": text},
-            turn_id=self._turn.turn_id if self._turn else None,
+            turn_id=turn_id,
             phase="speculative",
         )
 
@@ -1178,8 +1191,12 @@ class VoiceTurnJournal:
             state = self._turn
             if state is None or state.finalized:
                 return
+            pending_delta = self._pending_delta_text
+            self._pending_delta_text = ""
             state.finalized = True
             self._cancel_recovery_timers()
+        if pending_delta:
+            await self._emit_assistant_delta(pending_delta, state.turn_id)
         spoken = self._spoken_assistant_text(state)
         # What the user heard is the whole answer. The LLM's output is only used
         # when no sentence was ever spoken at all *and* the turn still succeeded
@@ -1389,8 +1406,12 @@ class VoiceTurnJournal:
             state = self._turn
             if state is None or state.finalized:
                 return
+            pending_delta = self._pending_delta_text
+            self._pending_delta_text = ""
             state.finalized = True
             self._cancel_recovery_timers()
+        if pending_delta:
+            await self._emit_assistant_delta(pending_delta, state.turn_id)
         heard_text = self._spoken_assistant_text(state)
         self._update_playback_context(state, heard_text)
         await self._publish_live(
@@ -1726,6 +1747,7 @@ class VoiceJournalProcessor(FrameProcessor):
                 await self._journal.assistant_delta(frame.text)
             return
         if isinstance(frame, LLMFullResponseEndFrame):
+            await self._journal.assistant_delta("", force=True)
             self._journal.llm_closed()
             return
         if isinstance(frame, BotStartedSpeakingFrame):
