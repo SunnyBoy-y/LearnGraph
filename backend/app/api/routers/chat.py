@@ -183,6 +183,14 @@ def _detached_sse_transport(
                 if subscriber_active.is_set():
                     publish(chunk)
         except BaseException as exc:
+            if not isinstance(exc, AppError):
+                logger.exception(
+                    "Detached message stream worker failed",
+                    extra={
+                        "session_id": session_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
             publish(_DetachedStreamFailure(exc))
         finally:
             # Release before signalling completion, so "the consumer saw the
