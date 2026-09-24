@@ -1,7 +1,7 @@
 {
   "name": "learngraph-mobile",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "LearnGraph 手机端 APK：瘦客户端，连电脑服务（Docker 服务器），账号密码认证，共享电脑历史记录",
   "scripts": {
