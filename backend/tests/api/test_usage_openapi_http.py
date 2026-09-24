@@ -13,8 +13,11 @@ PUBLIC_PREFIXES = (
     "/api/v1/auth/login",
     "/api/v1/auth/register",
     "/api/v1/auth/demo-login",
+    "/api/v1/deployment/profile",
     "/api/v1/artifact-share",
     "/api/v1/card-share",
+    "/api/v1/share",
+    "/api/v1/voice/capabilities",
     "/api/v1/docs",
     "/api/v1/openapi.json",
 )
@@ -83,7 +86,15 @@ def test_openapi_workspace_endpoints_require_workspace_header(client, register_u
     for path, method, _op in _iter_operations(client):
         if path.startswith(PUBLIC_PREFIXES):
             continue
-        if path.startswith(("/api/v1/auth/", "/api/v1/permissions", "/api/v1/users", "/api/v1/organizations", "/api/v1/workspaces")):
+        if path.startswith((
+            "/api/v1/auth/",
+            "/api/v1/permissions",
+            "/api/v1/users",
+            "/api/v1/organizations",
+            "/api/v1/workspaces",
+            "/api/v1/deployment/profile",
+            "/api/v1/voice/ice-servers",
+        )):
             continue  # 全局级端点不要求 workspace
         r = client.request(method, path, headers={"Authorization": f"Bearer {token}"})
         if r.status_code not in (401, 403, 404, 422):
