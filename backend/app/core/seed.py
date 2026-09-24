@@ -56,12 +56,21 @@ def ensure_auth_identities(db: Session) -> None:
     ensure_permission_catalog(db)
 
     admin_name = settings.bootstrap_admin_username.strip()
-    admin = db.scalar(
-        select(User).where(
-            User.tenant_id == LOCAL_TENANT_ID,
-            User.username_normalized == normalize_identity(admin_name),
+    # Anchor the bootstrap identity on its primary key, not on the username:
+    # account deletion (AuthService.delete_account) renames the row to
+    # "deleted-<id>" and sets status="deleted", so a username lookup misses and
+    # the insert below then collides with "UNIQUE constraint failed: users.id"
+    # — every restart crashed once the bootstrap admin had deleted itself. A
+    # deleted bootstrap identity is deliberate state and is never resurrected
+    # (its password hash was replaced on deletion).
+    admin = db.get(User, "bootstrap-admin")
+    if admin is None:
+        admin = db.scalar(
+            select(User).where(
+                User.tenant_id == LOCAL_TENANT_ID,
+                User.username_normalized == normalize_identity(admin_name),
+            )
         )
-    )
     if admin is None:
         bootstrap_password = settings.bootstrap_admin_password or (
             "Lg!" + secrets.token_urlsafe(24) + "9"
