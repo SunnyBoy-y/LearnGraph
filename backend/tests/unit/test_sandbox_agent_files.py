@@ -361,6 +361,11 @@ class TestDeleteFile:
         written = _write(service, "work/tmp.txt", "delete me\n")
         return written["sandbox_session_id"]
 
+    def _enable_approval_mode(self, monkeypatch) -> None:
+        # The product default is approval-free. These two tests specifically
+        # cover the opt-in single-use authorization flow.
+        monkeypatch.setattr(get_settings(), "sandbox_delete_approval_mode", "on")
+
     def _grant(self, db: Session, session_id: str, path: str) -> None:
         digest = destructive_intent_digest(
             chat_session_id=CHAT_SESSION_ID,
@@ -375,7 +380,8 @@ class TestDeleteFile:
             command_intent_digest=digest,
         )
 
-    def test_delete_requires_authorization(self, db: Session, service) -> None:
+    def test_delete_requires_authorization(self, db: Session, service, monkeypatch) -> None:
+        self._enable_approval_mode(monkeypatch)
         self._seed_session(service)
         with pytest.raises(AppError) as excinfo:
             service.execute_agent_tool(
@@ -387,7 +393,8 @@ class TestDeleteFile:
         assert excinfo.value.code == "sandbox_auth_required"
         assert excinfo.value.details["command_intent_digest"]
 
-    def test_delete_with_grant(self, db: Session, service) -> None:
+    def test_delete_with_grant(self, db: Session, service, monkeypatch) -> None:
+        self._enable_approval_mode(monkeypatch)
         session_id = self._seed_session(service)
         self._grant(db, session_id, "work/tmp.txt")
         result = service.execute_agent_tool(
@@ -506,6 +513,10 @@ def test_snapshot_cleanup_removes_only_stale_snapshot_directories(tmp_path: Path
     assert prefixed_file.exists()
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="read-only attribute cleanup regression is specific to Windows",
+)
 def test_snapshot_cleanup_removes_stale_snapshot_with_readonly_files(
     tmp_path: Path,
 ) -> None:

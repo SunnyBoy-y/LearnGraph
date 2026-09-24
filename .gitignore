@@ -158,6 +158,14 @@ temp/
 **/*_spec.py
 **/test/**/*.{ts,tsx,js,jsx}
 
+# Shared pytest fixtures are required by the checked-in backend tests and CI.
+!backend/tests/
+backend/tests/*
+!backend/tests/conftest.py
+!backend/tests/api/
+backend/tests/api/*
+!backend/tests/api/conftest.py
+
 # Local editor, operating-system, and agent state
 .idea/
 .vscode/
