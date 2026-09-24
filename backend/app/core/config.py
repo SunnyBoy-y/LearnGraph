@@ -75,7 +75,7 @@ def default_sandboxd_url() -> str:
 # never need to edit their .env to follow a newer runner build. Setting the env
 # var still pins an explicit reference (admin lock).
 DEFAULT_SANDBOX_PREBUILT_IMAGE = (
-    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.4"
+    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.5"
 )
 
 
