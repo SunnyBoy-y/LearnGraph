@@ -94,6 +94,7 @@ from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.storage_factory import object_storage_provider
 from app.providers.model_options import resolve_image_input_mode
+from app.providers.error_policy import provider_stream_retry_category
 from app.providers.remote.fetch import (
     FetchProviderError,
     FetchProviderTimeout,
@@ -139,6 +140,10 @@ from app.services.chat_attachment_policy import (
 )
 from app.services.document_parsers import LOCAL_TEXT_EXTENSIONS
 from app.services.session_workspace import SessionWorkspaceService
+from app.services.session_titles import (
+    apply_session_title_fallback,
+    is_default_session_title,
+)
 from app.services.token_estimate import estimate_tokens
 from app.services.text_utils import truncate_without_splitting_urls
 
@@ -158,6 +163,11 @@ ACTIVITY_SUMMARY_USAGE_FEATURE = "chat_session_activity_summary"
 DICTATION_CLEANUP_USAGE_FEATURE = "chat_dictation_cleanup"
 VISION_DESCRIBE_USAGE_FEATURE = "chat_vision_describe"
 VISION_DESCRIBE_MAX_CHARS = 4_000
+# A short, optional first response for Agent mode.  It is persisted as a
+# normal text part so the canvas can render it while the full generation runs.
+FAST_PREFACE_PART_KIND = "fast_preface"
+FAST_PREFACE_MAX_CHARS = 240
+FAST_PREFACE_MAX_INPUT_CHARS = 8_000
 # Agent tool-round count is intentionally unbounded: research-style Agent
 # turns may need many search/tool cycles before a final answer.  Safety
 # against runaway loops comes only from the shared remote-stream attempt
@@ -565,11 +575,6 @@ def _jittered_delay(base_seconds: float, ratio: float) -> float:
     return max(0.0, base_seconds + random.uniform(-spread, spread))
 
 
-# Upstream statuses that signal a transient gateway/overload condition:
-# 502/503/504 are relay (Cloudflare) failures, 500 covers flaky origins,
-# 408/429 are explicit try-again signals, 529 is Anthropic "overloaded".
-_RETRYABLE_PROVIDER_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
-
 _IMAGE_INPUT_UNSUPPORTED_PATTERNS = (
     "does not support image",
     "doesn't support image",
@@ -605,26 +610,7 @@ def _is_native_image_input_unsupported(exc: BaseException) -> bool:
 
 
 def _stream_retry_category(exc: BaseException) -> str | None:
-    """Classify a provider stream failure as retryable or terminal.
-
-    Returns the retry event category (``"timeout"`` or ``"upstream_http"``)
-    when the failure is transient and should re-enter the backoff loop, or
-    ``None`` when it must terminate the stream. Upstream 5xx responses from
-    proxy stations fail before any SSE payload is parsed, so retrying them is
-    as safe as retrying a timeout. Malformed-response errors stay terminal:
-    a retry would just bill another attempt against a broken deployment.
-    """
-
-    if isinstance(exc, (ProviderTimeoutError, TimeoutError)):
-        return "timeout"
-    if isinstance(exc, ProviderResponseError):
-        return None
-    if (
-        isinstance(exc, ProviderHTTPError)
-        and getattr(exc, "status_code", None) in _RETRYABLE_PROVIDER_HTTP_STATUSES
-    ):
-        return "upstream_http"
-    return None
+    return provider_stream_retry_category(exc)
 
 
 @dataclass
@@ -870,6 +856,10 @@ class ChatService:
         self.actor_id = actor_id
         self.tenant_id = tenant_id
         self.context_builder = context_builder
+        # Captured from the same ContextBuilder invocation that builds the
+        # provider prompt. Benchmark and diagnostic callers can use this to
+        # distinguish retrieval candidates from memories actually injected.
+        self._last_memory_telemetry: dict[str, Any] = {}
         # A1-5: host settings for agent-tool timeout and workspace storage policy.
         self.settings = settings or get_settings()
         self.model_provider = model_provider
@@ -945,6 +935,178 @@ class ChatService:
             {"provider_id": self.model_provider.provider_id},
         )
 
+    def _build_fast_preface_provider(self) -> ModelProviderPort | None:
+        """Return a usable provider for the optional quick Agent preface."""
+
+        provider = getattr(self, "model_provider", None)
+        if provider is None:
+            return None
+        if not str(getattr(provider, "model_id", "") or "").strip():
+            return None
+        if not str(getattr(provider, "provider_id", "") or "").strip():
+            return None
+        if not callable(getattr(provider, "stream_chat", None)):
+            return None
+        return provider
+
+    @staticmethod
+    def _fast_preface_part_snapshot(record: MessagePartRecord) -> dict[str, Any]:
+        return {
+            "id": record.id,
+            "type": record.part_type,
+            "status": record.status,
+            "content": record.content,
+            "sequence": record.ordinal,
+            "data": record.data or {},
+        }
+
+    def _stream_fast_preface(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        message_version_id: str,
+        user_content: str,
+        history_before_message_id: str | None,
+        ordinal: int,
+        sequence: int,
+        cancelled: Callable[[], bool],
+    ):
+        """Stream a bounded, no-tools Agent preface when a provider is ready.
+
+        The part is created only after the first non-empty delta.  A missing
+        provider or an upstream failure therefore degrades to the regular
+        generation without leaving an empty bubble or stream events behind.
+        """
+
+        provider = self._build_fast_preface_provider()
+        start_sequence = int(sequence)
+        next_sequence = start_sequence
+        if provider is None:
+            return None, "", start_sequence
+        if cancelled():
+            raise _GenerationCancellationRequested()
+
+        stream = None
+        quote = None
+        attempt_started = time.monotonic()
+        record: MessagePartRecord | None = None
+        chunks: list[str] = []
+        part_data = {"kind": FAST_PREFACE_PART_KIND}
+        try:
+            # This is an acknowledgement, not a second full answer. Keep its
+            # context bounded and use the current request only so a long chat
+            # history does not make the quick lane slower than the main turn.
+            preface_prompt = (
+                "先不要解决用户的问题。请用一句自然、简短的话说明你将如何处理，"
+                f"最多 60 个汉字，不要列清单。用户请求：\n{user_content[:FAST_PREFACE_MAX_INPUT_CHARS]}"
+            )
+            messages = [ProviderChatMessage(role="user", content=preface_prompt)]
+            quote = self._preflight_model_call(
+                self._structured_billing_input(messages),
+                "chat_fast_preface",
+            )
+            stream = provider.stream_chat(messages, tools=None)
+
+            for provider_event in stream:
+                if cancelled():
+                    raise _GenerationCancellationRequested()
+                if provider_event.type != "text_delta" or not provider_event.content:
+                    continue
+                remaining = FAST_PREFACE_MAX_CHARS - sum(len(chunk) for chunk in chunks)
+                if remaining <= 0:
+                    break
+                text = str(provider_event.content)[:remaining]
+                if not text:
+                    break
+                if record is None:
+                    record = self.message_parts.add(
+                        MessagePartRecord(
+                            workspace_id=self.workspace_id,
+                            message_version_id=message_version_id,
+                            ordinal=int(ordinal),
+                            part_type="text",
+                            status="streaming",
+                            content="",
+                            data=part_data,
+                        )
+                    )
+                    started = self._append_event(
+                        session_id=session_id,
+                        message_id=message_id,
+                        message_version_id=message_version_id,
+                        part_id=record.id,
+                        sequence=next_sequence,
+                        event_type="part.started",
+                        payload={
+                            "part": self._fast_preface_part_snapshot(record)
+                        },
+                    )
+                    next_sequence += 1
+                    yield self._encode_event(started)
+                record.content += text
+                chunks.append(text)
+                delta = self._append_event(
+                    session_id=session_id,
+                    message_id=message_id,
+                    message_version_id=message_version_id,
+                    part_id=record.id,
+                    sequence=next_sequence,
+                    event_type="part.delta",
+                    payload={
+                        "part": self._fast_preface_part_snapshot(record),
+                        "delta": text,
+                    },
+                )
+                next_sequence += 1
+                yield self._encode_event(delta)
+        except _GenerationCancellationRequested:
+            raise
+        except Exception:
+            logger.warning("fast Agent preface degraded", exc_info=True)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("fast Agent preface stream close failed", exc_info=True)
+            if quote is not None:
+                try:
+                    usage = dict(getattr(provider, "last_usage", {}) or {})
+                    self.billing.record_usage(
+                        quote,
+                        input_tokens=int(usage.get("input_tokens") or 0),
+                        output_tokens=int(usage.get("output_tokens") or 0),
+                        cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                        cache_creation_input_tokens=int(
+                            usage.get("cache_creation_input_tokens") or 0
+                        ),
+                        reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
+                        attempt=1,
+                        latency_ms=int((time.monotonic() - attempt_started) * 1000),
+                        usage_reported=bool(usage), usage_units=usage,
+                    )
+                    self.db.commit()
+                except Exception:
+                    logger.warning("fast Agent preface usage recording failed", exc_info=True)
+
+        if record is None or not chunks:
+            return None, "", start_sequence
+        record.status = "completed"
+        completed = self._append_event(
+            session_id=session_id,
+            message_id=message_id,
+            message_version_id=message_version_id,
+            part_id=record.id,
+            sequence=next_sequence,
+            event_type="part.completed",
+            payload={"part": self._fast_preface_part_snapshot(record)},
+        )
+        next_sequence += 1
+        yield self._encode_event(completed)
+        return record, "".join(chunks), next_sequence
+
     def voice_context_snapshot(
         self,
         session_id: str,
@@ -993,7 +1155,7 @@ class ChatService:
 
         settings = get_settings()
         budget = int(token_budget or self._memory_prompt_token_budget())
-        if self.memory_context_loader is not None and settings.memory_read_mode != "events":
+        if self.memory_context_loader is not None and (settings.memory_read_mode != "events" or not settings.memory_context_builder_v2):
             block = self.memory_context_loader(
                 session_id,
                 query_text=query,
@@ -1796,7 +1958,7 @@ class ChatService:
                     reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                     attempt=1,
                     latency_ms=latency_ms,
-                    usage_reported=bool(usage),
+                    usage_reported=bool(usage), usage_units=usage,
                 )
                 usage_events.append(usage_event.id)
                 for key in total_usage:
@@ -2285,6 +2447,8 @@ class ChatService:
         """
 
         settings = get_settings()
+        if not self._session_memory_policy_enabled(session_id):
+            return None, {"manifest_status": "policy_disabled", "request_sent": False}, None
         if self.context_builder is None or not settings.memory_context_builder_v2:
             return None, {}, None
 
@@ -2340,6 +2504,29 @@ class ChatService:
                 "excluded": dict(built.view.excluded),
                 "degraded_modes": list(built.view.degraded_modes),
                 "read_mode": settings.memory_read_mode,
+                "candidate_external_sources": [
+                    item.external_source
+                    for item in built.view.candidate_memories
+                    if item.external_source
+                ],
+                "retrieved_external_sources": [
+                    item.external_source
+                    for item in built.view.retrieved_memories
+                    if item.external_source
+                ],
+                "selected_external_sources": [
+                    item.external_source
+                    for item in built.view.selected_memories
+                    if item.external_source
+                ],
+                "injected_external_sources": [
+                    item.external_source
+                    for item in built.view.injected_memories
+                    if item.external_source
+                ],
+                "manifest_status": built.view.manifest_status,
+                "request_sent": False,
+                "stage": "context_built",
             }
 
             if settings.memory_read_mode == "events":
@@ -2423,6 +2610,12 @@ class ChatService:
         # A summary that covers messages outside `older` would duplicate
         # content already present verbatim in the recent window — skip it.
         if not covered_ids or not covered_ids.issubset(older_ids):
+            return mechanical(older), "mechanical"
+        import hashlib as summary_hashlib
+        source_hash = summary_hashlib.sha256(
+            chr(10).join(f"{item.id}:{item.content}" for item in older if item.id in covered_ids).encode("utf-8")
+        ).hexdigest()
+        if latest.source_hash != source_hash:
             return mechanical(older), "mechanical"
         uncovered = [item for item in older if item.id not in covered_ids]
         parts = [f"[模型生成的早期会话摘要]\n{latest.summary}"]
@@ -2648,8 +2841,11 @@ class ChatService:
         web_search_results_present: bool = False,
         audio_transcripts: list[tuple[FileRecord, AudioTranscription]] | None = None,
         agent_id: str | None = None,
+        include_memory: bool = True,
+        include_history: bool = True,
+        prepared_context: str | None = None,
     ) -> tuple[str, ContextSummary | None]:
-        history = self._session_timeline(session_id)
+        history = self._session_timeline(session_id) if include_history else []
         if history_before_message_id is not None:
             cutoff = next(
                 (
@@ -2667,51 +2863,57 @@ class ChatService:
                 )
             history = history[:cutoff]
         session = self.sessions.require(session_id, "session")
-        context_sections = [
-            self._authorized_context(
-                node_ids or [],
-                file_ids or [],
-                current_content,
-                document_selection=document_selection,
-                agent_mode=agent_mode,
-                audio_transcripts=audio_transcripts,
-            )
-        ]
-        package_context = learning_package_prompt_context(
-            self.db,
-            self.workspace_id,
-            node_ids or [],
-            session=session,
-        )
-        if package_context:
-            context_sections.append(package_context)
-        if session.session_kind == "concept_branch" and session.context_capsule:
-            context_sections.append(self._concept_capsule_prompt(session.context_capsule))
-        if self.memory_context_loader is not None and get_settings().memory_read_mode != "events":
-            # Current message + selected nodes let recall rank node-scoped
-            # memories and (when configured) apply the embedding plugin.
-            # ``events`` read mode must not double-inject legacy memory: the
-            # v2 Context Builder block below fully replaces this section.
-            context_sections.append(
-                self.memory_context_loader(
-                    session_id,
-                    query_text=current_content,
-                    node_ids=node_ids or None,
-                    prompt_token_budget=self._memory_prompt_token_budget(),
+        if prepared_context is None:
+            context_sections = [
+                self._authorized_context(
+                    node_ids or [],
+                    file_ids or [],
+                    current_content,
+                    document_selection=document_selection,
+                    agent_mode=agent_mode,
+                    audio_transcripts=audio_transcripts,
                 )
+            ]
+            package_context = learning_package_prompt_context(
+                self.db,
+                self.workspace_id,
+                node_ids or [],
+                session=session,
             )
-        v2_block, _v2_telemetry = self._build_v2_memory_context(
-            session_id, current_content, node_ids=node_ids, agent_id=agent_id
-        )
-        if v2_block is not None:
-            context_sections.append(v2_block)
-        if additional_context:
-            context_sections.append(additional_context)
-        authorized_context = "\n\n".join(section for section in context_sections if section)
+            if package_context:
+                context_sections.append(package_context)
+            if session.session_kind == "concept_branch" and session.context_capsule:
+                context_sections.append(self._concept_capsule_prompt(session.context_capsule))
+            if include_memory and self.memory_context_loader is not None and (get_settings().memory_read_mode != "events" or not get_settings().memory_context_builder_v2):
+                # Current message + selected nodes let recall rank node-scoped
+                # memories and (when configured) apply the embedding plugin.
+                # ``events`` read mode must not double-inject legacy memory: the
+                # v2 Context Builder block below fully replaces this section.
+                context_sections.append(
+                    self.memory_context_loader(
+                        session_id,
+                        query_text=current_content,
+                        node_ids=node_ids or None,
+                        prompt_token_budget=self._memory_prompt_token_budget(),
+                    )
+                )
+            v2_block, _v2_telemetry = (self._build_v2_memory_context(
+                session_id, current_content, node_ids=node_ids, agent_id=agent_id
+            ) if include_memory else (None, {}))
+            self._last_memory_telemetry = dict(_v2_telemetry or {})
+            if v2_block is not None:
+                context_sections.append(v2_block)
+            if additional_context:
+                context_sections.append(additional_context)
+            authorized_context = "\n\n".join(section for section in context_sections if section)
+        else:
+            authorized_context = prepared_context
         style_instructions = (
             f"{self._style_instructions()}\n\n"
             f"{self._mode_tool_policy(agent_mode_enabled=agent_mode, web_search_results_present=web_search_results_present)}"
         )
+        if not include_history and not include_memory:
+            return style_instructions + chr(10) * 2 + authorized_context, None
         if not history:
             prompt = f"当前用户消息：\n{current_content}"
             body = f"{authorized_context}\n\n{prompt}" if authorized_context else prompt
@@ -3045,7 +3247,7 @@ class ChatService:
             context_sections.append(package_context)
         if session.session_kind == "concept_branch" and session.context_capsule:
             context_sections.append(self._concept_capsule_prompt(session.context_capsule))
-        if self.memory_context_loader is not None and get_settings().memory_read_mode != "events":
+        if self.memory_context_loader is not None and (get_settings().memory_read_mode != "events" or not get_settings().memory_context_builder_v2):
             context_sections.append(
                 self.memory_context_loader(
                     session_id,
@@ -3057,6 +3259,7 @@ class ChatService:
         v2_block, _v2_telemetry = self._build_v2_memory_context(
             session_id, current_content, node_ids=node_ids
         )
+        self._last_memory_telemetry = dict(_v2_telemetry or {})
         if v2_block is not None:
             context_sections.append(v2_block)
         if additional_context:
@@ -3274,7 +3477,9 @@ class ChatService:
                 recent_tokens=used,
                 before_tokens=self._estimate_tokens(serialized),
             )
-            prefix = messages[: len(messages) - len(history) - 1]
+            # Keep both current-turn references and the question outside history compaction.
+            turn_tail_size = 2 if authorized_context else 1
+            prefix = messages[: len(messages) - len(history) - turn_tail_size]
             return [
                 *prefix,
                 ProviderChatMessage(
@@ -3286,7 +3491,7 @@ class ChatService:
                     ),
                 ),
                 *recent_history,
-                messages[-1],
+                *messages[-turn_tail_size:],
             ], summary
 
         # Preserve availability under a true context overflow. The normal path
@@ -3301,6 +3506,9 @@ class ChatService:
             additional_context=additional_context,
             history_before_message_id=history_before_message_id,
             agent_mode=agent_mode_enabled,
+            prepared_context=authorized_context,
+            web_search_results_present=web_search_results_present,
+            audio_transcripts=audio_transcripts,
         )
         return [ProviderChatMessage(role="user", content=compacted)], summary
 
@@ -5376,7 +5584,7 @@ class ChatService:
             )
         domains = {item.strip().casefold() for item in allowed_domains if item.strip()}
         try:
-            results = self.search_provider.search(
+            results, _ = self.billing.execute_search(self.search_provider,
                 query.strip(),
                 5,
                 allowed_domains=domains or None,
@@ -5898,7 +6106,7 @@ class ChatService:
             results: list[SearchResult] = []
             seen_urls: set[str] = set()
             for query in queries[:2]:
-                chunk = self.search_provider.search(
+                chunk, _ = self.billing.execute_search(self.search_provider,
                     query,
                     5,
                     allowed_domains=allowed_domains or None,
@@ -6240,6 +6448,8 @@ class ChatService:
 
         from app.domain.models import FetchAuthorizationRequest
 
+        session = self.sessions.require(session_id, "session")
+        self._apply_first_message_title_fallback(session, payload.content)
         user_part_id = str(uuid4())
         attachment_snapshots = [
             self._part_snapshot(
@@ -6710,7 +6920,8 @@ class ChatService:
             "remote_capability": self.model_provider.remote_capability,
             "attempts": 1,
             "usage_is_estimate": False,
-            "cost_usd": 0,
+            "cost_amount": None,
+            "currency": None,
             "thinking_mode": getattr(self.model_provider, "thinking_mode", "off"),
             "search_route": getattr(self.model_provider, "search_route", "disabled"),
             "agent_mode": False,
@@ -6933,7 +7144,8 @@ class ChatService:
             "remote_capability": self.model_provider.remote_capability,
             "attempts": 1,
             "usage_is_estimate": False,
-            "cost_usd": 0,
+            "cost_amount": None,
+            "currency": None,
             "thinking_mode": getattr(self.model_provider, "thinking_mode", "off"),
             "search_route": getattr(self.model_provider, "search_route", "disabled"),
             "agent_mode": True,
@@ -7332,7 +7544,7 @@ class ChatService:
                     reasoning_tokens=int(attempt_usage.get("reasoning_tokens") or 0),
                     attempt=attempt_no,
                     latency_ms=int((time.monotonic() - started_at) * 1000),
-                    usage_reported=bool(attempt_usage),
+                    usage_reported=bool(attempt_usage), usage_units=attempt_usage,
                 )
                 # A structured model attempt may be billable even when its JSON
                 # later fails domain validation, so usage is committed separately
@@ -7454,6 +7666,23 @@ class ChatService:
         )
         if payload.graph_id and graph is None:
             raise AppError(404, "graph_not_found", "Session graph was not found in this workspace")
+        requested_node_id = payload.current_node_id
+        node = None
+        if requested_node_id:
+            node = self.db.scalar(
+                select(GraphNode).where(
+                    GraphNode.workspace_id == self.workspace_id,
+                    GraphNode.id == requested_node_id,
+                )
+            )
+            if node is None:
+                raise AppError(404, "node_not_found", "Session node was not found in this workspace")
+            if graph is None or node.graph_id != graph.id:
+                raise AppError(
+                    409,
+                    "session_node_graph_mismatch",
+                    "Session node must belong to the bound Graph",
+                )
         resolved_goal_id = payload.goal_id or (graph.goal_id if graph is not None else None)
         goal = (
             self.db.scalar(
@@ -7496,6 +7725,7 @@ class ChatService:
                     "Nested sessions cannot themselves become parents",
                 )
         session_values = payload.model_dump()
+        session_values.pop("current_node_id", None)
         session_values["goal_id"] = resolved_goal_id
         if parent_session is not None:
             # Inherit project/goal/graph from the parent so sidebar grouping and
@@ -7503,6 +7733,14 @@ class ChatService:
             session_values["project_id"] = parent_session.project_id
             session_values["goal_id"] = parent_session.goal_id
             session_values["graph_id"] = parent_session.graph_id
+            inherited_node_id = parent_session.current_node_id
+            if requested_node_id and requested_node_id != inherited_node_id:
+                raise AppError(
+                    409,
+                    "session_node_rebind_forbidden",
+                    "A side Session inherits its parent node binding",
+                )
+            requested_node_id = inherited_node_id
             session_values["parent_session_id"] = parent_session.id
             if not session_values.get("session_kind"):
                 session_values["session_kind"] = "side"
@@ -7510,6 +7748,11 @@ class ChatService:
             session_values.pop("parent_session_id", None)
             if not session_values.get("session_kind"):
                 session_values["session_kind"] = "main"
+        session_values["context_capsule"] = (
+            {"current_node_id": requested_node_id}
+            if requested_node_id
+            else {}
+        )
         try:
             session = self.sessions.add(
                 ChatSession(
@@ -7579,6 +7822,25 @@ class ChatService:
             .order_by(Message.created_at, Message.id)
             .limit(1)
         )
+
+    def _apply_first_message_title_fallback(
+        self,
+        session: ChatSession,
+        question: str | None,
+    ) -> str:
+        """Give a still-unlabeled session a deterministic title immediately.
+
+        The check is intentionally made before the new message is inserted so
+        the same helper can be used by the text, authorization-gated, image,
+        and voice persistence paths.  Automatic model naming remains a later
+        compare-and-set update and can replace this title safely.
+        """
+
+        if self._first_local_user_message(session.id) is not None:
+            return ""
+        if not is_default_session_title(session.title):
+            return ""
+        return apply_session_title_fallback(session, question)
 
     @_serialize_auto_title_generation
     def auto_title_session(
@@ -7666,7 +7928,7 @@ class ChatService:
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
-                usage_reported=bool(usage),
+                usage_reported=bool(usage), usage_units=usage,
             )
             usage_event_id = usage_event.id
             # A real Provider call is billable even if validation or the later
@@ -7931,7 +8193,7 @@ class ChatService:
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
-                usage_reported=bool(usage),
+                usage_reported=bool(usage), usage_units=usage,
             )
             usage_event_id = usage_event.id
             # A real Provider call is billable even if validation fails.
@@ -8177,7 +8439,7 @@ class ChatService:
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
-                usage_reported=bool(usage),
+                usage_reported=bool(usage), usage_units=usage,
             )
             # A real Provider call is billable even if validation fails.
             self._commit_usage_best_effort(usage_event)
@@ -8721,7 +8983,7 @@ class ChatService:
                 reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
-                usage_reported=bool(usage),
+                usage_reported=bool(usage), usage_units=usage,
             )
             usage_event_id = usage_event.id
             # The remote call may already be billable even if its result is
@@ -9091,26 +9353,6 @@ class ChatService:
         "client_message_id",
     )
 
-    # Part types whose full body is required for interactive list rendering
-    # (approval dialogs, images, quizzes). Everything else is truncated.
-    _LIST_FULL_PART_TYPES = frozenset(
-        {
-            "image",
-            "quiz",
-            "chart",
-            "component",
-            "magic_card",
-            "user_confirmation",
-            "sandbox_status",
-            "graph_context",
-            "attachment",
-            "document_selection",
-            "selection_quote",
-        }
-    )
-    _LIST_CONTENT_MAX_CHARS = 6_000
-    _LIST_PART_CONTENT_MAX_CHARS = 2_000
-
     def list_messages_page(
         self,
         session_id: str,
@@ -9122,8 +9364,9 @@ class ChatService:
         """Return a (optionally windowed) compact view of the session timeline.
 
         Windowing runs on the resolved branch timeline so parent-prefix messages
-        stay consistent with the full list. Compact mode reuses the SSE
-        stream-safe truncation so tool dumps never land in the list payload.
+        stay consistent with the full list. Compact mode keeps durable text and
+        Markdown/HTML source lossless while bounding only nested structured tool
+        metadata that is not needed to paint the timeline.
         """
 
         timeline = self._session_timeline(session_id)
@@ -9172,11 +9415,6 @@ class ChatService:
         provider_trace = dict(message.provider_trace or {})
         content = message.content or ""
         if compact:
-            if len(content) > self._LIST_CONTENT_MAX_CHARS:
-                content = (
-                    f"{content[: self._LIST_CONTENT_MAX_CHARS]}"
-                    f"\n…（列表已截断，完整内容见消息详情）"
-                )
             parts = [self._compact_list_part(part) for part in parts]
             provider_trace = {
                 key: provider_trace[key]
@@ -9202,15 +9440,12 @@ class ChatService:
             return {"id": "", "type": "text", "status": "completed", "content": "", "data": {}}
         part_type = part.get("type")
         content = part.get("content")
-        if (
-            isinstance(content, str)
-            and len(content) > self._LIST_PART_CONTENT_MAX_CHARS
-            and part_type not in self._LIST_FULL_PART_TYPES
-        ):
-            content = (
-                f"{content[: self._LIST_PART_CONTENT_MAX_CHARS]}"
-                f"\n…（列表已截断）"
-            )
+        # Never rewrite a persisted text body in the list representation. The
+        # frontend may fold a long block visually, but it must retain the full
+        # source for Markdown parsing, HTML preview, copy and text selection.
+        # Structured tool *data* remains stream-safe below; it is not used as
+        # the durable answer text and full snapshots remain available through
+        # the message-detail endpoint.
         data = part.get("data") if isinstance(part.get("data"), dict) else {}
         if part_type in {"tool_call", "agent_step", "sandbox", "sandbox_artifact"}:
             data = self._stream_safe_part_data(part_type, data)
@@ -10852,7 +11087,8 @@ class ChatService:
             "remote_capability": self.model_provider.remote_capability,
             "attempts": 1,
             "usage_is_estimate": False,
-            "cost_usd": 0,
+            "cost_amount": None,
+            "currency": None,
             "context_summary_id": context_summary.id if context_summary else None,
             "thinking_mode": getattr(self.model_provider, "thinking_mode", "off"),
             "actual_reasoning_effort": getattr(
@@ -10874,6 +11110,8 @@ class ChatService:
                 file.id for file in attached_files if self._is_image_attachment(file)
             ],
         }
+        if self._last_memory_telemetry:
+            provider_trace["memory_context"] = self._last_memory_telemetry
         if structured_chat and image_input_trace:
             provider_trace["image_input"] = {
                 key: value
@@ -10941,9 +11179,13 @@ class ChatService:
                 part_type="text",
                 status="pending",
                 content="",
+                # The shared draft may still become pre-tool narration.
+                # Only maybe_start_answer() establishes the final boundary.
+                data={},
             )
         )
         next_ordinal += 1
+        preface_records: list[MessagePartRecord] = []
         self.db.add(
             MessageControl(
                 workspace_id=self.workspace_id,
@@ -10968,7 +11210,9 @@ class ChatService:
                 if source_record is not None
                 else []
             ),
-            self._part_snapshot(text_record.id, "text", "pending", ""),
+            self._part_snapshot(
+                text_record.id, "text", "pending", "", text_record.data
+            ),
         ]
         self.audit.record(
             actor_id=self.actor_id,
@@ -11011,6 +11255,7 @@ class ChatService:
                 started = utc_now()
                 answer_started = True
                 answer_started_at = started
+                text_record.data = {**(text_record.data or {}), "kind": "final_answer"}
                 thinking_ms = max(
                     0,
                     round((started - generation_started_at).total_seconds() * 1000),
@@ -11025,6 +11270,7 @@ class ChatService:
                     sequence=sequence,
                     event_type="answer.started",
                     payload={
+                        "data": {"kind": "final_answer"},
                         "final_part_id": text_record.id,
                         "boundary_sequence": text_record.ordinal,
                         "started_at": started.isoformat(),
@@ -11047,6 +11293,17 @@ class ChatService:
                             sequence=source_record.ordinal,
                         )
                     )
+                parts.extend(
+                    self._part_snapshot(
+                        record.id,
+                        record.part_type,
+                        record.status,
+                        record.content,
+                        record.data,
+                        sequence=record.ordinal,
+                    )
+                    for record in preface_records
+                )
                 parts.append(
                     self._part_snapshot(
                         text_record.id,
@@ -11092,7 +11349,7 @@ class ChatService:
                     reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                     attempt=active_attempt_no,
                     latency_ms=int((time.monotonic() - active_started_at) * 1000),
-                    usage_reported=bool(usage),
+                    usage_reported=bool(usage), usage_units=usage,
                 )
                 active_usage_recorded = True
                 return usage_event
@@ -11146,12 +11403,12 @@ class ChatService:
             self._begin_event_batching()
 
             def checkpoint_stream_state() -> None:
-                text_record.status = "streaming"
+                # Checkpoints persist content; event handlers own part states.
+                # Reviving completed tools here corrupts replay after a failure.
                 text_record.content = final_text
                 message.content = final_text
                 message.parts = assembled_parts(text_record.status, final_text)
                 for reasoning_record in reasoning_records:
-                    reasoning_record.status = "streaming"
                     reasoning_record.content = reasoning_text_by_part.get(
                         reasoning_record.id, reasoning_record.content
                     )
@@ -11170,6 +11427,7 @@ class ChatService:
                         "text",
                         "pending",
                         "",
+                        text_record.data,
                     )
                 },
             )
@@ -11208,6 +11466,22 @@ class ChatService:
                     )
                     sequence += 1
                     yield self._encode_event(compacted)
+                if retry_agent_mode:
+                    preface_result = yield from self._stream_fast_preface(
+                        session_id=session_id,
+                        message_id=message.id,
+                        message_version_id=version.id,
+                        user_content=parent.content,
+                        history_before_message_id=parent.id,
+                        ordinal=next_ordinal,
+                        sequence=sequence,
+                        cancelled=cancellation_requested,
+                    )
+                    if preface_result is not None:
+                        preface_record, _preface_text, sequence = preface_result
+                        if preface_record is not None:
+                            preface_records.append(preface_record)
+                            next_ordinal += 1
                 if source_record is not None:
                     source_event = self._append_event(
                         session_id=session_id,
@@ -11229,8 +11503,9 @@ class ChatService:
                     sequence += 1
                     yield self._encode_event(source_event)
 
-                max_attempts = 5
+                max_attempts = MAX_PROVIDER_STREAM_ATTEMPTS
                 retry_tool_rounds = 0
+                stream_retry_count = 0
                 # Turn-local progressive-disclosure state (mirror of the primary
                 # stream). Populated by lg_capability_activate and applied to the
                 # next retry provider invocation; never durable authorization.
@@ -11265,6 +11540,15 @@ class ChatService:
                         status="running",
                     )
                     self.db.add(active_attempt)
+                    provider_trace["attempts"] = attempt_no
+                    if "memory_context" in provider_trace:
+                        provider_trace["memory_context"] = {
+                            **provider_trace["memory_context"],
+                            "request_sent": True,
+                            "stage": "request_started",
+                        }
+                    version.provider_trace = dict(provider_trace)
+                    message.provider_trace = dict(provider_trace)
                     self.db.commit()
                     attempt_text_start = final_text
                     attempt_reasoning: dict[str, MessagePartRecord] = {}
@@ -11304,6 +11588,11 @@ class ChatService:
                                     chunk = provider_event.content or ""
                                     if not chunk:
                                         continue
+                                    # Reserve visible order at the first text delta,
+                                    # not when the empty shared draft was created.
+                                    if not final_text and text_record.ordinal < next_ordinal - 1:
+                                        text_record.ordinal = next_ordinal
+                                        next_ordinal += 1
                                     if not retry_agent_mode:
                                         yield from maybe_start_answer()
                                     self._mark_first_token(
@@ -11332,8 +11621,8 @@ class ChatService:
                                                 "type": "text",
                                                 "status": "streaming",
                                                 "content_delta": chunk,
-                                                "sequence": chunk_sequence,
-                                                "data": {},
+                                                "sequence": text_record.ordinal,
+                                                "data": text_record.data or {},
                                             }
                                         },
                                     )
@@ -11411,7 +11700,7 @@ class ChatService:
                                                 "type": part_type,
                                                 "status": "streaming",
                                                 "content_delta": chunk,
-                                                "sequence": chunk_sequence,
+                                                "sequence": reasoning_record.ordinal,
                                                 "data": reasoning_record.data,
                                             }
                                         },
@@ -11471,8 +11760,8 @@ class ChatService:
                                             "type": "text",
                                             "status": "streaming",
                                             "content_delta": chunk,
-                                            "sequence": chunk_sequence,
-                                            "data": {},
+                                            "sequence": text_record.ordinal,
+                                            "data": text_record.data or {},
                                         }
                                     },
                                 )
@@ -12012,8 +12301,8 @@ class ChatService:
                                     provider_trace.get("reasoning_tokens") or 0
                                 )
                                 + int(usage.get("reasoning_tokens") or 0),
-                                "cost_usd": usage_event.cost_usd,
-                                "cost_cny": usage_event.cost_cny,
+                                "currency": usage_event.currency,
+                                "cost_amount": usage_event.cost_amount,
                                 "cost_status": usage_event.cost_status,
                             }
                             message.provider_trace = dict(provider_trace)
@@ -12086,13 +12375,10 @@ class ChatService:
                                 provider_trace.get("reasoning_tokens") or 0
                             )
                             + int(usage.get("reasoning_tokens") or 0),
-                            "cost_usd": usage_event.cost_usd,
-                            "cost_cny": usage_event.cost_cny,
+                            "currency": usage_event.currency,
+                            "cost_amount": usage_event.cost_amount,
                             "cost_status": usage_event.cost_status,
                             "price_version_id": usage_event.price_version_id,
-                            "exchange_rate_version_id": (
-                                usage_event.exchange_rate_version_id
-                            ),
                             "remote_request_id": active_attempt.remote_request_id,
                             "native_search_sources": list(
                                 getattr(self.model_provider, "last_sources", []) or []
@@ -12221,7 +12507,7 @@ class ChatService:
                                         else "provider_http_error"
                                     ),
                                 )
-                        if attempt_no >= max_attempts:
+                        if attempt_no >= max_attempts or stream_retry_count >= len(self.retry_delays):
                             exhausted = self._append_event(
                                 session_id=session_id,
                                 message_id=message.id,
@@ -12231,7 +12517,7 @@ class ChatService:
                                 event_type="provider.retry.exhausted",
                                 payload={
                                     "attempt_no": attempt_no,
-                                    "max_retries": 4,
+                                    "max_retries": len(self.retry_delays),
                                     "max_attempts": max_attempts,
                                     "error_category": error_category,
                                 },
@@ -12239,7 +12525,8 @@ class ChatService:
                             sequence += 1
                             yield self._encode_event(exhausted)
                             raise
-                        delay = _jittered_delay(self.retry_delays[attempt_no - 1], self.retry_jitter_ratio)
+                        delay = _jittered_delay(self.retry_delays[stream_retry_count], self.retry_jitter_ratio)
+                        stream_retry_count += 1
                         active_attempt.backoff_ms = int(delay * 1000)
                         if final_text != attempt_text_start:
                             final_text = attempt_text_start
@@ -12278,7 +12565,7 @@ class ChatService:
                             event_type="provider.retry.scheduled",
                             payload={
                                 "attempt_no": attempt_no + 1,
-                                "max_retries": 4,
+                                "max_retries": len(self.retry_delays),
                                 "max_attempts": max_attempts,
                                 "error_category": error_category,
                                 "backoff_ms": int(delay * 1000),
@@ -12308,7 +12595,7 @@ class ChatService:
                             event_type="provider.retry.started",
                             payload={
                                 "attempt_no": attempt_no + 1,
-                                "max_retries": 4,
+                                "max_retries": len(self.retry_delays),
                                 "max_attempts": max_attempts,
                             },
                         )
@@ -13454,6 +13741,11 @@ class ChatService:
                 "subapp_event_id": payload.subapp_event_id,
                 "event_type": payload.subapp_event_id or "",
             }
+        # The model title request is intentionally asynchronous from the
+        # stream.  Persist a deterministic question prefix first so a new
+        # conversation is identifiable even while that request is pending (or
+        # when the configured title provider is unavailable).
+        self._apply_first_message_title_fallback(session, payload.content)
         user_message = self.messages.add(
             Message(
                 workspace_id=self.workspace_id,
@@ -13562,7 +13854,8 @@ class ChatService:
             "remote_capability": self.model_provider.remote_capability,
             "attempts": 1,
             "usage_is_estimate": False,
-            "cost_usd": 0,
+            "cost_amount": None,
+            "currency": None,
             "context_summary_id": context_summary.id if context_summary else None,
             "thinking_mode": getattr(self.model_provider, "thinking_mode", "off"),
             "actual_reasoning_effort": getattr(
@@ -13576,6 +13869,8 @@ class ChatService:
                 file.id for file in attached_files if self._is_image_attachment(file)
             ],
         }
+        if self._last_memory_telemetry:
+            provider_trace["memory_context"] = self._last_memory_telemetry
         if image_input_trace:
             provider_trace["image_input"] = {
                 key: value
@@ -13839,6 +14134,9 @@ class ChatService:
                 part_type="text",
                 status="pending",
                 content="",
+                # The shared draft may still become pre-tool narration.
+                # Only maybe_start_answer() establishes the final boundary.
+                data={},
             )
         )
         streamed_parts: list[MessagePartRecord] = (
@@ -14204,6 +14502,7 @@ class ChatService:
                         "text",
                         "pending",
                         "",
+                        text_record.data,
                     )
                 },
             )
@@ -14243,6 +14542,7 @@ class ChatService:
                 started = utc_now()
                 answer_started = True
                 answer_started_at = started
+                text_record.data = {**(text_record.data or {}), "kind": "final_answer"}
                 thinking_ms = max(
                     0,
                     round((started - generation_started_at).total_seconds() * 1000),
@@ -14257,6 +14557,7 @@ class ChatService:
                     sequence=sequence,
                     event_type="answer.started",
                     payload={
+                        "data": {"kind": "final_answer"},
                         "final_part_id": text_record.id,
                         "boundary_sequence": text_record.ordinal,
                         "started_at": started.isoformat(),
@@ -14267,12 +14568,12 @@ class ChatService:
                 yield self._encode_event(envelope)
 
             def checkpoint_stream_state() -> None:
-                text_record.status = "streaming"
+                # Preserve terminal states when a flush follows part.completed
+                # or part.failed, including the previous tool round's reasoning.
                 text_record.content = final_text
                 assistant_message.content = final_text
-                assistant_message.parts = assembled_parts("streaming", final_text)
+                assistant_message.parts = assembled_parts(text_record.status, final_text)
                 if invocation_reasoning_record is not None:
-                    invocation_reasoning_record.status = "streaming"
                     invocation_reasoning_record.content = invocation_reasoning
 
             self._stream_checkpoint_fn = checkpoint_stream_state
@@ -14594,6 +14895,23 @@ class ChatService:
                     yield self._encode_event(event)
                 yield from maybe_persist_graph_proposal()
 
+                if payload.agent_mode:
+                    preface_result = yield from self._stream_fast_preface(
+                        session_id=session_id,
+                        message_id=assistant_message.id,
+                        message_version_id=assistant_version.id,
+                        user_content=payload.content,
+                        history_before_message_id=user_message.id,
+                        ordinal=next_stream_part_ordinal,
+                        sequence=sequence,
+                        cancelled=cancelled,
+                    )
+                    if preface_result is not None:
+                        preface_record, _preface_text, sequence = preface_result
+                        if preface_record is not None:
+                            streamed_parts.append(preface_record)
+                            next_stream_part_ordinal += 1
+
                 pending_media_kinds = [
                     kind
                     for kind in list(image_input_trace.get("pending_media_kinds") or [])
@@ -14716,6 +15034,15 @@ class ChatService:
                         status="running",
                     )
                     self.db.add(attempt)
+                    provider_trace["attempts"] = attempt_no
+                    if "memory_context" in provider_trace:
+                        provider_trace["memory_context"] = {
+                            **provider_trace["memory_context"],
+                            "request_sent": True,
+                            "stage": "request_started",
+                        }
+                    assistant_version.provider_trace = dict(provider_trace)
+                    assistant_message.provider_trace = dict(provider_trace)
                     self.db.commit()
                     try:
                         invocation_tool_calls: list[dict] = []
@@ -14762,6 +15089,11 @@ class ChatService:
                                     # first visible text IS the final answer, so
                                     # collapse the chain immediately (zero-latency
                                     # boundary) instead of waiting for stream end.
+                                    # Reserve visible order at the first text delta,
+                                    # not when the empty shared draft was created.
+                                    if not final_text and text_record.ordinal < next_stream_part_ordinal - 1:
+                                        text_record.ordinal = next_stream_part_ordinal
+                                        next_stream_part_ordinal += 1
                                     if not payload.agent_mode:
                                         yield from maybe_start_answer()
                                     self._mark_first_token(
@@ -14778,7 +15110,7 @@ class ChatService:
                                         "status": "streaming",
                                         "content_delta": chunk,
                                         "sequence": text_record.ordinal,
-                                        "data": {},
+                                        "data": text_record.data or {},
                                     }
                                     envelope = self._append_event(
                                         session_id=session_id,
@@ -14893,7 +15225,7 @@ class ChatService:
                                     "status": "streaming",
                                     "content_delta": chunk,
                                     "sequence": text_record.ordinal,
-                                    "data": {},
+                                    "data": text_record.data or {},
                                 }
                                 envelope = self._append_event(
                                     session_id=session_id,
@@ -14927,7 +15259,7 @@ class ChatService:
                             latency_ms=int(
                                 (time.monotonic() - attempt_started_at) * 1000
                             ),
-                            usage_reported=bool(usage),
+                            usage_reported=bool(usage), usage_units=usage,
                         )
                         provider_trace = {
                             **provider_trace,
@@ -14948,13 +15280,10 @@ class ChatService:
                                 provider_trace.get("reasoning_tokens") or 0
                             )
                             + int(usage.get("reasoning_tokens") or 0),
-                            "cost_usd": usage_event.cost_usd,
-                            "cost_cny": usage_event.cost_cny,
+                            "currency": usage_event.currency,
+                            "cost_amount": usage_event.cost_amount,
                             "cost_status": usage_event.cost_status,
                             "price_version_id": usage_event.price_version_id,
-                            "exchange_rate_version_id": (
-                                usage_event.exchange_rate_version_id
-                            ),
                             "remote_request_id": getattr(self.model_provider, "last_request_id", None),
                             "native_search_sources": list(
                                 getattr(self.model_provider, "last_sources", []) or []
@@ -15698,7 +16027,7 @@ class ChatService:
                             latency_ms=int(
                                 (time.monotonic() - attempt_started_at) * 1000
                             ),
-                            usage_reported=bool(timeout_usage),
+                            usage_reported=bool(timeout_usage), usage_units=timeout_usage,
                         )
                         if (
                             invocation_reasoning_record is not None

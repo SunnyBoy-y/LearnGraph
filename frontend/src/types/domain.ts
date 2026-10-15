@@ -154,6 +154,7 @@ export type ChatSession = {
   title: string
   goal_id: string | null
   graph_id: string | null
+  current_node_id?: string | null
   parent_session_id: string | null
   source_message_id: string | null
   memory_enabled: boolean

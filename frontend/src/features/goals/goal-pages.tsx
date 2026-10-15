@@ -733,9 +733,9 @@ export function GraphReviewPage() {
                 node={node}
                 onDelete={() => removeNode.mutate(node.id)}
                 onRetry={(instruction) =>
-                  retryNode.mutate({ nodeId: node.id, instruction })
+                  retryNode.mutateAsync({ nodeId: node.id, instruction })
                 }
-                onSave={(body) => updateNode.mutate({ nodeId: node.id, body })}
+                onSave={(body) => updateNode.mutateAsync({ nodeId: node.id, body })}
                 onSelect={() => setSelected(node.id)}
                 retrying={retryNode.isPending}
                 selected={selectedNode?.id === node.id}
@@ -938,12 +938,12 @@ function CandidateKnowledgeCard({
   disabled: boolean;
   node: GraphNode;
   onDelete: () => void;
-  onRetry: (instruction: string) => void;
+  onRetry: (instruction: string) => Promise<unknown>;
   onSave: (body: {
     label: string;
     description: string;
     target_weight: number;
-  }) => void;
+  }) => Promise<unknown>;
   onSelect: () => void;
   retrying: boolean;
   selected: boolean;
@@ -975,14 +975,12 @@ function CandidateKnowledgeCard({
     setEditing(false);
   }
 
-  function saveEdit() {
+  async function saveEdit() {
     if (!draft.label.trim()) return;
-    onSave({
-      label: draft.label.trim(),
-      description: draft.description.trim(),
-      target_weight: draft.targetWeight,
-    });
-    setEditing(false);
+    try {
+      await onSave({label: draft.label.trim(), description: draft.description.trim(), target_weight: draft.targetWeight});
+      setEditing(false);
+    } catch { /* retain the draft; the mutation renders the failure */ }
   }
 
   return (
@@ -1101,10 +1099,12 @@ function CandidateKnowledgeCard({
               disabled={
                 disabled || retrying || retryInstruction.trim().length < 2
               }
-              onClick={() => {
-                onRetry(retryInstruction.trim());
-                setRetryOpen(false);
-                setRetryInstruction("");
+              onClick={async () => {
+                try {
+                  await onRetry(retryInstruction.trim());
+                  setRetryOpen(false);
+                  setRetryInstruction("");
+                } catch { /* preserve the instruction for retry */ }
               }}
               size="xs"
               type="button"

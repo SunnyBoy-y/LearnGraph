@@ -40,7 +40,7 @@ export function ConceptBranchWorkspace({
   const active = sessions.data?.find((session) => session.id === effectiveActiveId);
   const messages = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", effectiveActiveId),
-    queryFn: () => listSessionMessages(effectiveActiveId, { limit: 50 }),
+    queryFn: () => listSessionMessages(effectiveActiveId, { limit: 50, compact: false }),
     enabled: Boolean(effectiveActiveId),
     gcTime: 15_000,
   });

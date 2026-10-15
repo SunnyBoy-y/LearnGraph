@@ -8,6 +8,7 @@ import {
   Info,
   Palette,
   RadioTower,
+  Share2,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -25,13 +26,14 @@ export type SettingsNavItem = {
 /** Navigation for the settings secondary window. Mirrors the /settings/* routes. */
 export const settingsNav: SettingsNavItem[] = [
   { label: "工作区设置", icon: SlidersHorizontal, path: "settings/workspace" },
-  { label: "模型 Provider", icon: Bot, path: "settings/providers" },
+  { label: "模型与服务", icon: Bot, path: "settings/providers" },
   { label: "语音中继", icon: RadioTower, path: "settings/voice-relay" },
   { label: "用量与预算", icon: CircleDollarSign, path: "settings/usage" },
   { label: "个性化", icon: Palette, path: "settings/personalization" },
   { label: "扩展中心", icon: Sparkles, path: "settings/extensions" },
   { label: "搜索与抓取", icon: Globe, path: "settings/search-fetch" },
   { label: "账户与访问", icon: UsersRound, path: "settings/access" },
+  { label: "会话与分享", icon: Share2, path: "settings/session-sharing" },
   { label: "权限审计", icon: ShieldCheck, path: "settings/audit" },
   { label: "存储迁移", icon: Database, path: "settings/storage/migrations" },
   { label: "关于", icon: Info, path: "settings/about" },

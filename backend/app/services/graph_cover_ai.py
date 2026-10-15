@@ -177,7 +177,7 @@ def _record_usage(billing, provider, quote) -> None:
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
         attempt=1,
-        usage_reported=bool(usage),
+        usage_reported=bool(usage), usage_units=usage,
     )
 
 
@@ -742,7 +742,12 @@ def run_cover_ai_job(job_id: str, token: str, cover_job_id: str) -> None:
             job.status, job.error = "failed", "图谱已不可访问，本次生成已取消。"
             db.commit()
             return
-        job.status = "running"
+        claimed = db.execute(update(GraphCoverJob).where(
+            GraphCoverJob.id == cover_job_id, GraphCoverJob.status == "queued",
+        ).values(status="running"))
+        if claimed.rowcount != 1:
+            db.rollback()
+            return
         db.commit()
         file_id: str | None = None
         try:
@@ -784,6 +789,13 @@ def run_cover_ai_job(job_id: str, token: str, cover_job_id: str) -> None:
         if graph is None:
             job.status, job.error = "failed", "图谱已不存在，本次生成已丢弃。"
             db.commit()
+            return
+        completed = db.execute(update(GraphCoverJob).where(
+            GraphCoverJob.id == cover_job_id,
+            GraphCoverJob.status == "running",
+        ).values(status="ready"))
+        if completed.rowcount != 1:
+            db.rollback()
             return
         graph.cover_svg = cover
         job.status = "ready"

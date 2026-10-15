@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { startTransition, useEffect, useState, type ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { Check, ChevronDown, Settings, X } from "lucide-react";
 
@@ -68,6 +68,17 @@ export function SettingsModal({
     ? `设置 · ${activeItem.label}`
     : "设置";
 
+  // Route pages are lazy-loaded. Treat category changes as a transition so
+  // React keeps the already visible settings page mounted until the next
+  // page is ready instead of falling through to the app-wide route loader.
+  const navigateToSetting = (path: string) => {
+    const target = `/w/${workspaceId}/${path}`;
+    if (pathname === target) return;
+    startTransition(() => {
+      navigate(target);
+    });
+  };
+
   // Group consecutive items that share a `section` so the sidebar can render
   // section headers; ungrouped items fall under a null title.
   const sections: Array<{ title: string | null; items: SettingsNavItem[] }> =
@@ -130,9 +141,7 @@ export function SettingsModal({
                         <li key={item.path}>
                           <button
                             type="button"
-                            onClick={() =>
-                              navigate(`/w/${workspaceId}/${item.path}`)
-                            }
+                            onClick={() => navigateToSetting(item.path)}
                             className={cn(
                               "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
                               active
@@ -208,9 +217,7 @@ export function SettingsModal({
                         return (
                           <DropdownMenuItem
                             key={item.path}
-                            onSelect={() =>
-                              navigate(`/w/${workspaceId}/${item.path}`)
-                            }
+                            onSelect={() => navigateToSetting(item.path)}
                             className={cn(
                               "mb-0.5 min-h-12 gap-3 rounded-xl px-2.5 py-2.5 text-sm",
                               active &&

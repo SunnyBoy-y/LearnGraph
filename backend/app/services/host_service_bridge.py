@@ -437,13 +437,28 @@ class HostServiceBridge:
             if len(body) > self.max_body_bytes:
                 self._audit(decision="deny", service_id=service.id, path=request.url.path, request=request, reason="body_too_large")
                 return JSONResponse(status_code=413, content={"error": "request body too large"})
-            skip_headers = {"host", "content-length", "authorization"}
+            # Consume both bridge authentication forms; only an independently
+            # authenticated upstream Authorization may pass through.
+            skip_headers = {"host", "content-length", "x-learngraph-host-bridge-token"}
+            bridge_bearer = f"Bearer {self.token}"
+            if (
+                request.headers.get("x-learngraph-host-bridge-token") != self.token
+                or request.headers.get("authorization") == bridge_bearer
+            ):
+                skip_headers.add("authorization")
             request_headers = {
                 key: value
                 for key, value in request.headers.items()
                 if key.casefold() not in skip_headers
             }
-            request_headers.update(headers)
+            # Registry headers are case-insensitive and must not reintroduce
+            # the bridge credential or leave two Authorization headers.
+            for key, value in headers.items():
+                lowered = key.casefold()
+                if lowered == "x-learngraph-host-bridge-token" or value == bridge_bearer:
+                    continue
+                request_headers = {k: v for k, v in request_headers.items() if k.casefold() != lowered}
+                request_headers[key] = value
             try:
                 request_instance = client.build_request(
                     request.method,

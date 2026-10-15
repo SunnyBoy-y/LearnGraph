@@ -1257,6 +1257,20 @@ body.is-resizing .workspace-resizer {
   margin-left: auto;
   margin-right: 0;
 }
+/* User prose folds at twelve lines while keeping the complete text mounted
+   for copy and selection. Match the message's 1.5rem line height so the fold
+   lands on an actual line instead of an em-based approximation. */
+.chat-canvas-page .user-message-text-expandable__body {
+  max-height: calc(var(--expandable-line-limit, 12) * 1.5rem);
+  line-height: 1.5rem;
+}
+.chat-canvas-page .user-message-text-expandable__body::after {
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    var(--secondary, #f1f1f1)
+  );
+}
 .chat-canvas-page .is-assistant {
   width: 100%;
   max-width: 100%;
@@ -1420,13 +1434,16 @@ body.is-resizing .workspace-resizer {
   background: var(--background);
 }
 .chat-composer__start, .chat-composer__end { flex: none; cursor: default !important; }
-.chat-composer__start { padding-left: 5px !important; }
+/* The generic InputGroup addon pulls inline-start controls left by 0.3rem.
+   That compact-field adjustment makes the add button's hover surface touch
+   the composer border, so keep this pill's leading control visibly inset. */
+.chat-composer__start { margin-left: 0 !important; padding-left: 5px !important; }
 .chat-composer__end { gap: 3px !important; padding-right: 11px !important; }
 .chat-composer__add { flex: none; border-radius: 50% !important; color: #2c2c2c; }
 /* Mode/model trigger: ChatGPT-style pill. Collapsed it is icon-only (the mode
    word only appears while the menu is open), so the long "模式 · Provider /
    model-id" string no longer competes with the textarea for space. */
-.chat-composer__mode { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: 999px !important; background: #f2f2f2; color: #0d0d0d; font-size: 13px; font-weight: 500; transition: background-color .15s ease; }
+.chat-composer__mode { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: 999px !important; background: transparent; color: #0d0d0d; font-size: 13px; font-weight: 500; transition: background-color .15s ease; }
 .chat-composer__mode:hover, .chat-composer__mode[data-state='open'] { background: #eaeaea; }
 .chat-composer__mode:disabled { opacity: .5; }
 .chat-composer__mode svg { flex: none; color: #5d5d5d; }
@@ -1529,6 +1546,9 @@ body.is-resizing .workspace-resizer {
   border-radius: 50% !important;
   color: var(--muted-foreground);
 }
+/* Keep the plus surface a little lighter than the larger voice/send hit areas;
+   the mobile layout restores the 40px touch target below. */
+.chat-composer__add { width: 32px; height: 32px; min-width: 32px; }
 .chat-composer__add:hover:not(:disabled),
 .chat-composer__microphone:hover:not(:disabled),
 .chat-composer__voice-mode:hover:not(:disabled),
@@ -1547,6 +1567,56 @@ body.is-resizing .workspace-resizer {
 .chat-composer__submit--stop:hover { background: #e3e3e3 !important; }
 .chat-composer__submit--stop svg { color: #111 !important; fill: #111 !important; stroke: none !important; }
 .chat-composer__submit:disabled { background: #ececec; color: #8b8b8b; opacity: 1; }
+.memory-report-composer [data-slot='input-group'] {
+  min-height: 96px;
+  align-items: stretch;
+  border-radius: 20px;
+  background: var(--background);
+}
+.memory-report-composer__textarea {
+  min-height: 52px !important;
+  max-height: 132px !important;
+  padding: 14px 17px 5px !important;
+  font-size: 14px;
+  line-height: 1.55;
+}
+.memory-report-composer__hint {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  padding: 0 17px 5px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.memory-report-composer__actions {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 8px 6px 17px;
+}
+.memory-report-composer__examples {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.memory-report-composer__controls { display: inline-flex; flex: none; align-items: center; gap: 4px; }
+.memory-report-composer__mode { max-width: 156px; font-size: 11px; }
+.memory-report-composer__mode:hover,
+.memory-report-composer__mode[data-state='open'] { background: color-mix(in srgb, var(--foreground) 7%, transparent); }
+.dark .memory-report-composer [data-slot='input-group'] { background: var(--card); }
+@media (max-width: 720px) {
+  .memory-report-composer__examples { display: none; }
+  .memory-report-composer__actions { justify-content: flex-end; }
+  .memory-report-composer__mode { max-width: 132px; }
+}
 .chat-send-queue {
   display: flex;
   width: 100%;
@@ -1652,6 +1722,36 @@ body.is-resizing .workspace-resizer {
 .chat-voice-orb-dock { align-self: center; display: flex; flex-direction: column; align-items: center; margin: 2px 0 6px; pointer-events: auto; }
 .chat-voice-orb-dock__visual { width: 84px; height: 84px; cursor: grab; touch-action: none; }
 .chat-voice-orb-dock__visual:active { cursor: grabbing; }
+.chat-voice-stop,
+.chat-composer__stop-speaking {
+  align-items: center;
+  display: inline-flex;
+  min-height: 26px;
+  margin-top: -2px;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-muted-foreground) 35%, transparent);
+  border-radius: 999px;
+  background: var(--background);
+  color: var(--color-muted-foreground);
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.chat-voice-stop:hover,
+.chat-composer__stop-speaking:hover {
+  border-color: var(--color-foreground);
+  color: var(--color-foreground);
+}
+.chat-voice-resume-audio,
+.chat-voice-notice,
+.chat-voice-notice.is-playback,
+.chat-voice-notice.is-tts,
+.chat-voice-notice.is-asr,
+.chat-voice-unheard,
+.chat-voice-detail {
+  font-size: 12px;
+  line-height: 1.5;
+}
 /* pointer-events: none is deliberate: this layer covers the whole viewport, and
    the sphere is grabbed through a hit test instead (see voice-orb.tsx). */
 /* 100% (not just inset: 0) is load-bearing: a canvas is a replaced element, so
@@ -1662,11 +1762,8 @@ body.is-resizing .workspace-resizer {
    on the layer itself, which cannot be reached from the dock: it is on <body>. */
 .chat-voice-orb-ball.is-muted { filter: saturate(.3); }
 .chat-voice-orb-ball.is-error { filter: grayscale(.75); }
-/* Reduced motion keeps the sphere as a still readout: it cannot be dragged (see
-   voice-orb.tsx), so its anchor must not swallow scrolls either. */
-@media (prefers-reduced-motion: reduce) {
-  .chat-voice-orb-dock__visual { cursor: default; touch-action: auto; }
-}
+/* Reduced motion keeps the sphere as a still readout. The component disables
+   its pointer handlers in this mode, so no layout or content rule is needed. */
 /* Typewriter captions: the sentence being read aloud is typed out as it is
    spoken, so nothing appears before the voice reaches it -- the not-yet-read
    tail is simply absent rather than dimmed. The estimate behind the caret is
@@ -1700,6 +1797,7 @@ body.is-resizing .workspace-resizer {
   line-height: 1.5;
   color: var(--color-muted-foreground);
 }
+.chat-voice-status-line.is-connecting { color: var(--color-muted-foreground); }
 .chat-voice-status-line.is-error { color: #d9483f; }
 /* Model-switch truth: a pin takes effect on the next turn (or the next
    connection), so the UI must never present the requested model as live. */
@@ -1722,6 +1820,7 @@ body.is-resizing .workspace-resizer {
 /* 未读（官方 bot-output 已下发、但还没被朗读）的部分用灰字。灰字只活在前端内存里：
    刷新或被打断后就消失，账本永远只认真的播过的句子。 */
 .chat-voice-captions__unread { color: var(--color-muted-foreground); }
+.chat-voice-sentence.is-speaking { color: var(--color-muted-foreground); }
 .chat-composer .chat-composer__mute.is-active { color: #d9483f; }
 .chat-composer .chat-composer__mute.is-active:hover { color: #b8352d; }
 /* Connection state lives on this button: grey + spinner until the peer
@@ -1756,7 +1855,6 @@ body.is-resizing .workspace-resizer {
 .chat-suggestions .chat-empty-state__prompts { margin-top: 0; }
 .chat-follow-up-prompts .chat-suggestions { margin-top: 0; }
 .chat-suggestions__status { display: flex; min-width: 0; min-height: 84px; align-items: center; gap: 8px; color: var(--muted-foreground); font-size: 12px; }
-.chat-suggestions__status--error { justify-content: space-between; color: var(--destructive); }
 .chat-suggestions__status--unavailable { justify-content: space-between; color: var(--muted-foreground); }
 .chat-suggestions__status > span { min-width: 0; overflow-wrap: anywhere; }
 .chat-suggestions__status > button { flex: none; }
@@ -2042,6 +2140,173 @@ body.is-resizing .workspace-resizer {
   display: none;
 }
 
+/* HTML fences are executable only after an explicit user click. The preview
+   remains a separate, opaque-origin iframe so generated scripts never enter
+   the chat document. */
+.html-code-preview {
+  min-width: 0;
+  margin: 1rem 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--sidebar);
+}
+.html-code-preview--native {
+  position: relative;
+  margin: 1rem 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.html-code-preview__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 34px;
+  padding: 5px 8px 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--sidebar) 92%, var(--foreground) 8%);
+}
+.html-code-preview__toolbar--overlay {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.5rem;
+  z-index: 20;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.html-code-preview__language {
+  color: var(--muted-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: lowercase;
+}
+.html-code-preview__source pre {
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+.html-code-preview__source .expandable-content__body {
+  overflow-x: auto;
+}
+.html-code-preview__source pre > code {
+  display: block;
+  min-width: max-content;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+}
+.html-code-preview__source .expandable-content__footer {
+  padding: 3px 8px 5px;
+  border-top: 1px solid var(--border);
+}
+.html-code-preview--native [data-streamdown="code-block"] {
+  position: relative;
+  margin: 0 !important;
+}
+.html-code-preview--native [data-streamdown="code-block"] > div:has([data-streamdown="code-block-actions"]) {
+  position: absolute;
+  top: 0.35rem;
+  right: 7.5rem;
+  z-index: 10;
+  margin: 0 !important;
+  height: auto;
+}
+.html-code-preview__frame {
+  min-height: 320px;
+  background: var(--background);
+}
+.html-code-preview__iframe {
+  display: block;
+  width: 100%;
+  height: min(70svh, 640px);
+  min-height: 320px;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+}
+.html-code-preview__error {
+  margin: 0;
+  padding: 20px;
+  color: var(--destructive);
+  font-size: 12px;
+}
+
+/* Long text stays complete in the DOM and is folded only as a presentation
+   choice. This prevents backend/list-size ellipses from destroying Markdown,
+   HTML source, copy/select ranges, or code indentation. */
+.expandable-content {
+  min-width: 0;
+}
+.expandable-content__body {
+  position: relative;
+  min-width: 0;
+  max-height: calc(var(--expandable-line-limit, 24) * 1.55em);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+/* CodeBlock uses content-visibility for normal history performance. A folded
+   wrapper must still be able to measure the complete source before deciding
+   whether to show its toggle. */
+.expandable-content [data-language] {
+  content-visibility: visible !important;
+  contain: none !important;
+}
+.expandable-content__body > pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.message-part-unknown .expandable-content pre,
+.message-component--invalid .expandable-content pre {
+  max-height: none;
+  overflow: visible;
+}
+.expandable-content__body::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3.25rem;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--background, #fff));
+  content: "";
+}
+.expandable-content[data-overflowing="false"] .expandable-content__body {
+  max-height: none;
+  overflow: visible;
+}
+.expandable-content[data-overflowing="false"] .expandable-content__body::after {
+  display: none;
+}
+.expandable-content.is-expanded .expandable-content__body {
+  max-height: none;
+  overflow: visible;
+}
+.expandable-content.is-expanded .expandable-content__body::after {
+  display: none;
+}
+.expandable-content__footer {
+  display: flex;
+  justify-content: flex-start;
+  padding-top: 3px;
+}
+.expandable-content__toggle {
+  min-height: 25px;
+  gap: 4px;
+  padding-inline: 5px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.expandable-content__toggle:hover { color: var(--foreground); }
+.expandable-content__toggle svg { width: 13px; height: 13px; }
+.expandable-content:not(.is-expanded) .expandable-content__body > :first-child { margin-top: 0; }
+.expandable-content:not(.is-expanded) .expandable-content__body > :last-child { margin-bottom: 0; }
+
 /* Streamdown tables: one frame only; copy/download/fullscreen sit inside the box. */
 [data-streamdown="table-wrapper"] {
   position: relative;
@@ -2206,11 +2471,14 @@ body.is-resizing .workspace-resizer {
 /* ===== 消息尾部操作按钮（复制全文 / 重试 / 分支）：与文字最左对齐；
    流式回答过程中隐藏，回答结束 / 终止后才显示（用户需求） ===== */
 .is-assistant > div:last-child {
-  width: 100%;
+  /* Keep the action row on the same inset column as the answer text.  The
+     message body reserves 24px on each side, so a full-width action row puts
+     the copy icon visibly to the left of the first text glyph. */
+  width: min(var(--chat-content-width), calc(100% - 48px));
   max-width: var(--chat-content-width);
   margin-inline: auto;
 }
-.is-assistant[data-streaming] > div:last-child {
+.is-assistant[data-streaming] > div:last-child:not([data-message-content]) {
   opacity: 0;
   pointer-events: none;
 }
@@ -2243,7 +2511,6 @@ body.is-resizing .workspace-resizer {
   .chat-selection-menu,
   .chat-generated-image__preview,
   .sandbox-progress-stripes { animation: none; }
-  .chat-acknowledgement--streaming p { color: inherit; background: none; }
 }
 /* ChatGPT-like compact tool rows: no card chrome, one-line trigger. */
 .chat-tool-call { margin: 4px 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; position: relative; }
@@ -2426,7 +2693,6 @@ body.is-resizing .workspace-resizer {
 @media (prefers-reduced-motion: reduce) {
   .thinking-chain__live span:last-child,
   .thinking-chain__live-dot { animation: none; }
-  .thinking-chain__live span:last-child { color: inherit; background: none; }
 }
 @keyframes chat-mic-pulse { 50% { box-shadow: 0 0 0 5px rgba(0,0,0,.08); } }
 
@@ -2907,7 +3173,15 @@ body.is-resizing .workspace-resizer {
 .message-acknowledgement svg { flex: none; margin-top: 3px; color: #222; }
 .message-graph-context, .message-quiz, .message-chart, .message-component, .sandbox-artifact, .graph-proposal, .magic-card { margin: 12px 0; border: 1px solid #e0e0e0; border-radius: 14px; background: #fff; padding: 14px; }
 .learning-package-canvas { width: 100%; min-width: 0; }
+.learning-canvas-content { display: grid; gap: 2.25rem; }
 .learning-canvas-header { display: grid; gap: 8px; }
+.learning-canvas-header__topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.learning-canvas-toggle { flex: none; margin-inline-start: auto; color: var(--muted-foreground); }
+.learning-canvas-toggle svg { transition: transform .18s ease; }
+.learning-package-canvas.is-collapsed .learning-canvas-toggle svg { transform: rotate(-90deg); }
+.learning-canvas-collapsed-note { margin: 0; border: 1px dashed var(--border); border-radius: 10px; background: color-mix(in srgb, var(--muted) 38%, transparent); padding: 10px 12px; color: var(--muted-foreground); font-size: 12px; line-height: 1.6; }
+.learning-canvas-body { display: grid; gap: 2.25rem; min-width: 0; animation: learning-package-reveal .2s ease-out both; }
+.learning-canvas-body.is-hidden { display: none; }
 .learning-canvas-eyebrow { display: inline-flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 12px; font-weight: 650; }
 .learning-canvas-header h1 { margin: 0; font-size: clamp(1.35rem, 2vw, 1.9rem); font-weight: 650; line-height: 1.35; }
 .learning-canvas-header > p { margin: 0; color: var(--muted-foreground); line-height: 1.8; }
@@ -2919,8 +3193,22 @@ body.is-resizing .workspace-resizer {
 .learning-canvas-illustration { margin: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--background); padding: 12px; }
 .learning-canvas-illustration img { display: block; width: 100%; max-height: 420px; object-fit: contain; }
 .learning-canvas-illustration figcaption { margin-top: 8px; color: var(--muted-foreground); font-size: 11px; }
-.learning-canvas-section { scroll-margin-top: 72px; }
-.learning-canvas-section h2 { margin: 0 0 8px; font-size: 1.1rem; font-weight: 650; }
+.learning-canvas-section { scroll-margin-top: 72px; margin: 0; padding-top: 1.9rem; border-top: 1px solid color-mix(in srgb, var(--border) 78%, transparent); }
+.learning-canvas-section:first-of-type { padding-top: 0; border-top: 0; }
+.learning-canvas-section h2 { margin: 0 0 1rem; font-size: 1.1rem; font-weight: 650; }
+.is-assistant [data-message-content] .learning-canvas-section h2 { margin: 0 0 1rem; }
+.learning-package-canvas .learning-prose { min-width: 0; overflow-wrap: anywhere; }
+.learning-package-canvas .learning-prose > :first-child { margin-top: 0; }
+.learning-package-canvas .learning-prose > :last-child { margin-bottom: 0; }
+.learning-package-canvas .learning-prose pre { margin: 1.1rem 0; overflow-x: auto; border: 1px solid color-mix(in srgb, var(--border) 88%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--muted) 62%, transparent); padding: 13px 15px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; line-height: 1.7; }
+.learning-package-canvas .learning-prose pre code { white-space: pre; }
+.learning-package-canvas .learning-prose table { width: 100%; margin: 1.1rem 0; border-collapse: collapse; font-size: .92em; }
+.learning-package-canvas .learning-prose th, .learning-package-canvas .learning-prose td { border: 1px solid var(--border); padding: .55rem .7rem; text-align: left; vertical-align: top; }
+.learning-package-canvas .learning-prose th { background: color-mix(in srgb, var(--muted) 58%, transparent); font-weight: 650; }
+.learning-takeaway { display: grid; gap: 4px; margin: 1.25rem 0 0; border-left: 3px solid color-mix(in srgb, var(--primary) 42%, transparent); background: color-mix(in srgb, var(--muted) 64%, transparent); padding: 11px 14px; }
+.learning-takeaway__label { color: var(--muted-foreground); font-size: 11px; font-weight: 700; letter-spacing: .04em; }
+.learning-takeaway p { margin: 0; line-height: 1.75; }
+.is-assistant [data-message-content] .learning-takeaway p { margin: 0; }
 .learning-canvas-card { display: grid; gap: 9px; margin: 12px 0; border: 1px solid var(--border); border-radius: 14px; background: var(--background); padding: 14px; }
 .learning-canvas-card > p { margin: 0; line-height: 1.7; }
 .learning-canvas-card__heading { display: flex; align-items: center; gap: 7px; font-size: 13px; }
@@ -2932,6 +3220,11 @@ body.is-resizing .workspace-resizer {
 .learning-canvas-state small { font-size: 11px; font-weight: 400; }
 .learning-canvas-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .learning-canvas-feedback { color: var(--muted-foreground); font-size: 12px; }
+@keyframes learning-package-reveal { from { opacity: .35; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .learning-canvas-toggle svg,
+  .learning-canvas-body { transition: none; animation: none; }
+}
 .dark .learning-canvas-illustration, .dark .learning-canvas-card { background: var(--card); }
 .message-graph-context > div:first-child, .message-quiz__heading, .message-chart__heading { display: flex; align-items: center; gap: 7px; font-size: 12px; }
 .message-graph-context__nodes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
@@ -3147,6 +3440,12 @@ body.is-resizing .workspace-resizer {
 .chat-subapp-event { display: inline-flex; align-items: center; gap: 7px; border: 1px solid #e4e4e4; border-radius: 8px; background: #fafafa; padding: 5px 9px; color: #555; font-size: 11px; }
 .chat-subapp-event code { font-family: ui-monospace, monospace; font-size: 10px; color: #222; }
 .sandbox-artifact__code { max-height: 360px; }
+/* ExpandableContent owns the vertical fold for generated source. Keep the
+   inner CodeBlock unbounded so its scrollHeight exposes the complete source. */
+.expandable-content .sandbox-artifact__code {
+  max-height: none;
+  overflow: visible;
+}
 .graph-proposal { display: grid; gap: 11px; }
 .graph-proposal__heading { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 9px; }
 .graph-proposal__heading > span { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 9px; background: #111; color: #fff; }
@@ -3177,11 +3476,57 @@ body.is-resizing .workspace-resizer {
 .weather-card__temp span, .weather-card__range, .weather-card__summary { color: #666; font-size: 12px; line-height: 1.55; }
 .weather-card__range { display: flex; gap: 12px; flex-wrap: wrap; }
 .weather-card__summary { margin: 0; }
-.metric-card__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
-.metric-card__grid li { display: grid; gap: 2px; border: 1px solid #ececec; border-radius: 10px; padding: 10px; background: #fafafa; }
-.metric-card__grid span { color: #777; font-size: 11px; }
-.metric-card__grid strong { font-size: 18px; letter-spacing: -0.02em; }
-.metric-card__grid small { color: #888; font-size: 10px; line-height: 1.4; }
+.metric-card__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+.metric-card__grid li {
+  --metric-surface: #f5f8ff;
+  --metric-border: #dce6f8;
+  --metric-accent: #5277d7;
+  --metric-block: #b9d2ff;
+  --metric-value: #24468f;
+  position: relative;
+  display: grid;
+  min-height: 106px;
+  gap: 6px;
+  overflow: hidden;
+  isolation: isolate;
+  border: 1px solid var(--metric-border);
+  border-radius: 12px;
+  background: var(--metric-surface);
+  padding: 12px;
+}
+.metric-card__grid li::before {
+  position: absolute;
+  z-index: -1;
+  right: -21px;
+  bottom: -29px;
+  width: 96px;
+  height: 82px;
+  border-radius: 28px 0 0;
+  background: var(--metric-block);
+  content: "";
+  opacity: .3;
+  transform: rotate(-11deg);
+}
+.metric-card__grid li::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 4px;
+  border-radius: 12px 0 0 12px;
+  background: var(--metric-accent);
+  content: "";
+}
+.metric-card__item--1 { --metric-surface: #fff8ef; --metric-border: #f1dfc4; --metric-accent: #d18738; --metric-block: #f6c987; --metric-value: #8b531b; }
+.metric-card__item--2 { --metric-surface: #f3fbf7; --metric-border: #d2ebdd; --metric-accent: #3d9a69; --metric-block: #9ddab8; --metric-value: #1d6742; }
+.metric-card__item--3 { --metric-surface: #fff4f5; --metric-border: #f0d7db; --metric-accent: #c45d6a; --metric-block: #f2aab5; --metric-value: #8b3340; }
+.metric-card__label { color: #6d7480; font-size: 11px; line-height: 1.35; }
+.metric-card__value { display: flex; align-items: center; margin: 2px 0 0; color: var(--metric-value); font-family: "STKaiti", "KaiTi", "DFKai-SB", "Songti SC", Georgia, serif; font-size: clamp(26px, 3vw, 34px); font-weight: 800; line-height: .96; letter-spacing: -.055em; }
+.metric-card__value > span { display: inline-block; border-radius: 8px 10px 8px 2px; background: var(--metric-block); padding: 5px 9px 4px; box-shadow: 3px 3px 0 color-mix(in srgb, var(--metric-accent) 22%, transparent); }
+.metric-card__hint { color: #8a919c; font-size: 10px; line-height: 1.4; }
+.dark .metric-card__grid li { border-color: color-mix(in srgb, var(--metric-accent) 36%, var(--border)); background: color-mix(in srgb, var(--metric-accent) 11%, var(--card)); }
+.dark .metric-card__label, .dark .metric-card__hint { color: var(--muted-foreground); }
+.dark .metric-card__value > span { background: color-mix(in srgb, var(--metric-accent) 34%, var(--card)); color: #f7fbff; }
 /* Artifacts card wall: auto-fill tracks keep the layout adaptive, and the page
    frame is capped (max-w-[1720px]) so a fifth track can never fit - wide screens
    top out at four columns. */
@@ -3561,6 +3906,10 @@ body.is-resizing .workspace-resizer {
 .sidebar-sessions__header-actions { display: flex; gap: 1px; opacity: 0; pointer-events: none; transition: opacity .16s ease; }
 .sidebar-sessions__heading:hover .sidebar-sessions__header-actions, .sidebar-sessions__heading:focus-within .sidebar-sessions__header-actions { opacity: 1; pointer-events: auto; }
 .sidebar-sessions__header-actions button { color: #606060; }
+@media (hover: none) {
+  /* Touch users cannot hover the heading to reveal the session actions. */
+  .sidebar-sessions__header-actions { opacity: 1; pointer-events: auto; }
+}
 .sidebar-sessions__search { display: grid; grid-template-columns: auto minmax(0,1fr) auto; flex: none; align-items: center; gap: 5px; margin: 7px 7px 0; border-bottom: 1px solid #e4e4e4; padding: 0 4px 6px; color: #777; }
 .sidebar-sessions__search input { height: 28px; border: 0; background: transparent; padding-inline: 3px; font-size: 11px; box-shadow: none; }
 .sidebar-sessions__search input:focus-visible { box-shadow: none; }
@@ -3577,9 +3926,11 @@ body.is-resizing .workspace-resizer {
 .sidebar-project__heading { display: flex; align-items: center; gap: 1px; min-width: 0; }
 .sidebar-project__heading .sidebar-project__header { flex: 1; min-width: 0; }
 .sidebar-project__heading.is-selecting { padding-left: 2px; }
+.sidebar-project__heading.is-current .sidebar-project__header { background: color-mix(in srgb, var(--primary) 9%, transparent); color: var(--foreground); box-shadow: inset 2px 0 var(--primary); }
+.sidebar-project__heading.is-current .sidebar-project__header small { color: color-mix(in srgb, var(--primary) 72%, var(--muted-foreground)); }
 .sidebar-project__select { flex: none; margin-left: 8px; }
 .sidebar-sessions__batch-detail { color: #999; }
-.sidebar-project__header { display: grid; grid-template-columns: 15px minmax(0, 1fr) auto 14px; align-items: center; gap: 6px; width: 100%; border: 0; border-radius: 7px; background: transparent; padding: 6px 10px; color: #4a4a4a; font-size: 14px; font-weight: 400; text-align: left; }
+.sidebar-project__header { display: grid; grid-template-columns: 15px minmax(0, 1fr) auto; align-items: center; gap: 6px; width: 100%; border: 0; border-radius: 7px; background: transparent; padding: 6px 10px; color: #4a4a4a; font-size: 14px; font-weight: 400; text-align: left; }
 .sidebar-project__header:hover { background: #f3f3f3; color: #171717; }
 .sidebar-project__header small { color: #999; font-size: 11px; font-weight: 400; }
 .sidebar-project__delete-project { flex: none; margin-right: 2px; opacity: 0; color: #777; transition: opacity .16s ease, color .16s ease; }
@@ -3592,22 +3943,6 @@ body.is-resizing .workspace-resizer {
 .sidebar-project__session--folder { font-size: 13px; font-weight: 400; }
 .sidebar-project__session--nested { color: #444; font-size: 13px; font-weight: 400; }
 .sidebar-project__session--nested .sidebar-project__session-title { padding-block: 5px; }
-.sidebar-session__fold {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 22px;
-  margin-left: -2px;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: #8a8a8a;
-  cursor: pointer;
-}
-.sidebar-session__fold:hover { background: #e8e8e8; color: #222; }
-.sidebar-session__fold-spacer { flex: none; width: 14px; }
 .sidebar-project__session-title { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 7px 0; font-size: inherit; font-weight: inherit; color: inherit; }
 .sidebar-session__unread-dot {
   flex: none;
@@ -3699,31 +4034,330 @@ body.is-resizing .workspace-resizer {
 .workspace-topbar button {
   color: color-mix(in srgb, var(--muted-foreground) 92%, var(--foreground));
 }
-.chat-graph-rail { display: flex; flex-direction: column; gap: 8px; }
-.chat-graph-rail__switch {
+.chat-graph-rail {
   display: flex;
-  width: fit-content;
-  gap: 2px;
-  border: 0;
-  border-radius: 0;
-  padding: 0;
-  background: transparent;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0;
+  overflow: hidden;
 }
+.chat-graph-rail__switch {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: flex;
+  width: calc(100% + 4px);
+  min-height: 38px;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  padding: 3px 0 4px;
+  background: color-mix(in srgb, var(--background) 94%, transparent);
+  scrollbar-width: none;
+  backdrop-filter: blur(16px);
+}
+.chat-graph-rail__switch::-webkit-scrollbar { display: none; }
 .chat-graph-rail__switch button {
+  flex: none;
   border: 0 !important;
-  border-radius: 8px;
+  border-radius: 7px;
   background: transparent;
   color: #666;
   box-shadow: none !important;
+  font-size: 11px;
+  white-space: nowrap;
 }
 .chat-graph-rail__switch button[aria-selected='true'] {
-  background: color-mix(in srgb, var(--foreground) 7%, transparent) !important;
-  color: #252525;
+  background: color-mix(in srgb, var(--primary) 11%, transparent) !important;
+  color: var(--foreground);
+  font-weight: 650;
 }
 .chat-graph-rail__switch button:hover {
   background: color-mix(in srgb, var(--foreground) 4%, transparent) !important;
 }
+.chat-graph-rail__switch .chat-graph-rail__add {
+  margin-left: auto;
+  color: var(--muted-foreground);
+}
+.chat-graph-rail__switch .chat-graph-rail__add:hover,
+.chat-graph-rail__switch .chat-graph-rail__add:focus-visible {
+  color: var(--foreground);
+}
+.chat-graph-rail__switch button:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+}
 .chat-graph-rail__canvas { height: auto !important; min-height: 0 !important; flex: 1; }
+
+/* Right rail workspaces -------------------------------------------------- */
+.right-rail-panel {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+.right-rail-panel__header {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 13px 2px 10px;
+}
+.right-rail-panel__heading { display: grid; min-width: 0; gap: 3px; }
+.right-rail-panel__heading strong {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 720;
+  letter-spacing: -.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.right-rail-panel__heading small {
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.right-rail-panel__eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 680;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.right-rail-panel__eyebrow svg { color: var(--primary); }
+.right-rail-panel__header-actions { display: flex; flex: none; gap: 3px; }
+.right-rail-empty {
+  display: grid;
+  min-height: 88px;
+  place-items: center;
+  gap: 7px;
+  padding: 18px 12px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+.right-rail-empty strong { color: var(--foreground); font-size: 12px; font-weight: 650; }
+.right-rail-empty span { max-width: 240px; }
+.right-rail-empty.is-error { color: var(--destructive); }
+.right-rail-empty--tall { min-height: 220px; flex: 1; align-content: center; }
+
+/* Memory report execution rail ------------------------------------------ */
+.memory-process-rail {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+}
+.memory-process-rail__header {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  padding: 4px 0 13px;
+}
+.memory-process-rail__header > div { min-width: 0; }
+.memory-process-rail__eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.memory-process-rail__header h2 {
+  margin: 5px 0 0;
+  color: var(--foreground);
+  font-size: 16px;
+  font-weight: 720;
+  letter-spacing: -.02em;
+}
+.memory-process-rail__header p {
+  margin: 4px 0 0;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.memory-process-rail__status {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1;
+}
+.memory-process-rail__status.is-running {
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  color: var(--primary);
+}
+.memory-process-rail__status.is-completed { color: #16805a; }
+.memory-process-rail__status.is-failed { color: var(--destructive); }
+.memory-process-rail__empty {
+  display: grid;
+  min-height: 180px;
+  flex: 1;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  padding: 24px 12px;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+.memory-process-rail__empty strong { color: var(--foreground); font-size: 12px; }
+.memory-process-rail__empty span { max-width: 240px; font-size: 10px; line-height: 1.55; }
+.memory-process-rail__body { min-height: 0; flex: 1; overflow-y: auto; padding-top: 12px; scrollbar-width: thin; }
+.memory-process-rail__meta {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--card) 78%, var(--muted));
+  padding: 9px 10px;
+}
+.memory-process-rail__meta > span {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 11px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.memory-process-rail__meta small { color: var(--muted-foreground); font-size: 9px; }
+.memory-process-rail__steps { position: relative; display: grid; gap: 0; margin: 14px 0 0; padding: 0; list-style: none; }
+.memory-process-rail__step { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr); min-height: 48px; column-gap: 8px; }
+.memory-process-rail__step > i { position: absolute; top: 24px; bottom: -1px; left: 11px; width: 1px; background: var(--border); }
+.memory-process-rail__step-icon { position: relative; z-index: 1; display: grid; width: 23px; height: 23px; place-items: center; border: 1px solid var(--border); border-radius: 7px; background: var(--background); color: var(--muted-foreground); }
+.memory-process-rail__step.is-running .memory-process-rail__step-icon { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); color: var(--primary); }
+.memory-process-rail__step.is-completed .memory-process-rail__step-icon { border-color: color-mix(in srgb, #16805a 35%, var(--border)); }
+.memory-process-rail__step.is-failed .memory-process-rail__step-icon { border-color: color-mix(in srgb, var(--destructive) 35%, var(--border)); }
+.memory-process-rail__step-copy { display: grid; align-content: start; gap: 3px; min-width: 0; padding: 2px 0 14px; }
+.memory-process-rail__step-copy strong { color: var(--foreground); font-size: 11px; font-weight: 650; line-height: 1.35; }
+.memory-process-rail__step-copy small { color: var(--muted-foreground); font-size: 9px; line-height: 1.45; }
+.memory-process-rail__note { margin: 6px 0 0; color: var(--muted-foreground); font-size: 9px; line-height: 1.55; }
+.memory-process-rail__error { margin: 8px 0 0; color: var(--destructive); font-size: 10px; line-height: 1.5; }
+
+.right-rail-conversation__picker { display: grid; flex: none; gap: 8px; padding: 0 0 10px; }
+.right-rail-conversation__search {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 0 8px;
+  color: var(--muted-foreground);
+}
+.right-rail-conversation__search input {
+  height: 30px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-size: 11px;
+  box-shadow: none;
+}
+.right-rail-conversation__search input:focus-visible { box-shadow: none; }
+.right-rail-conversation__select-label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 650;
+}
+.right-rail-conversation__select {
+  width: 100%;
+  height: 31px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 0 8px;
+  color: var(--foreground);
+  font-size: 11px;
+  outline: none;
+}
+.right-rail-conversation__select:focus-visible { border-color: var(--ring); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 25%, transparent); }
+.right-rail-conversation__active { display: grid; min-height: 0; flex: 1; grid-template-rows: auto minmax(0, 1fr) auto auto; overflow: hidden; border: 1px solid var(--border); border-radius: 16px; background: var(--card); box-shadow: 0 8px 24px color-mix(in srgb, var(--foreground) 5%, transparent); }
+.right-rail-conversation__active-meta { display: grid; grid-template-columns: 28px minmax(0,1fr) auto; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); padding: 9px; }
+.right-rail-conversation__session-mark { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 10px; background: color-mix(in srgb, var(--primary) 13%, var(--muted)); color: var(--primary); }
+.right-rail-conversation__active-meta > div:nth-child(2) { display: grid; min-width: 0; gap: 2px; }
+.right-rail-conversation__active-meta strong { overflow: hidden; color: var(--foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-conversation__active-meta span { overflow: hidden; color: var(--muted-foreground); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-conversation__messages-shell { min-height: 0; flex: 1; }
+.right-rail-conversation__messages { min-height: 100%; gap: 10px !important; overflow-y: auto; padding: 10px !important; scrollbar-width: thin; }
+.right-rail-message { display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 7px; padding: 7px 2px; }
+.right-rail-message + .right-rail-message { border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+.right-rail-message__avatar { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 6px; background: var(--muted); color: var(--muted-foreground); }
+.right-rail-message--user .right-rail-message__avatar { background: color-mix(in srgb, var(--primary) 13%, var(--muted)); color: var(--primary); }
+.right-rail-message__body { min-width: 0; }
+.right-rail-message__body > span { display: block; color: var(--muted-foreground); font-size: 9px; font-weight: 650; }
+.right-rail-message__body p { margin: 2px 0 0; color: var(--foreground); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.right-rail-rich-message { width: 100% !important; max-width: 100% !important; gap: 5px !important; }
+.right-rail-rich-message__identity { display: flex; min-width: 0; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 9px; font-weight: 650; }
+.right-rail-rich-message__identity > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-rich-message__identity > svg { flex: none; }
+.right-rail-rich-message__bubble { width: 100% !important; max-width: 100% !important; min-width: 0; gap: 7px !important; overflow: visible !important; overflow-wrap: anywhere; }
+.right-rail-rich-message--assistant .right-rail-rich-message__bubble { border: 1px solid color-mix(in srgb, var(--border) 92%, transparent); border-radius: 14px !important; background: color-mix(in srgb, var(--background) 76%, var(--muted)); padding: 9px 10px !important; }
+.right-rail-rich-message--user .right-rail-rich-message__bubble { width: fit-content !important; max-width: 92% !important; margin-left: auto; border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border)); border-radius: 14px !important; background: color-mix(in srgb, var(--primary) 9%, var(--secondary)); padding: 9px 10px !important; }
+.right-rail-rich-message__content, .right-rail-rich-message__answer, .right-rail-rich-message__chain { min-width: 0; max-width: 100%; }
+.right-rail-rich-message__content { overflow-wrap: anywhere; }
+.right-rail-rich-message__answer + .right-rail-rich-message__answer { margin-top: 8px; }
+.right-rail-rich-message__bubble .message-text-block { font-size: 11px; line-height: 1.55; }
+.right-rail-rich-message__bubble img, .right-rail-rich-message__bubble video, .right-rail-rich-message__bubble iframe { max-width: 100%; }
+.right-rail-conversation__composer { display: grid; flex: none; gap: 5px; margin: 7px; border: 1px solid var(--border); border-radius: 14px; background: var(--background); padding: 7px 8px 6px; box-shadow: 0 4px 14px color-mix(in srgb, var(--foreground) 4%, transparent); }
+.right-rail-conversation__textarea { min-height: 46px; max-height: 120px; resize: vertical; border: 0 !important; border-radius: 10px !important; background: transparent !important; padding: 4px 2px !important; font-size: 11px; line-height: 1.5; box-shadow: none !important; }
+.right-rail-conversation__textarea:focus-visible { box-shadow: none !important; }
+.right-rail-conversation__composer-actions { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 6px; color: var(--muted-foreground); font-size: 9px; }
+.right-rail-conversation__composer-actions > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-conversation__composer-actions > div { display: flex; flex: none; gap: 4px; }
+.right-rail-conversation__composer-actions button { border-radius: 10px; }
+.right-rail-conversation__footer { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 6px; border-top: 1px solid var(--border); padding: 5px 7px 5px 9px; color: var(--muted-foreground); font-size: 9px; }
+.right-rail-conversation__footer > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.right-rail-files__list { display: grid; max-height: min(29dvh, 230px); flex: none; gap: 5px; overflow-y: auto; padding: 0 0 9px; scrollbar-width: thin; }
+.right-rail-file-card { display: grid; grid-template-columns: 28px minmax(0,1fr) auto; align-items: center; gap: 8px; min-width: 0; border: 1px solid var(--border); border-radius: 9px; background: var(--card); padding: 7px; color: var(--foreground); text-align: left; transition: border-color .15s ease, background .15s ease, transform .15s ease; }
+.right-rail-file-card:hover, .right-rail-file-card:focus-visible { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: color-mix(in srgb, var(--primary) 4%, var(--card)); outline: none; transform: translateY(-1px); }
+.right-rail-file-card.is-active { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); background: color-mix(in srgb, var(--primary) 7%, var(--card)); }
+.right-rail-file-card__icon { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; background: color-mix(in srgb, var(--primary) 13%, var(--muted)); color: var(--primary); }
+.right-rail-file-card__copy { display: grid; min-width: 0; gap: 2px; }
+.right-rail-file-card__copy strong { overflow: hidden; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-file-card__copy small { overflow: hidden; color: var(--muted-foreground); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-file-card [data-slot='badge'] { padding: 2px 5px; font-size: 9px; }
+.right-rail-files__preview { display: grid; min-height: 0; flex: 1; grid-template-rows: auto minmax(0,1fr); overflow: hidden; border: 1px solid var(--border); border-radius: 11px; background: var(--card); }
+.right-rail-files__preview-head { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); padding: 7px 8px 7px 10px; }
+.right-rail-files__preview-head > div { display: grid; min-width: 0; gap: 2px; }
+.right-rail-files__preview-head strong { overflow: hidden; color: var(--foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.right-rail-files__preview-head span { color: var(--muted-foreground); font-size: 9px; }
+.right-rail-files__preview-body { min-height: 0; overflow: auto; background: color-mix(in srgb, var(--muted) 38%, var(--background)); }
+.right-rail-files__canvas { min-height: 0 !important; }
+.right-rail-files__canvas .document-pdf-surface,
+.right-rail-files__canvas .document-word-viewer,
+.right-rail-files__canvas .document-ppt-viewer,
+.right-rail-files__canvas .document-excel-viewer,
+.right-rail-files__canvas .audio-document-workspace { min-height: 26rem; }
+.right-rail-files__canvas .document-ppt-preview,
+.right-rail-files__canvas .document-word-preview .docx-wrapper { padding: 16px !important; }
 .goal-graph-rail__empty { display: flex; min-height: 0; flex: 1; align-items: center; justify-content: center; gap: 11px; border-top: 1px solid #ededed; padding: 24px; color: #777; }
 .goal-graph-rail__empty > svg { flex: none; color: #555; }
 .goal-graph-rail__empty > div { display: grid; min-width: 0; max-width: 260px; gap: 5px; }
@@ -3738,6 +4372,12 @@ body.is-resizing .workspace-resizer {
 .project-bookshelf__list > button { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 9px; width: 100%; border: 1px solid #e2e2e2; border-radius: 10px; background: #fff; padding: 9px; color: #333; text-align: left; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
 .project-bookshelf__list > button:hover, .project-bookshelf__list > button:focus-visible { border-color: #8d8d8d; background: #f8f8f8; transform: translateY(-1px); }
 .project-bookshelf__list strong, .project-bookshelf__list small { display: block; }
+.session-graph-binding { display: grid; gap: 8px; border: 1px solid #e4e4e1; border-radius: 12px; background: color-mix(in srgb, var(--card) 92%, var(--muted)); padding: 9px; }
+.session-graph-binding__summary { display: grid; min-width: 0; gap: 2px; padding: 1px 2px; }
+.session-graph-binding__summary span { color: #858585; font-size: 10px; font-weight: 700; letter-spacing: .04em; }
+.session-graph-binding__summary strong { overflow: hidden; color: #292929; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.session-graph-binding__summary small { overflow: hidden; color: #777; font-size: 10px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.session-graph-binding__graph-button { width: 100%; justify-content: center; }
 .project-bookshelf__list strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .project-bookshelf__list small { margin-top: 3px; color: #777; font-size: 10px; line-height: 1.35; }
 .project-bookshelf__spine { display: grid; place-items: center; width: 30px; height: 36px; border-radius: 6px 9px 9px 6px; background: linear-gradient(145deg, #8b84e4, #76cbb8); color: #fff; box-shadow: inset 2px 0 rgba(255, 255, 255, .28); }
@@ -3746,29 +4386,6 @@ body.is-resizing .workspace-resizer {
 .bound-graph-rail { display: grid; min-height: 0; grid-template-rows: minmax(280px, 1fr) auto; border-top: 1px solid #e8e8e8; }
 .bound-graph-rail__canvas.graph-canvas { height: 100% !important; min-height: 280px !important; border-radius: 0; }
 .bound-graph-rail__inspector { display: grid; gap: 8px; max-height: min(34dvh, 280px); overflow: auto; border-top: 1px solid #e8e8e8; padding: 10px 1px 2px; }
-.bound-graph-rail__node-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.bound-graph-rail__node-title span, .bound-graph-rail__node-title strong { display: block; }
-.bound-graph-rail__node-title span { color: #858585; font-size: 10px; }
-.bound-graph-rail__node-title strong { margin-top: 2px; font-size: 14px; line-height: 1.3; }
-.bound-graph-rail__summary { display: grid; gap: 2px; }
-.bound-graph-rail__description { margin: 0; color: #666; font-size: 11px; line-height: 1.5; }
-.bound-graph-rail__description.is-clamped {
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-.bound-graph-rail__text-toggle {
-  justify-self: start;
-  border: 0;
-  background: transparent;
-  color: #6a6a6a;
-  font-size: 10px;
-  line-height: 1.2;
-  padding: 0;
-  cursor: pointer;
-}
-.bound-graph-rail__text-toggle:hover { color: #111; }
 .bound-graph-rail__actions, .bound-graph-rail__tools, .graph-rail-editor__actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .bound-graph-rail__tools { padding-top: 2px; }
 .bound-graph-rail__count {
@@ -3784,18 +4401,6 @@ body.is-resizing .workspace-resizer {
   line-height: 1;
   padding: 0 5px;
 }
-.bound-graph-rail__relations { display: flex; flex-wrap: wrap; gap: 6px; }
-.bound-graph-rail__chip {
-  border: 1px solid #e4e4e4;
-  border-radius: 999px;
-  background: #f7f7f6;
-  color: #444;
-  font-size: 10px;
-  line-height: 1.2;
-  padding: 4px 8px;
-  cursor: pointer;
-}
-.bound-graph-rail__chip:hover { background: #efefee; color: #111; }
 .graph-rail-editor { display: grid; gap: 8px; }
 .graph-rail-editor label { display: grid; gap: 4px; color: #626262; font-size: 10px; font-weight: 650; }
 .graph-rail-editor input, .graph-rail-editor textarea { width: 100%; border: 1px solid #d8d8d8; border-radius: 8px; background: #fff; padding: 7px 8px; color: #202020; font-size: 12px; outline: none; transition: border-color .15s ease, box-shadow .15s ease; }
@@ -4463,6 +5068,111 @@ html[data-color-mode='mono'] .topbar-model-status {
 .document-selection-menu { position: fixed; z-index: 90; display: flex; max-width: calc(100vw - 20px); gap: 2px; border: 1px solid #d7d7d5; border-radius: 8px; background: rgba(255,255,255,.98); padding: 3px; box-shadow: 0 12px 32px rgba(0,0,0,.16); transform: translate(-50%, -100%); animation: document-selection-in .14s ease-out; }
 @keyframes document-selection-in { from { opacity: 0; transform: translate(-50%, calc(-100% + 5px)); } }
 
+.document-learning-reader-shell {
+  position: relative;
+  min-width: 0;
+  min-height: calc(100svh - 7rem);
+  height: 100%;
+}
+@media (min-width: 1280px) {
+  .document-learning-reader-shell { min-height: calc(100svh - 4.25rem); }
+}
+.document-learning-chat-dock {
+  position: absolute;
+  z-index: 40;
+  bottom: 16px;
+  left: 50%;
+  width: min(42rem, calc(100% - 32px));
+  height: min(38rem, calc(100% - 32px));
+  min-height: 0;
+  transform: translateX(-50%);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--background) 96%, transparent);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, .2);
+  backdrop-filter: blur(18px);
+}
+.document-learning-chat-dock--compact {
+  width: min(72%, 36rem);
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+  backdrop-filter: none;
+}
+.document-learning-chat-dock__compact-inner {
+  height: auto;
+  overflow: visible;
+}
+
+.document-chat-compact {
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--background) 96%, transparent);
+  padding: 7px 9px 8px;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, .16);
+  backdrop-filter: blur(18px);
+}
+.document-chat-compact__form {
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  gap: 4px;
+}
+.document-chat-compact__textarea {
+  min-width: 0;
+  min-height: 40px !important;
+  height: 40px !important;
+  max-height: 40px;
+  flex: 1;
+  resize: none;
+  border: 0 !important;
+  background: transparent !important;
+  padding: 10px 5px !important;
+  box-shadow: none !important;
+  font-size: 14px;
+  line-height: 20px;
+}
+.document-chat-compact__textarea:focus-visible { outline: 0; box-shadow: none !important; }
+.document-chat-compact__textarea::placeholder { color: var(--muted-foreground); opacity: .9; }
+.document-chat-compact__plus,
+.document-chat-compact__mode,
+.document-chat-compact__mic {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+.document-chat-compact__plus,
+.document-chat-compact__mic {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+}
+.document-chat-compact__mode {
+  min-width: 42px;
+  height: 34px;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 0 8px;
+  color: var(--foreground);
+  font-size: 13px;
+}
+.document-chat-compact__plus:hover,
+.document-chat-compact__mode:hover,
+.document-chat-compact__mic:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+.document-chat-compact__mic:disabled { cursor: default; opacity: .55; }
+
 .document-chat-composer { position: relative; }
 .document-chat-attachments { display: grid; gap: 6px; margin-bottom: 8px; }
 .document-chat-attachment { display: grid; min-height: 58px; grid-template-columns: minmax(0,1fr) auto; align-items: center; border: 1px solid #dededb; border-radius: 7px; background: #fff; padding: 6px; }
@@ -4488,8 +5198,17 @@ html[data-color-mode='mono'] .topbar-model-status {
 .concept-branch-actions { display: flex; min-height: 46px; gap: 2px; overflow-x: auto; border-top: 1px solid #e5e5e2; padding: 5px; }
 .concept-branch-actions button { flex: none; font-size: 9px; }
 
+@media (max-width: 1120px) {
+  .document-learning-chat-dock { width: min(42rem, calc(100% - 24px)); }
+  .document-learning-chat-dock--compact { width: min(78%, 36rem); }
+}
+
 @media (max-width: 720px) {
   .concept-branch-window { inset: auto 8px 8px !important; width: calc(100vw - 16px); height: min(76svh, 680px); transform: none !important; }
+  .document-learning-chat-dock { right: 8px; bottom: 8px; left: 50%; width: calc(100% - 16px); height: min(72svh, 38rem); transform: translateX(-50%); }
+  .document-learning-chat-dock--compact { width: calc(100% - 16px); }
+  .document-chat-compact { padding-inline: 7px; }
+  .document-chat-compact__textarea { font-size: 13px; }
   .audio-document-workspace { padding: 10px; }
   .audio-waveform { height: 92px; gap: 1px; }
   .audio-learning-player__heading { align-items: flex-start; flex-direction: column; gap: 6px; }
@@ -4911,7 +5630,7 @@ html.dark[data-color-mode='mono'] {
 .dark .chat-graph-action,
 .dark .chat-image-action,
 .dark .chat-selection-reference { color: var(--muted-foreground); }
-.dark .chat-composer__mode { background: rgba(255,255,255,.08); color: var(--foreground); }
+.dark .chat-composer__mode { background: transparent; color: var(--foreground); }
 .dark .chat-composer__mode:hover, .dark .chat-composer__mode[data-state='open'] { background: rgba(255,255,255,.16); }
 .dark .chat-composer__mode svg { color: var(--muted-foreground); }
 .dark .chat-mode-chip { background: rgba(255,255,255,.08); color: var(--foreground); }
@@ -6186,12 +6905,13 @@ html[data-drawer-open] [data-slot="sheet-content"] {
   .chat-message-version-row,
   .chat-composer-dock,
   .chat-follow-up-prompts,
-  .is-assistant [data-message-content] {
+  .is-assistant [data-message-content],
+  .is-assistant > div:last-child {
     width: min(var(--chat-content-width), calc(100% - 24px));
   }
 }
 
-  html.is-native-app .chat-message-version-row, html.is-native-app .chat-composer-dock, html.is-native-app .chat-follow-up-prompts, html.is-native-app .is-assistant [data-message-content]{
+  html.is-native-app .chat-message-version-row, html.is-native-app .chat-composer-dock, html.is-native-app .chat-follow-up-prompts, html.is-native-app .is-assistant [data-message-content], html.is-native-app .is-assistant > div:last-child{
     width: min(var(--chat-content-width), calc(100% - 24px));
   }
 
@@ -6218,6 +6938,8 @@ html[data-drawer-open] [data-slot="sheet-content"] {
 
 /* ===========================================================================
    Message stream stats bar (first-token / token speed / cache hit).
+   Every streaming state uses the same footprint for the selected meteor/star
+   animation; numeric metrics may appear alongside it when enabled.
    Shares --chat-content-width with the message body so its left edge aligns
    with the text; tabular-nums + fixed min-height prevent horizontal jitter
    while the numbers update during streaming.
@@ -6234,6 +6956,78 @@ html[data-drawer-open] [data-slot="sheet-content"] {
   font-size: 11.5px;
   line-height: 1.5;
   font-variant-numeric: tabular-nums;
+}
+@keyframes message-stream-meteor {
+  0% {
+    opacity: 0;
+    transform: rotate(-28deg) translateX(-12px);
+  }
+  28% { opacity: .96; }
+  72%, 100% {
+    opacity: 0;
+    transform: rotate(-28deg) translateX(24px);
+  }
+}
+@keyframes message-stream-meteor-core {
+  0%, 100% {
+    opacity: .55;
+    transform: scale(.86);
+  }
+  42% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+.message-stream-stats--loading {
+  min-height: 32px;
+  color: var(--primary);
+}
+.message-stream-stats__loading-visual {
+  position: relative;
+  display: inline-grid;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 32px;
+  place-items: center;
+  overflow: visible;
+}
+.message-stream-stats__meteor-trail {
+  position: absolute;
+  left: 5px;
+  width: 28px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0;
+  transform: rotate(-28deg) translateX(-12px);
+  animation: message-stream-meteor 1.55s ease-out infinite;
+  box-shadow: 0 0 5px color-mix(in srgb, currentColor 52%, transparent);
+  will-change: opacity, transform;
+}
+.message-stream-stats__meteor-trail--a { top: 3px; animation-delay: 0s; }
+.message-stream-stats__meteor-trail--b { top: 15px; left: -1px; animation-delay: .28s; }
+.message-stream-stats__meteor-trail--c { top: 27px; left: 6px; animation-delay: .56s; }
+.message-stream-stats__loading-icon {
+  position: relative;
+  z-index: 1;
+  width: 22px;
+  height: 22px;
+  stroke-width: 2.2;
+  filter: drop-shadow(0 1px 4px color-mix(in srgb, var(--primary) 42%, transparent));
+  animation: message-stream-meteor-core 1.55s ease-in-out infinite;
+  transform-origin: center;
+  will-change: opacity, transform;
+}
+@media (prefers-reduced-motion: reduce) {
+  .message-stream-stats__meteor-trail {
+    animation: none;
+    opacity: .35;
+    transform: rotate(-28deg) translateX(0);
+  }
+  .message-stream-stats__loading-icon {
+    animation: none;
+    opacity: .8;
+  }
 }
 .message-stream-stats__item {
   display: inline-flex;
@@ -6809,4 +7603,575 @@ path.knowledge-plan-edge.is-selected { opacity: .7 !important; }
   .chat-composer.is-expanded .chat-composer__start,
   .chat-composer.is-expanded .chat-composer__end { align-self: center; padding-bottom: 0 !important; }
   .chat-plus-menu { min-width: min(236px, calc(100vw - 40px)); }
+
+  /* The memory composer has two block-end rows instead of the chat
+     composer's inline start/end addons. Keep those rows stacked on narrow
+     screens rather than inheriting the chat three-column grid. */
+  .memory-report-composer [data-slot='input-group'] {
+    display: flex !important;
+    grid-template-columns: none !important;
+    grid-template-areas: none !important;
+    flex-direction: column !important;
+    min-height: 96px;
+    padding: 0 !important;
+  }
+  .memory-report-composer__textarea,
+  .memory-report-composer__hint,
+  .memory-report-composer__actions { grid-area: auto !important; }
+  .memory-report-composer__textarea { width: 100%; }
+  .memory-report-composer__actions { padding-left: 12px; }
+}
+
+/* --------------------------------------------------------------------------
+   Motion-web layer
+
+   The workspace keeps its chrome mounted while route content moves through a
+   short directional transition. Lists then use smaller, content-specific
+   arrivals: overview metrics settle left-to-right, pending actions follow the
+   reading order, and graph shelves rise like a set of cards being placed.
+   -------------------------------------------------------------------------- */
+:root {
+  --lg-motion-ease-out: cubic-bezier(.16, 1, .3, 1);
+}
+
+.workspace-route-motion {
+  min-width: 0;
+  min-height: 100%;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .dashboard-overview__item {
+    animation: lg-dashboard-arrive .52s var(--lg-motion-ease-out) both;
+  }
+  .dashboard-overview__item:nth-child(2) { animation-delay: 70ms; }
+  .dashboard-overview__item:nth-child(3) { animation-delay: 140ms; }
+
+  .dashboard-overview__item > span {
+    transition: transform .22s var(--lg-motion-ease-out), background-color .22s ease;
+  }
+  .dashboard-overview__item:hover > span {
+    transform: translateY(-2px) rotate(-3deg);
+    background-color: color-mix(in srgb, var(--primary) 13%, var(--muted));
+  }
+
+  .dashboard-action-item {
+    animation: lg-dashboard-row-arrive .42s var(--lg-motion-ease-out) both;
+    transition: transform .2s var(--lg-motion-ease-out);
+  }
+  .dashboard-action-item:nth-child(2) { animation-delay: 80ms; }
+  .dashboard-action-item:nth-child(3) { animation-delay: 150ms; }
+  .dashboard-action-item:hover {
+    transform: translateX(3px);
+  }
+
+  .dashboard-today-item {
+    animation: lg-dashboard-row-arrive .42s var(--lg-motion-ease-out) both;
+  }
+  .dashboard-today-item:nth-child(2) { animation-delay: 80ms; }
+  .dashboard-today-item:nth-child(3) { animation-delay: 150ms; }
+  .dashboard-today-item:nth-child(4) { animation-delay: 220ms; }
+
+  .graph-library__book {
+    animation: lg-shelf-arrive .56s var(--lg-motion-ease-out) both;
+  }
+  .graph-library__book:nth-child(2) { animation-delay: 55ms; }
+  .graph-library__book:nth-child(3) { animation-delay: 110ms; }
+  .graph-library__book:nth-child(4) { animation-delay: 165ms; }
+  .graph-library__book:nth-child(5) { animation-delay: 220ms; }
+  .graph-library__book:nth-child(6) { animation-delay: 275ms; }
+  .graph-library__spine {
+    transition: transform .32s var(--lg-motion-ease-out);
+  }
+  .graph-library__book:hover .graph-library__spine {
+    transform: scale(1.025);
+  }
+}
+
+@keyframes lg-dashboard-arrive {
+  from { opacity: 0; transform: translate3d(0, 10px, 0); }
+  to { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+@keyframes lg-dashboard-row-arrive {
+  from { opacity: 0; transform: translate3d(-7px, 0, 0); }
+  to { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+@keyframes lg-shelf-arrive {
+  from { opacity: 0; transform: translate3d(0, 14px, 0) scale(.985); }
+  to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-route-motion .animate-in {
+    animation: none !important;
+  }
+  .dashboard-overview__item,
+  .dashboard-action-item,
+  .dashboard-today-item,
+  .graph-library__book {
+    animation: none !important;
+  }
+  .dashboard-overview__item > span,
+  .graph-library__spine {
+    transition: none !important;
+  }
+  .dashboard-action-item:hover,
+  .dashboard-overview__item:hover > span,
+  .graph-library__book:hover .graph-library__spine {
+    transform: none !important;
+  }
+}
+
+/*
+ * Desktop chat canvas when the right rail is folded.
+ *
+ * The main column grows into the freed rail space, so its auto margins would
+ * recenter the reading column in the remaining area. Keep the canvas anchored
+ * to the viewport's first-third line instead. The scroll content and composer
+ * must share one rectangle; offsetting only individual rows leaves the scroll
+ * content centered and creates the large blank strip shown in the canvas.
+ * The offset is relative to the main column, which already starts after the
+ * left sidebar.
+ */
+@media (min-width: 1121px) {
+  .workspace-shell--rail-collapsed .workspace-main--chat {
+    --chat-canvas-offset: max(
+      24px,
+      calc(33.333333vw - var(--sidebar-width, 268px))
+    );
+    --chat-canvas-width: min(
+      var(--chat-content-width),
+      calc(100% - var(--chat-canvas-offset) - 24px)
+    );
+  }
+
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-canvas-page .chat-messages-content {
+    width: var(--chat-canvas-width);
+    max-width: none;
+    margin-left: var(--chat-canvas-offset);
+    margin-right: 0;
+    padding-inline: 0;
+  }
+
+  /* All message rows inherit the same rectangle from the scroll content.
+     The previous rule moved each row independently, which double-counted the
+     offset after the parent was centered. */
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-canvas-page
+    :is(
+      .is-user,
+      .is-assistant,
+      .chat-follow-up-prompts,
+      .learning-package-canvas,
+      .message-stream-stats,
+      .chat-message-version-row
+    ) {
+    width: 100%;
+    max-width: none;
+    margin-inline: 0;
+  }
+
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-canvas-page
+    :is(
+      .is-assistant [data-message-content],
+      .is-assistant [data-message-content] .message-answer-segment,
+      .is-assistant > div:last-child
+    ) {
+    width: 100%;
+    max-width: none;
+    margin-inline: 0;
+  }
+
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-empty-state {
+    align-items: flex-start;
+  }
+
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-empty-state__content {
+    width: min(620px, 100%);
+    margin-right: 0;
+    margin-left: 0;
+  }
+
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-composer-dock {
+    left: var(--chat-canvas-offset);
+    width: var(--chat-canvas-width);
+    transform: none;
+  }
+
+  /* The toolbar is a shrink-to-fit flex item by default. Stretch its hit area
+     to the same width as the input so every visible control lives in the
+     shared canvas rectangle. */
+  .workspace-shell--rail-collapsed .workspace-main--chat
+    .chat-composer-dock .chat-workbench-toolbar {
+    width: 100%;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Motion-web sidebar chrome
+
+   The shell is a stateful control, not page decoration: the rail width, its
+   labels, the context rail, and the mobile drawers should acknowledge the
+   same open/closed decision.  The normal path uses a short rail glide and a
+   slightly delayed label fade.  The reduced-motion path below intentionally
+   keeps only opacity/colour feedback, so Windows' "Animation effects" setting
+   removes spatial travel without making the control feel unresponsive.
+   -------------------------------------------------------------------------- */
+:root {
+  --lg-sidebar-motion-duration: 340ms;
+  --lg-sidebar-motion-fast: 180ms;
+  --lg-sidebar-motion-ease: cubic-bezier(.32, .72, 0, 1);
+  --lg-sidebar-feedback-ease: cubic-bezier(.4, 0, .2, 1);
+}
+
+/* Desktop rail ------------------------------------------------------------ */
+@media (min-width: 1025px) {
+  .workspace-shell {
+    transition:
+      grid-template-columns var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      background-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease);
+  }
+
+  .workspace-sidebar {
+    transition:
+      background-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      border-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease);
+  }
+
+  .sidebar-nav {
+    transition:
+      padding-inline var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease);
+  }
+
+  .sidebar-nav.is-collapsed {
+    padding-inline: 10px !important;
+  }
+
+  /* Keep the label mounted so the icon and the word do not pop in different
+     frames.  max-width removes its layout contribution after the fade. */
+  .sidebar-nav .sidebar-text {
+    display: inline-block !important;
+    max-width: 16rem;
+    overflow: hidden;
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+    visibility: visible;
+    transition:
+      max-width var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      transform var(--lg-sidebar-motion-fast) var(--lg-sidebar-motion-ease),
+      visibility 0s linear;
+  }
+
+  .sidebar-nav.is-collapsed .sidebar-text {
+    max-width: 0 !important;
+    min-width: 0 !important;
+    flex-basis: 0 !important;
+    opacity: 0;
+    pointer-events: none;
+    transform: translate3d(-6px, 0, 0);
+    visibility: hidden;
+    transition:
+      max-width var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      transform var(--lg-sidebar-motion-fast) var(--lg-sidebar-motion-ease),
+      visibility 0s linear var(--lg-sidebar-motion-fast);
+  }
+
+  .sidebar-nav [data-nav-label],
+  .sidebar-nav .sidebar-brand,
+  .sidebar-nav .sidebar-user-menu {
+    transition:
+      gap var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      padding-inline var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      background-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      border-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease);
+  }
+
+  .sidebar-nav .sidebar-brand__mark,
+  .sidebar-nav .sidebar-user-menu [data-slot="avatar"] {
+    transition:
+      width var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      height var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      border-radius var(--lg-sidebar-motion-fast) var(--lg-sidebar-motion-ease),
+      background-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease);
+  }
+
+  .sidebar-nav.is-collapsed [data-nav-label],
+  .sidebar-nav.is-collapsed .sidebar-brand,
+  .sidebar-nav.is-collapsed .sidebar-user-menu {
+    gap: 0;
+  }
+
+  /* These blocks used to switch to display:none.  Keeping a zero-height
+     mounted block gives the collapse a readable fade and preserves the
+     scroller's geometry when the rail opens again. */
+  .sidebar-nav .sidebar-nav__more {
+    display: flex !important;
+    max-height: 2.5rem;
+    overflow: hidden;
+    opacity: 1;
+    visibility: visible;
+    transition:
+      max-height var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      visibility 0s linear;
+  }
+
+  .sidebar-nav.is-collapsed .sidebar-nav__more {
+    max-height: 0;
+    margin-top: 0 !important;
+    opacity: 0;
+    pointer-events: none;
+    visibility: hidden;
+    transition:
+      max-height var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      visibility 0s linear var(--lg-sidebar-motion-fast);
+  }
+
+  .sidebar-nav .sidebar-recent {
+    display: flex !important;
+    max-height: min(1000px, calc(100dvh - 140px));
+    overflow: hidden;
+    opacity: 1;
+    visibility: visible;
+    transition:
+      max-height var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      transform var(--lg-sidebar-motion-fast) var(--lg-sidebar-motion-ease),
+      visibility 0s linear;
+  }
+
+  .sidebar-nav.is-collapsed .sidebar-recent {
+    max-height: 0;
+    margin-block: 0 !important;
+    padding-block: 0 !important;
+    border-top-color: transparent !important;
+    opacity: 0;
+    pointer-events: none;
+    transform: translate3d(-8px, 0, 0);
+    visibility: hidden;
+    transition:
+      max-height var(--lg-sidebar-motion-duration) var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      transform var(--lg-sidebar-motion-fast) var(--lg-sidebar-motion-ease),
+      visibility 0s linear var(--lg-sidebar-motion-fast);
+  }
+
+  .sidebar-nav [data-sidebar-toggle],
+  .sidebar-nav [data-sidebar-toggle] svg,
+  .topbar-rail-toggle,
+  .topbar-rail-toggle svg {
+    transition:
+      transform var(--lg-sidebar-motion-fast) var(--lg-sidebar-motion-ease),
+      background-color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      color var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease);
+  }
+
+  .workspace-shell[data-rail-state="collapsed"] .topbar-rail-toggle svg {
+    transform: rotate(-8deg) scale(.94);
+  }
+
+  .sidebar-project__sessions {
+    transform-origin: top;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) and (min-width: 1025px) {
+  .sidebar-project__sessions {
+    animation: lg-sidebar-folder-open 220ms var(--lg-sidebar-motion-ease) both;
+  }
+}
+
+@keyframes lg-sidebar-folder-open {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/* Mobile drawers ---------------------------------------------------------- */
+@media (max-width: 1120px) {
+  .mobile-nav-drawer {
+    opacity: 0;
+    transition:
+      transform 320ms var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      visibility 0s linear 320ms;
+  }
+
+  .mobile-nav-drawer.is-open {
+    opacity: 1;
+    transition:
+      transform 320ms var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      visibility 0s linear;
+  }
+
+  /* During a swipe the React open flag is intentionally committed only after
+     release.  Mirror the gesture progress in opacity as well, otherwise a
+     reduced-motion user would see an invisible panel following their finger. */
+  html[data-drawer-dragging="left"] .mobile-nav-drawer {
+    opacity: var(--lg-left-drawer-progress, 0);
+  }
+
+  .workspace-shell .context-rail,
+  .workspace-shell--rail-collapsed .context-rail {
+    opacity: 0;
+    transition:
+      transform 340ms var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      visibility 0s linear 340ms;
+  }
+
+  .workspace-shell--graph-open .context-rail {
+    opacity: 1;
+    transition:
+      transform 340ms var(--lg-sidebar-motion-ease),
+      opacity var(--lg-sidebar-motion-fast) var(--lg-sidebar-feedback-ease),
+      visibility 0s linear;
+  }
+
+  html[data-drawer-dragging="right"] .workspace-shell .context-rail {
+    opacity: var(--lg-right-drawer-progress, 0);
+  }
+
+  .mobile-nav-drawer-overlay,
+  .graph-drawer-backdrop,
+  .graph-drawer-close {
+    transition-duration: var(--lg-sidebar-motion-fast);
+    transition-timing-function: var(--lg-sidebar-feedback-ease);
+  }
+}
+
+/* Reduced-motion fallback -------------------------------------------------
+
+   The broad legacy rule above intentionally disables decorative animation.
+   Do not let it erase the interaction's state feedback as well: when the OS
+   asks for reduced motion, rail geometry snaps (no spatial travel) while
+   labels, surfaces, and scrims still cross-fade for a short, legible beat.
+   Explicit !important is needed here because the legacy reset is global and
+   important. */
+@media (prefers-reduced-motion: reduce) {
+  .workspace-shell[data-sidebar-state],
+  .workspace-sidebar,
+  .sidebar-nav,
+  .sidebar-nav [data-nav-label],
+  .sidebar-nav .sidebar-brand,
+  .sidebar-nav .sidebar-user-menu,
+  .sidebar-nav .sidebar-brand__mark,
+  .sidebar-nav .sidebar-user-menu [data-slot="avatar"],
+  .sidebar-nav [data-sidebar-toggle],
+  .topbar-rail-toggle {
+    transition-duration: 140ms !important;
+    transition-timing-function: linear !important;
+  }
+
+  .workspace-shell[data-sidebar-state] {
+    /* Width is an essential layout state, not a decorative animation. */
+    transition-property: background-color, border-color !important;
+  }
+
+  .sidebar-nav {
+    transition-property: color, background-color, border-color !important;
+  }
+
+  .sidebar-nav [data-nav-label],
+  .sidebar-nav .sidebar-brand,
+  .sidebar-nav .sidebar-user-menu,
+  .sidebar-nav .sidebar-brand__mark,
+  .sidebar-nav .sidebar-user-menu [data-slot="avatar"],
+  .sidebar-nav [data-sidebar-toggle],
+  .topbar-rail-toggle {
+    transition-property: opacity, color, background-color, border-color !important;
+  }
+
+  .sidebar-nav .sidebar-text,
+  .sidebar-nav .sidebar-nav__more,
+  .sidebar-nav .sidebar-recent {
+    transition-duration: 140ms !important;
+    transition-timing-function: linear !important;
+    transition-delay: 0s !important;
+    transition-property: opacity, color, background-color, visibility !important;
+    transform: none !important;
+  }
+
+  .sidebar-nav [data-sidebar-toggle] svg,
+  .topbar-rail-toggle svg {
+    transition-duration: 140ms !important;
+    transition-timing-function: linear !important;
+    transition-property: opacity, color, background-color !important;
+    transform: none !important;
+  }
+
+  @media (min-width: 1025px) {
+    .workspace-shell .context-rail,
+    .workspace-resizer {
+      transition-duration: 140ms !important;
+      transition-timing-function: linear !important;
+      transition-property: opacity, background-color, border-color, visibility !important;
+      transform: none !important;
+    }
+  }
+
+  @media (max-width: 1120px) {
+    .mobile-nav-drawer,
+    .workspace-shell .context-rail,
+    .mobile-nav-drawer-overlay,
+    .graph-drawer-backdrop,
+    .graph-drawer-close {
+      transition-duration: 140ms !important;
+      transition-timing-function: linear !important;
+      transition-property: opacity, visibility !important;
+      transition-delay: 0s, 140ms !important;
+    }
+
+    /* The progress variable still drives drag gestures.  Only the settled
+       open/close transition loses its spatial interpolation. */
+    .mobile-nav-drawer,
+    .workspace-shell .context-rail {
+      transition-property: opacity, visibility !important;
+    }
+
+    .mobile-nav-drawer.is-open,
+    .workspace-shell--graph-open .context-rail,
+    .mobile-nav-drawer-overlay.is-open,
+    .workspace-shell--graph-open .graph-drawer-backdrop,
+    .workspace-shell--graph-open .graph-drawer-close {
+      transition-delay: 0s, 0s !important;
+    }
+
+    html[data-drawer-dragging="left"] .mobile-nav-drawer,
+    html[data-drawer-dragging="right"] .workspace-shell .context-rail,
+    html[data-drawer-dragging="left"] .mobile-nav-drawer-overlay,
+    html[data-drawer-dragging="right"] .graph-drawer-backdrop {
+      transition: none !important;
+    }
+
+    @media (min-width: 1025px) {
+      /* Tablet right-rail swipes still need to follow the finger even though
+         the settled reduced-motion state removes transform interpolation. */
+      html[data-drawer-dragging="right"] .workspace-shell .context-rail {
+        transform: translate3d(
+          calc(100% - 100% * var(--lg-right-drawer-progress, 0)),
+          0,
+          0
+        ) !important;
+      }
+    }
+  }
 }

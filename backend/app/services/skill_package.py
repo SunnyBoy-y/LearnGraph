@@ -630,14 +630,15 @@ OFFICIAL_SKILLS: tuple[OfficialSkillSpec, ...] = (
         version="1.0.0",
         dir_name="frontend_build_preview",
         description=(
-            "离线创建 Vite/React/Vue 项目、构建静态产物并渲染 PNG/PDF 预览；"
+            "离线创建 Vite/React/Vue 项目（可直接使用 Three.js）、构建静态产物并渲染 PNG/PDF 预览；"
             "发布带 __lgSubapp SDK、事件埋点、状态回写与数据分析的双向交互子应用。"
         ),
         grant_reason="official_skill_auto_enable",
         category="frontend",
         capability_ids=("frontend.scaffold", "frontend.build", "frontend.preview", "frontend.publish"),
         keywords=(
-            "vite", "react", "vue", "前端", "构建", "预览", "spa", "dist",
+            "vite", "react", "vue", "three", "three.js", "webgl", "3d",
+            "前端", "构建", "预览", "spa", "dist",
             "双向交互子应用", "表单", "问卷", "埋点", "__lgSubapp", "状态回写",
         ),
         trigger_phrases=(

@@ -9,7 +9,6 @@ import {
   Link2,
   LoaderCircle,
   MessageSquare,
-  Play,
   RefreshCw,
   Rocket,
   Trash2,
@@ -64,16 +63,15 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { DECLARATIVE_COMPONENT_CARD_TYPE } from "@/features/artifacts/card-types";
-import {
-  PreviewPauseScopeContext,
-  resumeAllPreviews,
-  type PreviewPauseScope,
-} from "@/lib/preview-pause-controller";
+import { resumeAllPreviews } from "@/lib/preview-pause-controller";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type {
   ArtifactCard,
   ArtifactCardShareTokenCreated,
 } from "@/types/artifacts";
+import { ArtifactCardShell } from "./card-preview";
+
+export { ArtifactCardShell, CardInlinePreview } from "./card-preview";
 
 function formatDate(value: string): string {
   const date = new Date(value);
@@ -275,73 +273,63 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
         ) : (
           <div className="artifact-card-grid">
             {cards.data?.slice(0, visibleCount).map((card) => (
-              <article
-                aria-label={card.title}
-                className="flex min-w-0 flex-col rounded-xl border bg-background p-3"
+              <ArtifactCardShell
+                active={activeCardId === card.id}
+                card={card}
+                footer={
+                  <>
+                    <Button
+                      disabled={!card.chat_session_id}
+                      onClick={() => openSession(card)}
+                      size="sm"
+                      title="跳转到对应会话"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <MessageSquare className="size-4" />
+                      会话
+                    </Button>
+                    <Button
+                      aria-label={`版本与分享 ${card.title}`}
+                      className="ml-auto"
+                      onClick={() => setPreviewCard(card)}
+                      size="sm"
+                      title="管理版本与分享"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <Link2 className="size-4" />
+                      版本与分享
+                    </Button>
+                    <Button
+                      aria-label={`删除 ${card.title}`}
+                      onClick={() => setDeleteTarget(card)}
+                      size="icon"
+                      title="删除卡片"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <Trash2 className="size-4 text-destructive" />
+                    </Button>
+                  </>
+                }
                 key={card.id}
-                onClick={(event) => {
-                  // Clicking the card (title, body, padding) means "play this one";
-                  // its own controls keep their own jobs.
-                  if (isCardControl(event.target)) return;
-                  activateCard(card.id);
-                }}
-                style={{ contentVisibility: "auto", containIntrinsicSize: "520px" }}
-              >
-                <div className="flex min-w-0 flex-col items-start gap-2">
-                  <div className="flex flex-wrap items-center gap-1.5">
+                meta={
+                  <>
                     <CardTypeBadge card={card} />
                     <StatusBadge card={card} />
                     {card.draft_dirty ? (
                       <Badge variant="destructive">有未发布更新</Badge>
                     ) : null}
-                  </div>
-                  <h3 className="line-clamp-2 text-sm font-semibold">{card.title}</h3>
-                  <span className="text-xs text-muted-foreground">
-                    更新于 {formatDate(card.updated_at)}
-                  </span>
-                </div>
-                <CardInlinePreview
-                  active={activeCardId === card.id}
-                  card={card}
-                  onActivate={activateCard}
-                  workspaceId={workspaceId}
-                />
-                <div className="mt-3 flex items-center gap-1 border-t pt-2">
-                  <Button
-                    disabled={!card.chat_session_id}
-                    onClick={() => openSession(card)}
-                    size="sm"
-                    title="跳转到对应会话"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <MessageSquare className="size-4" />
-                    会话
-                  </Button>
-                  <Button
-                    aria-label={`版本与分享 ${card.title}`}
-                    className="ml-auto"
-                    onClick={() => setPreviewCard(card)}
-                    size="sm"
-                    title="管理版本与分享"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Link2 className="size-4" />
-                    版本与分享
-                  </Button>
-                  <Button
-                    aria-label={`删除 ${card.title}`}
-                    onClick={() => setDeleteTarget(card)}
-                    size="icon"
-                    title="删除卡片"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Trash2 className="size-4 text-destructive" />
-                  </Button>
-                </div>
-              </article>
+                    <span className="ml-auto text-xs text-muted-foreground">
+                      更新于 {formatDate(card.updated_at)}
+                    </span>
+                  </>
+                }
+                metaAriaLabel="卡片类型、状态和更新时间"
+                onActivate={activateCard}
+                workspaceId={workspaceId}
+              />
             ))}
             {cards.data && visibleCount < cards.data.length ? (
               <div
@@ -389,118 +377,6 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
-  );
-}
-
-/** Cards keep their own controls: clicks on them must not be read as "play". */
-function isCardControl(target: EventTarget | null): boolean {
-  return (
-    target instanceof Element &&
-    Boolean(
-      target.closest(
-        'button, a, input, select, textarea, [role="button"], [data-preview-control]',
-      ),
-    )
-  );
-}
-
-function CardInlinePreview({
-  active,
-  card,
-  onActivate,
-  workspaceId,
-}: {
-  active: boolean;
-  card: ArtifactCard;
-  onActivate: (cardId: string) => void;
-  workspaceId: string;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(false);
-  // True while this preview is expanded (top layer) or natively fullscreen: the
-  // expanded overlay keeps covering the canvas even when the card's own box has
-  // been scrolled out of the lazy-mount band, so it must stay mounted and running.
-  const [pinned, setPinned] = useState(false);
-
-  // Keep only nearby previews running so long libraries do not start dozens
-  // of iframe runtimes at once. React Query retains the fetched snapshots.
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    if (typeof IntersectionObserver === "undefined") {
-      setVisible(true);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      ([entry]) => setVisible(entry.isIntersecting),
-      { rootMargin: "480px" },
-    );
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, []);
-
-  const preview = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "cards", card.card_id, "preview", "draft", card.updated_at),
-    queryFn: () => getArtifactCardPreview(card.card_id),
-    enabled: visible,
-    staleTime: 60_000,
-  });
-
-  const activate = useCallback(() => onActivate(card.id), [card.id, onActivate]);
-  // Off-viewport previews are suspended by the scope instead of being unmounted:
-  // unmounting throws the iframe away, so scrolling back restarts the card from
-  // zero. Only a preview that was never activated and left the band is still
-  // reclaimed, which keeps the number of live iframes bounded.
-  const live = visible || active || pinned;
-  const suspended = !pinned && (!active || !visible);
-  const scope = useMemo<PreviewPauseScope>(
-    () => ({ suspended, activate, pin: setPinned }),
-    [suspended, activate],
-  );
-  const showPreview = live && !preview.isPending && !preview.isError;
-
-  return (
-    <div
-      className="relative mt-3 min-h-80 max-h-[520px] min-w-0 overflow-hidden rounded-xl border border-border/60 bg-muted/20"
-      data-preview-suspended={suspended ? "true" : "false"}
-      ref={containerRef}
-    >
-      {!live || preview.isPending ? (
-        <Skeleton aria-label={`正在加载 ${card.title} 的预览`} className="h-80 w-full" />
-      ) : preview.isError ? (
-        <div className="flex h-80 flex-col items-center justify-center gap-3 p-4 text-center">
-          <p className="text-sm text-destructive">{preview.error.message || "加载预览失败"}</p>
-          <Button onClick={() => void preview.refetch()} size="sm" type="button" variant="outline">重新加载预览</Button>
-        </div>
-      ) : (
-        <PreviewPauseScopeContext.Provider value={scope}>
-          {card.card_type === DECLARATIVE_COMPONENT_CARD_TYPE ? (
-            /* 组件卡已不再进入本页列表（见 card-types.ts），这里保留渲染分支：
-               将来若恢复入口，或接口在别处返回组件卡，预览能力不丢。 */
-            <div className="max-h-[520px] overflow-auto p-4">
-              <TrustedComponentRenderer data={preview.data.preview_snapshot} fallbackId={card.card_id} interactive={false} />
-            </div>
-          ) : (
-            <MagicCardHost key={card.updated_at} data={preview.data.preview_snapshot} />
-          )}
-        </PreviewPauseScopeContext.Provider>
-      )}
-      {showPreview && suspended ? (
-        /* A paused card must say so and offer the one action it accepts. Without
-           this the wall looks broken: frozen mid-animation with no explanation. */
-        <button
-          className="absolute inset-0 z-30 flex cursor-pointer items-center justify-center bg-background/45 transition-colors hover:bg-background/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-          onClick={activate}
-          title={`播放 ${card.title}`}
-          type="button"
-        >
-          <span className="flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-3 py-1.5 text-xs font-medium shadow-sm">
-            <Play className="size-3.5" />
-            点击播放
-          </span>
-        </button>
-      ) : null}
     </div>
   );
 }

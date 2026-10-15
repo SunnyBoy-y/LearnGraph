@@ -10,6 +10,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { apiClient } from "@/api/client";
 import { streamSessionMessage } from "@/api/sessions";
@@ -363,16 +364,22 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
       ) : null}
 
       {sourceCode ? (
-        <CodeBlock
-          className="sandbox-artifact__code"
-          code={sourceCode}
-          language={codeLanguage(data.language)}
+        <ExpandableContent
+          className="sandbox-artifact__source"
+          label="源码"
+          lineLimit={24}
         >
-          <CodeBlockHeader>
-            <span>{codeLanguage(data.language)}</span>
-            <CodeBlockCopyButton aria-label="复制组件源码" size="icon-xs" />
-          </CodeBlockHeader>
-        </CodeBlock>
+          <CodeBlock
+            className="sandbox-artifact__code"
+            code={sourceCode}
+            language={codeLanguage(data.language)}
+          >
+            <CodeBlockHeader>
+              <span>{codeLanguage(data.language)}</span>
+              <CodeBlockCopyButton aria-label="复制组件源码" size="icon-xs" />
+            </CodeBlockHeader>
+          </CodeBlock>
+        </ExpandableContent>
       ) : null}
     </section>
   );

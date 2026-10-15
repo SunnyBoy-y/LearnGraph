@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import or_, select, update
 
@@ -60,6 +60,27 @@ _DEGRADE_KINDS = {
     "selection_quote",
     "error",
 }
+
+
+def _share_token_is_usable(token: SessionShareToken, now: datetime) -> bool:
+    """Whether a bearer token can still open its immutable snapshot."""
+
+    if token.revoked_at is not None:
+        return False
+    expires_at = token.expires_at
+    if expires_at is not None and _utc_datetime(expires_at) <= _utc_datetime(now):
+        return False
+    if token.max_views is not None and token.view_count >= token.max_views:
+        return False
+    return True
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    """Compare SQLite's occasionally-naive timestamps safely with UTC now."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _sanitize_parts(parts: list[dict]) -> list[dict]:
@@ -255,39 +276,144 @@ class SessionSharingService:
             },
         )
         self.db.commit()
+        # Keep the returned ORM row usable after the commit.  SQLAlchemy's
+        # default ``expire_on_commit`` would otherwise leave callers with an
+        # object whose attributes are all expired until a later lazy reload.
+        # Artifact sharing follows the same refresh-after-create contract.
+        self.db.refresh(token)
         return raw_token, token
 
-    def list_shares(self, session_id: str) -> list[SessionShare]:
+    def list_shares(
+        self, session_id: str, *, include_revoked: bool = False
+    ) -> list[SessionShare]:
         self._session_for_workspace(session_id)
-        return list(
-            self.db.scalars(
-                select(SessionShare)
-                .where(
-                    SessionShare.workspace_id == self.workspace_id,
-                    SessionShare.source_session_id == session_id,
-                    SessionShare.status != "deleted",
-                )
-                .order_by(SessionShare.created_at.desc())
+        query = select(SessionShare).where(
+            SessionShare.workspace_id == self.workspace_id,
+            SessionShare.tenant_id == self.tenant_id,
+            SessionShare.source_session_id == session_id,
+            SessionShare.status != "deleted",
+        )
+        if not include_revoked:
+            query = query.where(SessionShare.status == "active")
+        return list(self.db.scalars(query.order_by(SessionShare.created_at.desc())))
+
+    def list_management_shares(
+        self, *, include_revoked: bool = False
+    ) -> list[dict[str, object]]:
+        """Return the workspace-level share rows for settings.
+
+        The default view contains active snapshots, including links that have
+        reached an expiry/view cap (their counters remain useful to the
+        owner).  Explicitly cancelled snapshots are omitted, while
+        ``include_revoked`` is available to operators that need the retained
+        history.  Nothing is deleted when a share is revoked; the snapshot,
+        token counters, and audit trail stay queryable in the database.
+        """
+
+        query = (
+            select(SessionShare, ChatSession)
+            .outerjoin(
+                ChatSession,
+                (ChatSession.id == SessionShare.source_session_id)
+                & (ChatSession.workspace_id == self.workspace_id),
+            )
+            .where(
+                SessionShare.workspace_id == self.workspace_id,
+                SessionShare.tenant_id == self.tenant_id,
+                SessionShare.status != "deleted",
             )
         )
+        if not include_revoked:
+            query = query.where(SessionShare.status == "active")
+        rows = self.db.execute(
+            query.order_by(SessionShare.created_at.desc(), SessionShare.id.desc())
+        ).all()
+        now = utc_now()
+        result: list[dict[str, object]] = []
+        for share, session in rows:
+            tokens = list(
+                self.db.scalars(
+                    select(SessionShareToken)
+                    .where(
+                        SessionShareToken.session_share_id == share.id,
+                        SessionShareToken.workspace_id == self.workspace_id,
+                        SessionShareToken.tenant_id == self.tenant_id,
+                    )
+                    .order_by(SessionShareToken.created_at.desc())
+                )
+            )
+            active_tokens = [
+                token for token in tokens if _share_token_is_usable(token, now)
+            ]
+            viewed_at = [
+                _utc_datetime(token.last_viewed_at)
+                for token in tokens
+                if token.last_viewed_at
+            ]
+            # Prefer a currently usable link for the flattened artifact-like
+            # aliases; fall back to the newest historical token when every
+            # link has expired or been revoked.
+            primary_token = next(
+                (token for token in tokens if _share_token_is_usable(token, now)),
+                tokens[0] if tokens else None,
+            )
+            session_title = (
+                share.title
+                or (session.title if session is not None else None)
+                or "未命名会话"
+            )
+            result.append(
+                {
+                    **share.__dict__,
+                    "session_id": share.source_session_id,
+                    "source_session_id": share.source_session_id,
+                    "session_title": session_title,
+                    "tokens": tokens,
+                    "view_count": sum(token.view_count for token in tokens),
+                    "last_viewed_at": max(viewed_at) if viewed_at else None,
+                    "active_token_count": len(active_tokens),
+                    "token_id": primary_token.id if primary_token else None,
+                    "token_prefix": primary_token.token_prefix if primary_token else "",
+                    "label": primary_token.label if primary_token else "",
+                    "expires_at": primary_token.expires_at if primary_token else None,
+                    "max_views": primary_token.max_views if primary_token else None,
+                    "revoked_at": primary_token.revoked_at if primary_token else None,
+                }
+            )
+        return result
 
     def list_tokens(self, share_id: str) -> list[SessionShareToken]:
         share = self._share_for_workspace(share_id)
         return list(
             self.db.scalars(
                 select(SessionShareToken)
-                .where(SessionShareToken.session_share_id == share.id)
+                .where(
+                    SessionShareToken.session_share_id == share.id,
+                    SessionShareToken.workspace_id == self.workspace_id,
+                    SessionShareToken.tenant_id == self.tenant_id,
+                )
                 .order_by(SessionShareToken.created_at.desc())
             )
         )
 
-    def revoke_token(self, token_id: str) -> SessionShareToken:
+    def revoke_token(
+        self, token_id: str, *, share_id: str | None = None
+    ) -> SessionShareToken:
         token = self.db.scalar(
             select(SessionShareToken)
             .join(SessionShare, SessionShare.id == SessionShareToken.session_share_id)
             .where(
                 SessionShareToken.id == token_id,
+                SessionShareToken.workspace_id == self.workspace_id,
+                SessionShareToken.tenant_id == self.tenant_id,
                 SessionShare.workspace_id == self.workspace_id,
+                SessionShare.tenant_id == self.tenant_id,
+                SessionShare.status != "deleted",
+                *(
+                    (SessionShareToken.session_share_id == share_id,)
+                    if share_id is not None
+                    else ()
+                ),
             )
         )
         if token is None:
@@ -311,6 +437,8 @@ class SessionSharingService:
             update(SessionShareToken)
             .where(
                 SessionShareToken.session_share_id == share.id,
+                SessionShareToken.workspace_id == self.workspace_id,
+                SessionShareToken.tenant_id == self.tenant_id,
                 SessionShareToken.revoked_at.is_(None),
             )
             .values(revoked_at=utc_now())
@@ -345,7 +473,10 @@ class SessionSharingService:
         if (
             token is None
             or token.revoked_at is not None
-            or (token.expires_at is not None and token.expires_at <= now)
+            or (
+                token.expires_at is not None
+                and _utc_datetime(token.expires_at) <= _utc_datetime(now)
+            )
             or (token.max_views is not None and token.view_count >= token.max_views)
         ):
             raise AppError(404, "session_share_not_found", "Session share was not found")
@@ -359,6 +490,8 @@ class SessionSharingService:
                 SessionShareToken.revoked_at.is_(None),
                 or_(
                     SessionShareToken.expires_at.is_(None),
+                    # SQL comparison handles the stored timezone representation;
+                    # the Python guard above protects SQLite's naive values.
                     SessionShareToken.expires_at > now,
                 ),
                 or_(
@@ -446,6 +579,7 @@ class SessionSharingService:
             select(SessionShare).where(
                 SessionShare.id == share_id,
                 SessionShare.workspace_id == self.workspace_id,
+                SessionShare.tenant_id == self.tenant_id,
             )
         )
         if share is None or share.status == "deleted":

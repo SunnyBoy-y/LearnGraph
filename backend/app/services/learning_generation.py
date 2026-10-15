@@ -587,7 +587,7 @@ def generate_raw(
     db.commit()
     result = provider.generate_json(prompt, schema.__name__, schema.model_json_schema())
     usage = dict(getattr(provider, "last_usage", {}) or {})
-    billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0), attempt=1, usage_reported=bool(usage))
+    billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0), attempt=1, usage_reported=bool(usage), usage_units=usage)
     db.commit()
     return result
 

@@ -32,8 +32,11 @@ export function listSessions(): Promise<Session[]> {
   return apiClient.get<Session[]>('/sessions')
 }
 
-export function createSession(payload: SessionCreateRequest = {}): Promise<Session> {
-  return apiClient.post<Session, SessionCreateRequest>('/sessions', payload)
+export function createSession(
+  payload: SessionCreateRequest = {},
+  options: ApiRequestOptions = {},
+): Promise<Session> {
+  return apiClient.post<Session, SessionCreateRequest>('/sessions', payload, options)
 }
 
 export function autoTitleSession(
@@ -137,11 +140,11 @@ export function deleteSessionsBatch(
 }
 
 export type ListSessionMessagesOptions = {
-  /** Newest-window size. Omit for the full timeline (still compact by default). */
+  /** Newest-window size. Omit for the full timeline (text stays lossless). */
   limit?: number
   /** Load the page ending just before this message id (scroll-up). */
   beforeId?: string
-  /** When false, return full durable parts/provider_trace (rare). Default true. */
+  /** When false, also return full nested tool metadata. Default true. */
   compact?: boolean
 }
 

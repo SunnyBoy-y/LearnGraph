@@ -222,6 +222,8 @@ def _blocks(public: dict[str, Any], node: GraphNode, source: str) -> list[str]:
         blocks.append(f"节点说明：{_text(node.description, 1_000)}")
     blueprint = public.get("blueprint")
     if blueprint:
+        if blueprint.get("title"):
+            blocks.append(f"课程：{blueprint['title']}")
         objective_text = "、".join(blueprint.get("objectives") or []) or "（未提供）"
         blocks.append(f"学习目标：{objective_text}")
     lesson = public.get("lesson")

@@ -32,6 +32,7 @@ import {
   Files,
   Focus,
   Folder,
+  FolderOpen,
   FolderPlus,
   GitBranch,
   GraduationCap,
@@ -76,7 +77,12 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -92,6 +98,7 @@ import {
 import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { SettingsModal } from "@/components/layout/settings-modal";
+import { RouteMotion } from "@/components/shared/route-motion";
 import { NativeActions } from "@/features/mobile/NativeActions";
 import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
 import {
@@ -133,8 +140,11 @@ const KnowledgeGraph = lazy(() =>
   })),
 );
 import { NodeExploreChain } from "@/components/graph/node-explore";
-import { SessionFilesList } from "@/features/chat/session-files-list";
-import { TrajectoryRail } from "@/features/trajectory/TrajectoryRail";
+import {
+  SessionFilePreviewRail,
+  SideConversationRail,
+} from "@/features/chat/right-rail-panels";
+import { MemoryProcessRail } from "@/features/memory/components/memory-process-rail";
 import { VoiceLatencyRail } from "@/features/voice/voice-debug-panel";
 import { SessionShareDialog } from "@/features/chat/session-share-dialog";
 import {
@@ -161,11 +171,14 @@ import {
   updateGraphNode,
   updateProject as updateProjectRecord,
   updateSession,
-  updateSetting,
 } from "@/api";
 import { createSession } from "@/api/sessions";
 import {
   clearDraftSessionId,
+  draftSessionScope,
+  getDraftSessionCreationKey,
+  getDraftSessionProjectId,
+  getOrCreateDraftSession,
   getDraftSessionId,
   isDefaultDraftTitle,
   setDraftSessionId,
@@ -183,16 +196,17 @@ import {
   setSessionComposerPrefs,
 } from "@/lib/session-composer-prefs";
 import { readChatDefaultResponseMode } from "@/lib/workspace-settings";
+import { isVoiceDebugPanelEnabled } from "@/lib/workspace-settings";
 import {
-  isTrajectoryEnabled,
-  isVoiceDebugPanelEnabled,
-} from "@/lib/workspace-settings";
-import {
+  readSidebarFolderState,
   readSidebarProjectFolders,
-  resolveSidebarProjectOpen,
-  UI_PREFERENCES_SETTING_KEY,
-  withSidebarProjectFolder,
-  type SidebarProjectFolders,
+  SIDEBAR_FOLDER_STATE_EVENT,
+  SIDEBAR_FOLDER_STATE_STORAGE_KEY,
+  sidebarFolderStateKey,
+  writeSidebarFolderState,
+  type SidebarFolderKind,
+  type SidebarFolderRef,
+  type SidebarFolderState,
 } from "@/lib/sidebar-folders";
 import type { Session } from "@/types/sessions";
 import type { Graph, GraphNode, GraphSummary } from "@/types/graphs";
@@ -278,6 +292,9 @@ type LearningNodeContext = {
   graphId: string;
   nodeId?: string;
   nodeLabel?: string;
+  sessionId?: string;
+  learningPackage?: boolean;
+  openKey?: string;
 };
 
 type LearningProjectRequest = {
@@ -290,10 +307,18 @@ type LearningProjectRequest = {
   graphAction?: "none" | "propose_create" | "propose_update";
   /** Marks a learning-package canvas entry and receives async open failures. */
   learningPackage?: boolean;
+  /** A fresh identity for every graph-open request, including cache hits. */
+  openKey?: string;
   onError?: (message: string) => void;
 };
 
 const LEARNING_NODE_CONTEXT_STORAGE_KEY = "learngraph:active-learning-node";
+let learningPackageOpenSequence = 0;
+
+function nextLearningPackageOpenKey() {
+  learningPackageOpenSequence += 1;
+  return `graph-learning-${Date.now()}-${learningPackageOpenSequence}`;
+}
 
 function findProjectForSession(projects: SidebarProject[], sessionId?: string) {
   return projects.find((project) =>
@@ -601,73 +626,99 @@ function SidebarNav({
     [settingsQuery.data],
   );
   const [activeSessionId, setActiveSessionId] = useState("");
-  // 图谱文件夹（项目）默认折叠，每次手动开合都入库到工作区设置 ui.preferences。
-  // 该键与 theme 共用，所以写回是「读最新值 → 合并一个字段 → 整体覆盖」。
-  const persistedProjectFolders = useMemo(
-    () =>
-      readSidebarProjectFolders(
-        settingsQuery.data as WorkspaceSetting[] | undefined,
-      ),
-    [settingsQuery.data],
+  /** The project folder targeted by both "new conversation" entry points. */
+  const [selectedProjectId, setSelectedProjectId] = useState<string>();
+  const routedSessionIdRef = useRef("");
+  /**
+   * 项目文件夹和父会话文件夹共用一份前端本地状态。按 workspace 隔离，
+   * 因此切换工作区不会把另一边的折叠偏好带过来。
+   */
+  const [folderState, setFolderState] = useState<SidebarFolderState>(() =>
+    readSidebarFolderState(workspaceId),
   );
-  // 本次访问里用户手动开合过的文件夹：立即生效，并优先于自动展开与入库状态。
-  const [folderOverrides, setFolderOverrides] = useState<SidebarProjectFolders>(
-    {},
-  );
-  const folderOverridesRef = useRef<SidebarProjectFolders>({});
-  // 写回串行化：两次快速开合若并发做读改写，后一次会把前一次的字段覆盖掉。
-  const folderSaveChain = useRef<Promise<unknown>>(Promise.resolve());
-  // 当前会话所在的文件夹本次访问临时展开（用户手动折叠后由 overrides 接管）。
-  const activeProjectId = useMemo(
-    () => findProjectForSession(projects, activeSessionId)?.id,
-    [activeSessionId, projects],
-  );
-  const projectFolderOpen = useMemo(() => {
-    const open: SidebarProjectFolders = {};
-    for (const project of projects) {
-      open[project.id] = resolveSidebarProjectOpen({
-        projectId: project.id,
-        activeProjectId,
-        overrides: folderOverrides,
-        persisted: persistedProjectFolders,
-      });
+  const folderStateRef = useRef<SidebarFolderState>(folderState);
+
+  useEffect(() => {
+    const next = readSidebarFolderState(workspaceId);
+    folderStateRef.current = next;
+    setFolderState(next);
+  }, [workspaceId]);
+
+  // Migrate the previous server-backed project-folder preference once. New
+  // interactions are local-only, but existing users should not lose the
+  // layout they already chose when this version switches storage backends.
+  useEffect(() => {
+    const legacy = readSidebarProjectFolders(
+      settingsQuery.data as WorkspaceSetting[] | undefined,
+    );
+    if (!Object.keys(legacy).length) return;
+    const current = folderStateRef.current;
+    const migrated = { ...current };
+    let changed = false;
+    for (const [projectId, open] of Object.entries(legacy)) {
+      const key = sidebarFolderStateKey("project", projectId);
+      if (typeof migrated[key] === "boolean") continue;
+      migrated[key] = open;
+      changed = true;
     }
-    return open;
-  }, [activeProjectId, folderOverrides, persistedProjectFolders, projects]);
-  const toggleProjectFolder = useCallback(
-    (projectId: string, open: boolean) => {
-      const next = { ...folderOverridesRef.current, [projectId]: open };
-      folderOverridesRef.current = next;
-      setFolderOverrides(next);
-      folderSaveChain.current = folderSaveChain.current
-        .catch(() => undefined)
-        .then(async () => {
-          const current = queryClient
-            .getQueryData<WorkspaceSetting[]>(settingsQueryKey)
-            ?.find((item) => item.key === UI_PREFERENCES_SETTING_KEY)?.value;
-          return updateSetting(
-            UI_PREFERENCES_SETTING_KEY,
-            withSidebarProjectFolder(current, projectId, open),
-          );
-        })
-        .then((setting) => {
-          queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
-            ...(current ?? []).filter((item) => item.key !== setting.key),
-            setting,
-          ]);
-        })
-        .catch((error: unknown) => {
-          // 入库失败就丢掉本次访问的本地决定，回到服务端状态，避免本地显示与
-          // 刷新后的结果不一致。
-          folderOverridesRef.current = {};
-          setFolderOverrides({});
-          void queryClient.invalidateQueries({ queryKey: settingsQueryKey });
-          toast.error(
-            error instanceof Error ? error.message : "文件夹折叠状态保存失败",
-          );
-        });
+    if (!changed) return;
+    folderStateRef.current = migrated;
+    setFolderState(migrated);
+    writeSidebarFolderState(workspaceId, migrated);
+    window.dispatchEvent(new Event(SIDEBAR_FOLDER_STATE_EVENT));
+  }, [settingsQuery.data, workspaceId]);
+
+  // 其它标签页修改折叠状态时同步当前侧栏；本页点击仍然走下面的同步
+  // ref + state 路径，所以不会依赖 storage 事件（浏览器不会向发起页派发它）。
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        event.key !== null &&
+        event.key !== SIDEBAR_FOLDER_STATE_STORAGE_KEY
+      )
+        return;
+      const next = readSidebarFolderState(workspaceId);
+      folderStateRef.current = next;
+      setFolderState(next);
+    };
+    const handleLocalChange = () => {
+      const next = readSidebarFolderState(workspaceId);
+      folderStateRef.current = next;
+      setFolderState(next);
+    };
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener(SIDEBAR_FOLDER_STATE_EVENT, handleLocalChange);
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(SIDEBAR_FOLDER_STATE_EVENT, handleLocalChange);
+    };
+  }, [workspaceId]);
+
+  const setFolderOpen = useCallback(
+    (kind: SidebarFolderKind, id: string, open: boolean) => {
+      const next = {
+        ...folderStateRef.current,
+        [sidebarFolderStateKey(kind, id)]: open,
+      };
+      folderStateRef.current = next;
+      setFolderState(next);
+      writeSidebarFolderState(workspaceId, next);
+      window.dispatchEvent(new Event(SIDEBAR_FOLDER_STATE_EVENT));
     },
-    [queryClient, settingsQueryKey],
+    [workspaceId],
+  );
+  const setFoldersOpen = useCallback(
+    (folders: SidebarFolderRef[], open: boolean) => {
+      const next = { ...folderStateRef.current };
+      for (const folder of folders) {
+        next[sidebarFolderStateKey(folder.kind, folder.id)] = open;
+      }
+      folderStateRef.current = next;
+      setFolderState(next);
+      writeSidebarFolderState(workspaceId, next);
+      window.dispatchEvent(new Event(SIDEBAR_FOLDER_STATE_EVENT));
+    },
+    [workspaceId],
   );
   /** Empty draft kept for reuse; hidden from the sidebar until the first message. */
   const [hiddenDraftSessionId, setHiddenDraftSessionId] = useState<string | null>(
@@ -716,17 +767,59 @@ function SidebarNav({
       pathname.match(/\/chat\/([^/]+)/)?.[1];
     if (!currentSessionId) return;
     setActiveSessionId(currentSessionId);
-    publishProjectContext(
-      findProjectForSession(projects, currentSessionId),
-      currentSessionId,
+    const currentProject = findProjectForSession(projects, currentSessionId);
+    publishProjectContext(currentProject, currentSessionId);
+    // `/chat/new` is a standalone blank canvas. Do not carry a project target
+    // from the last historical session into it, otherwise the shell can create
+    // a project draft while the canvas is creating its root draft at the same
+    // time.
+    if (currentSessionId === "new") {
+      if (routedSessionIdRef.current !== currentSessionId) {
+        routedSessionIdRef.current = currentSessionId;
+        setSelectedProjectId(undefined);
+      }
+      return;
+    }
+    // A route change means the user selected a conversation, so its parent
+    // folder becomes the next-create target. Do not overwrite a folder that
+    // the user explicitly clicked merely because the project query refetched.
+    const routedSession = sessionsQuery.data?.find(
+      (session) => session.id === currentSessionId,
     );
-  }, [pathname, projects, publishProjectContext, search]);
+    const projectReady =
+      Boolean(routedSession) &&
+      (!routedSession?.project_id || currentProject?.id === routedSession.project_id);
+    if (routedSessionIdRef.current !== currentSessionId && projectReady) {
+      routedSessionIdRef.current = currentSessionId;
+      setSelectedProjectId(currentProject?.id);
+    }
+  }, [
+    pathname,
+    projects,
+    publishProjectContext,
+    search,
+    sessionsQuery.data,
+    workspaceId,
+  ]);
 
-  const trackDraftSession = useCallback((sessionId: string) => {
-    draftSessionId.current = sessionId;
-    setDraftSessionId(sessionId);
-    setHiddenDraftSessionId(sessionId);
-  }, []);
+  useEffect(() => {
+    if (
+      selectedProjectId &&
+      projectsQuery.data &&
+      !projects.some((project) => project.id === selectedProjectId)
+    ) {
+      setSelectedProjectId(undefined);
+    }
+  }, [projects, projectsQuery.data, selectedProjectId]);
+
+  const trackDraftSession = useCallback(
+    (sessionId: string, projectId: string | null = null) => {
+      draftSessionId.current = sessionId;
+      setDraftSessionId(sessionId, projectId);
+      setHiddenDraftSessionId(sessionId);
+    },
+    [],
+  );
 
   const releaseDraftSession = useCallback((sessionId?: string) => {
     if (sessionId && draftSessionId.current !== sessionId) return;
@@ -888,7 +981,7 @@ function SidebarNav({
         "learngraph:session-created",
         addCreatedSession,
       );
-  }, [pathname, queryClient, sessionActivity, trackDraftSession]);
+  }, [pathname, queryClient, sessionActivity, trackDraftSession, workspaceId]);
 
   useEffect(() => {
     const bindProjectGraph = (event: Event) => {
@@ -944,6 +1037,8 @@ function SidebarNav({
             learningNode?: LearningNodeContext;
             pendingGraphAction?: "none" | "propose_create" | "propose_update";
             learningPackage?: boolean;
+            /** Identifies the pinned top-level button from project-row actions. */
+            fromNewConversationNav?: boolean;
             onError?: (message: string) => void;
             /** When true, always create a fresh session (project / learning entry). */
             forceNew?: boolean;
@@ -952,18 +1047,38 @@ function SidebarNav({
       const options =
         typeof input === "string" ? { projectId: input } : (input ?? {});
       const projectId = options.projectId;
+      const draftScope = draftSessionScope(workspaceId, projectId);
+      const draftProjectId = getDraftSessionProjectId();
+      const canReuseDraft = Boolean(
+        !options.forceNew &&
+          !options.pendingPrompt &&
+          !options.learningNode &&
+          !options.learningPackage &&
+          draftSessionId.current &&
+          (draftProjectId ?? null) === (projectId ?? null),
+      );
+      const reusableDraftId = canReuseDraft ? draftSessionId.current : null;
+      const isNewRouteAction = Boolean(
+        options.fromNewConversationNav &&
+          pathname.endsWith("/chat/new") &&
+          !new URLSearchParams(search).has("mode"),
+      );
       // 「新会话」是一次会话切换，不是"在同一个会话里继续"：通话属于它所在的那个会话，
       // 必须先挂断再建新的。不这么做，新会话会被上一通电话的自动拨号带走（语音页
       // 监听这个事件做挂断与退出语音模式）。
       window.dispatchEvent(new CustomEvent("learngraph:new-conversation"));
-      // Reuse the single empty draft so multi-click "新对话" never spawns duplicates.
       if (
-        !projectId &&
+        isNewRouteAction &&
         !options.forceNew &&
         !options.pendingPrompt &&
         !options.learningNode &&
-        draftSessionId.current
+        !options.learningPackage
       ) {
+        onNavigate?.();
+        return;
+      }
+      // Reuse the single empty draft so multi-click "新对话" never spawns duplicates.
+      if (reusableDraftId) {
         // Empty drafts opened via "新对话" should always present the workspace
         // default response mode, even if an earlier race polluted localStorage.
         // If the workspace setting is still loading, fetch it first so we do
@@ -984,11 +1099,11 @@ function SidebarNav({
           }
         }
         setSessionComposerPrefs(
-          draftSessionId.current,
+          reusableDraftId,
           defaultComposerPrefsForResponseMode(resolvedMode),
         );
-        setActiveSessionId(draftSessionId.current);
-        navigate(`${base}/chat/${draftSessionId.current}`);
+        setActiveSessionId(reusableDraftId);
+        navigate(`${base}/chat/${reusableDraftId}`);
         onNavigate?.();
         return;
       }
@@ -998,13 +1113,29 @@ function SidebarNav({
       try {
         const project =
           options.project ?? projects.find((entry) => entry.id === projectId);
-        const session = await createSession({
+        const payload = {
           memory_enabled: true,
           title: "新会话",
           goal_id: project?.goalId ?? null,
           graph_id: project?.graphId ?? null,
+          current_node_id: options.learningNode?.nodeId ?? null,
           project_id: project?.id ?? null,
-        });
+        };
+        const isEmptyDraftRequest = Boolean(
+          !options.forceNew &&
+            !options.pendingPrompt &&
+            !options.learningNode &&
+            !options.learningPackage,
+        );
+        const session = await (isEmptyDraftRequest
+          ? getOrCreateDraftSession(draftScope, () =>
+              createSession(payload, {
+                headers: {
+                  "Idempotency-Key": getDraftSessionCreationKey(draftScope),
+                },
+              }),
+            )
+          : createSession(payload));
         // Seed the workspace default response mode before the chat canvas
         // hydrates, so a new draft does not inherit another session's "极速".
         // If the workspace setting is still loading (e.g. the user clicked
@@ -1038,6 +1169,12 @@ function SidebarNav({
           ...(current ?? []).filter((item) => item.id !== session.id),
         ]);
         const sidebarSession = toSidebarSession(session);
+        if (isEmptyDraftRequest) {
+          // Keep the current empty draft reusable even when it belongs to a
+          // project. A second click in the same project must switch back to
+          // this draft instead of creating another blank row.
+          trackDraftSession(session.id, session.project_id ?? null);
+        }
         if (projectId) {
           // Project-scoped chats appear immediately under the project.
           setProjects((current) =>
@@ -1058,7 +1195,11 @@ function SidebarNav({
                 : entry,
             ),
           );
-        } else if (options.pendingPrompt || options.learningNode) {
+        } else if (
+          options.pendingPrompt ||
+          options.learningNode ||
+          options.learningPackage
+        ) {
           // Learning-entry paths already have content intent — list them.
           releaseDraftSession();
           setUngroupedSessions((current) =>
@@ -1072,9 +1213,9 @@ function SidebarNav({
               sessionActivity,
             ),
           );
-        } else {
+        } else if (isEmptyDraftRequest) {
           // Empty draft: track for reuse; show while viewing, hide after leave.
-          trackDraftSession(session.id);
+          trackDraftSession(session.id, session.project_id ?? null);
           setUngroupedSessions((current) =>
             nestSidebarSessions(
               [
@@ -1088,9 +1229,13 @@ function SidebarNav({
           );
         }
         setActiveSessionId(session.id);
+        setSelectedProjectId(project?.id);
         publishProjectContext(project, session.id);
         if (options.learningNode)
-          publishLearningNodeContext(options.learningNode);
+          publishLearningNodeContext({
+            ...options.learningNode,
+            sessionId: session.id,
+          });
         const navigationState =
           options.pendingPrompt || options.learningNode
             ? {
@@ -1123,12 +1268,16 @@ function SidebarNav({
       base,
       navigate,
       onNavigate,
+      pathname,
       projects,
       publishProjectContext,
       queryClient,
       releaseDraftSession,
+      settingsQuery.isPending,
       sessionActivity,
       trackDraftSession,
+      search,
+      workspaceId,
       workspaceDefaultResponseMode,
     ],
   );
@@ -1172,21 +1321,24 @@ function SidebarNav({
       const prompt =
         request.prompt?.trim() ||
         (request.nodeLabel ? `什么是 ${request.nodeLabel}？` : undefined);
+      const openKey = request.openKey?.trim() || nextLearningPackageOpenKey();
       await createConversation({
         projectId: project.id,
         project,
         pendingPrompt: prompt,
         pendingGraphAction: request.graphAction,
-          learningNode: {
-            graphId,
-            nodeId: request.nodeId,
-            nodeLabel: request.nodeLabel,
-          },
+        learningNode: {
+          graphId,
+          nodeId: request.nodeId,
+          nodeLabel: request.nodeLabel,
           learningPackage: request.learningPackage,
-          onError: request.onError,
-        });
+          openKey,
+        },
+        learningPackage: request.learningPackage,
+        onError: request.onError,
+      });
     },
-    [createConversation, projects, queryClient],
+    [createConversation, projects, queryClient, workspaceId],
   );
 
   useEffect(() => {
@@ -1508,6 +1660,12 @@ function SidebarNav({
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") }),
         queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memory") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memories") }),
+        queryClient.invalidateQueries({ queryKey: ["memory-pending"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-drafts"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-episodes"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-context-manifests"] }),
       ]);
       toast.success(
         deleteTarget.kind === "session"
@@ -1672,7 +1830,12 @@ function SidebarNav({
           data-nav-label={item.label}
           disabled={creatingConversation}
           key={`${item.label}-${item.path}`}
-          onClick={() => void createConversation()}
+          onClick={() =>
+            void createConversation({
+              projectId: selectedProjectId,
+              fromNewConversationNav: true,
+            })
+          }
           type="button"
         >
           <Icon
@@ -1687,6 +1850,7 @@ function SidebarNav({
     }
     return (
       <NavLink
+        aria-label={item.label}
         className={className}
         data-nav-label={item.label}
         key={`${item.label}-${item.path}`}
@@ -1709,6 +1873,7 @@ function SidebarNav({
         collapsed && "is-collapsed",
         mobile && "is-mobile",
       )}
+      data-sidebar-state={collapsed && !mobile ? "collapsed" : "expanded"}
     >
       <div className="sidebar-nav__top flex items-center justify-between">
         {collapsed && !mobile ? (
@@ -1716,7 +1881,9 @@ function SidebarNav({
             <TooltipTrigger asChild>
               <Button
                 aria-label="展开侧边栏"
+                aria-expanded={false}
                 className="sidebar-brand flex items-center gap-2 px-2 py-2"
+                data-sidebar-toggle="expand"
                 onClick={onCollapse}
                 variant="ghost"
               >
@@ -1761,6 +1928,8 @@ function SidebarNav({
         {!mobile && !collapsed ? (
           <Button
             aria-label="折叠侧边栏"
+            aria-expanded={true}
+            data-sidebar-toggle="collapse"
             onClick={onCollapse}
             size="icon-sm"
             title="折叠侧边栏"
@@ -1790,6 +1959,7 @@ function SidebarNav({
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
+                      aria-label="更多"
                       className={cn(
                         "w-full justify-start gap-3 rounded-xl px-3",
                         moreActive &&
@@ -1827,14 +1997,17 @@ function SidebarNav({
 
         <SessionProjects
           activeSessionId={activeSessionId}
-          onToggleProjectFolder={toggleProjectFolder}
-          projectFolderOpen={projectFolderOpen}
+          folderState={folderState}
+          selectedProjectId={selectedProjectId}
+          onToggleFolder={setFolderOpen}
+          onToggleFolders={setFoldersOpen}
           workspaceId={workspaceId}
-          onCreateConversation={(projectId) =>
-            projectId
-              ? createConversation(projectId)
-              : createConversation()
-          }
+          onCreateConversation={(projectId) => {
+            const targetProjectId = projectId ?? selectedProjectId;
+            return targetProjectId
+              ? createConversation(targetProjectId)
+              : createConversation();
+          }}
           onCreateProject={async (title) => {
             const created = await createProjectRecord({ title });
             await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
@@ -1867,10 +2040,12 @@ function SidebarNav({
           onSelectSession={(sessionId, project) => {
             markSessionViewed(sessionId);
             setActiveSessionId(sessionId);
+            setSelectedProjectId(project?.id);
             publishProjectContext(project, sessionId);
             navigate(`${base}/chat/${sessionId}`);
             onNavigate?.();
           }}
+          onSelectProject={(projectId) => setSelectedProjectId(projectId)}
           projects={projects}
           ungroupedSessions={ungroupedSessions}
         />
@@ -1951,8 +2126,10 @@ const MemoSidebarNav = memo(SidebarNav);
 function SessionProjects({
   workspaceId,
   activeSessionId,
-  projectFolderOpen,
-  onToggleProjectFolder,
+  folderState,
+  selectedProjectId,
+  onToggleFolder,
+  onToggleFolders,
   onCreateConversation,
   onCreateProject,
   onRequestProjectDeletion,
@@ -1966,16 +2143,24 @@ function SessionProjects({
   onToggleSessionPin,
   onToggleSessionArchive,
   onShareSession,
+  onSelectProject,
   onSelectSession,
   projects,
   ungroupedSessions,
 }: {
   workspaceId: string;
   activeSessionId: string;
-  /** 项目文件夹的已解析开合状态（缺省折叠；当前会话所在文件夹临时展开）。 */
-  projectFolderOpen: Record<string, boolean>;
-  /** 用户手动开合某个文件夹：立即生效并入库。 */
-  onToggleProjectFolder: (projectId: string, open: boolean) => void;
+  /** 项目和父会话文件夹共用的前端本地开合状态。 */
+  folderState: SidebarFolderState;
+  /** 当前新建会话要落入的项目文件夹。 */
+  selectedProjectId?: string;
+  /** 统一写入某一种文件夹的开合状态。 */
+  onToggleFolder: (
+    kind: SidebarFolderKind,
+    id: string,
+    open: boolean,
+  ) => void;
+  onToggleFolders: (folders: SidebarFolderRef[], open: boolean) => void;
   onCreateConversation: (projectId?: string) => Promise<void>;
   onCreateProject: (title: string) => Promise<string>;
   onRequestProjectDeletion: (project: SidebarProject) => void;
@@ -1992,6 +2177,7 @@ function SessionProjects({
   onToggleSessionPin: (session: SidebarSession) => void;
   onToggleSessionArchive: (session: SidebarSession) => void;
   onShareSession: (session: SidebarSession) => void;
+  onSelectProject: (projectId?: string) => void;
   onSelectSession: (sessionId: string, project?: SidebarProject) => void;
   projects: SidebarProject[];
   ungroupedSessions: SidebarSession[];
@@ -2006,10 +2192,6 @@ function SessionProjects({
       window.removeEventListener("storage", refresh);
     };
   }, []);
-  // Parent conversations with nested 划词解释 / side threads act as folders.
-  const [expandedSessions, setExpandedSessions] = useState<
-    Record<string, boolean>
-  >({});
   const [creatingProject, setCreatingProject] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -2087,6 +2269,66 @@ function SessionProjects({
       ),
     [normalizedQuery, sessionActivity, ungroupedSessions],
   );
+  const activeProjectId = useMemo(
+    () => findProjectForSession(projects, activeSessionId)?.id,
+    [activeSessionId, projects],
+  );
+  const projectFolderOpen = useMemo(() => {
+    const open: Record<string, boolean> = {};
+    for (const project of projects) {
+      const stored = folderState[sidebarFolderStateKey("project", project.id)];
+      // A currently viewed project's folder is revealed until the user makes
+      // an explicit choice. An explicit local false always wins.
+      open[project.id] =
+        typeof stored === "boolean"
+          ? stored
+          : project.id === activeProjectId;
+    }
+    return open;
+  }, [activeProjectId, folderState, projects]);
+  const sessionFolderOpen = useMemo(() => {
+    const open: Record<string, boolean> = {};
+    const sessions = [
+      ...projects.flatMap((project) => flattenSidebarSessions(project.sessions)),
+      ...flattenSidebarSessions(ungroupedSessions),
+    ];
+    for (const session of sessions) {
+      if (!session.children?.length) continue;
+      const stored = folderState[sidebarFolderStateKey("session", session.id)];
+      const childActive = flattenSidebarSessions(session.children).some(
+        (child) => child.id === activeSessionId,
+      );
+      open[session.id] =
+        typeof stored === "boolean" ? stored : childActive;
+    }
+    return open;
+  }, [activeSessionId, folderState, projects, ungroupedSessions]);
+  const folderEntries = useMemo(
+    () => [
+      ...projects.map((project) => ({
+        kind: "project" as const,
+        id: project.id,
+      })),
+      ...projects
+        .flatMap((project) => flattenSidebarSessions(project.sessions))
+        .filter((session) => session.children?.length)
+        .map((session) => ({ kind: "session" as const, id: session.id })),
+      ...flattenSidebarSessions(ungroupedSessions)
+        .filter((session) => session.children?.length)
+        .map((session) => ({ kind: "session" as const, id: session.id })),
+    ],
+    [projects, ungroupedSessions],
+  );
+  const allFoldersCollapsed =
+    folderEntries.length > 0 &&
+    folderEntries.every((folder) => {
+      if (folder.kind === "project") return !projectFolderOpen[folder.id];
+      return !sessionFolderOpen[folder.id];
+    });
+  function toggleAllFolders() {
+    const open = allFoldersCollapsed;
+    onToggleFolders(folderEntries, open);
+  }
   const visibleSessionIds = useMemo(
     () =>
       new Set([
@@ -2204,8 +2446,10 @@ function SessionProjects({
     if (!title) return;
     try {
       const id = await onCreateProject(title);
-      // 刚建的空文件夹先展开，方便直接往里加对话；折叠回去同样会入库。
-      onToggleProjectFolder(id, true);
+      // 刚建的空文件夹先展开，方便直接往里加对话；折叠回去同样会
+      // 写入前端本地偏好。
+      onToggleFolder("project", id, true);
+      onSelectProject(id);
       setProjectName("");
       setCreatingProject(false);
     } catch (error) {
@@ -2237,10 +2481,12 @@ function SessionProjects({
   }
 
   function toggleSessionFolder(sessionId: string) {
-    setExpandedSessions((current) => ({
-      ...current,
-      [sessionId]: !(current[sessionId] ?? true),
-    }));
+    // Search temporarily reveals matching children; treat that visual state
+    // as open so clicking the chevron can still save an intentional collapse.
+    const current = normalizedQuery
+      ? true
+      : (sessionFolderOpen[sessionId] ?? false);
+    onToggleFolder("session", sessionId, !current);
   }
 
   function renderSessionRow(
@@ -2263,14 +2509,22 @@ function SessionProjects({
     );
     const children = session.children ?? [];
     const hasChildren = children.length > 0;
-    const open = expandedSessions[session.id] ?? true;
+    const open = sessionFolderOpen[session.id] ?? false;
     const childActive =
       hasChildren &&
       flattenSidebarSessions(children).some(
         (child) => child.id === activeSessionId,
       );
-    // Auto-expand when a nested child is the active route.
-    const effectivelyOpen = open || childActive;
+    // Search reveals matching children, while an explicit local false still
+    // wins over the active-child convenience expansion.
+    const hasStoredOpen =
+      typeof folderState[sidebarFolderStateKey("session", session.id)] ===
+      "boolean";
+    const effectivelyOpen = normalizedQuery
+      ? true
+      : hasStoredOpen
+        ? open
+        : open || childActive;
     // Read the marker during render so active voice sessions are identifiable
     // even after navigating away from the conversation route.
     void voiceMarkerVersion;
@@ -2294,31 +2548,6 @@ function SessionProjects({
               checked={selectedSessionIds.has(session.id)}
               onCheckedChange={() => toggleSessionSelection(session.id)}
             />
-          ) : null}
-          {hasChildren && !selectionMode ? (
-            <button
-              aria-expanded={effectivelyOpen}
-              aria-label={
-                effectivelyOpen
-                  ? `折叠 ${displayTitle} 的附属会话`
-                  : `展开 ${displayTitle} 的附属会话`
-              }
-              className="sidebar-session__fold"
-              onClick={(event) => {
-                event.stopPropagation();
-                toggleSessionFolder(session.id);
-              }}
-              type="button"
-            >
-              <ChevronRight
-                className={cn(
-                  "size-3 transition-transform",
-                  effectivelyOpen && "rotate-90",
-                )}
-              />
-            </button>
-          ) : depth > 0 && !selectionMode ? (
-            <span aria-hidden="true" className="sidebar-session__fold-spacer" />
           ) : null}
           {renamingSessionId === session.id ? (
             <form
@@ -2367,8 +2596,14 @@ function SessionProjects({
                   longPressRef.current.fired = false;
                   return;
                 }
-                if (selectionMode) toggleSessionSelection(session.id);
-                else onSelectSession(session.id, options.project);
+                if (selectionMode) {
+                  toggleSessionSelection(session.id);
+                  return;
+                }
+                // Folder rows no longer show a collapse arrow: the whole row
+                // remains the single, quiet-line interaction target.
+                if (hasChildren) toggleSessionFolder(session.id);
+                onSelectSession(session.id, options.project);
               }}
               onContextMenu={(event) => {
                 if (selectionMode) return;
@@ -2387,6 +2622,19 @@ function SessionProjects({
                   className="sidebar-session__unread-dot"
                   title="模型回复已完成"
                 />
+              ) : null}
+              {hasChildren ? (
+                effectivelyOpen ? (
+                  <FolderOpen
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0"
+                  />
+                ) : (
+                  <Folder
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0"
+                  />
+                )
               ) : null}
               <span className="min-w-0 flex-1 truncate">{displayTitle}</span>
               {voiceActive ? <span aria-label="语音导师已开启" className="sidebar-session__voice" title="语音导师已开启">◉</span> : null}
@@ -2543,6 +2791,31 @@ function SessionProjects({
       <div className="sidebar-sessions__heading group flex items-center justify-between px-3">
         <p className="text-sm font-bold text-foreground">会话</p>
         <div className="sidebar-sessions__header-actions">
+          {folderEntries.length ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label={
+                    allFoldersCollapsed ? "展开所有文件夹" : "折叠所有文件夹"
+                  }
+                  className="sidebar-sessions__folders-trigger"
+                  onClick={toggleAllFolders}
+                  size="icon-xs"
+                  variant="ghost"
+                >
+                  <ChevronDown
+                    className={cn(
+                      "size-3.5 transition-transform",
+                      allFoldersCollapsed && "-rotate-90",
+                    )}
+                  />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="right">
+                {allFoldersCollapsed ? "展开所有文件夹" : "折叠所有文件夹"}
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -2672,6 +2945,7 @@ function SessionProjects({
               <div
                 className={cn(
                   "sidebar-project__heading group",
+                  selectedProjectId === project.id && "is-current",
                   selectionMode && "is-selecting",
                 )}
               >
@@ -2685,29 +2959,37 @@ function SessionProjects({
                 ) : null}
                 <button
                   aria-expanded={open}
+                  aria-label={
+                    open
+                      ? `折叠文件夹 ${project.title}`
+                      : `展开文件夹 ${project.title}`
+                  }
+                  aria-pressed={selectedProjectId === project.id}
                   className="sidebar-project__header"
                   onClick={() => {
                     if (selectionMode) {
                       toggleProjectSelection(project);
                       return;
                     }
-                    onToggleProjectFolder(project.id, !open);
+                    onSelectProject(project.id);
+                    onToggleFolder("project", project.id, !open);
                   }}
                   type="button"
                 >
-                  <Folder className="size-3.5" />
+                  {open ? (
+                    <FolderOpen
+                      aria-hidden="true"
+                      className="size-3.5"
+                    />
+                  ) : (
+                    <Folder aria-hidden="true" className="size-3.5" />
+                  )}
                   <span>{project.title}</span>
                   <small>
                     {project.status === "archived"
                       ? "已归档"
                       : project.sessions.length}
                   </small>
-                  <ChevronRight
-                    className={cn(
-                      "size-3.5 transition-transform",
-                      open && "rotate-90",
-                    )}
-                  />
                 </button>
                 {!selectionMode ? (
                 <DropdownMenu>
@@ -2762,7 +3044,10 @@ function SessionProjects({
                   ) : (
                     <button
                       className="sidebar-project__empty"
-                      onClick={() => void onCreateConversation(project.id)}
+                      onClick={() => {
+                        onSelectProject(project.id);
+                        void onCreateConversation(project.id);
+                      }}
                       type="button"
                     >
                       新建此项目的对话
@@ -2887,6 +3172,7 @@ function UserMenu({
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
+          aria-label={`打开用户菜单（${username}）`}
           className={cn(
             "sidebar-user-menu mt-auto h-auto w-full shrink-0 justify-start gap-3 overflow-hidden rounded-xl px-2 py-2",
             collapsed && !mobile && "px-0",
@@ -3045,9 +3331,12 @@ function MobileNavDrawer({
       />
       <div
         aria-label="LearnGraph 导航"
+        aria-hidden={!open && !dragging}
         aria-modal={open ? true : undefined}
         className={cn("mobile-nav-drawer", open && "is-open")}
+        data-drawer-state={open ? "open" : "closed"}
         data-drawer-surface="nav"
+        inert={!open && !dragging ? true : undefined}
         ref={panelRef}
         role="dialog"
         tabIndex={-1}
@@ -3196,6 +3485,7 @@ function TopBar({
   const { workspaceId = "" } = useParams();
   const auth = useAuth();
   const isChat = pathname.includes("/chat/");
+  const isMemory = pathname.includes("/memory");
   // 页面预览的全局暂停只属于「产物」页，其它页面顶栏不再常驻该按钮。
   const isArtifacts = pathname.includes("/artifacts");
   const previewsPaused = useAllPreviewsPaused();
@@ -3270,13 +3560,21 @@ function TopBar({
         {onToggleGraph ? (
           <Button
             aria-expanded={graphOpen}
-            aria-label={graphOpen ? "收起图谱面板" : "展开图谱面板"}
+            aria-label={
+              graphOpen
+                ? isMemory
+                  ? "收起 AI 导师过程面板"
+                  : "收起图谱面板"
+                : isMemory
+                  ? "展开 AI 导师过程面板"
+                  : "展开图谱面板"
+            }
             className="topbar-graph-toggle shrink-0"
             onClick={onToggleGraph}
             size="icon-sm"
             variant="ghost"
           >
-            <Network className="size-4" />
+            {isMemory ? <Brain className="size-4" /> : <Network className="size-4" />}
           </Button>
         ) : null}
         <div className="hidden items-center gap-0.5 md:flex">
@@ -3285,18 +3583,41 @@ function TopBar({
               <TooltipTrigger asChild>
                 <Button
                   aria-expanded={!railCollapsed}
-                  aria-label={railCollapsed ? "展开图谱书架" : "折叠图谱书架"}
+                  aria-label={
+                    railCollapsed
+                      ? isMemory
+                        ? "展开 AI 导师过程"
+                        : "展开图谱书架"
+                      : isMemory
+                        ? "折叠 AI 导师过程"
+                        : "折叠图谱书架"
+                  }
                   className="topbar-rail-toggle shrink-0"
+                  data-rail-toggle={railCollapsed ? "expand" : "collapse"}
                   onClick={onToggleRail}
                   size="icon-sm"
-                  title={railCollapsed ? "展开图谱书架" : "折叠图谱书架"}
+                  title={
+                    railCollapsed
+                      ? isMemory
+                        ? "展开 AI 导师过程"
+                        : "展开图谱书架"
+                      : isMemory
+                        ? "折叠 AI 导师过程"
+                        : "折叠图谱书架"
+                  }
                   variant="ghost"
                 >
-                  <Network className="size-4" />
+                  {isMemory ? <Brain className="size-4" /> : <Network className="size-4" />}
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom">
-                {railCollapsed ? "展开图谱书架" : "折叠图谱书架"}
+                {railCollapsed
+                  ? isMemory
+                    ? "展开 AI 导师过程"
+                    : "展开图谱书架"
+                  : isMemory
+                    ? "折叠 AI 导师过程"
+                    : "折叠图谱书架"}
               </TooltipContent>
             </Tooltip>
           ) : null}
@@ -3403,6 +3724,7 @@ function ContextRail({
     staleTime: 30_000,
   });
   const isSettings = pathname.includes("/settings/");
+  const isMemory = pathname.includes("/memory");
   const isGoalClarify = pathname.includes("/goals/new/clarify");
   const isGraph = pathname.includes("/graphs/");
   const isChat = pathname.includes("/chat/");
@@ -3418,7 +3740,6 @@ function ContextRail({
     "/evidence/",
     "/research/",
     "/practice",
-    "/memory",
   ].some((route) => pathname.includes(route));
   const items = useMemo(
     () =>
@@ -3540,6 +3861,7 @@ function ContextRail({
     <aside
       aria-hidden={collapsed || undefined}
       className="context-rail min-h-svh bg-card px-4 py-5"
+      data-rail-state={collapsed ? "collapsed" : "expanded"}
       data-drawer-swipe="ignore"
       // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
       inert={collapsed || undefined}
@@ -3559,9 +3881,12 @@ function ContextRail({
       ) : isChat ? (
         <ChatGraphRail
           project={activeProject}
+          session={activeSession}
           sessionId={sessionId}
           workspaceId={workspaceId}
         />
+      ) : isMemory ? (
+        <MemoryProcessRail workspaceId={workspaceId} />
       ) : showActivity ? (
         <ActivityRail />
       ) : (
@@ -3615,52 +3940,182 @@ function ActivityRail() {
 
 function ChatGraphRail({
   project,
+  session,
   sessionId,
   workspaceId,
 }: {
   project?: SidebarProject;
+  session?: Session;
   sessionId?: string;
   workspaceId: string;
 }) {
+  const queryClient = useQueryClient();
   const [view, setView] = useState<
-    "learning" | "capability" | "files" | "trajectory" | "voice"
+    | "learning"
+    | "capability"
+    | "files"
+    | "conversation"
+    | "voice"
   >("learning");
-  const [boundOverride, setBoundOverride] = useState<{
-    graphId: string;
-    graphTitle: string;
-  }>();
+  const [sideConversationFocusId, setSideConversationFocusId] = useState<string>();
+  const [creatingSideConversation, setCreatingSideConversation] = useState(false);
+  const creatingSideConversationRef = useRef(false);
+  useEffect(() => {
+    setSideConversationFocusId(undefined);
+  }, [sessionId]);
+  // undefined = follow server data, null = optimistic explicit unbind.
+  const [boundOverride, setBoundOverride] = useState<
+    { graphId: string; graphTitle: string } | null | undefined
+  >();
+  const [nodeOverride, setNodeOverride] = useState<
+    string | null | undefined
+  >();
+  const [bindingPending, setBindingPending] = useState(false);
   const isLearning = view === "learning";
-  const binding =
-    boundOverride ??
-    (project?.graphId
+  const graphs = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "graphs"),
+    queryFn: listGraphs,
+    staleTime: 30_000,
+  });
+  const serverBinding = session?.graph_id
+    ? {
+        graphId: session.graph_id,
+        graphTitle:
+          graphs.data?.find((graph) => graph.id === session.graph_id)?.title ||
+          (project?.graphId === session.graph_id
+            ? project.graphTitle || project.title
+            : "当前会话图谱"),
+      }
+    : !session && project?.graphId
       ? {
           graphId: project.graphId,
           graphTitle: project.graphTitle || project.title,
         }
-      : undefined);
-
-  useEffect(() => setBoundOverride(undefined), [project?.id, project?.graphId]);
+      : undefined;
+  const binding =
+    boundOverride === undefined ? serverBinding : boundOverride ?? undefined;
+  const boundNodeId =
+    nodeOverride === undefined
+      ? session?.current_node_id ?? null
+      : nodeOverride;
+  const boundGraph = useQuery({
+    queryKey: workspaceQueryKey(
+      workspaceId,
+      "graph",
+      binding?.graphId ?? "unbound",
+    ),
+    queryFn: () => getGraph(binding!.graphId),
+    staleTime: 30_000,
+    enabled: Boolean(binding?.graphId),
+  });
+  const boundNode = boundGraph.data?.nodes.find(
+    (node) => node.id === boundNodeId,
+  );
+  useEffect(() => {
+    setBoundOverride(undefined);
+    setNodeOverride(undefined);
+  }, [session?.graph_id, session?.id, session?.current_node_id]);
 
   const settings = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "settings"),
     queryFn: listSettings,
     staleTime: 30_000,
   });
-  const trajectoryEnabled = isTrajectoryEnabled(settings.data);
   const voiceDebugEnabled = isVoiceDebugPanelEnabled(settings.data);
-
-  // 开关关闭后若仍停在「轨迹」视图，回落到默认视图。
-  useEffect(() => {
-    if (!trajectoryEnabled && view === "trajectory") setView("learning");
-  }, [trajectoryEnabled, view]);
 
   // 同一个约定：语音调试面板关掉时栏目整个不渲染，视点也不能停在它上面。
   useEffect(() => {
     if (!voiceDebugEnabled && view === "voice") setView("learning");
   }, [voiceDebugEnabled, view]);
 
-  const bindGraph = (graph: GraphSummary) => {
-    if (!project) {
+  // Keep the selected rail tab while switching between conversations. This
+  // makes the right side feel like a persistent workspace instead of a page
+  // fragment that resets every time the main chat changes.
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem("learngraph:right-rail-view");
+      if (
+        stored === "learning" ||
+        stored === "capability" ||
+        stored === "files" ||
+        stored === "conversation" ||
+        stored === "voice"
+      ) {
+        setView(stored);
+      }
+    } catch {
+      // Local storage is optional; the rail remains fully usable in private
+      // browsing modes where storage can be denied.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("learngraph:right-rail-view", view);
+    } catch {
+      // See the read-side comment above.
+    }
+  }, [view]);
+
+  const cacheSession = useCallback(
+    (updated: Session) => {
+      queryClient.setQueryData<Session[]>(
+        workspaceQueryKey(workspaceId, "sessions"),
+        (current) =>
+          current?.map((item) => (item.id === updated.id ? updated : item)),
+      );
+    },
+    [queryClient, workspaceId],
+  );
+
+  const createSideConversation = useCallback(async () => {
+    setView("conversation");
+    if (creatingSideConversationRef.current) return;
+    creatingSideConversationRef.current = true;
+    setCreatingSideConversation(true);
+    try {
+      const parentSessionId =
+        session?.parent_session_id ??
+        (sessionId && sessionId !== "new" ? sessionId : null);
+      const created = await createSession({
+        title: "侧边对话",
+        session_kind: "side",
+        parent_session_id: parentSessionId,
+      });
+      queryClient.setQueryData<Session[]>(
+        workspaceQueryKey(workspaceId, "sessions"),
+        (current) => [
+          created,
+          ...(current ?? []).filter((item) => item.id !== created.id),
+        ],
+      );
+      setSideConversationFocusId(created.id);
+      toast.success("已创建侧边会话");
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "创建侧边会话失败",
+      );
+    } finally {
+      creatingSideConversationRef.current = false;
+      setCreatingSideConversation(false);
+    }
+  }, [
+    queryClient,
+    session?.parent_session_id,
+    sessionId,
+    workspaceId,
+  ]);
+
+  const clearNodeContext = useCallback(() => {
+    window.dispatchEvent(
+      new CustomEvent("learngraph:learning-node-clear", {
+        detail: { sessionId },
+      }),
+    );
+  }, [sessionId]);
+
+  const bindGraph = async (graph: GraphSummary) => {
+    if (!sessionId || !session) {
       window.dispatchEvent(
         new CustomEvent("learngraph:open-learning-project", {
           detail: { graphId: graph.id, title: graph.title },
@@ -3668,25 +4123,98 @@ function ChatGraphRail({
       );
       return;
     }
+    if (graph.status !== "published") {
+      toast.error("当前会话只能绑定已发布的图谱");
+      return;
+    }
+    if (session.goal_id && session.goal_id !== graph.goal_id) {
+      toast.error("该图谱与当前会话的学习目标不一致");
+      return;
+    }
+    if (bindingPending || graph.id === binding?.graphId) return;
+    const previousBinding = binding ?? null;
+    const previousNodeId = boundNodeId;
     setBoundOverride({ graphId: graph.id, graphTitle: graph.title });
-    window.dispatchEvent(
-      new CustomEvent("learngraph:bind-project-graph", {
-        detail: {
-          projectId: project.id,
-          graphId: graph.id,
-          graphTitle: graph.title,
-        },
-      }),
-    );
-    window.dispatchEvent(
-      new CustomEvent("learngraph:project-context", {
-        detail: {
-          workspaceId,
-          project: { ...project, graphId: graph.id, graphTitle: graph.title },
+    setNodeOverride(null);
+    setBindingPending(true);
+    try {
+      const updated = await updateSession(sessionId, {
+        graph_id: graph.id,
+        goal_id: session.goal_id ?? graph.goal_id,
+        current_node_id: null,
+      });
+      cacheSession(updated);
+      clearNodeContext();
+      toast.success(`当前会话已绑定「${graph.title}」`);
+    } catch (error) {
+      setBoundOverride(previousBinding);
+      setNodeOverride(previousNodeId);
+      toast.error(error instanceof Error ? error.message : "图谱绑定失败");
+    } finally {
+      setBindingPending(false);
+    }
+  };
+
+  const clearGraph = async () => {
+    if (!sessionId || !session || !binding || bindingPending) return;
+    const previousBinding = binding;
+    const previousNodeId = boundNodeId;
+    setBoundOverride(null);
+    setNodeOverride(null);
+    setBindingPending(true);
+    try {
+      const updated = await updateSession(sessionId, {
+        graph_id: null,
+        current_node_id: null,
+      });
+      cacheSession(updated);
+      clearNodeContext();
+      toast.success("已取消当前会话的图谱与节点绑定");
+    } catch (error) {
+      setBoundOverride(previousBinding);
+      setNodeOverride(previousNodeId);
+      toast.error(error instanceof Error ? error.message : "取消绑定失败");
+    } finally {
+      setBindingPending(false);
+    }
+  };
+
+  const bindNode = async (nodeId: string | null) => {
+    if (!sessionId || !session || !binding || bindingPending) return;
+    if (nodeId === boundNodeId) return;
+    const node = nodeId
+      ? boundGraph.data?.nodes.find((item) => item.id === nodeId)
+      : undefined;
+    if (nodeId && !node) {
+      toast.error("所选节点不属于当前图谱");
+      return;
+    }
+    const previousNodeId = boundNodeId;
+    setNodeOverride(nodeId);
+    setBindingPending(true);
+    try {
+      const updated = await updateSession(sessionId, {
+        current_node_id: nodeId,
+      });
+      cacheSession(updated);
+      if (node) {
+        publishLearningNodeContext({
+          graphId: binding.graphId,
+          nodeId: node.id,
+          nodeLabel: node.label,
           sessionId,
-        },
-      }),
-    );
+        });
+        toast.success(`当前会话已切换到节点「${node.label}」`);
+      } else {
+        clearNodeContext();
+        toast.success("已取消当前会话的节点绑定");
+      }
+    } catch (error) {
+      setNodeOverride(previousNodeId);
+      toast.error(error instanceof Error ? error.message : "节点绑定失败");
+    } finally {
+      setBindingPending(false);
+    }
   };
 
   return (
@@ -3694,7 +4222,7 @@ function ChatGraphRail({
       <div
         className="chat-graph-rail__switch"
         role="tablist"
-        aria-label="图谱视图"
+        aria-label="右侧工作区"
       >
         <Button
           aria-selected={isLearning}
@@ -3706,13 +4234,22 @@ function ChatGraphRail({
           当前学习
         </Button>
         <Button
-          aria-selected={!isLearning}
+          aria-selected={view === "capability"}
           onClick={() => setView("capability")}
           role="tab"
           size="xs"
           variant="ghost"
         >
           能力成长
+        </Button>
+        <Button
+          aria-selected={view === "conversation"}
+          onClick={() => setView("conversation")}
+          role="tab"
+          size="xs"
+          variant="ghost"
+        >
+          侧边对话
         </Button>
         <Button
           aria-selected={view === "files"}
@@ -3723,42 +4260,130 @@ function ChatGraphRail({
         >
           会话文件
         </Button>
-        {trajectoryEnabled ? (
-          <Button
-            aria-selected={view === "trajectory"}
-            onClick={() => setView("trajectory")}
-            role="tab"
-            size="xs"
-            variant="ghost"
-          >
-            轨迹
-          </Button>
-        ) : null}
-        {voiceDebugEnabled ? (
-          <Button
-            aria-selected={view === "voice"}
-            onClick={() => setView("voice")}
-            role="tab"
-            size="xs"
-            variant="ghost"
-          >
-            语音延迟
-          </Button>
-        ) : null}
+        <Button
+          aria-disabled={!voiceDebugEnabled || undefined}
+          aria-selected={view === "voice"}
+          disabled={!voiceDebugEnabled}
+          onClick={() => setView("voice")}
+          role="tab"
+          size="xs"
+          title={voiceDebugEnabled ? "查看语音延迟" : "请在设置中启用语音调试"}
+          variant="ghost"
+        >
+          语音延迟
+        </Button>
+        <Button
+          aria-label="新建侧边对话"
+          className="chat-graph-rail__add"
+          disabled={creatingSideConversation}
+          onClick={() => void createSideConversation()}
+          size="icon-xs"
+          title="新建侧边对话"
+          variant="ghost"
+        >
+          {creatingSideConversation ? (
+            <LoaderCircle className="size-3.5 animate-spin" />
+          ) : (
+            <Plus className="size-3.5" />
+          )}
+        </Button>
       </div>
-      {view === "trajectory" ? (
-        <TrajectoryRail sessionId={sessionId} workspaceId={workspaceId} />
-      ) : view === "voice" ? (
-        <VoiceLatencyRail />
+      {view === "learning" ? (
+        <section
+          aria-label="当前会话图谱绑定"
+          className="session-graph-binding"
+        >
+          <div className="session-graph-binding__summary">
+            <span>当前会话</span>
+            <strong>{binding?.graphTitle ?? "未绑定图谱"}</strong>
+            <small>
+              {binding
+                ? boundNode?.label
+                  ? `绑定节点 · ${boundNode.label}`
+                  : "未绑定具体节点"
+                : project?.graphId
+                  ? `文件夹默认 · ${project.graphTitle || project.title}`
+                  : "可从图谱书架选择"}
+            </small>
+          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                aria-label={binding ? "更换当前会话图谱" : "绑定当前会话图谱"}
+                className="session-graph-binding__graph-button"
+                disabled={bindingPending || !session}
+                size="xs"
+                variant="outline"
+              >
+                {bindingPending ? (
+                  <LoaderCircle className="size-3 animate-spin" />
+                ) : (
+                  <Network className="size-3" />
+                )}
+                {binding ? "更换" : "绑定"}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-60">
+              <DropdownMenuLabel>绑定到当前会话</DropdownMenuLabel>
+              {(graphs.data ?? []).map((graph) => {
+                const compatible =
+                  graph.status === "published" &&
+                  (!session?.goal_id || session.goal_id === graph.goal_id);
+                return (
+                  <DropdownMenuItem
+                    disabled={!compatible || graph.id === binding?.graphId}
+                    key={graph.id}
+                    onSelect={() => void bindGraph(graph)}
+                  >
+                    <Network className="size-3.5" />
+                    <span className="min-w-0 flex-1 truncate">
+                      {graph.title}
+                    </span>
+                    {graph.id === binding?.graphId ? (
+                      <BadgeCheck className="size-3.5" />
+                    ) : !compatible ? (
+                      <small>不可用</small>
+                    ) : null}
+                  </DropdownMenuItem>
+                );
+              })}
+              {binding ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onSelect={() => void clearGraph()}
+                    variant="destructive"
+                  >
+                    <X className="size-3.5" />
+                    取消图谱与节点绑定
+                  </DropdownMenuItem>
+                </>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </section>
+      ) : null}
+      {view === "conversation" ? (
+        <SideConversationRail
+          currentSessionId={sessionId}
+          focusSessionId={sideConversationFocusId}
+          workspaceId={workspaceId}
+        />
       ) : view === "files" ? (
-        <SessionFilesList
+        <SessionFilePreviewRail
           sessionId={sessionId}
           workspaceId={workspaceId}
         />
-      ) : isLearning ? (
+      ) : view === "voice" ? (
+        <VoiceLatencyRail />
+      ) : view === "learning" ? (
         binding ? (
           <BoundGraphRail
+            bindingPending={bindingPending}
             graphId={binding.graphId}
+            onBindNode={(nodeId) => void bindNode(nodeId)}
+            selectedNodeId={boundNodeId ?? undefined}
+            sessionId={sessionId}
             title={binding.graphTitle}
             workspaceId={workspaceId}
           />
@@ -3802,8 +4427,8 @@ function ProjectBookshelf({
           <p className="text-sm font-semibold">图谱书架</p>
           <p>
             {project
-              ? `「${project.title}」尚未绑定图谱`
-              : "当前会话尚未归入有图谱的项目"}
+              ? `当前会话尚未绑定图谱${project.graphId ? `；文件夹「${project.title}」已有默认图谱` : ""}`
+              : "当前会话尚未绑定图谱"}
           </p>
         </div>
       </div>
@@ -3826,7 +4451,7 @@ function ProjectBookshelf({
         ))}
       </div>
       <p className="project-bookshelf__hint">
-        选择一本图谱后，会显示在右侧并成为该项目新会话的默认上下文。
+        这里的选择只修改当前会话；文件夹默认图谱不会被改动。
       </p>
     </section>
   );
@@ -3893,13 +4518,19 @@ function toRailKnowledgeGraph(
 }
 
 function BoundGraphRail({
+  bindingPending,
   graphId,
+  onBindNode,
   selectedNodeId: requestedNodeId,
+  sessionId,
   title,
   workspaceId,
 }: {
+  bindingPending?: boolean;
   graphId: string;
+  onBindNode?: (nodeId: string | null) => void;
   selectedNodeId?: string;
+  sessionId?: string;
   title: string;
   workspaceId: string;
 }) {
@@ -3914,7 +4545,6 @@ function BoundGraphRail({
   const [editing, setEditing] = useState(false);
   const draftRef = useRef({ label: "", description: "" });
   const [explorePanelOpen, setExplorePanelOpen] = useState(false);
-  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [validation, setValidation] = useState<{
     errors: string[];
     suggestions: string[];
@@ -3924,7 +4554,6 @@ function BoundGraphRail({
     setSelectedNodeId(requestedNodeId);
     setEditing(false);
     setExplorePanelOpen(false);
-    setDescriptionExpanded(false);
     setValidation(undefined);
   }, [graphId, requestedNodeId]);
 
@@ -3938,11 +4567,6 @@ function BoundGraphRail({
     const preferred = pickDefaultLearningNode(graph);
     if (!preferred) return;
     setSelectedNodeId(preferred.id);
-    publishLearningNodeContext({
-      graphId,
-      nodeId: preferred.id,
-      nodeLabel: preferred.label,
-    });
   }, [graph, graphId, requestedNodeId, selectedNodeId]);
 
   const selectedNode =
@@ -3974,13 +4598,6 @@ function BoundGraphRail({
     () => (graph ? toRailKnowledgeGraph(graph, exploreCounts) : undefined),
     [exploreCounts, graph],
   );
-  const children =
-    selectedNode && graph
-      ? graph.edges
-          .filter((edge) => edge.source_node_id === selectedNode.id)
-          .map((edge) => edge.target_node_id)
-      : [];
-  const isLeaf = children.length === 0;
   // Same query key as chat completion invalidation so "未深入" flips live.
   const questions = questionsQuery.data ?? [];
 
@@ -4118,7 +4735,7 @@ function BoundGraphRail({
   if (graphQuery.isPending)
     return (
       <div className="chat-graph-rail__canvas grid place-items-center text-xs text-muted-foreground">
-        正在读取项目图谱…
+        正在读取会话图谱…
       </div>
     );
   if (graphQuery.isError || !graph || !railGraph)
@@ -4155,14 +4772,25 @@ function BoundGraphRail({
       })()
     : undefined;
 
-  function askNode(question: string) {
-    if (!selectedNode) return;
-    rememberLastLearnedNode(graphId, selectedNode.id);
+  function activateNode(
+    node: Pick<GraphNode, "id" | "label">,
+    options: { learningPackage?: boolean } = {},
+  ) {
+    setSelectedNodeId(node.id);
+    rememberLastLearnedNode(graphId, node.id);
+    onBindNode?.(node.id);
     publishLearningNodeContext({
       graphId,
-      nodeId: selectedNode.id,
-      nodeLabel: selectedNode.label,
+      nodeId: node.id,
+      nodeLabel: node.label,
+      sessionId,
+      learningPackage: options.learningPackage,
     });
+  }
+
+  function askNode(question: string) {
+    if (!selectedNode) return;
+    activateNode(selectedNode);
     window.dispatchEvent(
       new CustomEvent("learngraph:compose", { detail: { content: question } }),
     );
@@ -4170,12 +4798,7 @@ function BoundGraphRail({
 
   function studyNode() {
     if (!selectedNode) return;
-    rememberLastLearnedNode(graphId, selectedNode.id);
-    publishLearningNodeContext({
-      graphId,
-      nodeId: selectedNode.id,
-      nodeLabel: selectedNode.label,
-    });
+    activateNode(selectedNode, { learningPackage: true });
     // 学习内容和追问必须留在同一个对话画布中。由 shell 创建/复用会话，
     // ChatCanvasPage 会在收到 learningNode 后挂载阶段式学习包预览。
     window.dispatchEvent(
@@ -4206,13 +4829,7 @@ function BoundGraphRail({
       toast.message("当前没有更合适的下一个节点。");
       return;
     }
-    setSelectedNodeId(next.id);
-    rememberLastLearnedNode(graphId, next.id);
-    publishLearningNodeContext({
-      graphId,
-      nodeId: next.id,
-      nodeLabel: next.label,
-    });
+    activateNode(next, { learningPackage: true });
     window.dispatchEvent(
       new CustomEvent("learngraph:open-learning-project", {
         detail: {
@@ -4239,12 +4856,7 @@ function BoundGraphRail({
 
   function splitNode() {
     if (!selectedNode) return;
-    rememberLastLearnedNode(graphId, selectedNode.id);
-    publishLearningNodeContext({
-      graphId,
-      nodeId: selectedNode.id,
-      nodeLabel: selectedNode.label,
-    });
+    activateNode(selectedNode);
     const childHint = childNodes.length
       ? `已有下级：${childNodes
           .slice(0, 8)
@@ -4289,18 +4901,17 @@ function BoundGraphRail({
         minimumZoom={0.15}
         nodes={railGraph.nodes}
         onOpenExplore={(node) => openExploreHistory(node.id)}
+        onStudy={(node) => {
+          activateNode(node, { learningPackage: true });
+          window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", {detail: {
+            graphId, title: graph.title || node.label, nodeId: node.id, nodeLabel: node.label, learningPackage: true,
+          }}));
+        }}
         onSelect={(node) => {
-          setSelectedNodeId(node.id);
+          activateNode(node);
           setEditing(false);
           setExplorePanelOpen(false);
-          setDescriptionExpanded(false);
           setValidation(undefined);
-          rememberLastLearnedNode(graphId, node.id);
-          publishLearningNodeContext({
-            graphId,
-            nodeId: node.id,
-            nodeLabel: node.label,
-          });
         }}
         selectedId={selectedNode?.id}
         showZoomControls
@@ -4308,20 +4919,6 @@ function BoundGraphRail({
       /></Suspense>
       {selectedNode ? (
         <div className="bound-graph-rail__inspector">
-          <div className="bound-graph-rail__node-title">
-            <div>
-              <span>
-                当前节点 ·{" "}
-                {isLeaf ? "叶子节点" : `${children.length} 个下级节点`}
-              </span>
-              <strong>{selectedNode.label}</strong>
-            </div>
-            {selectedNode.attention_state === "mastered" ? (
-              <Badge variant="secondary">已掌握</Badge>
-            ) : selectedNode.attention_state === "focused" ? (
-              <Badge variant="secondary">重点</Badge>
-            ) : null}
-          </div>
           {explorePanelOpen && questions.length ? (
             <NodeExploreChain
               onClose={() => setExplorePanelOpen(false)}
@@ -4417,26 +5014,6 @@ function BoundGraphRail({
             </div>
           ) : (
             <>
-              <div className="bound-graph-rail__summary">
-                <p
-                  className={cn(
-                    "bound-graph-rail__description",
-                    !descriptionExpanded && "is-clamped",
-                  )}
-                >
-                  {selectedNode.description || "还没有补充学习说明。"}
-                </p>
-                {selectedNode.description &&
-                selectedNode.description.trim().length > 48 ? (
-                  <button
-                    className="bound-graph-rail__text-toggle"
-                    onClick={() => setDescriptionExpanded((open) => !open)}
-                    type="button"
-                  >
-                    {descriptionExpanded ? "收起" : "展开"}
-                  </button>
-                ) : null}
-              </div>
               <div className="bound-graph-rail__actions">
                 <Button onClick={studyNode} size="xs">
                   <Play className="size-3.5" />
@@ -4480,6 +5057,40 @@ function BoundGraphRail({
                       <Split className="size-3.5" />
                       拆分节点
                     </DropdownMenuItem>
+                    {onBindNode ? (
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <Network className="size-3.5" />
+                          换绑节点
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent className="max-h-[min(60vh,24rem)] w-56 overflow-y-auto">
+                          <DropdownMenuRadioGroup
+                            onValueChange={(value) =>
+                              onBindNode(value === "__none__" ? null : value)
+                            }
+                            value={requestedNodeId ?? "__none__"}
+                          >
+                            <DropdownMenuRadioItem
+                              disabled={Boolean(!graph || bindingPending)}
+                              value="__none__"
+                            >
+                              不绑定具体节点
+                            </DropdownMenuRadioItem>
+                            {(graph?.nodes ?? []).map((node) => (
+                              <DropdownMenuRadioItem
+                                disabled={bindingPending}
+                                key={node.id}
+                                value={node.id}
+                              >
+                                <span className="min-w-0 truncate">
+                                  {node.label}
+                                </span>
+                              </DropdownMenuRadioItem>
+                            ))}
+                          </DropdownMenuRadioGroup>
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    ) : null}
                     <DropdownMenuItem
                       onSelect={() => focus.mutate(selectedNode.id)}
                     >
@@ -4495,37 +5106,6 @@ function BoundGraphRail({
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
-              {parentNode || childNodes.length ? (
-                <div className="bound-graph-rail__relations">
-                  {parentNode ? (
-                    <button
-                      className="bound-graph-rail__chip"
-                      onClick={() => {
-                        setSelectedNodeId(parentNode.id);
-                        setDescriptionExpanded(false);
-                        rememberLastLearnedNode(graphId, parentNode.id);
-                      }}
-                      type="button"
-                    >
-                      上级 · {parentNode.label}
-                    </button>
-                  ) : null}
-                  {childNodes.slice(0, 4).map((child) => (
-                    <button
-                      className="bound-graph-rail__chip"
-                      key={child.id}
-                      onClick={() => {
-                        setSelectedNodeId(child.id);
-                        setDescriptionExpanded(false);
-                        rememberLastLearnedNode(graphId, child.id);
-                      }}
-                      type="button"
-                    >
-                      下级 · {child.label}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
               <div className="bound-graph-rail__tools">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -4959,7 +5539,42 @@ function GraphWorkspaceRail() {
  * 路由变化仍会经 RouteContext 让这里重新渲染。
  */
 const ShellOutlet = memo(function ShellOutlet() {
-  return <Outlet />;
+  return (
+    <RouteMotion>
+      <Outlet />
+    </RouteMotion>
+  );
+});
+
+/**
+ * The settings pages are route-level lazy chunks. Keep this fallback inside
+ * the already-mounted settings window; the app-wide fallback says that the
+ * whole workspace is loading and causes a visible flash between categories.
+ */
+function SettingsOutletFallback() {
+  return (
+    <div
+      aria-busy="true"
+      aria-label="正在打开设置"
+      className="flex min-h-full flex-col gap-4 p-5"
+      data-settings-route-loading="true"
+    >
+      <div className="h-6 w-2/5 animate-pulse rounded-md bg-muted" />
+      <div className="h-4 w-4/5 animate-pulse rounded-md bg-muted" />
+      <div className="grid gap-3 pt-3 sm:grid-cols-2">
+        <div className="h-24 animate-pulse rounded-xl border bg-muted/40" />
+        <div className="h-24 animate-pulse rounded-xl border bg-muted/40" />
+      </div>
+    </div>
+  );
+}
+
+const SettingsOutlet = memo(function SettingsOutlet() {
+  return (
+    <Suspense fallback={<SettingsOutletFallback />}>
+      <ShellOutlet />
+    </Suspense>
+  );
 });
 
 export function WorkspaceShell() {
@@ -4989,6 +5604,7 @@ export function WorkspaceShell() {
   const isChat = pathname.includes("/chat/");
   const isDocumentReader = pathname.includes("/documents/");
   const isSettings = pathname.includes("/settings/");
+  const isMemory = pathname.includes("/memory");
   // Remember the last non-settings location so closing the modal can restore it.
   const settingsOriginRef = useRef<string | null>(null);
   useEffect(() => {
@@ -4999,9 +5615,10 @@ export function WorkspaceShell() {
   const isGoalClarify =
     pathname.includes("/goals/new/clarify") ||
     (isChat && new URLSearchParams(search).get("mode") === "goal");
-  // Right rail is available on chat/goal pages; the topbar toggle only appears on pure chat.
-  const showContextRail = isChat || isGoalClarify;
-  const showRailToggle = isChat && !isGoalClarify;
+  // The process rail is also useful on the memory report page. Keep it in the
+  // same shell column as chat so it can be opened/collapsed consistently.
+  const showContextRail = isChat || isGoalClarify || isMemory;
+  const showRailToggle = (isChat || isMemory) && !isGoalClarify;
   useEffect(() => {
     setGraphDrawerOpen(false);
     setSelectionExplanationOpen(false);
@@ -5145,9 +5762,15 @@ export function WorkspaceShell() {
           "workspace-shell--rail-collapsed",
         showContextRail && graphDrawerOpen && "workspace-shell--graph-open",
       )}
+      data-rail-state={railAvailable ? (railCollapsedEffective ? "collapsed" : "expanded") : "unavailable"}
+      data-sidebar-state={collapsed ? "collapsed" : "expanded"}
       style={shellStyle}
     >
-      <aside className="workspace-sidebar min-h-svh overflow-hidden bg-sidebar">
+      <aside
+        aria-label="主导航"
+        className="workspace-sidebar min-h-svh overflow-hidden bg-sidebar"
+        data-sidebar-state={collapsed ? "collapsed" : "expanded"}
+      >
         <div className="sticky top-0 h-svh w-full">
           <MemoSidebarNav collapsed={collapsed} onCollapse={toggleSidebar} />
         </div>
@@ -5168,7 +5791,7 @@ export function WorkspaceShell() {
               );
             }}
           >
-            <ShellOutlet />
+            <SettingsOutlet />
           </SettingsModal>
         ) : (
           <>
@@ -5201,7 +5824,7 @@ export function WorkspaceShell() {
         <>
           <div
             aria-hidden={railCollapsedEffective || undefined}
-            aria-label="调整图谱栏宽度"
+            aria-label={isMemory ? "调整 AI 导师过程栏宽度" : "调整图谱栏宽度"}
             aria-orientation="vertical"
             className="workspace-resizer"
             onPointerDown={beginRailResize}
@@ -5223,7 +5846,7 @@ export function WorkspaceShell() {
             onSelectionExplanationChange={handleSelectionExplanationChange}
           />
           <Button
-            aria-label="收起图谱面板"
+            aria-label={isMemory ? "收起 AI 导师过程面板" : "收起图谱面板"}
             className="graph-drawer-close"
             onClick={() => {
               setGraphDrawerOpen(false);

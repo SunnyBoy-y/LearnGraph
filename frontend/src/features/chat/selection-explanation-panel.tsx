@@ -253,7 +253,7 @@ export function SelectionExplanationPanel({
   const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
   const history = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
-    queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
+    queryFn: () => listSessionMessages(sessionId, { limit: 50, compact: false }),
     enabled: Boolean(sessionId),
     gcTime: 15_000,
   });

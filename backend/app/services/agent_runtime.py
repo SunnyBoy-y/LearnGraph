@@ -52,13 +52,14 @@ from app.repositories.audit import AuditRepository
 from app.services.canvas_cards import MAX_MAGIC_CARD_PREVIEW_CHARS
 from app.services.chat_attachment_policy import is_image_attachment
 from app.services.image_generations import ImageGenerationService
+from app.services.billing import BillingService
 from app.services.mcp_skills import MCPAndSkillService
 from app.services.sandbox import SandboxAgentWorkspaceService
 from app.services.session_retrieval import SessionRetrievalService
 from app.services.session_workspace import SessionWorkspaceService
 
 
-AGENT_TOOL_RESULT_MAX_BYTES = 128 * 1024
+from app.services.harness_contracts import AGENT_TOOL_RESULT_MAX_BYTES
 MAX_PARALLEL_RESEARCH_CHILDREN = 4
 DEFAULT_CLOCK_TIMEZONE = "UTC"
 MAX_AGENT_IMAGE_PROMPT_CHARS = 2_000
@@ -160,6 +161,7 @@ class AgentToolRuntime:
         definitions.extend(self._model_invocation_tool_definitions())
         definitions.extend(self._chart_tool_definitions())
         definitions.extend(self._learning_orchestration_tool_definitions())
+        definitions.extend(self._voice_practice_tool_definitions())
         # Read-only observation of interactive sub-application events (T1.4).
         # The write-side subapp_patch_state (T2.5) is registered through its
         # own method right below so the observe list stays pure observation.
@@ -260,6 +262,71 @@ class AgentToolRuntime:
             and definition["function"].get("name") in allowed
         ]
 
+
+    @staticmethod
+    def _voice_practice_tool_definitions() -> list[dict[str, Any]]:
+        """Voice-only durable exercise creation for the background Agent lane."""
+
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "voice_practice_create",
+                    "description": (
+                        "Create durable LearnGraph Exercise rows for a voice practice task. "
+                        "Return 1 to 5 questions tied to an existing graph node. "
+                        "The answer key is stored server-side and is never shown in the "
+                        "Exercise view; users submit answers through the voice answer tool."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "node_id": {"type": "string", "minLength": 1, "maxLength": 36},
+                            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                            "questions": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 5,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question_type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "single_choice",
+                                                "multiple_choice",
+                                                "true_false",
+                                                "fill_blank",
+                                                "short_answer",
+                                            ],
+                                        },
+                                        "prompt": {"type": "string", "minLength": 1, "maxLength": 2_000},
+                                        "options": {
+                                            "type": "array",
+                                            "items": {"type": "string", "maxLength": 300},
+                                            "maxItems": 8,
+                                        },
+                                        "answer_key": {
+                                            "oneOf": [
+                                                {"type": "string", "minLength": 1, "maxLength": 2_000},
+                                                {"type": "array", "items": {"type": "string", "maxLength": 300}, "minItems": 1, "maxItems": 8},
+                                            ]
+                                        },
+                                        "explanation": {"type": "string", "maxLength": 2_000},
+                                        "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
+                                        "rubric_points": {"type": "array", "items": {"type": "string", "maxLength": 300}, "maxItems": 12},
+                                    },
+                                    "required": ["question_type", "prompt", "answer_key"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["node_id", "title", "questions"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
 
     @staticmethod
     def _learning_orchestration_tool_definitions() -> list[dict[str, Any]]:
@@ -1404,11 +1471,16 @@ class AgentToolRuntime:
                 "function": {
                     "name": "get_current_time",
                     "description": (
-                        "Return the authoritative current date and time from the "
-                        "LearnGraph host clock. Use this whenever the user asks about "
-                        "today, now, weekdays, deadlines, or any time-sensitive fact "
-                        "instead of guessing from training data. Optional IANA timezone "
-                        f"(default {DEFAULT_CLOCK_TIMEZONE})."
+                        "Return the LearnGraph host-clock time converted to the requested "
+                        "IANA timezone. Use this whenever the user asks about today, now, "
+                        "weekdays, dates, or other time-sensitive facts instead of guessing "
+                        "from training data. Pass a user-confirmed IANA timezone whenever "
+                        "local civil time matters; never infer timezone from language, IP, "
+                        "or an unconfirmed location. If omitted, the result uses "
+                        f"{DEFAULT_CLOCK_TIMEZONE}, which must be stated to the user and may "
+                        "not match their local date. This tool provides only the current "
+                        "time; deadline status or remaining time also requires the deadline "
+                        "timestamp and its timezone."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2049,32 +2121,28 @@ class AgentToolRuntime:
             self._function_definition(
                 "list_budget_policies",
                 "List workspace token-cost budget policies with their scope, period, limits, and enabled state.",
-                {},
+                {"currency": {"type": "string", "enum": ["USD", "CNY"]}},
             ),
             self._function_definition(
                 "get_budget_status",
                 "Read the current spending vs. limit status of every workspace budget policy.",
-                {},
+                {"currency": {"type": "string", "enum": ["USD", "CNY"]}},
             ),
             self._function_definition(
                 "list_budget_alerts",
                 "List workspace budget alerts (soft/hard threshold hits) and whether each is acknowledged.",
-                {},
-            ),
-            self._function_definition(
-                "get_exchange_rate",
-                "Read the currently effective USD/CNY exchange rate used for cost conversion.",
-                {},
+                {"currency": {"type": "string", "enum": ["USD", "CNY"]}},
             ),
             self._function_definition(
                 "list_manual_prices",
                 "List workspace-defined manual model prices that override catalog defaults.",
-                {},
+                {"currency": {"type": "string", "enum": ["USD", "CNY"]}},
             ),
             self._function_definition(
                 "get_usage_summary",
                 "Read persisted token and cost usage aggregates (optional provider/model/feature filter).",
                 {
+                    "currency": {"type": "string", "enum": ["USD", "CNY"]},
                     "provider_id": {"type": "string", "maxLength": 80},
                     "model_id": {"type": "string", "maxLength": 160},
                     "feature": {"type": "string", "maxLength": 80},
@@ -2084,6 +2152,7 @@ class AgentToolRuntime:
                 "list_usage_events",
                 "List persisted usage events (optional provider/model/feature filter). Returns the most recent events first.",
                 {
+                    "currency": {"type": "string", "enum": ["USD", "CNY"]},
                     "provider_id": {"type": "string", "maxLength": 80},
                     "model_id": {"type": "string", "maxLength": 160},
                     "feature": {"type": "string", "maxLength": 80},
@@ -2222,7 +2291,7 @@ class AgentToolRuntime:
                 ),
                 self._function_definition(
                     "delete_budget_policy",
-                    "Permanently delete a workspace budget policy by id. Requires workspace.manage.",
+                    "Disable a workspace budget policy by id while retaining alert history. Requires workspace.manage.",
                     {"policy_id": {"type": "string", "minLength": 1, "maxLength": 36}},
                     required=["policy_id"],
                 ),
@@ -2233,42 +2302,34 @@ class AgentToolRuntime:
                     required=["alert_id"],
                 ),
                 self._function_definition(
-                    "set_exchange_rate",
-                    "Set the workspace USD/CNY exchange rate used for cost conversion. Requires workspace.manage.",
-                    {"rate": {"type": "number", "minimum": 0.01}},
-                    required=["rate"],
-                ),
-                self._function_definition(
-                    "refresh_exchange_rate",
-                    "Refresh the USD/CNY exchange rate from the network. Requires workspace.manage.",
-                    {},
-                ),
-                self._function_definition(
                     "upsert_manual_price",
                     "Create or replace a workspace manual model price overriding the catalog. Requires workspace.manage.",
                     {
                         "model_id": {"type": "string", "minLength": 1, "maxLength": 160},
                         "provider_id": {"type": "string", "minLength": 1, "maxLength": 80},
                         "currency": {"type": "string", "enum": ["USD", "CNY"]},
-                        "input_per_million": {"type": "number", "minimum": 0},
+                        "input_per_million": {"type": "string"},
                         "cached_input_per_million": {
-                            "type": ["number", "null"],
-                            "minimum": 0,
+                            "type": ["string", "null"],
                         },
-                        "output_per_million": {"type": "number", "minimum": 0},
-                        "fixed_per_call": {"type": "number", "minimum": 0},
+                        "output_per_million": {"type": "string"},
+                        "fixed_per_call": {"type": "string"},
+                        "cache_write_per_million": {"type": ["string", "null"]},
+                        "rates_by_unit": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "conditions": {"type": "object", "additionalProperties": True},
+                        "feature": {"type": "string"},
                     },
-                    required=["model_id", "input_per_million", "output_per_million"],
+                    required=["provider_id", "model_id", "currency", "input_per_million", "output_per_million"],
                 ),
                 self._function_definition(
                     "remove_manual_price",
-                    "Remove a workspace manual model price by model_id. Requires workspace.manage.",
-                    {"model_id": {"type": "string", "minLength": 1, "maxLength": 160}},
-                    required=["model_id"],
+                    "Remove one workspace manual price by price_id. Requires workspace.manage.",
+                    {"price_id": {"type": "string", "minLength": 1, "maxLength": 160}},
+                    required=["price_id"],
                 ),
                 self._function_definition(
                     "refresh_models_dev_snapshot",
-                    "Re-fetch the models.dev price snapshot from the network. Requires workspace.manage.",
+                    "Re-fetch the global models.dev snapshot. Requires system administrator permission and workspace.write.",
                     {},
                 ),
                 self._function_definition(
@@ -2368,7 +2429,8 @@ class AgentToolRuntime:
                 "Create a Deep Research job. Cost-bearing remote jobs remain awaiting explicit user approval. When the result contains user_approval_required=true, STOP and do not call get_deep_research again until the user approves the budget in chat; the host injects a confirmation card the user must click.",
                 {
                     "question": {"type": "string", "minLength": 3, "maxLength": 4000},
-                    "budget_cny": {"type": "number", "minimum": 0, "maximum": 10000},
+                    "budget_amount": {"type": "string", "description": "Native decimal amount; never convert currencies"},
+                    "currency": {"type": "string", "enum": ["USD", "CNY"]},
                     "allowed_domains": {
                         "type": "array",
                         "maxItems": 50,
@@ -3133,6 +3195,11 @@ class AgentToolRuntime:
                     assistant_message_id=assistant_message_id,
                     source_message_id=source_message_id,
                 )
+            if name == "voice_practice_create":
+                return self._execute_voice_practice_create(
+                    arguments,
+                    chat_session_id=chat_session_id,
+                )
             if name in {
                 "lg_goal_read",
                 "lg_goal_create",
@@ -3406,6 +3473,107 @@ class AgentToolRuntime:
             )
             self.extensions.db.commit()
             return self._failure("agent_tool_failed", "The authorized tool failed")
+
+    def _execute_voice_practice_create(
+        self,
+        arguments: dict[str, Any],
+        *,
+        chat_session_id: str,
+    ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        """Persist voice practice questions through the normal Exercise model."""
+
+        from app.domain.models import Exercise
+
+        node_id = str(arguments.get("node_id") or "").strip()
+        title = str(arguments.get("title") or "语音练习").strip()[:200]
+        questions = arguments.get("questions")
+        if not node_id or not isinstance(questions, list) or not questions:
+            raise AppError(422, "invalid_tool_arguments", "node_id, title and questions are required")
+        workspace, _principal, authz = self.extensions._runtime_context()
+        if not authz.can_access_bindings(workspace, "write", node_id=node_id):
+            raise AppError(404, "graph_node_not_found", "Graph node was not found")
+        db = self.extensions.db
+        batch_id = str(uuid4())
+        created: list[Exercise] = []
+        for raw in questions[:5]:
+            if not isinstance(raw, dict):
+                raise AppError(422, "invalid_tool_arguments", "Each question must be an object")
+            question_type = str(raw.get("question_type") or "").strip()
+            prompt = str(raw.get("prompt") or "").strip()
+            if question_type not in {"single_choice", "multiple_choice", "true_false", "fill_blank", "short_answer"} or not prompt:
+                raise AppError(422, "invalid_tool_arguments", "Question type and prompt are invalid")
+            options = [str(item).strip() for item in (raw.get("options") or []) if str(item).strip()]
+            answer_key = raw.get("answer_key")
+            if isinstance(answer_key, list):
+                answer_values = [str(item).strip() for item in answer_key if str(item).strip()]
+                if not answer_values:
+                    raise AppError(422, "invalid_tool_arguments", "answer_key must not be empty")
+                answer_key_value = json.dumps(answer_values, ensure_ascii=False)
+            else:
+                answer_key_value = str(answer_key or "").strip()
+                if not answer_key_value:
+                    raise AppError(422, "invalid_tool_arguments", "answer_key must not be empty")
+            if question_type in {"single_choice", "multiple_choice"} and not options:
+                raise AppError(422, "invalid_tool_arguments", "Choice questions need options")
+            created.append(
+                Exercise(
+                    workspace_id=self.workspace_id,
+                    node_id=node_id,
+                    question_type=question_type,
+                    prompt=prompt[:2_000],
+                    options=options[:8],
+                    answer_key=answer_key_value,
+                    explanation=str(raw.get("explanation") or "")[:2_000],
+                    difficulty=str(raw.get("difficulty") or "medium"),
+                    generation_batch_id=batch_id,
+                    source_refs=[
+                        {
+                            "type": "voice_agent",
+                            "chat_session_id": chat_session_id,
+                        }
+                    ],
+                    rubric_json={
+                        "points": [
+                            str(item)[:300]
+                            for item in (raw.get("rubric_points") or [])
+                            if str(item).strip()
+                        ][:12]
+                    },
+                    metadata_json={
+                        "origin": "voice_agent",
+                        "title": title,
+                        "chat_session_id": chat_session_id,
+                    },
+                )
+            )
+        db.add_all(created)
+        self.audit.record(
+            actor_id=self.actor_id,
+            action="voice.practice_created",
+            resource_type="exercise_batch",
+            resource_id=batch_id,
+            details={"node_id": node_id, "count": len(created), "chat_session_id": chat_session_id},
+        )
+        db.commit()
+        for exercise in created:
+            db.refresh(exercise)
+        result = {
+            "practice_batch_id": batch_id,
+            "title": title,
+            "node_id": node_id,
+            "exercise_ids": [item.id for item in created],
+            "questions": [
+                {
+                    "exercise_id": item.id,
+                    "prompt": item.prompt,
+                    "question_type": item.question_type,
+                    "options": item.options,
+                }
+                for item in created
+            ],
+            "next_step": "请让用户按题目顺序用语音回答，并使用 voice_submit_exercise_answer 提交。",
+        }
+        return self._success(result, {"practice_batch_id": batch_id, "exercise_count": len(created)}, [])
 
     def _execute_graph_proposal_tool(
         self,
@@ -5716,17 +5884,17 @@ class AgentToolRuntime:
             if name == "list_budget_policies":
                 items = [
                     BudgetPolicyView.model_validate(item).model_dump(mode="json")
-                    for item in billing.list_budget_policies()
+                    for item in billing.list_budget_policies(str(arguments.get("currency") or "USD"))
                 ]
             elif name == "get_budget_status":
                 items = [
                     BudgetStatusView.model_validate(item).model_dump(mode="json")
-                    for item in billing.budget_statuses()
+                    for item in billing.budget_statuses(currency=str(arguments.get("currency") or "USD"))
                 ]
             else:
                 items = [
                     BudgetAlertView.model_validate(item).model_dump(mode="json")
-                    for item in billing.list_alerts()
+                    for item in billing.list_alerts(str(arguments.get("currency") or "USD"))
                 ]
             return self._success(
                 {"items": items, "count": len(items)},
@@ -5759,56 +5927,12 @@ class AgentToolRuntime:
                 {"tool": name, "alert_id": alert_id, "mutated": True},
                 [],
             )
-        if name == "get_exchange_rate":
-            from app.domain.schemas.management import ExchangeRateInfo
-
-            rate = BillingService(
-                db, self.workspace_id, self.actor_id
-            ).current_exchange_rate()
-            return self._success(
-                ExchangeRateInfo.model_validate(rate, from_attributes=True).model_dump(
-                    mode="json"
-                ),
-                {"tool": name},
-                [],
-            )
-        if name == "set_exchange_rate":
-            self._require_provider_manage()
-            rate = arguments.get("rate")
-            if not isinstance(rate, (int, float)) or rate <= 0:
-                raise AppError(
-                    422, "invalid_tool_arguments", "rate must be a positive number"
-                )
-            from app.domain.schemas.management import ExchangeRateInfo
-
-            result = BillingService(
-                db, self.workspace_id, self.actor_id
-            ).set_exchange_rate(float(rate))
-            return self._success(
-                ExchangeRateInfo.model_validate(
-                    result, from_attributes=True
-                ).model_dump(mode="json"),
-                {"tool": name, "mutated": True},
-                [],
-            )
-        if name == "refresh_exchange_rate":
-            self._require_provider_manage()
-            from app.domain.schemas.management import ExchangeRateInfo
-
-            result = BillingService(
-                db, self.workspace_id, self.actor_id
-            ).refresh_exchange_rate_from_network()
-            return self._success(
-                ExchangeRateInfo.model_validate(
-                    result, from_attributes=True
-                ).model_dump(mode="json"),
-                {"tool": name, "mutated": True},
-                [],
-            )
+        if name in {"get_exchange_rate", "set_exchange_rate", "refresh_exchange_rate"}:
+            raise AppError(410, "exchange_rate_removed", "USD and CNY billing is independent; exchange rates are not used")
         if name == "list_manual_prices":
             raw = BillingService(
                 db, self.workspace_id, self.actor_id
-            ).list_manual_prices()
+            ).list_manual_prices(str(arguments.get("currency") or "USD"))
             items = [
                 ManualPriceView.model_validate(item).model_dump(mode="json")
                 for item in raw
@@ -5830,14 +5954,18 @@ class AgentToolRuntime:
                     model_id=model_id,
                     provider_id=str(arguments.get("provider_id") or "*").strip(),
                     currency=str(arguments.get("currency") or "USD").strip(),
-                    input_per_million=float(arguments.get("input_per_million", 0)),
+                    input_per_million=arguments.get("input_per_million", "0"),
                     cached_input_per_million=(
-                        float(arguments["cached_input_per_million"])
+                        arguments["cached_input_per_million"]
                         if arguments.get("cached_input_per_million") is not None
                         else None
                     ),
-                    output_per_million=float(arguments.get("output_per_million", 0)),
-                    fixed_per_call=float(arguments.get("fixed_per_call", 0)),
+                    output_per_million=arguments.get("output_per_million", "0"),
+                    fixed_per_call=arguments.get("fixed_per_call", "0"),
+                    cache_write_per_million=arguments.get("cache_write_per_million"),
+                    rates_by_unit=arguments.get("rates_by_unit") or {},
+                    conditions=arguments.get("conditions") or {},
+                    feature=str(arguments.get("feature") or "*"),
                 )
             except (TypeError, ValueError) as exc:
                 raise AppError(
@@ -5853,15 +5981,15 @@ class AgentToolRuntime:
             )
         if name == "remove_manual_price":
             self._require_provider_manage()
-            model_id = str(arguments.get("model_id") or "").strip()
-            if not model_id:
-                raise AppError(422, "invalid_tool_arguments", "model_id is required")
+            price_id = str(arguments.get("price_id") or "").strip()
+            if not price_id:
+                raise AppError(422, "invalid_tool_arguments", "price_id is required")
             removed = BillingService(
                 db, self.workspace_id, self.actor_id
-            ).remove_manual_price(model_id)
+            ).remove_manual_price(price_id)
             return self._success(
-                {"model_id": model_id, "removed_count": removed},
-                {"tool": name, "model_id": model_id, "mutated": True},
+                {"price_id": price_id, "removed_count": removed},
+                {"tool": name, "price_id": price_id, "mutated": True},
                 [],
             )
         if name in {"get_usage_summary", "list_usage_events"}:
@@ -5883,6 +6011,7 @@ class AgentToolRuntime:
             )
             if name == "get_usage_summary":
                 summary = usage_service.summary(
+                    currency=str(arguments.get("currency") or "USD"),
                     provider_id=provider_id,
                     model_id=model_id,
                     feature=feature,
@@ -5893,6 +6022,7 @@ class AgentToolRuntime:
                     [],
                 )
             events = usage_service.events(
+                currency=str(arguments.get("currency") or "USD"),
                 provider_id=provider_id,
                 model_id=model_id,
                 feature=feature,
@@ -5910,7 +6040,14 @@ class AgentToolRuntime:
                 [],
             )
         if name == "refresh_models_dev_snapshot":
-            self._require_provider_manage()
+            principal = self.extensions.principal
+            if principal is None or not principal.is_system_admin:
+                raise AppError(403, "system_admin_required", "Global pricing refresh requires system administrator permission")
+            from app.services.authorization import AuthorizationService
+            from app.domain.models import Workspace
+            owning_workspace = db.scalar(select(Workspace).where(Workspace.id == self.workspace_id))
+            if owning_workspace is None or "workspace.write" not in AuthorizationService(db, principal).workspace_permissions(owning_workspace):
+                raise AppError(403, "permission_denied", "Permission workspace.write is required")
             from app.domain.schemas.management import ModelsDevSnapshotStatus
             from app.providers.models_dev import refresh_snapshot
 
@@ -6163,16 +6300,21 @@ class AgentToolRuntime:
                 file,
                 limit_bytes=50 * 1024 * 1024,
             )
-            result = provider.transcribe(
-                filename=file.original_name,
-                mime_type=file.mime_type,
-                content=content,
-                language=(
-                    str(arguments["language"]).strip()
-                    if arguments.get("language")
-                    else None
-                ),
-            )
+            billing = BillingService(db, self.workspace_id, self.actor_id)
+            quote = billing.preflight_model_call(provider_id=provider.provider_id, model_id=provider.model_id,
+                feature="audio_transcription", estimated_input_tokens=0, estimated_output_tokens=0,
+                remote_capability=provider.remote_capability)
+            result = None
+            try:
+                result = provider.transcribe(filename=file.original_name, mime_type=file.mime_type, content=content,
+                    language=str(arguments["language"]).strip() if arguments.get("language") else None)
+            finally:
+                usage = dict(result.usage or {}) if result else {}
+                units = {**usage, "requests": 1} if result else {}
+                if result and result.duration_seconds is not None:
+                    units["seconds"] = str(result.duration_seconds)
+                billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0),
+                    output_tokens=int(usage.get("output_tokens") or 0), attempt=1, usage_reported=bool(usage), usage_units=units)
             payload = {
                 "file_id": file.id,
                 "text": result.text,
@@ -6238,23 +6380,38 @@ class AgentToolRuntime:
                 )
             encoded = base64.b64encode(content).decode("ascii")
             text_parts: list[str] = []
-            for event in provider.stream_chat(
-                [
-                    ProviderChatMessage(
-                        role="user",
-                        content=str(arguments.get("prompt") or "").strip(),
-                        content_parts=[
-                            {
-                                "type": "input_image",
-                                "image_url": f"data:{mime_type};base64,{encoded}",
-                                "detail": "auto",
-                            }
-                        ],
-                    )
-                ]
-            ):
-                if event.content:
-                    text_parts.append(event.content)
+            billing = BillingService(db, self.workspace_id, self.actor_id)
+            quote = billing.preflight_model_call(provider_id=provider.provider_id, model_id=provider.model_id,
+                feature="vision", estimated_input_tokens=max(1, len(str(arguments.get("prompt") or "")) // 3) + 4096,
+                estimated_output_tokens=int(getattr(provider, "max_output_tokens", 2048) or 2048),
+                remote_capability=provider.remote_capability, estimated_units={"images": 1, "requests": 1})
+            vision_completed = False
+            try:
+                for event in provider.stream_chat(
+                    [
+                        ProviderChatMessage(
+                            role="user",
+                            content=str(arguments.get("prompt") or "").strip(),
+                            content_parts=[
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:{mime_type};base64,{encoded}",
+                                    "detail": "auto",
+                                }
+                            ],
+                        )
+                    ]
+                ):
+                    if event.content:
+                        text_parts.append(event.content)
+                vision_completed = bool(text_parts)
+            finally:
+                usage = dict(getattr(provider, "last_usage", {}) or {})
+                billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0),
+                    output_tokens=int(usage.get("output_tokens") or 0), attempt=1,
+                    cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                    cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+                    usage_reported=bool(usage), usage_units={**usage, **({"images": 1, "requests": 1} if vision_completed else {})})
             answer = "".join(text_parts).strip()
             if not answer:
                 raise AppError(
@@ -6320,7 +6477,8 @@ class AgentToolRuntime:
             job = research.create_research(
                 ResearchRequest(
                     question=str(arguments.get("question") or "").strip(),
-                    budget_cny=float(arguments.get("budget_cny") or 0),
+                    budget_amount=arguments.get("budget_amount") or "0",
+                    currency=str(arguments.get("currency") or "USD"),
                     allowed_domains=[
                         str(item)
                         for item in (arguments.get("allowed_domains") or [])
@@ -6330,6 +6488,7 @@ class AgentToolRuntime:
             )
             payload = ResearchJobView.model_validate(job).model_dump(mode="json")
             payload["user_approval_required"] = job.status == "awaiting_approval"
+            payload["quote_id"] = (job.billing_snapshot or {}).get("quote_id")
             return self._success(
                 payload,
                 {
@@ -6337,7 +6496,9 @@ class AgentToolRuntime:
                     "research_job_id": job.id,
                     "status": job.status,
                     "user_approval_required": payload["user_approval_required"],
-                    "estimated_cost_cny": payload.get("estimated_cost_cny", 0.0),
+                    "currency": payload.get("currency"),
+                    "budget_amount": payload.get("budget_amount"),
+                    "estimated_cost_amount": payload.get("estimated_cost_amount"),
                 },
                 [],
             )
@@ -7003,7 +7164,10 @@ class AgentToolRuntime:
             raise AppError(503, "search_provider_unavailable", "SearchProvider is unavailable")
         domains = {item.strip().casefold() for item in allowed_domains if item.strip()}
         try:
-            results = self.search_provider.search(query.strip(), 5, allowed_domains=domains or None)
+            if self.extensions is None:
+                raise AppError(500, "billing_scope_missing", "Search requires a workspace billing context")
+            results, _ = BillingService(self.extensions.db, self.workspace_id, self.actor_id).execute_search(
+                self.search_provider, query.strip(), 5, allowed_domains=domains or None)
         except SearchProviderTimeout as exc:
             raise AppError(504, "search_provider_timeout", "SearchProvider timed out") from exc
         except SearchProviderError as exc:
@@ -8136,6 +8300,10 @@ class AgentToolRuntime:
         self.extensions.db.commit()
         final_event = None
         usage: dict[str, Any] = {}
+        billing = BillingService(self.extensions.db, self.workspace_id, self.actor_id)
+        quote = billing.preflight_model_call(provider_id=image_provider.provider_id, model_id=image_provider.model_id,
+            feature="image_generation", estimated_input_tokens=max(1, len(prompt) // 3), estimated_output_tokens=0,
+            estimated_units={"images": 1, "requests": 1}, remote_capability=image_provider.remote_capability)
         try:
             for event in image_provider.stream_generate(
                 ImageGenerationRequest(
@@ -8197,6 +8365,11 @@ class AgentToolRuntime:
                     else "The authorized image generation Provider failed"
                 ),
             )
+
+        finally:
+            billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0), cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                attempt=1, usage_reported=bool(usage), usage_units={**usage, "images": 1, "requests": 1} if final_event else {})
 
         part_data: dict[str, Any] = {
             "generation_id": task.id,
@@ -8328,20 +8501,6 @@ class AgentToolRuntime:
 
     @staticmethod
     def _bounded_content(value: dict[str, Any]) -> tuple[str, bool]:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        raw = encoded.encode("utf-8")
-        if len(raw) <= AGENT_TOOL_RESULT_MAX_BYTES:
-            return encoded, False
-        prefix = raw[: AGENT_TOOL_RESULT_MAX_BYTES - 256].decode("utf-8", errors="ignore")
-        return (
-            json.dumps(
-                {
-                    "truncated": True,
-                    "message": "Tool result exceeded the Agent transcript limit",
-                    "preview": prefix,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            True,
-        )
+        from app.services.harness_contracts import bounded_json
+
+        return bounded_json(value, AGENT_TOOL_RESULT_MAX_BYTES)

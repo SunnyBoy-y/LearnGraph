@@ -360,7 +360,7 @@ class ProviderService:
             for record in records
         }
 
-    def create(self, payload: ProviderCreateRequest) -> ProviderConfig:
+    def create(self, payload: ProviderCreateRequest, *, auto_probe: bool = True, commit: bool = True) -> ProviderConfig:
         spec = provider_type_spec(payload.provider_type)
         if spec is None or not spec.create_allowed:
             raise AppError(
@@ -690,6 +690,11 @@ class ProviderService:
                 "secret_persisted_encrypted": bool(secret),
             },
         )
+        from app.services.provider_balance_lifecycle import enqueue_initial
+        enqueue_initial(self, provider)
+        if not commit:
+            self.db.flush()
+            return provider
         self.db.commit()
         self.db.refresh(provider)
         if provider.provider_type in _MODEL_MANAGEMENT_PROVIDER_TYPES:
@@ -704,7 +709,8 @@ class ProviderService:
                 provider = self.providers.require(provider.id, "provider")
                 self.db.refresh(provider)
         if (
-            secret
+            auto_probe
+            and secret
             and spec.supports_probe
             and provider.provider_type in MODEL_PROVIDER_TYPES
         ):
@@ -712,7 +718,8 @@ class ProviderService:
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
         elif (
-            not secret
+            auto_probe
+            and not secret
             and spec.supports_probe
             and provider.provider_type == "ollama"
             and provider.base_url
@@ -966,50 +973,8 @@ class ProviderService:
         return discovered
 
     def import_from_discovered(self, payload: DiscoveredProviderImportRequest) -> ProviderConfig:
-        """按探测项 source_id 在后端解析来源并创建 Provider。
-
-        环境凭据（``env-*``）由后端读取系统环境变量注入 Secret Store，明文密钥
-        不经过前端；本地服务项免密钥创建。环境变量缺失时明确报错而非静默建空。
-        """
-        import os
-
-        spec = provider_type_spec(payload.target_provider_type)
-        if spec is None or not spec.create_allowed:
-            raise AppError(
-                422,
-                "unsupported_provider_type",
-                "This provider type cannot be created by the current backend",
-            )
-        resolved_base_url = (payload.base_url or "").strip() or spec.default_base_url
-        resolved_name = (payload.display_name or "").strip() or spec.label
-
-        secret_plaintext: str | None = None
-        if payload.source_id.startswith("env-"):
-            env_var = payload.source_id[4:]
-            secret_plaintext = os.environ.get(env_var)
-            if spec.requires_secret and not secret_plaintext:
-                raise AppError(
-                    422,
-                    "env_secret_unavailable",
-                    f"系统环境变量 {env_var} 未提供可用的密钥，无法导入",
-                )
-            if secret_plaintext is not None:
-                secret_plaintext = secret_plaintext.strip()
-
-        provider = self.create(
-            ProviderCreateRequest(
-                display_name=resolved_name,
-                provider_type=payload.target_provider_type,
-                base_url=resolved_base_url,
-                api_key=SecretStr(secret_plaintext) if secret_plaintext else None,
-            )
-        )
-        if (
-            spec.supports_model_discovery
-            and payload.target_provider_type not in IMPORT_MODEL_FILTERS
-        ):
-            provider = self._import_discover(provider)
-        return provider
+        from app.services.provider_environment_import import import_discovered
+        return import_discovered(self, payload)
 
     def import_from_ccswitch(self, payload: CcSwitchImportRequest) -> dict:
         """从 cc-switch 配置导入供应商（批量创建 model 角色 Provider）。
@@ -1029,7 +994,8 @@ class ProviderService:
                     {"name": item["name"], "reason": "unsupported_provider_type"}
                 )
                 continue
-            existing = self._find_provider_by_base_url(item["base_url"], provider_type)
+            from app.services.provider_config_import import _existing
+            existing = _existing(self, {**item, "provider_type": provider_type})
             if existing is not None:
                 skipped.append(
                     {
@@ -1046,7 +1012,8 @@ class ProviderService:
                         provider_type=provider_type,
                         base_url=item["base_url"],
                         api_key=SecretStr(item["api_key"]) if item["api_key"] else None,
-                    )
+                        capabilities={"discovered_model_ids": item.get("model_ids", [])},
+                    ), auto_probe=False,
                 )
                 # 探测真机模型：调用 /models 端点列出该供应商实际可用的模型并
                 # 自动挑选默认模型；探测失败不阻断导入（凭据与地址已写入）。
@@ -1066,60 +1033,15 @@ class ProviderService:
         return {"created": created, "skipped": skipped}
 
     def _parse_ccswitch_providers(self, config_json: str) -> list[dict]:
-        """解析 cc-switch config.json，提取 Anthropic/OpenAI 供应商连接信息。"""
+        from app.services.provider_config_sources import parse_document
         try:
             data = json.loads(config_json)
-        except json.JSONDecodeError as exc:
-            raise AppError(
-                422,
-                "ccswitch_config_invalid",
-                f"cc-switch 配置 JSON 解析失败：{exc}",
-            )
-        raw = data.get("providers") if isinstance(data, dict) else None
-        if isinstance(raw, dict):
-            items = list(raw.values())
-        elif isinstance(raw, list):
-            items = raw
-        else:
-            raise AppError(
-                422,
-                "ccswitch_config_invalid",
-                "cc-switch 配置缺少 providers 字段",
-            )
-        result: list[dict] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            settings = item.get("settingsConfig") or {}
-            if isinstance(settings, str):
-                try:
-                    settings = json.loads(settings)
-                except json.JSONDecodeError:
-                    settings = {}
-            env = settings.get("env") or {} if isinstance(settings, dict) else {}
-            base_url = str(
-                env.get("ANTHROPIC_BASE_URL")
-                or env.get("OPENAI_BASE_URL")
-                or ""
-            ).strip()
-            api_key = str(
-                env.get("ANTHROPIC_AUTH_TOKEN")
-                or env.get("ANTHROPIC_API_KEY")
-                or env.get("OPENAI_API_KEY")
-                or ""
-            ).strip()
-            if not base_url:
-                continue
-            name = str(item.get("name") or "").strip() or base_url
-            result.append(
-                {
-                    "name": name,
-                    "base_url": base_url,
-                    "api_key": api_key,
-                    "provider_type": self._infer_ccswitch_type(env),
-                }
-            )
-        return result
+            items, warnings = parse_document(data, "ccswitch")
+        except (ValueError, TypeError):
+            raise AppError(422, "ccswitch_config_invalid", "配置JSON格式不支持，未导入任何凭据") from None
+        if not items:
+            raise AppError(422, "ccswitch_config_invalid", "未找到可导入的URL和API Key，请使用部署机器配置预览查看逐项原因")
+        return items
 
     def _infer_ccswitch_type(self, env: dict) -> str:
         """按 env 字段推断协议：OPENAI_API_KEY → openai_compatible_chat，否则 anthropic。"""
@@ -1420,6 +1342,11 @@ class ProviderService:
         was_enabled = provider.enabled
         capabilities = dict(provider.capabilities or {})
         fields_set = payload.model_fields_set
+        if "billing_currency" in fields_set:
+            if payload.billing_currency is None:
+                capabilities.pop("billing_currency", None)
+            else:
+                capabilities["billing_currency"] = payload.billing_currency
         if payload.provider_type is not None and payload.provider_type != provider.provider_type:
             next_spec = provider_type_spec(payload.provider_type)
             current_spec = provider_type_spec(provider.provider_type)
@@ -2897,15 +2824,15 @@ class ProviderService:
         record.key_provider = encrypted.key_provider
         record.key_version = encrypted.key_version
 
-    def _codex_usage(self, provider: ProviderConfig) -> dict:
+    def _codex_usage(self, provider: ProviderConfig, *, transport=None) -> dict:
         secret = self._decrypt_secret(provider.id)
         try:
             credentials, changed = ensure_fresh_codex_credentials(
-                parse_codex_credentials(secret)
+                parse_codex_credentials(secret), timeout_seconds=5.0, transport=transport
             )
             if changed:
                 self._persist_codex_credentials(provider.id, credentials.to_secret())
-            usage = fetch_codex_usage(credentials)
+            usage = fetch_codex_usage(credentials, timeout_seconds=5.0, transport=transport)
         except CodexAuthError as exc:
             raise AppError(
                 502,
@@ -3040,7 +2967,7 @@ class ProviderService:
             "plan_type": credentials.plan_type,
         }
 
-    def _dashscope_balance(self, provider: ProviderConfig) -> dict:
+    def _dashscope_balance(self, provider: ProviderConfig, *, transport=None) -> dict:
         """Query Aliyun account balance via the BSS RPC using a configured AccessKey.
 
         DashScope API keys cannot read account balance.  The workspace owner
@@ -3098,6 +3025,7 @@ class ProviderService:
             report = fetch_dashscope_balance(
                 access_key_id=access_key_id,
                 access_key_secret=access_key_secret,
+                timeout_seconds=5.0, transport=transport,
             )
         except ProviderBalanceError as exc:
             raise AppError(
@@ -3137,6 +3065,13 @@ class ProviderService:
         }
 
     def balance(self, provider_id: str) -> dict:
+        from app.services.provider_balance_lifecycle import run_balance
+        result = run_balance(self, provider_id)
+        if result is None:
+            raise AppError(409, 'balance_busy', '余额查询状态已变化，请稍后重试')
+        return result
+
+    def _balance_unmanaged(self, provider_id: str, *, transport=None) -> dict:
         provider = self.providers.require(provider_id, "provider")
         capabilities = dict(provider.capabilities or {})
         extra_headers = self._sanitize_extra_headers(capabilities.get("extra_headers"))
@@ -3150,11 +3085,11 @@ class ProviderService:
             or is_deepseek_chat_configuration(provider.provider_type, provider.base_url)
         )
         if provider.provider_type == "codex_chatgpt":
-            return self._codex_usage(provider)
+            return self._codex_usage(provider, transport=transport)
         if not provider.base_url:
             raise AppError(409, "provider_not_configured", "Provider base URL is missing")
         if _is_dashscope_host(provider.base_url):
-            return self._dashscope_balance(provider)
+            return self._dashscope_balance(provider, transport=transport)
         # Balance requests carry the saved key, so each vendor implementation
         # only ever talks to its verified official origin; everything else may
         # at most use the relay-station billing convention against the same
@@ -3166,6 +3101,7 @@ class ProviderService:
                     base_url=provider.base_url,
                     api_key=api_key,
                     extra_headers=extra_headers,
+                    timeout_seconds=5.0, transport=transport,
                 )
             except DeepSeekBalanceError as exc:
                 raise AppError(
@@ -3216,6 +3152,7 @@ class ProviderService:
                     base_url=provider.base_url,
                     api_key=api_key,
                     extra_headers=extra_headers,
+                    timeout_seconds=5.0, transport=transport,
                 )
             except ProviderBalanceError as exc:
                 raise AppError(
@@ -3276,6 +3213,9 @@ class ProviderService:
             bucket.pop("last_result", None)
         else:
             bucket["config"] = config.model_dump()
+            bucket.pop("last_result", None)
+        from app.services.provider_balance_lifecycle import invalidate
+        invalidate(self, provider.id)
         if bucket:
             capabilities[self._BALANCE_QUERY_CAPABILITY_KEY] = bucket
         else:
@@ -3308,6 +3248,16 @@ class ProviderService:
         self,
         provider_id: str,
         payload: ProviderBalanceQueryExecuteRequest,
+    ) -> dict:
+        from app.services.provider_balance_manual import run_custom_balance
+        return run_custom_balance(self, provider_id, payload)
+
+    def _execute_balance_query_unmanaged(
+        self,
+        provider_id: str,
+        payload: ProviderBalanceQueryExecuteRequest,
+        *,
+        transport: httpx.BaseTransport,
     ) -> dict:
         provider = self.providers.require(provider_id, "provider")
         request = payload.request
@@ -3350,6 +3300,7 @@ class ProviderService:
                 api_key=api_key or "",
                 variables=variables,
                 timeout_seconds=timeout_seconds,
+                transport=transport,
             )
         except CustomBalanceQueryError as exc:
             raise AppError(
@@ -3382,11 +3333,13 @@ class ProviderService:
         payload: ProviderBalanceQueryResultRequest,
     ) -> dict:
         provider = self.providers.require(provider_id, "provider")
+        from app.services.provider_balance_manual import consume_custom_result
+        consume_custom_result(self, provider, payload.query_token)
         capabilities = dict(provider.capabilities or {})
         bucket = dict(capabilities.get(self._BALANCE_QUERY_CAPABILITY_KEY) or {})
         queried_at = utc_now()
         bucket["last_result"] = {
-            **payload.model_dump(),
+            **payload.model_dump(exclude={"query_token"}),
             "queried_at": queried_at.isoformat(),
         }
         capabilities[self._BALANCE_QUERY_CAPABILITY_KEY] = bucket
@@ -4124,133 +4077,80 @@ class ProviderService:
 
 class UsageService:
     def __init__(self, db: Session, workspace_id: str) -> None:
-        self.db = db
-        self.workspace_id = workspace_id
+        self.db, self.workspace_id = db, workspace_id
         self.usage = UsageRepository(db, workspace_id)
 
-    def events(
-        self,
-        *,
-        provider_id: str | None = None,
-        model_id: str | None = None,
-        feature: str | None = None,
-        start_at: datetime | None = None,
-        end_at: datetime | None = None,
-    ) -> list[UsageEvent]:
-        statement = self._filtered_query(
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            start_at=start_at,
-            end_at=end_at,
-        )
-        return list(
-            self.db.scalars(statement.order_by(UsageEvent.created_at.desc())).all()
-        )
+    def events(self, *, currency: str | None = "USD", provider_id: str | None = None,
+               model_id: str | None = None, feature: str | None = None,
+               start_at: datetime | None = None, end_at: datetime | None = None,
+               archived: str = "exclude", offset: int = 0, limit: int = 500,
+               unknown_currency: bool = False) -> list[UsageEvent]:
+        statement = self._filtered_query(currency=None if unknown_currency else currency,
+            provider_id=provider_id, model_id=model_id, feature=feature, start_at=start_at, end_at=end_at)
+        statement = statement.where(UsageEvent.record_stage == "settled")
+        if archived == "exclude":
+            statement = statement.where(UsageEvent.archived_at.is_(None))
+        elif archived == "only":
+            statement = statement.where(UsageEvent.archived_at.is_not(None))
+        return list(self.db.scalars(statement.order_by(UsageEvent.created_at.desc(), UsageEvent.id)
+            .offset(max(0, offset)).limit(min(max(1, limit), 2000))).all())
 
-    def summary(
-        self,
-        *,
-        provider_id: str | None = None,
-        model_id: str | None = None,
-        feature: str | None = None,
-        start_at: datetime | None = None,
-        end_at: datetime | None = None,
-    ) -> UsageSummary:
-        filtered = self._filtered_query(
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            start_at=start_at,
-            end_at=end_at,
-        ).subquery()
-        values = self.db.execute(
-            select(
-                func.coalesce(func.sum(filtered.c.input_tokens), 0),
-                func.coalesce(func.sum(filtered.c.cached_input_tokens), 0),
-                func.coalesce(func.sum(filtered.c.cache_creation_input_tokens), 0),
-                func.coalesce(func.sum(filtered.c.output_tokens), 0),
-                func.coalesce(func.sum(filtered.c.reasoning_tokens), 0),
-                func.coalesce(func.sum(filtered.c.total_tokens), 0),
-                func.count(filtered.c.id),
-                func.coalesce(func.sum(filtered.c.cost_usd), 0.0),
-                func.coalesce(func.sum(filtered.c.cost_cny), 0.0),
-            )
-        ).one()
-        remote_count = self.db.scalar(
-            select(func.count()).select_from(filtered).where(
-                filtered.c.provider_id != "local_mock",
-                filtered.c.cost_status != "non_billable",
-            )
-        ) or 0
-        unpriced_count = self.db.scalar(
-            select(func.count()).select_from(filtered).where(
-                filtered.c.cost_status.in_(["unpriced", "estimated_usage_missing"])
-            )
-        ) or 0
-        return UsageSummary(
-            workspace_id=self.workspace_id,
-            input_tokens=int(values[0]),
-            cached_input_tokens=int(values[1]),
-            cache_creation_input_tokens=int(values[2]),
-            output_tokens=int(values[3]),
-            reasoning_tokens=int(values[4]),
-            total_tokens=int(values[5]),
-            attempts=int(values[6]),
-            cost_usd=float(values[7]),
-            cost_cny=float(values[8]),
-            unpriced_events=int(unpriced_count),
-            remote_usage_recorded=bool(remote_count),
-        )
+    def summary(self, *, currency: str = "USD", provider_id: str | None = None,
+                model_id: str | None = None, feature: str | None = None,
+                start_at: datetime | None = None, end_at: datetime | None = None) -> UsageSummary:
+        from app.core.money import currency_code, sum_amounts
+        currency = currency_code(currency)
+        args = dict(provider_id=provider_id, model_id=model_id, feature=feature, start_at=start_at, end_at=end_at)
+        records = list(self.db.scalars(self._filtered_query(currency=currency, **args)
+            .where(UsageEvent.record_stage != "released")).all())
+        events = [event for event in records if event.record_stage == "settled"]
+        tokens = {name: sum(getattr(event, name) for event in events) for name in (
+            "input_tokens", "cached_input_tokens", "cache_creation_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens")}
+        unknown = len(self.db.scalars(self._filtered_query(currency=None, **args)
+            .where(UsageEvent.record_stage == "settled", UsageEvent.cost_status != "non_billable")).all())
+        breakdown = {}
+        for dimension in ("provider_id", "model_id", "feature", "day"):
+            groups = {}
+            for event in events:
+                label = event.created_at.date().isoformat() if dimension == "day" else getattr(event, dimension)
+                groups.setdefault(label, []).append(event)
+            breakdown[dimension] = [dict(label=label, cost_amount=sum_amounts(event.cost_amount for event in members),
+                attempts=len(members), total_tokens=sum(event.total_tokens for event in members),
+                unknown_events=sum(event.cost_amount is None for event in members)) for label, members in sorted(groups.items())]
+        return UsageSummary(workspace_id=self.workspace_id, currency=currency, **tokens, attempts=len(events),
+            cost_amount=sum_amounts(event.cost_amount for event in events),
+            reserved_amount=sum_amounts(event.reserved_amount for event in records),
+            unpriced_events=sum(event.cost_amount is None for event in events), unknown_currency_events=unknown,
+            remote_usage_recorded=any(event.cost_status != "non_billable" for event in events), breakdown=breakdown)
 
-    def clear_events(self, *, actor_id: str) -> dict[str, int]:
-        """Delete every UsageEvent in the current workspace.
-
-        Price versions, exchange rates, and budget policies remain so the
-        workspace can keep billing configuration while resetting the ledger.
-        """
-
-        count = int(
-            self.db.scalar(
-                select(func.count())
-                .select_from(UsageEvent)
-                .where(UsageEvent.workspace_id == self.workspace_id)
-            )
-            or 0
-        )
-        self.db.execute(
-            delete(UsageEvent).where(UsageEvent.workspace_id == self.workspace_id)
-        )
-        AuditRepository(self.db, self.workspace_id).record(
-            actor_id=actor_id,
-            action="usage.events.cleared",
-            resource_type="usage_event",
-            resource_id=self.workspace_id,
-            details={"deleted_count": count},
-        )
+    def clear_events(self, *, actor_id: str, currency: str, provider_id: str | None = None,
+                     model_id: str | None = None, feature: str | None = None,
+                     start_at: datetime | None = None, end_at: datetime | None = None) -> dict[str, int]:
+        statement = self._filtered_query(currency=currency, provider_id=provider_id, model_id=model_id,
+                                         feature=feature, start_at=start_at, end_at=end_at)
+        records = self.db.scalars(statement.where(UsageEvent.record_stage == "settled", UsageEvent.archived_at.is_(None))).all()
+        for event in records:
+            event.archived_at = utc_now()
+        AuditRepository(self.db, self.workspace_id).record(actor_id=actor_id, action="usage.events.archived",
+            resource_type="usage_event", resource_id=self.workspace_id, details={"currency": currency, "archived_count": len(records)})
         self.db.commit()
-        return {"deleted_count": count}
+        return {"archived_count": len(records)}
 
-    def _filtered_query(
-        self,
-        *,
-        provider_id: str | None,
-        model_id: str | None,
-        feature: str | None,
-        start_at: datetime | None,
-        end_at: datetime | None,
-    ):
-        statement = self.usage.query()
-        if provider_id:
-            statement = statement.where(UsageEvent.provider_id == provider_id)
-        if model_id:
-            statement = statement.where(UsageEvent.model_id == model_id)
-        if feature:
-            statement = statement.where(UsageEvent.feature == feature)
+    def _filtered_query(self, *, currency: str | None, provider_id: str | None = None,
+                        model_id: str | None = None, feature: str | None = None,
+                        start_at: datetime | None = None, end_at: datetime | None = None):
+        from app.core.money import currency_code
+        from app.services.billing import BillingService
+        if start_at and end_at and BillingService._as_utc(start_at) >= BillingService._as_utc(end_at):
+            raise AppError(422, "invalid_usage_period", "Period start must precede its exclusive end")
+        statement = self.usage.query().where(UsageEvent.currency == currency_code(currency) if currency else UsageEvent.currency.is_(None))
+        for name, value in (("provider_id", provider_id), ("model_id", model_id), ("feature", feature)):
+            if value:
+                statement = statement.where(getattr(UsageEvent, name) == value)
         if start_at:
-            statement = statement.where(UsageEvent.created_at >= start_at)
+            statement = statement.where(UsageEvent.created_at >= BillingService._as_utc(start_at))
         if end_at:
-            statement = statement.where(UsageEvent.created_at < end_at)
+            statement = statement.where(UsageEvent.created_at < BillingService._as_utc(end_at))
         return statement
 
 
@@ -4456,6 +4356,10 @@ class SettingsService:
     # are managed through dedicated endpoints with masked views and must not
     # leak through the generic listing.
     HIDDEN_SETTING_KEYS = frozenset({"usage.alert_email"})
+    # Compatibility tombstones for settings whose product feature was removed.
+    # Keep the generic settings API available for every other key, but do not
+    # expose or recreate the retired trajectory switch for old clients.
+    REMOVED_SETTING_KEYS = frozenset({"trajectory.enabled"})
     SETTING_CATALOG: dict[str, dict] = {
         CHAT_SUGGESTED_PROMPTS_SETTING_KEY: {
             "description": "Generate suggested follow-up prompts after chat replies",
@@ -4617,8 +4521,20 @@ class SettingsService:
         return [
             setting
             for setting in self.settings.list()
-            if setting.key not in self.HIDDEN_SETTING_KEYS
+            if (
+                setting.key not in self.HIDDEN_SETTING_KEYS
+                and setting.key not in self.REMOVED_SETTING_KEYS
+            )
         ]
+
+    def _ensure_setting_available(self, key: str) -> None:
+        if key in self.REMOVED_SETTING_KEYS:
+            raise AppError(
+                410,
+                "setting_removed",
+                "This workspace setting has been removed",
+                {"key": key},
+            )
 
     def catalog(self) -> list[dict]:
         persisted = {item.key: item for item in self.list()}
@@ -4644,6 +4560,7 @@ class SettingsService:
         ]
 
     def get(self, key: str) -> dict:
+        self._ensure_setting_available(key)
         if key in self.HIDDEN_SETTING_KEYS:
             raise AppError(
                 403,
@@ -4664,6 +4581,7 @@ class SettingsService:
         }
 
     def require_agent_writable(self, key: str) -> None:
+        self._ensure_setting_available(key)
         if key not in self.SETTING_CATALOG or key in self.HIDDEN_SETTING_KEYS:
             raise AppError(
                 403,
@@ -4673,6 +4591,7 @@ class SettingsService:
             )
 
     def update(self, key: str, payload: SettingUpdateRequest) -> WorkspaceSetting:
+        self._ensure_setting_available(key)
         if key in self.HIDDEN_SETTING_KEYS:
             raise AppError(
                 403,

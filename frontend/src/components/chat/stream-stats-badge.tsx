@@ -1,5 +1,7 @@
 /**
  * Live/terminal stream metrics badge: 首字延迟 (first-token latency) + token/s.
+ * During a response stream it renders the selected animated meteor/sparkle
+ * indicator; numeric metrics remain optional.
  *
  * While the message is streaming it reads the client-side registry updated by
  * the stream consumers and refreshes on a short interval. Once the message is
@@ -8,6 +10,7 @@
  * (e.g. after a page reload the registry may be empty).
  */
 import { useEffect, useState } from "react";
+import { Sparkles } from "lucide-react";
 
 import {
   estimateStreamTokens,
@@ -43,6 +46,30 @@ function numericTraceValue(
     : undefined;
 }
 
+/**
+ * The selected preview treatment: a Lucide star that brightens in place while
+ * three short meteor streaks pass behind it. Keep the visual in one component
+ * so the same animation is used before the first delta and while later deltas
+ * are still arriving.
+ */
+function MeteorSparkle() {
+  return (
+    <span
+      aria-hidden="true"
+      className="message-stream-stats__loading-visual"
+      data-animation="meteor-flicker"
+    >
+      <span className="message-stream-stats__meteor-trail message-stream-stats__meteor-trail--a" />
+      <span className="message-stream-stats__meteor-trail message-stream-stats__meteor-trail--b" />
+      <span className="message-stream-stats__meteor-trail message-stream-stats__meteor-trail--c" />
+      <Sparkles
+        aria-hidden="true"
+        className="message-stream-stats__loading-icon"
+      />
+    </span>
+  );
+}
+
 export function StreamStatsBadge({
   messageId,
   status,
@@ -54,14 +81,13 @@ export function StreamStatsBadge({
 
   const streaming = status === "streaming" || status === "submitted";
 
-  // Live refresh while streaming and enabled.
+  // Refresh while streaming even when the optional numeric metrics are off:
+  // the selected star animation is visible for the whole response stream.
   useEffect(() => {
-    if (!enabled || !streaming) return;
+    if (!streaming) return;
     const timer = window.setInterval(() => setTick((value) => value + 1), STREAMING_TICK_MS);
     return () => window.clearInterval(timer);
-  }, [enabled, streaming]);
-
-  if (!enabled) return null;
+  }, [streaming]);
 
   const stats = lookupStreamStats(messageId);
   const now = Date.now();
@@ -79,12 +105,15 @@ export function StreamStatsBadge({
 
   if (streaming) {
     if (!stats || !stats.firstDeltaAt) {
-      const waiting = stats ? now - stats.startedAt : undefined;
       return (
-        <div className="message-stream-stats" role="status" aria-live="polite">
-          <span className="message-stream-stats__item">
-            {waiting !== undefined ? `等待首字… ${formatMilliseconds(waiting)}` : "等待首字…"}
-          </span>
+        <div
+          aria-busy="true"
+          aria-label="正在生成回答"
+          aria-live="polite"
+          className="message-stream-stats message-stream-stats--loading"
+          role="status"
+        >
+          <MeteorSparkle />
         </div>
       );
     }
@@ -115,6 +144,23 @@ export function StreamStatsBadge({
       tokensPerSecond = (estimateStreamTokens(stats) / elapsed) * 1_000;
     }
     totalTokens = estimateStreamTokens(stats);
+  }
+
+  // The animation is intentionally independent from the optional metrics
+  // toggle. Once the first delta exists, keep showing the same selected star
+  // while the answer continues to stream; the toggle only controls numbers.
+  if (!enabled) {
+    return streaming ? (
+      <div
+        aria-busy="true"
+        aria-label="正在生成回答"
+        aria-live="polite"
+        className="message-stream-stats message-stream-stats--loading"
+        role="status"
+      >
+        <MeteorSparkle />
+      </div>
+    ) : null;
   }
 
   // Cache-hit share of billed prompt input (terminal only: the cache fields
@@ -176,7 +222,13 @@ export function StreamStatsBadge({
   if (!segments.length && !cacheBadge) return null;
 
   return (
-    <div className="message-stream-stats" role="status" aria-live="polite">
+    <div
+      aria-busy={streaming ? "true" : undefined}
+      className="message-stream-stats"
+      role="status"
+      aria-live="polite"
+    >
+      {streaming ? <MeteorSparkle /> : null}
       {segments.map((segment) => (
         <span className="message-stream-stats__item" key={segment}>
           {segment}

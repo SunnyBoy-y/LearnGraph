@@ -580,6 +580,9 @@ export function DocumentLearningPage() {
         state: {
           pendingPrompt: `请基于文档《${file?.original_name ?? ""}》和已确认目标，提取需要学习的概念、前置关系与证据，生成候选目标图谱供我审核。`,
           pendingFileIds: scopeFileIds,
+          pendingAttachmentFiles: (files.data ?? []).filter((item) =>
+            scopeFileIds.includes(item.id),
+          ),
           pendingGraphAction: "propose_create",
         },
       }),
@@ -600,6 +603,7 @@ export function DocumentLearningPage() {
   if (!file) {
     return <div className="grid min-h-[70svh] place-items-center text-sm text-muted-foreground">文档不存在或无权访问。</div>;
   }
+  const currentFile = file;
 
   const previewKind = resolveFilePreviewKind(file.original_name, file.mime_type);
   const isAudio = previewKind === "audio";
@@ -620,6 +624,9 @@ export function DocumentLearningPage() {
   // HTML 页面在沙箱 iframe 中整体预览，证据检索与图谱构建不适用。
   const chatOnlyPanel = previewKind === "html" || !supportsEvidenceAndGraph;
   const effectiveRightPanel = chatOnlyPanel ? "chat" : rightPanel;
+  // Chat-only previews use the fifth, compact composer; indexed PDF/DOCX
+  // previews keep their evidence/graph tabs available in the expanded dock.
+  const compactChat = chatOnlyPanel && effectiveRightPanel === "chat";
   const confirmedGoals = (goals.data ?? []).filter((item) =>
     ["confirmed", "candidate_ready", "approved"].includes(item.status),
   );
@@ -634,6 +641,24 @@ export function DocumentLearningPage() {
       retryableDocumentJobStatuses.has(documentJob.status),
   );
   const originalUnavailable = blob.isError && !blob.data;
+
+  async function sendDocumentQuestionToFullChat(content: string) {
+    let targetSessionId = chatSessionId;
+    if (!targetSessionId) {
+      const session = await createSession({
+        title: `阅读 ${currentFile.original_name}`,
+        memory_enabled: false,
+      });
+      targetSessionId = session.id;
+    }
+    navigate(`/w/${workspaceId}/chat/${targetSessionId}`, {
+      state: {
+        pendingPrompt: content,
+        pendingFileIds: [currentFile.id],
+        pendingAttachmentFiles: [currentFile],
+      },
+    });
+  }
 
   return (
     <div className="min-h-[calc(100svh-3.5rem)] bg-background lg:min-h-svh">
@@ -821,8 +846,8 @@ export function DocumentLearningPage() {
 
       <div
         className={cn(
-          "grid min-h-[calc(100svh-7rem)] xl:min-h-[calc(100svh-4.25rem)] xl:grid-cols-[minmax(0,1fr)_23rem]",
-          outlineOpen && "2xl:grid-cols-[13rem_minmax(0,1fr)_23rem]",
+          "grid min-h-[calc(100svh-7rem)] xl:min-h-[calc(100svh-4.25rem)] xl:grid-cols-[minmax(0,1fr)]",
+          outlineOpen && "2xl:grid-cols-[13rem_minmax(0,1fr)]",
         )}
       >
         <aside
@@ -872,6 +897,7 @@ export function DocumentLearningPage() {
           </div>
         </aside>
 
+        <div className="document-learning-reader-shell">
         <main className={cn("min-w-0 bg-card xl:block", mobilePane === "reader" ? "block" : "hidden")}>
           {blob.isPending && hasOriginalPreview ? (
             <div className="grid min-h-[36rem] place-items-center text-sm text-muted-foreground">
@@ -1039,15 +1065,22 @@ export function DocumentLearningPage() {
           ) : null}
         </main>
 
-        <aside className={cn("border-l bg-background xl:block", mobilePane === "chat" ? "block" : "hidden")}>
-          <div
-            className={cn(
-              "sticky top-[7.5rem] flex min-h-[36rem] flex-col xl:top-[4.25rem]",
-              jobId && jobBelongsToFile
-                ? "h-[calc(100svh-10.5rem)] xl:h-[calc(100svh-6.75rem)]"
-                : "h-[calc(100svh-8.25rem)] xl:h-[calc(100svh-4.25rem)]",
-            )}
-          >
+        <aside
+          aria-label="文档学习对话"
+          className={cn(
+            "document-learning-chat-dock",
+            compactChat && "document-learning-chat-dock--compact",
+            mobilePane === "chat" ? "block" : "hidden",
+            "xl:block",
+          )}
+          role="dialog"
+        >
+          <div className={cn(
+            "flex min-h-0 flex-col",
+            compactChat
+              ? "document-learning-chat-dock__compact-inner"
+              : "h-full overflow-hidden rounded-2xl bg-background/95",
+          )}>
             {!chatOnlyPanel ? (
               <div className="grid h-10 flex-none grid-cols-3 border-b p-1">
                 <Button aria-pressed={effectiveRightPanel === "chat"} onClick={() => setRightPanel("chat")} size="sm" variant={effectiveRightPanel === "chat" ? "secondary" : "ghost"}>
@@ -1063,10 +1096,12 @@ export function DocumentLearningPage() {
             ) : null}
 
             {effectiveRightPanel === "chat" ? (
-              <div className="min-h-0 flex-1">
+              <div className={cn("min-h-0", !compactChat && "flex-1")}>
                 <DocumentChatPanel
                   embeddedImages={embeddedImages}
                   file={file}
+                  compact={compactChat}
+                  onSendToFullChat={sendDocumentQuestionToFullChat}
                   onRemoveEmbeddedImage={(id) => setEmbeddedImages((current) => current.filter((image) => image.id !== id))}
                   onClearSelection={() => setSelected(null)}
                   onSessionChange={setChatSessionId}
@@ -1163,6 +1198,7 @@ export function DocumentLearningPage() {
             ) : null}
           </div>
         </aside>
+        </div>
       </div>
       {selectionMenu && pendingSelection ? (
         <div

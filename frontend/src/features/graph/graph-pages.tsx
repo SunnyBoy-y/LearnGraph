@@ -308,6 +308,8 @@ export type OpenLearningProjectDetail = {
   nodeLabel?: string;
   prompt?: string;
   graphAction?: "none" | "propose_create" | "propose_update";
+  learningPackage?: boolean;
+  openKey?: string;
 };
 
 function openLearningProject(detail: OpenLearningProjectDetail) {
@@ -722,7 +724,7 @@ function GraphBookshelf({
                   ) : (
                     <Button
                       onClick={() =>
-                        entry.graphId ? onStartLearning(entry) : onStartGoal()
+                        onStartLearning(entry)
                       }
                       size="xs"
                       variant={entry.graphId ? "default" : "outline"}
@@ -1333,18 +1335,9 @@ export function GraphWorkspacePage() {
     }
     return { upstream, downstream, related };
   }, [effectiveGraph, selectedNode]);
-  const maximumDepth = workbenchGraph
-    ? getKnowledgeGraphTreeDepth(workbenchGraph.nodes, workbenchGraph.edges)
-    : 0;
-  // Clamp so the initial "show all" sentinel never flashes as a huge fraction.
+  const maximumDepth = useMemo(() => nodeDepthById.size ? Math.max(...nodeDepthById.values()) : 0, [nodeDepthById]);
   const effectiveDepthLimit = Math.min(depthLimit, maximumDepth);
-  const requestedNodeDepth =
-    workbenchGraph && requestedNodeId
-      ? (getKnowledgeGraphTreeDepths(
-          workbenchGraph.nodes,
-          workbenchGraph.edges,
-        ).get(requestedNodeId) ?? 0)
-      : 0;
+  const requestedNodeDepth = requestedNodeId ? nodeDepthById.get(requestedNodeId) ?? 0 : 0;
 
   useEffect(() => {
     setSelectedNodeId((current) =>
@@ -1949,6 +1942,7 @@ export function GraphWorkspacePage() {
 
   /** Camera-only focus: never a mode change, just a deliberate framing. */
   function locateNode(nodeId: string, neighbors = true) {
+    setDepthLimit(current => Math.max(current, nodeDepthById.get(nodeId) ?? 0));
     canvasApiRef.current?.focusNode(nodeId, { neighbors });
   }
 
@@ -1992,7 +1986,9 @@ export function GraphWorkspacePage() {
       editable={editMode}
       exploreOpen={explorePanelOpen}
       exploreRounds={selectedExplore.data ?? []}
-      exploreLoading={selectedExplore.isPending}
+      exploreLoading={selectedExplore.isLoading}
+      exploreError={selectedExplore.error?.message}
+      onRetryExplore={() => void selectedExplore.refetch()}
       focusBusy={focus.isPending}
       focusEditable={focusEditable}
       levelLabel={graphLevelLabel(
@@ -2592,6 +2588,7 @@ export function GraphWorkspacePage() {
                     initialFit="focus"
                     onCanvasApi={handleCanvasApi}
                     onSelect={selectWorkbenchNode}
+                     onOpenExplore={(node) => { selectWorkbenchNode(node); setExplorePanelOpen(true); }}
                     onSelectionChange={updateWorkbenchSelection}
                     onStudy={studyFromNode}
                     rootEmphasis
@@ -2763,6 +2760,8 @@ function GraphNodeInspector({
   exploreOpen = false,
   exploreRounds = [],
   exploreLoading = false,
+  exploreError,
+  onRetryExplore,
   focusEditable,
   saving,
   focusBusy,
@@ -2796,6 +2795,8 @@ function GraphNodeInspector({
   exploreOpen?: boolean;
   exploreRounds?: Array<{ id: string; content: string; created_at: string }>;
   exploreLoading?: boolean;
+  exploreError?: string;
+  onRetryExplore?: () => void;
   focusEditable: boolean;
   saving: boolean;
   focusBusy: boolean;
@@ -2841,6 +2842,7 @@ function GraphNodeInspector({
   };
 }) {
   const [tab, setTab] = useState<"core" | "relations" | "resources">("core");
+  useEffect(() => { if (exploreOpen) setTab("resources"); }, [exploreOpen, node?.id]);
   const importance = weightToImportance(draft.targetWeight);
   const statusProfile = statusId ? NODE_STATUS_PROFILES[statusId] : undefined;
 
@@ -3196,7 +3198,7 @@ function GraphNodeInspector({
                   <div>
                     <span>探索链</span>
                     <strong>
-                      {exploreLoading
+                      {exploreError ? "读取失败" : exploreLoading
                         ? "加载中…"
                         : exploreRounds.length
                           ? `已深入 ×${exploreRounds.length}`
@@ -3222,7 +3224,8 @@ function GraphNodeInspector({
                     title={node.label}
                   />
                 ) : null}
-                {!exploreRounds.length && !exploreLoading ? (
+                {exploreError && <div role="alert"><p>{exploreError}</p><Button size="xs" onClick={onRetryExplore} disabled={exploreLoading}>重试读取历史</Button></div>}
+                {!exploreRounds.length && !exploreLoading && !exploreError ? (
                   <NodeExploreEmpty onLearn={onLearn} />
                 ) : null}
               </section>
@@ -3390,33 +3393,30 @@ export function JointStudyPage() {
         : graph.data.nodes.slice(0, 3).map((node) => node.id);
     });
   }, [graph.data, requestedNodeIds]);
-  const [result, setResult] = useState<MultiNodeStudyResponse | null>(null);
+  const [storedResult, setResult] = useState<{key: string; data: MultiNodeStudyResponse} | null>(null);
   const selectedKey = selected.join(",");
+  const selectionKey = JSON.stringify([resolvedGraphId, selected]);
+  const result = storedResult?.key === selectionKey ? storedResult.data : null;
   useEffect(() => setResult(null), [resolvedGraphId, selectedKey]);
   const study = useMutation({
-    mutationFn: () =>
-      studyMultipleNodes(resolvedGraphId, { node_ids: selected }),
-    onSuccess: setResult,
+    mutationFn: (snapshot: {graphId: string; nodeIds: string[]; key: string}) =>
+      studyMultipleNodes(snapshot.graphId, { node_ids: snapshot.nodeIds }),
+    onSuccess: (data, snapshot) => setResult({key: snapshot.key, data}),
     onError: (error) => toast.error(error.message),
   });
   const startSession = useMutation({
-    mutationFn: () =>
-      createSession({
-        title: `${graph.data?.title ?? "联合"}学习`,
-        graph_id: resolvedGraphId,
-      }),
-    onSuccess: (session) =>
-      navigate(`/w/${workspaceId}/chat/${session.id}`, {
-        state: {
-          pendingPrompt:
-            result?.next_actions.join("；") ||
-            `请联合讲解：${selectedNodes.map((node) => node.label).join("、")}`,
-          learningNode: {
-            graphId: resolvedGraphId,
-            nodeIds: selectedNodes.map((node) => node.id),
-          },
-        },
-      }),
+    mutationFn: async () => {
+      const nodeIds = [...selected];
+      if (!result?.related || nodeIds.length < 2) throw new Error("请先判断当前所选节点的关联。");
+      const graphId = resolvedGraphId;
+      const prompt = result.next_actions.join("；") || `请联合讲解：${graph.data?.nodes.filter(node => nodeIds.includes(node.id)).map(node => node.label).join("、")}`;
+      const session = await createSession({title: `${graph.data?.title ?? "联合"}学习`, graph_id: graphId});
+      return {session, graphId, nodeIds, prompt};
+    },
+    onSuccess: ({session, graphId, nodeIds, prompt}) => navigate(`/w/${workspaceId}/chat/${session.id}`, {
+      state: {pendingPrompt: prompt, learningNode: {graphId, nodeIds}},
+    }),
+    onError: (error: Error) => toast.error(`无法进入联合讲解：${error.message}`),
   });
   const splitSessions = useMutation({
     mutationFn: () =>
@@ -3443,6 +3443,11 @@ export function JointStudyPage() {
     },
     onError: (error) => toast.error(error.message),
   });
+  if (!resolvedGraphId) {
+    if (graphs.isPending) return <PageFrame><LoadingState /></PageFrame>;
+    if (graphs.isError) return <PageFrame><ErrorState message={graphs.error.message} onRetry={() => void graphs.refetch()} /></PageFrame>;
+    return <PageFrame><p>还没有可用于联合学习的图谱。</p><Button onClick={() => navigate(`/w/${workspaceId}/graphs`)}>前往图谱书架</Button></PageFrame>;
+  }
   if (graph.isPending)
     return (
       <PageFrame>
@@ -3452,7 +3457,7 @@ export function JointStudyPage() {
   if (graph.isError)
     return (
       <PageFrame>
-        <ErrorState message={graph.error.message} />
+        <ErrorState message={graph.error.message} onRetry={() => void graph.refetch()} />
       </PageFrame>
     );
   const selectedNodes = graph.data.nodes.filter((node) =>
@@ -3465,7 +3470,7 @@ export function JointStudyPage() {
         actions={
           <Button
             disabled={selected.length < 2 || study.isPending}
-            onClick={() => study.mutate()}
+            onClick={() => study.mutate({graphId: resolvedGraphId, nodeIds: [...selected], key: selectionKey})}
           >
             <Sparkles className="size-4" />
             {study.isPending ? "正在判断…" : "重新判断关联"}
@@ -3477,6 +3482,7 @@ export function JointStudyPage() {
       />
       <Surface className="p-5">
         <Select
+          disabled={startSession.isPending || splitSessions.isPending}
           onValueChange={(value) => {
             setGraphId(value);
             setSelected([]);
@@ -3510,7 +3516,7 @@ export function JointStudyPage() {
               >
                 <Checkbox
                   checked={checked}
-                  disabled={!checked && selected.length >= 8}
+                  disabled={startSession.isPending || splitSessions.isPending || (!checked && selected.length >= 8)}
                   onCheckedChange={() => {
                     setResult(null);
                     setSelected((current) => {
@@ -3661,10 +3667,10 @@ export function JointStudyPage() {
             ) : null}
             <Button
               className="w-full"
-              disabled={!result || !result.related || startSession.isPending}
+              disabled={!result?.related || selectedNodes.length < 2 || startSession.isPending || splitSessions.isPending}
               onClick={() => startSession.mutate()}
             >
-              进入联合讲解
+              {startSession.isPending ? "正在进入…" : "进入联合讲解"}
               <ArrowRight className="size-4" />
             </Button>
             <Button

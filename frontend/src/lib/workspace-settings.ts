@@ -39,8 +39,6 @@ export const CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY =
 export const CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY =
   "chat.thinking_chain_default";
 export { CHAT_RESPONSE_STYLE_SETTING_KEY } from "@/lib/response-style";
-export const TRAJECTORY_ENABLED_SETTING_KEY =
-  "trajectory.enabled";
 /** 语音调试面板（右侧栏「语音延迟」栏目）：未配置时默认关闭。 */
 export const VOICE_DEBUG_PANEL_SETTING_KEY =
   "voice.debug_panel";
@@ -102,17 +100,6 @@ export function isChatDictationCleanupEnabled(
   // 每个语音片段都会产生一次计费调用,未配置时默认关闭。
   if (!value || typeof value !== "object" || !("enabled" in value)) return false;
   return value.enabled === true;
-}
-
-
-/** 轨迹追踪为可选特性，未配置时默认关闭。 */
-export function isTrajectoryEnabled(
-  settings: WorkspaceSetting[] | undefined,
-): boolean {
-  const value = settings?.find(
-    (setting) => setting.key === TRAJECTORY_ENABLED_SETTING_KEY,
-  )?.value;
-  return value === true;
 }
 
 /** 语音调试面板为可选特性（排障用），未配置时默认关闭。 */

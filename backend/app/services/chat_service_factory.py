@@ -339,7 +339,7 @@ def build_chat_service(
         search_provider=search_provider,
         memory_context_loader=(
             None
-            if settings.memory_context_builder_v2
+            if settings.memory_context_builder_v2 and settings.memory_read_mode == "events"
             else memory_service.context_for_session
         ),
         memory_cache_context_loader=(

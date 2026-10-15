@@ -1,3 +1,7 @@
+import { nativeMoney } from "@/lib/money";
+import { useAuth } from "@/features/auth/auth-context-value";
+import { authStore } from "@/api/auth-store";
+import type { BillingCurrency } from "@/types/usage";
 import {
   useCallback,
   useEffect,
@@ -26,12 +30,10 @@ import {
   List,
   Globe2,
   HardDrive,
-  Link2,
   LoaderCircle,
   MoreHorizontal,
   RefreshCcw,
   Search,
-  ShieldCheck,
   Sparkles,
   Trash2,
   UploadCloud,
@@ -409,6 +411,41 @@ export function SourcesPage() {
     },
     onError: (error) => toast.error(error.message),
   });
+  const batchParse = useMutation({
+    mutationFn: async (fileIds: string[]) => {
+      const outcomes = await Promise.all(
+        fileIds.map(async (fileId) => {
+          try {
+            const job = await parseFile(fileId);
+            await pollParseJob(job);
+            return { fileId, ok: true, error: null as string | null };
+          } catch (error) {
+            return {
+              fileId,
+              ok: false,
+              error: error instanceof Error ? error.message : "解析任务失败",
+            };
+          }
+        }),
+      );
+      const failed = outcomes.filter((outcome) => !outcome.ok);
+      return { completed: outcomes.length - failed.length, failed };
+    },
+    onSuccess: (result) => {
+      setSelectedFileIds(new Set());
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      if (result.failed.length === 0) {
+        toast.success(`已完成 ${result.completed} 个文件索引`);
+      } else if (result.completed > 0) {
+        toast.warning(
+          `已完成 ${result.completed} 个文件索引，${result.failed.length} 个失败`,
+        );
+      } else {
+        toast.error(`批量索引失败：${result.failed[0]?.error ?? "解析任务失败"}`);
+      }
+    },
+    onError: (error) => toast.error(error.message),
+  });
   const deleteImpact = useQuery({
     enabled: Boolean(deleteTarget),
     queryKey: ["file-delete-impact", deleteTarget?.id],
@@ -601,6 +638,22 @@ export function SourcesPage() {
     pageFileIds.length > 0 && selectedOnPageCount === pageFileIds.length;
   const somePageSelected =
     selectedOnPageCount > 0 && selectedOnPageCount < pageFileIds.length;
+  const selectedIndexableFileIds = files.data
+    .filter((file) => {
+      const capability = parserCapabilityForFile(
+        file,
+        parserCapabilities.data,
+      );
+      return (
+        selectedFileIds.has(file.id) &&
+        !["indexed", "queued", "running", "processing"].includes(
+          file.parse_status,
+        ) &&
+        !isAttachmentOnlyFile(file) &&
+        capability?.available !== false
+      );
+    })
+    .map((file) => file.id);
   const chooseFiles = () => inputRef.current?.click();
   const toggleFileSelected = (fileId: string, checked: boolean) => {
     setSelectedFileIds((current) => {
@@ -725,34 +778,6 @@ export function SourcesPage() {
             个解析失败
           </span>
         ) : null}
-        <span className="ml-auto flex items-center gap-2">
-          {/* 资料库已停用「粘贴网页抓取正文」；对话内的网页解析链路不受影响。 */}
-          <Button
-            disabled
-            size="sm"
-            title="已停用：资料库不再保存网页正文"
-            variant="outline"
-          >
-            <Link2 className="size-4" />
-            粘贴网页（已停用）
-          </Button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button aria-label="更多资料库操作" size="icon-sm" variant="ghost">
-                <MoreHorizontal className="size-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={() => setSupportOpen(true)}>
-                查看支持的文件格式
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setPolicyOpen(true)}>
-                <ShieldCheck className="size-4" />
-                网页缓存策略
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </span>
       </div>
 
       {/* 扁平工具栏：搜索 + 类型一行，状态 chips 一行；外层没有 Card。 */}
@@ -832,6 +857,29 @@ export function SourcesPage() {
               >
                 <Trash2 className="size-3.5" />
                 批量删除
+              </Button>
+              <Button
+                disabled={
+                  batchParse.isPending || selectedIndexableFileIds.length === 0
+                }
+                onClick={() => {
+                  if (!selectedIndexableFileIds.length) {
+                    toast.info("所选资料中没有可建立索引的文件");
+                    return;
+                  }
+                  batchParse.mutate(selectedIndexableFileIds);
+                }}
+                size="xs"
+                variant="outline"
+              >
+                {batchParse.isPending ? (
+                  <LoaderCircle className="size-3.5 animate-spin" />
+                ) : (
+                  <RefreshCcw className="size-3.5" />
+                )}
+                {batchParse.isPending
+                  ? "批量索引中…"
+                  : `批量索引${selectedIndexableFileIds.length ? ` (${selectedIndexableFileIds.length})` : ""}`}
               </Button>
               <Button
                 onClick={() => setSelectedFileIds(new Set())}
@@ -923,10 +971,24 @@ export function SourcesPage() {
                 const isSelected = selectedFileIds.has(file.id);
                 return (
                   <tr
-                    className={isSelected ? "bg-muted/25" : undefined}
+                    aria-label={`打开 ${file.original_name} 的学习预览`}
+                    className={`group cursor-pointer transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+                      isSelected ? "bg-muted/25" : ""
+                    }`}
                     key={file.id}
+                    onClick={() => navigate(`../documents/${file.id}`)}
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return;
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      navigate(`../documents/${file.id}`);
+                    }}
+                    tabIndex={0}
                   >
-                    <td className="px-4 py-4">
+                    <td
+                      className="px-4 py-4"
+                      onClick={(event) => event.stopPropagation()}
+                    >
                       <Checkbox
                         aria-label={`选择 ${file.original_name}`}
                         checked={isSelected}
@@ -936,16 +998,12 @@ export function SourcesPage() {
                       />
                     </td>
                     <td className="px-5 py-4">
-                      <button
-                        className="flex max-w-full items-center gap-2 text-left hover:underline"
-                        onClick={() => setDiagnosticFile(file)}
-                        type="button"
-                      >
+                      <div className="flex max-w-full items-center gap-2 text-left group-hover:underline">
                         <FileThumbnail file={file} />
                         <span className="max-w-64 truncate font-medium">
                           {file.original_name}
                         </span>
-                      </button>
+                      </div>
                     </td>
                     <td className="px-5 py-4 text-xs text-muted-foreground">
                       {fileType(file)}
@@ -959,7 +1017,10 @@ export function SourcesPage() {
                     <td className="px-5 py-4 text-xs text-muted-foreground">
                       {formatUploadTime(file.created_at)}
                     </td>
-                    <td className="sticky right-0 z-10 border-l bg-card px-5 py-4">
+                    <td
+                      className="sticky right-0 z-10 border-l bg-card px-5 py-4"
+                      onClick={(event) => event.stopPropagation()}
+                    >
                       <div className="flex justify-end">
                         <DropdownMenu>
                           <DropdownMenuTrigger asChild>
@@ -1576,31 +1637,40 @@ export function ResearchNewTaskPage() {
   const { workspaceId = "" } = useParams();
   const navigate = useNavigate();
   const [question, setQuestion] = useState("");
-  const [budget, setBudget] = useState(0);
+  const [budget, setBudget] = useState("0");
+  const [currency, setCurrency] = useState<BillingCurrency>("USD");
   const [plan, setPlan] = useState<ResearchPlan | null>(null);
+  const { userId } = useAuth();
+  useEffect(() => { setPlan(null); setQuestion(""); setBudget("0"); }, [workspaceId, userId]);
   const queryClient = useQueryClient();
+  type Draft = { workspaceId: string; userId: string; question: string; budget: string; currency: BillingCurrency };
+  const captureDraft = (): Draft => ({ workspaceId, userId, question, budget, currency });
+  const isCurrentDraft = (draft: Draft) => {
+    const session = authStore.getSession();
+    return session?.workspaceId === draft.workspaceId && (session.userId ?? session.username) === draft.userId;
+  };
   const preview = useMutation({
-    mutationFn: () =>
-      planResearch({ question, budget_cny: budget, source_scope: [] }),
-    onSuccess: setPlan,
-    onError: (error) => toast.error(error.message),
+    mutationFn: (draft: Draft) => planResearch({ question: draft.question, budget_amount: draft.budget, currency: draft.currency, source_scope: [] }, draft.workspaceId),
+    onSuccess: (value, draft) => { if (isCurrentDraft(draft) && draft.question === question && draft.budget === budget && draft.currency === currency) setPlan(value); },
+    onError: (error, draft) => { if (isCurrentDraft(draft)) toast.error(error.message); },
   });
   const create = useMutation({
-    mutationFn: () =>
-      createResearchJob({ question, budget_cny: budget, source_scope: [] }),
-    onSuccess: (created) => {
+    mutationFn: (draft: Draft) =>
+      createResearchJob({ question: draft.question, budget_amount: draft.budget, currency: draft.currency, source_scope: [] }, draft.workspaceId),
+    onSuccess: (created, draft) => {
+      if (!isCurrentDraft(draft) || created.workspace_id !== draft.workspaceId) return;
       setPlan(null);
       toast.success(
         created.status === "awaiting_approval"
           ? "研究任务等待预算确认"
           : "研究任务已创建",
       );
-      void queryClient.invalidateQueries({ queryKey: ["research"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(created.workspace_id, "research") });
       navigate(
         `/w/${encodeURIComponent(workspaceId)}/research/tasks/${encodeURIComponent(created.id)}`,
       );
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error, draft) => { if (isCurrentDraft(draft)) toast.error(error.message); },
   });
   return (
     <PageFrame>
@@ -1609,14 +1679,14 @@ export function ResearchNewTaskPage() {
           <div className="flex gap-2">
             <Button
               disabled={preview.isPending || !question.trim()}
-              onClick={() => preview.mutate()}
+              onClick={() => preview.mutate(captureDraft())}
               variant="outline"
             >
               预估计划
             </Button>
             <Button
               disabled={create.isPending || !question.trim()}
-              onClick={() => create.mutate()}
+              onClick={() => create.mutate(captureDraft())}
             >
               <Sparkles className="size-4" />
               {create.isPending ? "创建中…" : "创建研究任务"}
@@ -1638,18 +1708,19 @@ export function ResearchNewTaskPage() {
             <Input
               className="mt-2"
               id="research-question"
-              onChange={(event) => setQuestion(event.target.value)}
+              onChange={(event) => { setQuestion(event.target.value); setPlan(null); }}
               placeholder="输入需要多来源综合的问题"
               value={question}
             />
           </div>
           <div>
-            <Label htmlFor="research-budget">预算（CNY）</Label>
+            <Label htmlFor="research-budget">预算（原币）</Label>
+            <select aria-label="研究预算币种" value={currency} onChange={(event) => { setCurrency(event.target.value as BillingCurrency); setPlan(null); }} className="mt-2 h-9 rounded-md border bg-background"><option value="USD">美元 USD</option><option value="CNY">人民币 CNY</option></select>
             <Input
               className="mt-2"
               id="research-budget"
               min="0"
-              onChange={(event) => setBudget(Number(event.target.value) || 0)}
+              onChange={(event) => { setBudget(event.target.value); setPlan(null); }}
               step="0.01"
               type="number"
               value={budget}
@@ -1658,7 +1729,7 @@ export function ResearchNewTaskPage() {
           <div className="flex items-end">
             <Badge className="h-9 px-3" variant="secondary">
               {plan
-                ? `${plan.provider_id} · 预计 ¥${plan.estimated_cost_cny.toFixed(2)}`
+                ? `${plan.provider_id} · 预计 ${nativeMoney(plan.estimated_cost_amount, plan.currency)}`
                 : "尚未预估"}
             </Badge>
           </div>
@@ -1689,33 +1760,35 @@ export function ResearchNewTaskPage() {
 export function ResearchPage() {
   const { taskId, workspaceId = "" } = useParams();
   const queryClient = useQueryClient();
-  const jobs = useQuery({ queryKey: ["research"], queryFn: listResearchJobs });
+  const { userId, effectivePermissions } = useAuth();
+  const canWrite = effectivePermissions.includes("workspace.write");
+  const jobs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "research", "native-v2", userId), queryFn: ({ signal }) => listResearchJobs(workspaceId, signal) });
   const job = taskId
     ? jobs.data?.find((item) => item.id === taskId)
     : undefined;
   const events = useQuery({
-    queryKey: ["research-events", job?.id],
-    queryFn: () => listResearchEvents(job!.id),
+    queryKey: workspaceQueryKey(workspaceId, "research-events", "native-v2", userId, job?.id),
+    queryFn: ({ signal }) => listResearchEvents(job!.id, workspaceId, signal),
     enabled: Boolean(job),
   });
   const approve = useMutation({
-    mutationFn: () => approveResearch(job!.id),
-    onSuccess: () => {
+    mutationFn: (capture: { id: string; quoteId?: string; workspaceId: string }) => approveResearch(capture.id, capture.quoteId, capture.workspaceId),
+    onSuccess: (updated) => {
       toast.success("预算已确认，研究任务已启动");
-      void queryClient.invalidateQueries({ queryKey: ["research"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(updated.workspace_id, "research") });
       void queryClient.invalidateQueries({
-        queryKey: ["research-events", job?.id],
+        queryKey: workspaceQueryKey(updated.workspace_id, "research-events"),
       });
     },
     onError: (error) => toast.error(error.message),
   });
   const cancel = useMutation({
-    mutationFn: () => cancelResearch(job!.id),
-    onSuccess: () => {
+    mutationFn: (capture: { id: string; workspaceId: string }) => cancelResearch(capture.id, capture.workspaceId),
+    onSuccess: (updated) => {
       toast.success("已提交取消");
-      void queryClient.invalidateQueries({ queryKey: ["research"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(updated.workspace_id, "research") });
       void queryClient.invalidateQueries({
-        queryKey: ["research-events", job?.id],
+        queryKey: workspaceQueryKey(updated.workspace_id, "research-events"),
       });
     },
     onError: (error) => toast.error(error.message),
@@ -1777,8 +1850,8 @@ export function ResearchPage() {
             action={
               canCancel ? (
                 <Button
-                  disabled={cancel.isPending}
-                  onClick={() => cancel.mutate()}
+                  disabled={cancel.isPending || !canWrite}
+                  onClick={() => cancel.mutate({ id: job.id, workspaceId })}
                   size="xs"
                   variant="outline"
                 >
@@ -1791,17 +1864,18 @@ export function ResearchPage() {
           {job.status === "awaiting_approval" ? (
             <div className="mt-4 rounded-xl border border-amber-200 p-4">
               <p className="text-sm">
-                预计费用 ¥{job.estimated_cost_cny.toFixed(2)}
-                ，批准后才会调用远程 Provider。
+                预计费用 {nativeMoney(job.estimated_cost_amount, job.currency)}
+                ；预算 {nativeMoney(job.budget_amount, job.currency)}，批准后才会调用远程 Provider。
               </p>
               <Button
                 className="mt-3"
-                disabled={approve.isPending}
-                onClick={() => approve.mutate()}
+                disabled={approve.isPending || !canWrite || job.billing_snapshot?.schema_version !== 2}
+                onClick={() => approve.mutate({ id: job.id, quoteId: String(job.billing_snapshot?.quote_id ?? ""), workspaceId })}
                 size="sm"
               >
                 确认预算并启动
               </Button>
+              {job.billing_snapshot?.schema_version !== 2 ? <p className="mt-2 text-sm">旧报价已过期，请用原币预算重新创建研究计划。</p> : null}
             </div>
           ) : null}
           <div className="mt-5">
@@ -1816,6 +1890,7 @@ export function ResearchPage() {
         </Surface>
         <Surface className="p-5">
           <SectionHeading action={<StatePill status={job.status} />} title="证据包摘要" />
+          <p className="mt-3 text-sm">实际费用 {nativeMoney(job.actual_cost_amount, job.currency)}</p>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             {[
               [

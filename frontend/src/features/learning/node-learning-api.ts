@@ -1,3 +1,4 @@
+import { validateLearningPage, validateEnrollment, validateAttempt } from './learning-response'
 import { apiClient } from '@/api/client'
 
 export interface Build { id: string; node_id: string; status: string; stage: string; completed_stages: number; total_stages: number; error?: string; notes: string[]; updated_at?: string; failed_stage?: string | null; failed_item?: string | null; attempts?: number; failure_category?: string; advice?: string | null }
@@ -59,17 +60,17 @@ async function statusRequest<T>(request: (signal: AbortSignal) => Promise<T>, pa
   }
 }
 export const learningApi = {
-  page: (id: string, signal?: AbortSignal) => statusRequest(s => apiClient.get<LearningPageData>(`${url}/nodes/${id}`, {signal: s}), signal),
+  page: (id: string, signal?: AbortSignal) => statusRequest(s => apiClient.get<LearningPageData>(`${url}/nodes/${id}`, {signal: s}), signal).then(validateLearningPage),
   policy: (id: string) => apiClient.get<Policy>(`${url}/graphs/${id}/policy`),
   setPolicy: (id: string, value: Policy) => apiClient.patch<Policy>(`${url}/graphs/${id}/policy`, {...value, expected_revision: value.revision, revision: undefined}),
   builds: (id: string) => statusRequest(s => apiClient.get<Build[]>(`${url}/graphs/${id}/builds`, {signal: s})),
   build: (id: string) => statusRequest(s => apiClient.post<Build>(`${url}/nodes/${id}/build`, {trigger: 'on_demand'}, {signal: s})),
   control: (id: string, action: 'cancel' | 'retry') => statusRequest(s => apiClient.post<Build>(`${url}/builds/${id}/${action}`, undefined, {signal: s})),
-  start: (id: string) => apiClient.post<Enrollment>(`${url}/nodes/${id}/start`),
-  progress: (id: string, payload: {expected_revision: number; section_id?: string; action_id?: string; reset_activity?: boolean}) => apiClient.patch<Enrollment>(`${url}/enrollments/${id}`, payload),
-  startAttempt: (id: string, key: string) => apiClient.post<Attempt>(`${url}/nodes/${id}/attempts`, {request_key: key}),
-  attempt: (id: string) => apiClient.get<Attempt>(`${url}/attempts/${id}`),
-  save: (id: string, revision: number, answers: Attempt['answers']) => apiClient.patch<Attempt>(`${url}/attempts/${id}/answers`, {expected_revision: revision, answers}),
-  action: (id: string, revision: number, action_id?: string, reset_activity = false) => apiClient.patch<Attempt>(`${url}/attempts/${id}/activity`, {expected_revision: revision, action_id, reset_activity}),
-  submit: (id: string) => apiClient.post<Attempt>(`${url}/attempts/${id}/submit`),
+  start: (id: string) => apiClient.post<Enrollment>(`${url}/nodes/${id}/start`).then(validateEnrollment),
+  progress: (id: string, payload: {expected_revision: number; section_id?: string; action_id?: string; reset_activity?: boolean}) => apiClient.patch<Enrollment>(`${url}/enrollments/${id}`, payload).then(validateEnrollment),
+  startAttempt: (id: string, key: string) => apiClient.post<Attempt>(`${url}/nodes/${id}/attempts`, {request_key: key}).then(validateAttempt),
+  attempt: (id: string) => apiClient.get<Attempt>(`${url}/attempts/${id}`).then(validateAttempt),
+  save: (id: string, revision: number, answers: Attempt['answers']) => apiClient.patch<Attempt>(`${url}/attempts/${id}/answers`, {expected_revision: revision, answers}).then(validateAttempt),
+  action: (id: string, revision: number, action_id?: string, reset_activity = false) => apiClient.patch<Attempt>(`${url}/attempts/${id}/activity`, {expected_revision: revision, action_id, reset_activity}).then(validateAttempt),
+  submit: (id: string) => apiClient.post<Attempt>(`${url}/attempts/${id}/submit`).then(validateAttempt),
 }

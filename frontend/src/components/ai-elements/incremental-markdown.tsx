@@ -7,6 +7,11 @@ import {
   LazyStreamdown,
   type CodeHighlightMode,
 } from "@/components/ai-elements/lazy-streamdown";
+import {
+  HtmlCodePreview,
+  isHtmlCodeLanguage,
+} from "@/components/chat/html-code-preview";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { normalizeLatexDelimiters } from "@/lib/markdown";
 
 /**
@@ -104,8 +109,17 @@ export class IncrementalMarkdownParser {
     const previousLength = this.prevText.length;
     // Stream parts carry append provenance. This makes the hot path O(delta);
     // snapshots and edits retain the safe prefix check and reset on mismatch.
-    const trustedAppend = epoch !== undefined && epoch === this.prevEpoch && text.length >= this.prevText.length;
-    const streamReplacement = epoch !== undefined && this.prevEpoch !== undefined && epoch !== this.prevEpoch;
+    const prefixAppend = this.prevText.length > 0 &&
+      text.length >= this.prevText.length &&
+      text.startsWith(this.prevText);
+    const trustedAppend = epoch !== undefined && epoch === this.prevEpoch && prefixAppend;
+    // A completed stream may arrive under a fresh epoch with the full text.
+    // Preserve the frozen prefix when the bytes are still an append; reset only
+    // when the new epoch actually rewrites the prefix.
+    const streamReplacement = epoch !== undefined &&
+      this.prevEpoch !== undefined &&
+      epoch !== this.prevEpoch &&
+      !prefixAppend;
     if (streamReplacement || (!trustedAppend && !text.startsWith(this.prevText))) {
       this.prevText = "";
       this.stable = [];
@@ -306,13 +320,25 @@ function CodeBlockPlain({
   }
   cache.sourceLength += added.length;
   if (appendRevision !== undefined) cache.lastRevision = appendRevision;
-  return (
+  const codeBlock = (
     <pre className="incremental-markdown-fence overflow-x-auto rounded-lg border bg-muted/30 p-3 text-[13px] leading-6">
       <code>
         {cache.rows}
         <div>{cache.lineChunks}</div>
       </code>
     </pre>
+  );
+  if (isHtmlCodeLanguage(node.lang)) {
+    return (
+      <HtmlCodePreview code={node.value} language={node.lang ?? "html"}>
+        {codeBlock}
+      </HtmlCodePreview>
+    );
+  }
+  return (
+    <ExpandableContent className="incremental-code-block" label="代码" lineLimit={24}>
+      {codeBlock}
+    </ExpandableContent>
   );
 }
 
@@ -439,7 +465,9 @@ class IncrementalRenderer {
     // A full part replacement resets parser state. Include that generation in
     // the React key so code-row caches cannot survive a retry/edit with the
     // same source offset.
-    const renderKey = `${this.generation}:${block.key}`;
+    const renderKey = isCodeBlock(node) || (node as { type?: string }).type === "raw_stream"
+      ? `${this.generation}:${block.key}`
+      : String(block.key);
     if (isCodeBlock(node)) {
       const streamNode = node as unknown as StreamTailNode;
       return createElement(CodeBlockPlain, {

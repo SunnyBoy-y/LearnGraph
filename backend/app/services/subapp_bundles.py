@@ -397,6 +397,21 @@ class SubAppBundleService:
             interaction_contract = self._load_contract_from_workspace(
                 chat_session_id, contract_path
             )
+        if interaction_contract is not None:
+            # Normalize optional fields before SQLAlchemy snapshots the JSON
+            # column.  The manifest and bundle must carry the same stable
+            # contract shape even when the caller omitted both optional keys.
+            if not isinstance(interaction_contract, dict):
+                raise AppError(
+                    422,
+                    "subapp_interaction_contract_invalid",
+                    "interaction_contract must be an object",
+                )
+            interaction_contract = {
+                **interaction_contract,
+                "agent_triggers": interaction_contract.get("agent_triggers") or [],
+                "analytics": interaction_contract.get("analytics"),
+            }
         bundle = SubAppBundle(
             workspace_id=self.workspace_id,
             owner_user_id=self.actor_id,

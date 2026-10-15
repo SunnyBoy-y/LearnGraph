@@ -3,6 +3,7 @@
 import { Brain, ChevronDown } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
 
@@ -84,7 +85,14 @@ export function ReasoningSummaryRow({
         />
       </button>
       {expanded ? (
-        <div className="reasoning-summary-row__body">{text}</div>
+        <ExpandableContent
+          className="reasoning-summary-row__expandable"
+          label="思考过程"
+          lineLimit={18}
+          storageKey={`learngraph:expanded:reasoning-row:${part.id}`}
+        >
+          <div className="reasoning-summary-row__body">{text}</div>
+        </ExpandableContent>
       ) : null}
     </div>
   );

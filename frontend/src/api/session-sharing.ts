@@ -40,6 +40,23 @@ export interface SessionShareDetailView extends SessionShareView {
   tokens: SessionShareTokenView[];
 }
 
+/** Workspace-wide row shown by Settings → 会话与分享. */
+export interface SessionShareManagementView extends SessionShareDetailView {
+  session_id: string;
+  source_session_id: string | null;
+  session_title: string;
+  /** Sum of all token reads belonging to this immutable snapshot. */
+  view_count: number;
+  last_viewed_at: string | null;
+  active_token_count: number;
+  token_id: string | null;
+  token_prefix: string;
+  label: string;
+  expires_at: string | null;
+  max_views: number | null;
+  revoked_at: string | null;
+}
+
 export interface SessionSharePublicView {
   id: string;
   title: string;
@@ -69,13 +86,32 @@ export function createSessionShare(
   );
 }
 
+/** List active shares for one session; pass include_revoked for audit history. */
 export function listSessionShares(
   sessionId: string,
+  options?: { include_revoked?: boolean },
 ): Promise<SessionShareDetailView[]> {
   return apiClient.get<SessionShareDetailView[]>(
     `/sessions/${encodeURIComponent(sessionId)}/shares`,
+    { query: options },
   );
 }
+
+/**
+ * List the active session shares in the current workspace.  The server filters
+ * revoked snapshots by default, so a cancelled row drops out on refresh while
+ * its snapshot and audit history remain retained.
+ */
+export function listSessionShareManagement(options?: {
+  include_revoked?: boolean;
+}): Promise<SessionShareManagementView[]> {
+  return apiClient.get<SessionShareManagementView[]>('/session-shares', {
+    query: options,
+  });
+}
+
+/** Alias matching the artifact share management API naming. */
+export const listAllSessionShares = listSessionShareManagement;
 
 export function revokeSessionShare(shareId: string): Promise<SessionShareView> {
   return apiClient.delete<SessionShareView>(

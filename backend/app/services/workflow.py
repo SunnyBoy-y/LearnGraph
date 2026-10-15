@@ -127,13 +127,15 @@ class WorkflowService:
                 ),
             )
         ) or 0
-        return DeleteImpact(resource_type="project", resource_id=item.id, title=item.title, confirmation_text=item.title, impacts=[ImpactItem(resource_type="session", count=sessions, action="delete"), ImpactItem(resource_type="graph_change_set", count=proposals, action="delete"), ImpactItem(resource_type="action_item", count=actions, action="delete"), ImpactItem(resource_type="source_link", count=links, action="delete"), ImpactItem(resource_type="file_reference", count=file_references, action="delete")])
+        return DeleteImpact(resource_type="project", resource_id=item.id, title=item.title, confirmation_text=item.title, impacts=[ImpactItem(resource_type="session", count=sessions, action="delete"), ImpactItem(resource_type="graph_change_set", count=proposals, action="delete"), ImpactItem(resource_type="action_item", count=actions, action="delete"), ImpactItem(resource_type="source_link", count=links, action="delete"), ImpactItem(resource_type="file_reference", count=file_references, action="delete"), *self._session_memory_impacts(list(self.db.scalars(session_ids)))])
 
     def delete_project(self, project_id: str, confirmation: str) -> None:
         impact = self.project_impact(project_id)
         if confirmation != impact.confirmation_text:
             raise AppError(409, "confirmation_mismatch", "Confirmation text does not match the project title")
         session_ids = list(self.db.scalars(select(ChatSession.id).where(ChatSession.workspace_id == self.workspace_id, ChatSession.project_id == project_id)))
+        if session_ids:
+            self._session_memory_deletion().delete(session_ids)
         message_ids = list(self.db.scalars(select(Message.id).where(Message.workspace_id == self.workspace_id, Message.session_id.in_(session_ids)))) if session_ids else []
         source_link_ids = list(self.db.scalars(select(SourceLink.id).where(SourceLink.workspace_id == self.workspace_id, SourceLink.target_type == "project", SourceLink.target_id == project_id)))
         version_ids = list(self.db.scalars(select(MessageVersion.id).where(MessageVersion.workspace_id == self.workspace_id, MessageVersion.message_id.in_(message_ids)))) if message_ids else []
@@ -200,25 +202,28 @@ class WorkflowService:
         values = payload.model_dump(exclude_unset=True)
         if not values:
             return session
+        node_binding_supplied = "current_node_id" in values
+        requested_node_id = values.pop("current_node_id", None)
         binding_fields = {"goal_id", "graph_id"}.intersection(values)
         requested_goal_id = values.get("goal_id", session.goal_id)
         requested_graph_id = values.get("graph_id", session.graph_id)
-        if binding_fields and not self.authz.can_access_bindings(
+        if (binding_fields or node_binding_supplied) and not self.authz.can_access_bindings(
             self.workspace,
             "read",
             goal_id=requested_goal_id,
             graph_id=requested_graph_id,
+            node_id=requested_node_id,
         ):
             raise AppError(
                 404,
                 "session_binding_not_found",
                 "One or more Session bindings were not found",
             )
-        if binding_fields and session.status != "active":
+        if (binding_fields or node_binding_supplied) and session.status != "active":
             raise AppError(
                 409,
                 "session_binding_closed",
-                "Only an active Session can be bound to a Goal or Graph",
+                "Only an active Session can change its learning context",
             )
 
         goal = None
@@ -248,12 +253,6 @@ class WorkflowService:
             )
             if graph is None:
                 raise AppError(404, "graph_not_found", "Session Graph was not found")
-        if "graph_id" in values and session.graph_id not in {None, values["graph_id"]}:
-            raise AppError(
-                409,
-                "session_graph_rebind_forbidden",
-                "A Session cannot be rebound to a different Graph",
-            )
         if graph is not None:
             if graph.status != "published":
                 raise AppError(
@@ -267,21 +266,59 @@ class WorkflowService:
                     "session_graph_goal_mismatch",
                     "Session Goal and Graph must belong to the same target",
                 )
-        if binding_fields and goal is not None and goal.status != "approved":
+        if (
+            (requested_graph_id or ("goal_id" in values and values["goal_id"]))
+            and goal is not None
+            and goal.status != "approved"
+        ):
             raise AppError(
                 409,
                 "session_goal_not_approved",
                 "A learning Session can only bind an approved Goal",
             )
+
+        if requested_node_id:
+            node = self.db.scalar(
+                select(GraphNode).where(
+                    GraphNode.workspace_id == self.workspace_id,
+                    GraphNode.id == requested_node_id,
+                )
+            )
+            if node is None:
+                raise AppError(404, "node_not_found", "Session node was not found")
+            if not requested_graph_id or node.graph_id != requested_graph_id:
+                raise AppError(
+                    409,
+                    "session_node_graph_mismatch",
+                    "Session node must belong to the bound Graph",
+                )
+
         changed_values = {
             key: value
             for key, value in values.items()
             if getattr(session, key) != value
         }
+        graph_changed = (
+            "graph_id" in changed_values
+            and changed_values["graph_id"] != session.graph_id
+        )
+        if node_binding_supplied or graph_changed:
+            capsule = dict(session.context_capsule or {})
+            next_node_id = requested_node_id if node_binding_supplied else None
+            if next_node_id:
+                capsule["current_node_id"] = next_node_id
+            else:
+                # Changing or clearing the graph invalidates the previous node.
+                capsule.pop("current_node_id", None)
+            if capsule != (session.context_capsule or {}):
+                changed_values["context_capsule"] = capsule
         if not changed_values:
             return session
         changed_binding_fields = binding_fields.intersection(changed_values)
-        if changed_binding_fields:
+        # Goal binding still uses the original compare-and-set guard. Graphs are
+        # intentionally rebindable from the current conversation UI, so a graph
+        # change follows the validated ordinary update path below.
+        if changed_binding_fields and "graph_id" not in changed_binding_fields:
             supplied_binding_fields = sorted(binding_fields)
             compatible_bindings = [
                 or_(
@@ -317,11 +354,7 @@ class WorkflowService:
                 for field in supplied_binding_fields:
                     current_value = getattr(current, field)
                     if current_value not in {None, values[field]}:
-                        code = (
-                            "session_goal_rebind_forbidden"
-                            if field == "goal_id"
-                            else "session_graph_rebind_forbidden"
-                        )
+                        code = "session_goal_rebind_forbidden"
                         raise AppError(
                             409,
                             code,
@@ -446,6 +479,19 @@ class WorkflowService:
                 affected.append(batch.id)
         return affected
 
+    def _session_memory_deletion(self):
+        from app.services.session_memory_deletion import SessionMemoryDeletionService
+
+        return SessionMemoryDeletionService(self.db, self.workspace, self.actor_id)
+
+    def _session_memory_impacts(self, session_ids: list[str]) -> list[ImpactItem]:
+        targets = self._session_memory_deletion().targets(session_ids)
+        return [
+            ImpactItem(resource_type="memory", count=len(targets.memory_ids), action="delete"),
+            ImpactItem(resource_type="memory_draft", count=len(targets.draft_ids), action="delete"),
+            ImpactItem(resource_type="conversation_episode", count=len(targets.episode_ids), action="delete"),
+        ]
+
     def session_impact(self, session_id: str) -> DeleteImpact:
         item = self._session(session_id)
         message_ids = select(Message.id).where(
@@ -467,7 +513,7 @@ class WorkflowService:
         suggested_prompt_batches = len(
             self._suggested_prompt_batch_ids_for_session_deletion([session_id])
         )
-        return DeleteImpact(resource_type="session", resource_id=item.id, title=item.title, confirmation_text=item.title, impacts=[ImpactItem(resource_type="message", count=messages, action="delete"), ImpactItem(resource_type="graph_change_set", count=proposals, action="delete"), ImpactItem(resource_type="suggested_prompt_batch", count=suggested_prompt_batches, action="delete"), ImpactItem(resource_type="child_session", count=children, action="detach"), ImpactItem(resource_type="file_reference", count=file_references, action="delete")])
+        return DeleteImpact(resource_type="session", resource_id=item.id, title=item.title, confirmation_text=item.title, impacts=[ImpactItem(resource_type="message", count=messages, action="delete"), ImpactItem(resource_type="graph_change_set", count=proposals, action="delete"), ImpactItem(resource_type="suggested_prompt_batch", count=suggested_prompt_batches, action="delete"), ImpactItem(resource_type="child_session", count=children, action="detach"), ImpactItem(resource_type="file_reference", count=file_references, action="delete"), *self._session_memory_impacts([session_id])])
 
     def _sessions(self, session_ids: list[str]) -> list[ChatSession]:
         items = list(
@@ -568,10 +614,12 @@ class WorkflowService:
                     count=file_reference_count,
                     action="delete",
                 ),
+                *self._session_memory_impacts(session_ids),
             ],
         )
 
     def _delete_session_records(self, session_ids: list[str]) -> None:
+        self._session_memory_deletion().delete(session_ids)
         message_ids = list(
             self.db.scalars(
                 select(Message.id).where(

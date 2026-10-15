@@ -5,6 +5,7 @@ import { Network } from 'lucide-react'
 import { Toaster } from 'sonner'
 
 import { WorkspaceShell } from '@/components/layout/workspace-shell'
+import { RouteErrorBoundary } from '@/components/shared/route-error-boundary'
 import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { listGraphs } from '@/api'
@@ -13,6 +14,7 @@ import { AuthProvider, RequireAuth } from '@/features/auth/auth-context'
 import { RouteLoading, WorkspaceRouteGuard } from '@/features/auth/workspace-route-guard'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { registerAuthQueryClient } from '@/lib/auth-query-cache'
+import { hydratePersistedQueryCache, startPersistedQueryCache } from '@/lib/query-persistence'
 import { VoiceSessionProvider } from '@/features/voice/voice-session-controller'
 
 const LoginPage = lazy(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
@@ -48,6 +50,7 @@ const WorkspaceSettingsPage = lazy(() => import('@/features/settings/governance-
 const PersonalizationPage = lazy(() => import('@/features/settings/personalization-page').then((module) => ({ default: module.PersonalizationPage })))
 const AccessManagementPage = lazy(() => import('@/features/settings/control-pages').then((module) => ({ default: module.AccessManagementPage })))
 const AboutPage = lazy(() => import('@/features/settings/about-page').then((module) => ({ default: module.AboutPage })))
+const SessionSharingPage = lazy(() => import('@/features/settings/session-sharing-page').then((module) => ({ default: module.SessionSharingPage })))
 const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
 const SessionShareViewPage = lazy(() => import('@/features/chat/session-share-view').then((module) => ({ default: module.SessionShareViewPage })))
 
@@ -69,6 +72,8 @@ const queryClient = new QueryClient({
     mutations: { retry: 0 },
   },
 })
+hydratePersistedQueryCache(queryClient)
+startPersistedQueryCache(queryClient)
 registerAuthQueryClient(queryClient)
 
 function RootRedirect() {
@@ -76,12 +81,17 @@ function RootRedirect() {
   if (auth.mustChangePassword) {
     return <Navigate replace to="/auth/change-password" />
   }
-  return <Navigate replace to={auth.authenticated ? `/w/${auth.workspaceId}/home` : '/auth/login'} />
+  // New visitors should land in a blank conversation; the LearnGraph mark in
+  // the sidebar remains the explicit link back to the workspace dashboard.
+  return <Navigate replace to={auth.authenticated ? `/w/${auth.workspaceId}/chat/new` : '/auth/login'} />
 }
 
 function GoalModeRedirect() {
   const { workspaceId = '' } = useParams()
-  return <Navigate replace to={`/w/${workspaceId}/chat/new?mode=goal`} />
+  const location = useLocation()
+  const search = new URLSearchParams(location.search)
+  search.set('mode', 'goal')
+  return <Navigate replace to={`/w/${workspaceId}/chat/new?${search.toString()}`} />
 }
 
 /** 联网搜索与网页获取页（SearchPage）对全部用户下线：入口与页面同时撤下，
@@ -96,7 +106,7 @@ function NotFound() {
   const auth = useAuth()
   const location = useLocation()
   return (
-    <main className="grid min-h-svh place-items-center p-6"><div className="max-w-lg text-center"><span className="mx-auto grid size-12 place-items-center rounded-2xl bg-foreground text-background"><Network className="size-5" /></span><h1 className="mt-5 text-2xl font-semibold">页面不存在</h1><p className="mt-2 text-sm leading-6 text-muted-foreground">没有找到 <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{location.pathname}</code>。它可能属于尚未启用的扩展。</p><Button asChild className="mt-5"><a href={auth.authenticated ? `/w/${auth.workspaceId}/home` : '/auth/login'}>返回 LearnGraph</a></Button></div></main>
+    <main className="grid min-h-svh place-items-center p-6"><div className="max-w-lg text-center"><span className="mx-auto grid size-12 place-items-center rounded-2xl bg-foreground text-background"><Network className="size-5" /></span><h1 className="mt-5 text-2xl font-semibold">页面不存在</h1><p className="mt-2 text-sm leading-6 text-muted-foreground">没有找到 <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{location.pathname}</code>。它可能属于尚未启用的扩展。</p><Button asChild className="mt-5"><a href={auth.authenticated ? `/w/${auth.workspaceId}/chat/new` : '/auth/login'}>返回 LearnGraph</a></Button></div></main>
   )
 }
 
@@ -125,7 +135,7 @@ function LegacyRoadmapRoute() {
 
 function AppRoutes() {
   return (
-    <Suspense fallback={<RouteLoading />}><Routes>
+    <RouteErrorBoundary><Suspense fallback={<RouteLoading />}><Routes>
       <Route element={<RootRedirect />} path="/" />
       <Route element={<LoginPage />} path="/auth/login" />
       <Route element={<ChangePasswordPage />} path="/auth/change-password" />
@@ -134,7 +144,7 @@ function AppRoutes() {
         element={<RequireAuth><WorkspaceRouteGuard><WorkspaceShell /></WorkspaceRouteGuard></RequireAuth>}
         path="/w/:workspaceId"
       >
-        <Route element={<Navigate replace to="home" />} index />
+        <Route element={<Navigate replace to="chat/new" />} index />
         <Route element={<DashboardPage />} path="home" />
         <Route element={<GoalModeRedirect />} path="goals/new/clarify" />
         <Route element={<GoalConfirmPage />} path="goals/:goalId/confirm" />
@@ -176,13 +186,16 @@ function AppRoutes() {
         <Route element={<WorkspaceSettingsPage />} path="settings/workspace" />
         <Route element={<PersonalizationPage />} path="settings/personalization" />
         <Route element={<AccessManagementPage />} path="settings/access" />
+        <Route element={<SessionSharingPage />} path="settings/session-sharing" />
+        <Route element={<Navigate replace to="../session-sharing" />} path="settings/sharing" />
+        <Route element={<Navigate replace to="../session-sharing" />} path="settings/session-shares" />
         <Route element={<AboutPage />} path="settings/about" />
         <Route element={<ArtifactsPage />} path="artifacts" />
         <Route element={<Navigate replace to="../artifacts" />} path="settings/artifacts" />
       </Route>
       <Route element={<NotFound />} path="*" />
       <Route element={<SessionShareViewPage />} path="/share/:token" />
-    </Routes></Suspense>
+    </Routes></Suspense></RouteErrorBoundary>
   )
 }
 

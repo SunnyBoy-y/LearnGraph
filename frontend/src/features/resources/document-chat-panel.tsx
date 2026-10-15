@@ -14,6 +14,7 @@ import {
   ExternalLink,
   FileText,
   LoaderCircle,
+  Mic,
   MessageSquareText,
   Plus,
   Search,
@@ -123,8 +124,10 @@ export interface PendingDocumentSelection {
 
 interface DocumentChatPanelProps {
   autoSubmitSeed?: boolean;
+  compact?: boolean;
   embeddedImages?: Array<{ id: string; blob: Blob; filename: string; locator: Record<string, unknown> }>;
   file: FileRecord;
+  onSendToFullChat?: (content: string) => Promise<void> | void;
   onRemoveEmbeddedImage?: (id: string) => void;
   onClearSelection: () => void;
   onSessionChange: (sessionId: string) => void;
@@ -218,8 +221,10 @@ function messageParts(message: Message): MessagePart[] {
 
 export function DocumentChatPanel({
   autoSubmitSeed = false,
+  compact = false,
   embeddedImages = [],
   file,
+  onSendToFullChat,
   onRemoveEmbeddedImage,
   onClearSelection,
   onSessionChange,
@@ -261,7 +266,7 @@ export function DocumentChatPanel({
   const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
   const history = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
-    queryFn: () => listSessionMessages(sessionId, { limit: 50 }),
+    queryFn: () => listSessionMessages(sessionId, { limit: 50, compact: false }),
     enabled: Boolean(sessionId),
     gcTime: 15_000,
   });
@@ -495,6 +500,16 @@ export function DocumentChatPanel({
     event?.preventDefault();
     const content = contentOverride?.trim() || draft.trim();
     if (!content || status === "submitted" || status === "streaming") return;
+    if (onSendToFullChat) {
+      setStatus("submitted");
+      try {
+        await onSendToFullChat(content);
+      } catch (error) {
+        setStatus("error");
+        toast.error(error instanceof Error ? error.message : "无法打开完整对话");
+      }
+      return;
+    }
     if (!activeProvider) {
       toast.error("没有可用的真实模型 Provider，无法发送文档问题。");
       return;
@@ -599,6 +614,19 @@ export function DocumentChatPanel({
       status: "completed",
       content,
       parts: [
+        {
+          id: `document-attachment-${file.id}-${stamp}`,
+          type: "attachment",
+          status: "completed",
+          content: file.original_name,
+          data: {
+            file_id: file.id,
+            filename: file.original_name,
+            media_type: file.mime_type,
+            mime_type: file.mime_type,
+            parse_status: file.parse_status,
+          },
+        },
         { id: `document-user-text-${stamp}`, type: "text", status: "completed", content },
         ...(documentSelection
           ? [{
@@ -843,8 +871,83 @@ export function DocumentChatPanel({
   const sessionClosed = activeSession?.status === "closed";
   const busy = status === "submitted" || status === "streaming";
 
+  const compactModeLabel = responseMode === "fast"
+    ? "快"
+    : thinkingMode === "low"
+      ? "低"
+      : thinkingMode === "high"
+        ? "高"
+        : thinkingMode === "xhigh"
+          ? "极"
+          : "中";
+
+  if (compact) {
+    return (
+      <section className="document-chat-compact" aria-label="文档学习对话">
+        <form className="document-chat-compact__form" onSubmit={(event) => void send(event)}>
+          <button
+            aria-label="添加文件"
+            className="document-chat-compact__plus"
+            onClick={() => toast.message("当前文件会随消息作为附件发送")}
+            type="button"
+          >
+            <Plus aria-hidden="true" className="size-4" />
+          </button>
+          <Textarea
+            aria-label="询问当前文档"
+            className="document-chat-compact__textarea"
+            disabled={
+              onSendToFullChat
+                ? false
+                : !activeProvider || sessionClosed || unavailableSession
+            }
+            onChange={(event) => setDraft(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void send();
+              }
+            }}
+            placeholder="输入消息，或输入 @ 选择模式 / 文件..."
+            ref={composerRef}
+            rows={1}
+            value={draft}
+          />
+          <button
+            aria-label="选择模式"
+            className="document-chat-compact__mode"
+            onClick={() => toast.message(`当前响应模式：${compactModeLabel}`)}
+            type="button"
+          >
+            <span>{compactModeLabel}</span>
+            <ChevronDown aria-hidden="true" className="size-3.5" />
+          </button>
+          {draft.trim() ? (
+            <button
+              aria-label="发送文档问题"
+              className="document-chat-compact__mic"
+              disabled={busy}
+              type="submit"
+            >
+              {busy ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : <ArrowUp aria-hidden="true" className="size-4" />}
+            </button>
+          ) : (
+            <button
+              aria-label="麦克风"
+              className="document-chat-compact__mic"
+              onClick={() => toast.message("麦克风输入可在完整对话中使用")}
+              type="button"
+            >
+              <Mic aria-hidden="true" className="size-4" />
+            </button>
+          )}
+        </form>
+      </section>
+    );
+  }
+
   return (
-    <section className="flex h-full min-h-[36rem] flex-col bg-background" aria-label="文档学习对话">
+    <section className="flex h-full min-h-0 flex-col bg-background" aria-label="文档学习对话">
       <header className="flex h-12 flex-none items-center gap-2 border-b px-3">
         <MessageSquareText className="size-4" />
         <div className="min-w-0 flex-1">
@@ -1152,7 +1255,11 @@ export function DocumentChatPanel({
           <Textarea
             aria-label="询问当前文档"
             className="min-h-20 resize-none border-0 pb-11 shadow-none focus-visible:ring-0"
-            disabled={!activeProvider || sessionClosed || unavailableSession}
+            disabled={
+              onSendToFullChat
+                ? false
+                : !activeProvider || sessionClosed || unavailableSession
+            }
             onChange={(event) => setDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -1175,7 +1282,11 @@ export function DocumentChatPanel({
             ) : (
               <Button
                 aria-label="发送文档问题"
-                disabled={!draft.trim() || !activeProvider || sessionClosed || unavailableSession}
+                disabled={
+                  !draft.trim() ||
+                  (!onSendToFullChat &&
+                    (!activeProvider || sessionClosed || unavailableSession))
+                }
                 size="icon-sm"
                 type="submit"
               >

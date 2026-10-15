@@ -15,6 +15,7 @@ export * from "./dashboard";
 export * from "./goals";
 export * from "./graphs";
 export * from "./sessions";
+export * from "./session-sharing";
 export * from "./files";
 export * from "./search";
 export * from "./research";

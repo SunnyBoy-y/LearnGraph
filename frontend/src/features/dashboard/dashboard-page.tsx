@@ -230,13 +230,13 @@ export function DashboardPage() {
         title="继续你的学习计划"
       />
 
-      <Surface aria-label="工作区概览" className="grid overflow-hidden sm:grid-cols-3">
+      <Surface aria-label="工作区概览" className="dashboard-overview grid overflow-hidden sm:grid-cols-3">
         {overview.map((item, index) => {
           const Icon = item.icon;
           return (
             <div
               className={cn(
-                "flex items-center gap-3 px-5 py-4",
+                "dashboard-overview__item flex items-center gap-3 px-5 py-4",
                 index > 0 && "border-t sm:border-l sm:border-t-0",
               )}
               key={item.key}
@@ -341,7 +341,7 @@ export function DashboardPage() {
               {actions.length > 1 ? (
                 <div className="mt-3 divide-y border-t">
                   {actions.slice(1, 4).map((action) => (
-                    <div className="flex items-center gap-3 py-3" key={action.id}>
+                    <div className="dashboard-action-item flex items-center gap-3 py-3" key={action.id}>
                       <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/60" />
                       <p className="min-w-0 flex-1 truncate text-sm">{action.title}</p>
                       <span className="shrink-0 text-xs text-muted-foreground">
@@ -393,7 +393,7 @@ export function DashboardPage() {
           {todayActivities.length ? (
             <ul className="mt-4 divide-y">
               {todayActivities.map((activity) => (
-                <li className="py-3 first:pt-0 last:pb-0" key={activity.id}>
+                <li className="dashboard-today-item py-3 first:pt-0 last:pb-0" key={activity.id}>
                   <p className="line-clamp-1 text-sm font-medium">{activity.title}</p>
                   <p className="mt-1 text-xs text-muted-foreground">{activity.detail}</p>
                 </li>

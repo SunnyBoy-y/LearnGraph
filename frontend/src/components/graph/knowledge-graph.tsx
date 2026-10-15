@@ -59,6 +59,8 @@ import {
   TREE_ROOT_SIZE,
   buildFlatLayout,
   buildKnowledgeTreeLayout,
+  buildKnowledgeTreeHierarchy,
+  getKnowledgeGraphTreeDepths,
   buildSpatialLayout,
   countTreeDescendants,
   type TreeNodeKind,
@@ -382,13 +384,13 @@ const KnowledgeNodeView = memo(function KnowledgeNodeView({
             <span className="knowledge-node__explore">
               <NodeExploreChip
                 count={exploreCount}
-                onOpen={() => data.onOpenExplore?.(id)}
+                onOpen={data.onOpenExplore ? () => data.onOpenExplore?.(id) : undefined}
               />
             </span>
           ) : null}
         </div>
       ) : null}
-      {tree && !isRoot ? (
+      {tree && !isRoot && data.onStudy ? (
         <button
           className="knowledge-node__cta nodrag"
           onClick={handleStudy}
@@ -554,6 +556,9 @@ export function KnowledgeGraph({
   const [flowInstance, setFlowInstance] =
     useState<ReactFlowInstance<KnowledgeNode>>();
   const [zoom, setZoom] = useState(1);
+  const [revealedDepth, setRevealedDepth] = useState<number>();
+  const [pendingFocus, setPendingFocus] = useState<{id: string; neighbors?: boolean} | null>(null);
+  useEffect(() => setRevealedDepth(undefined), [maxDepth]);
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState<false | "svg" | "png">(false);
   /** Narrow canvas: toolbar buttons collapse into a single "more" menu. */
@@ -658,6 +663,14 @@ export function KnowledgeGraph({
     };
     const resizeCanvas = (width: number, height: number) => {
       if (suppressAutoFit.current) return;
+      // Opening the inspector changes the canvas width. After the learner has
+      // clicked or navigated the map, preserve the existing viewport instead
+      // of treating that layout change as a request to recenter and rescale
+      // the selected node.
+      if (userInteracted.current) {
+        resizeViewport.current = { width, height, zoom: flowInstance.getZoom() };
+        return;
+      }
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
         const focusedNode = focusId ? flowInstance.getNode(focusId) : undefined;
@@ -738,20 +751,23 @@ export function KnowledgeGraph({
    * recedes. Selecting the goal root is the "whole graph" state, so nothing is
    * dimmed there — the canvas then reads as the full map.
    */
-  const structureSkeleton = useMemo(
-    () =>
-      view === "tree"
-        ? buildKnowledgeTreeLayout(nodes, edges, { collapsedIds })
-        : buildKnowledgeTreeLayout([], []),
-    [collapsedIds, edges, nodes, view],
-  );
+  const structureSkeleton = useMemo(() => {
+    const hierarchy = buildKnowledgeTreeHierarchy(nodes, edges);
+    const depths = getKnowledgeGraphTreeDepths(nodes, edges);
+    return { ...buildKnowledgeTreeLayout([], []),
+      depths: Object.fromEntries(depths),
+      maxDepth: depths.size ? Math.max(...depths.values()) : 0,
+      parentByChild: hierarchy.parentByChild,
+      childrenByParent: hierarchy.children,
+    };
+  }, [edges, nodes]);
 
   const focusIsRoot = useMemo(() => {
     if (!focusId) return false;
     const item = structureSkeleton.items.find((entry) => entry.id === focusId);
     if (item) return item.kind === "root";
-    return Boolean(nodes.find((node) => node.id === focusId)?.data.root);
-  }, [focusId, nodes, structureSkeleton.items]);
+    return structureSkeleton.depths[focusId] === 0 || Boolean(nodes.find((node) => node.id === focusId)?.data.root);
+  }, [focusId, nodes, structureSkeleton]);
 
   const neighborhoodHighlight = Boolean(focusId) && !focusIsRoot;
 
@@ -788,13 +804,13 @@ export function KnowledgeGraph({
 
   const structuredTree = useMemo(() => {
     if (view !== "tree") {
-      return buildKnowledgeTreeLayout([], []);
+      return structureSkeleton;
     }
     return buildKnowledgeTreeLayout(nodes, edges, {
       collapsedIds,
       activePathIds: highlightIds,
     });
-  }, [collapsedIds, edges, highlightIds, nodes, view]);
+  }, [collapsedIds, edges, highlightIds, nodes, view, structureSkeleton]);
 
   const freeLayoutPositions = useMemo(() => {
     if (view === "spatial") return buildSpatialLayout(nodes, edges);
@@ -802,6 +818,8 @@ export function KnowledgeGraph({
     return {} as Record<string, { x: number; y: number }>;
   }, [edges, nodes, view]);
 
+  const treePositionsRef = useRef(structuredTree.positions);
+  useEffect(() => { treePositionsRef.current = structuredTree.positions; }, [structuredTree.positions]);
   const toggleCollapse = useCallback(
     (nodeId: string) => {
       setInternalCollapsed((current) => {
@@ -815,7 +833,7 @@ export function KnowledgeGraph({
       suppressAutoFit.current = true;
       window.setTimeout(() => {
         if (!flowInstance) return;
-        const pos = structuredTree.positions[nodeId];
+        const pos = treePositionsRef.current[nodeId];
         if (!pos) return;
         // Tree layout positions are node centers, not top-left coordinates.
         void flowInstance.setCenter(pos.x, pos.y, {
@@ -827,15 +845,15 @@ export function KnowledgeGraph({
         }, 480);
       }, 40);
     },
-    [flowInstance, onCollapsedIdsChange, structuredTree],
+    [flowInstance, onCollapsedIdsChange],
   );
 
   const visibleSourceNodes = useMemo(() => {
     const base = nodes.slice(0, visibleCount);
     if (view !== "tree") return base;
     return base.filter((node) => {
-      const depth = structuredTree.depths[node.id] ?? 0;
-      if (maxDepth !== undefined && depth > maxDepth) return false;
+      const depth = structureSkeleton.depths[node.id] ?? 0;
+      if (maxDepth !== undefined && depth > Math.max(maxDepth, revealedDepth ?? maxDepth)) return false;
       // Hide descendants of collapsed ancestors.
       let cursor = structuredTree.parentByChild.get(node.id);
       while (cursor) {
@@ -847,8 +865,9 @@ export function KnowledgeGraph({
   }, [
     collapsedIds,
     maxDepth,
+    revealedDepth,
     nodes,
-    structuredTree.depths,
+    structureSkeleton.depths,
     structuredTree.parentByChild,
     view,
     visibleCount,
@@ -912,10 +931,10 @@ export function KnowledgeGraph({
 
   const laidOutNodesRef = useRef<Map<string, LaidOutCacheEntry>>(new Map());
 
-  const laidOutNodes = useMemo(() => {
+  const laidOutResult = useMemo(() => {
     const previous = laidOutNodesRef.current;
     const next = new Map<string, LaidOutCacheEntry>();
-    return visibleSourceNodes.map((node) => {
+    const built = visibleSourceNodes.map((node) => {
         const item = layoutItemById.get(node.id);
         const depth = structuredTree.depths[node.id] ?? item?.depth ?? 0;
         const kind = item?.kind;
@@ -959,16 +978,16 @@ export function KnowledgeGraph({
             matched: matchIds ? matchIds.includes(node.id) : false,
             highlight: highlightStateOf(node.id),
             onToggleCollapse: toggleCollapse,
-            onOpenExplore: (nodeId: string) => {
+            onOpenExplore: onOpenExplore || node.data.onOpenExplore ? (nodeId: string) => {
               const selected = { ...node.data, id: nodeId };
               if (onOpenExplore) onOpenExplore(selected);
               else node.data.onOpenExplore?.(nodeId);
-            },
-            onStudy: (nodeId: string) => {
+            } : undefined,
+            onStudy: onStudy || node.data.onStudy ? (nodeId: string) => {
               const selected = { ...node.data, id: nodeId };
               if (onStudy) onStudy(selected);
               else node.data.onStudy?.(nodeId);
-            },
+            } : undefined,
           },
           className: "graph-node-enter",
           selected: internalSelectedIds.includes(node.id),
@@ -1011,6 +1030,7 @@ export function KnowledgeGraph({
         });
         return candidate;
       });
+      return {nodes: built, cache: next};
     },
     [
       collapsedIds,
@@ -1035,6 +1055,9 @@ export function KnowledgeGraph({
       visibleSourceNodes,
     ],
   );
+
+  const laidOutNodes = laidOutResult.nodes;
+  useEffect(() => { laidOutNodesRef.current = laidOutResult.cache; }, [laidOutResult]);
 
   const [renderedNodes, setRenderedNodes] =
     useState<KnowledgeNode[]>(laidOutNodes);
@@ -1093,7 +1116,7 @@ export function KnowledgeGraph({
     // Rendering every additional semantic relation here made the canvas noisy
     // and produced long, dashed lines with no clear action for the learner.
     return [...treeEdges, ...planOverlay];
-  }, [neighborhoodHighlight, planEdges, structuredTree.edges, view, visibleIds]);
+  }, [edges, neighborhoodHighlight, planEdges, structuredTree.edges, view, visibleIds]);
 
   // Initial / structure fit — skip while the user is mid-focus or collapsing.
   useEffect(() => {
@@ -1112,6 +1135,14 @@ export function KnowledgeGraph({
   // Focus the selected learning node at its actual center and 100% scale.
   useEffect(() => {
     if (!flowInstance || view !== "tree" || !focusId) return;
+    // Selecting a node is a detail-panel action. Once the learner has
+    // interacted with the canvas, keep the current camera exactly where it is
+    // instead of recentering and forcing a zoom animation for every click.
+    // Explicit locate/focus commands still go through frameNode below.
+    if (userInteracted.current) {
+      lastFocusedId.current = focusId;
+      return;
+    }
     if (skipAutoCenter.current) {
       // A host camera request (search locate / 聚焦此节点) already framed the
       // node together with its relations — do not fight it.
@@ -1235,14 +1266,33 @@ export function KnowledgeGraph({
     onCanvasApi({
       focusNode: (nodeId, options) => {
         skipAutoCenter.current = true;
-        frameNode(nodeId, options);
+        const depth = structureSkeleton.depths[nodeId];
+        if (depth !== undefined) setRevealedDepth(current => Math.max(current ?? 0, depth));
+        const next = new Set(collapsedIds);
+        let parent = structureSkeleton.parentByChild.get(nodeId);
+        while (parent) { next.delete(parent); parent = structureSkeleton.parentByChild.get(parent); }
+        if (next.size !== collapsedIds.size) { setInternalCollapsed(next); onCollapsedIdsChange?.([...next]); }
+        setPendingFocus({id: nodeId, ...options});
       },
       fit: fitAll,
     });
-  }, [fitAll, frameNode, onCanvasApi]);
+  }, [fitAll, onCanvasApi, structureSkeleton, collapsedIds, onCollapsedIdsChange]);
+
+  useEffect(() => {
+    if (!pendingFocus || !visibleIds.has(pendingFocus.id) || !flowInstance) return;
+    const frame = requestAnimationFrame(() => {
+      frameNode(pendingFocus.id, pendingFocus);
+      setPendingFocus(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [pendingFocus, visibleIds, renderedNodes, frameNode, flowInstance]);
 
   const activateNode = (node: KnowledgeNode) => {
     if (!interactive) return;
+    // A node click should never be interpreted as a request to move the
+    // camera. This also prevents the selection update from triggering the
+    // initial-focus effect while the click is still being processed.
+    userInteracted.current = true;
     const selectedNode = { ...node.data, id: node.id };
     const nextIds = multiple
       ? internalSelectedIds.includes(node.id)
@@ -1672,15 +1722,7 @@ export function KnowledgeGraph({
         onInit={setFlowInstance}
         onMove={(event, viewport) => {
           if (event) userInteracted.current = true;
-          setZoom((current) => {
-            // F4.2/U1-1: commit zoom state only when the LOD tier changes so
-            // pan/zoom frames do not re-render the whole tree every frame.
-            const currentTier =
-              current < 0.4 ? "low" : current < 0.8 ? "mid" : "high";
-            const nextTier =
-              viewport.zoom < 0.4 ? "low" : viewport.zoom < 0.8 ? "mid" : "high";
-            return currentTier === nextTier ? current : viewport.zoom;
-          });
+          setZoom(current => Math.abs(current - viewport.zoom) < 0.001 ? current : viewport.zoom);
         }}
         onNodeClick={handleNodeClick}
         onNodeDragStop={(_, node) =>

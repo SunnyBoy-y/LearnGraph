@@ -12,6 +12,11 @@ import {
 } from "lucide-react";
 
 import { LazyStreamdown } from "@/components/ai-elements/lazy-streamdown";
+import {
+  PreviewableMarkdownPre,
+  type MarkdownPreProps,
+} from "@/components/chat/html-code-preview";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { fetchSharedSession, type SessionSharePublicView } from "@/api/session-sharing";
 
 type Part = Record<string, unknown>;
@@ -38,7 +43,16 @@ function PartRenderer({ part }: { part: Part }) {
   if (TEXT_KINDS.has(type)) {
     return (
       <div className="share-part share-part--text">
-        <LazyStreamdown codeHighlight="plain">{content}</LazyStreamdown>
+        <ExpandableContent label="正文" lineLimit={32}>
+          <LazyStreamdown
+            codeHighlight="plain"
+            components={{
+              pre: (props: MarkdownPreProps) => <PreviewableMarkdownPre {...props} />,
+            }}
+          >
+            {content}
+          </LazyStreamdown>
+        </ExpandableContent>
       </div>
     );
   }
@@ -47,7 +61,9 @@ function PartRenderer({ part }: { part: Part }) {
     return (
       <details className="share-reasoning">
         <summary>思考过程</summary>
-        <div className="share-reasoning__body">{content}</div>
+        <ExpandableContent label="思考过程" lineLimit={18}>
+          <div className="share-reasoning__body">{content}</div>
+        </ExpandableContent>
       </details>
     );
   }
@@ -249,9 +265,18 @@ export function SessionShareViewPage() {
               </div>
               {message.content ? (
                 <div className="share-part share-part--text">
-                  <LazyStreamdown codeHighlight="plain">
-                    {message.content}
-                  </LazyStreamdown>
+                  <ExpandableContent label="正文" lineLimit={32}>
+                    <LazyStreamdown
+                      codeHighlight="plain"
+                      components={{
+                        pre: (props: MarkdownPreProps) => (
+                          <PreviewableMarkdownPre {...props} />
+                        ),
+                      }}
+                    >
+                      {message.content}
+                    </LazyStreamdown>
+                  </ExpandableContent>
                 </div>
               ) : null}
               {message.parts.map((part, index) => (

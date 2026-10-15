@@ -6,11 +6,12 @@ import io
 import re
 from collections.abc import Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.models import Graph, GraphNode
+from app.domain.models import DurableJob, Graph, GraphNode
+from app.domain.graph_cover_models import COVER_ACTIVE_STATUSES, GraphCoverJob
 from app.domain.schemas.graphs import GraphCoverUpdateRequest, GraphCoverView
 from app.repositories.audit import AuditRepository
 from app.services.graph_cover import (
@@ -133,6 +134,22 @@ class GraphCoverService:
         else:
             cover = self._generated(graph, nodes)
             used_default = cover == default_graph_cover(graph.title)
+        # The later manual choice supersedes every queued/running AI render.
+        # Update job rows before the graph: this serializes against the runner's
+        # guarded completion write, including cancellation during its final read.
+        job_ids = select(GraphCoverJob.job_id).where(
+            GraphCoverJob.workspace_id == self.workspace_id,
+            GraphCoverJob.graph_id == graph.id,
+            GraphCoverJob.status.in_(COVER_ACTIVE_STATUSES),
+        )
+        self.db.execute(update(DurableJob).where(
+            DurableJob.id.in_(job_ids), DurableJob.status.in_(("queued", "leased")),
+        ).values(status="cancelled", lease_expires_at=None))
+        self.db.execute(update(GraphCoverJob).where(
+            GraphCoverJob.workspace_id == self.workspace_id,
+            GraphCoverJob.graph_id == graph.id,
+            GraphCoverJob.status.in_(COVER_ACTIVE_STATUSES),
+        ).values(status="cancelled", error="已使用手动保存的封面，旧生成结果不再应用。"))
         graph.cover_svg = cover
         AuditRepository(self.db, self.workspace_id).record(
             actor_id=self.actor_id, action="graph.cover_updated", resource_type="graph", resource_id=graph.id,

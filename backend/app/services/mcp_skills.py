@@ -399,15 +399,15 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "enum": ["calendar_day_utc", "calendar_month_utc"],
                 },
-                "soft_limit_cny": {"type": "number", "minimum": 0},
-                "hard_limit_cny": {"type": "number", "minimum": 0},
-                "limit_currency": {"type": "string", "enum": ["CNY", "USD"]},
+                "soft_limit": {"type": "string"},
+                "hard_limit": {"type": "string"},
+                "currency": {"type": "string", "enum": ["CNY", "USD"]},
                 "enabled": {"type": "boolean"},
             },
-            "required": ["name", "provider_id", "model_id", "feature", "period"],
+            "required": ["name", "provider_id", "model_id", "feature", "period", "currency"],
             "anyOf": [
-                {"required": ["soft_limit_cny"]},
-                {"required": ["hard_limit_cny"]},
+                {"required": ["soft_limit"]},
+                {"required": ["hard_limit"]},
             ],
             "additionalProperties": False,
         },
@@ -420,9 +420,9 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "properties": {
                 "policy_id": {"type": "string", "minLength": 1, "maxLength": 36},
                 "name": {"type": "string", "minLength": 1, "maxLength": 160},
-                "soft_limit_cny": {"type": ["number", "null"], "minimum": 0},
-                "hard_limit_cny": {"type": ["number", "null"], "minimum": 0},
-                "limit_currency": {"type": "string", "enum": ["CNY", "USD"]},
+                "soft_limit": {"type": ["string", "null"]},
+                "hard_limit": {"type": ["string", "null"]},
+                "currency": {"type": "string", "enum": ["CNY", "USD"]},
                 "enabled": {"type": "boolean"},
             },
             "required": ["policy_id", "name", "enabled"],
@@ -1681,7 +1681,7 @@ class MCPAndSkillService:
                             "authorized LearnGraph Agent Skill package. Use this when a "
                             "skill listed in the skill catalog matches the current task "
                             "and you need its complete instructions before applying it, "
-                            "or to load its references/ files on demand."
+                            "or to load its references/ files on demand. Follow next_cursor while has_more is true."
                         ),
                         "parameters": {
                             "type": "object",
@@ -1697,6 +1697,17 @@ class MCPAndSkillService:
                                     "minLength": 1,
                                     "maxLength": 500,
                                     "description": "Package-relative file path; defaults to SKILL.md.",
+                                },
+                                "cursor": {
+                                    "type": "string",
+                                    "maxLength": 2048,
+                                    "description": "Use next_cursor from the previous page; bound to the file version.",
+                                },
+                                "max_chars": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": SKILL_READ_MAX_CONTENT_CHARS,
+                                    "description": "Maximum text characters per page. Follow next_cursor until has_more is false.",
                                 },
                             },
                             "required": ["skill_key"],
@@ -2092,7 +2103,9 @@ class MCPAndSkillService:
 
         skill_key = str(arguments.get("skill_key") or "").strip()
         raw_path = str(arguments.get("path") or "SKILL.md").strip() or "SKILL.md"
-        input_json = {"skill_key": skill_key, "path": raw_path}
+        input_json = {"skill_key": skill_key, "path": raw_path,
+                      "cursor": arguments.get("cursor"),
+                      "max_chars": arguments.get("max_chars", SKILL_READ_MAX_CONTENT_CHARS)}
         invocation = self._create_invocation(
             target_type="skill",
             target_id="",
@@ -2188,9 +2201,23 @@ class MCPAndSkillService:
                 status="failed",
                 http_status=exc.status_code,
             )
-        truncated = len(content) > SKILL_READ_MAX_CONTENT_CHARS
-        if truncated:
-            content = content[:SKILL_READ_MAX_CONTENT_CHARS]
+        from app.services.harness_contracts import AGENT_TOOL_RESULT_MAX_BYTES, canonical_json, text_page
+
+        try:
+            max_chars = arguments.get("max_chars", SKILL_READ_MAX_CONTENT_CHARS)
+            cursor = arguments.get("cursor")
+            if type(max_chars) is not int or not 1 <= max_chars <= SKILL_READ_MAX_CONTENT_CHARS:
+                raise AppError(422, "invalid_page_size", "max_chars is outside the skill read budget")
+            if cursor is not None and (not isinstance(cursor, str) or len(cursor) > 2048):
+                raise AppError(422, "invalid_read_cursor", "Use next_cursor from the previous read")
+            page = text_page(
+                content, key=f"skill:{self.workspace_id}:{skill.id}:{path}",
+                max_chars=max_chars, cursor=cursor,
+            )
+        except AppError as exc:
+            self._fail_invocation(
+                invocation, exc.code, exc.message, status="failed", http_status=exc.status_code,
+            )
         files = [
             item.relative_path
             for item in self.db.scalars(
@@ -2205,10 +2232,48 @@ class MCPAndSkillService:
             "skill_key": skill.skill_key,
             "name": skill.name,
             "path": path,
-            "content": content,
-            "truncated": truncated,
+            **page,
             "package_files": files[:64],
+            "package_files_total": len(files),
+            "package_files_truncated": len(files) > 64,
         }
+
+        def model_payload() -> dict[str, Any]:
+            # Match invoke_agent_function -> _invocation_data -> runtime._success.
+            return {
+                "invocation_id": invocation.id,
+                "target_type": invocation.target_type,
+                "tool_name": invocation.tool_name,
+                "status": "succeeded",
+                "result": result,
+                "skill_trigger": {
+                    "skill_key": skill.skill_key,
+                    "skill_name": skill.skill_key,
+                    "skill_id": None,
+                    "origin": "catalog_read",
+                },
+            }
+
+        page_chars = max_chars
+        while len(canonical_json(model_payload()).encode("utf-8")) > AGENT_TOOL_RESULT_MAX_BYTES:
+            visible_files = result["package_files"]
+            directory_bytes = len(canonical_json(visible_files).encode("utf-8"))
+            if visible_files and (directory_bytes > AGENT_TOOL_RESULT_MAX_BYTES // 3 or page_chars == 1):
+                result["package_files"] = visible_files[:len(visible_files) // 2]
+                result["package_files_truncated"] = True
+            elif page_chars > 1:
+                page_chars = max(1, page_chars // 2)
+                page = text_page(
+                    content, key=f"skill:{self.workspace_id}:{skill.id}:{path}",
+                    max_chars=page_chars, cursor=cursor,
+                )
+                result.update(page)
+            else:
+                self._fail_invocation(
+                    invocation, "skill_page_metadata_too_large",
+                    "Skill metadata exceeds the tool result byte budget",
+                    status="failed", http_status=422,
+                )
         invocation.status = "succeeded"
         invocation.result_json = result
         invocation.result_size_bytes = len(_canonical_bytes(result))
@@ -2224,8 +2289,8 @@ class MCPAndSkillService:
             details={
                 "skill_key": skill.skill_key,
                 "path": path,
-                "truncated": truncated,
-                "content_chars": len(content),
+                "truncated": page["truncated"],
+                "content_chars": len(page["content"]),
             },
         )
         self.db.commit()
@@ -5161,6 +5226,7 @@ class MCPAndSkillService:
                 provider_id=arguments.get("provider_id"),
                 model_id=arguments.get("model_id"),
                 feature=arguments.get("feature"),
+                currency=str(arguments.get("currency") or "USD"),
             ).model_dump(mode="json")
 
         if tool_name in {
@@ -5178,18 +5244,18 @@ class MCPAndSkillService:
                     model_id=str(arguments["model_id"]),
                     feature=str(arguments["feature"]),
                     period=str(arguments["period"]),
-                    soft_limit_cny=arguments.get("soft_limit_cny"),
-                    hard_limit_cny=arguments.get("hard_limit_cny"),
-                    limit_currency=str(arguments.get("limit_currency", "CNY")),
+                    soft_limit=arguments.get("soft_limit"),
+                    hard_limit=arguments.get("hard_limit"),
+                    currency=str(arguments.get("currency", "CNY")),
                     enabled=bool(arguments.get("enabled", True)),
                 )
             else:
                 policy = billing.update_budget_policy(
                     str(arguments["policy_id"]),
                     name=str(arguments["name"]),
-                    soft_limit_cny=arguments.get("soft_limit_cny"),
-                    hard_limit_cny=arguments.get("hard_limit_cny"),
-                    limit_currency=str(arguments.get("limit_currency", "CNY")),
+                    soft_limit=arguments.get("soft_limit"),
+                    hard_limit=arguments.get("hard_limit"),
+                    currency=str(arguments.get("currency", "CNY")),
                     enabled=bool(arguments["enabled"]),
                 )
             return BudgetPolicyView.model_validate(policy).model_dump(mode="json")

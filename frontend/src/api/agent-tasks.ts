@@ -24,7 +24,8 @@ export interface AgentTaskAttempt {
   rounds?: number;
   tool_calls?: number;
   token_usage?: number;
-  cost_usd?: number;
+  cost_amounts?: Partial<Record<"USD" | "CNY", string>>;
+  unknown_cost_events?: number;
   started_at?: number;
   finished_at?: number;
   error_class?: string | null;

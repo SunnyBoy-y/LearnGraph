@@ -1,3 +1,7 @@
+import { nativeMoney } from "@/lib/money";
+import { useQuery } from "@tanstack/react-query";
+import { workspaceQueryKey } from "@/lib/query-keys";
+import type { BillingCurrency } from "@/types/usage";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -41,6 +45,11 @@ import {
 import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
 import {
+  PreviewableMarkdownPre,
+  type MarkdownPreProps,
+} from "@/components/chat/html-code-preview";
+import { ExpandableContent } from "@/components/shared/expandable-content";
+import {
   isSandboxImageArtifactPart,
   SandboxImageArtifact,
 } from "@/components/chat/sandbox-image-artifact";
@@ -56,7 +65,7 @@ import {
   type AgentTask,
 } from "@/api/agent-tasks";
 import { confirmSkillDeletion } from "@/api/extensions";
-import { approveResearch } from "@/api/research";
+import { approveResearch, getResearchJob } from "@/api/research";
 import { decideFetchAuthorization, resumeFetchAuthorization } from "@/api/fetch-authorizations";
 import { decideEgressApproval, resumeEgressApproval } from "@/api/egress";
 import {
@@ -236,14 +245,18 @@ function SandboxStatusPart({
         </ul>
       ) : null}
       {typeof data?.stdout_summary === "string" && data.stdout_summary ? (
-        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px]">
-          {data.stdout_summary}
-        </pre>
+        <ExpandableContent className="mt-2" label="标准输出" lineLimit={12}>
+          <pre className="whitespace-pre-wrap font-mono text-[10px]">
+            {data.stdout_summary}
+          </pre>
+        </ExpandableContent>
       ) : null}
       {typeof data?.stderr_summary === "string" && data.stderr_summary ? (
-        <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono text-[10px] text-amber-800 dark:text-amber-200">
-          {data.stderr_summary}
-        </pre>
+        <ExpandableContent className="mt-1" label="标准错误" lineLimit={12}>
+          <pre className="whitespace-pre-wrap font-mono text-[10px] text-amber-800 dark:text-amber-200">
+            {data.stderr_summary}
+          </pre>
+        </ExpandableContent>
       ) : null}
     </div>
   );
@@ -451,9 +464,8 @@ function SubagentTaskPart({
           {latestAttempt && latestAttempt.rounds !== undefined ? (
             <p className="text-[10px] text-muted-foreground">
               轮次 {latestAttempt.rounds} · 工具调用 {latestAttempt.tool_calls ?? 0}
-              {typeof latestAttempt.cost_usd === "number"
-                ? ` · $${latestAttempt.cost_usd.toFixed(4)}`
-                : ""}
+              {latestAttempt.cost_amounts ? Object.entries(latestAttempt.cost_amounts).map(([currency, amount]) => " · " + nativeMoney(amount, currency as BillingCurrency)).join("") : " · 金额待核实"}
+              {latestAttempt.unknown_cost_events ? " · " + latestAttempt.unknown_cost_events + " 次金额待核实" : ""}
             </p>
           ) : null}
           {!terminal ? (
@@ -1103,6 +1115,7 @@ function TextWithCitations({
         }
         return <img alt={alt} src={src} {...props} />;
       },
+      pre: (props: MarkdownPreProps) => <PreviewableMarkdownPre {...props} />,
     }),
     [lookup],
   );
@@ -1114,23 +1127,25 @@ function TextWithCitations({
   const useIncremental = streaming && markdown.length > INCREMENTAL_RENDER_MIN_CHARS;
 
   return (
-    <div data-message-selectable-text>
-      {useIncremental ? (
-        <IncrementalMarkdown
-          codeHighlight={codeHighlight}
-          components={components}
-          epoch={streamEpoch}
-          text={markdown}
-        />
-      ) : (
-        <MessageResponse
-          className={cn("min-w-0", className)}
-          codeHighlight={codeHighlight}
-          components={components}
-        >
-          {markdown}
-        </MessageResponse>
-      )}
+    <div className={cn("message-text-block", className)}>
+      <div data-message-selectable-text>
+        {useIncremental ? (
+          <IncrementalMarkdown
+            codeHighlight={codeHighlight}
+            components={components}
+            epoch={streamEpoch}
+            text={markdown}
+          />
+        ) : (
+          <MessageResponse
+            className={cn("min-w-0", className)}
+            codeHighlight={codeHighlight}
+            components={components}
+          >
+            {markdown}
+          </MessageResponse>
+        )}
+      </div>
     </div>
   );
 }
@@ -1550,7 +1565,7 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
 }
 
 
-function DocumentSelectionPart({ content, data }: { content: string; data: PartData }) {
+function DocumentSelectionPart({ content, data, partId }: { content: string; data: PartData; partId?: string }) {
   const filename = stringField(data, "filename") || "文档选区";
   const locator =
     stringField(data, "locator_label") ||
@@ -1564,12 +1579,19 @@ function DocumentSelectionPart({ content, data }: { content: string; data: PartD
         <strong className="truncate">{filename}</strong>
         <span className="ml-auto truncate font-mono text-[10px] text-muted-foreground">{locator}</span>
       </div>
-      <p className="mt-1 line-clamp-4 whitespace-pre-wrap leading-5 text-muted-foreground">{quote}</p>
+      <ExpandableContent
+        className="mt-1"
+        label="选区"
+        lineLimit={4}
+        storageKey={partId ? `learngraph:expanded:selection:${partId}` : undefined}
+      >
+        <p className="whitespace-pre-wrap leading-5 text-muted-foreground">{quote}</p>
+      </ExpandableContent>
     </section>
   );
 }
 
-function SelectionQuotePart({ content, data }: { content: string; data: PartData }) {
+function SelectionQuotePart({ content, data, partId }: { content: string; data: PartData; partId?: string }) {
   const sourceRole = stringField(data, "source_role");
   const sourceLabel = sourceRole === "assistant" ? "引用模型回答" : "引用会话内容";
   return (
@@ -1581,9 +1603,16 @@ function SelectionQuotePart({ content, data }: { content: string; data: PartData
         <Quote className="size-3.5 flex-none" />
         <span>{sourceLabel}</span>
       </div>
-      <p className="mt-1 line-clamp-4 whitespace-pre-wrap leading-5 text-muted-foreground">
-        {content}
-      </p>
+      <ExpandableContent
+        className="mt-1"
+        label="引用"
+        lineLimit={4}
+        storageKey={partId ? `learngraph:expanded:selection:${partId}` : undefined}
+      >
+        <p className="whitespace-pre-wrap leading-5 text-muted-foreground">
+          {content}
+        </p>
+      </ExpandableContent>
     </blockquote>
   );
 }
@@ -1803,8 +1832,11 @@ function ToolCallPart({
 type DeepResearchApprovalData = {
   user_approval_required?: boolean;
   research_job_id?: string;
-  estimated_cost_cny?: number | string;
-  budget_cny?: number | string;
+  currency?: BillingCurrency;
+  estimated_cost_amount?: string | null;
+  budget_amount?: string | null;
+  workspace_id?: string;
+  quote_id?: string;
   question?: string;
 };
 
@@ -1826,15 +1858,14 @@ export function DeepResearchApprovalFromPart({ part }: { part: MessagePart }) {
 
 function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) {
   const jobId = typeof data.research_job_id === "string" ? data.research_job_id : "";
-  const estimated =
-    typeof data.estimated_cost_cny === "number"
-      ? data.estimated_cost_cny
-      : Number(data.estimated_cost_cny) || 0;
-  const budget =
-    typeof data.budget_cny === "number"
-      ? data.budget_cny
-      : Number(data.budget_cny) || 0;
-  const displayCost = estimated > 0 ? estimated : budget;
+  const { workspaceId, userId, effectivePermissions } = useAuth();
+  const current = useQuery({ queryKey: workspaceQueryKey(workspaceId, "research", "approval", userId, jobId),
+    queryFn: ({ signal }) => getResearchJob(jobId, workspaceId, signal),
+    enabled: Boolean(jobId) && (!data.workspace_id || data.workspace_id === workspaceId), retry: false });
+  const fresh = current.data;
+  const displayCost = nativeMoney(fresh?.estimated_cost_amount, fresh?.currency);
+  const displayBudget = nativeMoney(fresh?.budget_amount, fresh?.currency);
+  const quoteId = fresh?.billing_snapshot?.schema_version === 2 ? String(fresh.billing_snapshot.quote_id ?? "") : "";
   const [status, setStatus] = useState<"pending" | "submitting" | "approved">(
     "pending",
   );
@@ -1849,7 +1880,7 @@ function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) 
       </section>
     );
   }
-  if (status === "approved") {
+  if (status === "approved" || (fresh?.approval_status === "approved" && fresh.status !== "awaiting_approval")) {
     return (
       <section className="mt-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:bg-emerald-950/30">
         <strong className="text-emerald-700 dark:text-emerald-400">
@@ -1868,9 +1899,7 @@ function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) 
           需要确认研究预算
         </strong>
         <p className="mt-1 text-sm text-muted-foreground">
-          {displayCost > 0
-            ? `远程 Provider 预计费用 ¥${displayCost.toFixed(2)}。批准后才会调用远程研究 Provider。`
-            : "批准后才会调用远程研究 Provider。"}
+          {"预计费用 " + displayCost + "；批准预算 " + displayBudget + "。批准后才会调用远程研究 Provider。"}
         </p>
         {typeof data.question === "string" && data.question.trim() ? (
           <p className="mt-2 text-sm text-foreground/80">
@@ -1884,13 +1913,13 @@ function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) 
         </p>
       ) : null}
       <Button
-        disabled={status === "submitting"}
+        disabled={status === "submitting" || !quoteId || !effectivePermissions.includes("workspace.write") || fresh?.status !== "awaiting_approval"}
         size="sm"
         onClick={async () => {
           setStatus("submitting");
           setError("");
           try {
-            await approveResearch(jobId);
+            await approveResearch(jobId, quoteId, workspaceId);
             setStatus("approved");
             toast.success("预算已确认，研究任务已启动");
             // Re-drive the agent to fetch the approved job's results via the
@@ -1914,6 +1943,8 @@ function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) 
       >
         {status === "submitting" ? "确认中…" : "确认预算并启动"}
       </Button>
+      {current.isError ? <p className="text-sm text-destructive">{current.error.message}</p> : null}
+      {fresh && !quoteId ? <p className="text-sm">旧报价已过期，请用原币预算重新生成研究计划。</p> : null}
     </section>
   );
 }
@@ -2115,23 +2146,34 @@ function FetchSetupNoticePart({ data }: { data: PartData }) {
 
 function AcknowledgementPart({
   content,
+  partId,
   streaming,
 }: {
   content: string;
+  partId?: string;
   streaming: boolean;
 }) {
   const text = content.trim();
   if (!text) return null;
   return (
-    <div
-      className={cn(
-        "chat-acknowledgement",
-        streaming && "chat-acknowledgement--streaming",
-      )}
-      data-message-selectable-text
+    <ExpandableContent
+      className="chat-acknowledgement-block"
+      expandedWhileStreaming
+      label="说明"
+      lineLimit={12}
+      storageKey={partId ? `learngraph:expanded:ack:${partId}` : undefined}
+      streaming={streaming}
     >
-      <p>{text}</p>
-    </div>
+      <div
+        className={cn(
+          "chat-acknowledgement",
+          streaming && "chat-acknowledgement--streaming",
+        )}
+        data-message-selectable-text
+      >
+        <p>{text}</p>
+      </div>
+    </ExpandableContent>
   );
 }
 
@@ -2169,7 +2211,7 @@ export function MessagePartRenderer({
   switch (part.type) {
     case "acknowledgement":
       return (
-        <AcknowledgementPart content={content} streaming={streaming} />
+        <AcknowledgementPart content={content} partId={part.id} streaming={streaming} />
       );
     case "text":
       return content ? (
@@ -2203,9 +2245,18 @@ export function MessagePartRenderer({
                 : "思考过程"}
           </div>
           {content ? (
-            <div className="chat-reasoning-step__body whitespace-pre-wrap">
-              {content}
-            </div>
+            <ExpandableContent
+              className="chat-reasoning-step__expandable"
+              expandedWhileStreaming
+              label="思考过程"
+              lineLimit={18}
+              storageKey={`learngraph:expanded:reasoning:${part.id}`}
+              streaming={streaming}
+            >
+              <div className="chat-reasoning-step__body whitespace-pre-wrap">
+                {content}
+              </div>
+            </ExpandableContent>
           ) : streaming ? (
             <div className="chat-reasoning-step__body text-muted-foreground">…</div>
           ) : null}
@@ -2345,9 +2396,9 @@ export function MessagePartRenderer({
     case "attachment":
       return <AttachmentPart data={part.data} status={part.status} />;
     case "document_selection":
-      return <DocumentSelectionPart content={content} data={part.data} />;
+      return <DocumentSelectionPart content={content} data={part.data} partId={part.id} />;
     case "selection_quote":
-      return <SelectionQuotePart content={content} data={part.data} />;
+      return <SelectionQuotePart content={content} data={part.data} partId={part.id} />;
     case "error":
       return (
         <p className="message-part-error" role="alert">
@@ -2360,7 +2411,9 @@ export function MessagePartRenderer({
           <p>
             <ShieldAlert className="size-4" />未知 Message Part 已安全降级
           </p>
-          <pre>{JSON.stringify(part, null, 2)}</pre>
+          <ExpandableContent label="详情" lineLimit={18}>
+            <pre>{JSON.stringify(part, null, 2)}</pre>
+          </ExpandableContent>
         </div>
       );
   }

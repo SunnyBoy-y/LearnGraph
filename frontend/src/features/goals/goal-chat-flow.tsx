@@ -270,6 +270,7 @@ export function useGoalSetupFlow({
       graphStreamAbortRef.current = controller;
       try {
         let streamedGraphId = "";
+        let streamCompleted = false;
         for await (const sse of streamCandidateGraph(
           result.goal.id,
           {
@@ -304,6 +305,7 @@ export function useGoalSetupFlow({
               ],
             }));
           } else if (sse.event === "graph.complete") {
+            streamCompleted = true;
             streamedGraphId = String(payload.graph_id ?? streamedGraphId);
             setGraphId(streamedGraphId);
             setStreamPreview({
@@ -319,6 +321,7 @@ export function useGoalSetupFlow({
         }
         if (!streamedGraphId)
           throw new Error("服务端没有返回候选图谱，请刷新后重试。");
+        if (!streamCompleted) throw new Error("生成连接提前结束，已保留收到的内容，但图谱尚未确认完整。请重试生成，或从图谱书架查看已保存的候选内容。");
         return { graphId: streamedGraphId, savedGoal };
       } finally {
         graphStreamAbortRef.current = null;
@@ -711,7 +714,7 @@ export function useGoalSetupFlow({
     recordAnswer,
     removeNode: (nodeId: string) => removeNode.mutate(nodeId),
     retryNode: (nodeId: string, instruction: string) =>
-      retryNode.mutate({ nodeId, instruction }),
+      retryNode.mutateAsync({ nodeId, instruction }),
     result,
     returnToQuestionnaire,
     reviewGoal,
@@ -723,7 +726,7 @@ export function useGoalSetupFlow({
     submit,
     submittedPrompt,
     updateNode: (nodeId: string, body: Partial<GraphNode>) =>
-      updateNode.mutate({ nodeId, body }),
+      updateNode.mutateAsync({ nodeId, body }),
   };
 }
 
@@ -955,8 +958,8 @@ function GoalGraphNodeReview({
   deletable: boolean;
   node: GraphNode;
   onDelete: () => void;
-  onRetry: (instruction: string) => void;
-  onSave: (body: Partial<GraphNode>) => void;
+  onRetry: (instruction: string) => Promise<unknown>;
+  onSave: (body: Partial<GraphNode>) => Promise<unknown>;
 }) {
   const [editing, setEditing] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -1040,10 +1043,12 @@ function GoalGraphNodeReview({
             </Button>
             <Button
               disabled={busy || retryInstruction.trim().length < 2}
-              onClick={() => {
-                onRetry(retryInstruction.trim());
-                setRetrying(false);
-                setRetryInstruction("");
+              onClick={async () => {
+                try {
+                  await onRetry(retryInstruction.trim());
+                  setRetrying(false);
+                  setRetryInstruction("");
+                } catch { /* mutation reports failure; retain the draft */ }
               }}
               size="sm"
             >
@@ -1071,9 +1076,9 @@ function GoalGraphNodeReview({
                 draft.target_weight < 1 ||
                 draft.target_weight > 100
               }
-              onClick={() => {
-                onSave(draft);
-                setEditing(false);
+              onClick={async () => {
+                try { await onSave(draft); setEditing(false); }
+                catch { /* retain the user's editing state and values */ }
               }}
               size="sm"
             >

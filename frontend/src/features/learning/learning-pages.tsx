@@ -248,6 +248,11 @@ export function EvidenceReviewPage() {
 
 export function ExerciseAnswerPage() {
   const { questionId = "", workspaceId = "", setId = "default" } = useParams();
+  return <ExerciseAnswerContent key={`${workspaceId}:${setId}:${questionId}`} />;
+}
+
+function ExerciseAnswerContent() {
+  const { questionId = "", workspaceId = "", setId = "default" } = useParams();
   const queryClient = useQueryClient();
   const exercises = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "exercises", { setId }),

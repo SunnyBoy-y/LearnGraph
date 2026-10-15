@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Search } from 'lucide-react'
 
-import { discoverProviderModels, listProviders } from '@/api'
-import { fuzzyModelMatch, providerCapabilityString } from '@/lib/model-choices'
+import { listProviderCatalog, listProviders } from '@/api'
+import { fuzzyModelMatch, providerModelOptions } from '@/lib/model-choices'
 import {
   Command,
   CommandEmpty,
@@ -30,6 +30,7 @@ export const MODEL_PROVIDER_TYPES = new Set([
   'openai_compatible_chat',
   'qwen',
   'codex_chatgpt',
+  'github_copilot',
   'deepseek_chat',
   'anthropic_messages',
   'ollama',
@@ -51,18 +52,7 @@ export function featureModelOptions(
   provider: Provider | undefined,
   discovered: ProviderModel[] | undefined,
 ) {
-  if (!provider) return [] as ProviderModel[]
-  const byId = new Map((discovered ?? []).map((model) => [model.id, model]))
-  const configured = providerCapabilityString(provider, 'default_model')
-  if (configured && !byId.has(configured)) {
-    byId.set(configured, {
-      id: configured,
-      roles: ['llm'],
-      streaming: true,
-      remote: true,
-    })
-  }
-  return [...byId.values()]
+  return providerModelOptions(provider, discovered)
 }
 
 export function featureModelValue(providerId: string | null, modelId: string | null) {
@@ -119,42 +109,27 @@ export function useFeatureModelChoices(): {
     queryFn: listProviders,
     staleTime: 30_000,
   })
+  const catalog = useQuery({
+    queryKey: ['provider-catalog'], queryFn: listProviderCatalog, staleTime: 300_000,
+  })
   const modelProviders = useMemo(
     () =>
       (providersQuery.data ?? []).filter(
         (provider) =>
           provider.enabled &&
           provider.remote_capability &&
-          MODEL_PROVIDER_TYPES.has(provider.provider_type),
+          (catalog.data
+            ? catalog.data.some((spec) => spec.provider_type === provider.provider_type && spec.role === 'model')
+            : MODEL_PROVIDER_TYPES.has(provider.provider_type)),
       ),
-    [providersQuery.data],
+    [providersQuery.data, catalog.data],
   )
-  const discoveredByProvider = useQuery({
-    queryKey: [
-      'feature-model-discovery',
-      modelProviders.map((item) => item.id).join(','),
-    ],
-    queryFn: async () => {
-      const entries = await Promise.all(
-        modelProviders.map(async (provider) => {
-          try {
-            const models = await discoverProviderModels(provider.id)
-            return [provider.id, models.models] as const
-          } catch {
-            return [provider.id, [] as ProviderModel[]] as const
-          }
-        }),
-      )
-      return Object.fromEntries(entries) as Record<string, ProviderModel[]>
-    },
-    enabled: modelProviders.length > 0,
-  })
   const choices = useMemo(() => {
     const result: FeatureModelChoice[] = []
     for (const provider of modelProviders) {
       const models = featureModelOptions(
         provider,
-        discoveredByProvider.data?.[provider.id],
+        undefined,
       )
       for (const model of models) {
         result.push({
@@ -166,7 +141,7 @@ export function useFeatureModelChoices(): {
       }
     }
     return result
-  }, [discoveredByProvider.data, modelProviders])
+  }, [modelProviders])
 
   return { choices, providers: providersQuery.data ?? [] }
 }

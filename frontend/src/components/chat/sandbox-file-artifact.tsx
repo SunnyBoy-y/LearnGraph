@@ -58,6 +58,7 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
         ? data.blob_sha256
         : "";
   const previewKind = resolveFilePreviewKind(path || title, mime);
+  const isHtmlArtifact = previewKind === "html";
   const canPreview = Boolean(fileId) && previewKind !== "unsupported";
 
   useEffect(() => {
@@ -153,9 +154,9 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             {canPreview ? (
-              <Button aria-label={`预览 ${title}`} onClick={() => setViewerOpen(true)} size="sm" variant="outline">
+              <Button aria-label={`${isHtmlArtifact ? "预览运行" : "预览"} ${title}`} onClick={() => setViewerOpen(true)} size="sm" variant="outline">
                 <Eye className="size-4" />
-                预览
+                {isHtmlArtifact ? "预览运行" : "预览"}
               </Button>
             ) : null}
             <Button aria-label={`下载 ${title}`} disabled={!fileId || downloading} onClick={() => void onDownload()} size="sm">

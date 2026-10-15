@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link2, MessageCircle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -63,7 +64,7 @@ export function NodeExploreChip({
         active ? "is-active" : "is-empty",
         className,
       )}
-      disabled={!active}
+      disabled={!active || !onOpen}
       onClick={(event) => {
         event.stopPropagation();
         if (active) onOpen?.();
@@ -92,6 +93,7 @@ export function NodeExploreChain({
   onJump?: (round: NodeExploreRound, index: number) => void;
   onClose?: () => void;
 }) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   if (!rounds.length) return null;
   return (
     <div className="chain-panel visible" role="dialog" aria-label={`${title} 的探索链`}>
@@ -99,7 +101,7 @@ export function NodeExploreChain({
         <div>
           <strong>{title}</strong>
           <span>
-            {rounds.length} 轮探索 · 点击条目查看对应问答
+            {rounds.length} 轮探索 · {onJump ? "点击条目定位对应问答" : "点击条目展开历史问题"}
           </span>
         </div>
         {onClose ? (
@@ -130,10 +132,11 @@ export function NodeExploreChain({
               <span className="chain-dot">{index + 1}</span>
               <button
                 className="chain-body"
-                onClick={() => onJump?.(round, index)}
+                aria-expanded={!onJump ? expandedId === round.id : undefined}
+                onClick={() => onJump ? onJump(round, index) : setExpandedId(current => current === round.id ? null : round.id)}
                 type="button"
               >
-                <span className="chain-label">{label}</span>
+                <span className="chain-label" style={!onJump && expandedId === round.id ? {whiteSpace: "pre-wrap", overflow: "visible", display: "block", WebkitLineClamp: "unset"} : undefined}>{!onJump && expandedId === round.id ? round.content : label}</span>
                 {when ? <span className="chain-hint">{when}</span> : null}
               </button>
             </li>

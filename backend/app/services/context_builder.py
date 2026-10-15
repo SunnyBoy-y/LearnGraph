@@ -71,6 +71,7 @@ class ContextBuilder:
                 reason_codes=self._reason_codes_for(item),
                 token_cost=estimate_tokens(f"{item.title}\n{item.content}"),
                 manifest_status="candidate",
+                external_source=item.external_source,
             )
             for item in routed.retrieval.candidates
         ]
@@ -116,7 +117,10 @@ class ContextBuilder:
 
         def _try_section(name: str, serialized: str, raw: Any) -> bool:
             nonlocal used
-            cost = estimate_tokens(serialized)
+            cost = estimate_tokens(
+                chr(10) * 2 + f"<HOST_DATA_BLOCK kind={name}>" + chr(10)
+                + serialized + chr(10) + "</HOST_DATA_BLOCK>"
+            )
             if used + cost > request.token_budget:
                 excluded["budget"] += len(raw) if isinstance(raw, list) else 1
                 return False
@@ -126,6 +130,18 @@ class ContextBuilder:
             return True
 
         for name, serialized, raw in sections:
+            if name == "memories" and isinstance(raw, list):
+                kept = []
+                for item in raw:
+                    trial = json.dumps([*kept, item], ensure_ascii=False, sort_keys=True)
+                    cost = estimate_tokens(chr(10) * 2 + f"<HOST_DATA_BLOCK kind={name}>" + chr(10) + trial + chr(10) + "</HOST_DATA_BLOCK>")
+                    if used + cost <= request.token_budget:
+                        kept.append(item)
+                    else:
+                        excluded["budget"] += 1
+                if kept:
+                    _try_section(name, json.dumps(kept, ensure_ascii=False, sort_keys=True), kept)
+                continue
             if name == "task_state" and raw is not None:
                 # Cross-session continuity depends on the task state above all
                 # else (plan §4.3 "继续上次"). Reserve priority for it: if the
@@ -163,11 +179,12 @@ class ContextBuilder:
         }
         package_hash = hashlib.sha256(canonical_json_bytes(selected_payload)).hexdigest()
         context_build_id = "ctx_" + package_hash[:24]
-        memories_injected = any(name == "memories" for name, _, _ in selected_sections)
-        injected_memories = [item for item in evidence if memories_injected]
-        excluded_memories = [item for item in evidence if not memories_injected]
+        included_ids = {item["memory_id"] for name, _, raw in selected_sections if name == "memories" for item in raw}
+        memories_injected = bool(included_ids)
+        injected_memories = [item for item in evidence if item.target_id in included_ids]
+        excluded_memories = [item for item in evidence if item.target_id not in included_ids]
         for item in evidence:
-            item.manifest_status = "injected" if memories_injected else "excluded"
+            item.manifest_status = "injected" if item.target_id in included_ids else "excluded"
             if item.manifest_status == "excluded" and "BUDGET_EXCEEDED" not in item.reason_codes:
                 item.reason_codes.append("BUDGET_EXCEEDED")
         manifest = [
@@ -193,7 +210,7 @@ class ContextBuilder:
             memories=injected_memories,
             candidate_memories=evidence,
             retrieved_memories=evidence,
-            selected_memories=evidence if memories_injected else [],
+            selected_memories=injected_memories,
             injected_memories=injected_memories,
             excluded_memories=excluded_memories,
             truncated_memories=(
@@ -351,6 +368,7 @@ class ContextBuilder:
                 StrategyMemory.tenant_id == scope.tenant_id,
                 StrategyMemory.workspace_id == scope.workspace_id,
                 StrategyMemory.status == "verified",
+                (StrategyMemory.subject_user_id.is_(None)) | (StrategyMemory.subject_user_id == scope.principal_user_id),
             )
             .order_by(StrategyMemory.confidence.desc())
             .limit(2)

@@ -434,9 +434,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           <Box className="size-4" />
           <div>
             <strong>{title}</strong>
-            <span>多文件沙箱（已启用）</span>
           </div>
-          <Badge variant="secondary">bundle · 联网</Badge>
         </div>
         <FullscreenPreview className="magic-card__frame-wrap" label={title}>
           <iframe loading="lazy"
@@ -468,9 +466,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
           <Box className="size-4" />
           <div>
             <strong>{title}</strong>
-            <span>动态预览（脚本已启用）</span>
           </div>
-          <Badge variant="secondary">preview · 联网</Badge>
         </div>
         <FullscreenPreview className="magic-card__frame-wrap" label={title}>
           <iframe loading="lazy"

@@ -57,6 +57,10 @@ export function workspaceQueryPrefix(workspaceId: string): QueryKey {
   return ["workspace", workspaceId];
 }
 
+export function billingQueryKey(workspaceId: string, userId: string, currency: "USD" | "CNY", ...parts: readonly unknown[]): QueryKey {
+  return workspaceQueryKey(workspaceId, "usage", "native-v2", userId, currency, ...parts);
+}
+
 /**
  * Prefix for one resource family within a workspace — e.g.
  * `workspaceResourcePrefix(ws, "sessions")` invalidates every sessions query

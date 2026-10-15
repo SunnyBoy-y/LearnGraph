@@ -8,6 +8,7 @@ import {
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import { LazyStreamdown } from "@/components/ai-elements/lazy-streamdown";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { BrainIcon, ChevronDownIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import {
@@ -245,28 +246,35 @@ export const ReasoningContent = memo(
         )}
         {...props}
       >
-        {isStreaming ? (
-          <>
-            {head ? (
-              <LazyStreamdown>{head}</LazyStreamdown>
-            ) : null}
-            <div className="reasoning-streaming-last-line">
-              <span
-                aria-hidden="true"
-                className="reasoning-streaming-dot"
-              />
-              {last ? (
-                <div className="reasoning-streaming-last-line__text">
-                  <LazyStreamdown>{last}</LazyStreamdown>
-                </div>
-              ) : (
-                <span className="sr-only">处理中</span>
-              )}
-            </div>
-          </>
-        ) : (
-          <LazyStreamdown>{children}</LazyStreamdown>
-        )}
+        <ExpandableContent
+          expandedWhileStreaming
+          label="步骤详情"
+          lineLimit={18}
+          streaming={isStreaming}
+        >
+          {isStreaming ? (
+            <>
+              {head ? (
+                <LazyStreamdown>{head}</LazyStreamdown>
+              ) : null}
+              <div className="reasoning-streaming-last-line">
+                <span
+                  aria-hidden="true"
+                  className="reasoning-streaming-dot"
+                />
+                {last ? (
+                  <div className="reasoning-streaming-last-line__text">
+                    <LazyStreamdown>{last}</LazyStreamdown>
+                  </div>
+                ) : (
+                  <span className="sr-only">处理中</span>
+                )}
+              </div>
+            </>
+          ) : (
+            <LazyStreamdown>{children}</LazyStreamdown>
+          )}
+        </ExpandableContent>
       </CollapsibleContent>
     );
   }

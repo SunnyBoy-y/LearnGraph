@@ -921,7 +921,7 @@ async def dictation_realtime(websocket: WebSocket, db: DB, settings: AppSettings
             reasoning_tokens=int((usage or {}).get("reasoning_tokens") or 0),
             attempt=1,
             latency_ms=latency_ms,
-            usage_reported=bool(usage),
+            usage_reported=bool(usage), usage_units=usage,
         )
         db.commit()
     except Exception:
@@ -1161,9 +1161,9 @@ def list_messages(
 ) -> MessageListPageView:
     """Return the session timeline, optionally windowed and compact.
 
-    - Default: full timeline with compact parts/provider_trace (list UI).
+    - Default: full timeline with lossless text and compact nested tool/citation metadata.
     - ``limit``: newest N messages (or the window ending just before ``before_id``).
-    - ``compact=false``: full durable parts/provider_trace (debug / rare callers).
+    - ``compact=false``: full durable parts/provider_trace for detail views.
     Full fidelity for a single message remains on
     ``GET /messages/{message_id}``.
     """

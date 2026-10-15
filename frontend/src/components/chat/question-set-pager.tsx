@@ -418,9 +418,6 @@ export function QuestionSetPager({
   const total = questions.length;
   const current = questions[Math.min(page, total - 1)];
   const draft = drafts[Math.min(page, total - 1)] ?? emptyDraft();
-  const answeredCount = drafts.filter((item) => item.answered || item.skipped)
-    .length;
-
   function currentPageReady(source: DraftAnswer = draft) {
     if (source.answered || source.skipped) return true;
     if (current?.mode === "text") return Boolean(source.textValue.trim());
@@ -585,23 +582,6 @@ export function QuestionSetPager({
                 : null}
             </span>
           </div>
-          {total > 1 ? (
-            <div className="question-set-pager__dots" aria-hidden="true">
-              {results.map((item, index) => (
-                <button
-                  className={cn(
-                    "question-set-pager__dot",
-                    index === resultPage && "is-active",
-                    item.isCorrect === true && "is-correct",
-                    item.isCorrect === false && "is-wrong",
-                  )}
-                  key={item.componentId}
-                  onClick={() => setResultPage(index)}
-                  type="button"
-                />
-              ))}
-            </div>
-          ) : null}
         </div>
 
         {currentResult ? (
@@ -690,36 +670,6 @@ export function QuestionSetPager({
 
   return (
     <section aria-label="交互练习" className="question-set-pager">
-      <div className="question-set-pager__chrome">
-        <div className="question-set-pager__meta">
-          <strong>交互练习</strong>
-          <span>
-            {total > 1
-              ? `第 ${page + 1} / ${total} 题 · 已答 ${answeredCount}`
-              : "作答后确认提交"}
-          </span>
-        </div>
-        {total > 1 ? (
-          <div className="question-set-pager__dots" aria-hidden="true">
-            {questions.map((question, index) => {
-              const item = drafts[index];
-              return (
-                <button
-                  className={cn(
-                    "question-set-pager__dot",
-                    index === page && "is-active",
-                    (item?.answered || item?.skipped) && "is-done",
-                  )}
-                  key={question.componentId}
-                  onClick={() => setPage(index)}
-                  type="button"
-                />
-              );
-            })}
-          </div>
-        ) : null}
-      </div>
-
       <div className="question-set-pager__stage">
         {current.mode === "text" ? (
           <section className="option-group" aria-label={current.title}>
@@ -804,6 +754,16 @@ export function QuestionSetPager({
               <span>
                 {page + 1} / {total}
               </span>
+              <Button
+                aria-label="下一题"
+                disabled={page >= total - 1}
+                onClick={() => setPage((value) => Math.min(total - 1, value + 1))}
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+              >
+                <ChevronRight className="size-3.5" />
+              </Button>
             </>
           ) : (
             <span />

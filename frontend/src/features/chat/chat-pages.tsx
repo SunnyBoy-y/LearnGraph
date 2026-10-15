@@ -114,7 +114,8 @@ import {
 } from "@/api";
 import { VoiceCallControl, VoiceComposerActions, VoiceOrb } from "@/features/voice/voice-orb";
 import { voiceModelPinText, voiceStatusText } from "@/features/voice/voice-status";
-import { VoiceTaskChip } from "@/features/voice/voice-task-chip";
+import { applyVoiceCanvasUpdate } from "@/features/voice/voice-canvas";
+import { VoiceTaskCanvas } from "@/features/voice/voice-task-canvas";
 import { voiceSessionController } from "@/features/voice/voice-session-controller";
 import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
@@ -146,11 +147,8 @@ import {
   voiceRenderStartsSession,
 } from "@/features/voice/voice-render-policy";
 import {
-  mergeVoiceTrace,
   mergeAdjacentVoiceUserMessages,
   voiceActionsVisible,
-  retireVoiceRows,
-  voiceTurnParentRowId,
 } from "@/features/voice/voice-rows";
 import {
   Message as AiMessage,
@@ -244,6 +242,7 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -286,8 +285,14 @@ import {
 import type { WorkspaceSetting } from "@/types/settings";
 import {
   clearDraftSessionId,
+  draftSessionScope,
+  fallbackSessionTitle,
+  getDraftSessionCreationKey,
   getDraftSessionId,
+  getDraftSessionProjectId,
+  getOrCreateDraftSession,
   isDefaultDraftTitle,
+  isQuestionFallbackTitle,
   setDraftSessionId,
 } from "@/lib/draft-session";
 import {
@@ -453,6 +458,9 @@ type LearningNodeContext = {
   nodeId?: string;
   nodeIds?: string[];
   nodeLabel?: string;
+  sessionId?: string;
+  learningPackage?: boolean;
+  openKey?: string;
 };
 
 type TextSelectionMenu = MessageSelectionContext & {
@@ -1070,13 +1078,19 @@ function shouldFallbackEnableDictationCleanup(
   );
 }
 
-function readLearningNodeContext(): LearningNodeContext | undefined {
+function readLearningNodeContext(
+  sessionId?: string,
+): LearningNodeContext | undefined {
   try {
     const raw = window.sessionStorage.getItem(
       LEARNING_NODE_CONTEXT_STORAGE_KEY,
     );
     const value = raw ? (JSON.parse(raw) as LearningNodeContext) : undefined;
-    return value && typeof value.graphId === "string" ? value : undefined;
+    if (!value || typeof value.graphId !== "string") return undefined;
+    if (sessionId && value.sessionId && value.sessionId !== sessionId) {
+      return undefined;
+    }
+    return value;
   } catch {
     return undefined;
   }
@@ -1607,6 +1621,8 @@ type MessageVersionNavigation = {
   onPrevious: () => void;
 };
 
+const USER_MESSAGE_LINE_LIMIT = 12;
+
 function MessageVersionNavigator({
   navigation,
 }: {
@@ -1650,6 +1666,7 @@ function UserMessage({
   onEditValueChange,
   onSaveEdit,
   onStartEdit,
+  onRetryVoice,
 }: {
   message: Message;
   editing: boolean;
@@ -1662,6 +1679,7 @@ function UserMessage({
   onEditValueChange: (value: string) => void;
   onSaveEdit: () => void;
   onStartEdit: () => void;
+  onRetryVoice?: () => void;
 }) {
   const copyMessage = async () => {
     try {
@@ -1741,37 +1759,50 @@ function UserMessage({
                 ),
               )
               .map((part) => <ChatStreamPartRenderer key={part.id} part={part} />)}
-            <p
-              className="whitespace-pre-wrap leading-6"
-              data-message-selectable-text
+            <ExpandableContent
+              className="user-message-text-expandable"
+              contentClassName="user-message-text-expandable__body"
+              label="消息正文"
+              lineLimit={USER_MESSAGE_LINE_LIMIT}
+              storageKey={`learngraph:expanded:user-message:${message.id}`}
             >
-              {markedSegments.map((segment, index) =>
-                segment.type === "mark" ? (
-                  <button
-                    aria-label={`打开划词解释：${segment.value.slice(0, 40)}`}
-                    className="selection-explain-mark"
-                    data-selection-explain-id={segment.id}
-                    key={`${segment.id}-${index}`}
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      onOpenSelectionExplanation?.(segment.id);
-                    }}
-                    title="打开历史划词解释"
-                    type="button"
-                  >
-                    {segment.value}
-                  </button>
-                ) : (
-                  <span key={`text-${index}`}>{segment.value}</span>
-                ),
-              )}
-            </p>
+              <p
+                className="whitespace-pre-wrap leading-6"
+                data-message-selectable-text
+              >
+                {markedSegments.map((segment, index) =>
+                  segment.type === "mark" ? (
+                    <button
+                      aria-label={`打开划词解释：${segment.value.slice(0, 40)}`}
+                      className="selection-explain-mark"
+                      data-selection-explain-id={segment.id}
+                      key={`${segment.id}-${index}`}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onOpenSelectionExplanation?.(segment.id);
+                      }}
+                      title="打开历史划词解释"
+                      type="button"
+                    >
+                      {segment.value}
+                    </button>
+                  ) : (
+                    <span key={`text-${index}`}>{segment.value}</span>
+                  ),
+                )}
+              </p>
+            </ExpandableContent>
           </div>
         )}
       </MessageContent>
       {!editing && message.provider_trace?.voice_segment !== true ? (
         <MessageActions className="chat-message-actions--user min-h-8 justify-end opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          {message.provider_trace?.retryable === true && onRetryVoice ? (
+            <MessageAction label="重试发送" onClick={onRetryVoice} tooltip="重试发送">
+              <RefreshCcw className="size-3.5" />
+            </MessageAction>
+          ) : null}
           <MessageAction
             label="复制消息"
             onClick={() => void copyMessage()}
@@ -1982,18 +2013,14 @@ function AssistantMessageInner({
       }
     />
   );
-    // 语音字幕：没有 LLM 草稿时，才使用官方 `bot-output` 的句级路径。
-    // 有草稿时主画布持续渲染完整文本，音频账本只负责推进回合状态。
+    // 语音中央画布只显示播放账本确认过的句子。
     if (
       isVoiceTrace(shown.provider_trace) &&
       shown.role === "assistant" &&
       shown.status === "streaming"
     ) {
       const captions = readVoiceCaptionParts(part.data);
-      // While the LLM draft is streaming, the canvas owns the full answer
-      // text. Karaoke captions remain available for turns that have no text
-      // draft, but they must not hide the typewriter content.
-      if (captions.length && typeof part.data?.voice_streaming_text !== "string") {
+      if (captions.length) {
         return <VoiceCaptions key={part.id} parts={captions} />;
       }
     }
@@ -2219,8 +2246,7 @@ function AssistantMessageInner({
       {
         // A voice answer is not a token stream, so this badge has nothing to
         // measure: while the answer was being read aloud it sat underneath it
-        // announcing "waiting for the first character" about text that was
-        // already on screen.
+        // showing a pre-first-token indicator for text already on screen.
         isVoiceTrace(shown.provider_trace) ? null : (
           <StreamStatsBadge
             messageId={message.id}
@@ -2345,20 +2371,16 @@ function EmptySessionPrompts({
   prompts,
   onSelect,
   disabled,
-  isError,
   isPending,
   isUnavailable,
   onConfigureProvider,
-  onRetry,
 }: {
   prompts: SuggestedPrompt[];
   onSelect: (content: string) => void;
   disabled: boolean;
-  isError: boolean;
   isPending: boolean;
   isUnavailable: boolean;
   onConfigureProvider: () => void;
-  onRetry: () => void;
 }) {
   return (
     <ConversationEmptyState className="chat-empty-state">
@@ -2367,11 +2389,9 @@ function EmptySessionPrompts({
         <h2>从一个问题开始</h2>
         <SuggestedPromptContent
           disabled={disabled}
-          isError={isError}
           isPending={isPending}
           isUnavailable={isUnavailable}
           onConfigureProvider={onConfigureProvider}
-          onRetry={onRetry}
           onSelect={onSelect}
           prompts={prompts}
         />
@@ -2415,23 +2435,20 @@ function SuggestedPromptContent({
   prompts,
   onSelect,
   disabled,
-  isError,
   isPending,
   isUnavailable,
   onConfigureProvider,
-  onRetry,
 }: {
   prompts: SuggestedPrompt[];
   onSelect: (content: string) => void;
   disabled: boolean;
-  isError: boolean;
   isPending: boolean;
   isUnavailable: boolean;
   onConfigureProvider: () => void;
-  onRetry: () => void;
 }) {
   // 即便模型/Provider 不可用，也展示记忆或中文默认提示，避免空白或英文占位。
-  if (!isPending && !isError && !isUnavailable && !prompts.length) return null;
+  // 生成失败由页面级 toast 提示；推荐问题区域不渲染错误文案。
+  if (!isPending && !isUnavailable && !prompts.length) return null;
 
   return (
     <div
@@ -2452,14 +2469,6 @@ function SuggestedPromptContent({
           <span>需配置真实模型 Provider</span>
           <Button onClick={onConfigureProvider} size="xs" variant="outline">
             前往设置
-          </Button>
-        </div>
-      ) : isError && !prompts.length ? (
-        <div className="chat-suggestions__status chat-suggestions__status--error">
-          <span>问题提示生成失败</span>
-          <Button onClick={onRetry} size="xs" variant="ghost">
-            <RefreshCcw aria-hidden="true" className="size-3" />
-            重试
           </Button>
         </div>
       ) : (
@@ -2484,21 +2493,17 @@ function SuggestedPromptContent({
 function FollowUpPrompts({
   prompts,
   onSelect,
-  isError,
   isPending,
   isUnavailable,
   onConfigureProvider,
-  onRetry,
 }: {
   prompts: SuggestedPrompt[];
   onSelect: (content: string) => void;
-  isError: boolean;
   isPending: boolean;
   isUnavailable: boolean;
   onConfigureProvider: () => void;
-  onRetry: () => void;
 }) {
-  if (!prompts.length && !isError && !isPending && !isUnavailable) return null;
+  if (!prompts.length && !isPending && !isUnavailable) return null;
 
   return (
     <section aria-label="对话问题提示" className="chat-follow-up-prompts">
@@ -2508,11 +2513,9 @@ function FollowUpPrompts({
       </div>
       <SuggestedPromptContent
         disabled={isPending}
-        isError={isError}
         isPending={isPending}
         isUnavailable={isUnavailable}
         onConfigureProvider={onConfigureProvider}
-        onRetry={onRetry}
         onSelect={onSelect}
         prompts={prompts}
       />
@@ -2768,10 +2771,34 @@ export function ChatCanvasPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  /**
+   * Show the deterministic question prefix while the model title is pending.
+   * Only draft titles are eligible, so a manual rename always wins.
+   */
+  const applyFallbackSessionTitle = useCallback(
+    (targetSessionId: string, question: string) => {
+      const title = fallbackSessionTitle(question);
+      if (!targetSessionId || !title) return title;
+      queryClient.setQueryData<Session[]>(
+        workspaceQueryKey(workspaceId, "sessions"),
+        (current) => {
+          if (!current) return current;
+          return current.map((item) =>
+            item.id === targetSessionId && isDefaultDraftTitle(item.title)
+              ? { ...item, title }
+              : item,
+          );
+        },
+      );
+      return title;
+    },
+    [queryClient, workspaceId],
+  );
   const conversationScroll = useConversationScrollController();
   const {
     captureScrollSnapshot,
     notifyCommittedAnswerStarted,
+    notifyActivityUpdated,
     notifyUserTurnStarted,
     resetTailSpace,
     restoreScrollSnapshot,
@@ -2906,6 +2933,60 @@ export function ChatCanvasPage() {
     voiceSessionController.getSnapshot,
     voiceSessionController.getSnapshot,
   );
+  const unavailableCapabilitySignature = useMemo(
+    () =>
+      voiceSnapshotForGating.capabilitiesLoaded
+        ? voiceSnapshotForGating.agentCapabilities
+            .filter((item) => !item.available)
+            .map((item) => `${item.id}:${item.reason || ""}`)
+            .sort()
+            .join("|")
+        : "",
+    [
+      voiceSnapshotForGating.agentCapabilities,
+      voiceSnapshotForGating.capabilitiesLoaded,
+    ],
+  );
+  const capabilityNoticeSeenRef = useRef<string | null>(null);
+  const capabilityNoticeTimerRef = useRef<number | null>(null);
+  const [showUnavailableCapabilityNotice, setShowUnavailableCapabilityNotice] =
+    useState(false);
+  useEffect(() => {
+    if (capabilityNoticeTimerRef.current !== null) {
+      window.clearTimeout(capabilityNoticeTimerRef.current);
+      capabilityNoticeTimerRef.current = null;
+    }
+    if (!unavailableCapabilitySignature) {
+      setShowUnavailableCapabilityNotice(false);
+      return;
+    }
+    const sessionSignature = `${sessionId}:${unavailableCapabilitySignature}`;
+    const storageKey = `learngraph:voice-capability-notice:${sessionSignature}`;
+    let stored = false;
+    try {
+      stored = window.sessionStorage.getItem(storageKey) === "1";
+    } catch {
+      // Session storage is optional in embedded WebViews.
+    }
+    if (capabilityNoticeSeenRef.current === sessionSignature || stored) return;
+    capabilityNoticeSeenRef.current = sessionSignature;
+    try {
+      window.sessionStorage.setItem(storageKey, "1");
+    } catch {
+      // Continue with the in-memory once-per-mount fallback.
+    }
+    setShowUnavailableCapabilityNotice(true);
+    capabilityNoticeTimerRef.current = window.setTimeout(() => {
+      setShowUnavailableCapabilityNotice(false);
+      capabilityNoticeTimerRef.current = null;
+    }, 6_000);
+    return () => {
+      if (capabilityNoticeTimerRef.current !== null) {
+        window.clearTimeout(capabilityNoticeTimerRef.current);
+        capabilityNoticeTimerRef.current = null;
+      }
+    };
+  }, [sessionId, unavailableCapabilitySignature]);
   const voiceTextFallback =
     voiceModeOpen &&
     voiceSnapshotForGating.sessionId === sessionId &&
@@ -2962,7 +3043,7 @@ export function ChatCanvasPage() {
         "learngraph:new-conversation",
         hangUpForNewConversation,
       );
-  }, []);
+  }, [sessionId]);
   // 语音会话的自动命名。
   //
   // 文本路径在 `message.accepted` 那一刻就拿到了首条用户消息的 id，随即调用
@@ -3012,32 +3093,6 @@ export function ChatCanvasPage() {
     },
     [queryClient, workspaceId],
   );
-  // 语音回合与文本首条消息同等地位：一条用户话落定，这个会话就不再是"空草稿"。
-  // 少了这一步，侧栏会继续把它当草稿藏着（空草稿不列出），点「新会话」还会被复用
-  // 回同一个会话——用户看到的就是"没离开上一通电话"。
-  //
-  // 这条判据不跟着"画布是否在渲染"走（所以没有并进下面那个 effect）：通话可以
-  // 在退出语音模式后仍然活着（刷新/切页后的「回到通话中」），那时用户说的话
-  // 同样属于这个会话。
-  useEffect(() => {
-    const onVoiceTurnSettled = (event: Event) => {
-      const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
-      if (!item || !voiceRenderStartsSession(item)) return;
-      // 同样只认当前会话：别的会话的回调不能把这里的草稿毕业掉。
-      if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
-      clearDraftSessionId(sessionId);
-      window.dispatchEvent(
-        new CustomEvent("learngraph:session-started", {
-          detail: { sessionId },
-        }),
-      );
-      markSessionTouched(sessionId);
-      armVoiceTitleRefetch(sessionId);
-    };
-    window.addEventListener("learngraph:voice-render", onVoiceTurnSettled);
-    return () =>
-      window.removeEventListener("learngraph:voice-render", onVoiceTurnSettled);
-  }, [armVoiceTitleRefetch, sessionId]);
   // Voice turns → the conversation canvas.
   //
   // Interim speech and the tutor's answer are rendered live now: they used to be
@@ -3049,145 +3104,21 @@ export function ChatCanvasPage() {
   useEffect(() => {
     const onVoiceRender = (event: Event) => {
       const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
-      const text = item?.text?.trim() || "";
-      const removals = item?.removes ?? [];
-      const retireTurnSegments = item?.retireTurnSegments ?? "";
       if (!item?.id || !item?.role) return;
       if (!shouldCommitVoiceRender(item)) return;
       // 只接受当前会话的语音回合，避免切换会话后残留的回调写进别的会话。
       if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
-      const id = `temp-voice-${item.id}`;
-      const status = item.deliveryStatus === "failed"
-        ? "failed"
-        : item.pending
-          ? "pending"
-          : item.final
-            ? "completed"
-            : "streaming";
-      // Keep the full LLM draft visible while sentence-level audio markers
-      // advance. A playback marker must not roll the canvas back to only the
-      // sentence currently being spoken.
-      const streamingText =
-        item.role === "assistant" && !item.final
-          ? item.streamingText?.trim() || ""
-          : "";
-      const displayText = streamingText || text;
-      // 官方 `bot-output` 宣布过的段落，按到达顺序；每段自带"已读游标"。
-      const captions =
-        item.role === "assistant" ? (item.captionParts ?? []) : [];
-      // 整段回答仍是**一个块**（不是一句一段）：这一块里既有已经点亮的句子，也有还没
-      // 朗读的灰字（官方 Karaoke 的预读）。灰字只活在前端内存里，刷新/打断即消失。
-      const live = !item.final && captions.length > 0;
-      const parts: MessagePart[] = captions.length
-        ? [
-            {
-              id: `temp-voice-part-${item.id}`,
-              type: "text" as const,
-              status: (live
-                ? "streaming"
-                : "completed") as MessagePart["status"],
-              content: displayText,
-              sequence: 0,
-              // 每段原样交给渲染器：Karaoke 模式下它把未读部分画成灰字。
-              data: {
-                kind: "final_answer",
-                voice_captions: {
-                  parts: captions.map((caption) => ({
-                    text: caption.text,
-                    segmentId: caption.segmentId,
-                    spokenChars: caption.spokenChars,
-                    status: caption.status,
-                    willBeSpoken: caption.willBeSpoken,
-                    playbackStarted: caption.playbackStarted,
-                  })),
-                  ...(streamingText ? { voice_streaming_text: streamingText } : {}),
-                },
-              },
-            },
-          ]
-        : [
-            {
-              id: `temp-voice-part-${item.id}`,
-              type: "text" as const,
-              status,
-              content: displayText,
-              sequence: 0,
-              data: { kind: "final_answer" },
-            },
-          ];
-      const trace: Record<string, unknown> = mergeVoiceTrace(undefined, {
-        voice_turn: true,
-        voice_segment: Boolean(item.voiceSegment),
-        interrupted: Boolean(item.interrupted),
-        event_id: item.eventId,
-        turn_id: item.turnId,
-        client_message_id: item.clientMessageId,
-        authoritative: Boolean(item.authoritative || item.final),
-        retryable: item.deliveryStatus === "failed",
-      });
-      setLocalMessages((current) => {
-        const kept = retireVoiceRows(current, {
-          removes: removals,
-          retireTurnSegments,
-        });
-        // 导师行要挂到同一回合的本地用户行上（见 `voiceTurnParentRowId`）：这样即便
-        // 客户端从没拿到服务端的回合 id，画布仍能顺着"持久化用户行 → 持久化回答行的
-        // parent_message_id"这条链找到它的孪生行，而不是把落库的那一条当成另一条回答
-        // 并排画出来。
-        const parentRowId =
-          item.role === "assistant"
-            ? voiceTurnParentRowId(kept, {
-                turnId: item.turnId,
-                clientMessageId: item.clientMessageId,
-              })
-            : null;
-        // A per-segment row is matched by its own id only: every segment of a
-        // turn shares the turn id, so a turn-id match would rewrite one segment
-        // with another segment's text.
-        const existing = kept.find((message) => message.id === id) ?? (item.voiceSegment
-          ? undefined
-          : kept.find((message) =>
-              message.role === item.role &&
-              message.provider_trace?.voice_segment !== true &&
-              ((item.turnId && message.provider_trace?.turn_id === item.turnId) ||
-                (item.clientMessageId && message.provider_trace?.client_message_id === item.clientMessageId)),
-            ));
-        if (existing) {
-          if (existing.provider_trace?.authoritative === true && item.role === "assistant" && !item.final) return kept;
-          if (!text) return kept;
-          return kept.map((message) => message.id === existing.id
-            ? {
-                ...message,
-                content: text,
-                status,
-                parts,
-                parent_message_id: parentRowId ?? message.parent_message_id,
-                provider_trace: mergeVoiceTrace(message.provider_trace, trace),
-              }
-            : message);
-        }
-        if (!text) return kept;
-        const voiceMessage: Message = {
-          id,
-          workspace_id: workspaceId,
-          session_id: sessionId,
-          parent_message_id: parentRowId,
-          role: item.role,
-          version: 1,
-          status,
-          content: text,
-          parts,
-          provider_trace: trace,
-          created_at: item.createdAt || new Date().toISOString(),
-        };
-        return [...kept, voiceMessage];
-      });
+      setLocalMessages((current) => applyVoiceCanvasUpdate(current, item, workspaceId, sessionId));
+      // The voice path bypasses the ordinary SSE stream, so explicitly notify
+      // the conversation scroller after each live user/assistant update. This
+      // keeps the current turn in the canvas while the side transcript grows.
+      notifyActivityUpdated();
     };
     window.addEventListener("learngraph:voice-render", onVoiceRender);
     return () => {
       window.removeEventListener("learngraph:voice-render", onVoiceRender);
     };
-  }, [armVoiceTitleRefetch, sessionId, voiceModeOpen, workspaceId]);
+  }, [armVoiceTitleRefetch, notifyActivityUpdated, sessionId, voiceModeOpen, workspaceId]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -3213,7 +3144,7 @@ export function ChatCanvasPage() {
   const [imageRetryChoice, setImageRetryChoice] = useState("");
   const [sandboxAuthRequest, setSandboxAuthRequest] = useState<SandboxAuthRequest | null>(null);
   const initialLearningNode = useRef<LearningNodeContext | undefined>(
-    readLearningNodeContext(),
+    readLearningNodeContext(sessionId),
   );
   const [learningNode, setLearningNode] = useState<
     LearningNodeContext | undefined
@@ -3444,6 +3375,9 @@ export function ChatCanvasPage() {
     queryFn: async () => {
       const page = await listSessionMessagesPage(sessionId, {
         limit: INITIAL_MESSAGE_PAGE,
+        // Chat rendering needs the durable text/tool payload. The server's
+        // compact view is for lightweight lists; it may omit nested tool data.
+        compact: false,
       });
       setHistoryTotalCount(page.total_count);
       const previous =
@@ -3470,7 +3404,9 @@ export function ChatCanvasPage() {
     },
     enabled: sessionId !== "new",
     // Incomplete streams need a fresh read after refresh so we can resume.
-    refetchOnMount: "always",
+    // A hydrated browser cache can paint the conversation immediately. The
+    // normal stale check still refreshes it in the background when needed.
+    refetchOnMount: true,
     // Evict inactive session histories quickly; active eviction below is the
     // primary bound, this is the safety net for unobserved caches.
     gcTime: 15_000,
@@ -3502,6 +3438,7 @@ export function ChatCanvasPage() {
       const page = await listSessionMessagesPage(sessionId, {
         limit: OLDER_MESSAGE_PAGE,
         beforeId: oldestId,
+        compact: false,
       });
       setHistoryHasMoreBefore(page.has_more_before);
       setHistoryTotalCount(page.total_count);
@@ -4903,6 +4840,58 @@ export function ChatCanvasPage() {
   const currentSession = sessions.data?.find(
     (session) => session.id === sessionId,
   );
+  const persistedNodeGraph = useQuery({
+    queryKey: workspaceQueryKey(
+      workspaceId,
+      "graph",
+      currentSession?.graph_id ?? "unbound",
+    ),
+    queryFn: () => getGraph(currentSession!.graph_id!),
+    staleTime: 30_000,
+    enabled: Boolean(
+      currentSession?.graph_id && currentSession?.current_node_id,
+    ),
+  });
+
+  // Restore the conversation's durable node binding even when the right rail
+  // is collapsed (the rail is not the source of truth for chat context).
+  useEffect(() => {
+    if (!currentSession || currentSession.id !== sessionId) return;
+    const nodeId = currentSession.current_node_id;
+    const graphId = currentSession.graph_id;
+    if (!nodeId || !graphId) {
+      if (learningNodeRef.current?.sessionId === sessionId) {
+        learningNodeRef.current = undefined;
+        setLearningNode(undefined);
+        clearLearningNodeContext();
+      }
+      return;
+    }
+    const node = persistedNodeGraph.data?.nodes.find(
+      (item) => item.id === nodeId,
+    );
+    if (!node) return;
+    if (
+      learningNodeRef.current?.sessionId === sessionId &&
+      learningNodeRef.current.nodeId === node.id &&
+      learningNodeRef.current.graphId === graphId
+    ) {
+      return;
+    }
+    const context: LearningNodeContext = {
+      graphId,
+      nodeId: node.id,
+      nodeLabel: node.label,
+      sessionId,
+    };
+    learningNodeRef.current = context;
+    setLearningNode(context);
+    storeLearningNodeContext(context);
+  }, [
+    currentSession,
+    persistedNodeGraph.data,
+    sessionId,
+  ]);
   const conversationBranchLinks = useMemo(() => {
     if (!currentSession?.parent_session_id) return [];
     const parent = (sessions.data ?? []).find(
@@ -5011,6 +5000,34 @@ export function ChatCanvasPage() {
     },
     [queryClient, workspaceId],
   );
+  // 语音回合与文本首条消息同等地位：一条用户话落定，这个会话就不再是"空草稿"。
+  // 少了这一步，侧栏会继续把它当草稿藏着（空草稿不列出），点「新会话」还会被复用
+  // 回同一个会话——用户看到的就是"没离开上一通电话"。
+  //
+  // 这条判据不跟着"画布是否在渲染"走：通话可以在退出语音模式后仍然活着
+  // （刷新/切页后的「回到通话中」），那时用户说的话同样属于这个会话。
+  useEffect(() => {
+    const onVoiceTurnSettled = (event: Event) => {
+      const item = (event as CustomEvent<VoiceRenderUpdate>).detail;
+      if (!item || !voiceRenderStartsSession(item)) return;
+      if (voiceSessionController.getSnapshot().sessionId !== sessionId) return;
+      clearDraftSessionId(sessionId);
+      // The voice path does not pass through the ordinary send() function;
+      // seed the same question-derived title as soon as its first utterance
+      // is durable, before the asynchronous model naming call completes.
+      applyFallbackSessionTitle(sessionId, item.text);
+      window.dispatchEvent(
+        new CustomEvent("learngraph:session-started", {
+          detail: { sessionId },
+        }),
+      );
+      markSessionTouched(sessionId);
+      armVoiceTitleRefetch(sessionId);
+    };
+    window.addEventListener("learngraph:voice-render", onVoiceTurnSettled);
+    return () =>
+      window.removeEventListener("learngraph:voice-render", onVoiceTurnSettled);
+  }, [applyFallbackSessionTitle, armVoiceTitleRefetch, sessionId]);
   // 语音会话的自动命名触发点。
   //
   // 触发条件是"这个会话的首条用户消息就是语音回合"：文本回合有它自己的触发点
@@ -5029,8 +5046,15 @@ export function ChatCanvasPage() {
     if (historyHasMoreBefore) return;
     voiceTitlePendingRef.current.delete(sessionId);
     if (!currentSession || !isVoiceTrace(firstUser.provider_trace)) return;
-    // 标题已经不是默认值：有人先命名过（或用户改过名），不再插手。
-    if (!isDefaultDraftTitle(currentSession.title)) return;
+    // The persisted draft may already carry the deterministic question prefix.
+    // Treat that one value as still pending model naming, but never touch an
+    // unrelated title that the user (or another client) set manually.
+    const questionFallbackTitle = fallbackSessionTitle(firstUser.content);
+    const currentTitleIsEligible =
+      isDefaultDraftTitle(currentSession.title) ||
+      isQuestionFallbackTitle(currentSession.title, firstUser.content);
+    if (!currentTitleIsEligible) return;
+    const expectedTitle = questionFallbackTitle || currentSession.title;
     if (voiceTitleRequestedRef.current.has(sessionId)) return;
     voiceTitleRequestedRef.current.add(sessionId);
     // 模型沿用设置里的自动命名模型；没配就沿用这通话用的那个（与文本路径
@@ -5041,7 +5065,7 @@ export function ChatCanvasPage() {
     const callModel = call.sessionId === sessionId ? call : null;
     void autoTitleSession(sessionId, {
       source_message_id: firstUser.id,
-      expected_title: currentSession.title,
+      expected_title: expectedTitle,
       provider_id: autoTitleModel.provider_id ?? callModel?.providerId ?? undefined,
       model_id: autoTitleModel.model_id ?? callModel?.modelId ?? undefined,
     })
@@ -5129,7 +5153,7 @@ export function ChatCanvasPage() {
     ]);
   }, [asrHotwords, saveAsrHotwords]);
   // 全双工语音模式是一通「通话」：画布里不该再出现「接下来可以问」这种需要点选
-  // 才能继续的提示卡，也不该为它去读/生成提示（生成失败还会弹「问题提示生成失败」）。
+  // 才能继续的提示卡，也不该为它去读/生成提示（失败提示由右上角 toast 承担）。
   // `!voiceBlocksComposer` 只覆盖通话进行中，挂断后会立刻复原——所以真正的口径放在
   // 锚点上：语音回合的回答永不充当锚点（`!suggestionAnchorIsVoice`）。通话结束后提示
   // 不会自己回来，直到用户在输入框里发出一轮文本回合。
@@ -5309,7 +5333,7 @@ export function ChatCanvasPage() {
       !suggestionProviderError &&
       !remoteSuggestionProviderAvailable,
   );
-  const retrySuggestedPrompts = () => {
+  const retrySuggestedPrompts = useCallback(() => {
     if (suggestionAnchorError) {
       void suggestionAnchorVersions.refetch();
     } else if (persistedSuggestedPrompts.isError) {
@@ -5324,11 +5348,47 @@ export function ChatCanvasPage() {
     } else {
       void generatedSuggestedPrompts.refetch();
     }
-  };
+  }, [
+    discoveredModels,
+    generatedSuggestedPrompts,
+    persistedSuggestedPrompts,
+    providers,
+    remoteSuggestionProviderAvailable,
+    suggestionAnchorError,
+    suggestionAnchorVersions,
+  ]);
+  const suggestedPromptFailureKey =
+    suggestedPromptsError && !suggestedPromptsPending
+      ? [
+          sessionId,
+          expectedSuggestionAnchorId ?? "",
+          expectedSuggestionAnchorVersionId ?? "",
+          generatedSuggestedPrompts.isError ? "generation" : "read",
+          generatedSuggestedPrompts.failureCount,
+        ].join(":")
+      : "";
+  const suggestedPromptFailureNoticeRef = useRef("");
+  useEffect(() => {
+    if (!suggestedPromptFailureKey) {
+      suggestedPromptFailureNoticeRef.current = "";
+      return;
+    }
+    if (suggestedPromptFailureNoticeRef.current === suggestedPromptFailureKey) {
+      return;
+    }
+    suggestedPromptFailureNoticeRef.current = suggestedPromptFailureKey;
+    toast.error("问题提示生成失败", {
+      description: "推荐问题暂时不可用，请稍后重试。",
+      action: {
+        label: "重试",
+        onClick: retrySuggestedPrompts,
+      },
+    });
+  }, [retrySuggestedPrompts, suggestedPromptFailureKey]);
+  // A failed suggestion request is toast-only; do not leave an empty error card in the canvas.
   const showSuggestedPromptState =
     canPrepareSuggestedPrompts &&
     (suggestedPromptsPending ||
-      suggestedPromptsError ||
       suggestedPromptsUnavailable ||
       promptSuggestions.length > 0);
   const graphTitle = currentSession?.graph_id
@@ -5393,10 +5453,12 @@ export function ChatCanvasPage() {
       return;
     }
     let cancelled = false;
+    const draftScope = draftSessionScope(workspaceId, null);
 
     // Prefer reusing the single unused empty draft so /chat/new never multiplies.
     const existingDraftId = getDraftSessionId();
-    if (existingDraftId) {
+    const existingDraftProjectId = getDraftSessionProjectId();
+    if (existingDraftId && existingDraftProjectId === null) {
       const cached = (
         queryClient.getQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions")) ?? []
       ).find((session) => session.id === existingDraftId);
@@ -5432,17 +5494,24 @@ export function ChatCanvasPage() {
             return;
           }
           clearDraftSessionId(existingDraftId);
-          return createSession({ memory_enabled: true, title: "新会话" }).then(
-            (created) => {
-              if (cancelled) return;
-              rememberCreatedSession(created);
-              setDraftSessionId(created.id);
-              preserveDraftForSessionRef.current = created.id;
-              navigate(`/w/${workspaceId}/chat/${created.id}`, {
-                replace: true,
-              });
-            },
-          );
+          return getOrCreateDraftSession(draftScope, () =>
+            createSession(
+              { memory_enabled: true, title: "新会话" },
+              {
+                headers: {
+                  "Idempotency-Key": getDraftSessionCreationKey(draftScope),
+                },
+              },
+            ),
+          ).then((created) => {
+            if (cancelled) return;
+            rememberCreatedSession(created);
+            setDraftSessionId(created.id, created.project_id ?? null);
+            preserveDraftForSessionRef.current = created.id;
+            navigate(`/w/${workspaceId}/chat/${created.id}`, {
+              replace: true,
+            });
+          });
         });
       void reusePromise.catch((error: unknown) => {
         if (!cancelled) {
@@ -5460,7 +5529,16 @@ export function ChatCanvasPage() {
     if (!attempt || attempt.locationKey !== location.key) {
       attempt = {
         locationKey: location.key,
-        promise: createSession({ memory_enabled: true, title: "新会话" }),
+        promise: getOrCreateDraftSession(draftScope, () =>
+          createSession(
+            { memory_enabled: true, title: "新会话" },
+            {
+              headers: {
+                "Idempotency-Key": getDraftSessionCreationKey(draftScope),
+              },
+            },
+          ),
+        ),
       };
       draftSessionCreationRef.current = attempt;
     }
@@ -5469,7 +5547,7 @@ export function ChatCanvasPage() {
       .then((session) => {
         if (cancelled) return;
         rememberCreatedSession(session);
-        setDraftSessionId(session.id);
+        setDraftSessionId(session.id, session.project_id ?? null);
         preserveDraftForSessionRef.current = session.id;
         navigate(`/w/${workspaceId}/chat/${session.id}`, { replace: true });
       })
@@ -6082,6 +6160,7 @@ export function ChatCanvasPage() {
       let targetSession = currentSession;
       if (sessionId === "new") {
         try {
+          const initialNode = learningNodeRef.current;
           if (goalMode) {
             targetSession = await createSession({
               memory_enabled: true,
@@ -6090,12 +6169,24 @@ export function ChatCanvasPage() {
           } else {
             let draftAttempt = draftSessionCreationRef.current;
             if (!draftAttempt || draftAttempt.locationKey !== location.key) {
+              const draftScope = draftSessionScope(workspaceId, null);
               draftAttempt = {
                 locationKey: location.key,
-                promise: createSession({
-                  memory_enabled: true,
-                  title: "新会话",
-                }),
+                promise: getOrCreateDraftSession(draftScope, () =>
+                  createSession(
+                    {
+                      memory_enabled: true,
+                      title: "新会话",
+                      graph_id: initialNode?.graphId ?? null,
+                      current_node_id: initialNode?.nodeId ?? null,
+                    },
+                    {
+                      headers: {
+                        "Idempotency-Key": getDraftSessionCreationKey(draftScope),
+                      },
+                    },
+                  ),
+                ),
               };
               draftSessionCreationRef.current = draftAttempt;
             }
@@ -6159,6 +6250,14 @@ export function ChatCanvasPage() {
                   message.role === "user",
               ))),
       );
+      // Keep the generic draft title out of the sidebar while the model title
+      // request is in flight. The backend persists the same prefix when it
+      // accepts the first message; this local update removes the latency gap.
+      const pendingQuestionTitle = shouldAutoTitle
+        ? applyFallbackSessionTitle(targetSession!.id, content)
+        : "";
+      const autoTitleExpectedTitle =
+        pendingQuestionTitle || targetSession?.title || "新会话";
       const activeLearningNode =
         requestedGenerationMode === "text" ? learningNodeRef.current : undefined;
       // First user message graduates the empty draft into a normal sidebar session.
@@ -6437,7 +6536,7 @@ export function ChatCanvasPage() {
                 } else {
                   autoTitlePromise = autoTitleSession(targetSessionId, {
                     source_message_id: sourceMessageId,
-                    expected_title: targetSession!.title,
+                    expected_title: autoTitleExpectedTitle,
                     provider_id:
                       autoTitleModel.provider_id ?? requestProvider.id,
                     model_id: autoTitleModel.model_id ?? requestModelId,
@@ -6680,6 +6779,7 @@ export function ChatCanvasPage() {
       queryClient,
       activeModelProvider,
       activeImageProvider,
+      applyFallbackSessionTitle,
       applyGeneratedSessionTitle,
       autoTitleModel,
       currentSession,
@@ -7146,6 +7246,7 @@ export function ChatCanvasPage() {
       storedAudioAsrAvailable,
       uploadAndIndex,
       voiceModeOpen,
+      voiceTextFallback,
       voiceBlocksComposer,
     ],
   );
@@ -7437,6 +7538,17 @@ export function ChatCanvasPage() {
     onError: (error) => toast.error(error.message),
   });
 
+  const graphReviewPendingRef = useRef(false);
+  const submitGraphReview = useCallback((payload: Parameters<typeof reviewGraphChange.mutate>[0]) => {
+    if (graphReviewPendingRef.current) { toast.message("图谱变更正在处理，请稍候。"); return; }
+    graphReviewPendingRef.current = true;
+    const notification = toast.loading("正在处理图谱变更…");
+    void reviewGraphChange.mutateAsync(payload).catch(() => { /* mutation reports the error */ }).finally(() => {
+      graphReviewPendingRef.current = false;
+      toast.dismiss(notification);
+    });
+  }, [reviewGraphChange]);
+
   const handleComponentAction = useCallback(
     (action: TrustedComponentAction) => {
       if (action.componentType === "graph_update_proposal") {
@@ -7446,12 +7558,12 @@ export function ChatCanvasPage() {
           return;
         }
         if (action.event === "confirm") {
-          reviewGraphChange.mutate({ decision: "confirm", proposalId });
+          submitGraphReview({ decision: "confirm", proposalId });
         } else if (action.event === "reject") {
           setRejectProposalId(proposalId);
           setRejectReason("");
         } else if (action.event === "undo") {
-          reviewGraphChange.mutate({ decision: "undo", proposalId });
+          submitGraphReview({ decision: "undo", proposalId });
         }
         return;
       }
@@ -7555,7 +7667,7 @@ export function ChatCanvasPage() {
       }
       void send(answer, { graphAction: "none" });
     },
-    [reviewGraphChange, send],
+    [submitGraphReview, send],
   );
 
   useEffect(() => {
@@ -7619,6 +7731,7 @@ export function ChatCanvasPage() {
     const routeState = location.state as {
       pendingPrompt?: string;
       pendingFileIds?: string[];
+      pendingAttachmentFiles?: FileRecord[];
       pendingGraphAction?: GraphAction;
       learningNode?: LearningNodeContext;
       targetMessageId?: string;
@@ -7645,9 +7758,10 @@ export function ChatCanvasPage() {
       return () => window.clearInterval(timer);
     }
     if (routeState?.learningNode?.graphId) {
-      learningNodeRef.current = routeState.learningNode;
-      setLearningNode(routeState.learningNode);
-      storeLearningNodeContext(routeState.learningNode);
+      const context = { ...routeState.learningNode, sessionId };
+      learningNodeRef.current = context;
+      setLearningNode(context);
+      storeLearningNodeContext(context);
     }
     const pendingPrompt = routeState?.pendingPrompt;
     if (
@@ -7658,8 +7772,16 @@ export function ChatCanvasPage() {
     ) {
       pendingHandled.current = true;
       navigate(location.pathname, { replace: true });
+      const pendingAttachmentFiles = routeState.pendingAttachmentFiles ?? [];
+      const pendingFileIds = Array.from(
+        new Set([
+          ...(routeState.pendingFileIds ?? []),
+          ...pendingAttachmentFiles.map((file) => file.id),
+        ]),
+      );
       void send(pendingPrompt, {
-        fileIds: routeState.pendingFileIds ?? [],
+        fileIds: pendingFileIds,
+        attachmentFiles: pendingAttachmentFiles,
         graphAction: routeState.pendingGraphAction,
       });
     }
@@ -7754,14 +7876,16 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     const selectLearningNode = (event: Event) => {
       const detail = (event as CustomEvent<LearningNodeContext>).detail;
       if (!detail || typeof detail.graphId !== "string") return;
+      if (detail.sessionId && detail.sessionId !== sessionId) return;
+      const context = { ...detail, sessionId };
       const previousLabel = learningNodeRef.current?.nodeLabel;
-      learningNodeRef.current = detail;
-      setLearningNode(detail);
-      storeLearningNodeContext(detail);
+      learningNodeRef.current = context;
+      setLearningNode(context);
+      storeLearningNodeContext(context);
       // Keep the composer in sync with the selected node: fill when empty, or
       // replace the previous auto draft. Leave real user edits untouched.
-      if (detail.nodeLabel) {
-        const nextDraft = learningNodeComposerDraft(detail.nodeLabel);
+      if (context.nodeLabel) {
+        const nextDraft = learningNodeComposerDraft(context.nodeLabel);
         setComposerText((current) =>
           isLearningNodeComposerDraft(current, previousLabel)
             ? nextDraft
@@ -7781,7 +7905,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         "learngraph:learning-node-selected",
         selectLearningNode,
       );
-  }, []);
+  }, [sessionId]);
 
   useEffect(
     () => () => {
@@ -8891,7 +9015,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     if (voiceBlocksComposer) return;
     if (!supportsAgentMode || !hasDeepResearchProvider) return;
     prepareTaskPrompt(
-      "请使用 start_deep_research 工具启动深度研究。研究问题请根据当前对话上下文提炼；若用户已给出预算则使用该预算，否则先询问预算（单位：元 / budget_cny）。提交后若返回 user_approval_required=true，请停止并等待用户在界面上确认预算，不要重复调用 get_deep_research。",
+      "请使用 start_deep_research 工具启动深度研究。研究问题请根据当前对话上下文提炼；若用户已给出预算则使用该预算，否则先询问预算金额和供应商原币（currency=USD 或 CNY，budget_amount 为十进制字符串，不进行汇率换算）。提交后若返回 user_approval_required=true，请停止并等待用户在界面上确认预算，不要重复调用 get_deep_research。",
       { agent: true },
     );
   }, [hasDeepResearchProvider, prepareTaskPrompt, supportsAgentMode, voiceModeOpen, voiceBlocksComposer]);
@@ -9195,7 +9319,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       }
       if (action === "usage") {
         prepareTaskPrompt(
-          "请读取当前工作区的模型用量与预算，分别说明美元和人民币成本以及剩余额度。",
+          "请读取当前工作区的模型用量与预算，分别用 currency=USD 和 currency=CNY 读取原币费用、预算占用和剩余额度；缺少金额明确说待核实，不使用汇率，不合计两个币种。",
           { agent: true },
         );
         return;
@@ -9221,20 +9345,41 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     learningNodeRef.current = undefined;
     setLearningNode(undefined);
     clearLearningNodeContext();
+    if (currentSession?.current_node_id) {
+      void updateSession(currentSession.id, { current_node_id: null })
+        .then((updated) => {
+          queryClient.setQueryData<Session[]>(
+            workspaceQueryKey(workspaceId, "sessions"),
+            (current) =>
+              current?.map((item) =>
+                item.id === updated.id ? updated : item,
+              ),
+          );
+        })
+        .catch((error: unknown) => {
+          toast.error(error instanceof Error ? error.message : "取消节点绑定失败");
+        });
+    }
     // Drop the auto-filled “什么是 X？” draft when the user unbinds the node.
     setComposerText((current) =>
       isLearningNodeComposerDraft(current, previousLabel) ? "" : current,
     );
     focusComposer();
-  }, [focusComposer]);
+  }, [currentSession, focusComposer, queryClient, workspaceId]);
   // The merged topbar status+context menu dispatches this event to unbind the
   // active learning node (the conversation context chip lives in the shell).
   useEffect(() => {
-    const clearNode = () => clearSelectedLearningNode();
+    const clearNode = (event: Event) => {
+      const targetSessionId = (
+        event as CustomEvent<{ sessionId?: string }>
+      ).detail?.sessionId;
+      if (targetSessionId && targetSessionId !== sessionId) return;
+      clearSelectedLearningNode();
+    };
     window.addEventListener("learngraph:learning-node-clear", clearNode);
     return () =>
       window.removeEventListener("learngraph:learning-node-clear", clearNode);
-  }, [clearSelectedLearningNode]);
+  }, [clearSelectedLearningNode, sessionId]);
   const toggleGoalMode = useCallback(() => {
     if (goalMode) {
       leaveGoalMode();
@@ -9447,15 +9592,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               workspaceId={workspaceId}
             />
           ) : null}
-          {isEmptySession && !goalMode && !voiceModeOpen ? (
+          {isEmptySession && !learningNode?.nodeId && !goalMode && !voiceModeOpen ? (
             <EmptySessionPrompts
               disabled={
                 history.isPending || status !== "ready" || sessionIsClosed
-              }
-              isError={
-                showSuggestedPromptState &&
-                suggestedPromptsError &&
-                emptySessionDisplayPrompts.length === 0
               }
               isPending={
                 (showSuggestedPromptState && suggestedPromptsPending) ||
@@ -9470,7 +9610,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               onConfigureProvider={() =>
                 navigate(`/w/${workspaceId}/settings/providers`)
               }
-              onRetry={retrySuggestedPrompts}
               onSelect={(content) => void send(content)}
               prompts={emptySessionDisplayPrompts}
             />
@@ -9579,6 +9718,16 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                         }}
                         onEditValueChange={setEditingMessageContent}
                         onOpenSelectionExplanation={handleOpenSelectionExplanation}
+                        onRetryVoice={
+                          message.provider_trace?.retryable === true &&
+                          typeof message.provider_trace?.client_message_id === "string"
+                            ? () => {
+                                void voiceSessionController.retryText(
+                                  String(message.provider_trace?.client_message_id),
+                                );
+                              }
+                            : undefined
+                        }
                         onSaveEdit={() => {
                           const content = editingMessageContent.trim();
                           if (!content) return;
@@ -9721,17 +9870,24 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               ) : null}
               {!goalMode && showSuggestedPromptState ? (
                 <FollowUpPrompts
-                  isError={suggestedPromptsError}
                   isPending={suggestedPromptsPending}
                   isUnavailable={suggestedPromptsUnavailable}
                   onConfigureProvider={() =>
                     navigate(`/w/${workspaceId}/settings/providers`)
                   }
-                  onRetry={retrySuggestedPrompts}
                   onSelect={(content) => void send(content)}
                   prompts={promptSuggestions}
                 />
               ) : null}
+              <VoiceTaskCanvas
+                onCancel={(taskId) => void voiceSessionController.cancelTask(taskId)}
+                onApprove={(taskId) => void voiceSessionController.approveTask(taskId, true)}
+                onReject={(taskId) => void voiceSessionController.approveTask(taskId, false)}
+                onRetryApproval={(taskId) => void voiceSessionController.retryApproval(taskId)}
+                onRetryPlayback={(taskId) => void voiceSessionController.retryPlayback(taskId)}
+                busyTaskIds={new Set(voiceSnapshotForGating.busyTaskIds)}
+                tasks={voiceSnapshotForGating.tasks}
+              />
             </>
           )}
         </ConversationContent>
@@ -10145,9 +10301,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   时才有内容，缺失的模型名也绝不用占位符冒充——一个叫「新模型」的
                   模型并不存在，那是把上下文快照事件误当模型声明时的产物。 */}
               {voiceModelPinText(voiceSnapshotForGating.modelPin)}
-              {voiceSnapshotForGating.icePath
-                ? ` · ${voiceSnapshotForGating.icePath.relayed ? "中继连接" : "直连"}（${voiceSnapshotForGating.icePath.label}）`
-                : ""}
             </p>
             {voiceSnapshotForGating.playbackBlocked || voiceSnapshotForGating.transport === "error" ? (
               // 通话需要用户做一件事：浏览器按自动播放策略拦了导师的声音，或者连接失败
@@ -10172,10 +10325,11 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 ) : null}
               </div>
             ) : null}
-            <VoiceTaskChip
-              onCancel={(taskId) => void voiceSessionController.cancelTask(taskId)}
-              tasks={voiceSnapshotForGating.tasks}
-            />
+            {showUnavailableCapabilityNotice ? (
+              <p className="chat-voice-degraded-note" role="status">
+                部分语音 Agent 能力暂不可用：{voiceSnapshotForGating.agentCapabilities.filter((item) => !item.available).map((item) => `${item.description || item.id}（${item.reason || "配置或权限不足"}）`).join("；")}
+              </p>
+            ) : null}
             {voiceSnapshotForGating.degradedNotice ? (
               // 任何阶段降级都必须说出来，而不是只在「麦克风听不见你」时：
               // `degradedNotice` 里已经分好了 asr / tts 的文案，而 TTS 降级意味着
@@ -11275,7 +11429,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               disabled={!rejectProposalId || reviewGraphChange.isPending}
               onClick={() => {
                 if (!rejectProposalId) return;
-                reviewGraphChange.mutate({
+                submitGraphReview({
                   decision: "reject",
                   proposalId: rejectProposalId,
                   reason: rejectReason.trim(),
@@ -11301,7 +11455,7 @@ export function VersionsPage() {
   const [draftContent, setDraftContent] = useState("");
   const messages = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
-    queryFn: () => listSessionMessages(sessionId, { limit: 100 }),
+    queryFn: () => listSessionMessages(sessionId, { limit: 100, compact: false }),
     enabled: Boolean(sessionId),
     gcTime: 15_000,
   });

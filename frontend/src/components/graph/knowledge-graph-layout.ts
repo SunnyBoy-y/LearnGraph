@@ -87,14 +87,17 @@ export function buildKnowledgeTreeHierarchy(
       (nodeOrder.get(left.target) ?? 0) - (nodeOrder.get(right.target) ?? 0),
   );
 
-  const wouldCreateCycle = (parentId: string, childId: string) => {
-    let cursor: string | undefined = parentId;
-    while (cursor) {
-      if (cursor === childId) return true;
-      cursor = parentByChild.get(cursor);
-    }
-    return false;
+  // With at most one parent per node, a forest union detects cycles without
+  // walking the whole ancestor chain for every edge.
+  const components = new Map(nodes.map(node => [node.id, node.id]));
+  const componentOf = (id: string): string => {
+    let root = id;
+    while (components.get(root) !== root) root = components.get(root)!;
+    while (id !== root) { const next = components.get(id)!; components.set(id, root); id = next; }
+    return root;
   };
+  const wouldCreateCycle = (parentId: string, childId: string) =>
+    componentOf(parentId) === componentOf(childId);
 
   for (const edge of orderedEdges) {
     // One node gets one layout parent. Extra semantic edges stay visible but
@@ -108,6 +111,7 @@ export function buildKnowledgeTreeHierarchy(
     }
     children.get(edge.source)?.push(edge.target);
     parentByChild.set(edge.target, edge.source);
+    components.set(componentOf(edge.target), componentOf(edge.source));
   }
 
   for (const childIds of children.values()) {
@@ -186,33 +190,20 @@ export function buildKnowledgeTreeLayout(
   }
 
   const heightCache = new Map<string, number>();
-  const branchHeight = (
-    nodeId: string,
-    ancestors = new Set<string>(),
-  ): number => {
-    if (heightCache.has(nodeId)) return heightCache.get(nodeId)!;
-    if (ancestors.has(nodeId)) return TREE_NODE_H;
-    if (collapsedIds.has(nodeId)) {
-      heightCache.set(nodeId, TREE_NODE_H);
-      return TREE_NODE_H;
+  const branchHeight = (nodeId: string): number => {
+    const stack: [string, boolean][] = [[nodeId, false]];
+    while (stack.length) {
+      const [id, visited] = stack.pop()!;
+      if (heightCache.has(id)) continue;
+      const childIds = collapsedIds.has(id) ? [] : children.get(id) ?? [];
+      if (!visited && childIds.length) {
+        stack.push([id, true]);
+        for (const child of childIds) if (!heightCache.has(child)) stack.push([child, false]);
+      } else {
+        heightCache.set(id, Math.max(TREE_NODE_H, childIds.reduce((sum, child) => sum + (heightCache.get(child) ?? TREE_NODE_H), 0) + Math.max(0, childIds.length - 1) * TREE_ROW_GAP));
+      }
     }
-    const nextAncestors = new Set(ancestors);
-    nextAncestors.add(nodeId);
-    const childIds = (children.get(nodeId) ?? []).filter(
-      (childId) => !ancestors.has(childId),
-    );
-    const height = childIds.length
-      ? Math.max(
-          TREE_NODE_H,
-          childIds.reduce(
-            (total, childId) => total + branchHeight(childId, nextAncestors),
-            0,
-          ) +
-            Math.max(0, childIds.length - 1) * TREE_ROW_GAP,
-        )
-      : TREE_NODE_H;
-    heightCache.set(nodeId, height);
-    return height;
+    return heightCache.get(nodeId)!;
   };
 
   const items: TreeLayoutItem[] = [];
@@ -381,8 +372,25 @@ export function getKnowledgeGraphTreeDepths(
   edges: Edge[],
 ) {
   if (!nodes.length) return new Map<string, number>();
-  const layout = buildKnowledgeTreeLayout(nodes, edges);
-  return new Map(Object.entries(layout.depths));
+  const {children, rootId} = buildKnowledgeTreeHierarchy(nodes, edges);
+  const depths = new Map<string, number>();
+  if (!rootId) return depths;
+  const queue = [rootId];
+  depths.set(rootId, 0);
+  let maximum = 0;
+  for (let index = 0; index < queue.length; index++) {
+    const id = queue[index]!;
+    const depth = depths.get(id)!;
+    maximum = Math.max(maximum, depth);
+    for (const child of children.get(id) ?? []) {
+      if (depths.has(child)) continue;
+      depths.set(child, depth + 1);
+      queue.push(child);
+    }
+  }
+  // Match the tree renderer's auxiliary column for disconnected nodes.
+  for (const node of nodes) if (!depths.has(node.id)) depths.set(node.id, maximum + 1);
+  return depths;
 }
 
 export function getKnowledgeGraphTreeDepth(
@@ -473,10 +481,14 @@ export function buildSpatialLayout(
   }
 
   const ringGap = 210;
-  for (const [depth, ids] of byDepth) {
+  const cardClearance = Math.hypot(FREE_NODE_W, FREE_NODE_H) + 28;
+  let outerRadius = 0;
+  for (const [depth, ids] of [...byDepth].sort(([a], [b]) => a - b)) {
     if (depth === 0) continue;
-    const radius = depth * ringGap;
     const count = ids.length;
+    const packingRadius = count > 1 ? cardClearance / (2 * Math.sin(Math.PI / count)) : 0;
+    const radius = Math.max(depth * ringGap, outerRadius + cardClearance + 24, packingRadius);
+    outerRadius = radius + 24;
     // Slight phase offset per ring so spokes do not stack perfectly.
     const phase = (depth % 2 === 0 ? 0 : Math.PI / count) - Math.PI / 2;
     ids.forEach((id, index) => {
@@ -499,7 +511,8 @@ export function buildSpatialLayout(
     );
   if (orphans.length) {
     const maxDepth = Math.max(0, ...Object.values(depths));
-    const radius = (maxDepth + 1) * ringGap;
+    const packingRadius = orphans.length > 1 ? cardClearance / (2 * Math.sin(Math.PI / orphans.length)) : 0;
+    const radius = Math.max((maxDepth + 1) * ringGap, outerRadius + cardClearance, packingRadius);
     orphans.forEach((node, index) => {
       const angle =
         -Math.PI / 2 + ((index + 0.5) / orphans.length) * Math.PI * 2;

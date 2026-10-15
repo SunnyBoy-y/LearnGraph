@@ -56,7 +56,7 @@ from app.services.document_parsers import (
     parser_capabilities,
 )
 from app.services.file_references import FileReferenceService
-from app.services.billing import BillingService
+from app.services.billing import BillingQuote, BillingService
 from app.services.dictation import is_realtime_transcription_model
 
 
@@ -295,6 +295,10 @@ class FileService:
             transcription.error_code = error_code
             transcription.error_message = error_message[:4_000]
             transcription.completed_at = utc_now()
+            snapshot = (transcription.provider_trace or {}).get("billing_snapshot") or {}
+            if snapshot.get("schema_version") == 2:
+                BillingService(self.db, self.workspace_id, self.actor_id).record_usage(
+                    BillingQuote.from_snapshot(snapshot), input_tokens=0, output_tokens=0, attempt=1, usage_reported=False)
             self.audit.record(
                 actor_id=self.actor_id,
                 action="file.transcription.failed",
@@ -439,7 +443,7 @@ class FileService:
                 output_tokens=int(result.usage.get("output_tokens") or 0),
                 attempt=1,
                 latency_ms=latency_ms,
-                usage_reported=bool(result.usage),
+                usage_reported=bool(result.usage), usage_units=result.usage,
             )
             self.db.flush()
             transcription.provider_trace = {
@@ -562,6 +566,7 @@ class FileService:
             estimated_input_tokens=0,
             estimated_output_tokens=0,
             remote_capability=True,
+            durable_reservation=True,
         )
         transcription = AudioTranscription(
             workspace_id=self.workspace_id,
@@ -573,6 +578,7 @@ class FileService:
             idempotency_key_hash=key_hash,
             request_hash=request_hash,
             created_by=self.actor_id,
+            provider_trace={"billing_snapshot": quote.snapshot()},
         )
         try:
             self.db.add(transcription)
@@ -596,6 +602,7 @@ class FileService:
             task_id = provider.submit(source_url=source_url, language=payload.language)
             transcription.provider_request_id = task_id
             transcription.provider_trace = {
+                **transcription.provider_trace,
                 "provider_id": provider.provider_id,
                 "model_id": provider.model_id,
                 "async_mode": True,
@@ -673,14 +680,11 @@ class FileService:
             )
             raise AppError(502, "transcription_provider_failed", str(exc), {"transcription_id": transcription.id}) from exc
         billing = BillingService(self.db, self.workspace_id, self.actor_id)
-        quote = billing.preflight_model_call(
-            provider_id=provider.provider_id,
-            model_id=provider.model_id,
-            feature="audio_transcription",
-            estimated_input_tokens=0,
-            estimated_output_tokens=0,
-            remote_capability=True,
-        )
+        snapshot = (transcription.provider_trace or {}).get("billing_snapshot") or {}
+        quote = BillingQuote.from_snapshot(snapshot) if snapshot.get("schema_version") == 2 else BillingQuote(
+            provider_id=provider.provider_id, model_id=provider.model_id, feature="audio_transcription",
+            remote_capability=True, currency=None, workspace_id=self.workspace_id,
+            quote_id="audio:" + transcription.id, source="legacy_unknown")
         started = time.monotonic()
         self._finalize_async_transcription(transcription, provider, billing, quote, result, started, task_id)
         self.db.refresh(transcription)
@@ -714,7 +718,7 @@ class FileService:
             output_tokens=int(result.usage.get("output_tokens") or 0),
             attempt=1,
             latency_ms=latency_ms,
-            usage_reported=bool(result.usage),
+            usage_reported=bool(result.usage), usage_units=result.usage,
         )
         self.db.flush()
         transcription.provider_trace = {

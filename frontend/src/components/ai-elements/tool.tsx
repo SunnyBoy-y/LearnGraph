@@ -20,6 +20,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { isValidElement } from "react";
 
 import { CodeBlock } from "./code-block";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 
 export type ToolProps = ComponentProps<typeof Collapsible>;
 
@@ -122,7 +123,6 @@ export type ToolInputProps = ComponentProps<"div"> & {
 // agent sessions with many tools; keep a plain-text path for bulky JSON and only
 // highlight moderate payloads.
 const TOOL_HIGHLIGHT_MAX_CHARS = 12_000;
-const TOOL_PREVIEW_MAX_CHARS = 80_000;
 
 function formatToolJson(value: unknown): string {
   try {
@@ -134,17 +134,19 @@ function formatToolJson(value: unknown): string {
 
 function ToolCode({ code }: { code: string }) {
   if (code.length > TOOL_HIGHLIGHT_MAX_CHARS) {
-    const truncated =
-      code.length > TOOL_PREVIEW_MAX_CHARS
-        ? `${code.slice(0, TOOL_PREVIEW_MAX_CHARS)}\n…（已截断 ${code.length - TOOL_PREVIEW_MAX_CHARS} 字符）`
-        : code;
     return (
-      <pre className="m-0 max-h-96 overflow-auto p-4 font-mono text-xs whitespace-pre-wrap break-words">
-        {truncated}
-      </pre>
+      <ExpandableContent className="tool-code" label="完整内容" lineLimit={24}>
+        <pre className="m-0 p-4 font-mono text-xs whitespace-pre-wrap break-words">
+          {code}
+        </pre>
+      </ExpandableContent>
     );
   }
-  return <CodeBlock code={code} language="json" />;
+  return (
+    <ExpandableContent className="tool-code" label="完整内容" lineLimit={24}>
+      <CodeBlock code={code} language="json" />
+    </ExpandableContent>
+  );
 }
 
 export const ToolInput = ({ className, input, ...props }: ToolInputProps) => (
@@ -194,7 +196,11 @@ export const ToolOutput = ({
             : "bg-muted/50 text-foreground"
         )}
       >
-        {errorText && <div>{errorText}</div>}
+        {errorText ? (
+          <ExpandableContent className="tool-error" label="错误详情" lineLimit={12}>
+            <div>{errorText}</div>
+          </ExpandableContent>
+        ) : null}
         {Output}
       </div>
     </div>

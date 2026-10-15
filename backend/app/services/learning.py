@@ -557,7 +557,7 @@ class ExerciseService:
                     cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                     reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                     attempt=attempt,
-                    usage_reported=bool(usage),
+                    usage_reported=bool(usage), usage_units=usage,
                 )
                 self.db.commit()
             if result is not None:
@@ -1085,7 +1085,7 @@ class ExerciseService:
                     cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
                         reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
                         attempt=attempt,
-                        usage_reported=bool(usage),
+                        usage_reported=bool(usage), usage_units=usage,
                     )
                     # Keep billing durable even if the outer answer transaction later rolls back.
                     self.db.commit()

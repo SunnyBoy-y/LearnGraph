@@ -309,7 +309,7 @@ export function planTimeInputs(
   const fromSnapshot = Boolean(snapshotMinutes || snapshotDays || snapshotSession);
   const rawDeadline = goalSnapshot.deadline_at;
   const deadlineValue =
-    fromSnapshot && typeof rawDeadline === "string" ? rawDeadline : (goal?.deadline_at ?? null);
+    (rawDeadline === null || typeof rawDeadline === "string") ? rawDeadline : (goal?.deadline_at ?? null);
   const parsedDeadline = deadlineValue ? new Date(deadlineValue) : null;
 
   return {

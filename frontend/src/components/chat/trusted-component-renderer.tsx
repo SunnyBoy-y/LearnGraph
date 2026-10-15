@@ -23,6 +23,7 @@ import {
   type OptionGroupSubmission,
 } from "@/components/chat/option-group";
 import { StatePill } from "@/components/shared/page-elements";
+import { ExpandableContent } from "@/components/shared/expandable-content";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -299,7 +300,9 @@ function UnsupportedComponent({
           <span>{reason}</span>
         </div>
       </div>
-      <pre>{JSON.stringify(data, null, 2)}</pre>
+      <ExpandableContent label="组件详情" lineLimit={18}>
+        <pre>{JSON.stringify(data, null, 2)}</pre>
+      </ExpandableContent>
     </section>
   );
 }
@@ -485,7 +488,6 @@ export function TrustedComponentRenderer({
             <strong>{title}</strong>
             <span>{component.props.location}</span>
           </div>
-          <Badge variant="secondary">Schema {component.schema_version}</Badge>
         </div>
         <div className="weather-card__body">
           <div className="weather-card__temp">
@@ -558,14 +560,20 @@ export function TrustedComponentRenderer({
               <span>{component.props.description}</span>
             ) : null}
           </div>
-          <Badge variant="secondary">Schema {component.schema_version}</Badge>
         </div>
         <ul className="metric-card__grid">
           {component.props.metrics.map((metric, index) => (
-            <li key={metric.id ?? `${metric.label}-${index}`}>
-              <span>{metric.label}</span>
-              <strong>{metric.value}</strong>
-              {metric.hint ? <small>{metric.hint}</small> : null}
+            <li
+              className={`metric-card__item metric-card__item--${index % 4}`}
+              key={metric.id ?? `${metric.label}-${index}`}
+            >
+              <span className="metric-card__label">{metric.label}</span>
+              <strong className="metric-card__value">
+                <span>{metric.value}</span>
+              </strong>
+              {metric.hint ? (
+                <small className="metric-card__hint">{metric.hint}</small>
+              ) : null}
             </li>
           ))}
         </ul>

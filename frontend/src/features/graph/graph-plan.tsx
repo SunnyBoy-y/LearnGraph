@@ -209,7 +209,7 @@ export function useGraphPlanController(args: {
       acceptRoadmap(next);
       toast.success("任务时间已更新");
     },
-    onError: (error: Error) => toast.error(error.message),
+    onError: async (error: Error) => { toast.error(error.message); await roadmapQuery.refetch(); },
   });
 
   const insert = useMutation({
@@ -232,7 +232,7 @@ export function useGraphPlanController(args: {
       acceptRoadmap(next);
       toast.success("已加入学习计划");
     },
-    onError: (error: Error) => toast.error(error.message),
+    onError: async (error: Error) => { toast.error(error.message); await roadmapQuery.refetch(); },
   });
 
   const complete = useMutation({
@@ -252,7 +252,11 @@ export function useGraphPlanController(args: {
 
   const settings = useMutation({
     mutationFn: async (payload: GoalPlanningUpdate) => {
-      await updateGoalPlanning(goalId as string, payload);
+      const updated = await updateGoalPlanning(goalId as string, payload);
+      queryClient.setQueryData(workspaceQueryKey(workspaceId, "goal", goalId), updated);
+      queryClient.setQueriesData<Goal[]>({queryKey: workspaceQueryKey(workspaceId, "goals")}, current =>
+        Array.isArray(current) ? current.map(item => item.id === updated.id ? updated : item) : current);
+      await queryClient.invalidateQueries({queryKey: workspaceQueryKey(workspaceId, "goals")});
       return replanRoadmap(goalId as string);
     },
     onSuccess: (next) => {

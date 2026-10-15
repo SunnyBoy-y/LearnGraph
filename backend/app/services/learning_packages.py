@@ -60,6 +60,18 @@ def initial_activity(spec: dict) -> dict:
     return {"values": {v["id"]: v["initial"] for v in spec.get("variables", [])}, "history": [], "completed": False}
 
 
+def complete_training_activity(spec: dict, current: dict | None) -> dict:
+    """Supply late-built variables without resetting completed learner actions."""
+    initial = initial_activity(spec or {})
+    if not current:
+        return initial
+    state = deepcopy(current)
+    state["values"] = {**initial["values"], **state.get("values", {})}
+    state.setdefault("history", [])
+    state.setdefault("completed", False)
+    return state
+
+
 def transition(spec: dict, current: dict, action_id: str, *, feedback: bool = True) -> dict:
     state = deepcopy(current or initial_activity(spec))
     if len(state["history"]) >= 200:
@@ -460,14 +472,18 @@ class LearningPackageService:
             raise AppError(404, "learning_record_not_found", "学习记录不存在。")
         return row
 
-    @staticmethod
-    def enrollment_view(row):
-        return {"id": row.id, "package_id": row.package_id, "revision": row.revision, "progress": row.progress}
+    def enrollment_view(self, row):
+        package = self.db.get(LearningPackage, row.package_id)
+        progress = deepcopy(row.progress)
+        progress["activity"] = complete_training_activity(
+            package.private_activity if package else {}, progress.get("activity"))
+        return {"id": row.id, "package_id": row.package_id, "revision": row.revision, "progress": progress}
 
     def progress(self, enrollment_id: str, payload):
         row = self.owned(LearningEnrollment, enrollment_id)
         package = self.db.get(LearningPackage, row.package_id)
         progress = deepcopy(row.progress)
+        progress["activity"] = complete_training_activity(package.private_activity, progress.get("activity"))
         if payload.section_id:
             if payload.section_id not in {s["id"] for s in package.manifest["lesson"]["sections"]}:
                 raise AppError(422, "section_invalid", "章节不存在。")
@@ -908,7 +924,7 @@ def run_build_stage(job_id: str, token: str, build_id: str) -> bool:
                 tasks: list[tuple[str, Callable[[], Any]]] = []
                 if "lesson" not in snapshot:
                     tasks.append(("lesson", partial(generate_checked, run.workspace_id, run.actor_id, Lesson,
-                        prompt + "\n蓝图：" + json.dumps(snapshot["blueprint"], ensure_ascii=False) + "\n编写聚焦的完整教材，2-3 个章节即可；每章正文控制在约 600-1000 字，包含必要的例子/反例和小结。SVG 使用 viewBox、自包含基础元素和清晰文字，不含 style/script/外链；html 可为空，若有必须完整自包含，无外部资源，仅用于辅助演示，不含考试答案。",
+                        prompt + "\n蓝图：" + json.dumps(snapshot["blueprint"], ensure_ascii=False) + "\n编写聚焦的完整教材，2-3 个章节即可；每章正文控制在约 600-1000 字，包含必要的例子/反例和小结。body 是给学习者阅读的 Markdown：段落之间空一行；用三级标题拆分定义、步骤或易错点；连续步骤使用有序列表，多个并列项使用无序列表；SQL、命令和代码必须放在带语言标记的 fenced code block 中（例如 ```sql）；不要把多段文字拼成一行，不要在 body 中输出原始 HTML。SVG 使用 viewBox、自包含基础元素和清晰文字，不含 style/script/外链；html 可为空，若有必须完整自包含，无外部资源，仅用于辅助演示，不含考试答案。",
                         validate_lesson, normalize=partial(normalize_payload, Lesson), label="图文教材", notes=stage_notes)))
                 if activity_required(node, snapshot) and "activity" not in snapshot:
                     tasks.append(("activity", partial(generate_checked, run.workspace_id, run.actor_id, Activity,
@@ -1066,7 +1082,7 @@ def generate_illustration(db, run, prompt, job_id, token):
     if final is None or not final.image_bytes or final.mime_type not in {"image/png", "image/jpeg", "image/webp"}:
         raise ValueError("image generation did not return a final image")
     usage = final.usage or {}
-    billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0), attempt=1, usage_reported=bool(usage))
+    billing.record_usage(quote, input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0), attempt=1, usage_reported=bool(usage), usage_units=usage)
     db.commit()
     lease_fence(db, job_id, token)
     db.commit()

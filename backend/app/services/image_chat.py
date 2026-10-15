@@ -46,6 +46,7 @@ from app.repositories.domain import (
 )
 from app.services.file_references import FileReferenceService
 from app.services.image_generations import ImageGenerationService
+from app.services.session_titles import apply_session_title_fallback
 from app.providers.storage_factory import object_storage_provider
 
 
@@ -424,6 +425,15 @@ class ImageChatService:
                     "submission_not_found",
                     "No image generation exists for this replay cursor",
                 )
+
+        session = self.sessions.require(session_id, "session")
+        has_user_message = self.db.scalar(
+            self.messages.query()
+            .where(Message.session_id == session_id, Message.role == "user")
+            .limit(1)
+        )
+        if has_user_message is None:
+            apply_session_title_fallback(session, payload.content)
 
         user_part_id = str(uuid4())
         user = self.messages.add(

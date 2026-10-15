@@ -68,7 +68,9 @@ export function SessionShareDialog({
 
   const reloadShares = useCallback(() => {
     listSessionShares(sessionId)
-      .then(setShares)
+      // Revoked snapshots remain in the database for audit/history, but a
+      // cancelled share should disappear from the active management surface.
+      .then((items) => setShares(items.filter((item) => item.status === "active")))
       .catch(() => setShares([]));
   }, [sessionId]);
 
@@ -81,7 +83,7 @@ export function SessionShareDialog({
 
   useEffect(() => {
     if (!open || scope !== "range") return;
-    listSessionMessages(sessionId)
+    listSessionMessages(sessionId, { compact: false })
       .then(setMessages)
       .catch(() => setMessages([]));
   }, [open, scope, sessionId]);

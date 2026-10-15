@@ -72,6 +72,7 @@ export interface SessionCreateRequest {
   title?: string
   goal_id?: string | null
   graph_id?: string | null
+  current_node_id?: string | null
   project_id?: string | null
   /** Nest under a parent conversation (e.g. 划词解释). */
   parent_session_id?: string | null
@@ -82,8 +83,10 @@ export interface SessionCreateRequest {
 export interface SessionUpdateRequest {
   title?: string
   pinned?: boolean
-  goal_id?: string
-  graph_id?: string
+  goal_id?: string | null
+  graph_id?: string | null
+  /** The graph node used as the persistent context for this conversation. */
+  current_node_id?: string | null
 }
 
 export interface SessionAutoTitleRequest {
@@ -119,6 +122,7 @@ export interface Session {
   title: string
   goal_id: string | null
   graph_id: string | null
+  current_node_id?: string | null
   project_id: string | null
   parent_session_id: string | null
   source_message_id: string | null
