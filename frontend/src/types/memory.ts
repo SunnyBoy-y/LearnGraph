@@ -250,6 +250,8 @@ export interface MemoryProfileIntentRequest {
   text: string
   selected_text?: string
   selected_atom_ids?: string[]
+  provider_id?: string
+  model_id?: string
   timezone_name?: string
 }
 
@@ -259,6 +261,8 @@ export interface MemoryProfileIntentResult {
   auto_committed: number
   affected_memory_ids: string[]
   profile_status: string
+  provider_id?: string | null
+  model_id?: string | null
 }
 
 /**

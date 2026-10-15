@@ -1,0 +1,286 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="1500" viewBox="0 0 1900 1500" role="img" aria-labelledby="title desc">
+  <title id="title">LearnGraph 记忆机制：写入、事件化、检索、注入与治理</title>
+  <desc id="desc">基于 LearnGraph 真实代码的静态架构图。展示 MemoryService、MemoryRecord、加密事件流、搜索投影、Outbox、混合检索、Context Builder、画像和遗忘治理之间的关系。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#425466"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2878c8"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2d8a63"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c14e5a"/>
+    </marker>
+    <style>
+      .bg { fill:#f6f8fb; }
+      .title { font:600 30px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#17212b; }
+      .subtitle { font:400 16px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#526273; }
+      .section { font:600 19px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#17212b; }
+      .box-title { font:600 16px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#17212b; }
+      .body { font:400 14px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#304255; }
+      .small { font:400 12px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#5d6d7d; }
+      .tiny { font:400 11px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#67798a; }
+      .code { font:400 11px 'Cascadia Code','Consolas',monospace; fill:#526273; }
+      .section-line { stroke:#d7e0e8; stroke-width:1.5; }
+      .box { stroke:#b8c7d4; stroke-width:1.3; rx:12; }
+      .source { fill:#fff4de; }
+      .control { fill:#eef5ff; stroke:#87acd0; }
+      .canonical { fill:#e9f7f0; stroke:#79b794; }
+      .event { fill:#e9f0ff; stroke:#7c9fd4; }
+      .projection { fill:#f2edff; stroke:#9f8ad1; }
+      .read { fill:#e9f7fb; stroke:#6daec1; }
+      .govern { fill:#fff0f0; stroke:#d6979f; }
+      .side { fill:#f4f6f8; stroke:#aebdca; }
+      .arrow { fill:none; stroke:#425466; stroke-width:2; marker-end:url(#arrow); }
+      .arrow-blue { fill:none; stroke:#2878c8; stroke-width:2.2; marker-end:url(#arrowBlue); }
+      .arrow-green { fill:none; stroke:#2d8a63; stroke-width:2.2; marker-end:url(#arrowGreen); }
+      .arrow-red { fill:none; stroke:#c14e5a; stroke-width:2; stroke-dasharray:7 5; marker-end:url(#arrowRed); }
+      .dashed { fill:none; stroke:#8292a1; stroke-width:1.7; stroke-dasharray:6 5; marker-end:url(#arrow); }
+      .pill { fill:#ffffff; stroke:#c7d2dc; stroke-width:1; rx:10; }
+      .legend-text { font:400 12px 'Segoe UI','Microsoft YaHei',sans-serif; fill:#526273; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1900" height="1500"/>
+  <text class="title" x="60" y="55">LearnGraph 记忆机制：从产生到被召回</text>
+  <text class="subtitle" x="60" y="84">静态代码梳理｜当前默认配置：memory_write_mode = dual，memory_read_mode = events，context_builder_v2 = true</text>
+
+  <rect class="pill" x="60" y="105" width="150" height="27"/>
+  <text class="legend-text" x="76" y="123">输入 / 候选</text>
+  <rect class="pill" x="220" y="105" width="150" height="27"/>
+  <text class="legend-text" x="236" y="123">权威数据</text>
+  <rect class="pill" x="380" y="105" width="150" height="27"/>
+  <text class="legend-text" x="396" y="123">事件 / 投影</text>
+  <rect class="pill" x="540" y="105" width="150" height="27"/>
+  <text class="legend-text" x="556" y="123">读取 / 注入</text>
+  <rect class="pill" x="700" y="105" width="150" height="27"/>
+  <text class="legend-text" x="716" y="123">治理 / 删除</text>
+  <line class="arrow" x1="872" y1="119" x2="940" y2="119"/>
+  <text class="legend-text" x="952" y="123">实线 = 主路径</text>
+  <line class="dashed" x1="1070" y1="119" x2="1138" y2="119"/>
+  <text class="legend-text" x="1150" y="123">虚线 = 旁路 / 异步</text>
+
+  <!-- section 1 -->
+  <line class="section-line" x1="60" y1="165" x2="1840" y2="165"/>
+  <text class="section" x="60" y="198">一、记忆从哪里来：输入、证据与候选</text>
+
+  <rect class="box source" x="60" y="230" width="235" height="94"/>
+  <text class="box-title" x="80" y="257">文本 / 语音对话</text>
+  <text class="body" x="80" y="280">ChatService、VoiceTurn</text>
+  <text class="small" x="80" y="301">已听到的语音答复才可进入长期记忆</text>
+  <text class="code" x="80" y="318">chat.py:1076 · voice_context.py</text>
+
+  <rect class="box source" x="60" y="343" width="235" height="94"/>
+  <text class="box-title" x="80" y="370">Agent / 子 Agent</text>
+  <text class="body" x="80" y="393">memory 工具只提议 Draft</text>
+  <text class="small" x="80" y="414">不能静默直接写 active memory</text>
+  <text class="code" x="80" y="431">agent_runtime.py:6884</text>
+
+  <rect class="box source" x="60" y="456" width="235" height="94"/>
+  <text class="box-title" x="80" y="483">用户显式 API / 文件</text>
+  <text class="body" x="80" y="506">/memory、文件证据、意图接口</text>
+  <text class="small" x="80" y="527">可带 scope、sensitivity、source refs</text>
+  <text class="code" x="80" y="544">api/routers/memory.py</text>
+
+  <rect class="box source" x="60" y="569" width="235" height="94"/>
+  <text class="box-title" x="80" y="596">后台自动提取</text>
+  <text class="body" x="80" y="619">静默会话 → durable atoms</text>
+  <text class="small" x="80" y="640">CREATE 可过置信度门槛自动提交</text>
+  <text class="code" x="80" y="657">memory_enhancement.py</text>
+
+  <rect class="box control" x="350" y="320" width="265" height="218"/>
+  <text class="box-title" x="370" y="349">准入与候选层</text>
+  <text class="body" x="370" y="376">SensitiveDataFilter</text>
+  <text class="body" x="370" y="399">MemoryEvidence（来源证据）</text>
+  <text class="body" x="370" y="422">MemoryDraft（候选变更）</text>
+  <text class="small" x="370" y="451">• secrets / credentials 不进入长期记忆</text>
+  <text class="small" x="370" y="472">• agent / extractor 先提议</text>
+  <text class="small" x="370" y="493">• UPDATE 默认等人工决策</text>
+  <text class="code" x="370" y="522">memory_sensitive_filter.py</text>
+
+  <rect class="box canonical" x="680" y="276" width="310" height="306"/>
+  <text class="box-title" x="700" y="306">权威提交：MemoryService</text>
+  <text class="body" x="700" y="334">create / update / delete / restore</text>
+  <text class="body" x="700" y="357">decide_draft → commit</text>
+  <text class="body" x="700" y="380">MemoryRecord（当前原子）</text>
+  <text class="body" x="700" y="403">MemoryRevision（版本）</text>
+  <text class="body" x="700" y="426">MemoryJournal / MemoryEvidence</text>
+  <text class="small" x="700" y="456">记忆类型：preference / misconception /</text>
+  <text class="small" x="700" y="475">strategy / decision / event_summary…</text>
+  <text class="small" x="700" y="503">scope：workspace → goal → node → session</text>
+  <text class="small" x="700" y="524">禁止把 mastery、graph、file 状态塞进 Memory body</text>
+  <text class="code" x="700" y="559">memory.py:209, 1145, 1298, 2395, 2545</text>
+
+  <path class="arrow" d="M295 277 C320 277 322 359 350 359"/>
+  <path class="arrow" d="M295 390 C320 390 322 399 350 399"/>
+  <path class="arrow" d="M295 503 C320 503 322 439 350 439"/>
+  <path class="arrow" d="M295 616 C320 616 322 478 350 478"/>
+  <path class="arrow-blue" d="M615 424 C642 424 650 424 680 424"/>
+  <text class="tiny" x="625" y="414">通过确认 / 提交</text>
+
+  <!-- governance side -->
+  <rect class="box govern" x="1230" y="235" width="570" height="230"/>
+  <text class="box-title" x="1250" y="265">贯穿全链路的边界</text>
+  <text class="body" x="1250" y="293">租户 / workspace / subject_user / task / project / conversation</text>
+  <text class="body" x="1250" y="318">sensitivity：public / normal / private</text>
+  <text class="body" x="1250" y="343">lifecycle：active → superseded / retracted / deleted / forgotten</text>
+  <text class="body" x="1250" y="368">zone：hot / recent / topics / archive；strength 会衰减</text>
+  <text class="small" x="1250" y="399">检索先做 scope、权限、敏感度、生命周期过滤，再评分。</text>
+  <text class="code" x="1250" y="439">memory_retrieval.py:62 · memory_zones.py</text>
+
+  <path class="dashed" d="M990 330 C1080 285 1150 285 1230 285"/>
+  <text class="tiny" x="1050" y="273">受约束的数据面</text>
+
+  <!-- section 2 -->
+  <line class="section-line" x1="60" y1="710" x2="1840" y2="710"/>
+  <text class="section" x="60" y="743">二、怎样成为可追溯的长期记忆：事件流与分层投影</text>
+
+  <rect class="box event" x="350" y="785" width="300" height="196"/>
+  <text class="box-title" x="370" y="815">加密事件流（事实账本）</text>
+  <text class="body" x="370" y="843">MemoryEventStore.append()</text>
+  <text class="body" x="370" y="866">MemoryStream + MemoryEvent</text>
+  <text class="body" x="370" y="889">stream_version / idempotency_key</text>
+  <text class="body" x="370" y="912">Envelope encryption + payload key</text>
+  <text class="small" x="370" y="941">可 replay / validate；forget 会销毁 payload key</text>
+  <text class="code" x="370" y="963">memory_event_store.py:60, 74, 235</text>
+
+  <rect class="box projection" x="715" y="765" width="330" height="236"/>
+  <text class="box-title" x="735" y="795">同步搜索投影</text>
+  <text class="body" x="735" y="823">MemoryProjector.apply()</text>
+  <text class="body" x="735" y="846">MemorySearchDocument</text>
+  <text class="body" x="735" y="869">SQLite FTS5（trigram / unicode）</text>
+  <text class="body" x="735" y="892">projection checkpoint / parity</text>
+  <text class="small" x="735" y="922">created / corrected / confirmed → upsert</text>
+  <text class="small" x="735" y="943">retracted / forgotten → remove</text>
+  <text class="code" x="735" y="981">memory_projector.py:170, 184</text>
+
+  <rect class="box projection" x="1110" y="765" width="330" height="236"/>
+  <text class="box-title" x="1130" y="795">Durable Outbox（异步可靠投影）</text>
+  <text class="body" x="1130" y="823">MemoryProjectionOutbox</text>
+  <text class="body" x="1130" y="846">leased → succeeded / failed / dead_letter</text>
+  <text class="body" x="1130" y="869">lease + retry + max_attempts</text>
+  <text class="small" x="1130" y="899">外部 provider 失败不回滚本地权威提交</text>
+  <text class="small" x="1130" y="920">当前 handler：markdown / mem0 / index</text>
+  <text class="code" x="1130" y="981">memory_outbox.py:32, 52</text>
+
+  <rect class="box side" x="1505" y="765" width="295" height="236"/>
+  <text class="box-title" x="1525" y="795">Provider / 增强投影</text>
+  <text class="body" x="1525" y="823">local_workspace_markdown</text>
+  <text class="body" x="1525" y="846">Mem0（若 remote capability 可用）</text>
+  <text class="body" x="1525" y="869">Embedding cache（可选）</text>
+  <text class="body" x="1525" y="892">Profile / index / episode</text>
+  <text class="small" x="1525" y="922">provider 只是投影，不取代本地事件账本</text>
+  <text class="code" x="1525" y="981">memory_provider_projector.py</text>
+
+  <path class="arrow-blue" d="M835 582 C835 660 500 705 500 785"/>
+  <text class="tiny" x="620" y="678">dual write：legacy commit 后 mirror event</text>
+  <path class="arrow" d="M650 883 L715 883"/>
+  <text class="tiny" x="663" y="871">project</text>
+  <path class="dashed" d="M650 930 C850 1015 965 1015 1110 930"/>
+  <text class="tiny" x="845" y="1035">outbox jobs</text>
+  <path class="arrow" d="M1440 883 L1505 883"/>
+
+  <rect class="box event" x="60" y="785" width="235" height="196"/>
+  <text class="box-title" x="80" y="815">内部事件 API</text>
+  <text class="body" x="80" y="843">POST /memory/events</text>
+  <text class="body" x="80" y="866">仅 workspace.manage</text>
+  <text class="small" x="80" y="897">直接写事件流 + 投影</text>
+  <text class="small" x="80" y="918">不镜像 MemoryRecord</text>
+  <text class="small" x="80" y="939">不参与 /memory 兼容列表</text>
+  <text class="code" x="80" y="963">api/routers/memory_v2.py:75</text>
+  <path class="dashed" d="M295 883 L350 883"/>
+
+  <!-- section 3 -->
+  <line class="section-line" x1="60" y1="1055" x2="1840" y2="1055"/>
+  <text class="section" x="60" y="1088">三、怎样被使用：按意图检索，按预算装配，再注入模型</text>
+
+  <rect class="box read" x="60" y="1130" width="220" height="190"/>
+  <text class="box-title" x="80" y="1160">Chat / Voice 输入</text>
+  <text class="body" x="80" y="1188">当前用户消息 + session</text>
+  <text class="body" x="80" y="1211">ChatServiceFactory</text>
+  <text class="body" x="80" y="1234">voice_memory_block()</text>
+  <text class="small" x="80" y="1265">events 模式走 v2；否则 legacy loader</text>
+  <text class="code" x="80" y="1298">chat_service_factory.py:276</text>
+
+  <rect class="box read" x="330" y="1130" width="250" height="190"/>
+  <text class="box-title" x="350" y="1160">MemoryRouter</text>
+  <text class="body" x="350" y="1188">识别 intent：preference /</text>
+  <text class="body" x="350" y="1211">knowledge / goal / episode…</text>
+  <text class="body" x="350" y="1234">映射到允许的 memory layers</text>
+  <text class="small" x="350" y="1265">同时写 retrieval trace（query 只存 hash）</text>
+  <text class="code" x="350" y="1298">memory_router.py:191</text>
+
+  <rect class="box read" x="630" y="1130" width="300" height="190"/>
+  <text class="box-title" x="650" y="1160">MemoryHybridRetriever</text>
+  <text class="body" x="650" y="1188">scope / sensitivity / lifecycle 过滤</text>
+  <text class="body" x="650" y="1211">FTS lexical + token overlap</text>
+  <text class="body" x="650" y="1234">可选 embedding semantic boost</text>
+  <text class="small" x="650" y="1265">score = semantic + lexical + scope + entity</text>
+  <text class="code" x="650" y="1298">memory_retrieval.py:56, 62</text>
+
+  <rect class="box read" x="980" y="1130" width="330" height="190"/>
+  <text class="box-title" x="1000" y="1160">ContextBuilder</text>
+  <text class="body" x="1000" y="1188">memories + task_state + episodes</text>
+  <text class="body" x="1000" y="1211">+ learning_states + strategies</text>
+  <text class="body" x="1000" y="1234">token_budget / priority / truncation</text>
+  <text class="small" x="1000" y="1265">包装为 HOST_DATA_BLOCK，明确不是指令</text>
+  <text class="code" x="1000" y="1298">context_builder.py:34, 44</text>
+
+  <rect class="box read" x="1360" y="1130" width="240" height="190"/>
+  <text class="box-title" x="1380" y="1160">Context Package</text>
+  <text class="body" x="1380" y="1188">candidate → retrieved</text>
+  <text class="body" x="1380" y="1211">→ selected → injected</text>
+  <text class="body" x="1380" y="1234">package_hash / manifest</text>
+  <text class="small" x="1380" y="1265">超预算的记忆会被排除或截断</text>
+  <text class="code" x="1380" y="1298">context_telemetry.py</text>
+
+  <rect class="box canonical" x="1650" y="1130" width="150" height="190"/>
+  <text class="box-title" x="1668" y="1160">模型 Prompt</text>
+  <text class="body" x="1668" y="1190">系统规则</text>
+  <text class="body" x="1668" y="1213">+ Host data</text>
+  <text class="body" x="1668" y="1236">+ 对话历史</text>
+  <text class="small" x="1668" y="1268">当前消息优先</text>
+  <text class="code" x="1668" y="1298">chat.py:2690</text>
+
+  <path class="arrow-green" d="M280 1225 L330 1225"/>
+  <path class="arrow-green" d="M580 1225 L630 1225"/>
+  <path class="arrow-green" d="M930 1225 L980 1225"/>
+  <path class="arrow-green" d="M1310 1225 L1360 1225"/>
+  <path class="arrow-green" d="M1600 1225 L1650 1225"/>
+
+  <!-- profile and governance bottom -->
+  <rect class="box side" x="60" y="1370" width="520" height="92"/>
+  <text class="box-title" x="80" y="1400">画像旁路：MemoryEvidence → MemoryProfileService → Snapshot</text>
+  <text class="small" x="80" y="1425">只使用 active atoms + trusted/profile_eligible evidence；source fingerprint 变化后 snapshot 变 stale。</text>
+  <text class="code" x="80" y="1447">memory_profile.py:415, 852</text>
+
+  <rect class="box side" x="610" y="1370" width="520" height="92"/>
+  <text class="box-title" x="630" y="1400">增强旁路：embedding / auto extraction / summarization</text>
+  <text class="small" x="630" y="1425">embedding 只改变召回排序；auto extraction 仍回到 Draft → MemoryService；summary 不是事实源。</text>
+  <text class="code" x="630" y="1447">memory_enhancement.py</text>
+
+  <rect class="box govern" x="1160" y="1370" width="640" height="92"/>
+  <text class="box-title" x="1180" y="1400">反馈 / 撤回 / 永久忘记</text>
+  <text class="small" x="1180" y="1425">feedback 可 suppress / stale / wrong；retract 清理可召回投影；forget 销毁事件 payload key，并删除搜索、embedding、关系和受影响 ContextPackage。</text>
+  <text class="code" x="1180" y="1447">memory_commands.py:120, 170, 235</text>
+
+  <path class="arrow-red" d="M1530 1320 C1530 1342 1510 1350 1480 1370"/>
+  <text class="tiny" x="1545" y="1350">治理回写</text>
+  <path class="dashed" d="M1130 1370 C1190 1340 1200 1020 1270 1001"/>
+  <text class="tiny" x="1165" y="1328">outbox / projection failure 可重试</text>
+
+  <!-- current mode callout -->
+  <rect class="box control" x="1230" y="500" width="570" height="190"/>
+  <text class="box-title" x="1250" y="530">当前运行模式的关键判断</text>
+  <text class="body" x="1250" y="558">1. 用户侧 create / update 会先落 MemoryRecord，再镜像 memory event。</text>
+  <text class="body" x="1250" y="583">2. read_mode = events 时，Chat / Voice 由 ContextBuilder 取事件投影。</text>
+  <text class="body" x="1250" y="608">3. 外部 provider 延迟或失败，不应阻塞本地权威提交；Outbox 负责重试。</text>
+  <text class="body" x="1250" y="633">4. /memory/events 是运维 / 内部入口，单独写它不会自动生成 MemoryRecord。</text>
+  <text class="small" x="1250" y="663">这也是图中“账本”和“兼容视图”同时存在的原因。</text>
+  <text class="code" x="1250" y="683">core/config.py:375-390 · memory_v2.py:75-84</text>
+
+  <path class="dashed" d="M990 480 C1090 520 1140 550 1230 550"/>
+</svg>

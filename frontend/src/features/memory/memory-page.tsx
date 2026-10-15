@@ -1,4 +1,4 @@
-import { type FormEvent, useRef, useState } from 'react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Activity, Download, MoreHorizontal, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -11,6 +11,7 @@ import {
   exportMemoryMarkdown,
   getCurrentUser,
   getGraph,
+  getMemoryEnhancement,
   getMemoryProfile,
   listGoals,
   listGraphs,
@@ -83,6 +84,11 @@ import { MemoryReport, type MemoryReportSelection } from './components/memory-re
 import { MemoryReportComposer } from './components/memory-report-composer'
 import { MemorySettingsDialog } from './components/memory-settings-dialog'
 import { MemoryTrashDialog } from './components/memory-trash-dialog'
+import {
+  completeMemoryProcess,
+  failMemoryProcess,
+  startMemoryProcess,
+} from './memory-process'
 import { usePendingMemorySummary } from './use-pending-memory-summary'
 
 const zoneDefinitions: Array<{ zone: MemoryZone; title: string }> = [
@@ -151,7 +157,10 @@ export function MemoryPage() {
   const [draft, setDraft] = useState('')
   const [selection, setSelection] = useState<MemoryReportSelection | null>(null)
   const [forgetTarget, setForgetTarget] = useState<MemoryEntry[] | null>(null)
-  const composerRef = useRef<HTMLInputElement>(null)
+  const composerRef = useRef<HTMLTextAreaElement>(null)
+  const composerModelInitialized = useRef(false)
+  const [composerProviderId, setComposerProviderId] = useState('')
+  const [composerModelId, setComposerModelId] = useState('')
 
   const memories = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'views'),
@@ -160,6 +169,11 @@ export function MemoryPage() {
   const profile = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile'),
     queryFn: getMemoryProfile,
+  })
+  const enhancement = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'memory', 'enhancement'),
+    queryFn: getMemoryEnhancement,
+    staleTime: 30_000,
   })
   const memoryTypes = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'types'),
@@ -181,6 +195,40 @@ export function MemoryPage() {
     queryFn: getCurrentUser,
   })
   const { total: pendingCount } = usePendingMemorySummary()
+
+  // Start with the last explicit choice for this workspace; otherwise mirror
+  // the model configured in Memory Settings. The selection is per composer
+  // request and never silently changes the workspace setting.
+  useEffect(() => {
+    composerModelInitialized.current = false
+    setComposerProviderId('')
+    setComposerModelId('')
+  }, [workspaceId])
+
+  useEffect(() => {
+    if (composerModelInitialized.current || !workspaceId) return
+    let stored: { providerId?: string; modelId?: string } | null = null
+    try {
+      const raw = window.localStorage.getItem(`learngraph:memory-composer-model:${workspaceId}`)
+      stored = raw ? JSON.parse(raw) as { providerId?: string; modelId?: string } : null
+    } catch {
+      stored = null
+    }
+    // TanStack Query may briefly retain the previous workspace's result while
+    // the new key is resolving. Never seed this workspace's composer from
+    // that stale configuration; an explicit per-workspace local choice is
+    // still safe to restore immediately.
+    const currentEnhancement = enhancement.data?.workspace_id === workspaceId
+      ? enhancement.data
+      : undefined
+    const configured = currentEnhancement?.summarization.provider_id && currentEnhancement.summarization.model_id
+      ? currentEnhancement.summarization
+      : currentEnhancement?.extraction
+    if (!stored && !currentEnhancement) return
+    setComposerProviderId(stored?.providerId || configured?.provider_id || '')
+    setComposerModelId(stored?.modelId || configured?.model_id || '')
+    composerModelInitialized.current = true
+  }, [enhancement.data, workspaceId])
 
   const refreshMemory = async () => {
     await queryClient.invalidateQueries({ queryKey: workspaceResourcePrefix(workspaceId, 'memory') })
@@ -345,7 +393,11 @@ export function MemoryPage() {
   const typeList = memoryTypes.data ?? []
   const recoverableCount = deletedMemories.filter((item) => item.restore_available).length
   const zoneBusy = remove.isPending || update.isPending || restoreRevision.isPending
-  const composerBusy = editProfile.isPending || regenerateProfile.isPending || migrateAtoms.isPending
+  const composerBusy =
+    editProfile.isPending ||
+    create.isPending ||
+    regenerateProfile.isPending ||
+    migrateAtoms.isPending
 
   // “告诉 AI 导师需要记住、修改或忘记什么”优先走自然语言意图（LLM 原子化整理）。
   // 当工作区未配置记忆提取/摘要模型时，后端会返回 memory_profile_model_unconfigured ——
@@ -355,12 +407,15 @@ export function MemoryPage() {
     content: string,
     selectedText?: string,
     selectedAtomIds?: string[],
+    model?: { providerId: string; modelId: string },
   ) => {
     try {
-      await editProfile.mutateAsync({
+      return await editProfile.mutateAsync({
         text: content,
         selected_text: selectedText,
         selected_atom_ids: selectedAtomIds,
+        provider_id: model?.providerId || undefined,
+        model_id: model?.modelId || undefined,
         timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
       })
     } catch (error) {
@@ -375,25 +430,58 @@ export function MemoryPage() {
           record_kind: 'semantic_memory',
           source: 'user_confirmed',
         })
-        return
+        return null
       }
       throw error
     }
   }
 
-  async function submitIntent(event: FormEvent) {
-    event.preventDefault()
-    const content = draft.trim()
-    if (!content || composerBusy) return
+  async function submitIntent(contentValue: string): Promise<boolean> {
+    const content = contentValue.trim()
+    if (!content || composerBusy) return false
+    const selectedModel =
+      composerProviderId && composerModelId
+        ? { providerId: composerProviderId, modelId: composerModelId }
+        : undefined
+    const process = startMemoryProcess({
+      workspaceId,
+      text: content,
+      providerId: selectedModel?.providerId,
+      modelId: selectedModel?.modelId,
+    })
     try {
-      await quickAdd(content, selection?.text, selection?.atomIds)
-    } catch {
+      const result = await quickAdd(
+        content,
+        selection?.text,
+        selection?.atomIds,
+        selectedModel,
+      )
+      completeMemoryProcess(
+        workspaceId,
+        process,
+        result ?? {
+          status: 'ok',
+          drafts_created: 1,
+          auto_committed: 1,
+          affected_memory_ids: [],
+          profile_status: 'atomic_snapshot',
+          provider_id: selectedModel?.providerId,
+          model_id: selectedModel?.modelId,
+        },
+      )
+    } catch (error) {
       // 错误已由 mutation 的 onError 提示，保留输入内容让用户修改后重试。
-      return
+      failMemoryProcess(
+        workspaceId,
+        process,
+        error instanceof Error ? error.message : '记忆更新失败，请稍后重试',
+      )
+      return false
     }
     setDraft('')
     setSelection(null)
     window.getSelection()?.removeAllRanges()
+    return true
   }
 
   function requestCorrection(text: string) {
@@ -558,9 +646,28 @@ export function MemoryPage() {
               busy={composerBusy}
               draft={draft}
               inputRef={composerRef}
+              modelId={composerModelId}
               onClearSelection={() => setSelection(null)}
               onDraftChange={setDraft}
-              onSubmit={(event) => void submitIntent(event)}
+              onModelChange={({ modelId, providerId }) => {
+                composerModelInitialized.current = true
+                setComposerModelId(modelId)
+                setComposerProviderId(providerId)
+                try {
+                  if (providerId && modelId) {
+                    window.localStorage.setItem(
+                      `learngraph:memory-composer-model:${workspaceId}`,
+                      JSON.stringify({ modelId, providerId }),
+                    )
+                  } else {
+                    window.localStorage.removeItem(`learngraph:memory-composer-model:${workspaceId}`)
+                  }
+                } catch {
+                  // localStorage is optional; the current selection remains live.
+                }
+              }}
+              onSubmit={submitIntent}
+              providerId={composerProviderId}
               selection={selection}
             />
           </div>

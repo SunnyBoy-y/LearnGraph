@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import hashlib
 import json
 import logging
@@ -56,6 +58,7 @@ _PATCH_EVENTS = frozenset(
 
 SEARCH_PROJECTOR_NAME = "memory_search_v1"
 FTS_CAPABILITY_PROJECTOR_NAME = "memory_search_fts_capability"
+_FTS_CORRUPTION_MARKER = "database disk image is malformed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +119,63 @@ def probe_memory_search_fts_capability(db: Session) -> str:
     if "tokenize" in sql and "trigram" in sql:
         return "trigram"
     return "unicode"
+
+
+def is_memory_search_fts_corruption(error: BaseException) -> bool:
+    """Return whether an exception means SQLite's derived FTS index is corrupt."""
+
+    # SQLAlchemy wraps sqlite3.DatabaseError, so inspect the complete exception
+    # chain instead of relying on one concrete driver exception type.
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if _FTS_CORRUPTION_MARKER in str(current).casefold():
+            return True
+        for linked in (
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+            getattr(current, "orig", None),
+        ):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return False
+
+
+def memory_search_fts_is_healthy(db: Session) -> bool:
+    """Check FTS5 integrity without changing the caller's transaction.
+
+    FTS5 exposes ``integrity-check`` as an INSERT command. Running it through a
+    short-lived engine connection keeps the Session transaction untouched; this
+    matters because the caller may still have work queued for the same request.
+    Missing FTS is not considered corruption and is created lazily by the
+    normal projection path.
+    """
+
+    if db.bind is None or db.bind.dialect.name != "sqlite":
+        return True
+    if probe_memory_search_fts_capability(db) == "unavailable":
+        return True
+    try:
+        with db.get_bind().connect() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO memory_search_fts(memory_search_fts) "
+                    "VALUES ('integrity-check')"
+                )
+            )
+        return True
+    except Exception as exc:
+        if is_memory_search_fts_corruption(exc):
+            return False
+        # A transient lock or an older SQLite build should not make an otherwise
+        # valid memory write fail before the projection path gets a chance to run.
+        logger.debug("Memory FTS integrity check unavailable", exc_info=True)
+        return True
 
 
 def ensure_memory_search_fts(db: Session) -> str:
@@ -197,8 +257,42 @@ class MemoryProjector:
         if not memory_id:
             return
 
+        stream = self.db.scalar(select(MemoryStream).where(
+            MemoryStream.id == event.stream_id,
+            MemoryStream.tenant_id == event.tenant_id,
+            MemoryStream.workspace_id == event.workspace_id,
+        ))
+        if stream is not None and stream.status == "forgotten":
+            self._remove_search_document(memory_id)
+            return
+
         if event.event_type in _REMOVE_EVENTS:
             self._remove_search_document(memory_id)
+            return
+
+        if event.event_type == MemoryEventType.MEMORY_FEEDBACK_RECORDED:
+            document = self.db.scalar(select(MemorySearchDocument).where(
+                MemorySearchDocument.tenant_id == event.tenant_id,
+                MemorySearchDocument.workspace_id == event.workspace_id,
+                MemorySearchDocument.target_type == "memory", MemorySearchDocument.target_id == memory_id,
+            ))
+            if document is None:
+                return
+            kind = (payload or {}).get("feedback_type")
+            if kind in {"wrong", "stale", "suppress_auto_recall"}:
+                document.status = {"wrong": "disputed", "stale": "stale", "suppress_auto_recall": "suppressed"}[kind]
+            elif kind == "project_only":
+                document.subject_user_id = None
+                document.memory_layer = "L4"
+            elif kind == "deny_child" and document.sensitivity in {"public", "normal"}:
+                document.sensitivity = "private"
+            document.source_event_id = event.event_id
+            document.target_version = event.stream_version
+            self.db.flush()
+            if document.status == "active":
+                self._upsert_fts(document)
+            else:
+                self._delete_fts_row(document.id)
             return
 
         if event.event_type in _PATCH_EVENTS:
@@ -214,6 +308,16 @@ class MemoryProjector:
         if payload is None:
             return
 
+        hidden = (payload.get("state", "active") != "active"
+                  or payload.get("ledger_status", "active") != "active"
+                  or payload.get("zone") == "archive"
+                  or bool(payload.get("auto_recall_suppressed"))
+                  or (int(payload.get("atom_schema_version") or 0) >= 1
+                      and payload.get("summary_eligibility", "durable") in {"historical", "excluded"}))
+        if hidden:
+            self._remove_search_document(memory_id)
+            return
+        subject_user_id = payload.get("subject_user_id", stream.subject_user_id if stream is not None else event.subject_user_id)
         title = str(payload.get("title") or "")
         content = str(payload.get("content") or "")
         status = str(payload.get("status") or "active")
@@ -251,7 +355,7 @@ class MemoryProjector:
                 target_type="memory",
                 target_id=memory_id,
                 tenant_id=event.tenant_id,
-                subject_user_id=event.subject_user_id,
+                subject_user_id=subject_user_id,
                 workspace_id=event.workspace_id,
                 task_id=event.task_id,
                 source_event_id=event.event_id,
@@ -273,10 +377,16 @@ class MemoryProjector:
         )
         existing.status = "active"
         existing.sensitivity = str(payload.get("sensitivity") or event.sensitivity or "normal")
+        if payload.get("child_agent_denied") and existing.sensitivity in {"public", "normal"}:
+            existing.sensitivity = "private"
+        for field in ("valid_from", "valid_until"):
+            if field in payload:
+                value = payload[field]
+                setattr(existing, field, datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None)
         existing.importance = float(payload.get("importance") or existing.importance or 0.5)
         existing.confidence = float(payload.get("confidence") or existing.confidence or 0.7)
         existing.tenant_id = event.tenant_id
-        existing.subject_user_id = event.subject_user_id
+        existing.subject_user_id = subject_user_id
         existing.workspace_id = event.workspace_id
         existing.task_id = event.task_id
         existing.project_id = event.project_id or existing.project_id
@@ -387,7 +497,22 @@ class MemoryProjector:
         fts_capability = ensure_memory_search_fts(self.db)
         self.db.execute(delete(MemorySearchDocument))
         if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
-            self.db.execute(text("DELETE FROM memory_search_fts"))
+            try:
+                self.db.execute(text("DELETE FROM memory_search_fts"))
+            except Exception as exc:
+                if not is_memory_search_fts_corruption(exc):
+                    raise
+                # FTS5 is a derived view of the encrypted event log.  If its
+                # shadow index is malformed, discard only that derived table and
+                # replay the source events below.  The failed DELETE marks the
+                # transaction as unusable, hence the rollback before DROP.
+                logger.warning(
+                    "Memory FTS index is corrupt; rebuilding the derived index"
+                )
+                self.db.rollback()
+                self.db.execute(text("DROP TABLE IF EXISTS memory_search_fts"))
+                fts_capability = ensure_memory_search_fts(self.db)
+                self.db.execute(delete(MemorySearchDocument))
         self.db.flush()
 
         events: Sequence[MemoryEvent] = self.db.scalars(

@@ -23,7 +23,10 @@ so they survive provider changes and export/import.
 
 from __future__ import annotations
 
+from app.services.memory_job_guard import guarded_session_job, current_lease, extraction_batch
+
 import hashlib
+import json
 import logging
 import math
 import time
@@ -425,7 +428,7 @@ def semantic_boosts_for_records(
             quote,
             input_tokens=used_tokens,
             output_tokens=0,
-            attempt=1,
+            attempt=current_lease().attempt if current_lease() else 1,
             latency_ms=int((time.monotonic() - started_at) * 1000),
             usage_reported=used_tokens > 0,
         )
@@ -538,7 +541,7 @@ def semantic_boosts_for_documents(
             quote,
             input_tokens=used_tokens,
             output_tokens=0,
-            attempt=1,
+            attempt=current_lease().attempt if current_lease() else 1,
             latency_ms=int((time.monotonic() - started_at) * 1000),
             usage_reported=used_tokens > 0,
         )
@@ -650,7 +653,7 @@ def reindex_memory_embeddings(
             quote,
             input_tokens=used_tokens,
             output_tokens=0,
-            attempt=1,
+            attempt=current_lease().attempt if current_lease() else 1,
             latency_ms=int((time.monotonic() - started_at) * 1000),
             usage_reported=used_tokens > 0,
         )
@@ -904,7 +907,7 @@ def _new_messages_since(
                 for item in messages
                 if item.created_at.replace(tzinfo=last_at.tzinfo) > last_at
             ]
-    return messages[-_TRANSCRIPT_MESSAGE_CAP:]
+    return messages[:_TRANSCRIPT_MESSAGE_CAP]
 
 
 def _message_interaction_surface(message: Message) -> str:
@@ -1020,6 +1023,7 @@ def _proposal_scope(memory_type: str, session: ChatSession) -> str:
     return "workspace"
 
 
+@guarded_session_job("extraction")
 def extract_session_memories(
     db: Session,
     workspace: Workspace,
@@ -1048,6 +1052,7 @@ def extract_session_memories(
     if (
         not _workspace_memory_enabled(db, workspace.id)
         or not session.memory_enabled
+        or not session.memory_learning_enabled
     ):
         if force:
             policy = MemoryService(
@@ -1085,6 +1090,10 @@ def extract_session_memories(
     if not messages:
         return {"status": "no_new_messages", "drafts_created": 0}
 
+    lease = current_lease()
+    messages, transcript_slices, complete_messages, next_checkpoint = extraction_batch(
+        messages, lease.checkpoint if lease else {}
+    )
     if state is None:
         state = MemoryExtractionState(workspace_id=workspace.id, session_id=session_id)
         db.add(state)
@@ -1145,7 +1154,7 @@ def extract_session_memories(
         (
             f"<evidence id=\"{evidence_by_message[item.id].id}\" "
             f"message_id=\"{item.id}\">"
-            f"{item.content[:_TRANSCRIPT_CHARS_PER_MESSAGE]}"
+            f"{transcript_slices[item.id]}"
             "</evidence>"
         )
         for item in messages
@@ -1154,26 +1163,36 @@ def extract_session_memories(
         db, workspace.id, session_id
     )
     known_ids = {record.id for record in existing_records}
-    known_hashes = {record.content_hash for record in existing_records}
+    # Exact deduplication is not restricted to the prompt's recent-30 window.
+    known_hashes = set(db.scalars(select(MemoryRecord.content_hash).where(
+        MemoryRecord.workspace_id == workspace.id, MemoryRecord.state == "active",
+        (MemoryRecord.namespace == "workspace") | (MemoryRecord.session_id == session_id),
+    )).all())
     pending_titles = {
         (title or "").strip()
         for title in db.scalars(
             select(MemoryDraft.title).where(
                 MemoryDraft.workspace_id == workspace.id,
                 MemoryDraft.status == "PENDING",
+                MemoryDraft.session_id == session_id,
             )
         ).all()
     }
 
     prompt = _extraction_prompt(transcript, existing_lines, session)
+    if estimate_tokens(prompt + json.dumps(_extraction_schema())) > 12000:
+        return {"status": "input_budget_exceeded", "drafts_created": 0}
+    output_cap = min(int(getattr(model, "max_output_tokens", 4096) or 4096), 4096)
+    if hasattr(model, "max_output_tokens"):
+        model.max_output_tokens = output_cap
     billing = BillingService(db, workspace.id, actor_id)
     try:
         quote = billing.preflight_model_call(
             provider_id=model.provider_id,
             model_id=getattr(model, "model_id", extraction_cfg["model_id"]),
             feature="memory_extraction",
-            estimated_input_tokens=estimate_tokens(prompt),
-            estimated_output_tokens=1_024,
+            estimated_input_tokens=estimate_tokens(prompt + json.dumps(_extraction_schema())),
+            estimated_output_tokens=output_cap,
             remote_capability=bool(getattr(model, "remote_capability", True)),
         )
     except AppError as exc:
@@ -1208,10 +1227,24 @@ def extract_session_memories(
         cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
         cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
         reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
-        attempt=1,
+        attempt=current_lease().attempt if current_lease() else 1,
         latency_ms=int((time.monotonic() - started_at) * 1000),
-        usage_reported=bool(usage),
+        usage_reported=bool(usage), usage_units=usage,
     )
+    db.commit()  # Actual provider usage survives source deletion / lost ownership.
+    from app.services.session_memory_deletion import lock_session_memory_sources
+
+    try:
+        lock_session_memory_sources(db, workspace.id, [session_id])
+    except AppError as exc:
+        if exc.code != "session_not_found":
+            raise
+        # Preserve billing for the completed call, but never reattach the
+        # extraction cursor or proposals after their source has been deleted.
+        db.commit()
+        return {"status": "session_deleted", "session_id": session_id, "drafts_created": 0}
+    if lease:
+        lease.fence(db)
     if call_error is not None:
         state.last_status = "model_error"
         state.last_error = str(call_error)[:500]
@@ -1249,210 +1282,220 @@ def extract_session_memories(
         evidence.id: evidence.observed_at
         for evidence in evidence_by_message.values()
     }
-    normalizer = TemporalNormalizer()
-    for proposal in (proposals or [])[:_EXTRACTION_MAX_PROPOSALS]:
-        if not isinstance(proposal, dict):
-            continue
-        memory_type = str(proposal.get("memory_type") or "").strip()
-        title = str(proposal.get("title") or "").strip()[:240]
-        content = str(proposal.get("content") or "").strip()[:4_000]
-        if memory_type not in EXTRACTABLE_MEMORY_TYPES or not title or not content:
-            skipped += 1
-            continue
-        try:
-            confidence = min(1.0, max(0.0, float(proposal.get("confidence") or 0.0)))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        try:
-            importance = min(1.0, max(0.0, float(proposal.get("importance") or 0.5)))
-        except (TypeError, ValueError):
-            importance = 0.5
-        operation = str(proposal.get("operation") or "CREATE").strip().upper()
-        if operation == "NOOP":
-            continue
-        target_memory_id = str(proposal.get("target_memory_id") or "").strip() or None
-        canonical_key = str(proposal.get("canonical_key") or "").strip() or None
-        if operation != "CREATE":
-            resolved_target = resolve_target_for_operation(
-                operation,
-                target_memory_id=target_memory_id,
-                canonical_key=canonical_key,
-                records=existing_records,
-            )
-            if resolved_target is None:
-                # Never downgrade CANCEL/RESCHEDULE/COMPLETE into an orphan
-                # CREATE. The proposal stays a NOOP until a target is clear.
+    with memory_service.atomic_write():
+        normalizer = TemporalNormalizer()
+        if lease:
+            lease.fence(db)
+        for proposal in (proposals or [])[:_EXTRACTION_MAX_PROPOSALS]:
+            if not isinstance(proposal, dict):
+                continue
+            memory_type = str(proposal.get("memory_type") or "").strip()
+            title = str(proposal.get("title") or "").strip()[:240]
+            content = str(proposal.get("content") or "").strip()[:4_000]
+            if memory_type not in EXTRACTABLE_MEMORY_TYPES or not title or not content:
                 skipped += 1
                 continue
-            target_memory_id = resolved_target
-            target_record = next(
-                (record for record in existing_records if record.id == resolved_target),
-                None,
-            )
-            canonical_key = canonical_key or str(
-                getattr(target_record, "canonical_key", "") or ""
-            ).strip() or None
-        if operation == "CREATE":
-            if _content_hash(title, content) in known_hashes or title in pending_titles:
-                skipped += 1
+            try:
+                confidence = min(1.0, max(0.0, float(proposal.get("confidence") or 0.0)))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            try:
+                importance = min(1.0, max(0.0, float(proposal.get("importance") or 0.5)))
+            except (TypeError, ValueError):
+                importance = 0.5
+            operation = str(proposal.get("operation") or "CREATE").strip().upper()
+            if operation == "NOOP":
                 continue
-        evidence_ids = list(
-            dict.fromkeys(
-                str(value)
-                for value in (proposal.get("evidence_ids") or [])
-                if str(value) in eligible_evidence_ids
-            )
-        )
-        if not evidence_ids:
-            skipped += 1
-            continue
-        raw_temporal_status = str(
-            proposal.get("temporal_status") or "timeless"
-        ).strip()
-        summary_eligibility = str(
-            proposal.get("summary_eligibility") or "durable"
-        ).strip()
-        if summary_eligibility not in {
-            "durable", "current", "historical", "excluded",
-        }:
-            # Never let an out-of-vocabulary model value (e.g. legacy
-            # "eligible") silently exclude a valid atom from the summary.
-            summary_eligibility = "durable"
-        event_at = proposal.get("event_at")
-        valid_until = proposal.get("valid_until")
-        next_review_at = proposal.get("next_review_at")
-        observed_for_proposal = observed_at
-        for evidence_id in evidence_ids:
-            evidence_observed_at = observed_by_evidence.get(evidence_id)
-            if evidence_observed_at is not None:
-                observed_for_proposal = _as_utc(evidence_observed_at)
-                break
-        temporal_semantics: dict[str, Any] | None = None
-        original_expression = str(
-            proposal.get("time_expression") or proposal.get("original_expression") or ""
-        ).strip()
-        timezone_name = str(proposal.get("timezone_name") or "Asia/Shanghai").strip()
-        if original_expression and raw_temporal_status in {
-            "planned", "ongoing", "scheduled", "tentative", "rescheduled",
-            "in_progress", "completed", "cancelled", "lapsed_unverified", "expired",
-        }:
-            semantics = normalizer.normalize(
-                original_expression,
-                observed_at=observed_for_proposal,
-                timezone_name=timezone_name,
-            )
-            temporal_semantics = semantics.as_dict()
-            if semantics.start_at is not None and event_at is None:
-                event_at = semantics.start_at.isoformat()
-            if semantics.end_at is not None and valid_until is None:
-                valid_until = semantics.end_at.isoformat()
-        temporal_anchor = (
-            _parse_extraction_time(valid_until)
-            or _parse_extraction_time(event_at)
-        )
-        temporal_status = normalize_plan_status(
-            raw_temporal_status,
-            start_at=temporal_anchor,
-            now=_as_utc(observed_for_proposal),
-        )
-        if temporal_status == "lapsed_unverified":
-            # A past plan is evidence that a plan existed, never evidence that
-            # the event happened. Keep it out of the current profile until the
-            # user confirms, cancels, or reschedules it.
-            summary_eligibility = "historical"
-            next_review_at = None
-        elif temporal_status in PLAN_STATES and temporal_anchor is not None:
-            if _parse_extraction_time(next_review_at) is None:
-                next_review_at = (temporal_anchor + timedelta(days=1)).isoformat()
-        structured_payload = {
-            "atom_schema_version": 1,
-            "atom_kind": str(proposal.get("atom_kind") or "fact")[:64],
-            "canonical_key": canonical_key or "",
-            "ledger_status": "active",
-            "temporal_status": temporal_status,
-            "summary_eligibility": summary_eligibility,
-            "event_at": event_at,
-            "valid_from": proposal.get("valid_from"),
-            "valid_until": valid_until,
-            "next_review_at": next_review_at,
-            "last_verified_at": utc_now().isoformat(),
-            "timezone_name": timezone_name,
-            "evidence_ids": evidence_ids,
-            "temporal_semantics": temporal_semantics,
-            "provenance": {
-                "authorship": "user",
-                "source_kinds": ["user_statement"],
-                "profile_eligible": True,
-                **_provenance_surfaces(evidence_ids, surface_by_evidence),
-            },
-        }
-        structured_payload = ensure_plan_canonical_key(
-            structured_payload, title=title
-        )
-        if operation == "RESCHEDULE":
-            structured_payload["plan_change_text"] = plan_change_text("rescheduled")
-        elif operation == "CANCEL":
-            structured_payload["plan_change_text"] = plan_change_text("cancelled")
-        elif operation == "COMPLETE":
-            structured_payload["plan_change_text"] = plan_change_text("completed")
-        if temporal_status == "rescheduled":
-            structured_payload["plan_change_text"] = plan_change_text("rescheduled")
-        try:
-            draft = memory_service.create_draft(
-                MemoryDraftCreateRequest(
-                    operation=operation,
-                    memory_type=memory_type,
+            target_memory_id = str(proposal.get("target_memory_id") or "").strip() or None
+            canonical_key = str(proposal.get("canonical_key") or "").strip() or None
+            if operation != "CREATE":
+                resolved_target = resolve_target_for_operation(
+                    operation,
                     target_memory_id=target_memory_id,
-                    title=title,
-                    content=content,
-                    structured_payload=structured_payload,
-                    proposed_scope_type=_proposal_scope(memory_type, session),
-                    goal_id=session.goal_id,
-                    session_id=session.id,
-                    confidence=confidence,
-                    importance=importance,
-                    # UPDATE rewrites an existing memory: always human-reviewed.
-                    auto_commit=bool(extraction_cfg["auto_commit"]),
-                    created_by="memory_extraction",
-                    source_refs=[
-                        {
-                            "type": "memory_evidence",
-                            "id": evidence_id,
-                            "source_kind": "user_statement",
-                        }
-                        for evidence_id in evidence_ids
-                    ],
+                    canonical_key=canonical_key,
+                    records=existing_records,
+                )
+                if resolved_target is None:
+                    # Never downgrade CANCEL/RESCHEDULE/COMPLETE into an orphan
+                    # CREATE. The proposal stays a NOOP until a target is clear.
+                    skipped += 1
+                    continue
+                target_memory_id = resolved_target
+                target_record = next(
+                    (record for record in existing_records if record.id == resolved_target),
+                    None,
+                )
+                canonical_key = canonical_key or str(
+                    getattr(target_record, "canonical_key", "") or ""
+                ).strip() or None
+            if operation == "CREATE":
+                if _content_hash(title, content) in known_hashes or title in pending_titles:
+                    skipped += 1
+                    continue
+            evidence_ids = list(
+                dict.fromkeys(
+                    str(value)
+                    for value in (proposal.get("evidence_ids") or [])
+                    if str(value) in eligible_evidence_ids
                 )
             )
-        except AppError as exc:
-            logger.info(
-                "Memory extraction proposal rejected for session %s: %s",
-                session_id,
-                exc.code if hasattr(exc, "code") else exc,
+            if not evidence_ids:
+                skipped += 1
+                continue
+            raw_temporal_status = str(
+                proposal.get("temporal_status") or "timeless"
+            ).strip()
+            summary_eligibility = str(
+                proposal.get("summary_eligibility") or "durable"
+            ).strip()
+            if summary_eligibility not in {
+                "durable", "current", "historical", "excluded",
+            }:
+                # Never let an out-of-vocabulary model value (e.g. legacy
+                # "eligible") silently exclude a valid atom from the summary.
+                summary_eligibility = "durable"
+            event_at = proposal.get("event_at")
+            valid_until = proposal.get("valid_until")
+            next_review_at = proposal.get("next_review_at")
+            observed_for_proposal = observed_at
+            for evidence_id in evidence_ids:
+                evidence_observed_at = observed_by_evidence.get(evidence_id)
+                if evidence_observed_at is not None:
+                    observed_for_proposal = _as_utc(evidence_observed_at)
+                    break
+            temporal_semantics: dict[str, Any] | None = None
+            original_expression = str(
+                proposal.get("time_expression") or proposal.get("original_expression") or ""
+            ).strip()
+            timezone_name = str(proposal.get("timezone_name") or "Asia/Shanghai").strip()
+            if original_expression and raw_temporal_status in {
+                "planned", "ongoing", "scheduled", "tentative", "rescheduled",
+                "in_progress", "completed", "cancelled", "lapsed_unverified", "expired",
+            }:
+                semantics = normalizer.normalize(
+                    original_expression,
+                    observed_at=observed_for_proposal,
+                    timezone_name=timezone_name,
+                )
+                temporal_semantics = semantics.as_dict()
+                if semantics.start_at is not None and event_at is None:
+                    event_at = semantics.start_at.isoformat()
+                if semantics.end_at is not None and valid_until is None:
+                    valid_until = semantics.end_at.isoformat()
+            temporal_anchor = (
+                _parse_extraction_time(valid_until)
+                or _parse_extraction_time(event_at)
             )
-            skipped += 1
-            continue
-        drafts_created += 1
-        pending_titles.add(title)
-        if draft.status == "COMMITTED":
-            auto_committed += 1
+            temporal_status = normalize_plan_status(
+                raw_temporal_status,
+                start_at=temporal_anchor,
+                now=_as_utc(observed_for_proposal),
+            )
+            if temporal_status == "lapsed_unverified":
+                # A past plan is evidence that a plan existed, never evidence that
+                # the event happened. Keep it out of the current profile until the
+                # user confirms, cancels, or reschedules it.
+                summary_eligibility = "historical"
+                next_review_at = None
+            elif temporal_status in PLAN_STATES and temporal_anchor is not None:
+                if _parse_extraction_time(next_review_at) is None:
+                    next_review_at = (temporal_anchor + timedelta(days=1)).isoformat()
+            structured_payload = {
+                "atom_schema_version": 1,
+                "atom_kind": str(proposal.get("atom_kind") or "fact")[:64],
+                "canonical_key": canonical_key or "",
+                "ledger_status": "active",
+                "temporal_status": temporal_status,
+                "summary_eligibility": summary_eligibility,
+                "event_at": event_at,
+                "valid_from": proposal.get("valid_from"),
+                "valid_until": valid_until,
+                "next_review_at": next_review_at,
+                "last_verified_at": utc_now().isoformat(),
+                "timezone_name": timezone_name,
+                "evidence_ids": evidence_ids,
+                "temporal_semantics": temporal_semantics,
+                "provenance": {
+                    "authorship": "user",
+                    "source_kinds": ["user_statement"],
+                    "profile_eligible": True,
+                    **_provenance_surfaces(evidence_ids, surface_by_evidence),
+                },
+            }
+            structured_payload = ensure_plan_canonical_key(
+                structured_payload, title=title
+            )
+            if operation == "RESCHEDULE":
+                structured_payload["plan_change_text"] = plan_change_text("rescheduled")
+            elif operation == "CANCEL":
+                structured_payload["plan_change_text"] = plan_change_text("cancelled")
+            elif operation == "COMPLETE":
+                structured_payload["plan_change_text"] = plan_change_text("completed")
+            if temporal_status == "rescheduled":
+                structured_payload["plan_change_text"] = plan_change_text("rescheduled")
+            try:
+                draft = memory_service.create_draft(
+                    MemoryDraftCreateRequest(
+                        operation=operation,
+                        memory_type=memory_type,
+                        target_memory_id=target_memory_id,
+                        title=title,
+                        content=content,
+                        structured_payload=structured_payload,
+                        proposed_scope_type=_proposal_scope(memory_type, session),
+                        goal_id=session.goal_id,
+                        session_id=session.id,
+                        confidence=confidence,
+                        importance=importance,
+                        # UPDATE rewrites an existing memory: always human-reviewed.
+                        auto_commit=bool(extraction_cfg["auto_commit"]) and operation == "CREATE",
+                        created_by="memory_extraction",
+                        source_refs=[
+                            {
+                                "type": "memory_evidence",
+                                "id": evidence_id,
+                                "source_kind": "user_statement",
+                            }
+                            for evidence_id in evidence_ids
+                        ],
+                    )
+                )
+            except AppError:
+                raise
+            drafts_created += 1
+            pending_titles.add(title)
+            known_hashes.add(_content_hash(title, content))
+            if draft.status == "COMMITTED":
+                auto_committed += 1
 
-    last = messages[-1]
-    state.last_message_id = last.id
-    state.last_message_at = last.created_at
-    state.last_status = "ok" if drafts_created else "empty"
-    state.last_error = ""
-    state.extracted_count = int(state.extracted_count or 0) + drafts_created
-    db.commit()
-    return {
-        "status": "ok",
-        "session_id": session_id,
-        "messages_reviewed": len(messages),
-        "drafts_created": drafts_created,
-        "auto_committed": auto_committed,
-        "skipped": skipped,
-        "completion_reason": "model_completed" if not bool(payload.get("has_more")) else "batch_safety_limit",
-    }
+        try:
+            lock_session_memory_sources(db, workspace.id, [session_id])
+        except AppError as exc:
+            if exc.code != "session_not_found":
+                raise
+            db.rollback()
+            return {"status": "session_deleted", "session_id": session_id, "drafts_created": 0}
+        has_more = bool(payload.get("has_more"))
+        if not has_more:
+            if complete_messages:
+                last = complete_messages[-1]
+                state.last_message_id = last.id
+                state.last_message_at = last.created_at
+            if lease:
+                lease.save_checkpoint(db, next_checkpoint)
+        state.last_status = "ok" if drafts_created else "empty"
+        state.last_error = ""
+        state.extracted_count = int(state.extracted_count or 0) + drafts_created
+        db.flush()
+        return {
+            "status": "partial" if has_more else "ok",
+            "session_id": session_id,
+            "messages_reviewed": len(messages),
+            "drafts_created": drafts_created,
+            "auto_committed": auto_committed,
+            "skipped": skipped,
+            "completion_reason": "continuation_required" if has_more else ("text_chunk_completed" if next_checkpoint else "model_completed"),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1501,6 +1544,7 @@ def _summary_prompt(base_summary: str, transcript: str) -> str:
     )
 
 
+@guarded_session_job("summarization")
 def summarize_session_context(
     db: Session,
     workspace: Workspace,
@@ -1576,7 +1620,10 @@ def summarize_session_context(
     # Rolling base only stays valid while it covers a subset of the prefix
     # (edits/branch switches can orphan old ids — then start fresh).
     base_summary = ""
-    if latest is not None and covered and covered.issubset(set(prefix_ids)):
+    if (latest is not None and covered and covered.issubset(set(prefix_ids))
+            and latest.source_hash == hashlib.sha256(
+                "\n".join(f"{item.id}:{item.content}" for item in prefix if item.id in covered).encode("utf-8")
+            ).hexdigest()):
         base_summary = latest.summary
     else:
         covered = set()
@@ -1585,7 +1632,7 @@ def summarize_session_context(
         return {"status": "fresh"}
     if len(fresh_messages) < _SUMMARY_MIN_NEW_MESSAGES and base_summary and not force:
         return {"status": "fresh_enough"}
-    fresh_messages = fresh_messages[-_SUMMARY_BATCH_MESSAGE_CAP:]
+    fresh_messages = fresh_messages[:_SUMMARY_BATCH_MESSAGE_CAP]
 
     model = model_provider_for_workspace(
         db, workspace.id, settings, model_id=model_id, provider_id=provider_id
@@ -1603,14 +1650,19 @@ def summarize_session_context(
         for item in fresh_messages
     )
     prompt = _summary_prompt(base_summary, transcript)
+    if estimate_tokens(prompt + json.dumps(_summary_schema())) > 12000:
+        return {"status": "input_budget_exceeded"}
+    output_cap = min(int(getattr(model, "max_output_tokens", 2048) or 2048), 2048)
+    if hasattr(model, "max_output_tokens"):
+        model.max_output_tokens = output_cap
     billing = BillingService(db, workspace.id, actor_id)
     try:
         quote = billing.preflight_model_call(
             provider_id=model.provider_id,
             model_id=getattr(model, "model_id", model_id),
             feature="context_summarization",
-            estimated_input_tokens=estimate_tokens(prompt),
-            estimated_output_tokens=1_024,
+            estimated_input_tokens=estimate_tokens(prompt + json.dumps(_summary_schema())),
+            estimated_output_tokens=output_cap,
             remote_capability=bool(getattr(model, "remote_capability", True)),
         )
     except AppError:
@@ -1636,9 +1688,9 @@ def summarize_session_context(
         cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
         cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
         reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
-        attempt=1,
+        attempt=current_lease().attempt if current_lease() else 1,
         latency_ms=int((time.monotonic() - started_at) * 1000),
-        usage_reported=bool(usage),
+        usage_reported=bool(usage), usage_units=usage,
     )
     if call_error is not None:
         db.commit()
@@ -1649,6 +1701,13 @@ def summarize_session_context(
                 f"Summarization model call failed: {call_error}",
             ) from call_error
         return {"status": "model_error"}
+    # Usage must survive a lease loss or source-session deletion.
+    db.commit()
+    lease = current_lease()
+    if lease:
+        lease.fence(db)
+    from app.services.session_memory_deletion import lock_session_memory_sources
+    lock_session_memory_sources(db, workspace.id, [session_id])
     summary_text = str(payload.get("summary") or "").strip()[:_SUMMARY_TEXT_CHAR_CAP]
     if not summary_text:
         db.commit()
@@ -1714,7 +1773,7 @@ def run_workspace_summarization_sweep(
     idle_seconds: int,
     sessions_per_sweep: int,
 ) -> dict[str, int]:
-    totals = {"sessions_summarized": 0}
+    totals = {"sessions_summarized": 0, "sessions_attempted": 0}
     config = load_enhancement_config(db, workspace.id)
     if not config["summarization"]["enabled"]:
         return totals
@@ -1734,8 +1793,9 @@ def run_workspace_summarization_sweep(
         ).all()
     )
     for session in candidates:
-        if totals["sessions_summarized"] >= max(1, sessions_per_sweep):
+        if totals["sessions_attempted"] >= max(1, sessions_per_sweep):
             break
+        totals["sessions_attempted"] += 1
         try:
             result = summarize_session_context(db, workspace, session.id, settings)
         except Exception:
@@ -1745,6 +1805,9 @@ def run_workspace_summarization_sweep(
                 workspace.id,
             )
             db.rollback()
+            continue
+        if result.get("status") in {"busy", "already_processed", "retry_backoff", "retry_exhausted", "no_new_messages", "disabled", "policy_disabled", "too_short", "below_threshold", "fresh", "fresh_enough", "unconfigured"}:
+            totals["sessions_attempted"] -= 1
             continue
         if result.get("status") == "ok":
             totals["sessions_summarized"] += 1
@@ -1761,7 +1824,7 @@ def run_workspace_extraction_sweep(
 ) -> dict[str, int]:
     """Extract from quiet sessions with unprocessed turns (dreaming-style)."""
 
-    totals = {"sessions_processed": 0, "drafts_created": 0, "auto_committed": 0}
+    totals = {"sessions_processed": 0, "drafts_created": 0, "auto_committed": 0, "sessions_attempted": 0}
     config = load_enhancement_config(db, workspace.id)
     extraction_cfg = config["extraction"]
     if (
@@ -1783,8 +1846,9 @@ def run_workspace_extraction_sweep(
         ).all()
     )
     for session in candidates:
-        if totals["sessions_processed"] >= max(1, sessions_per_sweep):
+        if totals["sessions_attempted"] >= max(1, sessions_per_sweep):
             break
+        totals["sessions_attempted"] += 1
         try:
             result = extract_session_memories(
                 db, workspace, session.id, settings, force=False
@@ -1796,6 +1860,9 @@ def run_workspace_extraction_sweep(
                 workspace.id,
             )
             db.rollback()
+            continue
+        if result.get("status") in {"busy", "already_processed", "retry_backoff", "retry_exhausted", "no_new_messages", "disabled", "policy_disabled", "too_short", "below_threshold", "fresh", "fresh_enough", "unconfigured"}:
+            totals["sessions_attempted"] -= 1
             continue
         if result.get("status") in {"ok"}:
             totals["sessions_processed"] += 1

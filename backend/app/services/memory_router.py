@@ -199,7 +199,14 @@ class MemoryRouter:
         self.retriever = retriever
         self.db = db
 
-    def route(self, scope: MemoryScopeContext, query: str) -> MemoryRouteResult:
+    def route(
+        self,
+        scope: MemoryScopeContext,
+        query: str,
+        *,
+        top_k: int = 6,
+        min_score: float = 0.20,
+    ) -> MemoryRouteResult:
         t0 = time.monotonic()
         signals = _detect_intents(query)
         routes = _routes_from_signals(signals)
@@ -211,8 +218,8 @@ class MemoryRouter:
             scope,
             query,
             allowed_layers=frozenset(layers),
-            top_k=6,
-            min_score=0.20,
+            top_k=max(1, min(100, int(top_k))),
+            min_score=max(0.0, min(1.0, float(min_score))),
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
         trace_id = self._persist_trace(scope, query, routes, signals, retrieval, latency_ms)

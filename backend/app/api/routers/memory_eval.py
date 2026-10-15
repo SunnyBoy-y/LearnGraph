@@ -18,6 +18,8 @@
   即正式接口 ``POST /api/v1/memory/profile/intents`` 的同一条链路）。
   全程不计算 embedding：``memory.enhancement.embedding.enabled`` 被显式写成 false，
   且写入链路本身从不调用 embedding provider。
+* ``POST /memory-eval/ingest-session`` —— LongMemEval 专用证据接入：保留 role、
+  external session、turn 顺序和历史 observed_at；assistant 只作为 benchmark evidence。
 * ``POST /memory-eval/ask`` —— 正常文本问答路径。默认**每次调用新建一个会话**，
   这样回答只能来自长期记忆而不是同一段对话的历史；请求体固定
   ``agent_mode=True`` + ``thinking_mode="low"`` + ``model_id="deepseek-flash"``，
@@ -33,7 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Query
@@ -59,6 +61,7 @@ from app.services.memory_enhancement import load_enhancement_config, save_enhanc
 from app.services.memory_profile import MemoryProfileService
 from app.services.memory_retrieval import MemoryHybridRetriever
 from app.services.memory_router import MemoryRouter
+from app.services.longmemeval_adapter import LongMemEvalAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +77,8 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL_ID = "deepseek-flash"
 PROVIDER_DISPLAY_NAME = "DeepSeek（记忆评测）"
 
-# 检索口径与 ContextBuilder 内部完全一致（MemoryRouter.route 里硬编码的
-# top_k=6 / min_score=0.20），所以这里复算出来的候选就是真正会被注入提示词的那一批。
+# 评测返回沿用 MemoryRouter/ContextBuilder 的检索实现，benchmark 请求可显式
+# 调整 top_k/min_score，默认值仍与正常产品路径一致。
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +292,46 @@ class WriteRequest(BaseModel):
     timezone_name: str = Field(default="Asia/Shanghai", min_length=1, max_length=80)
 
 
+class BenchmarkTurn(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=200_000)
+
+
+class IngestSessionRequest(BaseModel):
+    benchmark: str = Field(default="longmemeval", pattern="^longmemeval$")
+    ingestion_mode: Literal["evidence", "product_memory"] = "evidence"
+    question_id: str = Field(min_length=1, max_length=160)
+    session_id: str = Field(min_length=1, max_length=160)
+    session_index: int = Field(default=0, ge=0, le=1_000_000)
+    session_date: str = Field(min_length=1, max_length=120)
+    timezone_name: str = Field(default="UTC", min_length=1, max_length=80)
+    turns: list[BenchmarkTurn] = Field(min_length=1, max_length=10_000)
+
+
+@router.post("/ingest-session")
+def ingest_benchmark_session(
+    payload: IngestSessionRequest,
+    db: DB,
+    settings: AppSettings,
+    workspace_id: str | None = Query(default=None, max_length=64),
+) -> dict[str, Any]:
+    """Ingest one LongMemEval session as timestamped benchmark evidence."""
+
+    context = _eval_context(db, workspace_id)
+    workspace = _require_workspace(db, context)
+    user = _require_user(db, context)
+    adapter = LongMemEvalAdapter(db, settings, workspace, user)
+    return adapter.ingest_session(
+        question_id=payload.question_id,
+        session_id=payload.session_id,
+        session_index=payload.session_index,
+        session_date=payload.session_date,
+        timezone_name=payload.timezone_name,
+        ingestion_mode=payload.ingestion_mode,
+        turns=[turn.model_dump() for turn in payload.turns],
+    ) | {"workspace_id": workspace.id}
+
+
 @router.post("/write")
 def write_memory(payload: WriteRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
     """一段文本 → 记忆建立通道（记忆整理模型原子化 → 草稿 → 自动提交 → 落库）。"""
@@ -332,6 +375,9 @@ class AskRequest(BaseModel):
     agent_mode: bool = True
     search_route: str = Field(default="disabled", min_length=1, max_length=32)
     include_retrieved_memories: bool = True
+    question_id: str | None = Field(default=None, max_length=160)
+    top_k: int = Field(default=6, ge=1, le=100)
+    min_score: float = Field(default=0.20, ge=0.0, le=1.0)
 
 
 def _drain_stream(events: Any) -> dict[str, Any]:
@@ -405,7 +451,9 @@ def ask(payload: AskRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
     )
 
     # 默认每次新建会话：这样回答只能来自长期记忆，而不是同一段对话的历史。
-    session_id = payload.session_id
+    # A LongMemEval question must be answered in a fresh chat session. Keep
+    # the legacy session_id escape hatch for the older temporary harness.
+    session_id = None if payload.question_id else payload.session_id
     if session_id is None:
         session = build_chat_service(
             db,
@@ -472,6 +520,8 @@ def ask(payload: AskRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
                 provider_trace = message.provider_trace
 
     result: dict[str, Any] = {
+        "question_id": payload.question_id,
+        "workspace_id": workspace.id,
         "session_id": session_id,
         "message_id": drained["message_id"],
         "answer": answer,
@@ -486,14 +536,20 @@ def ask(payload: AskRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
         },
         "provider_trace": {
             key: provider_trace.get(key)
-            for key in ("agent_mode", "thinking_mode", "usage", "model_id", "provider_id")
+            for key in (
+                "agent_mode",
+                "thinking_mode",
+                "usage",
+                "model_id",
+                "provider_id",
+                "memory_context",
+            )
             if key in provider_trace
         },
     }
 
     if payload.include_retrieved_memories:
-        # 同一条检索路径复算：MemoryRouter.route 的 top_k/min_score 是硬编码的，
-        # ContextBuilder 走的也是这一次调用，所以这里列出的就是会进提示词的候选。
+        # 同一条检索路径复算；这里列出的就是会进提示词的候选。
         scope = MemoryScopeContext(
             tenant_id=user.tenant_id,
             principal_user_id=user.id,
@@ -501,7 +557,9 @@ def ask(payload: AskRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
             conversation_id=session_id,
             agent_id="main_agent",
         )
-        routed = MemoryRouter(MemoryHybridRetriever(db), db=db).route(scope, payload.content)
+        routed = MemoryRouter(MemoryHybridRetriever(db), db=db).route(
+            scope, payload.content, top_k=payload.top_k, min_score=payload.min_score
+        )
         db.commit()
         result["retrieved_memories"] = [
             {
@@ -510,6 +568,8 @@ def ask(payload: AskRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
                 "title": item.title,
                 "content": item.content,
                 "score": item.score,
+                "retrieval_reason": item.retrieval_reason,
+                "external_source": item.external_source,
                 # 分量：semantic 恒为 0（embedding 关）、lexical 是词面命中、
                 # 其余是 scope/entity/importance/recency/confidence 的先验。
                 # 中文在没有 embedding 时 lexical 基本打不出来，排序主要靠先验 ——
@@ -518,7 +578,9 @@ def ask(payload: AskRequest, db: DB, settings: AppSettings) -> dict[str, Any]:
             }
             for item in routed.retrieval.candidates
         ]
-        result["retrieval_excluded"] = dict(routed.retrieval.excluded)
+        excluded = dict(routed.retrieval.excluded)
+        excluded.setdefault("budget", 0)
+        result["retrieval_excluded"] = excluded
         result["retrieval_routes"] = [
             getattr(route, "value", str(route)) for route in routed.routes
         ]

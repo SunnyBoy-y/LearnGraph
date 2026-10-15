@@ -17,7 +17,7 @@ from app.domain.memory_event_models import (
     MemoryStream,
     utc_now,
 )
-from app.domain.memory_event_types import CURRENT_EVENT_SCHEMA_VERSIONS
+from app.domain.memory_event_types import CURRENT_EVENT_SCHEMA_VERSIONS, MemoryEventType
 from app.repositories.memory_events import MemoryEventRepository
 from app.services.memory_crypto import MemoryPayloadCipher, payload_hash
 from app.services.memory_sensitive_filter import SensitiveDataFilter
@@ -145,6 +145,12 @@ class MemoryEventStore:
                 stream = self.events.stream_for_aggregate(scope, aggregate_type, aggregate_id)
                 if stream is None:
                     raise
+        forgetting = event.event_type == MemoryEventType.MEMORY_FORGOTTEN
+        stream_status = self.db.scalar(
+            select(MemoryStream.status).where(MemoryStream.id == stream.id)
+        )
+        if stream_status == "forgotten" and not forgetting:
+            raise AppError(410, "memory_stream_forgotten", "Forgotten memory cannot be changed")
         current_version = stream.current_version
         if expected_version is not None and expected_version != current_version:
             raise self._version_conflict(aggregate_id, expected_version, current_version)
@@ -168,7 +174,7 @@ class MemoryEventStore:
             actor_type=event.actor_type,
             actor_id=event.actor_id,
             tenant_id=scope.tenant_id,
-            subject_user_id=scope.principal_user_id,
+            subject_user_id=stream.subject_user_id,
             workspace_id=scope.workspace_id,
             task_id=scope.task_id,
             conversation_id=event.conversation_id or scope.conversation_id,
@@ -188,7 +194,11 @@ class MemoryEventStore:
         self.db.add(stored)
         cas = self.db.execute(
             update(MemoryStream)
-            .where(MemoryStream.id == stream.id, MemoryStream.current_version == current_version)
+            .where(
+                MemoryStream.id == stream.id,
+                MemoryStream.current_version == current_version,
+                True if forgetting else MemoryStream.status != "forgotten",
+            )
             .values(current_version=next_version, updated_at=utc_now())
             .execution_options(synchronize_session=False)
         )

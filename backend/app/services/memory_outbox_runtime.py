@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
-from app.services.memory_outbox import MemoryOutboxWorker
+from app.services.memory_outbox import MemoryOutboxWorker, PermanentProjectionError
 from app.services.memory_provider_projector import MemoryProviderProjector
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ def run_memory_outbox_once(*, limit: int = 25) -> dict[str, int]:
             return None
 
         def unsupported_projection(item) -> None:
-            raise RuntimeError(
+            raise PermanentProjectionError(
                 f"durable handler for {item.projection_kind} is not configured"
             )
 
@@ -35,7 +36,7 @@ def run_memory_outbox_once(*, limit: int = 25) -> dict[str, int]:
                 "index": acknowledge_sync_projection,
                 "episode": acknowledge_sync_projection,
             },
-            worker_id="embedded-memory-outbox",
+            worker_id=f"embedded-memory-outbox:{uuid4()}",
             lease_seconds=settings.memory_outbox_lease_seconds,
             max_attempts=settings.memory_outbox_max_attempts,
             strict_leases=settings.memory_outbox_strict_leases,

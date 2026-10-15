@@ -238,7 +238,7 @@ export function MemoryGovernancePanel({ memory }: { memory: MemoryEntry }) {
           <DialogHeader>
             <DialogTitle>纠正「{memory.title}」</DialogTitle>
             <DialogDescription>
-              提交替代内容后，旧记忆标记 superseded，新记忆成为当前有效版本；历史不会被静默覆盖。
+              提交纠正后，这条记忆的新修订立即生效；旧修订保留用于审计，不再作为当前事实召回。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">

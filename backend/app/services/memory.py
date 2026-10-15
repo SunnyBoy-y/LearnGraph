@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from sqlalchemy import update as atomic_sql_update
+
 import hashlib
 import json
 import logging
@@ -234,6 +237,33 @@ class MemoryService:
         self.graphs = GraphRepository(db, workspace.id)
         self.nodes = GraphNodeRepository(db, workspace.id)
         self.audit = AuditRepository(db, workspace.id)
+        self._atomic_write_active = False
+        self._after_commit = []
+
+    @contextmanager
+    def atomic_write(self):
+        if self._atomic_write_active:
+            yield
+            return
+        self._atomic_write_active = True
+        try:
+            yield
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            self._after_commit.clear()
+            raise
+        finally:
+            self._atomic_write_active = False
+        callbacks, self._after_commit = self._after_commit, []
+        for callback in callbacks:
+            callback()
+
+    def _commit_write(self):
+        if self._atomic_write_active:
+            self.db.flush()
+        else:
+            self.db.commit()
 
     def _event_store(self):
         from app.core.config import get_settings
@@ -297,6 +327,11 @@ class MemoryService:
         preserves the existing UI/readback behavior when the provider is healthy.
         """
 
+        if self._atomic_write_active:
+            self._after_commit.append(lambda: self._project_after_commit(
+                record, canonical, previous_provider_id=previous_provider_id,
+                previous_binding_id=previous_binding_id))
+            return
         try:
             binding_id = (
                 record.provider_binding_id
@@ -382,6 +417,11 @@ class MemoryService:
         provider_id: str,
         provider_binding_id: str | None,
     ) -> None:
+        if self._atomic_write_active:
+            self._after_commit.append(lambda: self._delete_projection_after_commit(
+                memory_id=memory_id, provider_id=provider_id,
+                provider_binding_id=provider_binding_id))
+            return
         if not provider_binding_id:
             return
         try:
@@ -390,29 +430,17 @@ class MemoryService:
             elif provider_id == self.local_projection.provider_id:
                 self.local_projection.delete(provider_binding_id)
             bindings = self.db.scalars(
-                self.bindings.query().where(MemoryProviderBinding.memory_id == memory_id)
+                self.bindings.query().where(
+                    MemoryProviderBinding.memory_id == memory_id,
+                    MemoryProviderBinding.provider_instance_id == provider_id,
+                    MemoryProviderBinding.provider_record_id == provider_binding_id,
+                )
             ).all()
             for binding in bindings:
                 binding.binding_status = "deleted"
-            from app.domain.memory_event_models import MemoryProjectionOutbox
-
-            completed_kind = (
-                "mem0"
-                if provider_id == self.provider.provider_id
-                and self.provider.remote_capability
-                else "markdown"
-            )
-            jobs = self.db.scalars(
-                select(MemoryProjectionOutbox).where(
-                    MemoryProjectionOutbox.aggregate_id == memory_id,
-                    MemoryProjectionOutbox.projection_kind == completed_kind,
-                    MemoryProjectionOutbox.status.in_(("queued", "failed")),
-                )
-            ).all()
-            for job in jobs:
-                job.status = "succeeded"
-                job.last_error = ""
+            # Remaining bindings are deliberately left for the durable projector.
             self.db.commit()
+            return
         except Exception:
             self.db.rollback()
             logger.warning(
@@ -759,7 +787,7 @@ class MemoryService:
             outcome="conflict",
             details={"expected_revision": expected_revision, "current_revision": record.revision},
         )
-        self.db.commit()
+        self._commit_write()
         raise AppError(
             409,
             "memory_revision_conflict",
@@ -928,6 +956,9 @@ class MemoryService:
         )
 
     def purge_expired(self, *, now: datetime | None = None) -> dict[str, int]:
+        # Retention commits and vault destruction must not escape the UoW.
+        if self._atomic_write_active:
+            return {"content_keys_destroyed": 0, "journal_entries_removed": 0}
         current = _as_utc(now or utc_now())
         destroyed = 0
         removed_journal = 0
@@ -1142,8 +1173,14 @@ class MemoryService:
             self.db.commit()
         return view
 
-    def create(self, payload: MemoryCreateRequest) -> MemoryView:
+    def create(
+        self, payload: MemoryCreateRequest, *, source_session_id: str | None = None
+    ) -> MemoryView:
         self.purge_expired()
+        from app.services.session_memory_deletion import lock_session_memory_sources
+
+        source_ids = [item for item in (source_session_id, payload.session_id) if item]
+        lock_session_memory_sources(self.db, self.workspace_id, source_ids)
         self._validate_session_scope(payload.namespace, payload.session_id)
         structured = self._validate_structured_payload(payload.structured_payload)
         type_def = get_memory_type(payload.record_kind)
@@ -1190,7 +1227,7 @@ class MemoryService:
             tenant_id=self.workspace.tenant_id,
             subject_user_id=self.actor_id if payload.namespace == "session" else None,
             audience_type="user" if payload.namespace == "session" else "workspace",
-            conversation_id=payload.session_id,
+            conversation_id=source_session_id or payload.session_id,
             memory_layer="L3" if payload.namespace == "session" else "L4",
             assertion_type="explicit" if payload.source.startswith("user") else "inferred",
             sensitivity="normal",
@@ -1289,7 +1326,7 @@ class MemoryService:
         )
         self._mark_profile_stale("memory_created")
         self._mirror_event(record, payload.content.rstrip(), "ADD")
-        self.db.commit()
+        self._commit_write()
         self._project_after_commit(record, canonical)
         record = self.memories.require(record.id, "memory")
         self.db.refresh(record)
@@ -1454,7 +1491,7 @@ class MemoryService:
                     "detected_at": "atomic_compare_and_swap",
                 },
             )
-            self.db.commit()
+            self._commit_write()
             raise AppError(
                 409,
                 "memory_revision_conflict",
@@ -1531,7 +1568,7 @@ class MemoryService:
         )
         self._mark_profile_stale("memory_updated")
         self._mirror_event(record, content, "UPDATE")
-        self.db.commit()
+        self._commit_write()
         self._project_after_commit(
             record,
             canonical,
@@ -1730,7 +1767,7 @@ class MemoryService:
         )
         self._mark_profile_stale("memory_deleted")
         self._mirror_event(record, "", "DELETE")
-        self.db.commit()
+        self._commit_write()
         self._delete_projection_after_commit(
             memory_id=record.id,
             provider_id=previous_provider_id,
@@ -2394,6 +2431,12 @@ class MemoryService:
 
     def create_draft(self, payload: MemoryDraftCreateRequest) -> MemoryDraftView:
         self.purge_expired()
+        from app.services.session_memory_deletion import lock_session_memory_sources
+
+        lock_session_memory_sources(
+            self.db, self.workspace_id,
+            [item for item in (payload.session_id, payload.branch_session_id) if item],
+        )
         structured = self._validate_structured_payload(payload.structured_payload)
         auto_commit_allowed = bool(payload.auto_commit)
         if payload.created_by == "learning_agent":
@@ -2509,9 +2552,9 @@ class MemoryService:
                 "auto_commit_allowed": auto_commit_allowed,
             },
         )
-        self.db.commit()
+        self._commit_write()
         self.db.refresh(draft)
-        if auto_commit_allowed and not type_def.requires_confirmation and draft.confidence >= 0.75:
+        if auto_commit_allowed and (draft.created_by != "memory_extraction" or draft.operation == "CREATE") and not type_def.requires_confirmation and draft.confidence >= 0.75:
             return self.decide_draft(
                 draft.id,
                 MemoryDraftDecisionRequest(decision="commit", reason="auto_commit_threshold"),
@@ -2542,12 +2585,27 @@ class MemoryService:
         draft = self.drafts.require(draft_id, "memory draft")
         return self._draft_view(draft)
 
-    def decide_draft(
+    def decide_draft(self, draft_id: str, payload: MemoryDraftDecisionRequest) -> MemoryDraftView:
+        with self.atomic_write():
+            return self._decide_draft(draft_id, payload)
+
+    def _decide_draft(
         self,
         draft_id: str,
         payload: MemoryDraftDecisionRequest,
     ) -> MemoryDraftView:
+        claimed = self.db.execute(atomic_sql_update(MemoryDraft).where(
+            MemoryDraft.workspace_id == self.workspace_id,
+            MemoryDraft.id == draft_id, MemoryDraft.status == "PENDING",
+        ).values(status="PENDING").execution_options(synchronize_session=False)).rowcount
+        if not claimed:
+            existing = self.drafts.require(draft_id, "memory draft")
+            self.db.refresh(existing)
+            if existing.status == "COMMITTED" and payload.decision == "commit":
+                return self._draft_view(existing)
+            raise AppError(409, "draft_not_pending", "Only pending drafts can be decided")
         draft = self.drafts.require(draft_id, "memory draft")
+        self.db.refresh(draft)
         if draft.status != "PENDING":
             raise AppError(
                 409,
@@ -2568,11 +2626,17 @@ class MemoryService:
                 resource_id=draft.id,
                 details={"reason": draft.rejection_reason},
             )
-            self.db.commit()
+            self._commit_write()
             self.db.refresh(draft)
             return self._draft_view(draft)
 
-        # commit path
+        # commit path: the source may have disappeared while review was open.
+        from app.services.session_memory_deletion import lock_session_memory_sources
+
+        lock_session_memory_sources(
+            self.db, self.workspace_id,
+            [item for item in (draft.session_id, draft.branch_session_id) if item],
+        )
         source_ids = []
         for ref in draft.source_refs or []:
             if isinstance(ref, dict) and ref.get("id"):
@@ -2598,7 +2662,8 @@ class MemoryService:
                     importance=float(draft.importance),
                     source=f"draft:{draft.created_by}",
                     source_ids=source_ids,
-                )
+                ),
+                source_session_id=draft.session_id or draft.branch_session_id,
             )
             draft.result_memory_id = created.id
             draft.result_revision = created.revision
@@ -2648,6 +2713,21 @@ class MemoryService:
                     reason=f"draft_commit:{draft.operation.lower()}",
                 ),
             )
+            if draft.operation == "MERGE":
+                target = self.memories.require(updated.id, "memory")
+                for conflict_id in dict.fromkeys(draft.conflicts_with or []):
+                    if conflict_id == target.id:
+                        continue
+                    other = self._require_active(conflict_id)
+                    if (other.subject_user_id, other.scope_type, other.scope_id) != (
+                        target.subject_user_id, target.scope_type, target.scope_id
+                    ):
+                        raise AppError(409, "memory_merge_scope_conflict", "Merge targets must have the same owner and scope")
+                    structured = dict(other.structured_payload or {})
+                    structured.update(ledger_status="superseded", summary_eligibility="historical")
+                    other.superseded_by_id = target.id
+                    self.update(other.id, MemoryUpdateRequest(
+                        zone="archive", structured_payload=structured, reason=f"merged_into:{target.id}"))
             draft.result_memory_id = updated.id
             draft.result_revision = updated.revision
         elif draft.operation in {"SUPERSEDE", "RESCHEDULE"}:
@@ -2692,7 +2772,8 @@ class MemoryService:
                     importance=float(draft.importance),
                     source=f"draft:{draft.created_by}",
                     source_ids=source_ids,
-                )
+                ),
+                source_session_id=draft.session_id or draft.branch_session_id,
             )
             successor = self.memories.require(created.id, "memory")
             successor.supersedes_id = draft.target_memory_id
@@ -2784,7 +2865,7 @@ class MemoryService:
                 "result_revision": draft.result_revision,
             },
         )
-        self.db.commit()
+        self._commit_write()
         self.db.refresh(draft)
         return self._draft_view(draft)
 

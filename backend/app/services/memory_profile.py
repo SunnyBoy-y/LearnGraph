@@ -47,6 +47,11 @@ from app.services.memory_plan import (
     plan_change_text,
     resolve_target_for_operation,
 )
+from app.services.memory_projector import (
+    MemoryProjector,
+    is_memory_search_fts_corruption,
+    memory_search_fts_is_healthy,
+)
 from app.services.temporal_normalizer import TemporalNormalizer
 from app.services.token_estimate import estimate_tokens
 
@@ -124,11 +129,18 @@ def _unsafe_memory_reason(text: str) -> str | None:
     return None
 
 
-def _profile_atom_query(workspace_id: str):
+def _profile_atom_query(workspace_id: str, owner_subject_id: str | None = None):
     return (
         select(MemoryRecord)
         .where(
             MemoryRecord.workspace_id == workspace_id,
+            MemoryRecord.tenant_id == select(Workspace.tenant_id).where(Workspace.id == workspace_id).scalar_subquery(),
+            (MemoryRecord.subject_user_id.is_(None)) | (MemoryRecord.subject_user_id == owner_subject_id),
+            MemoryRecord.lifecycle_status == "active",
+            MemoryRecord.deleted_at.is_(None), MemoryRecord.content_destroyed_at.is_(None),
+            MemoryRecord.auto_recall_suppressed.is_(False),
+            MemoryRecord.zone != "archive",
+            (MemoryRecord.valid_until.is_(None)) | (MemoryRecord.valid_until >= utc_now()),
             MemoryRecord.state == "active",
             MemoryRecord.atom_schema_version >= 1,
             MemoryRecord.ledger_status == "active",
@@ -144,7 +156,7 @@ def _profile_atom_query(workspace_id: str):
     )
 
 
-def _visible_atom_query(workspace_id: str):
+def _visible_atom_query(workspace_id: str, owner_subject_id: str | None = None):
     """Snapshot query: every active, non-excluded memory block.
 
     Unlike ``_profile_atom_query`` this does not require atomization
@@ -156,6 +168,13 @@ def _visible_atom_query(workspace_id: str):
         select(MemoryRecord)
         .where(
             MemoryRecord.workspace_id == workspace_id,
+            MemoryRecord.tenant_id == select(Workspace.tenant_id).where(Workspace.id == workspace_id).scalar_subquery(),
+            (MemoryRecord.subject_user_id.is_(None)) | (MemoryRecord.subject_user_id == owner_subject_id),
+            MemoryRecord.lifecycle_status == "active",
+            MemoryRecord.deleted_at.is_(None), MemoryRecord.content_destroyed_at.is_(None),
+            MemoryRecord.auto_recall_suppressed.is_(False),
+            MemoryRecord.zone != "archive",
+            (MemoryRecord.valid_until.is_(None)) | (MemoryRecord.valid_until >= utc_now()),
             MemoryRecord.state == "active",
             MemoryRecord.ledger_status == "active",
             MemoryRecord.summary_eligibility.in_(tuple(_ELIGIBLE_SUMMARY)),
@@ -171,11 +190,11 @@ def _visible_atom_query(workspace_id: str):
 
 
 def _eligible_profile_records(
-    db: Session, workspace_id: str
+    db: Session, workspace_id: str, owner_subject_id: str | None = None
 ) -> list[MemoryRecord]:
     """Return current atoms backed by at least one live trusted evidence row."""
 
-    candidates = list(db.scalars(_profile_atom_query(workspace_id)).all())
+    candidates = list(db.scalars(_profile_atom_query(workspace_id, owner_subject_id)).all())
     evidence_ids = {
         str(evidence_id)
         for record in candidates
@@ -230,14 +249,13 @@ def current_profile_prompt(
         .where(
             MemoryProfileSnapshot.workspace_id == workspace_id,
             MemoryProfileSnapshot.owner_subject_id == owner_subject_id,
-            MemoryProfileSnapshot.status == "ready",
         )
         .order_by(MemoryProfileSnapshot.version.desc())
         .limit(1)
     )
-    if snapshot is None or not snapshot.markdown.strip():
+    if snapshot is None or snapshot.status != "ready" or str(snapshot.stale_reason).startswith("refresh_failed") or not snapshot.markdown.strip():
         return ""
-    records = _eligible_profile_records(db, workspace_id)
+    records = _eligible_profile_records(db, workspace_id, owner_subject_id)
     if snapshot.source_fingerprint != _atom_fingerprint(records):
         snapshot.status = "stale"
         snapshot.stale_reason = "source_fingerprint_changed"
@@ -435,14 +453,44 @@ class MemoryProfileService:
             settings.memory_root,
         )
 
-    def _model_selection(self) -> tuple[str, str]:
+    def _model_selection(
+        self,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+    ) -> tuple[str, str]:
         config = load_enhancement_config(self.db, self.workspace_id)
         summarization = config["summarization"]
         extraction = config["extraction"]
+        configured_provider = summarization["provider_id"] or extraction["provider_id"]
+        configured_model = summarization["model_id"] or extraction["model_id"]
         return (
-            summarization["provider_id"] or extraction["provider_id"],
-            summarization["model_id"] or extraction["model_id"],
+            provider_id or configured_provider,
+            model_id or configured_model,
         )
+
+    def _repair_search_projection_if_needed(self, *, force: bool = False) -> None:
+        """Repair the rebuildable FTS view before an interactive memory write.
+
+        The event store is the source of truth.  A malformed SQLite FTS shadow
+        table must therefore never make the user-facing intent endpoint fail;
+        rebuild it from the encrypted events before creating evidence or calling
+        the model, so a repair cannot duplicate a partially completed request.
+        """
+
+        if not force and memory_search_fts_is_healthy(self.db):
+            return
+        try:
+            self.db.rollback()
+            store = self.memory._event_store()
+            MemoryProjector(self.db, cipher=store.cipher).rebuild_search_projection()
+            self.db.commit()
+        except Exception as exc:
+            self.db.rollback()
+            raise AppError(
+                503,
+                "memory_search_repair_failed",
+                "记忆索引修复失败，请稍后重试",
+            ) from exc
 
     def _profile_model(self, model_id: str, provider_id: str) -> tuple[Any, bool]:
         """Resolve the model used by one background memory-profile call.
@@ -484,15 +532,23 @@ class MemoryProfileService:
         schema: dict[str, Any],
         feature: str,
         estimated_output_tokens: int,
+        provider_id: str | None = None,
+        model_id: str | None = None,
     ) -> tuple[dict[str, Any], str]:
-        provider_id, model_id = self._model_selection()
-        if not provider_id or not model_id:
+        if estimate_tokens(prompt + json.dumps(schema, ensure_ascii=False)) > 12000:
+            raise AppError(413, "memory_profile_input_budget_exceeded", "Memory operation exceeds its input budget; select fewer atoms")
+        selected_provider_id, selected_model_id = self._model_selection(
+            provider_id, model_id
+        )
+        if not selected_provider_id or not selected_model_id:
             raise AppError(
                 409,
                 "memory_profile_model_unconfigured",
                 "Configure a memory extraction or summarization model first",
             )
-        model, fast_mode = self._profile_model(model_id, provider_id)
+        model, fast_mode = self._profile_model(
+            selected_model_id, selected_provider_id
+        )
         if not getattr(model, "available", False):
             raise AppError(
                 503,
@@ -502,7 +558,7 @@ class MemoryProfileService:
         billing = BillingService(self.db, self.workspace_id, self.actor_id)
         quote = billing.preflight_model_call(
             provider_id=model.provider_id,
-            model_id=getattr(model, "model_id", model_id),
+            model_id=getattr(model, "model_id", selected_model_id),
             feature=feature,
             estimated_input_tokens=estimate_tokens(prompt),
             estimated_output_tokens=estimated_output_tokens,
@@ -526,8 +582,8 @@ class MemoryProfileService:
                 self.db,
                 self.workspace_id,
                 self.settings,
-                model_id=model_id,
-                provider_id=provider_id,
+                model_id=selected_model_id,
+                provider_id=selected_provider_id,
             )
             if getattr(fallback, "available", False):
                 model = fallback
@@ -547,7 +603,7 @@ class MemoryProfileService:
             reasoning_tokens=int(usage.get("reasoning_tokens") or 0),
             attempt=1,
             latency_ms=int((time.monotonic() - started_at) * 1000),
-            usage_reported=bool(usage),
+            usage_reported=bool(usage), usage_units=usage,
         )
         self.db.commit()
         if error is not None:
@@ -556,7 +612,7 @@ class MemoryProfileService:
                 f"{feature}_failed",
                 f"Memory model call failed: {error}",
             ) from error
-        return payload, str(getattr(model, "model_id", model_id))
+        return payload, str(getattr(model, "model_id", selected_model_id))
 
     def _profile_view(
         self, snapshot: MemoryProfileSnapshot | None
@@ -565,6 +621,12 @@ class MemoryProfileService:
             return MemoryProfileView(
                 workspace_id=self.workspace_id,
                 owner_subject_id=self.actor_id,
+            )
+        if snapshot.status != "ready" or str(snapshot.stale_reason or "").startswith("refresh_failed"):
+            return MemoryProfileView(
+                id=snapshot.id, workspace_id=snapshot.workspace_id, owner_subject_id=snapshot.owner_subject_id,
+                version=snapshot.version, status=snapshot.status, stale_reason=snapshot.stale_reason,
+                generated_at=snapshot.generated_at, updated_at=snapshot.updated_at,
             )
         stored = list(snapshot.structured_sections or [])
         overview = ""
@@ -625,7 +687,7 @@ class MemoryProfileService:
         if snapshot is None:
             return self._atomic_snapshot_view()
         if snapshot.status == "ready":
-            records = _eligible_profile_records(self.db, self.workspace_id)
+            records = _eligible_profile_records(self.db, self.workspace_id, self.actor_id)
             if snapshot.source_fingerprint != _atom_fingerprint(records):
                 snapshot.status = "stale"
                 snapshot.stale_reason = "source_fingerprint_changed"
@@ -784,10 +846,10 @@ class MemoryProfileService:
         self, *, require_evidence: bool = True
     ) -> tuple[list[MemoryRecord], list[dict[str, Any]]]:
         if require_evidence:
-            records = _eligible_profile_records(self.db, self.workspace_id)
+            records = _eligible_profile_records(self.db, self.workspace_id, self.actor_id)
         else:
             records = list(
-                self.db.scalars(_visible_atom_query(self.workspace_id)).all()
+                self.db.scalars(_visible_atom_query(self.workspace_id, self.actor_id)).all()
             )
         payloads: list[dict[str, Any]] = []
         for record in records:
@@ -843,13 +905,46 @@ class MemoryProfileService:
             .limit(1)
         )
         if snapshot is None:
-            return
+            snapshot = MemoryProfileSnapshot(workspace_id=self.workspace_id, owner_subject_id=self.actor_id,
+                version=1, status="failed", source_fingerprint="")
+            self.db.add(snapshot)
+        snapshot.status = "failed"
         snapshot.stale_reason = (
             f"refresh_failed|{reason[:120]}|{utc_now().isoformat()}"
         )[:240]
         self.db.commit()
 
-    def refresh_profile(self, *, force: bool = False) -> MemoryProfileView:
+    def refresh_profile(
+        self,
+        *,
+        force: bool = False,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+    ) -> MemoryProfileView:
+        latest = self.db.scalar(select(MemoryProfileSnapshot).where(
+            MemoryProfileSnapshot.workspace_id == self.workspace_id,
+            MemoryProfileSnapshot.owner_subject_id == self.actor_id,
+        ).order_by(MemoryProfileSnapshot.version.desc()).limit(1))
+        if latest is not None and str(latest.stale_reason or "").startswith("refresh_failed|"):
+            failed_at = _parse_iso(str(latest.stale_reason).rsplit("|", 1)[-1])
+            if failed_at is not None and utc_now() - failed_at < timedelta(seconds=60):
+                return self._profile_view(latest)
+        try:
+            return self._refresh_profile(
+                force=force, provider_id=provider_id, model_id=model_id
+            )
+        except Exception as exc:
+            self.db.rollback()
+            self._note_refresh_failure(exc)
+            raise
+
+    def _refresh_profile(
+        self,
+        *,
+        force: bool = False,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+    ) -> MemoryProfileView:
         records, atoms = self._atom_payloads()
         if not atoms:
             return MemoryProfileView(
@@ -874,8 +969,10 @@ class MemoryProfileService:
             and not force
         ):
             return self._profile_view(current)
-        provider_id, model_id = self._model_selection()
-        if not provider_id or not model_id:
+        selected_provider_id, selected_model_id = self._model_selection(
+            provider_id, model_id
+        )
+        if not selected_provider_id or not selected_model_id:
             # 未配置记忆提取/摘要模型：与 get_profile 一致降级为无模型的
             # 原子快照视图，而不是抛出 memory_profile_model_unconfigured，
             # 保证刷新入口在未配置状态下也不报英文错误、仍能看到全部原子。
@@ -903,9 +1000,10 @@ class MemoryProfileService:
                 schema=_profile_schema(),
                 feature="memory_profile_summary",
                 estimated_output_tokens=2_400,
+                provider_id=selected_provider_id,
+                model_id=selected_model_id,
             )
-        except AppError as exc:
-            self._note_refresh_failure(exc)
+        except AppError:
             raise
         allowed_ids = {item["id"] for item in atoms}
         sections: list[dict[str, Any]] = []
@@ -1006,9 +1104,10 @@ class MemoryProfileService:
                 schema=_profile_verification_schema(),
                 feature="memory_profile_verification",
                 estimated_output_tokens=800,
+                provider_id=selected_provider_id,
+                model_id=selected_model_id,
             )
-        except AppError as exc:
-            self._note_refresh_failure(exc)
+        except AppError:
             raise
         valid_claim_ids = {
             str(value)
@@ -1047,6 +1146,22 @@ class MemoryProfileService:
                 502,
                 "memory_profile_unsupported_claims",
                 "No generated profile claims passed atom entailment verification",
+            )
+        # The model ran outside the write transaction. A conversation may have
+        # been deleted meanwhile; never publish a summary of forgotten atoms.
+        from sqlalchemy import update
+
+        self.db.execute(update(MemoryRecord).where(
+            MemoryRecord.workspace_id == self.workspace_id,
+            MemoryRecord.id.in_([record.id for record in records]),
+        ).values(updated_at=MemoryRecord.updated_at).execution_options(synchronize_session=False))
+        for record in records:
+            self.db.expire(record)
+        current_records = _eligible_profile_records(self.db, self.workspace_id, self.actor_id)
+        if _atom_fingerprint(current_records) != fingerprint:
+            raise AppError(
+                409, "memory_profile_sources_changed",
+                "Memory sources changed during profile generation; refresh again",
             )
         version = (
             self.db.scalar(
@@ -1087,8 +1202,10 @@ class MemoryProfileService:
         self.db.refresh(snapshot)
         return self._profile_view(snapshot)
 
-    def _create_user_evidence(self, text: str) -> MemoryEvidence:
-        now = utc_now()
+    def _create_user_evidence(
+        self, text: str, *, observed_at: datetime | None = None
+    ) -> MemoryEvidence:
+        now = observed_at or utc_now()
         evidence = MemoryEvidence(
             workspace_id=self.workspace_id,
             source_kind="user_statement",
@@ -1104,19 +1221,20 @@ class MemoryProfileService:
         self.db.flush()
         return evidence
 
-    def _existing_atom_context(self) -> list[dict[str, Any]]:
-        records = list(
-            self.db.scalars(
-                select(MemoryRecord)
-                .where(
-                    MemoryRecord.workspace_id == self.workspace_id,
-                    MemoryRecord.state == "active",
-                    MemoryRecord.atom_schema_version >= 1,
-                )
-                .order_by(MemoryRecord.updated_at.desc())
-                .limit(80)
-            ).all()
+    def _existing_atom_context(self, selected_atom_ids: list[str] | None = None) -> list[dict[str, Any]]:
+        query = select(MemoryRecord).where(
+            MemoryRecord.workspace_id == self.workspace_id, MemoryRecord.tenant_id == self.workspace.tenant_id,
+            MemoryRecord.state == "active", MemoryRecord.atom_schema_version >= 1,
+            MemoryRecord.deleted_at.is_(None), MemoryRecord.content_destroyed_at.is_(None),
+            (MemoryRecord.subject_user_id.is_(None)) | (MemoryRecord.subject_user_id == self.actor_id),
         )
+        records = list(self.db.scalars(query.order_by(MemoryRecord.updated_at.desc(), MemoryRecord.id).limit(80)))
+        selected = set(selected_atom_ids or [])
+        if selected:
+            explicit = list(self.db.scalars(query.where(MemoryRecord.id.in_(selected))))
+            if {record.id for record in explicit} != selected:
+                raise AppError(404, "memory_profile_target_unavailable", "Selected memory unavailable")
+            records = list({record.id: record for record in [*explicit, *records]}.values())
         return [
             {
                 "id": record.id,
@@ -1143,8 +1261,10 @@ class MemoryProfileService:
                 "This text cannot be stored as long-term memory",
                 {"reason": unsafe_reason},
             )
-        evidence = self._create_user_evidence(text)
-        now = utc_now()
+        self._repair_search_projection_if_needed()
+        now = request.observed_at or utc_now()
+        existing_atoms = self._existing_atom_context(request.selected_atom_ids)
+        evidence = self._create_user_evidence(text, observed_at=now)
         prompt = (
             "你是 LearnGraph 的原子记忆整理器。把本次明确由用户输入的修改意图转换为"
             "最小、规范化、可验证的原子操作。不要保存输入原文，不要发明事实。\n"
@@ -1161,7 +1281,10 @@ class MemoryProfileService:
             f"选中的摘要文字：{request.selected_text or '（无）'}\n"
             f"选中的 atom_ids：{json.dumps(request.selected_atom_ids, ensure_ascii=False)}\n"
             "EXISTING_ATOMS:\n"
-            f"{json.dumps(self._existing_atom_context(), ensure_ascii=False)}"
+            f"{json.dumps(existing_atoms, ensure_ascii=False)}"
+        )
+        selected_provider_id, selected_model_id = self._model_selection(
+            request.provider_id, request.model_id
         )
         payload, _ = self._model_json(
             prompt=prompt,
@@ -1169,8 +1292,10 @@ class MemoryProfileService:
             schema=_atomization_schema(),
             feature="memory_profile_intent",
             estimated_output_tokens=1_400,
+            provider_id=selected_provider_id,
+            model_id=selected_model_id,
         )
-        existing_atoms = self._existing_atom_context()
+        existing_atoms = self._existing_atom_context(request.selected_atom_ids)
         existing_ids = {item["id"] for item in existing_atoms}
         affected: list[str] = []
         drafts_created = 0
@@ -1305,13 +1430,23 @@ class MemoryProfileService:
             )
             drafts_created += 1
             if confidence >= 0.7:
-                committed = self.memory.decide_draft(
-                    draft.id,
-                    MemoryDraftDecisionRequest(
-                        decision="commit",
-                        reason="explicit_user_profile_intent",
-                    ),
+                decision = MemoryDraftDecisionRequest(
+                    decision="commit",
+                    reason="explicit_user_profile_intent",
                 )
+                try:
+                    committed = self.memory.decide_draft(draft.id, decision)
+                except Exception as exc:
+                    # A damaged FTS shadow table can fail only when SQLite
+                    # mutates a particular index segment, so an earlier global
+                    # integrity probe may not see it. The draft transaction is
+                    # rolled back by MemoryService.atomic_write; repair the
+                    # derived view and retry this same draft without calling the
+                    # model again or duplicating evidence.
+                    if not is_memory_search_fts_corruption(exc):
+                        raise
+                    self._repair_search_projection_if_needed(force=True)
+                    committed = self.memory.decide_draft(draft.id, decision)
                 auto_committed += 1
                 if committed.result_memory_id:
                     affected.append(committed.result_memory_id)
@@ -1319,7 +1454,11 @@ class MemoryProfileService:
         profile_status = "stale"
         if auto_committed:
             try:
-                profile_status = self.refresh_profile(force=True).status
+                profile_status = self.refresh_profile(
+                    force=True,
+                    provider_id=selected_provider_id,
+                    model_id=selected_model_id,
+                ).status
             except AppError:
                 profile_status = "stale"
         return MemoryProfileIntentResult(
@@ -1328,6 +1467,8 @@ class MemoryProfileService:
             auto_committed=auto_committed,
             affected_memory_ids=affected,
             profile_status=profile_status,
+            provider_id=selected_provider_id or None,
+            model_id=selected_model_id or None,
         )
 
     def migrate_legacy_atoms(self, *, limit: int = 20) -> dict[str, int]:
@@ -1579,26 +1720,35 @@ def reconcile_workspace_temporal_atoms(
     )
     lapsed = 0
     for record in records:
+        record_id = record.id
         structured = dict(record.structured_payload or {})
         structured["temporal_status"] = "lapsed_unverified"
         structured["summary_eligibility"] = "historical"
         structured["next_review_at"] = None
         structured["plan_change_text"] = "原计划 → 已逾期，待确认"
-        service.update(
-            record.id,
-            # Existing content/title remain unchanged; this creates an audited
-            # lifecycle revision rather than mutating the atom silently.
-            MemoryUpdateRequest(
-                structured_payload=structured,
-                reason="planned_time_passed_without_completion_evidence",
-            ),
+        update_payload = MemoryUpdateRequest(
+            structured_payload=structured,
+            reason="planned_time_passed_without_completion_evidence",
         )
+        try:
+            service.update(record_id, update_payload)
+        except Exception as exc:
+            if not is_memory_search_fts_corruption(exc):
+                raise
+            # The update transaction is rolled back by the failed projector
+            # write. Repair the derived index, then retry the same lifecycle
+            # revision; the event log remains the source of truth.
+            db.rollback()
+            store = service._event_store()
+            MemoryProjector(db, cipher=store.cipher).rebuild_search_projection()
+            db.commit()
+            service.update(record_id, update_payload)
         # The event projection must stop recalling a lapsed plan even when its
         # original end_at is still in the future.
         for document in db.scalars(
             select(MemorySearchDocument).where(
                 MemorySearchDocument.target_type == "memory",
-                MemorySearchDocument.target_id == record.id,
+                MemorySearchDocument.target_id == record_id,
             )
         ).all():
             document.status = "lapsed"

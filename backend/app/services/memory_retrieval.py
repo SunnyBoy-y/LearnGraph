@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import and_, or_, select, text
+from app.domain.models import MemoryRecord
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -37,6 +38,7 @@ class RetrievalCandidate:
     score: float
     component_scores: dict[str, float] = field(default_factory=dict)
     retrieval_reason: str = "hybrid_memory_search"
+    external_source: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,22 +93,64 @@ class MemoryHybridRetriever:
             workspace_scope = workspace_scope | (
                 MemorySearchDocument.subject_user_id == scope.principal_user_id
             )
-        documents = self.db.scalars(
-            select(MemorySearchDocument).where(
-                MemorySearchDocument.tenant_id == scope.tenant_id,
-                MemorySearchDocument.memory_layer.in_(allowed_layers),
-                MemorySearchDocument.status == "active",
-                workspace_scope,
-                (MemorySearchDocument.subject_user_id == scope.principal_user_id)
-                | (MemorySearchDocument.subject_user_id.is_(None)),
-                MemorySearchDocument.sensitivity.in_(scope.allowed_sensitivity),
-            )
-            # B1-5: bound the structured leg at 200 rows so a large memory base
-            # cannot stall every retrieval with a full materialized .all(); the
-            # FTS leg supplies relevance ranking, this leg only widens recall.
-            .limit(200)
-        ).all()
+        hard_filters = (
+            MemorySearchDocument.tenant_id == scope.tenant_id,
+            MemorySearchDocument.memory_layer.in_(allowed_layers),
+            MemorySearchDocument.status == "active",
+            workspace_scope,
+            (MemorySearchDocument.subject_user_id == scope.principal_user_id)
+            | (MemorySearchDocument.subject_user_id.is_(None)),
+            MemorySearchDocument.sensitivity.in_(scope.allowed_sensitivity),
+        )
+        if top_k <= 0:
+            return RetrievalResult((), excluded)
         fts_scores = self._fts_scores(scope, query, limit=max(top_k * 5, 20))
+        D, R = MemorySearchDocument, MemoryRecord
+        canonical_ok = and_(
+            R.tenant_id == scope.tenant_id,
+            R.workspace_id.is_not_distinct_from(D.workspace_id),
+            or_(R.subject_user_id.is_(None), R.subject_user_id == scope.principal_user_id),
+            R.state == "active", R.lifecycle_status == "active", R.ledger_status == "active",
+            R.zone != "archive", R.deleted_at.is_(None), R.content_destroyed_at.is_(None),
+            R.auto_recall_suppressed.is_(False),
+            R.sensitivity.in_(scope.allowed_sensitivity), R.memory_layer.in_(allowed_layers),
+            or_(R.atom_schema_version < 1, R.summary_eligibility.in_(("durable", "current"))),
+            R.temporal_status.not_in(("cancelled", "rescheduled", "lapsed_unverified", "expired")),
+            or_(R.valid_until.is_(None), R.valid_until >= now),
+        )
+        statement = (select(D).outerjoin(R, and_(D.target_type == "memory", R.id == D.target_id))
+            .where(*hard_filters, or_(R.id.is_(None), canonical_ok),
+                   or_(D.valid_until.is_(None), D.valid_until >= now), D.confidence >= min_confidence)
+            .order_by(D.id).execution_options(yield_per=128))
+        # Bound memory/embedding cost AFTER every eligible document can compete.
+        pool_limit = max(top_k, min(200, max(24, top_k * 8)))
+        pool = {}
+        stream = self.db.scalars(statement)
+        try:
+            for document in stream:
+                tokens = _tokens(f"{document.subject} {document.content}")
+                lexical = len(query_tokens & tokens) / math.sqrt(len(query_tokens) * len(tokens)) if query_tokens and tokens else 0.0
+                lexical = max(lexical, fts_scores.get(document.id, 0.0))
+                entity = float(bool(query_tokens & _tokens(document.entity_aliases_text)))
+                scope_score = 1.0 if document.task_id and document.task_id == scope.task_id else 0.85 if document.workspace_id == scope.workspace_id else 0.70 if document.workspace_id is None else 0.45
+                score = 0.20 * lexical + 0.15 * scope_score + 0.15 * entity + 0.05 + 0.10 * document.importance + 0.05 * document.confidence
+                external = (document.metadata_json or {}).get("external_source") or {}
+                try:
+                    observed = datetime.fromisoformat(str(external.get("observed_at") or "").replace("Z", "+00:00")).timestamp()
+                except (ValueError, TypeError, OverflowError):
+                    observed = 0.0
+                rank = (-score, -observed, document.target_id, document.id)
+                key = (document.target_type, " ".join(document.content.casefold().split()))
+                previous = pool.get(key)
+                if previous is not None:
+                    excluded["duplicate"] += 1
+                if previous is None or rank < previous[0]:
+                    pool[key] = (rank, document)
+                if len(pool) > pool_limit:
+                    del pool[max(pool, key=lambda value: pool[value][0])]
+        finally:
+            stream.close()
+        documents = [item[1] for item in sorted(pool.values(), key=lambda item: item[0])]
         semantic_boosts: dict[str, float] = {}
         embedding_enabled = False
         try:
@@ -128,9 +172,6 @@ class MemoryHybridRetriever:
         candidates: list[RetrievalCandidate] = []
         for document in documents:
             # ── Lifecycle: expired documents ────────────────────────────────
-            if document.valid_until is not None and document.valid_until < now:
-                excluded["expired"] += 1
-                continue
             # ── Audience / scope ────────────────────────────────────────────
             audience_ok = False
             scope_score = 0.0
@@ -210,9 +251,28 @@ class MemoryHybridRetriever:
                         "recency": recency,
                         "confidence": confidence,
                     },
+                    external_source=(
+                        dict(document.metadata_json.get("external_source") or {})
+                        if isinstance(getattr(document, "metadata_json", None), dict)
+                        else None
+                    ),
                 )
             )
-        candidates.sort(key=lambda item: (-item.score, item.target_id))
+        def _sort_key(item: RetrievalCandidate) -> tuple[float, float, str]:
+            observed_rank = 0.0
+            if item.external_source:
+                try:
+                    observed_rank = datetime.fromisoformat(
+                        str(item.external_source.get("observed_at") or "").replace("Z", "+00:00")
+                    ).timestamp()
+                except (TypeError, ValueError, OverflowError):
+                    observed_rank = 0.0
+            return (-item.score, -observed_rank, item.target_id)
+
+        # Benchmark updates with the same lexical score prefer the latest
+        # historical observation, while ordinary memories retain the stable ID
+        # tie-break used before this provenance field existed.
+        candidates.sort(key=_sort_key)
         deduped: list[RetrievalCandidate] = []
         seen: set[tuple[str, str]] = set()
         for candidate in candidates:

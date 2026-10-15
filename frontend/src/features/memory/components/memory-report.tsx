@@ -20,6 +20,7 @@ import { EmptyState } from '@/components/shared/page-elements'
 import { Button } from '@/components/ui/button'
 import type { MemoryProfile, MemoryProfileDimension } from '@/types/memory'
 import { buildMemoryReportSections, memoryRefreshFailure, memoryUpdatedHint } from '../memory-display'
+import { workspaceRecallEnabled } from '../memory-policy-state'
 
 export type MemoryReportSelection = { text: string; atomIds: string[] }
 
@@ -197,8 +198,7 @@ export function MemoryReport({
 
   const statusLabel = (() => {
     if (!profile) return null
-    const enabled =
-      policy.data?.effective_recall_enabled ?? policy.data?.effective_enabled ?? null
+    const enabled = workspaceRecallEnabled(policy.data)
     const parts: string[] = []
     if (enabled !== null) parts.push(enabled ? '记忆已开启' : '记忆已暂停')
     if (profile.status === 'stale') parts.push('报告待更新')

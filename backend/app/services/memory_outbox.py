@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import threading
 from datetime import timedelta
 from typing import Protocol
 
@@ -8,6 +10,10 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.domain.memory_event_models import MemoryProjectionOutbox, utc_now
+
+
+class PermanentProjectionError(RuntimeError):
+    """Configuration failure that must not consume eight retry cycles."""
 
 
 class OutboxHandler(Protocol):
@@ -40,14 +46,14 @@ class MemoryOutboxWorker:
         worker_id: str,
         lease_seconds: int = 120,
         max_attempts: int = 8,
-        strict_leases: bool = False,
+        strict_leases: bool = True,
     ) -> None:
         self.db = db
         self.handlers = handlers
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.max_attempts = max_attempts
-        self.strict_leases = strict_leases
+        self.strict_leases = True  # Retain parameter compatibility, not unsafe claims.
 
     def run_once(self, *, limit: int = 25) -> OutboxRunReport:
         now = utc_now()
@@ -67,11 +73,17 @@ class MemoryOutboxWorker:
             .order_by(MemoryProjectionOutbox.available_at, MemoryProjectionOutbox.created_at)
             .limit(limit)
         ).all()
-        claimed = self._claim(candidates, now)
+        claimed = []
         self.db.commit()
 
         succeeded = failed = dead_letter = ownership_lost = 0
-        for claim in claimed:
+        for candidate_id in candidates:
+            fresh_claims = self._claim([candidate_id], utc_now())
+            self.db.commit()
+            if not fresh_claims:
+                continue
+            claim = fresh_claims[0]
+            claimed.append(claim)
             item = self.db.get(MemoryProjectionOutbox, claim.id)
             if item is None or not self._is_claim_owner(item, claim):
                 ownership_lost += 1
@@ -80,13 +92,15 @@ class MemoryOutboxWorker:
             try:
                 if handler is None:
                     raise RuntimeError(f"no handler for {item.projection_kind}")
-                handler(item)
+                with self._heartbeat(claim):
+                    handler(item)
                 if self._mark_succeeded(claim):
                     succeeded += 1
                 else:
                     ownership_lost += 1
             except Exception as exc:
-                outcome = self._mark_failed(claim, str(exc))
+                self.db.rollback()
+                outcome = self._mark_failed(claim, str(exc), permanent=isinstance(exc, PermanentProjectionError))
                 if outcome == "failed":
                     failed += 1
                 elif outcome == "dead_letter":
@@ -97,6 +111,31 @@ class MemoryOutboxWorker:
         return OutboxRunReport(
             len(claimed), succeeded, failed, dead_letter, ownership_lost
         )
+
+    @contextmanager
+    def _heartbeat(self, claim):
+        stop = threading.Event()
+        bind = self.db.get_bind()
+        def renew():
+            while not stop.wait(max(0.2, self.lease_seconds / 3)):
+                try:
+                    with Session(bind) as heartbeat_db:
+                        result = heartbeat_db.execute(update(MemoryProjectionOutbox).where(
+                            self._claim_condition(claim),
+                            MemoryProjectionOutbox.lease_until > utc_now(),
+                        ).values(lease_until=utc_now()+timedelta(seconds=self.lease_seconds)))
+                        heartbeat_db.commit()
+                        if result.rowcount != 1:
+                            return
+                except Exception:
+                    continue
+        thread = threading.Thread(target=renew, daemon=True, name="memory-outbox-lease")
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=2)
 
     def _claim(self, candidate_ids: list[str], now) -> list[ClaimedOutboxItem]:
         claimed: list[ClaimedOutboxItem] = []
@@ -172,7 +211,7 @@ class MemoryOutboxWorker:
         )
         return result.rowcount == 1
 
-    def _mark_failed(self, claim: ClaimedOutboxItem, error: str) -> str | None:
+    def _mark_failed(self, claim: ClaimedOutboxItem, error: str, *, permanent: bool = False) -> str | None:
         item = self.db.get(MemoryProjectionOutbox, claim.id)
         if item is None or not self._is_claim_owner(item, claim):
             return None
@@ -183,7 +222,7 @@ class MemoryOutboxWorker:
             "lease_owner": None,
             "lease_until": None,
         }
-        if attempts >= self.max_attempts:
+        if permanent or attempts >= self.max_attempts:
             values["status"] = "dead_letter"
             outcome = "dead_letter"
         else:

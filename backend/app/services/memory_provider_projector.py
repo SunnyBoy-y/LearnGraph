@@ -130,7 +130,7 @@ class MemoryProviderProjector:
                 MemoryProviderBinding.workspace_id == workspace_id,
                 MemoryProviderBinding.memory_id == memory_id,
                 MemoryProviderBinding.provider_instance_id == provider.provider_id,
-                MemoryProviderBinding.binding_status == "verified",
+                MemoryProviderBinding.binding_status.in_(("verified", "pending_delete", "orphaned")),
             )
         ).all()
         for binding in bindings:

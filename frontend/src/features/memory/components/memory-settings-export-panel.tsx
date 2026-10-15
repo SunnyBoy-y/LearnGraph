@@ -25,6 +25,7 @@ import {
 } from '@/components/shared/page-elements'
 import type { MemoryArchitectureStatus } from '@/types/memory-events'
 import type { MemoryEnhancement, MemoryPolicy } from '@/types/memory'
+import { workspaceLearningEnabled, workspaceRecallEnabled } from '../memory-policy-state'
 
 function PolicyRow({
   label,
@@ -119,7 +120,7 @@ export function MemorySettingsExportPanel({ showPolicy = true }: { showPolicy?: 
           ) : policyData ? (
             <>
               <PolicyRow
-                checked={policyData.effective_recall_enabled ?? false}
+                checked={workspaceRecallEnabled(policyData) ?? false}
                 description="工作区级：是否在对话中自动召回长期记忆。"
                 disabled={updatePolicy.isPending}
                 label="工作区自动召回"
@@ -128,22 +129,13 @@ export function MemorySettingsExportPanel({ showPolicy = true }: { showPolicy?: 
                 }
               />
               <PolicyRow
-                checked={policyData.effective_learning_enabled ?? false}
+                checked={workspaceLearningEnabled(policyData) ?? false}
                 description="工作区级：是否根据证据更新知识节点掌握度。"
                 disabled={updatePolicy.isPending}
                 label="学习状态投影"
                 onToggle={(value) =>
                   updatePolicy.mutate({ workspace_learning_enabled: value })
                 }
-              />
-              <PolicyRow
-                checked={!policyData.effective_recall_enabled
-                  ? false
-                  : !(policyData.workspace_recall_enabled === false)}
-                description="仅作展示：当前会话是否继承工作区召回开关。关闭工作区召回时此项不生效。"
-                disabled
-                label="当前会话继承召回"
-                onToggle={() => undefined}
               />
             </>
           ) : null}

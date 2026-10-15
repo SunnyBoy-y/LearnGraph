@@ -99,6 +99,7 @@ class MemoryCommandService:
         actor_id: str,
         feedback_type: str,
         payload: dict[str, Any],
+        commit: bool = True,
     ) -> MemoryFeedback:
         record = self._require_record(scope, memory_id)
         result = self.store.append(
@@ -106,6 +107,7 @@ class MemoryCommandService:
             aggregate_type="memory_atom",
             aggregate_id=memory_id,
             expected_version=None,
+            stream_subject_user_id=None if feedback_type == "project_only" else record.subject_user_id,
             event=AppendEvent(
                 event_type=MemoryEventType.MEMORY_FEEDBACK_RECORDED,
                 payload={"memory_id": memory_id, "feedback_type": feedback_type, "payload": payload},
@@ -133,28 +135,16 @@ class MemoryCommandService:
             record.memory_layer = "L4"
         elif feedback_type in {"stale", "wrong"}:
             record.lifecycle_status = "disputed" if feedback_type == "wrong" else "stale"
-        document = self.db.scalar(
-            select(MemorySearchDocument).where(
-                MemorySearchDocument.target_type == "memory",
-                MemorySearchDocument.target_id == memory_id,
-            )
-        )
-        if document is not None:
-            if feedback_type in {"stale", "wrong", "suppress_auto_recall"}:
-                document.status = record.lifecycle_status if feedback_type != "suppress_auto_recall" else "suppressed"
-                if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
-                    self.db.execute(
-                        text("DELETE FROM memory_search_fts WHERE document_id = :id"),
-                        {"id": document.id},
-                    )
-            elif feedback_type == "project_only":
-                document.workspace_id = scope.workspace_id
-                document.subject_user_id = None
-                document.memory_layer = "L4"
-            elif feedback_type == "deny_child":
-                # Child contexts hard-filter private content; preserve main-agent recall.
-                document.sensitivity = "private"
-        self.db.commit()
+        from app.services.memory_projector import MemoryProjector
+        MemoryProjector(self.db).apply(result.event, {
+            "memory_id": memory_id, "feedback_type": feedback_type,
+        })
+        record.head_event_id = result.event.event_id
+        record.projection_version = result.event.stream_version
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         return row
 
     def retract(
@@ -193,21 +183,25 @@ class MemoryCommandService:
         actor_id: str,
         confirmation: str,
         reason: str,
+        commit: bool = True,
     ) -> ForgetReport:
         record = self._require_record(scope, memory_id)
         if confirmation.strip() not in {record.title.strip(), "永久忘记", "FORGET"}:
             raise AppError(422, "forget_confirmation_invalid", "Forget confirmation does not match")
         stream = self.store.events.stream_for_aggregate(scope, "memory_atom", memory_id)
-        if stream is None:
-            raise AppError(409, "memory_event_stream_missing", "Memory must be mirrored before it can be forgotten")
-        destroyed_keys = self.store.destroy_stream_payloads(
-            scope, stream.id, actor_id=actor_id, reason=reason
+        destroyed_keys = (
+            self.store.destroy_stream_payloads(
+                scope, stream.id, actor_id=actor_id, reason=reason
+            )
+            if stream is not None
+            else 0
         )
         result = self.store.append(
             scope,
             aggregate_type="memory_atom",
             aggregate_id=memory_id,
-            expected_version=stream.current_version,
+            expected_version=stream.current_version if stream is not None else 0,
+            stream_subject_user_id=record.subject_user_id,
             event=AppendEvent(
                 event_type=MemoryEventType.MEMORY_FORGOTTEN,
                 payload={"target_hash": record.content_hash, "scope": "all_projections"},
@@ -228,8 +222,19 @@ class MemoryCommandService:
             action_key.destroyed_by = actor_id
             action_key.reason = "forget_action_envelope_only"
             destroyed_keys += 1
+        # Legacy records may not have a stream until the forget command.
+        # Keep its tombstone so a delayed projection cannot resurrect content.
+        if stream is None:
+            self.store.destroy_stream_payloads(
+                scope, result.event.stream_id, actor_id=actor_id, reason=reason
+            )
         documents = self.db.scalars(
-            select(MemorySearchDocument).where(MemorySearchDocument.target_id == memory_id)
+            select(MemorySearchDocument).where(
+                MemorySearchDocument.tenant_id == scope.tenant_id,
+                MemorySearchDocument.workspace_id == scope.workspace_id,
+                MemorySearchDocument.target_type == "memory",
+                MemorySearchDocument.target_id == memory_id,
+            )
         ).all()
         deleted_documents = len(documents)
         for document in documents:
@@ -260,6 +265,51 @@ class MemoryCommandService:
                 package.selected_ids_json = [item for item in package.selected_ids_json if item != memory_id]
                 package.candidate_ids_json = [item for item in package.candidate_ids_json if item != memory_id]
                 invalidated_packages += 1
+        from app.domain.models import MemoryJournalEntry, MemoryDeletionRecovery, MemoryProfileSnapshot, MemoryDraft
+        now = utc_now()
+        for journal in self.db.scalars(select(MemoryJournalEntry).where(
+            MemoryJournalEntry.workspace_id == scope.workspace_id, MemoryJournalEntry.memory_id == memory_id
+        )):
+            journal.payload = {}
+            journal.content_hash = ""
+            journal.tombstone = True
+            journal.recoverable_until = None
+            journal.content_scrubbed_at = now
+        for recovery in self.db.scalars(select(MemoryDeletionRecovery).where(
+            MemoryDeletionRecovery.workspace_id == scope.workspace_id, MemoryDeletionRecovery.memory_id == memory_id
+        )):
+            from app.services.memory_vault import MemoryRecoveryVault
+            from app.core.config import get_settings
+            MemoryRecoveryVault(get_settings().memory_root, scope.workspace_id).destroy(memory_id)
+            recovery.encrypted_payload = None
+            recovery.recoverable_until = now
+            recovery.destroyed_at = now
+        for feedback in self.db.scalars(select(MemoryFeedback).where(
+            MemoryFeedback.workspace_id == scope.workspace_id, MemoryFeedback.memory_id == memory_id
+        )):
+            feedback.payload_json = {}
+        for draft in self.db.scalars(select(MemoryDraft).where(
+            MemoryDraft.workspace_id == scope.workspace_id,
+            (MemoryDraft.target_memory_id == memory_id) | (MemoryDraft.result_memory_id == memory_id),
+        )):
+            draft.title = "[forgotten]"
+            draft.content = ""
+            draft.structured_payload = {}
+            draft.source_refs = []
+            draft.status = "REJECTED"
+            draft.rejection_reason = "source_forgotten"
+        for snapshot in self.db.scalars(select(MemoryProfileSnapshot).where(
+            MemoryProfileSnapshot.workspace_id == scope.workspace_id
+        )):
+            refs = set(snapshot.source_atom_ids or []) | {i for ids in (snapshot.claim_atom_map or {}).values() for i in ids}
+            if memory_id in refs:
+                snapshot.markdown = ""
+                snapshot.structured_sections = []
+                snapshot.source_atom_ids = []
+                snapshot.claim_atom_map = {}
+                snapshot.source_fingerprint = ""
+                snapshot.status = "stale"
+                snapshot.stale_reason = "source_forgotten"
         record.title = "[forgotten]"
         record.content_hash = ""
         record.relative_path = ""
@@ -289,7 +339,12 @@ class MemoryCommandService:
                 MemoryProjectionOutbox.event_id == result.event.event_id
             )
         ).all()
-        self.db.commit()
+        record.deleted_at = record.deleted_at or utc_now()
+        record.recoverable_until = None
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         return ForgetReport(
             memory_id,
             destroyed_keys,
@@ -342,6 +397,19 @@ class MemoryCommandService:
     def _payload(record: MemoryRecord, content: str) -> dict[str, Any]:
         return {
             "memory_id": record.id,
+            "subject_user_id": record.subject_user_id,
+            "state": record.state,
+            "zone": record.zone,
+            "atom_schema_version": record.atom_schema_version,
+            "ledger_status": record.ledger_status,
+            "temporal_status": record.temporal_status,
+            "summary_eligibility": record.summary_eligibility,
+            "supersedes_id": record.supersedes_id,
+            "superseded_by_id": record.superseded_by_id,
+            "auto_recall_suppressed": record.auto_recall_suppressed,
+            "child_agent_denied": record.child_agent_denied,
+            "valid_from": record.valid_from.isoformat() if record.valid_from else None,
+            "valid_until": record.valid_until.isoformat() if record.valid_until else None,
             "title": record.title,
             "content": content,
             "revision": record.revision,

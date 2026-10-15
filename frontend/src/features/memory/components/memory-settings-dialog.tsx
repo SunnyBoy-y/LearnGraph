@@ -15,6 +15,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
+import { workspaceLearningEnabled, workspaceRecallEnabled } from '../memory-policy-state'
 import { MemoryModelSelect } from './memory-model-select'
 import { MemorySettingsExportPanel } from './memory-settings-export-panel'
 
@@ -143,14 +144,14 @@ export function MemorySettingsDialog({
               </div>
               <div className="divide-y">
                 <SettingRow
-                  checked={policyData?.effective_recall_enabled ?? false}
+                  checked={workspaceRecallEnabled(policyData) ?? false}
                   description="在回答中使用我的长期记忆，避免重复解释已经学过的内容。"
                   disabled={updatePolicy.isPending || !policyData}
                   label="在回答中使用长期记忆"
                   onToggle={(value) => updatePolicy.mutate({ workspace_recall_enabled: value })}
                 />
                 <SettingRow
-                  checked={policyData?.effective_learning_enabled ?? false}
+                  checked={workspaceLearningEnabled(policyData) ?? false}
                   description="根据学习证据更新我对知识点的掌握程度，用来调整练习与讲解重点。"
                   disabled={updatePolicy.isPending || !policyData}
                   label="使用记忆调整学习内容"

@@ -278,6 +278,35 @@ def record_feedback(
         raise AppError(404, "memory_not_found", "Memory was not found")
     if record.subject_user_id is None or payload.feedback_type == "project_only":
         context.require_permission("workspace.manage")
+    if payload.feedback_type == "wrong" and (
+        "replacement_content" in payload.payload or "replacement_title" in payload.payload
+    ):
+        from pydantic import ValidationError
+        from app.api.routers.memory import service
+        from app.domain.schemas.management import MemoryUpdateRequest
+        title = payload.payload.get("replacement_title", record.title)
+        content = payload.payload.get("replacement_content")
+        if not isinstance(title, str) or not title.strip() or not isinstance(content, str) or not content.strip():
+            raise AppError(422, "memory_replacement_invalid", "Replacement title and content are required")
+        try:
+            correction = MemoryUpdateRequest(title=title, content=content,
+                expected_revision=payload.payload.get("expected_revision", record.revision), reason="user_edit")
+        except ValidationError as exc:
+            raise AppError(422, "memory_replacement_invalid", "Invalid replacement fields") from exc
+        writer = service(db, context, settings)
+        commands = MemoryCommandService(db, event_store(db, settings))
+        with writer.atomic_write():
+            row = commands.feedback(memory_scope(context), memory_id, actor_id=context.principal.user_id,
+                feedback_type="wrong", payload=payload.payload, commit=False)
+            record.lifecycle_status = "active"
+            updated = writer.update(memory_id, correction)
+            if settings.memory_write_mode == "legacy":
+                from app.services.memory_projector import MemoryProjector
+                event = commands.mirror_legacy_record(memory_scope(context), record,
+                    content=content.rstrip(), operation="UPDATE", actor_id=context.principal.user_id)
+                MemoryProjector(db).apply(event, commands._payload(record, content.rstrip()))
+        return {"feedback_id": row.id, "applied_event_id": record.head_event_id,
+                "memory_id": updated.id, "revision": updated.revision}
     row = MemoryCommandService(db, event_store(db, settings)).feedback(
         memory_scope(context),
         memory_id,
