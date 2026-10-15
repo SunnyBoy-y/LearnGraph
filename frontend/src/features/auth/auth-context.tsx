@@ -30,6 +30,8 @@ import {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState(() => authStore.getSession());
   const [workspaceName, setWorkspaceName] = useState("");
+  const [permissionScope, setPermissionScope] = useState<{ token: string; workspaceId: string; permissions: string[] } | null>(null);
+  const [adminScope, setAdminScope] = useState<{ token: string; isAdmin: boolean } | null>(null);
   const workspaceSelectionRequestRef = useRef(0);
 
   useEffect(
@@ -44,12 +46,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!session?.workspaceId) {
       setWorkspaceName("");
+      setPermissionScope(null);
       return;
     }
     let cancelled = false;
     void listWorkspaces()
       .then((workspaces) => {
         if (!cancelled) {
+          setPermissionScope({ token: session.accessToken, workspaceId: session.workspaceId, permissions: workspaces.find((item) => item.id === session.workspaceId)?.effective_permissions ?? [] });
           setWorkspaceName(
             workspaces.find((item) => item.id === session.workspaceId)?.name ??
               session.workspaceId,
@@ -62,17 +66,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [session?.workspaceId]);
+  }, [session?.workspaceId, session?.accessToken]);
 
   useEffect(() => {
     if (!session?.accessToken) return;
 
     let checking = false;
+    let cancelled = false;
     const checkSession = () => {
       if (checking) return;
       checking = true;
       void getCurrentUser()
         .then((user) => {
+          if (cancelled || authStore.getAccessToken() !== session.accessToken) return;
+          setAdminScope({ token: session.accessToken, isAdmin: user.is_system_admin });
+          void listWorkspaces().then((workspaces) => {
+            if (cancelled || authStore.getWorkspaceId() !== session.workspaceId) return;
+            const permissions = workspaces.find((item) => item.id === session.workspaceId)?.effective_permissions ?? [];
+            setPermissionScope((current) => {
+              if (current?.permissions.some((permission) => !permissions.includes(permission))) void clearWorkspaceClientState(session.workspaceId);
+              return { token: session.accessToken, workspaceId: session.workspaceId, permissions };
+            });
+          }).catch(() => { if (!cancelled) setPermissionScope(null); });
           const mustChangePassword = user.must_change_password;
           authStore.setMustChangePassword(mustChangePassword);
           setSession((current) =>
@@ -97,17 +112,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     document.addEventListener('visibilitychange', checkSession);
 
     return () => {
+      cancelled = true;
       window.clearInterval(interval);
       window.removeEventListener('focus', checkSession);
       document.removeEventListener('visibilitychange', checkSession);
     };
-  }, [session?.accessToken]);
+  }, [session?.accessToken, session?.workspaceId]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
       authenticated: Boolean(session?.accessToken && session.workspaceId),
       username: session?.displayName ?? session?.username ?? "",
       workspaceId: session?.workspaceId ?? "",
+      userId: session?.userId ?? session?.username ?? "",
+      isSystemAdmin: adminScope?.token === session?.accessToken && adminScope?.isAdmin === true,
+      effectivePermissions: permissionScope?.token === session?.accessToken && permissionScope?.workspaceId === session?.workspaceId ? permissionScope?.permissions ?? [] : [],
       workspaceName: workspaceName || session?.workspaceId || "",
       mustChangePassword: session?.mustChangePassword ?? null,
       async setWorkspaceId(workspaceId) {
@@ -194,7 +213,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       },
     }),
-    [session, workspaceName],
+    [session, workspaceName, permissionScope, adminScope],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

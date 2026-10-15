@@ -45,7 +45,7 @@ export function ChangePasswordPage() {
     );
   }
   if (!auth.mustChangePassword) {
-    return <Navigate replace to={`/w/${auth.workspaceId}/home`} />;
+    return <Navigate replace to={`/w/${auth.workspaceId}/chat/new`} />;
   }
 
   async function submitPasswordChange(event: FormEvent<HTMLFormElement>) {
@@ -63,7 +63,7 @@ export function ChangePasswordPage() {
     setBusy(true);
     try {
       await auth.changePassword(currentPassword, newPassword);
-      navigate(`/w/${auth.workspaceId}/home`);
+      navigate(`/w/${auth.workspaceId}/chat/new`);
     } catch (reason) {
       setError(authErrorMessage(reason));
     } finally {

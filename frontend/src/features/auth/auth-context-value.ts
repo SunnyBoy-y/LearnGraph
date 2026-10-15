@@ -4,6 +4,9 @@ export type AuthContextValue = {
   authenticated: boolean
   username: string
   workspaceId: string
+  userId: string
+  isSystemAdmin: boolean
+  effectivePermissions: readonly string[]
   workspaceName: string
   mustChangePassword: boolean | null
   setWorkspaceId: (workspaceId: string) => Promise<void>

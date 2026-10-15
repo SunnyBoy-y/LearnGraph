@@ -200,7 +200,7 @@ def delete_account(
 def list_workspaces(principal: CurrentPrincipal, db: DB) -> list[WorkspaceView]:
     """列出当前用户可访问的工作区。无请求体，输出工作区及成员关系摘要。"""
     return [
-        WorkspaceView.model_validate(item)
+        WorkspaceView.model_validate(item).model_copy(update={"effective_permissions": sorted(AuthorizationService(db, principal).workspace_permissions(item))})
         for item in AuthorizationService(db, principal).list_workspaces()
     ]
 
@@ -220,7 +220,7 @@ def select_workspace(
     )
     if workspace is None:
         raise AppError(403, "workspace_forbidden", "Workspace is not accessible to this user")
-    return WorkspaceSelectionResponse(workspace=WorkspaceView.model_validate(workspace))
+    return WorkspaceSelectionResponse(workspace=WorkspaceView.model_validate(workspace).model_copy(update={"effective_permissions": sorted(AuthorizationService(db, principal).workspace_permissions(workspace))}))
 
 
 @router.get("/permissions", response_model=list[PermissionView])

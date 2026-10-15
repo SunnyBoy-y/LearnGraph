@@ -34,6 +34,7 @@ export interface Workspace {
   tenant_id: string
   owner_user_id: string
   organization_id: string | null
+  effective_permissions: string[]
   workspace_kind: 'personal' | 'organization'
   name: string
   description: string

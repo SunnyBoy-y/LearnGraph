@@ -14,7 +14,7 @@ export function RouteLoading() {
  *
  * Denial is recorded as *which* workspace was refused, never as a boolean flag.
  * The fallback is derived from the active workspace, so once the app sits on
- * `/w/<active>/home` a boolean denial would keep rendering a `<Navigate>` aimed
+ * `/w/<active>/chat/new` a boolean denial would keep rendering a `<Navigate>` aimed
  * at the URL it is already on: React Router still replaces the entry, the guard
  * re-renders, and the page stays empty with no error and nothing left to
  * re-render it (only a refresh resets the guard). A workspace id is
@@ -58,7 +58,7 @@ export function WorkspaceRouteGuard({ children }: { children: ReactNode }) {
     workspaceId !== activeWorkspaceId &&
     deniedWorkspaceId === workspaceId;
   if (!workspaceId || denied) {
-    const fallback = `/w/${activeWorkspaceId}/home`;
+    const fallback = `/w/${activeWorkspaceId}/chat/new`;
     // Never redirect to the URL we are already on: that renders nothing, and
     // nothing is left to re-render it.
     return location.pathname === fallback ? <RouteLoading /> : <Navigate replace to={fallback} />;

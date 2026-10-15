@@ -99,8 +99,6 @@ class AuthService:
                 )
         if payload.tenant_id:
             identity_query = identity_query.where(User.tenant_id == payload.tenant_id)
-        if demo_only:
-            identity_query = identity_query.where(User.id == "demo-user")
         matches = list(self.db.scalars(identity_query).all())
         user = matches[0] if len(matches) == 1 else None
         password_valid = verify_password(
@@ -135,9 +133,6 @@ class AuthService:
             )
             self.db.commit()
             raise AppError(401, "invalid_credentials", "Invalid username or password")
-        if demo_only and user.id != "demo-user":
-            raise AppError(401, "invalid_credentials", "Invalid username or password")
-
         # B1-1: a clean account (no prior failed attempts) must not touch the
         # users row, so the common login writes only AuthSession + SecurityEvent
         # in one short transaction; the Workspace SELECT stays a pure read (WAL).
@@ -266,8 +261,15 @@ class AuthService:
         ip_address: str = "",
         device_id: str = "",
     ) -> DemoLoginResponse:
+        # The browser's Demo button may come from an older bundle with stale
+        # credentials. The private server configuration is authoritative, so
+        # the endpoint resolves the configured demo identity and password.
+        del payload
         response = self.login(
-            payload,
+            DemoLoginRequest(
+                username=self.settings.demo_username,
+                password=self.settings.demo_password,
+            ),
             user_agent=user_agent,
             ip_address=ip_address,
             device_id=device_id,

@@ -13,5 +13,5 @@ export function postLoginPath(from: string | null | undefined, workspaceId: stri
   if (typeof from === 'string' && from.startsWith('/') && !from.startsWith('/auth/')) {
     if (/^\/w\/([^/?#]+)/.exec(from)?.[1] === workspaceId) return from
   }
-  return `/w/${workspaceId}`
+  return `/w/${workspaceId}/chat/new`
 }

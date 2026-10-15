@@ -1,6 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 
 import { workspaceQueryPrefix } from "@/lib/query-keys";
+import { clearPersistedQueryCache } from "@/lib/query-persistence";
 
 let activeQueryClient: QueryClient | null = null;
 let authInvalidated: (() => void) | null = null;
@@ -22,7 +23,9 @@ export async function invalidateAuthenticatedClient() {
 }
 
 export async function clearWorkspaceClientState(workspaceId: string) {
-  if (!activeQueryClient || !workspaceId) return;
+  if (!workspaceId) return;
+  clearPersistedQueryCache({ workspaceId });
+  if (!activeQueryClient) return;
   // Match the canonical prefix from the query-key factory so this only ever
   // removes one tenant's entries; workspace segment stays first by construction.
   const queryKey = workspaceQueryPrefix(workspaceId);
@@ -31,6 +34,7 @@ export async function clearWorkspaceClientState(workspaceId: string) {
 }
 
 export async function clearAuthenticatedClientState() {
+  clearPersistedQueryCache({ all: true });
   if (!activeQueryClient) return;
   await activeQueryClient.cancelQueries();
   activeQueryClient.clear();
